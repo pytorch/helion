@@ -202,22 +202,33 @@ def use_cudagraph() -> bool:
     return True
 
 
+def _bench_shapes() -> list[tuple[int, int]]:
+    """Shapes main() benchmarks (from the vLLM input_generator / pick_config grid)."""
+    hidden_sizes = [2048, 4096, 5120]
+    num_tokens_list = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    return [(h, t) for h in hidden_sizes for t in num_tokens_list]
+
+
 def correctness_check() -> None:
-    """Assert the Helion kernel matches the torch reference (used by the tests)."""
+    """Assert the Helion kernel matches the torch reference for every bench shape."""
     torch.manual_seed(0)
-    num_tokens, hidden_size = 16, 4096
-    x_in = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
-    weight = torch.normal(
-        mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device="cuda"
-    )
-    result = torch.empty_like(x_in, dtype=torch.float8_e4m3fn)
-    scale = torch.empty((num_tokens, 1), device="cuda", dtype=torch.float32)
-    result_ref = torch.empty_like(result)
-    scale_ref = torch.empty_like(scale)
-    rms_norm_dynamic_per_token_quant(result, x_in, weight, scale, 1e-6)
-    _rms_norm_dynamic_per_token_quant_torch(result_ref, x_in, weight, scale_ref, 1e-6)
-    torch.testing.assert_close(scale, scale_ref, rtol=2e-2, atol=1e-4)
-    torch.testing.assert_close(result.float(), result_ref.float(), rtol=0.2, atol=0.2)
+    for hidden_size, num_tokens in _bench_shapes():
+        x_in = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        weight = torch.normal(
+            mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device="cuda"
+        )
+        result = torch.empty_like(x_in, dtype=_FP8_DTYPE)
+        scale = torch.empty((num_tokens, 1), device="cuda", dtype=torch.float32)
+        result_ref = torch.empty_like(result)
+        scale_ref = torch.empty_like(scale)
+        rms_norm_dynamic_per_token_quant(result, x_in, weight, scale, 1e-6)
+        _rms_norm_dynamic_per_token_quant_torch(
+            result_ref, x_in, weight, scale_ref, 1e-6
+        )
+        torch.testing.assert_close(scale, scale_ref, rtol=2e-2, atol=1e-4)
+        torch.testing.assert_close(
+            result.float(), result_ref.float(), rtol=0.2, atol=0.2
+        )
 
 
 def main(verbose: bool = True) -> dict:
@@ -228,9 +239,7 @@ def main(verbose: bool = True) -> dict:
     from _bench import run_sweep
 
     # Representative sweep from the vLLM input_generator / pick_config grid.
-    hidden_sizes = [2048, 4096, 5120]
-    num_tokens_list = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
-    shapes = [(h, t) for h in hidden_sizes for t in num_tokens_list]
+    shapes = _bench_shapes()
     epsilon = 1e-6
     baselines = _baselines()
 
@@ -267,4 +276,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()

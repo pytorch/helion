@@ -175,7 +175,8 @@ def _run_kernel_in_subprocess_spawn(
         assert isinstance(args, (tuple, list))
         synchronize_device()
         with capture_output() as _cap:
-            fn(*args)
+            # Keep asynchronous device buffers alive until execution completes.
+            _output = fn(*args)
         synchronize_device()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:

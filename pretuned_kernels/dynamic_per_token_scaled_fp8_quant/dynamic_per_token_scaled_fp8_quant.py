@@ -131,18 +131,29 @@ def use_cudagraph() -> bool:
     return True
 
 
+def _bench_shapes() -> list[tuple[int, int]]:
+    """The (num_tokens, hidden_size) shapes main() benchmarks (and tests check)."""
+    # hidden_size / num_tokens drawn from the vLLM input generator.
+    hidden_sizes = [2048, 4096, 5120]
+    num_tokens_list = [1, 4, 16, 64, 256, 1024, 2048, 4096]
+    return [(t, h) for h in hidden_sizes for t in num_tokens_list]
+
+
 def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
-    x = torch.randn(16, 4096, device="cuda", dtype=torch.bfloat16)
-    result = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    scale = torch.empty((16, 1), device="cuda", dtype=torch.float32)
-    result_ref = torch.empty_like(result)
-    scale_ref = torch.empty_like(scale)
-    dynamic_per_token_scaled_fp8_quant(result, x, scale)
-    _dynamic_per_token_scaled_fp8_quant_torch(result_ref, x, scale_ref)
-    torch.testing.assert_close(scale, scale_ref, rtol=1e-2, atol=1e-4)
-    torch.testing.assert_close(result.float(), result_ref.float(), rtol=0.2, atol=0.2)
+    for num_tokens, hidden_size in _bench_shapes():
+        x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        result = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        scale = torch.empty((num_tokens, 1), device="cuda", dtype=torch.float32)
+        result_ref = torch.empty_like(result)
+        scale_ref = torch.empty_like(scale)
+        dynamic_per_token_scaled_fp8_quant(result, x, scale)
+        _dynamic_per_token_scaled_fp8_quant_torch(result_ref, x, scale_ref)
+        torch.testing.assert_close(scale, scale_ref, rtol=1e-2, atol=1e-4)
+        torch.testing.assert_close(
+            result.float(), result_ref.float(), rtol=0.2, atol=0.2
+        )
 
 
 def main(verbose: bool = True) -> dict:
@@ -152,10 +163,7 @@ def main(verbose: bool = True) -> dict:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _bench import run_sweep
 
-    # hidden_size / num_tokens drawn from the vLLM input generator.
-    hidden_sizes = [2048, 4096, 5120]
-    num_tokens_list = [1, 4, 16, 64, 256, 1024, 2048, 4096]
-    shapes = [(t, h) for h in hidden_sizes for t in num_tokens_list]
+    shapes = _bench_shapes()
     baselines = _baselines()
 
     def make_calls(shape: tuple) -> tuple:
@@ -184,4 +192,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()

@@ -1,0 +1,192 @@
+# Run TPU benchmarks through the *tritonbench bridge* (benchmarks/run.py
+# --device tpu), for kernels that have a tritonbench operator and run on TPU,
+# mirroring the GPU nightly (benchmark.yml). Reuses the TPU-aware
+# --list-impls-for-benchmark-ci for impl auto-discovery.
+#
+# run_tpu.py keeps: bmm (no tritonbench operator), cross_entropy (Helion Mosaic
+# holdout), Helion-only kernels, and the full sweep.
+name: Benchmark TPU (bridge)
+
+on:
+  workflow_call:
+    inputs:
+      alias:
+        required: true
+        type: string
+      kernels:
+        required: true
+        type: string
+        description: "Comma-separated tritonbench-backed kernels to run via the bridge on TPU."
+      env-vars:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: benchmark-${{ inputs.alias }}-bridge
+
+    env:
+      HELION_BACKEND: pallas
+      HELION_AUTOTUNE_LOG_LEVEL: INFO
+      HELION_AUTOTUNE_EFFORT: full
+      HELION_BENCHMARK_KERNEL_TIMEOUT: "3600"
+
+    runs-on: linux.google.tpuv7x.1
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
+      - name: Install PyTorch (CPU nightly)
+        run: |
+          source .venv/bin/activate
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+
+      - name: Install Helion
+        run: |
+          source .venv/bin/activate
+          uv pip install setuptools ninja
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          python -c "import helion; print(helion.__name__)"
+
+      # NOTE: identical to benchmark_tpu.yml's "Install TPU dependencies" step
+      # (jax/libtpu + bazel-build torch_tpu from the pin via GCP Secret Manager).
+      # TODO: factor this into a composite action shared with benchmark_tpu.yml.
+      - name: Install TPU dependencies (Pallas)
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          uv pip install \
+            --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
+            --pre \
+            'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+          if ! command -v bazel &> /dev/null; then
+            sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
+            sudo chmod +x /usr/local/bin/bazel
+          fi
+          if ! command -v gcloud &> /dev/null; then
+            sudo apt-get install -y apt-transport-https ca-certificates gpg curl
+            curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            sudo apt-get update && sudo apt-get install -y google-cloud-cli
+          fi
+          TORCH_TPU_COMMIT=$(cat .github/ci_commit_pins/torch_tpu.txt)
+          set +x
+          gcloud secrets versions access latest --secret="torchtpu-read-key" \
+            --project="ml-velocity-actions-testing" > /tmp/torch_tpu_ssh_key
+          set -x
+          chmod 600 /tmp/torch_tpu_ssh_key
+          GIT_SSH_COMMAND="ssh -i /tmp/torch_tpu_ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
+            git clone git@github.com:google-pytorch/torch_tpu.git /tmp/torch_tpu
+          rm -f /tmp/torch_tpu_ssh_key
+          cd /tmp/torch_tpu
+          git checkout "${TORCH_TPU_COMMIT}"
+          export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
+          export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+          bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
+          uv pip install bazel-bin/ci/wheel/*.whl
+          uv pip install libtpu==0.0.40
+          cd -
+          rm -rf /tmp/torch_tpu
+          python -c "import torch, sys; print('Success') if torch.tpu.is_available() else (print('(Torch)TPU not available'), sys.exit(1))"
+
+      # TPU-appropriate tritonbench install: base requirements + the dev-tpu
+      # dependency group (transformers/triton/tabulate). Deliberately SKIP the
+      # CUDA-only bits the GPU workflow does (quack-kernels, install.py --liger,
+      # mamba-ssm, flash-linear-attention).
+      # TODO: validate this recipe on the runner; requirements.txt may pull
+      # CUDA-only packages that need excluding.
+      - name: Install tritonbench (TPU)
+        run: |
+          set -x
+          source .venv/bin/activate
+          mkdir -p benchmarks/ && pushd benchmarks/
+          git clone https://github.com/meta-pytorch/tritonbench/
+          pushd tritonbench/
+          git checkout $(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/tritonbench.txt)
+          git submodule update --init --recursive
+          uv pip install -r requirements.txt
+          # dev-tpu group deps needed by the bridged operators.
+          uv pip install "transformers==5.0.0rc3" triton tabulate
+          uv pip install -e . --no-deps
+          popd
+          popd
+
+      - name: Run TPU Benchmark (bridge)
+        run: |
+          rm -rf /tmp/torchinductor_*/ || true
+          source .venv/bin/activate
+          TEST_REPORTS_DIR=$(pwd)/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+
+          KERNEL_LIST="${{ inputs.kernels }}"
+          for kernel in ${KERNEL_LIST//,/ }; do
+            echo "=== bridge TPU benchmark: $kernel ==="
+            # Requires --list-impls-for-benchmark-ci to be TPU-aware (return only
+            # TPU-runnable impls). See header note (2).
+            KERNEL_INFO=$(python benchmarks/run.py --list-impls-for-benchmark-ci --device tpu --op $kernel | grep "^$kernel:")
+            IMPLS=$(echo "$KERNEL_INFO" | sed -n 's/.*impls=\([^ ]*\).*/\1/p')
+            BASELINE=$(echo "$KERNEL_INFO" | sed -n 's/.*baseline=\([^ ]*\).*/\1/p')
+            if [[ -z "$IMPLS" || -z "$BASELINE" ]]; then
+              echo "Warning: no runnable impls/baseline for $kernel on TPU, skipping..."
+              continue
+            fi
+
+            # TPU differences vs GPU (benchmark.yml): --device tpu, --precision
+            # bf16 (match run_tpu), drop --cudagraph and
+            # --latency-measure-mode triton_do_bench (CUDA/Triton-only; TPU uses
+            # the wall-clock _do_bench_tpu path). Shapes are tritonbench's own,
+            # count-capped by --num-inputs; per-kernel shape args (e.g. embedding
+            # --B/--T/--D/--v-range) are supplied via inputs.env-vars / custom
+            # args where a default shape exceeds TPU vmem.
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
+              python benchmarks/run.py \
+                --op $kernel \
+                --device tpu \
+                --precision bf16 \
+                --helion-backend pallas \
+                --metrics speedup,accuracy,latency \
+                --measure-compile-time \
+                --num-inputs 2 \
+                --only $IMPLS \
+                --only-match-mode prefix-with-baseline \
+                --baseline $BASELINE \
+                --atol 1e-2 \
+                --rtol 1e-2 \
+                --output "$TEST_REPORTS_DIR/helionbench.json" \
+                --append-to-output \
+                --keep-going
+            echo "✅ $kernel"
+          done
+
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
+          fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
+
+      - name: Upload the benchmark results to GitHub
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ inputs.alias }}
+          path: test/test-reports
