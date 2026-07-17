@@ -324,13 +324,25 @@ def _get_ref_mode() -> RefMode:
     return RefMode.EAGER if interpret else RefMode.OFF
 
 
-def _get_dot_precision() -> DotPrecision:
+def _get_dot_precision(backend: str | None = None) -> DotPrecision:
     """
     Gets the dot precision setting from the TRITON_F32_DEFAULT environment variable.
     Defaults to 'tf32', 'ieee' if rocm and not CDNA.
     For Pallas, gets the precision setting from the JAX_DEFAULT_MATMUL_PRECISION environment variable, defaulting to 'default'.
+
+    ``backend`` selects which default to use. As a dataclass ``default_factory``
+    this runs before a per-kernel ``backend=`` kwarg is applied, so it falls back
+    to the *global* default backend (``HELION_BACKEND``, usually ``triton``);
+    :meth:`Settings.__init__` re-invokes it with the resolved backend so a pallas
+    kernel that leaves ``dot_precision`` unset gets the pallas default
+    (``default`` = single-pass bf16) instead of triton's ``tf32``. That matters
+    because ``map_dot_precision`` turns ``tf32`` into ``highest`` on Pallas
+    (fp32-contraction / bf16x3), which Mosaic rejects for bf16 matmuls inside a
+    distributed kernel ("Bad lhs type").
     """
-    if _get_backend() == "pallas":
+    if backend is None:
+        backend = _get_backend()
+    if backend == "pallas":
         return _env_get_literal(
             "JAX_DEFAULT_MATMUL_PRECISION",
             cast("DotPrecision", "default"),
@@ -814,6 +826,15 @@ class Settings(_Settings):
         """
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
+
+        # ``dot_precision``'s default_factory resolved against the *global*
+        # default backend (usually 'triton' -> 'tf32'); if the caller selected a
+        # different backend but left dot_precision unset, re-resolve it for the
+        # actual backend so e.g. a pallas kernel gets 'default' (single-pass
+        # bf16) rather than 'tf32' (-> 'highest'/fp32-contraction, which Mosaic
+        # rejects for bf16 matmuls in distributed kernels).
+        if "dot_precision" not in settings:
+            self.dot_precision = _get_dot_precision(self.backend)
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
