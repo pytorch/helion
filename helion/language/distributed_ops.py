@@ -27,14 +27,13 @@ dependent) scalars, so a loop can scatter each row to a different peer/slot.
 Completion semantics: ``op.wait()`` guarantees only that the *locally-initiated*
 push has drained on this rank.  It does **not** establish that *inbound* peer
 writes into a local ``dst`` buffer have landed -- for a reduce-scatter /
-all-to-all where a rank both sends and receives rows, a subsequent device- or
-host-wide barrier (e.g. ``dist.barrier()``) is required before reading ``dst``
-cross-rank.  A compiler-managed receive-side drain (counting-semaphore + one
-wait) is future work; see the ``examples/distributed`` kernels for the current
-barrier-based finalize.
+all-to-all where a rank both sends and receives rows, either a subsequent
+device-/host-wide barrier (e.g. ``dist.barrier()``) or the compiler-managed
+counting receive drain ``hl.wait_async_remote_recv(dst, count)`` establishes
+cross-rank visibility of the inbound writes before reading ``dst``.
 
-Only the Pallas backend is wired up today.  ``start_async_remote_copy`` lowers
-to::
+Both the Pallas (TPU) and Triton/NVSHMEM (GPU) backends are wired up.  On Pallas,
+``start_async_remote_copy`` lowers to::
 
     _op = pltpu.make_async_remote_copy(
         src.at[src_index],

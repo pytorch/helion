@@ -1,10 +1,11 @@
-"""Codegen tests for ``hl.start_async_remote_copy`` / ``wait_async_remote_copy`` (Pallas).
+"""Codegen tests for ``hl.start_async_remote_copy`` / ``wait_async_remote_copy``.
 
 These assert on the *generated backend source* (``BoundKernel.to_code``) rather
-than executing, so they need no TPU: they lock in the Pallas
-``make_async_remote_copy`` lowering for the asymmetric, runtime-routed remote copy
-that fused comms+compute kernels (reduce-scatter / all-to-all) rely on, plus the
-trace-time src<->dst contract.
+than executing, so they need no TPU/GPU: they lock in the Pallas
+``make_async_remote_copy`` lowering and the Triton/NVSHMEM
+``nvshmem_putmem_signal_block`` lowering for the asymmetric, runtime-routed
+remote copy that fused comms+compute kernels (reduce-scatter / all-to-all) rely
+on, plus the trace-time src<->dst contract.
 """
 
 from __future__ import annotations
@@ -41,10 +42,29 @@ def _pallas_symmetric(buf, ws: hl.constexpr):
     return buf
 
 
+@helion.kernel(backend="triton", config=helion.Config())
+def _triton_scatter(src, out, dest, wpos, ws: hl.constexpr):
+    """Same kernel, Triton/NVSHMEM backend."""
+    m = src.shape[0]
+    for i in hl.grid(m):
+        op = hl.start_async_remote_copy(src, [i], dest[i], dst=out, dst_index=[wpos[i]])
+        op.wait()
+    return out
+
+
 @helion.kernel(backend="pallas", distributed=[8], config=helion.Config())
 def _pallas_scatter_wait_send(src, out, dest, wpos, ws: hl.constexpr):
     """Reduce-scatter direct-write: drain the OUTGOING send per row (balanced),
     so an uneven receive count never deadlocks."""
+    m = src.shape[0]
+    for i in hl.grid(m):
+        op = hl.start_async_remote_copy(src, [i], dest[i], dst=out, dst_index=[wpos[i]])
+        op.wait_send()
+    return out
+
+
+@helion.kernel(backend="triton", config=helion.Config())
+def _triton_scatter_wait_send(src, out, dest, wpos, ws: hl.constexpr):
     m = src.shape[0]
     for i in hl.grid(m):
         op = hl.start_async_remote_copy(src, [i], dest[i], dst=out, dst_index=[wpos[i]])
@@ -76,6 +96,12 @@ def _scatter_args(
 
 def _code(kernel, args):
     return kernel.bind(args).to_code(helion.Config())
+
+
+def _putmem_line(code):
+    return next(
+        ln.strip() for ln in code.splitlines() if "nvshmem_putmem_signal_block" in ln
+    )
 
 
 def _remote_copy_line(code):
@@ -136,6 +162,94 @@ class TestRemoteCopyPallasCodegen(TestCase):
         self.assertIsNotNone(start, code)
         self.assertIn(f"{start.group(1)}.wait_send()", code)
         self.assertNotRegex(code, rf"{start.group(1)}\.wait\(\)")
+
+
+class TestRemoteCopyTritonCodegen(TestCase):
+    def test_emits_putmem_and_paired_wait(self):
+        code = _code(_triton_scatter, _scatter_args())
+        put = _putmem_line(code)
+        self.assertIn("NVSHMEM_SIGNAL_ADD", put)
+        sig = re.search(
+            r"nvshmem_putmem_signal_block\([^,]+,[^,]+,[^,]+,\s*(\w+),", put
+        )
+        self.assertIsNotNone(sig, put)
+        # The paired wait references the *same* signal var.
+        self.assertIn(
+            f"nvshmem_signal_wait_until({sig.group(1)}, NVSHMEM_CMP_GE, 1)", code
+        )
+
+    def test_nbytes_scales_with_dtype(self):
+        fp32 = _putmem_line(
+            _code(_triton_scatter, _scatter_args(src_dtype=torch.float32))
+        )
+        bf16 = _putmem_line(
+            _code(_triton_scatter, _scatter_args(src_dtype=torch.bfloat16))
+        )
+        self.assertIn(", 512,", fp32)  # 128 elems * 4 bytes
+        self.assertIn(", 256,", bf16)  # 128 elems * 2 bytes
+
+    def test_offset_uses_real_stride_not_row_numel(self):
+        # Non-contiguous leading dim (stride(0)=160, row width 128): the pointer
+        # offset must use the real stride, not prod(shape[1:]).
+        line = _putmem_line(_code(_triton_scatter, _scatter_args(src_stride0=160)))
+        self.assertRegex(line, r"src \+ \w+ \* 160")
+        self.assertNotRegex(line, r"src \+ \w+ \* 128")
+
+    def test_device_id_is_runtime_pe(self):
+        line = _putmem_line(_code(_triton_scatter, _scatter_args()))
+        pe = re.search(r"NVSHMEM_SIGNAL_ADD,\s*(\w+)\)", line)
+        self.assertIsNotNone(pe, line)
+        self.assertFalse(pe.group(1).isdigit(), f"expected runtime pe: {line}")
+
+    def test_wait_send_drains_with_quiet(self):
+        # On GPU the send-side drain is nvshmem_quiet() (all outbound puts done),
+        # not a signal wait.
+        code = _code(_triton_scatter_wait_send, _scatter_args())
+        self.assertIn("nvshmem_quiet()", code)
+        self.assertNotIn("nvshmem_signal_wait_until", code)
+
+
+@helion.kernel(
+    backend="triton",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[128, 64]),
+)
+def _fused_compute_scatter(src, w, scratch, recv, dest, ws: hl.constexpr, chunk, idim):
+    """A FUSED comms+compute kernel: per output chunk, a matmul + a reduce-scatter
+    push, in one grid iteration -- the fused MoE shape, one kernel."""
+    n = src.shape[1]
+    for k in hl.grid(ws):
+        for tm in hl.tile(chunk):
+            rows = k * chunk + tm.index
+            acc = hl.zeros([tm, idim], dtype=torch.float32)
+            for tk in hl.tile(n):
+                acc = torch.addmm(acc, src[rows, tk], w[tk, :])
+            scratch[k, tm.index, :] = acc.to(scratch.dtype)
+        op = hl.start_async_remote_copy(scratch, [k], dest[k], dst=recv, dst_index=[0])
+        op.wait()
+    return recv
+
+
+class TestFusedComputeCommsCodegen(TestCase):
+    def test_single_kernel_lowers_compute_and_comms_to_triton(self):
+        # The SAME single Helion kernel must emit BOTH the compute (tl.dot) and
+        # the reduce-scatter comms (nvshmem) into one Triton kernel.
+        ws, chunk, n, idim = 8, 128, 128, 128
+        args = (
+            torch.zeros(ws * chunk, n),
+            torch.zeros(n, idim),
+            torch.zeros(ws, chunk, idim),
+            torch.zeros(ws, chunk, idim),
+            torch.zeros(ws, dtype=torch.int32),
+            hl.constexpr(ws),
+            hl.constexpr(chunk),
+            hl.constexpr(idim),
+        )
+        cfg = helion.Config(block_sizes=[128, 64])
+        code = _fused_compute_scatter.bind(args).to_code(cfg)
+        self.assertIn("tl.dot", code)  # the fused matmul
+        self.assertIn("nvshmem_putmem_signal_block", code)  # the fused comms
+        self.assertIn("nvshmem_signal_wait_until", code)
 
 
 class TestRemoteCopyMemorySpace(TestCase):
