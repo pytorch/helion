@@ -117,10 +117,19 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          curl -fsSL \
-            "https://raw.githubusercontent.com/yushangdi/vllm/add-helion-benchmark-correctness/scripts/benchmark_helion_kernels.py" \
-            -o .github/scripts/benchmark_helion_kernels.py
-          grep -q "def check_kernel_correctness" .github/scripts/benchmark_helion_kernels.py \
-            || { echo "FATAL: fetched benchmark_helion_kernels.py lacks check_kernel_correctness"; exit 1; }
-          echo "Fetched benchmark_helion_kernels.py from PR #48968 branch (yushangdi:add-helion-benchmark-correctness)"
+          # Fetch with Python's urllib, not curl: the CUDA container doesn't ship
+          # curl and the toolchain step only installs git.
+          python - <<'PY'
+          import urllib.request
+          url = ("https://raw.githubusercontent.com/yushangdi/vllm/"
+                 "add-helion-benchmark-correctness/scripts/benchmark_helion_kernels.py")
+          dst = ".github/scripts/benchmark_helion_kernels.py"
+          urllib.request.urlretrieve(url, dst)
+          src = open(dst).read()
+          assert "def check_kernel_correctness" in src, (
+              "fetched benchmark_helion_kernels.py lacks check_kernel_correctness"
+          )
+          print(f"Fetched {dst} from PR #48968 branch "
+                "(yushangdi:add-helion-benchmark-correctness)")
+          PY
           python .github/scripts/check_vllm_helion_correctness.py
