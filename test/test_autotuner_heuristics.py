@@ -29,25 +29,47 @@ from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_PDL_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
 from helion._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
 from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
 from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
+from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
 from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
 from helion._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
+from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
 from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
 from helion._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
+from helion._compiler.cute.cute_flash import FLASH_RECOMPUTE_TILE_COORDS_KEY
 from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
 from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
 from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from helion._compiler.cute.cute_flash import FLASH_S_LOAD_REP_KEY
 from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
+from helion._compiler.cute.cute_flash import FLASH_SKIP_RESCALE_STATS_KEY
 from helion._compiler.cute.cute_flash import FLASH_SMALL_BIASED_KEY
+from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
 from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
+from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
 from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from helion._compiler.cute.cute_flash import flash_attention_seed_config
 from helion._compiler.cute.cute_flash import flash_attention_seed_configs
@@ -1298,9 +1320,29 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_flash_accepts_extra_knobs(self) -> None:
         self.assertIn(FLASH_MMA_INTERLEAVE_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_Q_TILE_COUNT_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_PERSISTENT_CTAS_PER_SM_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_P_STORE_REP_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_S_LOAD_REP_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_PRECOMPUTE_QK_DESC_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_RECOMPUTE_TILE_COORDS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_FIRST_LOAD_ORDER_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_KV_ORDER_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SOFTMAX_DISC_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_EPI_STG_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_EPI_STG_STORE_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_EPI_STG_GMEM_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CORR_TILE_SIZE_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_RESCALE_CHUNK_COLS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SKIP_RESCALE_STATS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_HEADS_PER_BATCH_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_PDL_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_STAGES_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_LOCAL_TMA_PARTITION_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_TENSOR_4D_TMA_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_SOFTMAX_REGS_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_CORR_REGS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_OTHER_REGS_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_MASKED_E2E_SCHEDULE_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_ROLE_MAP_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_SMALL_BIASED_KEY, FLASH_CONFIG_KEYS)
@@ -1315,20 +1357,192 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
             self.assertEqual(config[FLASH_KV_STAGE_KEY], 3)
             self.assertTrue(config[FLASH_PERSISTENT_KEY])
+            self.assertEqual(config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
             self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
             self.assertEqual(config[FLASH_E2E_OFFSET_KEY], 2)
             self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], 2)
+            self.assertTrue(config[FLASH_SOFTMAX_DISC_KEY])
             self.assertEqual(config[FLASH_DISC_PIPE_KEY], 4)
+            self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
+            self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
+            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
+            self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], 0)
+            self.assertEqual(config[FLASH_KV_ORDER_KEY], "ascending")
             self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], 184)
+            self.assertEqual(config[FLASH_OTHER_REGS_KEY], 48)
             self.assertTrue(config[FLASH_EPI_TMA_KEY])
+            self.assertFalse(config[FLASH_EPI_STG_KEY])
+            self.assertEqual(config[FLASH_CORR_TILE_SIZE_KEY], 16)
             self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
             self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+            self.assertFalse(config[FLASH_SKIP_RESCALE_STATS_KEY])
             self.assertFalse(config[FLASH_PACKED_REDUCE_KEY])
+            self.assertFalse(config[FLASH_CLC_KEY])
+            self.assertFalse(config[FLASH_LOCAL_TMA_PARTITION_KEY])
+            self.assertFalse(config[FLASH_TENSOR_4D_TMA_KEY])
 
-        for num_kv, offset, disc_pipe, epi_tma, rescale_chunk_cols in (
-            (64, 2, 3, True, 16),
-            (128, 3, 3, False, 16),
-            (512, 2, 4, False, 32),
+        for (
+            num_kv,
+            e2e_schedule,
+            offset,
+            offset0,
+            disc_pipe,
+            epi_tma,
+            rescale_threshold,
+            rescale_chunk_cols,
+            skip_rescale_stats,
+            persistent_ctas_per_sm,
+            kv_order,
+            corr_tile_size,
+            softmax_disc,
+            first_load_order,
+            softmax_regs,
+            corr_regs,
+            other_regs,
+            local_tma_partition,
+            cga2_local,
+            clc,
+            clc_heads_per_batch,
+        ) in (
+            (
+                64,
+                "8/2",
+                2,
+                2,
+                3,
+                True,
+                8.0,
+                16,
+                False,
+                1,
+                "ascending",
+                16,
+                True,
+                0,
+                184,
+                64,
+                48,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                128,
+                "8/2",
+                3,
+                2,
+                3,
+                False,
+                8.0,
+                16,
+                False,
+                1,
+                "ascending",
+                16,
+                True,
+                0,
+                184,
+                64,
+                48,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                256,
+                "8/2",
+                0,
+                1,
+                1,
+                True,
+                8.0,
+                8,
+                False,
+                1,
+                "descending",
+                8,
+                False,
+                0,
+                200,
+                64,
+                40,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                384,
+                "8/2",
+                0,
+                3,
+                1,
+                True,
+                32.0,
+                8,
+                False,
+                1,
+                "ascending",
+                8,
+                False,
+                0,
+                200,
+                72,
+                32,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                512,
+                "8/2",
+                0,
+                0,
+                3,
+                False,
+                8.0,
+                8,
+                False,
+                1,
+                "descending",
+                8,
+                False,
+                0,
+                200,
+                72,
+                32,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                1024,
+                "16/4",
+                0,
+                0,
+                1,
+                True,
+                8.0,
+                8,
+                False,
+                1,
+                "descending",
+                8,
+                False,
+                0,
+                200,
+                72,
+                40,
+                False,
+                False,
+                True,
+                32,
+            ),
         ):
             seed = flash_attention_seed_config(64, num_kv)
             assert seed is not None
@@ -1337,13 +1551,102 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
             self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
             self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
-            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], 2)
+            self.assertTrue(config[FLASH_PERSISTENT_KEY])
+            self.assertEqual(
+                config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], persistent_ctas_per_sm
+            )
+            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], e2e_schedule)
+            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], offset0)
             self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
+            self.assertEqual(config[FLASH_SOFTMAX_DISC_KEY], softmax_disc)
             self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
-            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], 184)
+            self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
+            self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
+            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
+            self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], first_load_order)
+            self.assertEqual(config[FLASH_KV_ORDER_KEY], kv_order)
+            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], softmax_regs)
+            self.assertEqual(config[FLASH_CORR_REGS_KEY], corr_regs)
+            self.assertEqual(config[FLASH_OTHER_REGS_KEY], other_regs)
             self.assertEqual(config[FLASH_EPI_TMA_KEY], epi_tma)
+            self.assertEqual(config[FLASH_EPI_STG_KEY], num_kv >= 512 and not epi_tma)
+            self.assertEqual(config[FLASH_CORR_TILE_SIZE_KEY], corr_tile_size)
+            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], rescale_threshold)
             self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
+            self.assertEqual(config[FLASH_SKIP_RESCALE_STATS_KEY], skip_rescale_stats)
             self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
+            self.assertEqual(config[FLASH_CGA2_LOCAL_KEY], cga2_local)
+            self.assertEqual(config[FLASH_CLC_KEY], clc)
+            self.assertEqual(config[FLASH_CLC_HEADS_PER_BATCH_KEY], clc_heads_per_batch)
+            self.assertEqual(config[FLASH_LOCAL_TMA_PARTITION_KEY], local_tma_partition)
+            self.assertFalse(config[FLASH_TENSOR_4D_TMA_KEY])
+
+        very_long_seed = flash_attention_seed_config(64, 2048)
+        assert very_long_seed is not None
+        very_long_config = very_long_seed.config
+        self.assertEqual(very_long_config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(very_long_config[FLASH_KV_STAGE_KEY], 3)
+        self.assertEqual(very_long_config[FLASH_E2E_SCHEDULE_KEY], "16/4")
+        self.assertEqual(very_long_config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(very_long_config[FLASH_E2E_OFFSET0_KEY], 0)
+        self.assertEqual(very_long_config[FLASH_DISC_PIPE_KEY], 1)
+        self.assertFalse(very_long_config[FLASH_SPLIT_P_ARRIVE_KEY])
+        self.assertFalse(very_long_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+        self.assertFalse(very_long_config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
+        self.assertEqual(very_long_config[FLASH_FIRST_LOAD_ORDER_KEY], 4)
+        self.assertEqual(very_long_config[FLASH_KV_ORDER_KEY], "descending")
+        self.assertEqual(very_long_config[FLASH_SOFTMAX_REGS_KEY], 192)
+        self.assertEqual(very_long_config[FLASH_CORR_REGS_KEY], 80)
+        self.assertEqual(very_long_config[FLASH_OTHER_REGS_KEY], 32)
+        self.assertFalse(very_long_config[FLASH_EPI_TMA_KEY])
+        self.assertTrue(very_long_config[FLASH_EPI_STG_KEY])
+        self.assertEqual(very_long_config[FLASH_CORR_TILE_SIZE_KEY], 8)
+        self.assertEqual(very_long_config.get(FLASH_ROLE_MAP_KEY, "helion"), "helion")
+        self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 32.0)
+        self.assertEqual(very_long_config[FLASH_RESCALE_CHUNK_COLS_KEY], 8)
+        self.assertTrue(very_long_config[FLASH_PACKED_REDUCE_KEY])
+        self.assertFalse(very_long_config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertFalse(very_long_config[FLASH_TENSOR_4D_TMA_KEY])
+
+        dense_sp_seed = flash_attention_seed_config(
+            64,
+            256,
+            seed_kind="dense_sp",
+        )
+        assert dense_sp_seed is not None
+        dense_sp_config = dense_sp_seed.config
+        self.assertFalse(dense_sp_config[FLASH_SOFTMAX_DISC_KEY])
+        self.assertFalse(dense_sp_config[FLASH_SPLIT_P_ARRIVE_KEY])
+        self.assertEqual(dense_sp_config[FLASH_P_STORE_REP_KEY], 32)
+        self.assertEqual(dense_sp_config[FLASH_S_LOAD_REP_KEY], 32)
+        self.assertTrue(dense_sp_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+        self.assertEqual(dense_sp_config[FLASH_FIRST_LOAD_ORDER_KEY], 1)
+        self.assertEqual(dense_sp_config[FLASH_KV_ORDER_KEY], "descending")
+        self.assertEqual(dense_sp_config[FLASH_CORR_REGS_KEY], 80)
+        self.assertEqual(dense_sp_config[FLASH_OTHER_REGS_KEY], 32)
+        self.assertFalse(dense_sp_config[FLASH_CGA2_LOCAL_KEY])
+        self.assertTrue(dense_sp_config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertTrue(dense_sp_config[FLASH_TENSOR_4D_TMA_KEY])
+        dense_sp_512_seed = flash_attention_seed_config(
+            64,
+            512,
+            seed_kind="dense_sp",
+        )
+        assert dense_sp_512_seed is not None
+        dense_sp_512_config = dense_sp_512_seed.config
+        self.assertFalse(dense_sp_512_config[FLASH_EPI_TMA_KEY])
+        self.assertTrue(dense_sp_512_config[FLASH_EPI_STG_KEY])
+        dense_sp_2048_seed = flash_attention_seed_config(
+            64,
+            2048,
+            seed_kind="dense_sp",
+        )
+        assert dense_sp_2048_seed is not None
+        dense_sp_2048_config = dense_sp_2048_seed.config
+        self.assertEqual(dense_sp_2048_config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+        self.assertEqual(dense_sp_2048_config[FLASH_SOFTMAX_REGS_KEY], 200)
+        self.assertIsNone(flash_attention_seed_config(64, 128, seed_kind="dense_sp"))
 
         short_seed = flash_attention_seed_config(64, 8)
         assert short_seed is not None
@@ -1574,13 +1877,21 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(dense_2048_seed.config[FLASH_S_STAGE_KEY], 2)
         self.assertEqual(dense_2048_seed.config[FLASH_KV_STAGE_KEY], 3)
         self.assertTrue(dense_2048_seed.config[FLASH_PERSISTENT_KEY])
+        self.assertEqual(dense_2048_seed.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
+        self.assertEqual(dense_2048_seed.config[FLASH_KV_ORDER_KEY], "ascending")
         self.assertEqual(dense_2048_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
         self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET_KEY], 2)
         self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
         self.assertEqual(dense_2048_seed.config[FLASH_DISC_PIPE_KEY], 4)
+        self.assertEqual(dense_2048_seed.config[FLASH_OTHER_REGS_KEY], 48)
         self.assertTrue(dense_2048_seed.config[FLASH_EPI_TMA_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_EPI_STG_KEY])
+        self.assertEqual(dense_2048_seed.config[FLASH_CORR_TILE_SIZE_KEY], 16)
         self.assertEqual(dense_2048_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
         self.assertFalse(dense_2048_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_CLC_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_TENSOR_4D_TMA_KEY])
         self.assertIn(
             dense_2048_seed, dense_2048_bound.config_spec.compiler_seed_configs
         )
@@ -1599,12 +1910,20 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET_KEY], 2)
         self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
         self.assertEqual(dense_8192_seed.config[FLASH_DISC_PIPE_KEY], 3)
+        self.assertEqual(dense_8192_seed.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
+        self.assertEqual(dense_8192_seed.config[FLASH_KV_ORDER_KEY], "ascending")
         self.assertEqual(dense_8192_seed.config[FLASH_SOFTMAX_REGS_KEY], 184)
-        self.assertNotIn(FLASH_CORR_REGS_KEY, dense_8192_seed.config)
+        self.assertEqual(dense_8192_seed.config[FLASH_OTHER_REGS_KEY], 48)
+        self.assertEqual(dense_8192_seed.config[FLASH_CORR_REGS_KEY], 64)
         self.assertTrue(dense_8192_seed.config[FLASH_EPI_TMA_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_EPI_STG_KEY])
+        self.assertEqual(dense_8192_seed.config[FLASH_CORR_TILE_SIZE_KEY], 16)
         self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
         self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
         self.assertTrue(dense_8192_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_CLC_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_TENSOR_4D_TMA_KEY])
         self.assertNotIn(FLASH_CAUSAL_LPT_SWIZZLE_KEY, dense_8192_seed.config)
         dense_8192_gen = ConfigGeneration(dense_8192_bound.config_spec)
         dense_8192_roundtrip = dense_8192_gen.unflatten(
@@ -1617,6 +1936,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(
             dense_8192_roundtrip.config[FLASH_CORR_REGS_KEY],
             64,
+        )
+        self.assertEqual(
+            dense_8192_roundtrip.config[FLASH_OTHER_REGS_KEY],
+            48,
         )
 
         causal_hd64_bound = causal_flash_attn.bind(fp16_args)
