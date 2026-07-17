@@ -21,12 +21,15 @@ class HelionPallasPrinter(HelionTritonPrinter):
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
         # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} // {self._print(rhs)})"
+        return f"(({self._print(lhs)}) // ({self._print(rhs)}))"
 
     def _print_PythonMod(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
+        # Paren both operands to override Python precedence — ``%`` binds
+        # tighter than ``+``/``-`` so ``(a + b) % c`` would otherwise
+        # print as ``a + b % c``.
         # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} % {self._print(rhs)})"
+        return f"(({self._print(lhs)}) % ({self._print(rhs)}))"
 
 
 def pallas_texpr(expr: sympy.Expr) -> str:
