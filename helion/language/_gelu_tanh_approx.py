@@ -34,20 +34,12 @@ code today).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from typing import Callable
 
 import torch
 
 from .. import exc
-from .._compiler.ast_extension import expr_from_string
 from . import _decorators
-
-if TYPE_CHECKING:
-    import ast
-
-    from .._compiler.inductor_lowering import CodegenState
-
 
 # Tanh-approximation GELU constants. Spelled out as ``float`` literals
 # rather than ``math.sqrt(2.0 / math.pi)`` at import time so the
@@ -142,25 +134,6 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
 
-@_decorators.codegen(_gelu_tanh_approx, "cute")
-def _(state: CodegenState) -> ast.AST:
-    # Same lift-to-single-local rationale as the triton path: see the
-    # module docstring and :class:`Tcgen05UnaryEpilogueChain`
-    # (``cute_epilogue.py``).
-    input_ast = state.codegen.lift(
-        state.ast_arg(0), dce=True, prefix="gelu_tanh_approx_in"
-    )
-    return expr_from_string(epilogue_unary_step_template().format(inner=input_ast.id))
-
-
-@_decorators.codegen(_gelu_erf, "cute")
-def _(state: CodegenState) -> ast.AST:
-    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
-    return expr_from_string(
-        gelu_erf_epilogue_unary_step_template().format(inner=input_ast.id)
-    )
-
-
 @_decorators.ref(_gelu_tanh_approx)
 def _(x: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.gelu(x, approximate="tanh")
@@ -218,5 +191,6 @@ def install_gelu_decomp(
 # helion/_compiler/<backend>/.  Import them here (at module import time) so the
 # @_decorators.codegen(op, "<backend>") registrations run with the same eager
 # timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.cute.gelu_tanh_approx  # noqa: E402, F401
 import helion._compiler.pallas.gelu_tanh_approx  # noqa: E402, F401
 import helion._compiler.triton.gelu_tanh_approx  # noqa: E402, F401

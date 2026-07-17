@@ -7374,7 +7374,7 @@ class TestCuteLowerings(unittest.TestCase):
         # would fire, and no ``BackendUnsupported`` would surface;
         # the test would pass for the wrong reason.
         from helion._compiler.cute import cute_epilogue
-        from helion.language import memory_ops
+        from helion._compiler.cute import memory_ops
 
         seen_fx_kwargs: list[dict[str, object]] = []
         original = cute_epilogue.analyze_tcgen05_unary_epilogue_chain
@@ -11540,15 +11540,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11601,15 +11601,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
             self.assertRaisesRegex(exc.BackendUnsupported, "hl.dot"),
@@ -11658,15 +11658,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
             self.assertRaisesRegex(
@@ -11720,15 +11720,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11788,15 +11788,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=16,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11862,11 +11862,11 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
