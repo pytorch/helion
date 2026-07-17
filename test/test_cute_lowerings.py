@@ -29,9 +29,7 @@ from helion._compiler.aten_lowering import _triton_argreduce
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
-from helion._compiler.backend import _detect_mma_loop
 from helion._compiler.backend import _loop_contains_matmul
-from helion._compiler.backend import _loop_may_use_mma
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
 from helion._compiler.cute.aten_lowering import codegen_baddbmm_cute
@@ -41,6 +39,8 @@ from helion._compiler.cute.aten_lowering import codegen_squeeze_cute
 from helion._compiler.cute.aten_lowering import codegen_stack_cute
 from helion._compiler.cute.aten_lowering import codegen_unsqueeze_cute
 from helion._compiler.cute.aten_lowering import codegen_view_cute
+from helion._compiler.cute.backend import _detect_mma_loop
+from helion._compiler.cute.backend import _loop_may_use_mma
 from helion._compiler.cute.cute_mma import _TCGEN05_CLUSTER_LEADER_PREDICATE
 from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
@@ -12467,13 +12467,15 @@ class TestCuteLowerings(unittest.TestCase):
                     device_ir=SimpleNamespace(grid_block_ids=[[2]])
                 ),
             ),
-            patch("helion._compiler.backend._loop_contains_matmul", return_value=True),
             patch(
-                "helion._compiler.backend._detect_mma_loop",
+                "helion._compiler.cute.backend._loop_contains_matmul", return_value=True
+            ),
+            patch(
+                "helion._compiler.cute.backend._detect_mma_loop",
                 return_value=True,
             ) as detect_mma_loop,
             patch(
-                "helion._compiler.backend._detect_specialized_mma_loop",
+                "helion._compiler.cute.backend._detect_specialized_mma_loop",
                 return_value=True,
             ),
         ):

@@ -615,8 +615,8 @@ class TestPallas(TestCase):
     def test_slice_addressing_classification(self) -> None:
         """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
         -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
-        from helion._compiler.backend import SliceAddressing as SA
-        from helion._compiler.backend import _slice_addressing as classify
+        from helion._compiler.pallas.backend import SliceAddressing as SA
+        from helion._compiler.pallas.backend import _slice_addressing as classify
 
         f32_2d = torch.empty(16, 128, dtype=torch.float32)
         bf16_2d = torch.empty(16, 128, dtype=torch.bfloat16)
