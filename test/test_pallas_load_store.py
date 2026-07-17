@@ -557,8 +557,6 @@ class TestPallasPartialSlice(TestCase):
 class TestPallasVmemScalarLoad(TestCase):
     """Loads with a runtime scalar index on a VMEM tensor's minor dims."""
 
-    # Mosaic rejects x[i, cols - 1] with runtime i when cols > 128; the
-    # sublane-load form compiles at any width.
     @parametrize("cols", [64, 256])
     @parametrize("dtype", [torch.float32, torch.int32])
     def test_runtime_row_index(self, dtype: torch.dtype, cols: int) -> None:
