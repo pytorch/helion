@@ -99,6 +99,28 @@ jobs:
           python -c "import torch; assert torch.cuda.is_available(), 'FATAL: CUDA not available'; print(torch.cuda.get_device_name(0))"
 
       - name: Check vLLM Helion kernels compile + are correct (all configs/shapes)
+        # check_vllm_helion_correctness.py reuses check_kernel_correctness from
+        # vLLM's scripts/benchmark_helion_kernels.py -- but scripts/ is NOT part
+        # of the installed wheel (pyproject packages only "vllm*"). Fetch just
+        # that module NEXT TO the check script: Python puts the script's own
+        # directory on sys.path[0], so the import resolves with no PYTHONPATH.
+        # Fetch + run live in one step (set -e) so a failed download fails loud
+        # instead of a later confusing ModuleNotFoundError.
+        #
+        # TODO(shangdiy): check_kernel_correctness is not merged into vLLM yet
+        # (vllm-project/vllm#48968), so the nightly wheel doesn't ship it. Until
+        # that lands, fetch the module from the PR branch below. AFTER #48968
+        # merges, switch to fetching from the real repo at the commit matching
+        # the installed wheel (embedded in vllm.__version__ as "+g<sha>"):
+        #   VLLM_SHA=$(python -c "import re, vllm; m = re.search(r'\+g([0-9a-f]+)', vllm.__version__); print(m.group(1) if m else 'main')")
+        #   curl -fsSL "https://raw.githubusercontent.com/vllm-project/vllm/${VLLM_SHA}/scripts/benchmark_helion_kernels.py" -o ...
         run: |
+          set -euo pipefail
           source .venv/bin/activate
+          curl -fsSL \
+            "https://raw.githubusercontent.com/yushangdi/vllm/add-helion-benchmark-correctness/scripts/benchmark_helion_kernels.py" \
+            -o .github/scripts/benchmark_helion_kernels.py
+          grep -q "def check_kernel_correctness" .github/scripts/benchmark_helion_kernels.py \
+            || { echo "FATAL: fetched benchmark_helion_kernels.py lacks check_kernel_correctness"; exit 1; }
+          echo "Fetched benchmark_helion_kernels.py from PR #48968 branch (yushangdi:add-helion-benchmark-correctness)"
           python .github/scripts/check_vllm_helion_correctness.py
