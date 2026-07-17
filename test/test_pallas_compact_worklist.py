@@ -17,6 +17,7 @@ import types
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -31,11 +32,20 @@ from helion._compiler.pallas.compact_worklist import metadata_arg_names
 from helion._compiler.pallas.compact_worklist import render_build_worklist
 from helion._compiler.pallas.compact_worklist import resolve_for_worklist
 from helion._testing import DEVICE
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
 import helion.language as hl
+from helion.runtime.settings import is_pallas_interpret
+
+if _get_backend() == "pallas" and is_pallas_interpret():
+    pytest.skip(
+        "compact worklist is TPU-only: JAX interpret mode does not support "
+        "pl.Element block specs",
+        allow_module_level=True,
+    )
 
 try:
     import jax  # noqa: F401

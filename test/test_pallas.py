@@ -4262,6 +4262,11 @@ class TestPallas(TestCase):
         self.assertNotIn(torch.ops.aten.view.default, _RELAYOUT_TARGETS)
         self.assertNotIn(torch.ops.aten.reshape.default, _RELAYOUT_TARGETS)
 
+    @skipIfPallasInterpret(
+        "JAX interpret mode does not support pl.Element block specs "
+        "(compact_worklist subtest); a failed interpret launch poisons "
+        "later tests, so skip rather than xfail"
+    )
     def test_transpose_dot_defers_pallas_load_mask(self) -> None:
         """A masked load consumed via ``transpose`` -> dot defers its mask to the
         consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
