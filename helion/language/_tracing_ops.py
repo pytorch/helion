@@ -383,36 +383,6 @@ def _(tensor: torch.Tensor, other: float) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
-@_decorators.codegen(_mask_to, "metal")
-def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    assert isinstance(tensor, torch.Tensor)
-    other = state.proxy_arg(1)
-    assert isinstance(other, (int, float, bool))
-    mask_exprs: list[str] = []
-    input_sizes = [*tensor.size()]
-    for size in input_sizes:
-        if (
-            index := CompileEnvironment.current().resolve_block_id(size)
-        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
-            if mask_var not in mask_exprs:
-                mask_exprs.append(mask_var)
-    if not mask_exprs:
-        return state.ast_arg(0)
-    mask_expr = " and ".join(mask_exprs)
-    input_dtype = tensor.dtype
-    other_typed = CompileEnvironment.current().backend.cast_ast(
-        expr_from_string(constant_repr(other)),
-        input_dtype,
-    )
-    return expr_from_string(
-        "({expr} if {mask} else {other})",
-        expr=state.ast_arg(0),
-        mask=expr_from_string(mask_expr),
-        other=other_typed,
-    )
-
-
 @_decorators.get_masked_value(_mask_to)
 def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]
@@ -473,5 +443,6 @@ def _(node: torch.fx.Node) -> float | bool | None:
 # @_decorators.codegen(op, "<backend>") registrations run with the same eager
 # timing as when the bodies lived in this file -- no behavior change.
 import helion._compiler.cute.tracing_ops  # noqa: E402, F401
+import helion._compiler.metal.tracing_ops  # noqa: E402, F401
 import helion._compiler.pallas.tracing_ops  # noqa: E402, F401
 import helion._compiler.triton.tracing_ops  # noqa: E402, F401
