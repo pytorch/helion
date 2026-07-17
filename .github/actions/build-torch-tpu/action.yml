@@ -16,7 +16,7 @@ runs:
           --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
           --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
           --pre \
-          'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
+          'jax==0.10.2' 'jaxlib==0.10.2' 'libtpu==0.0.43' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
         # Install Bazel
         if ! command -v bazel &> /dev/null; then
           sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -54,8 +54,6 @@ runs:
           --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
           --action_env=JAX_PLATFORMS=cpu
         uv pip install bazel-bin/ci/wheel/*.whl
-        # libtpu 0.0.44 is broken (segfaults in jax.profiler.start_trace).
-        uv pip install libtpu==0.0.43
         cd -
         rm -rf /tmp/torch_tpu
         # Verify
