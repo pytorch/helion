@@ -240,34 +240,6 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
-@_decorators.codegen(_gelu_tanh_approx, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    # Pallas does not have a ``cute.math.tanh`` analog wired through
-    # Helion today; raise a structured ``BackendUnsupported`` so the
-    # diagnostic is actionable rather than failing at codegen lookup
-    # with a missing-implementation error. Users can spell
-    # ``jax.nn.gelu(x, approximate=True)`` directly when targeting
-    # Pallas.
-    raise exc.BackendUnsupported(
-        "pallas",
-        "F.gelu(x, approximate='tanh') (cute and triton only)",
-    )
-
-
-@_decorators.codegen(_gelu_erf, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    # ``jax.nn.gelu(x, approximate=False)`` lowers via ``lax.erfc`` which is
-    # unimplemented in Pallas TPU's Mosaic lowering. Render the equivalent
-    # ``erf``-based formula directly so the chain only references the
-    # TPU-supported ``lax.erf`` primitive.
-    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
-    expr = (
-        f"(0.5 * ({input_ast.id}) * "
-        f"(1.0 + lax.erf(({input_ast.id}) * {GELU_ERF_INV_SQRT2!r})))"
-    )
-    return expr_from_string(expr)
-
-
 @_decorators.ref(_gelu_tanh_approx)
 def _(x: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.gelu(x, approximate="tanh")
@@ -318,3 +290,11 @@ def install_gelu_decomp(
         return original_decomp(x, approximate=approximate)
 
     decomp_table[torch.ops.aten.gelu.default] = _gelu_decomp
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.pallas.gelu_tanh_approx  # noqa: E402, F401

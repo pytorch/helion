@@ -61,7 +61,6 @@ from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
-from .._compiler.pallas import codegen as pallas_codegen
 from .._compiler.utils import compute_slice_size
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
@@ -334,50 +333,6 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     if expr is None:
         return None
     return HostFunction.current().expr_to_origin.get(expr)
-
-
-@_decorators.codegen(store, "pallas")
-def _(state: CodegenState) -> None:
-    tensor = state.proxy_arg(0)
-    subscript = state.proxy_arg(1)
-    assert isinstance(subscript, (list, tuple))
-    value = state.ast_arg(2)
-    assert isinstance(tensor, torch.Tensor)
-    name = state.device_function.tensor_arg(tensor).name
-    name = pallas_codegen.vmem_name(state, name)
-    # Increment memory op index to stay in sync with triton backend
-    device_fn = state.device_function
-    device_fn.device_store_index += 1
-    device_fn.device_memory_op_index += 1
-    parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
-    value = pallas_codegen.sliced_value_for_store(
-        state, tensor, subscript, parts, value
-    )
-    idx_str = ", ".join(parts)
-    patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
-    from .._compiler.pallas.gather import emit_scatter_store
-    from .._compiler.pallas.plan_tiling import IndirectScatterPattern
-
-    scatter_patterns = [
-        pattern
-        for pattern in patterns or ()
-        if isinstance(pattern, IndirectScatterPattern)
-    ]
-    assert len(scatter_patterns) <= 1, (
-        "Pallas store expected at most one indirect scatter pattern"
-    )
-    if scatter_patterns:
-        value = emit_scatter_store(
-            state, scatter_patterns[0].plan, name, idx_str, value
-        )
-    from .._compiler.pallas.ordered_carry import emit_carry_store
-
-    if not scatter_patterns and state.device_function.carry_tiles:
-        if emit_carry_store(state, tensor, subscript, name, idx_str, value):
-            return
-    state.codegen.add_statement(
-        statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
-    )
 
 
 def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:
@@ -6814,20 +6769,6 @@ def _(state: CodegenState) -> ast.AST:
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
-@_decorators.codegen(load, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    subscript = state.proxy_arg(1)
-    assert isinstance(tensor, torch.Tensor)
-    assert isinstance(subscript, (list, tuple))
-
-    tile_index_result = _maybe_materialize_tile_index_load(state, tensor, subscript)
-    if tile_index_result is not None:
-        return tile_index_result
-
-    return pallas_codegen.load_expr(state, list(subscript), tensor)
-
-
 @_decorators.codegen(load, "metal")
 def _(state: CodegenState) -> ast.AST:
     # Metal delegates to the same PointerIndexingStrategy as Triton.
@@ -7213,3 +7154,11 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.pallas.memory_ops  # noqa: E402, F401
