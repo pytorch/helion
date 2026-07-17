@@ -155,15 +155,6 @@ def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-@_decorators.codegen(split, "triton")
-def _(state: CodegenState) -> list[ast.AST]:
-    split_call = expr_from_string("tl.split({tensor})", tensor=state.ast_arg(0))
-    return [
-        expr_from_string("{value}[0]", value=split_call),
-        expr_from_string("{value}[1]", value=split_call),
-    ]
-
-
 @_decorators.codegen(split, "cute")
 def _(state: CodegenState) -> list[ast.AST]:
     from .._compiler.ast_extension import statement_from_string
@@ -280,15 +271,6 @@ def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
     return tensor0.new_empty([*broadcast_shape, 2])
 
 
-@_decorators.codegen(join, "triton")
-def _(state: CodegenState) -> ast.AST:
-    return expr_from_string(
-        "tl.join({tensor0}, {tensor1})",
-        tensor0=state.ast_arg(0),
-        tensor1=state.ast_arg(1),
-    )
-
-
 @_decorators.codegen(join, "cute")
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.cute.cute_reshape import _get_dim_local_coord
@@ -314,3 +296,11 @@ def _(state: CodegenState) -> ast.AST:
 def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
     left, right = torch.broadcast_tensors(tensor0, tensor1)
     return torch.stack((left, right), dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.triton.view_ops  # noqa: E402, F401
