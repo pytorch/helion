@@ -117,7 +117,7 @@ jobs:
             ~/.venv
           key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
-      # TPU installs its (pinned) torch via the install-tpu-torch composite
+      # TPU installs its (pinned) torch via the install-pytorch-for-torchtpu composite
       # action below; every other runtime installs torch here.
       - name: Install PyTorch
         if: ${{ matrix.alias != 'tpu' }}
@@ -139,7 +139,7 @@ jobs:
 
       - name: Install PyTorch (CPU nightly, pinned for TorchTPU)
         if: ${{ matrix.alias == 'tpu' }}
-        uses: ./.github/actions/install-tpu-torch
+        uses: ./.github/actions/install-pytorch-for-torchtpu
 
       - name: Configure XPU runtime library path
         if: matrix.alias == 'xpu'

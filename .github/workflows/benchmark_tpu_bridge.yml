@@ -57,7 +57,7 @@ jobs:
         run: uv venv --python 3.12
 
       - name: Install PyTorch (CPU nightly, pinned for TorchTPU)
-        uses: ./.github/actions/install-tpu-torch
+        uses: ./.github/actions/install-pytorch-for-torchtpu
 
       - name: Install Helion
         run: |

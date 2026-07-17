@@ -3,7 +3,7 @@ description: >
   Install jax/libtpu, build the torch_tpu wheel from the pinned commit
   (.github/ci_commit_pins/torch_tpu.txt), install it, and verify torch.tpu is
   available. Assumes a uv-managed .venv with the pinned PyTorch already
-  installed (see the install-tpu-torch action).
+  installed (see the install-pytorch-for-torchtpu action).
 runs:
   using: composite
   steps:
