@@ -66,12 +66,3 @@ def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
 @_decorators.ref(device_print)
 def _(prefix: str, *values: object) -> None:
     print(prefix, *values)
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.device_print  # noqa: E402, F401
-import helion._compiler.triton.device_print  # noqa: E402, F401

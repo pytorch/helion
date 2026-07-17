@@ -27,12 +27,3 @@ def _(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         torch.empty(value.shape, dtype=torch.float32, device=value.device),
         torch.empty(value.shape, dtype=torch.float32, device=value.device),
     )
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.quantized_ops  # noqa: E402, F401
-import helion._compiler.triton.quantized_ops  # noqa: E402, F401
