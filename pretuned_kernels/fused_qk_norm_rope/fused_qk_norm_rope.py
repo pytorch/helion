@@ -30,6 +30,17 @@ try:
     _HAS_VLLM = hasattr(_vllm_ir.ops, "rms_norm") and hasattr(
         _VllmRotaryEmbedding, "forward_static"
     )
+    if _HAS_VLLM:
+        # Match vLLM's CUDA eager default (see cuda.py get_default_ir_op_priority)
+        # so the baseline dispatches rms_norm to the compiled vllm_c kernel
+        # instead of the pure-PyTorch "native" fallback -- otherwise the vLLM
+        # baseline is artificially slow (and logs a "Priority not set" warning).
+        # import_ir_kernels() registers the platform's impls (e.g. vllm_c) that
+        # set_default requires; it's lazily imported, like vLLM's own KernelConfig.
+        from vllm.platforms import current_platform
+
+        current_platform.import_ir_kernels()
+        _vllm_ir.ops.rms_norm.set_default(["vllm_c", "native"])
 except ImportError:
     _HAS_VLLM = False
 
@@ -297,16 +308,24 @@ def _make_inputs(
     )
 
 
+def _bench_shapes() -> list[tuple[int, int, int]]:
+    """The (num_tokens, q_heads, kv_heads) shapes main() benchmarks."""
+    num_tokens_list = [1, 8, 32, 128, 512, 2048, 8192]
+    num_heads_pair = [(16, 8), (32, 8), (64, 8)]
+    return [(t, qh, kvh) for (qh, kvh) in num_heads_pair for t in num_tokens_list]
+
+
 def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
-    args = _make_inputs(16, 16, 8)
-    qkv = args[0]
-    qkv_helion = qkv.clone()
-    qkv_torch = qkv.clone()
-    fused_qk_norm_rope(qkv_helion, *args[1:])
-    _fused_qk_norm_rope_torch(qkv_torch, *args[1:])
-    torch.testing.assert_close(qkv_helion, qkv_torch, rtol=2e-2, atol=2e-2)
+    for num_tokens, q_heads, kv_heads in _bench_shapes():
+        args = _make_inputs(num_tokens, q_heads, kv_heads)
+        qkv = args[0]
+        qkv_helion = qkv.clone()
+        qkv_torch = qkv.clone()
+        fused_qk_norm_rope(qkv_helion, *args[1:])
+        _fused_qk_norm_rope_torch(qkv_torch, *args[1:])
+        torch.testing.assert_close(qkv_helion, qkv_torch, rtol=2e-2, atol=2e-2)
 
 
 def main(verbose: bool = True) -> dict:
@@ -316,9 +335,7 @@ def main(verbose: bool = True) -> dict:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _bench import run_sweep
 
-    num_tokens_list = [1, 8, 32, 128, 512, 2048, 8192]
-    num_heads_pair = [(16, 8), (32, 8), (64, 8)]
-    shapes = [(t, qh, kvh) for (qh, kvh) in num_heads_pair for t in num_tokens_list]
+    shapes = _bench_shapes()
     baselines = _baselines()
 
     def make_calls(shape: tuple) -> tuple:
@@ -352,4 +369,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()
