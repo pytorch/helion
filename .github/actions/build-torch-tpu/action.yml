@@ -24,7 +24,10 @@ runs:
         fi
         # Install gcloud CLI if not present (needed for Secret Manager)
         if ! command -v gcloud &> /dev/null; then
-          sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+          sudo apt-get install -y apt-transport-https ca-certificates curl
+          # On the TPU runners `gnupg` is a transitional package with no install
+          # candidate; `gpg` is the real one. Try gpg first, fall back to gnupg.
+          sudo apt-get install -y gpg || sudo apt-get install -y gnupg
           curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
           sudo apt-get update && sudo apt-get install -y google-cloud-cli
