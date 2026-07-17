@@ -422,7 +422,6 @@ class TestPallasJaggedCarryRejects(TestCase):
                 pallas_loop_type="emit_pipeline",
             )
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     def test_non_jagged_emit_pipeline_unaffected(self) -> None:
         # Static (compile-time) tile bounds never trip the gate: a plain
         # emit_pipeline matmul still lowers and runs correctly.
