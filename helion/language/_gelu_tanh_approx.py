@@ -184,13 +184,3 @@ def install_gelu_decomp(
         return original_decomp(x, approximate=approximate)
 
     decomp_table[torch.ops.aten.gelu.default] = _gelu_decomp
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.gelu_tanh_approx  # noqa: E402, F401
-import helion._compiler.pallas.gelu_tanh_approx  # noqa: E402, F401
-import helion._compiler.triton.gelu_tanh_approx  # noqa: E402, F401

@@ -191,12 +191,3 @@ def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
 def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
     left, right = torch.broadcast_tensors(tensor0, tensor1)
     return torch.stack((left, right), dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.view_ops  # noqa: E402, F401
-import helion._compiler.triton.view_ops  # noqa: E402, F401

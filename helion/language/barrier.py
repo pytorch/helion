@@ -47,12 +47,3 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
 def _() -> None:
     # No-op in ref/interpret mode
     return None
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.barrier  # noqa: E402, F401
-import helion._compiler.triton.barrier  # noqa: E402, F401

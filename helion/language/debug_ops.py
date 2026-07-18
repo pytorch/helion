@@ -49,11 +49,3 @@ def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
 @_decorators.ref(breakpoint)
 def _() -> None:
     builtins.breakpoint()
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.triton.debug_ops  # noqa: E402, F401
