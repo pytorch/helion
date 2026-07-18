@@ -187,7 +187,7 @@ class Backend(abc.ABC):
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         """Render a SymPy expression for this backend's device code."""
-        from .device_function import texpr
+        from .triton.printer import texpr
 
         return texpr(expr)
 
