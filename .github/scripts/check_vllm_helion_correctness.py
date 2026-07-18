@@ -161,7 +161,10 @@ def main() -> int:
                 print(f"  XFAIL {tag}  [{xfail_reason}]")
             else:
                 where = "correctness" if is_numerics else "compile/run"
-                failures.append((name, f"{where} {tag}", error.splitlines()[0]))
+                # Keep the full error (magnitudes/ULP counts live on later lines
+                # of the assert_close message) so a mismatch can be triaged as
+                # tolerance noise vs a real regression from the CI log alone.
+                failures.append((name, f"{where} {tag}", error))
 
     print(f"\nChecked {n_cases} (kernel, shape) cases across {len(kernels)} kernels.")
     for name, why in skipped:
