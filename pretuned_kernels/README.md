@@ -24,6 +24,7 @@ pretuned_kernels/
 │   ├── _helion_aot_vector_add_cuda_sm100.py   # B200 heuristic
 │   └── _helion_aot_vector_add_cuda_sm90.py    # H100 heuristic
 ├── softmax/
+├── attention/                        # B200 CuTe (tcgen05) non-causal flash attention
 ├── layer_norm/
 ├── rms_norm/
 ├── cross_entropy/
@@ -46,6 +47,7 @@ At runtime Helion picks the file matching the current GPU.
 |---|---|---|
 | `vector_add` | `2**i for i in range(19, 29)` | `x + y` |
 | `softmax` | Triton tutorial `M=4096, N=128*i for i in range(2, 100)` + realistic long-context shapes | `F.softmax` |
+| `attention` | Non-causal dense `(z, h, seq, head_dim)` shapes from the CuTe attention harness (B200 CuTe tcgen05 flash backend only; CUDA-graph timed) | `F.scaled_dot_product_attention` |
 | `layer_norm` | Triton tutorial `M=4096, N=512*i for i in range(2, 32)` + realistic hidden-size shapes | `F.layer_norm` |
 | `rms_norm` | TritonBench `(M=2048, H)` default + NPOT shapes + realistic LLM hidden-size and production-style shapes | `F.rms_norm` |
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
@@ -106,7 +108,7 @@ runtime based on the running GPU's compute capability (with fallback to
 older compatible capabilities, e.g. `sm120` → `sm100`).
 
 For a kernel whose `main()` benchmarks under CUDA graphs (`use_cudagraph()`
-returns `True`, e.g. `scaled_mm` and the vLLM-ported ops), set
+returns `True`, e.g. `scaled_mm`, `attention`, and the vLLM-ported ops), set
 `HELION_BENCHMARK_CUDAGRAPH=1` for the autotune run so the autotuner benchmarks
 candidate configs the same way — matching the deployment/benchmark timing
 regime.

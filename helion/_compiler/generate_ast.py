@@ -145,6 +145,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # the resolved per-thread coordinate expression so a load and store over
         # the same arange share one lane loop.
         self.cute_synthetic_arange_lane_exprs: dict[tuple[object, ...], str] = {}
+        self._attention_flash_emitted = False
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
@@ -314,6 +315,43 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             if isinstance(ti, (TensorType, StackTensorType)):
                 out.add(name)
         return out
+
+    def _clear_attention_flash_state(self) -> None:
+        cute_state = self.device_function.cute_state
+        cute_state.attention_flash_block_ids = None
+        cute_state.attention_flash_score_plan = None
+        cute_state.attention_flash_threads = 128
+
+    def _try_codegen_attention_flash_root(self, root_graph_info: GraphInfo) -> bool:
+        cute_state = self.device_function.cute_state
+        flash_block_ids = cute_state.attention_flash_block_ids
+        if flash_block_ids is None:
+            return False
+
+        from ..language._tracing_ops import is_for_loop_target
+        from .cute.cute_flash import codegen_attention_flash
+        from .cute.cute_flash import prepare_flash_attention_tensor_args
+        from .device_ir import ForLoopGraphInfo
+
+        for node in root_graph_info.graph.nodes:
+            if node.op != "call_function" or not is_for_loop_target(node.target):
+                continue
+            graph_id = node.args[0] if node.args else None
+            if not isinstance(graph_id, int):
+                continue
+            graph_info = self.get_graph(graph_id)
+            if not isinstance(graph_info, ForLoopGraphInfo):
+                continue
+            if graph_info.block_ids != flash_block_ids:
+                continue
+            if prepare_flash_attention_tensor_args(
+                self.device_function
+            ) and codegen_attention_flash(self):
+                self._attention_flash_emitted = True
+                return True
+            self._clear_attention_flash_state()
+            return False
+        return False
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
@@ -1062,27 +1100,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                         codegen_fn(state)
                     root = root_graph_info.graph
-                    grid_state = self.current_grid_state
-                    if isinstance(grid_state, DeviceGridState):
-                        # Codegen the body first so synthetic free-``hl.arange``
-                        # lane loops registered *during* body lowering (CuTe
-                        # over-budget chunking) are visible to the wrap below.
-                        wrapped_body: list[ast.AST] = []
-                        with self.set_statements(wrapped_body):
-                            codegen_call_with_graph(self, root, [])
-                        if grid_state.has_lane_loops():
-                            self.statements_stack[-1].extend(grid_state.outer_prefix)
-                            if self.device_function.cute_state.consume_root_lane_loop_suppression():
-                                self.statements_stack[-1].extend(wrapped_body)
-                            else:
+                    if not self._try_codegen_attention_flash_root(root_graph_info):
+                        grid_state = self.current_grid_state
+                        if isinstance(grid_state, DeviceGridState):
+                            # Codegen the body first so synthetic free-``hl.arange``
+                            # lane loops registered *during* body lowering (CuTe
+                            # over-budget chunking) are visible to the wrap below.
+                            wrapped_body: list[ast.AST] = []
+                            with self.set_statements(wrapped_body):
+                                codegen_call_with_graph(self, root, [])
+                            if grid_state.has_lane_loops():
                                 self.statements_stack[-1].extend(
-                                    grid_state.wrap_body(wrapped_body)
+                                    grid_state.outer_prefix
                                 )
-                            self.statements_stack[-1].extend(grid_state.outer_suffix)
+                                if self.device_function.cute_state.consume_root_lane_loop_suppression():
+                                    self.statements_stack[-1].extend(wrapped_body)
+                                else:
+                                    self.statements_stack[-1].extend(
+                                        grid_state.wrap_body(wrapped_body)
+                                    )
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
+                            else:
+                                self.statements_stack[-1].extend(wrapped_body)
                         else:
-                            self.statements_stack[-1].extend(wrapped_body)
-                    else:
-                        codegen_call_with_graph(self, root, [])
+                            codegen_call_with_graph(self, root, [])
                 finally:
                     self.current_root_graph_info = previous_root_graph_info
 
@@ -1130,23 +1173,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function.body = self.device_function.cute_state.move_tcgen05_post_loop_stmts_to_end(
                             list(self.device_function.body)
                         )
-                # Fused tcgen05 flash-attention (HELION_CUTE_FLASH): the
-                # detector set ``attention_flash_block_ids``; replace the
-                # FX-derived scalar body with the dedicated tensor-core flash
-                # kernel that mirrors ``.notes/spikes/fa_tcgen05_spike.py``.
                 if (
                     self.device_function.cute_state.attention_flash_block_ids
                     is not None
+                    and not self._attention_flash_emitted
                 ):
-                    from .cute.cute_flash import codegen_attention_flash
-
-                    if not codegen_attention_flash(self):
-                        # Codegen declined a config the detector could not fully
-                        # vet before the device-function arguments were populated
-                        # (e.g. non-contiguous operands). Clear the flash state so
-                        # the launch override does not force block=(N,1,1) onto
-                        # the scalar fallback body that stays in df.body.
-                        self.device_function.cute_state.attention_flash_block_ids = None
+                    self._clear_attention_flash_state()
                 # Mark extra params as placeholder args — they appear only in
                 # placeholder strings, not in the AST body, so DCE would
                 # otherwise remove them.
