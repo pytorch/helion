@@ -117,6 +117,54 @@ def jagged_layer_norm_kernel(
     return out.reshape(total_L, M)
 
 
+@helion.kernel(
+    backend="pallas",
+    config=helion.Config(
+        block_sizes=[8, 16, 8, 16, 8, 16], pallas_loop_type="emit_pipeline"
+    ),
+)
+def jagged_layer_norm_kernel_pallas(
+    x_values: torch.Tensor,
+    x_offsets: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Pallas/TPU variant of :func:`jagged_layer_norm_kernel`.
+
+    Norms jointly over the jagged rows and features via ``hl.tile(s, e)``. The
+    joint reduce is split into two single-axis reductions so it lowers on TPU.
+    """
+    M = x_values.size(1)
+    num_rows = x_offsets.size(0) - 1
+    out = torch.empty_like(x_values)
+
+    for g in hl.grid(num_rows):
+        s = x_offsets[g]
+        e = x_offsets[g + 1]
+        count = ((e - s) * M).to(torch.float32)
+
+        sum_acc = hl.zeros([1], dtype=torch.float32)
+        for tile_m in hl.tile(M):
+            for st in hl.tile(s, e):
+                part = x_values[st, tile_m].to(torch.float32).sum(dim=0)
+                sum_acc = sum_acc + part.sum(dim=0)
+        mean = sum_acc / count
+
+        var_acc = hl.zeros([1], dtype=torch.float32)
+        for tile_m in hl.tile(M):
+            for st in hl.tile(s, e):
+                centered = x_values[st, tile_m].to(torch.float32) - mean
+                part = (centered * centered).sum(dim=0)
+                var_acc = var_acc + part.sum(dim=0)
+        rstd = torch.rsqrt(var_acc / count + eps)
+
+        for tile_m in hl.tile(M):
+            for st in hl.tile(s, e):
+                normalized = (x_values[st, tile_m].to(torch.float32) - mean) * rstd
+                out[st, tile_m] = normalized.to(x_values.dtype)
+
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------
