@@ -1748,12 +1748,15 @@ def _codegen_cute_store_tcgen05_tile(
                 aux_loaded=df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
                 aux_view2d=aux_view2d,
                 # Pre-wait whole-fragment register hoist of N-broadcast
-                # (rowvec) aux on the bm=128 2-CTA full-tile TMA-store path.
-                # The fragment there is small (2 subtiles x epi-tile N of 64
-                # at bn=128 = a handful of fp32 registers per thread), so the
-                # whole-fragment LDG fits without spills and hides its GMEM
-                # latency under the MMA wait (standalone CUTLASS does the
-                # same; ~2% on the 512x6144x2048 fp8 scaled_mm shape). It is
+                # (rowvec) aux on the small-tile (bm <= 128) full-tile
+                # TMA-store paths: the bm=128 2-CTA family and the 1-CTA
+                # bm<=128 family. The fragment there is small (<= 32 fp32
+                # registers per thread), so the whole-fragment LDG fits
+                # without spills and hides its GMEM latency under the MMA
+                # wait (standalone CUTLASS does the same; ~2% on the
+                # 512x6144x2048 fp8 scaled_mm shape, ~10% on the M=64
+                # decode shapes where the per-subtile rowvec LDG after the
+                # acc consumer_wait was the dominant epilogue cost). It is
                 # deliberately NOT applied to the bm=256 family: its larger
                 # whole-tile fragment regressed via register spills (see the
                 # fp8_gap_v2 history of the rowvec hoist removal at bn=128/
@@ -1761,14 +1764,21 @@ def _codegen_cute_store_tcgen05_tile(
                 aux_rmem_full=(
                     df.new_var(f"tcgen05_aux_rmem_full_{aux_idx}")
                     if (
-                        aux_step.broadcast_axis in (0, 1)
-                        and tcgen05_is_two_cta_m128(
-                            is_two_cta=tcgen05_lifecycle.is_two_cta,
-                            bm=tcgen05_value.bm,
+                        (
+                            aux_step.broadcast_axis in (0, 1)
+                            and tcgen05_is_two_cta_m128(
+                                is_two_cta=tcgen05_lifecycle.is_two_cta,
+                                bm=tcgen05_value.bm,
+                            )
                         )
-                        and tcgen05_value.use_tma_store_epilogue
-                        and not tcgen05_value.partial_output_tma_store
+                        or (
+                            aux_step.broadcast_axis in (0, 1, 2)
+                            and not tcgen05_lifecycle.is_two_cta
+                            and tcgen05_value.bm <= 128
+                        )
                     )
+                    and tcgen05_value.use_tma_store_epilogue
+                    and not tcgen05_value.partial_output_tma_store
                     else None
                 ),
             )
@@ -2341,9 +2351,14 @@ def _codegen_cute_store_tcgen05_tile(
                     # family gate.
                     *(
                         [
+                            # make_rmem_tensor_like (not make_rmem_tensor from
+                            # ``.shape``) so the register tensor keeps the
+                            # source fragment's nested mode profile; the flat
+                            # rebuild trips autovec_copy's profile check on the
+                            # 1-CTA bm<=128 family.
                             (
-                                f"{rec.aux_rmem_full} = cute.make_rmem_tensor("
-                                f"{rec.ttr_aux_grouped}.shape, {rec.aux_dtype})"
+                                f"{rec.aux_rmem_full} = cute.make_rmem_tensor_like("
+                                f"{rec.ttr_aux_grouped}, {rec.aux_dtype})"
                             ),
                             (
                                 f"cute.autovec_copy({rec.ttr_aux_grouped}, "
@@ -2605,15 +2620,23 @@ def _codegen_cute_store_tcgen05_tile(
                 # all dynamic (nothing for ``cute.filter`` to drop, and mode 0
                 # conflates M and N), so such tests silently degrade to
                 # always-materialize.
+                # Pre-wait hoisted colvec reads slice the register fragment
+                # filled before the accumulator consumer_wait; otherwise
+                # read GMEM per subtile.
+                colvec_source = (
+                    rec.aux_rmem_full
+                    if rec.aux_rmem_full is not None
+                    else rec.ttr_aux_grouped
+                )
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
-                    f"{rec.ttr_aux_grouped}"
+                    f"{colvec_source}"
                     f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 if tcgen05_colvec_fragment_single_m_row:
                     lines.append(
                         f"{prelude_indent}{rec.aux_loaded} = "
-                        f"{rec.ttr_aux_grouped}"
+                        f"{colvec_source}"
                         f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
                     )
                 else:
@@ -2626,12 +2649,30 @@ def _codegen_cute_store_tcgen05_tile(
             if rec.aux_rmem_full is not None:
                 # Pre-wait hoisted rowvec: the whole fragment is already in
                 # registers (loaded before the accumulator consumer_wait by
-                # ``_aux_tile_setup_lines``); slice the active subtile.
-                lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = "
-                    f"{rec.aux_rmem_full}"
-                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
-                )
+                # ``_aux_tile_setup_lines``); slice the active subtile. On
+                # the 2-CTA m128 family the sliced profile combines with the
+                # carrier directly; the 1-CTA bm<=128 fragment keeps a
+                # nested mode profile, so materialize it into the carrier's
+                # flat register profile (register-to-register autovec_copy).
+                if tcgen05_is_two_cta_m128(
+                    is_two_cta=tcgen05_lifecycle.is_two_cta,
+                    bm=tcgen05_value.bm,
+                ):
+                    lines.append(
+                        f"{prelude_indent}{rec.aux_loaded} = "
+                        f"{rec.aux_rmem_full}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]"
+                        ".load()\n"
+                    )
+                else:
+                    lines.append(
+                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                        f"{rec.aux_rmem_full}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                        + _materialize_broadcast_aux_source(
+                            prelude_indent, rec, carrier_name
+                        )
+                    )
                 continue
             # Both remaining cases -- rowvec / leading-broadcast aux
             # (``broadcast_axis in (0, 1)``: a per-column operand broadcast
