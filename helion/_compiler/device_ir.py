@@ -3566,6 +3566,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        for graph in device_ir.graphs:
+            fold_gather_into_load(graph.graph)
         if CompileEnvironment.current().backend.name == "cute":
             promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
             if promotions:
@@ -3843,6 +3845,110 @@ def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
                 user.args = tuple(new_args)
         if len(node.users) == 0:
             graph.erase_node(node)
+
+
+def fold_gather_into_load(graph: torch.fx.Graph) -> None:
+    """Rewrite ``gather(load(t, [..., :, ...]), dim, idx)`` to a direct
+    indirect ``load(t, [..., idx, ...])`` that picks the gathered elements
+    in one shot.
+
+    The two forms compute the same values, but the direct form skips the
+    full-axis load that the gather output indexes into.  That matters in
+    two ways:
+
+    * the original load may be too wide to fit Triton's per-tile element
+      cap (the cross_entropy ``logits[tile_n, :]`` case), and
+    * if that axis is the reduction axis, the original load produces an
+      rdim-shaped value that the reduction roller can't carry out of its
+      ``_for_loop`` to feed the gather (the source of the cross_entropy
+      ``NameError: <load> is not defined`` codegen failure).
+
+    Folding the gather away removes both problems before the rolling
+    analysis runs.  The CuTe backend already applies the same fold at
+    codegen time (see ``aten_lowering.codegen_gather_cute``); this pass
+    lifts it to the FX layer so the Triton backend and the roller see the
+    rewritten graph.
+
+    The original load is preserved for any non-gather users (e.g. a
+    sibling reduction over the same axis) — they keep their wide view of
+    the tensor while the gather gets its narrow direct load.
+
+    The fold only fires when:
+
+    * the target backend is Triton — CuTe already applies the same
+      simplification at codegen time in
+      ``aten_lowering.codegen_gather_cute``, and Pallas / Metal have
+      their own gather lowerings that we don't want to bypass,
+    * the load's ``dim`` axis is a full ``slice(None)`` (so the gather is
+      genuinely picking one element from a wide axis — for narrow
+      already-indexed axes the fold would produce a different result
+      because Helion's indirect-load pairs tensor indexers elementwise
+      rather than taking a Cartesian product),
+    * the gather index has a singleton at ``dim`` and the same rank as
+      the load's subscript (the cross_entropy
+      ``idx[tile_n].unsqueeze(1)`` pattern).  Other gather index shapes
+      — e.g. one that picks ``K`` elements per row — broadcast
+      differently in Helion's indirect-load codegen, so we leave those
+      for the existing ``aten.gather`` path, and
+    * the original load has no ``extra_mask`` (a mask sized to the wide
+      subscript would no longer match the post-fold narrow shape).
+    """
+    if CompileEnvironment.current().backend_name != "triton":
+        return
+    for gather in graph.find_nodes(
+        op="call_function", target=torch.ops.aten.gather.default
+    ):
+        if gather.kwargs or len(gather.args) != 3:
+            continue
+        load_node, dim, index_node = gather.args
+        if not (
+            isinstance(load_node, torch.fx.Node)
+            and isinstance(index_node, torch.fx.Node)
+            and isinstance(dim, int)
+            and load_node.target is hl.load
+        ):
+            continue
+        tensor_node, subscript, *load_tail = load_node.args
+        if not isinstance(subscript, (list, tuple)):
+            continue
+        ndim = len(subscript)
+        if dim < 0:
+            dim += ndim
+        if not (0 <= dim < ndim):
+            continue
+        # Original load's gather axis must be a full slice — otherwise the
+        # fold doesn't preserve semantics (see docstring).
+        if not (isinstance(subscript[dim], slice) and subscript[dim] == slice(None)):
+            continue
+        # Forwarding a non-None ``extra_mask`` sized for the wide load
+        # would mismatch the narrow post-fold shape.  ``eviction_policy``
+        # is just a string and is fine to forward.
+        extra_mask = load_tail[0] if load_tail else None
+        if extra_mask is not None:
+            continue
+        index_val = index_node.meta.get("val")
+        if not (
+            isinstance(index_val, torch.Tensor)
+            and index_val.ndim == ndim
+            and CompileEnvironment.current().size_hint(index_val.size(dim)) == 1
+        ):
+            continue
+        new_subscript = [
+            (index_node if i == dim else s) for i, s in enumerate(subscript)
+        ]
+        with graph.inserting_before(gather):
+            new_load = graph.call_function(
+                hl.load,
+                (tensor_node, new_subscript, *load_tail),
+                {},
+            )
+        # The new load's value matches the gather's shape/dtype, so reuse
+        # gather.meta (val, lowering, etc.) verbatim.
+        new_load.meta.update(gather.meta)
+        gather.replace_all_uses_with(new_load)
+        graph.erase_node(gather)
+        if not load_node.users:
+            graph.erase_node(load_node)
 
 
 def collect_cute_half_atomic_output_promotions(
