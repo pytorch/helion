@@ -153,6 +153,23 @@ def main() -> None:
     current_hardware = args.hardware or _HARDWARE_BY_COMPUTE.get(compute, compute)
     print(f"GPU: {device} ({compute}); hardware={current_hardware}")
 
+    # SMEM budget probe: the cute (tcgen05) kernels request their tile SMEM as
+    # dynamic opt-in (MLIR ``max_dynamic_shared_size_bytes = dev_max_shared_memory_optin``),
+    # resolved against the driver-reported opt-in cap at compile time. When that
+    # cap is too small (older driver), the allocation is validated against the
+    # 48 KB static cap and ptxas rejects it ("uses too much shared data ... 0xc000
+    # max"). Print the driver, static, and opt-in caps so a failing b200 run shows
+    # whether the opt-in budget (not the toolkit) is the difference.
+    _props = torch.cuda.get_device_properties(0)
+    _driver = torch.version.cuda
+    _static_cap = int(getattr(_props, "shared_memory_per_block", 0) or 0)
+    _optin_cap = int(getattr(_props, "shared_memory_per_block_optin", 0) or 0)
+    print(
+        f"SMEM: static_per_block={_static_cap}B ({_static_cap // 1024}KB); "
+        f"optin_per_block={_optin_cap}B ({_optin_cap // 1024}KB); "
+        f"torch.version.cuda={_driver}"
+    )
+
     kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
     records = []
     for name in kernels:
