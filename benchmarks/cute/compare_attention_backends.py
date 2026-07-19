@@ -77,6 +77,7 @@ import types
 from typing import Any
 from typing import Callable
 from typing import Iterator
+from typing import Protocol
 from typing import cast
 
 import torch
@@ -86,6 +87,23 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
 ALL_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
 HELION_IMPLS = ("helion-cute", "helion-triton")
+
+
+class _ConfigLike(Protocol):
+    config: dict[str, object]
+
+
+class _ConfigSpecWithFlashSeeds(Protocol):
+    compiler_default_config: object | None
+    compiler_seed_configs: list[_ConfigLike]
+
+    def default_config(self) -> _ConfigLike: ...
+
+
+class _BoundWithConfigSpec(Protocol):
+    @property
+    def config_spec(self) -> _ConfigSpecWithFlashSeeds: ...
+
 
 _FA4_REPO = "https://github.com/Dao-AILab/flash-attention.git"
 _FA4_DEFAULT_REF = "v2.8.3"
@@ -659,6 +677,19 @@ def _make_helion_config(
     return config, config_overrides
 
 
+def _compiler_flash_seed_config(
+    bound: object, backend: str
+) -> dict[str, object] | None:
+    if backend != "cute":
+        return None
+    config_spec = cast("_BoundWithConfigSpec", bound).config_spec
+    if config_spec.compiler_default_config is not None:
+        return dict(config_spec.default_config().config)
+    if config_spec.compiler_seed_configs:
+        return dict(config_spec.compiler_seed_configs[0].config)
+    return None
+
+
 def _benchmark_sdpa(args: argparse.Namespace) -> dict[str, Any]:
     dtype = _dtype_from_name(args.dtype)
     q, k, v = _make_inputs(args, dtype)
@@ -962,12 +993,7 @@ def _benchmark_helion(args: argparse.Namespace) -> dict[str, Any]:
 
     with _scrubbed_argv():
         bound = kernel.bind(kernel_args)
-        compiler_seed_config = (
-            dict(bound.config_spec.default_config().config)
-            if backend == "cute"
-            and bound.config_spec.compiler_default_config is not None
-            else None
-        )
+        compiler_seed_config = _compiler_flash_seed_config(bound, backend)
         fixed_config, config_overrides = _make_helion_config(args, compiler_seed_config)
         notes: list[str] = []
         if bias is not None and backend == "cute":
