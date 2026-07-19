@@ -695,17 +695,18 @@ class PointerIndexingStrategy(IndexingStrategy):
                 tensor_dim += 1
                 k_index += 1
 
-        # If pointer is scalar but output_size has dimensions, reshape value to scalar.
-        # Skip reshaping for scalar constants which don't have shape.
         backend = CompileEnvironment.current().backend
-        if (
-            not pointer_has_block_dims
-            and output_size
-            and not isinstance(value, ast.Constant)
-        ):
-            # Pointer is scalar but value may have shape - squeeze to scalar
-            reshape = backend.reshape_expr("{value}", "[]")
-            value = expr_from_string(reshape, value=value)
+        if not pointer_has_block_dims and not isinstance(value, ast.Constant):
+            if output_size:
+                reshape = backend.reshape_expr("{value}", "[]")
+                value = expr_from_string(reshape, value=value)
+            elif state.fx_node is not None and len(state.fx_node.args) > 2:
+                value_node = state.fx_node.args[2]
+                if isinstance(value_node, torch.fx.Node):
+                    val_meta = value_node.meta.get("val")
+                    if isinstance(val_meta, torch.Tensor) and val_meta.ndim > 0:
+                        reshape = backend.reshape_expr("{value}", "[]")
+                        value = expr_from_string(reshape, value=value)
 
         offset_expr = indexing.index_expr
         # If dimensions need broadcasting for store, broadcast the pointer
