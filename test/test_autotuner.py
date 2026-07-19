@@ -3623,26 +3623,47 @@ class TestCuteAutotuner(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_PDL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
         from helion._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
         from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
         from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
         from helion._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
+        from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
         from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
         from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
         from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+        from helion._compiler.cute.cute_flash import FLASH_S_LOAD_REP_KEY
         from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SKIP_RESCALE_STATS_KEY
         from helion._compiler.cute.cute_flash import FLASH_SMALL_BIASED_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
         from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
         from helion._compiler.cute.cute_flash import flash_autotune_fragments
 
@@ -3772,7 +3793,23 @@ class TestCuteAutotuner(TestCase):
         for generic_key in ("num_threads", "loop_orders", "cute_vector_widths"):
             self.assertNotIn(generic_key, attn_keys)
         # The fa4-win knobs are explicitly part of the surface when enabled.
-        for fa4_key in (FLASH_TOPOLOGY_KEY, FLASH_DISC_PIPE_KEY, FLASH_EPI_TMA_KEY):
+        for fa4_key in (
+            FLASH_TOPOLOGY_KEY,
+            FLASH_SOFTMAX_DISC_KEY,
+            FLASH_DISC_PIPE_KEY,
+            FLASH_EPI_TMA_KEY,
+            FLASH_EPI_STG_KEY,
+            FLASH_EPI_STG_STORE_KEY,
+            FLASH_EPI_STG_GMEM_KEY,
+            FLASH_CORR_TILE_SIZE_KEY,
+            FLASH_OTHER_REGS_KEY,
+            FLASH_CLC_KEY,
+            FLASH_CLC_HEADS_PER_BATCH_KEY,
+            FLASH_CLC_PDL_KEY,
+            FLASH_CLC_STAGES_KEY,
+            FLASH_LOCAL_TMA_PARTITION_KEY,
+            FLASH_TENSOR_4D_TMA_KEY,
+        ):
             self.assertIn(fa4_key, attn_keys)
         # seq=256 -> num_kv=2 (even) is fa4-eligible (seq % 256 == 0), so the
         # topology fragment must offer fa4 (alongside the ws_overlap default
@@ -3823,10 +3860,25 @@ class TestCuteAutotuner(TestCase):
         self.assertEqual(
             set(flash_fragments[FLASH_DISC_PIPE_KEY].choices), {1, 2, 3, 4}
         )
+        self.assertEqual(
+            set(flash_fragments[FLASH_SOFTMAX_DISC_KEY].choices), {False, True}
+        )
         self.assertEqual(set(flash_fragments[FLASH_EPI_TMA_KEY].choices), {False, True})
+        self.assertEqual(set(flash_fragments[FLASH_EPI_STG_KEY].choices), {False, True})
+        self.assertEqual(
+            set(flash_fragments[FLASH_EPI_STG_STORE_KEY].choices), {"slice", "whole"}
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_EPI_STG_GMEM_KEY].choices), {"stage", "pair"}
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_CORR_TILE_SIZE_KEY].choices), {8, 16, 32}
+        )
         rescale_threshold_choices = flash_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices
         self.assertEqual(rescale_threshold_choices[0], 8.0)
-        self.assertEqual(set(rescale_threshold_choices), {0.0, 4.0, 8.0, 12.0, 16.0})
+        self.assertEqual(
+            set(rescale_threshold_choices), {0.0, 4.0, 8.0, 12.0, 16.0, 32.0}
+        )
         rescale_chunk_cols_choices = flash_fragments[
             FLASH_RESCALE_CHUNK_COLS_KEY
         ].choices
@@ -3858,6 +3910,15 @@ class TestCuteAutotuner(TestCase):
             set(flash_fragments[FLASH_CORR_REGS_KEY].choices), {64, 72, 80, 88}
         )
         self.assertEqual(set(flash_fragments[FLASH_CORR_REGS_KEY].search_choices), {64})
+        self.assertEqual(flash_fragments[FLASH_OTHER_REGS_KEY].choices[0], 48)
+        self.assertEqual(
+            set(flash_fragments[FLASH_OTHER_REGS_KEY].choices),
+            {32, 40, 48, 56, 64, 80},
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_OTHER_REGS_KEY].search_choices,
+            (48, 32, 40, 56, 64, 80),
+        )
         with unittest.mock.patch.dict(
             os.environ, {"HELION_CUTE_FLASH_CORR_REGS": "88"}
         ):
@@ -3965,7 +4026,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_ws_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0},
+            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
         )
         self.assertEqual(
             set(long_ws_fragments[FLASH_PACKED_REDUCE_KEY].choices), {False, True}
@@ -4099,6 +4160,31 @@ class TestCuteAutotuner(TestCase):
             causal_long_fragments[FLASH_ROLE_MAP_KEY].search_choices,
             ("helion", "fa4"),
         )
+        causal_very_long_fragments = flash_autotune_fragments(64, 4096, is_causal=True)
+        causal_very_long_search_choices = {
+            FLASH_KV_STAGE_KEY: (2,),
+            FLASH_E2E_SCHEDULE_KEY: ("8/2",),
+            FLASH_MASKED_E2E_SCHEDULE_KEY: ("16/4",),
+            FLASH_TOPOLOGY_KEY: ("fa4",),
+            FLASH_DISC_PIPE_KEY: (4,),
+            FLASH_E2E_OFFSET_KEY: (9,),
+            FLASH_E2E_OFFSET0_KEY: (3,),
+            FLASH_RESCALE_CHUNK_COLS_KEY: (32,),
+            FLASH_SKIP_RESCALE_STATS_KEY: (False,),
+            FLASH_SOFTMAX_REGS_KEY: (184,),
+            FLASH_CAUSAL_LPT_SWIZZLE_KEY: (1,),
+            FLASH_CAUSAL_KV_ORDER_KEY: ("descending",),
+            FLASH_ROLE_MAP_KEY: ("helion",),
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: (True,),
+            FLASH_EPI_TMA_KEY: (False,),
+            FLASH_EPI_STG_KEY: (False,),
+            FLASH_EPI_STG_STORE_KEY: ("slice",),
+            FLASH_EPI_STG_GMEM_KEY: ("stage",),
+        }
+        for key, search_choices in causal_very_long_search_choices.items():
+            self.assertEqual(
+                causal_very_long_fragments[key].search_choices, search_choices
+            )
         long_dense_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
             long_dense_fragments[FLASH_TOPOLOGY_KEY].choices,
@@ -4118,7 +4204,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
-            ("16/4", "8/2"),
+            ("8/2", "16/4"),
         )
         self.assertEqual(
             set(long_dense_fragments[FLASH_E2E_OFFSET_KEY].choices), set(range(16))
@@ -4132,15 +4218,296 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             long_dense_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
-            tuple(range(16)),
+            (2, 0, 1, *range(3, 16)),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
             (8.0,),
         )
+        very_long_dense_fragments = flash_autotune_fragments(64, 256, is_causal=False)
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (8.0, 32.0, 16.0),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_PERSISTENT_CTAS_PER_SM_KEY].search_choices,
+            (1, 2, 3, 4),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_PERSISTENT_CTAS_PER_SM_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_KV_ORDER_KEY].search_choices,
+            ("ascending", "descending"),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_KV_ORDER_KEY].search_choices,
+            ("descending",),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CORR_TILE_SIZE_KEY].search_choices,
+            (16, 8, 32),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CORR_TILE_SIZE_KEY].search_choices,
+            (8, 16),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_OTHER_REGS_KEY].search_choices,
+            (48, 32, 40, 56, 64, 80),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_OTHER_REGS_KEY].search_choices,
+            (40,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
+            ("8/2", "16/4"),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SOFTMAX_DISC_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_DISC_PIPE_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SPLIT_P_ARRIVE_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_PRECOMPUTE_QK_DESC_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_P_STORE_REP_KEY].search_choices,
+            (16,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_S_LOAD_REP_KEY].search_choices,
+            (32,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_FIRST_LOAD_ORDER_KEY].search_choices,
+            (0,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
+            (0,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_PDL_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            (0,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
+            (8,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SKIP_RESCALE_STATS_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SOFTMAX_REGS_KEY].search_choices,
+            (200, 192),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CORR_REGS_KEY].search_choices,
+            (64,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_TMA_KEY].search_choices,
+            (True,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_STG_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_STG_STORE_KEY].search_choices,
+            ("slice",),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_STG_GMEM_KEY].search_choices,
+            ("stage",),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_TENSOR_4D_TMA_KEY].search_choices,
+            (False,),
+        )
+        common_very_long_dense_search_choices = {
+            FLASH_PERSISTENT_CTAS_PER_SM_KEY: (1,),
+            FLASH_CORR_TILE_SIZE_KEY: (8, 16),
+            FLASH_SOFTMAX_DISC_KEY: (False,),
+            FLASH_DISC_PIPE_KEY: (1,),
+            FLASH_P_STORE_REP_KEY: (16,),
+            FLASH_S_LOAD_REP_KEY: (32,),
+            FLASH_CLC_KEY: (False,),
+            FLASH_CLC_HEADS_PER_BATCH_KEY: (0,),
+            FLASH_CLC_PDL_KEY: (False,),
+            FLASH_CLC_STAGES_KEY: (1,),
+            FLASH_E2E_OFFSET_KEY: (0,),
+            FLASH_RESCALE_CHUNK_COLS_KEY: (8,),
+            FLASH_SKIP_RESCALE_STATS_KEY: (False,),
+            FLASH_SOFTMAX_REGS_KEY: (200, 192),
+            FLASH_EPI_STG_KEY: (False,),
+            FLASH_EPI_STG_STORE_KEY: ("slice",),
+            FLASH_EPI_STG_GMEM_KEY: ("stage",),
+        }
+        very_long_dense_search_choices_by_num_kv = {
+            256: {
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_OTHER_REGS_KEY: (40,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (1,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_CORR_REGS_KEY: (64,),
+                FLASH_EPI_TMA_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+            },
+            384: {
+                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_OTHER_REGS_KEY: (32,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (3,),
+                FLASH_KV_ORDER_KEY: ("ascending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_CORR_REGS_KEY: (72,),
+                FLASH_EPI_TMA_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+            },
+            512: {
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_OTHER_REGS_KEY: (32,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (0,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_CORR_REGS_KEY: (72,),
+                FLASH_EPI_TMA_KEY: (False,),
+                FLASH_EPI_STG_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+            },
+            1024: {
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_OTHER_REGS_KEY: (40,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("16/4", "8/2"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (0,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_PERSISTENT_CTAS_PER_SM_KEY: (1,),
+                FLASH_CORR_REGS_KEY: (72,),
+                FLASH_EPI_TMA_KEY: (True,),
+                FLASH_EPI_STG_KEY: (False,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+                FLASH_CLC_KEY: (True,),
+                FLASH_CLC_HEADS_PER_BATCH_KEY: (32,),
+            },
+            2048: {
+                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_CORR_TILE_SIZE_KEY: (8, 16),
+                FLASH_SOFTMAX_REGS_KEY: (192, 200),
+                FLASH_ROLE_MAP_KEY: ("helion", "fa4"),
+                FLASH_OTHER_REGS_KEY: (32,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_FIRST_LOAD_ORDER_KEY: (4,),
+                FLASH_E2E_SCHEDULE_KEY: ("16/4", "8/2"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False, True),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (0,),
+                FLASH_CORR_REGS_KEY: (80,),
+                FLASH_EPI_TMA_KEY: (False,),
+                FLASH_EPI_STG_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (3, 2),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+            },
+        }
+        for num_kv, expected in very_long_dense_search_choices_by_num_kv.items():
+            with self.subTest(num_kv=num_kv):
+                fragments = flash_autotune_fragments(64, num_kv, is_causal=False)
+                for key, search_choices in {
+                    **common_very_long_dense_search_choices,
+                    **expected,
+                }.items():
+                    self.assertEqual(fragments[key].search_choices, search_choices)
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_FLASH_CLC": "1",
+                "HELION_CUTE_FLASH_CLC_HEADS": "128",
+            },
+        ):
+            clc_override_fragments = flash_autotune_fragments(64, 256, is_causal=False)
+        self.assertEqual(
+            clc_override_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
+            (128,),
+        )
+        self.assertIn(
+            128,
+            clc_override_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].choices,
+        )
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_FLASH_EPI_STG": "1",
+                "HELION_CUTE_FLASH_EPI_TMA": "0",
+            },
+        ):
+            epi_stg_override_fragments = flash_autotune_fragments(
+                64, 2048, is_causal=False
+            )
+        self.assertEqual(
+            epi_stg_override_fragments[FLASH_EPI_STG_KEY].search_choices,
+            (True,),
+        )
         self.assertEqual(
             long_dense_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
-            (32, 16),
+            (16, 32),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_DISC_PIPE_KEY].search_choices, (3, 2, 4)
@@ -4166,10 +4533,55 @@ class TestCuteAutotuner(TestCase):
             (2, 3, 4, 6, 8),
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_EPI_TMA_KEY].search_choices, (False, True)
+            long_dense_fragments[FLASH_EPI_TMA_KEY].search_choices, (True, False)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_EPI_STG_KEY].search_choices, (False, True)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_SOFTMAX_DISC_KEY].search_choices, (True, False)
         )
         self.assertEqual(
             long_dense_fragments[FLASH_PERSISTENT_KEY].search_choices, (True,)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_P_STORE_REP_KEY].search_choices, (16, 32)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_S_LOAD_REP_KEY].search_choices, (32, 16)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_PRECOMPUTE_QK_DESC_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_FIRST_LOAD_ORDER_KEY].search_choices,
+            (0, 1, 2, 3, 4),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_SKIP_RESCALE_STATS_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_KEY].search_choices, (False, True)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
+            (0, 32, 16, 64),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_PDL_KEY].search_choices, (False, True)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices, (1, 2, 3)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_TENSOR_4D_TMA_KEY].search_choices,
+            (False, True),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_PACKED_REDUCE_KEY].search_choices, (True,)
@@ -4198,6 +4610,10 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             long_dense_fragments[FLASH_CORR_REGS_KEY].search_choices, (64,)
+        )
+        self.assertEqual(
+            set(long_dense_fragments[FLASH_OTHER_REGS_KEY].choices),
+            {32, 40, 48, 56, 64, 80},
         )
         self.assertEqual(
             long_dense_fragments[FLASH_TOPOLOGY_KEY].differential_mutation(
@@ -4240,7 +4656,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0},
+            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
         )
         long_odd_fragments = flash_autotune_fragments(64, 65, is_causal=False)
         self.assertEqual(
@@ -4255,7 +4671,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0},
+            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
         )
         valid_wide_offset = helion.Config(
             block_sizes=[1, 128, 128],
@@ -4294,7 +4710,7 @@ class TestCuteAutotuner(TestCase):
         self.assertEqual(long_manual_bad_topology.config[FLASH_TOPOLOGY_KEY], "fa4")
         self.assertEqual(
             long_manual_bad_topology.config[FLASH_E2E_SCHEDULE_KEY],
-            "16/4",
+            "8/2",
         )
         self.assertEqual(long_manual_bad_topology.config[FLASH_DISC_PIPE_KEY], 3)
         self.assertTrue(long_manual_bad_topology.config[FLASH_PACKED_REDUCE_KEY])
@@ -4357,13 +4773,35 @@ class TestCuteAutotuner(TestCase):
             self.assertIn(random_long[FLASH_E2E_OFFSET_KEY], set(range(16)))
             self.assertIn(random_long[FLASH_E2E_OFFSET0_KEY], set(range(16)))
             self.assertIn(random_long[FLASH_TOPOLOGY_KEY], {"fa4", "ws_overlap"})
+            self.assertIn(random_long[FLASH_SOFTMAX_DISC_KEY], {False, True})
             self.assertIn(random_long[FLASH_DISC_PIPE_KEY], {2, 3, 4})
             self.assertIn(random_long[FLASH_EPI_TMA_KEY], {False, True})
+            self.assertIn(random_long[FLASH_EPI_STG_KEY], {False, True})
+            self.assertIn(random_long[FLASH_EPI_STG_STORE_KEY], {"slice", "whole"})
+            self.assertIn(random_long[FLASH_EPI_STG_GMEM_KEY], {"stage", "pair"})
             self.assertEqual(random_long[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
             self.assertIn(random_long[FLASH_RESCALE_CHUNK_COLS_KEY], {16, 32})
             self.assertEqual(random_long[FLASH_S_STAGE_KEY], 2)
             self.assertIn(random_long[FLASH_KV_STAGE_KEY], {2, 3, 4, 6, 8})
             self.assertTrue(random_long[FLASH_PERSISTENT_KEY])
+            self.assertIn(random_long[FLASH_PERSISTENT_CTAS_PER_SM_KEY], {1, 2, 3, 4})
+            self.assertIn(random_long[FLASH_P_STORE_REP_KEY], {16, 32})
+            self.assertIn(random_long[FLASH_S_LOAD_REP_KEY], {16, 32})
+            self.assertIn(random_long[FLASH_PRECOMPUTE_QK_DESC_KEY], {False, True})
+            self.assertIn(random_long[FLASH_FIRST_LOAD_ORDER_KEY], {0, 1, 2, 3, 4})
+            self.assertIn(random_long[FLASH_KV_ORDER_KEY], {"ascending", "descending"})
+            self.assertIn(random_long[FLASH_SKIP_RESCALE_STATS_KEY], {False, True})
+            self.assertIn(random_long[FLASH_OTHER_REGS_KEY], {32, 40, 48, 56, 64, 80})
+            self.assertIn(random_long[FLASH_CORR_TILE_SIZE_KEY], {8, 16, 32})
+            self.assertIn(random_long[FLASH_CLC_KEY], {False, True})
+            self.assertIn(random_long[FLASH_CLC_PDL_KEY], {False, True})
+            self.assertIn(random_long[FLASH_CLC_STAGES_KEY], {1, 2, 3})
+            self.assertIn(random_long[FLASH_LOCAL_TMA_PARTITION_KEY], {False, True})
+            self.assertIn(random_long[FLASH_TENSOR_4D_TMA_KEY], {False, True})
+            self.assertIn(
+                random_long[FLASH_CLC_HEADS_PER_BATCH_KEY],
+                {0, 1, 2, 4, 8, 16, 32, 64},
+            )
             self.assertTrue(random_long[FLASH_PACKED_REDUCE_KEY])
         odd_fa4_without_offset = helion.Config(
             block_sizes=[1, 128, 128],

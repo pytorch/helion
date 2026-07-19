@@ -1458,13 +1458,13 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
-            small_biased_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind") == "helion_small_biased_attention"
+            shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
+                plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
                 for plan in codegen.cute_wrapper_plans
             )
             if (
                 codegen.cute_uses_matmul or codegen.cute_wrapper_plans
-            ) and not small_biased_wrapper_only:
+            ) and not shape_bake_safe_wrapper_only:
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"

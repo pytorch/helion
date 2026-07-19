@@ -2783,9 +2783,8 @@ def _append_cute_wrapper_plan(
         # Fused tcgen05 flash-attention host setup: reorder Helion's (B, S, D)
         # tensors to the reference (S, D, B) / (D, S, B) layouts, build the two
         # tiled_mma (QK from SMEM, PV with OperandSource.TMEM) and the three TMA
-        # atoms, then append all kernel args. Mirrors
-        # ``.notes/spikes/fa_tcgen05_spike.py`` host_function (3D-batched variant
-        # validated standalone).
+        # atoms, then append all kernel args. This mirrors the standalone
+        # 3D-batched host setup validated for the specialized flash path.
         q_idx = plan_int("q_idx")
         k_idx = plan_int("k_idx")
         v_idx = plan_int("v_idx")
@@ -2806,6 +2805,10 @@ def _append_cute_wrapper_plan(
         document_heads_per_batch = plan_int("document_heads_per_batch", default=1)
         kv_stage = plan_int("kv_stage")
         q_stage = plan_int("q_stage", default=1)
+        use_2cta_instrs = bool(plan.get("use_2cta_instrs"))
+        use_cga2_local_cta = bool(plan.get("use_cga2_local_cta"))
+        use_clc_scheduler = bool(plan.get("use_clc_scheduler"))
+        cluster_m = 2 if use_2cta_instrs or use_cga2_local_cta else 1
         num_kv = (seq + 127) // 128
         # Static-persistent scheduler: total_tiles = num_bh * num_m_tiles (the
         # flat tile-id space the device-body strided while loop walks). When
@@ -2817,18 +2820,49 @@ def _append_cute_wrapper_plan(
         hd = head_dim
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
-        # (S, D, B) views over the existing (B, S, D) row-major buffers.
+        tensor_4d_batch = plan_int("tensor_4d_batch", default=0)
+        tensor_4d_heads = plan_int("tensor_4d_heads", default=0)
+        use_tensor_4d_tma = (
+            tensor_4d_batch > 0
+            and tensor_4d_heads > 0
+            and tensor_4d_batch * tensor_4d_heads == batch
+        )
+        # (S, D, B) views over the existing (B, S, D) row-major buffers. The
+        # dense FA4 4D-TMA knob instead treats the same flat storage as
+        # (S, D, H, Z), matching FA4's tensor-map rank for contiguous q[z,h,s,d].
         bw = "cutlass.utils.blackwell_helpers"
-        qkd = f"(128, 128, {hd})"
-        pvd = f"(128, {hd}, 128)"
-        sdb = f"cute.make_layout(({seq}, {hd}, {batch}), stride=({hd}, 1, {seq * hd}))"
-        dsb = f"cute.make_layout(({hd}, {seq}, {batch}), stride=(1, {hd}, {seq * hd}))"
+        mma_m = 256 if use_2cta_instrs else 128
+        qkd = f"({mma_m}, 128, {hd})"
+        pvd = f"({mma_m}, {hd}, 128)"
+        if use_tensor_4d_tma:
+            bh_stride = seq * hd
+            batch_stride = tensor_4d_heads * bh_stride
+            sdb = (
+                f"cute.make_layout(({seq}, {hd}, {tensor_4d_heads}, "
+                f"{tensor_4d_batch}), stride=({hd}, 1, {bh_stride}, "
+                f"{batch_stride}))"
+            )
+            dsb = (
+                f"cute.make_layout(({hd}, {seq}, {tensor_4d_heads}, "
+                f"{tensor_4d_batch}), stride=(1, {hd}, {bh_stride}, "
+                f"{batch_stride}))"
+            )
+        else:
+            sdb = (
+                f"cute.make_layout(({seq}, {hd}, {batch}), "
+                f"stride=({hd}, 1, {seq * hd}))"
+            )
+            dsb = (
+                f"cute.make_layout(({hd}, {seq}, {batch}), "
+                f"stride=(1, {hd}, {seq * hd}))"
+            )
         ssb = (
             f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
         )
         sb = f"cute.make_layout(({seq}, {batch}), stride=(1, {seq}))"
         majk = "cute.nvgpu.OperandMajorMode.K"
         cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        cg = "cute.nvgpu.tcgen05.CtaGroup.TWO" if use_2cta_instrs else cg1
         sel = "cute.select"
         flash_lines = [
             f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
@@ -2836,18 +2870,19 @@ def _append_cute_wrapper_plan(
             # V is MN-major: (D, S, B).
             f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
             f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
-            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
-            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, 128))",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({2 if use_2cta_instrs else 1}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
             # K/V are multi-stage TMA rings (Stage 3); the stage count must match
             # the device-body kv_stage + the SharedStorage MemRange depths.
             f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {kv_stage})",
             f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {dtype}, {kv_stage})",
             f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {dtype}, 1)",
-            f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg1})",
-            f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma)",
-            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma)",
-            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma)",
+            f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg})",
+            f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape)",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape)",
             f"_flash_scale_log2 = cutlass.Float32({scale_log2!r})",
             f"_flash_num_kv_tiles = cutlass.Int32({num_kv})",
         ]
@@ -2891,12 +2926,11 @@ def _append_cute_wrapper_plan(
                 f"_flash_mLSE = cute.make_tensor(arg{lse_idx}.iterator, {sb})"
             )
         epi_tma = bool(plan.get("epi_tma"))
-        if epi_tma:
-            # Lever A: build the O TMA STORE atom (fa4-only). The O smem layout is
-            # the per-Q-tile (128, hd) epilogue tile, 2-staged so BOTH adjacent
-            # Q-tiles' outputs fit (matches the fa4 q_stage=2 sQ region the corr
-            # epilogue reuses). ``make_tiled_tma_atom(S2G, ...)`` returns the
-            # TMA-adjusted mO as ``_flash_mOt`` (mirrors the Q/K/V load atoms).
+        epi_stg = bool(plan.get("epi_stg"))
+        if epi_tma or epi_stg:
+            # Build the O smem layout for epilogue-warp store paths. The TMA
+            # variant also builds the O TMA STORE atom; the STG variant reuses
+            # the layout but stores with a universal-copy tiled copy in device code.
             otile = f"(128, {hd})"
             flash_lines.extend(
                 [
@@ -2904,37 +2938,59 @@ def _append_cute_wrapper_plan(
                         f"_flash_osl = {bw}.make_smem_layout_epi("
                         f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, 2)"
                     ),
-                    (
-                        f"_flash_o_cta_v = cute.composition("
-                        f"cute.make_identity_layout(_flash_mO.shape), {otile})"
-                    ),
-                    (
-                        "_flash_tma_o, _flash_mOt = "
-                        "cute.nvgpu.cpasync.make_tiled_tma_atom("
-                        "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _flash_mO, "
-                        "cute.select(_flash_osl, mode=[0, 1]), _flash_o_cta_v)"
-                    ),
                 ]
             )
+            if epi_tma:
+                flash_lines.extend(
+                    [
+                        (
+                            f"_flash_o_cta_v = cute.composition("
+                            f"cute.make_identity_layout(_flash_mO.shape), {otile})"
+                        ),
+                        (
+                            "_flash_tma_o, _flash_mOt = "
+                            "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                            "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _flash_mO, "
+                            "cute.select(_flash_osl, mode=[0, 1]), _flash_o_cta_v)"
+                        ),
+                    ]
+                )
+            else:
+                flash_lines.append("_flash_mOt = _flash_mO")
         else:
             # mO stays the (S, D, B) view (no TMA atom; the epilogue uses
             # autovec_copy straight to gmem).
             flash_lines.append("_flash_mOt = _flash_mO")
         body.extend(f"    {line}" for line in flash_lines)
-        if persistent:
+        if use_clc_scheduler:
+            # CLC launches the full problem grid; the device starts from blockIdx
+            # and uses cluster launch control to dynamically steal remaining work.
+            clc_heads = plan_int("clc_heads_per_batch", batch)
+            if clc_heads <= 0 or batch % clc_heads != 0:
+                clc_heads = batch
+            body.extend(
+                [
+                    f"    grid_x = cutlass.Int32({total_tiles // batch})",
+                    f"    grid_y = cutlass.Int32({clc_heads})",
+                    f"    grid_z = cutlass.Int32({batch // clc_heads})",
+                ]
+            )
+        elif persistent:
             # Cap the flat grid at num_SMs (computed host-side from the q tensor's
             # device at wrapper-build time and baked as a literal). grid_y/grid_z
             # stay 1 (already true for the flat flash grid). The device-body
             # strided while loop then covers all total_tiles work items.
             assert num_sm is not None and num_sm > 0
-            grid_cap = min(total_tiles, num_sm)
+            ctas_per_sm = max(1, plan_int("persistent_ctas_per_sm", 1))
+            max_ctas = ((num_sm * ctas_per_sm) // cluster_m) * cluster_m
+            grid_cap = min(total_tiles * cluster_m, max_ctas)
             body.append(f"    grid_x = cutlass.Int32({grid_cap})")
         elif plan.get("topology") == "fa4":
             # The fa4 topology processes a PAIR of adjacent 128-row Q-tiles per
             # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs.
             # The default root grid would launch batch * seq // 128; override it
             # to the halved fa4 tile count.
-            body.append(f"    grid_x = cutlass.Int32({total_tiles})")
+            body.append(f"    grid_x = cutlass.Int32({total_tiles * cluster_m})")
         call_args.extend(
             [
                 "_flash_qk_mma",
@@ -2966,6 +3022,8 @@ def _append_cute_wrapper_plan(
             call_args.extend(["_flash_mDoc", "_flash_doc_heads_per_batch"])
         if epi_tma:
             call_args.extend(["_flash_tma_o", "_flash_osl"])
+        elif epi_stg:
+            call_args.append("_flash_osl")
         return
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
@@ -3830,7 +3888,7 @@ def _build_cute_schema_and_args(
         any_obj = cast("Any", cute_kernel)
         wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
         wrapper_plans_disable_bake = bool(wrapper_plans) and not all(
-            plan.get("kind") == "helion_small_biased_attention"
+            plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
             for plan in wrapper_plans
         )
         disable_bake = bool(

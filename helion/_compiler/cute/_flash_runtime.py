@@ -2450,3 +2450,88 @@ def fmax_reduce_packed(frg: cute.Tensor, init_val: object = None) -> Float32:
         local_max[3] = _fmax3(local_max[3], frg[i + 6], frg[i + 7])
     local_max[0] = _fmax3(local_max[0], local_max[1])
     return _fmax3(local_max[0], local_max[2], local_max[3])
+
+
+# ===========================================================================
+# Position-independent swizzled SMEM store helpers. Faithful inlined ports of
+# the ``quack.copy_utils`` / ``quack.layout_utils`` utilities the flash epilogue
+# uses, kept here so the generated flash module does NOT ``import quack`` at
+# runtime -- Helion never hard-depends on quack being installed (see
+# ``clc_helpers.py``). Behaviour is identical to the quack originals.
+# ===========================================================================
+
+
+def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    """Reselect layout modes of ``a`` while keeping its iterator."""
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
+def swizzle_int(ptr_int: object, b: int, m: int, s: int) -> object:
+    """Apply a CuTe swizzle to a raw integer pointer value."""
+    bit_msk = (1 << b) - 1
+    yyy_msk = bit_msk << (m + s)
+    return ptr_int ^ ((ptr_int & yyy_msk) >> s)  # pyrefly: ignore[unsupported-operation]
+
+
+def swizzle_ptr(ptr: cute.Pointer) -> cute.Pointer:
+    """Bake a pointer's swizzle into its address."""
+    swz = ptr.type.swizzle_type  # pyrefly: ignore[missing-attribute]
+    ptr_int = swizzle_int(ptr.toint(), swz.num_bits, swz.num_base, swz.num_shift)
+    return cute.make_ptr(ptr.dtype, ptr_int, ptr.memspace, assumed_align=ptr.alignment)
+
+
+def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
+    """Recast a swizzled smem tensor to an equivalent position-independent layout."""
+    outer = tensor.layout
+    width = tensor.element_type.width  # pyrefly: ignore[missing-attribute]
+    swizzle_type = tensor.iterator.type.swizzle_type  # pyrefly: ignore[missing-attribute]
+    inner = cute.make_swizzle(
+        swizzle_type.num_bits, swizzle_type.num_base, swizzle_type.num_shift
+    )
+    # Recast the swizzle from byte units (e.g. <3, 4, 3>) to element units (e.g.
+    # <3, 3, 3> for 16-bit and <3, 2, 3> for 32-bit).
+    new_layout = cute.recast_layout(
+        width,
+        8,
+        cute.make_composed_layout(inner, 0, cute.recast_layout(8, width, outer)),
+    )
+    # recast_ptr to remove the pointer swizzle.
+    return cute.make_tensor(
+        cute.recast_ptr(tensor.iterator, dtype=tensor.element_type), new_layout
+    )
+
+
+def partition_D_position_independent(
+    thr_copy: object, tensor: cute.Tensor
+) -> cute.Tensor:
+    """Partition ``tensor`` for a store while keeping the swizzle position-independent."""
+    return cute.make_tensor(
+        swizzle_ptr(thr_copy.partition_D(tensor).iterator),  # pyrefly: ignore[missing-attribute]
+        thr_copy.partition_D(as_position_independent_swizzle_tensor(tensor)).layout,  # pyrefly: ignore[missing-attribute]
+    )
+
+
+@dsl_user_op
+def cvt_copy(
+    tiled_copy: object,
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    *,
+    pred: object = None,
+    retile: bool = False,
+    loc: object = None,
+    ip: object = None,
+    **kwargs: object,
+) -> None:
+    """Convert an rmem source fragment to ``dst``'s dtype (if needed) then copy."""
+    assert (
+        isinstance(src.iterator, cute.Pointer)
+        and src.memspace == cute.AddressSpace.rmem
+    )
+    if cutlass.const_expr(src.element_type != dst.element_type):
+        src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
+        src_cvt.store(src.load().to(dst.element_type))
+        src = src_cvt
+    if cutlass.const_expr(retile):
+        src = tiled_copy.retile(src)  # pyrefly: ignore[missing-attribute]
+    cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
