@@ -23,6 +23,7 @@ from typing import TypeVar
 from typing import cast
 from typing import overload
 from typing_extensions import Protocol
+import warnings
 
 import torch
 from torch._dynamo.source import GetItemSource
@@ -59,6 +60,7 @@ from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .ref_mode import RefMode
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -1345,6 +1347,10 @@ def kernel(
             one of config or configs. Refer to the ``helion.Config`` class for
             details.
         key: Optional callable returning a hashable that augments the specialization key.
+        debug: If True, run the kernel in eager/interpret mode so you can set
+            breakpoints and step through the kernel body in a debugger. Also
+            disables autotuning. Equivalent to setting
+            ``ref_mode=RefMode.EAGER, autotune_effort="none"``.
         settings: Keyword arguments representing settings for the Kernel.
             Can also use settings=Settings(...) to pass a Settings object
             directly. Refer to the ``helion.Settings`` class for available
@@ -1363,19 +1369,32 @@ def kernel(
     elif configs is None:
         configs = []
 
-    if settings_obj := settings.get("settings"):
+    debug = settings.pop("debug", False)
+
+    if debug:
+        settings_obj = Settings(ref_mode=RefMode.EAGER, autotune_effort="none")
+    elif settings_obj := settings.get("settings"):
         assert len(settings) == 1, "settings must be the only keyword argument"
         assert isinstance(settings_obj, Settings), "settings must be a Settings object"
     else:
         settings_obj = Settings(**settings)
 
     if fn is None:
-        return functools.partial(
-            kernel,
-            configs=configs,
-            settings=settings_obj,
-            key=key,
+        partial_kwargs: dict[str, object] = {
+            "configs": configs,
+            "settings": settings_obj,
+            "key": key,
+        }
+        if debug:
+            partial_kwargs["debug"] = True
+        return functools.partial(kernel, **partial_kwargs)
+
+    if debug:
+        warnings.warn(
+            f"debug mode is active for '{fn.__name__}', all other settings are ignored",
+            stacklevel=2,
         )
+
     return Kernel(
         fn,
         configs=configs,
