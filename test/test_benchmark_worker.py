@@ -298,6 +298,57 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                     process.kill()
                     process.join(timeout=5)
 
+    def test_spawn_loads_source_module_from_file(self) -> None:
+        # Regression: a kernel loaded by path / notebook / exec lives under a
+        # synthetic module name that only the parent's sys.modules knows about.
+        # The generated code does `import <synthetic> as _source_module` for its
+        # module-globals; a fresh spawn worker cannot import that name. The
+        # serializer ships the origin module's real file in `source_modules` and
+        # the worker re-registers it before exec, so the import resolves.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            # The "origin" kernel module (only present here on disk, never on the
+            # worker's import path under this name).
+            origin_name = "helion_test_synthetic_origin_xyz"
+            origin_file = tmp_path / "origin.py"
+            origin_file.write_text("MAGIC = 4321\n", encoding="utf-8")
+            args_path = tmp_path / "args.pt"
+            result_path = tmp_path / "result.pkl"
+            torch.save((), args_path)
+            # Generated code references the origin via `_source_module`, exactly
+            # like Helion codegen emits for a module-global.
+            source_code = (
+                f"import {origin_name} as _source_module\n"
+                "def call_arg():\n"
+                "    assert _source_module.MAGIC == 4321\n"
+                "    return _source_module.MAGIC\n"
+            )
+            fn_spec = SerializedCompiledFunction(
+                function_name="call_arg",
+                source_code=source_code,
+                filename="<test_spawn_loads_source_module_from_file>",
+                module_name=None,
+                source_modules=[(origin_name, str(origin_file))],
+            )
+            process = mp.get_context("spawn").Process(
+                target=_run_kernel_in_subprocess_spawn,
+                args=(fn_spec, str(args_path), str(result_path), "@test"),
+            )
+            process.start()
+            try:
+                process.join(timeout=30)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+                self.assertEqual(process.exitcode, 0)
+                with result_path.open("rb") as f:
+                    result = pickle.load(f)
+                self.assertEqual(result, {"status": "ok"})
+            finally:
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+
     def test_timeout_kills_worker(self) -> None:
         worker = BenchmarkWorker()
         try:

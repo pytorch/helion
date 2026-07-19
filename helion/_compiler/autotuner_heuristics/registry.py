@@ -26,5 +26,19 @@ class AutotunerHeuristic:
     ) -> Config | None:
         return None
 
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        """Optional RANKED multi-seed hook. ``None`` (the default) means the
+        heuristic plants only its single ``get_seed_config``. A heuristic that
+        overrides this returns ``[primary, *alternates]`` — the loader plants the
+        whole list as compiler seeds (``compiler_seed_configs`` is a list); the
+        primary (``[0]``, the no-autotune Product-A config) must equal
+        ``get_seed_config``. Alternates earn their slot only by covering the
+        region's variance or speeding Product-B search convergence.
+        """
+        return None
+
 
 AutotunerHeuristicType = type[AutotunerHeuristic]
