@@ -488,6 +488,10 @@ def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
     return [index for index in subscript_meta if index is not None]
 
 
+def _subscript_at_dim(subscripts: list[object], dim: int) -> object:
+    return subscripts[dim] if dim < len(subscripts) else slice(None)
+
+
 def _get_dim_block_ids(
     subscript_meta: list[object],
     env: CompileEnvironment,
@@ -2057,11 +2061,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append("0")
             else:
-                idx_meta = (
-                    tensor_subscripts[dim_idx]
-                    if dim_idx < len(tensor_subscripts)
-                    else slice(None)
-                )
+                idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
                 from helion._utils import is_scalar_index
 
                 if is_scalar_index(idx_meta):
@@ -2412,11 +2412,7 @@ def _is_supported_contiguous_row_slab_dma(
     from helion._utils import is_scalar_index
 
     for dim_idx in range(row_dim):
-        idx_meta = (
-            tensor_subscripts[dim_idx]
-            if dim_idx < len(tensor_subscripts)
-            else slice(None)
-        )
+        idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
         if vmem_shape[dim_idx] != 1:
             return False
         if dim_idx in dim_to_bid:
@@ -2425,11 +2421,7 @@ def _is_supported_contiguous_row_slab_dma(
             return False
 
     for dim_idx in range(row_dim + 1, fake.ndim):
-        idx_meta = (
-            tensor_subscripts[dim_idx]
-            if dim_idx < len(tensor_subscripts)
-            else slice(None)
-        )
+        idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
         if idx_meta != slice(None):
             return False
         if dim_idx in dim_to_bid:
@@ -2494,11 +2486,7 @@ def _compute_vmem_shapes(
                 else:
                     parts.append(int(fake.shape[dim_idx]))
             else:
-                idx_meta = (
-                    tensor_subscripts[dim_idx]
-                    if dim_idx < len(tensor_subscripts)
-                    else slice(None)
-                )
+                idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
                 from helion._utils import is_scalar_index
 
                 parts.append(
@@ -2744,9 +2732,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         if id(fake) not in pipelined_tensor_ids:
             continue
         storage_id = id(fake.untyped_storage())
-        input_slots = input_slots_by_id.get(id(fake))
-        if input_slots is None:
-            input_slots = input_slots_by_storage.get(storage_id)
+        input_slots = input_slots_by_id.get(
+            id(fake), input_slots_by_storage.get(storage_id)
+        )
         load_buffer_count = (
             state.config.pallas_load_buffer_count[input_slots[0]]
             if enable_double_buffering
@@ -2756,22 +2744,22 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             and len(input_slots) == 1
             else 1
         )
+        assert load_buffer_count in (1, 2)
+        is_double_buffered = load_buffer_count == 2
         state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.register_scratch(
-            (load_buffer_count, *vmem_shape)
-            if load_buffer_count > 1
-            else vmem_shape,
+            (load_buffer_count, *vmem_shape) if is_double_buffered else vmem_shape,
             fake.dtype,
             name_hint=hbm_name.replace("_hbm", "") + "_buf",
         )
         sem_name = state.device_function.register_dma_semaphore(
             name_hint=hbm_name.replace("_hbm", "") + "_sem",
-            shape=(load_buffer_count,) if load_buffer_count > 1 else (),
+            shape=(load_buffer_count,) if is_double_buffered else (),
         )
         tensor_to_dma_scratch[hbm_name] = vmem_name
         tensor_to_sem[hbm_name] = sem_name
-        if load_buffer_count == 2:
+        if is_double_buffered:
             double_buffered_tensors.add(hbm_name)
             depth_two_loads.append((fake, sub_meta, vmem_name, sem_name))
 
@@ -2860,7 +2848,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         subscript_meta: list[object],
         *,
         clamp: bool,
-        iteration_indices: list[str] | None = None,
+        iteration_indices: list[str],
         stage_expr: str | None = None,
     ) -> tuple[str, str]:
         """Build (vmem_ref, hbm_ref) ref slices for a DMA copy with loop variable.
@@ -2874,8 +2862,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         """
         from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
 
-        if iteration_indices is None:
-            iteration_indices = dim_idx_exprs
         assert len(iteration_indices) == len(block_ids)
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         tensor_subscripts = _tensor_dim_subscripts(subscript_meta)
@@ -2936,11 +2922,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     hbm_parts.append(":")
                 vmem_parts.append(":")
             else:
-                idx_meta = (
-                    tensor_subscripts[dim_idx]
-                    if dim_idx < len(tensor_subscripts)
-                    else slice(None)
-                )
+                idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
                 from helion._utils import is_scalar_index
 
                 if is_scalar_index(idx_meta):
@@ -3007,7 +2989,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         return fn_def
 
     prime_statements: list[ast.stmt] = []
-    body_load_prefix: list[ast.stmt] = []
+    body_prefetch: ast.FunctionDef | None = None
     body_depth_two_waits: list[ast.stmt] = []
     if depth_two_loads:
         num_iterations = state.device_function.new_var("_num_iterations")
@@ -3039,18 +3021,16 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             next_starts.extend(
                 _dma_copy_statements(*record, next_indices, next_stage, ("start",))
             )
-        body_load_prefix.append(
-            _guarded_statements(
-                f"{next_iteration} < {num_iterations}",
-                "_prefetch_fori_loads",
-                next_starts,
-            )
+        body_prefetch = _guarded_statements(
+            f"{next_iteration} < {num_iterations}",
+            "_prefetch_fori_loads",
+            next_starts,
         )
 
         current_stage = f"{stage_loop_var} % 2"
         for record in depth_two_loads:
             body_depth_two_waits.extend(
-                _dma_copy_statements(*record, [*loop_vars], current_stage, ("wait",))
+                _dma_copy_statements(*record, loop_vars, current_stage, ("wait",))
             )
 
     # For loop-carried state, remap args to scratch reads inside the body
@@ -3075,8 +3055,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     )
                 )
 
-        for statement in body_load_prefix:
-            state.codegen.add_statement(statement)
+        if body_prefetch is not None:
+            state.codegen.add_statement(body_prefetch)
 
         for fake, _tensor_node, sub_meta in loaded_tensors.values():
             hbm_name = state.device_function.tensor_arg(fake).name
@@ -3090,7 +3070,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 sub_meta,
                 tensor_to_dma_scratch[hbm_name],
                 tensor_to_sem[hbm_name],
-                [*loop_vars],
+                loop_vars,
                 None,
                 ("start", "wait"),
             ):
@@ -3116,7 +3096,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 sub_meta,
                 tensor_to_dma_scratch[hbm_name],
                 tensor_to_sem[hbm_name],
-                [*loop_vars],
+                loop_vars,
                 None,
                 ("start", "wait"),
                 store=True,

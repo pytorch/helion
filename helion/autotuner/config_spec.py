@@ -1699,14 +1699,6 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
-        if (
-            self.supports_config_key("pallas_load_buffer_count")
-            and self.pallas_load_buffer_count.length > 0
-        ):
-            config.setdefault(
-                "pallas_load_buffer_count",
-                self.pallas_load_buffer_count.default(),
-            )
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         if self.backend_name == "cute":
@@ -1724,19 +1716,19 @@ class ConfigSpec:
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
         if (
-            not self.has_pallas_inner_loops
-            or config.get("pallas_loop_type") != "fori_loop"
+            self.supports_config_key("pallas_load_buffer_count")
+            and self.has_pallas_inner_loops
+            and config.get("pallas_loop_type") == "fori_loop"
         ):
-            config.pop("pallas_load_buffer_count", None)
-        elif "pallas_load_buffer_count" in config:
-            values = config["pallas_load_buffer_count"]
+            values = config.setdefault(
+                "pallas_load_buffer_count", self.pallas_load_buffer_count.default()
+            )
             expected = self.pallas_load_buffer_count.length
             if (
                 not isinstance(values, list)
                 or len(values) != expected
                 or any(
-                    type(value) is not int or value not in (1, 2)
-                    for value in values
+                    type(value) is not int or value not in (1, 2) for value in values
                 )
             ):
                 raise InvalidConfig(
@@ -1746,6 +1738,8 @@ class ConfigSpec:
                 )
             if expected == 0:
                 config.pop("pallas_load_buffer_count")
+        else:
+            config.pop("pallas_load_buffer_count", None)
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
