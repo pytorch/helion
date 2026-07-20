@@ -4895,6 +4895,11 @@ class TestPallasIndirectGather(TestCase):
 instantiate_parametrized_tests(TestPallasIndirectGather)
 
 
+# Module-level so Helion lifts it into a host-wrapper torch.tensor([...]) kernel
+# arg (see test_jax_fn_lifted_constant).
+_JAXFN_LIFTED_CONST = 0.5
+
+
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasJaxFn(TestCase):
     """End-to-end tests for the ``Kernel.jax_fn`` pure-JAX export path.
@@ -4951,6 +4956,33 @@ class TestPallasJaxFn(TestCase):
         ref_c = ref_a + ref_b
         ref = float(jnp.sum(ref_c) + jnp.mean(ref_c) * 0.5)
         self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_lifted_constant(self) -> None:
+        """jax_fn handles a Python float constant that Helion lifts into a
+        host-wrapper ``torch.tensor([...])`` kernel arg (regression: the launcher
+        assumed every tensor arg was a ``_JaxExportTensor`` -> AttributeError
+        ``_jax_arr``)."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def thresh_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                v = x[tile]
+                out[tile] = torch.where(v > _JAXFN_LIFTED_CONST, v, 0.0)
+            return out
+
+        f = jax.jit(thresh_kernel.jax_fn)
+        a = (jnp.arange(128 * 128, dtype=jnp.float32) / (128 * 128)).reshape(
+            128, 128
+        )
+        result = jax.block_until_ready(f(a))
+        ref = jnp.where(a > _JAXFN_LIFTED_CONST, a, 0.0)
+        self.assertTrue(bool(jnp.allclose(result, ref, atol=1e-5)))
 
     def test_jax_fn_unroll(self) -> None:
         """jax_fn drives an unroll kernel inside ``jax.jit``."""
