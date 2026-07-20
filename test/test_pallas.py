@@ -2335,19 +2335,20 @@ class TestPallas(TestCase):
         """Atomic use of selected storage also keeps the ordinary route."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
-        def load_then_atomic_add(x: torch.Tensor) -> None:
+        def load_then_atomic_add(x: torch.Tensor) -> torch.Tensor:
             m, n = x.size()
             for tile_m in hl.tile(m):
                 for tile_n in hl.tile(n):
                     value = x[tile_m, tile_n]
                     hl.atomic_add(x, [tile_m, tile_n], value)
+            return x
 
         source = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
         baseline = load_then_atomic_add.bind((source,)).to_code(
             helion.Config(block_sizes=[8, 128], pallas_loop_type="fori_loop")
         )
         arg = source.clone()
-        code, _ = code_and_output(
+        code, result = code_and_output(
             load_then_atomic_add,
             (arg,),
             block_sizes=[8, 128],
@@ -2355,7 +2356,7 @@ class TestPallas(TestCase):
             pallas_load_buffer_count=[2],
         )
         self.assertEqual(code, baseline)
-        torch.testing.assert_close(arg, source * 2)
+        torch.testing.assert_close(result, source * 2)
 
     def test_fori_loop_direct_jagged_tile(self) -> None:
         """Staged jagged loads handle eager and downstream nonlinear masks."""
@@ -2370,7 +2371,11 @@ class TestPallas(TestCase):
             with self.subTest(mask=name):
                 expected = torch.stack(
                     [
-                        transform(x[row, : int(lengths[row].item()), :]).sum(dim=0)
+                        (
+                            transform(x[row, : int(lengths[row].item()), :]).sum(dim=0)
+                            if int(lengths[row].item()) > 0
+                            else torch.zeros_like(x[row, 0, :])
+                        )
                         for row in range(4)
                     ]
                 )
@@ -3589,7 +3594,14 @@ class TestPallas(TestCase):
         self.assertIn("_BLOCK_SIZE", trip_count)
         self.assertNotIn("amax", trip_count)
         ref = torch.stack(
-            [x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0) for g in range(3)]
+            [
+                (
+                    x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0)
+                    if int(offsets[g + 1]) > int(offsets[g])
+                    else torch.zeros_like(x[g, 0])
+                )
+                for g in range(3)
+            ]
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
