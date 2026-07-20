@@ -251,6 +251,24 @@ def _device_for_jax_export() -> torch.device:
     return torch.device("cpu")
 
 
+def _tensor_arg_to_jax(arg: object) -> object:
+    """Return the JAX array for a kernel tensor argument.
+
+    Most tensor args are ``_JaxExportTensor`` adapters carrying the caller's JAX
+    array. Helion can also lift Python scalar constants used in the kernel body
+    (e.g. an epsilon threshold or a ``-inf`` mask fill) into ``torch.tensor([...])``
+    device constants in the generated host wrapper; those arrive as plain torch
+    tensors (not adapters), so materialize them as JAX arrays here.
+    """
+    if isinstance(arg, _JaxExportTensor):
+        return arg._jax_arr
+    if isinstance(arg, torch.Tensor):
+        import jax.numpy as jnp
+
+        return jnp.asarray(arg.detach().cpu().numpy())
+    return arg
+
+
 def default_pallas_jax_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -374,9 +392,7 @@ def default_pallas_jax_launcher(
             interpret=interpret,
         )
 
-    jax_inputs = [
-        cast("_JaxExportTensor", args[i])._jax_arr for i in result.tensor_arg_indices
-    ]
+    jax_inputs = [_tensor_arg_to_jax(args[i]) for i in result.tensor_arg_indices]
     jax_results = result.jit_fn(*jax_inputs)  # type: ignore[operator]
     if not isinstance(jax_results, (tuple, list)):
         jax_results = (jax_results,)
