@@ -242,6 +242,9 @@ intersphinx_resolve_self = "helion"
 # Linkcheck configuration - ignore URLs that block automated checkers
 linkcheck_ignore = [
     r"https://pytorchconference.*\.sched\.com/.*",  # Returns 403 to bots
+    # Moved from helion/experimental/ in this change; the blob/main URL 404s
+    # until the PR merges, then resolves.
+    r"https://github\.com/pytorch/helion/blob/main/helion/autotuner/aot_kernel\.py",
 ]
 
 # docs.pytorch.org/docs/stable/* serves a JS-only redirect stub to the
