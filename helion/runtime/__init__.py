@@ -2136,6 +2136,7 @@ def _pallas_compact_in_out_specs(
     smem_set: set[int],
     hbm_set: set[int],
     owner_ref_pos: int,
+    scalar_refs: tuple[object, ...],
     aligned_set: set[int] | None = None,
     tile_start_ref_pos: int = 1,
     compact_block: int = 1,
@@ -2143,15 +2144,16 @@ def _pallas_compact_in_out_specs(
     range_start_ref_pos: int = -1,
     ordered_window: int = 0,
 ) -> tuple[list[object], object]:
-    """Build in/out BlockSpecs for the compact-worklist PrefetchScalarGridSpec.
+    """Build in/out BlockSpecs for the compact-worklist emit_pipeline.
 
     Like ``_pallas_build_pipeline_specs`` but: pipelined tensors -> HBM; an
     owner-indexed tensor (its ``grid_dims`` carry the owner grid dim ``0``) gets
-    an ``index_map`` that reads ``owner_ids[wid]`` (a scalar-prefetch ref); a
+    an ``index_map`` that reads ``owner_ids[wid]`` (a ``scalar_refs`` table); a
     compact-aligned-load tensor (``aligned_set``) gets a per-tile
     ``pl.Element`` slice at ``tile_start`` so Pallas double-buffers it across work
-    items; everything else is full/SMEM.  Under ``PrefetchScalarGridSpec`` every
-    ``index_map`` receives ``(wid, *scalar_refs)``.
+    items; everything else is full/SMEM.  ``scalar_refs`` are the SMEM refs
+    holding the worklist metadata tables; every ``index_map`` receives only
+    ``wid`` and closes over them.
     """
     aligned_set = aligned_set or set()
     ordered_aligned_set = ordered_aligned_set or set()
@@ -2180,13 +2182,13 @@ def _pallas_compact_in_out_specs(
             # dim would require an aligned, fixed-grid block.  Verified bitwise ==
             # fori_loop on unaligned/random offsets; this holds for both the load
             # and the full-block store.
+            # Element only on dim 0: emit_pipeline rejects it on the lane dim.
             block = compact_block
             elt = pl.Element(block, padding=(0, block))  # type: ignore[union-attr]
-            block_shape = (elt, *(pl.Element(s) for s in t.shape[1:]))  # type: ignore[union-attr]
+            block_shape = (elt, *t.shape[1:])
 
             def aligned_index_map(
                 wid: object,
-                *scalar_refs: object,
                 _pos: int = tile_start_ref_pos,
                 _nd: int = t.ndim,
             ) -> tuple[object, ...]:
@@ -2200,42 +2202,32 @@ def _pallas_compact_in_out_specs(
             # offset (offset - range_start).  padding=(0, C) tolerates reads past
             # the range tail (same as the compact_aligned_load window).  Keying
             # on range_start lets Pallas dedup the load across same-range tiles.
+            # Element only on dim 0: emit_pipeline rejects it on the lane dim.
             assert ordered_window > 0
             assert range_start_ref_pos >= 0
-            oblock = ordered_window
-            oelt = pl.Element(oblock, padding=(0, oblock))  # type: ignore[union-attr]
-            oblock_shape = (
-                oelt,
-                *(pl.Element(s) for s in t.shape[1:]),  # type: ignore[union-attr]
-            )
+            oelt = pl.Element(ordered_window, padding=(0, ordered_window))  # type: ignore[union-attr]
+            oblock_shape = (oelt, *t.shape[1:])
 
             def ordered_index_map(
                 wid: object,
-                *scalar_refs: object,
                 _pos: int = range_start_ref_pos,
                 _nd: int = t.ndim,
             ) -> tuple[object, ...]:
                 start = scalar_refs[_pos][wid]  # type: ignore[index]
-                return (
-                    start,
-                    *(jnp.int32(0) for _ in range(_nd - 1)),  # type: ignore[union-attr]
-                )
+                return (start, *(jnp.int32(0) for _ in range(_nd - 1)))  # type: ignore[union-attr]
 
-            return pl.BlockSpec(  # type: ignore[union-attr]
-                oblock_shape, ordered_index_map
-            )
+            return pl.BlockSpec(oblock_shape, ordered_index_map)  # type: ignore[union-attr]
         entry = block_spec_info[arg_to_tpos[idx]] if block_spec_info else None
         if entry is not None:
             block_shape_template, grid_dims = entry
             if any(isinstance(g, int) for g in grid_dims):
                 block_shape = tuple(
-                    min(bs, t.shape[d]) if bs is not None else t.shape[d]
+                    max(min(bs, t.shape[d]) if bs is not None else t.shape[d], 1)
                     for d, bs in enumerate(block_shape_template)
                 )
 
                 def index_map(
                     wid: object,
-                    *scalar_refs: object,
                     _gd: tuple[object, ...] = grid_dims,
                     _pos: int = owner_ref_pos,
                 ) -> tuple[object, ...]:
@@ -2334,24 +2326,8 @@ def _pallas_compile_compact_jit_fn(
     scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
     smem_set = set(_smem_arg_indices or [])
     hbm_set = set(_hbm_arg_indices or [])
-    in_specs, out_specs = _pallas_compact_in_out_specs(
-        pl,
-        jnp,
-        pltpu,
-        args,
-        tensor_arg_indices,
-        _output_indices,
-        _block_spec_info,
-        smem_set,
-        hbm_set,
-        owner_ref_pos,
-        set(aligned_arg_indices or []),
-        tile_start_ref_pos,
-        compact_block,
-        set(ordered_aligned_arg_indices or []),
-        range_start_ref_pos,
-        ordered_window,
-    )
+    aligned_set = set(aligned_arg_indices or [])
+    ordered_set = set(ordered_aligned_arg_indices or [])
     reordered_kernel = _pallas_make_compact_reordered_kernel(
         pallas_kernel,
         args,
@@ -2368,66 +2344,98 @@ def _pallas_compile_compact_jit_fn(
     # Offsets-tensor positions within the tensor-arg list (jit_fn input order).
     offset_tpos = [arg_to_tensor_pos[i] for i in offset_arg_indices]
 
+    n_inputs = len(tensor_arg_indices)
+    n_outputs = len(_output_indices)
+    n_kernel_scratch = len(scratch_shapes)
+    hbm_in_positions = {i for i, idx in enumerate(tensor_arg_indices) if idx in hbm_set}
+    hbm_out_positions = {i for i, idx in enumerate(_output_indices) if idx in hbm_set}
+
+    # Flat positions within [inputs..., outputs...].
+    n_io = n_inputs + n_outputs
+    pass_positions = hbm_in_positions | {n_inputs + p for p in hbm_out_positions}
+    pipe_positions = [p for p in range(n_io) if p not in pass_positions]
+
     def jit_fn(*jax_inputs: object) -> object:
         offsets = [jax_inputs[tp] for tp in offset_tpos]
         metadata = build_worklist(*offsets)
         num_work = metadata.num_work  # type: ignore[attr-defined]
         scalar_prefetch = [getattr(metadata, f) for f in metadata_fields]
-        call = pl.pallas_call(  # type: ignore[union-attr]
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            out_shape=out_shape_arg,
-            grid_spec=pltpu.PrefetchScalarGridSpec(  # type: ignore[union-attr]
-                num_scalar_prefetch=num_scalar_prefetch,
-                # num_work is a traced scalar; for an empty batch (total == 0) it
-                # is 0, i.e. a dynamic grid=(0,).  Verified that Mosaic accepts the
-                # zero-grid launch and returns the empty output (no special-case
-                # skip needed).
+
+        # The BlockSpec index maps and the generated kernel read the
+        # worklist tables from SMEM.
+        smem_types = [
+            pltpu.SMEM(tuple(a.shape), a.dtype)  # type: ignore[union-attr]
+            for a in scalar_prefetch
+        ]
+        all_scratch: list[object] = [*scratch_shapes, *smem_types]
+
+        def kernel_body(*refs: object) -> None:
+            scalar_any = refs[:num_scalar_prefetch]
+            io_any = refs[num_scalar_prefetch : num_scalar_prefetch + n_io]
+            rest = refs[num_scalar_prefetch + n_io :]
+            kernel_scratch = rest[:n_kernel_scratch]
+            scalar_smem = rest[n_kernel_scratch:]
+            for src, dst in zip(scalar_any, scalar_smem, strict=True):
+                pltpu.sync_copy(src, dst)  # type: ignore[union-attr]
+
+            in_specs, out_specs = _pallas_compact_in_out_specs(
+                pl,
+                jnp,
+                pltpu,
+                args,
+                tensor_arg_indices,
+                _output_indices,
+                _block_spec_info,
+                smem_set,
+                hbm_set,
+                owner_ref_pos,
+                tuple(scalar_smem),
+                aligned_set,
+                tile_start_ref_pos,
+                compact_block,
+                ordered_set,
+                range_start_ref_pos,
+                ordered_window,
+            )
+            out_specs_seq = (
+                list(out_specs) if isinstance(out_specs, (list, tuple)) else [out_specs]
+            )
+            all_specs = list(in_specs) + out_specs_seq
+            pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
+            pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
+            pipe_any = [io_any[p] for p in pipe_positions]
+
+            def pipeline_body(*block_refs: object) -> None:
+                merged = list(io_any)
+                for p, block in zip(pipe_positions, block_refs, strict=True):
+                    merged[p] = block
+                reordered_kernel(*scalar_smem, *merged, *kernel_scratch)  # type: ignore[operator]
+
+            # Correctness relies on emit_pipeline running grid steps
+            # sequentially in ascending order (a later work item re-writes
+            # the previous item's spilled store rows) and re-fetching an
+            # input block only when its index map changes (owner-indexed
+            # k/v reuse).
+            pltpu.emit_pipeline(  # type: ignore[union-attr]
+                pipeline_body,
+                # num_work may be 0 (empty batch): zero steps, empty output.
                 grid=(num_work,),
-                in_specs=in_specs,
-                out_specs=out_specs,
-                scratch_shapes=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
-            ),
+                in_specs=pipe_in_specs,
+                out_specs=pipe_out_specs,
+            )(*pipe_any)
+
+        mesh = pltpu.create_tensorcore_mesh("core", num_cores=1)  # type: ignore[union-attr]
+        call = pl.kernel(  # type: ignore[union-attr]
+            kernel_body,
+            out_shape_arg,
+            mesh=mesh,
+            scratch_types=all_scratch,  # pyrefly: ignore[bad-argument-type]
             compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                # "arbitrary" (NOT "parallel") is load-bearing for correctness,
-                # for two reasons:
-                #
-                # 1. Input reuse: Pallas reuses an unchanged owner-indexed input
-                #    block across consecutive same-owner work items -- the builder
-                #    orders work items by owner, so all compact tiles for one owner
-                #    share the same owner-indexed fetches.
-                #
-                # 2. Ordered-overwrite store (the precondition the whole kernel
-                #    rests on): each work item's VALID output rows are disjoint,
-                #    BUT the store is a masked FULL-block pl.Element write, so a
-                #    partial last tile overwrites the next owner's leading rows
-                #    with masked-zero padding (owners are packed contiguously at
-                #    unaligned offsets, so the write regions overlap even though
-                #    valid-row ownership does not).  "arbitrary" tells
-                #    Mosaic the grid iterations may have dependencies, so it runs
-                #    them sequentially in grid order rather than reordering or
-                #    pipelining them.  The builder emits work items in ascending
-                #    (owner, tile) order, so the next owner's first tile is a
-                #    LATER iteration that re-writes those rows with the correct
-                #    values -- and being later + serial, it deterministically
-                #    wins.  With "parallel", Mosaic could reorder/overlap
-                #    iterations and the spill would race the re-write.
-                #
-                # KNOWN RISK: this rests on Mosaic running an "arbitrary" 1-D grid
-                # strictly sequentially in ascending order and never reordering
-                # it.  That is the documented meaning of
-                # "arbitrary" and is bitwise-verified vs fori today, but it is a
-                # scheduling-contract dependency -- if a future Mosaic relaxes it,
-                # the spilling store would silently corrupt.  The robust fix is the
-                # deferred exact pl.ds(tile_start, tile_extent) / emit_pipeline +
-                # BoundedSlice store; a future correctness-mode toggle could select
-                # it for validation.  Detection also now restricts to packed (so
-                # work order == row order); see detect_compact_worklist_plan.
-                dimension_semantics=("arbitrary",),
-                # Resident caching sizes its physical window from _get_vmem_limit_bytes
-                # during backend setup.  This 128MiB floor is ONLY a Mosaic compile
-                # ceiling so TPU7x accepts that already-sized allocation; do not use
-                # it to choose C.  A streamed compact_worklist kernel keeps the
-                # platform default ceiling.
+                # Resident caching sizes its physical window from
+                # _get_vmem_limit_bytes during backend setup.  This 128MiB
+                # floor is ONLY a Mosaic compile ceiling so TPU7x accepts that
+                # already-sized allocation; do not use it to choose C.  A
+                # streamed compact_worklist kernel keeps the platform default.
                 vmem_limit_bytes=(
                     max(_get_vmem_limit_bytes(pltpu), 128 * 1024 * 1024)
                     if ordered_aligned_arg_indices
