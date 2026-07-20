@@ -1217,6 +1217,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         # further reductions, which Triton lowers into a pathologically large
         # kernel once the reduction dim is padded up to 256 (~24s of ptxas,
         # tripping the 60s per-test CI timeout and crashing the xdist worker).
+        # See https://github.com/triton-lang/triton/issues/10987.
         # A width-32 reduction avoids that expansion; it exercises the same
         # backward code path and keeps identical fp semantics.
         self._check_backward(
