@@ -24,8 +24,6 @@ from typing import overload
 
 import torch
 
-from .linear_attention_utils import prepare_wy_repr_bwd
-from .linear_attention_utils import solve_tril_inv
 import helion
 import helion.language as hl
 
@@ -367,88 +365,6 @@ def chunk_fwd_h_diag_fused(
             h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
 
     return h_all
-
-
-@helion.kernel()
-def chunk_fwd_wy_diag_helion(
-    a: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    g_cs_d: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """WY decomposition with precomputed scalar A matrix."""
-    BHN = a.size(0)
-    C = hl.specialize(a.size(1))
-    D = a.size(2)
-    DV = v.size(2)
-
-    w = torch.empty([BHN, C, D], dtype=a.dtype, device=a.device)
-    u = torch.empty([BHN, C, DV], dtype=v.dtype, device=v.device)
-    A_buf = torch.empty([BHN, C, C], dtype=a.dtype, device=a.device)
-
-    for tile_bhn, tile_dv in hl.tile([BHN, DV], block_size=[1, None]):
-        idx = tile_bhn.id
-
-        a_fwd = a[idx, :, :] * torch.exp(g_cs_d[idx, :, :])
-        a_bwd = a[idx, :, :] * torch.exp(-g_cs_d[idx, :, :])
-        A_raw = torch.mm(a_fwd, a_bwd.T)
-        A_buf[idx, :, :] = A_raw.to(A_buf.dtype)
-
-        for i in range(C):
-            bi = beta[idx, i]
-            ba_i = bi * a[idx, i, :] * torch.exp(g_cs_d[idx, i, :])
-            bv_i = bi * v[idx, i, tile_dv].float()
-
-            for j in range(C):
-                if j < i:
-                    A_ij = bi * A_buf[idx, i, j]
-                    ba_i = ba_i - A_ij * w[idx, j, :].float()
-                    bv_i = bv_i - A_ij * u[idx, j, tile_dv].float()
-
-            w[idx, i, :] = ba_i.to(w.dtype)
-            u[idx, i, tile_dv] = bv_i.to(u.dtype)
-
-    return w, u, A_buf
-
-
-@helion.kernel()
-def chunk_fwd_phase1_diag_fused(
-    w: torch.Tensor,
-    u: torch.Tensor,
-    a_scaled: torch.Tensor,
-    g_last_d: torch.Tensor,
-    h0: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused Phase 1 for correction: WY correction + state propagation + v_new."""
-    BH = w.size(0)
-    N = w.size(1)
-    D = w.size(3)
-    DV = u.size(3)
-
-    h_all = torch.empty([BH, N, D, DV], dtype=h0.dtype, device=h0.device)
-    v_new_all = torch.empty([BH, N, w.size(2), DV], dtype=u.dtype, device=u.device)
-
-    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
-        idx = tile_bh.id
-        h_acc = h0[idx, :, tile_dv].float()
-
-        for i_t in hl.grid(N):
-            h_all[idx, i_t, :, tile_dv] = h_acc.to(h_all.dtype)
-            h_orig = h_acc
-
-            gl_d = g_last_d[idx, i_t, :]
-            h_acc = h_orig * torch.exp(gl_d)[:, None]
-
-            w_i = w[idx, i_t, :, :]
-            u_i = u[idx, i_t, :, tile_dv]
-            v_corr = torch.mm(w_i, h_orig)
-            v_new = u_i.float() - v_corr
-            v_new_all[idx, i_t, :, tile_dv] = v_new.to(v_new_all.dtype)
-
-            a_sc_i = a_scaled[idx, i_t, :, :]
-            h_acc = h_acc + torch.mm(a_sc_i.T, v_new)
-
-    return h_all, v_new_all
 
 
 @helion.kernel()
@@ -1427,52 +1343,6 @@ def chunk_bwd_dh_diag_fused(
 
 
 @helion.kernel()
-def chunk_bwd_dh_correction_diag_fused(
-    w: torch.Tensor,
-    a_scaled: torch.Tensor,
-    q_scaled: torch.Tensor,
-    do: torch.Tensor,
-    dv_new_intra: torch.Tensor,
-    g_last_d: torch.Tensor,
-    dh_init: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused corrected reverse dH propagation + dv_new computation."""
-    BH = w.size(0)
-    N = w.size(1)
-    D = w.size(3)
-    DV = do.size(3)
-
-    dh_all = torch.empty([BH, N, D, DV], dtype=dh_init.dtype, device=dh_init.device)
-    dv_new_all = torch.empty([BH, N, w.size(2), DV], dtype=do.dtype, device=do.device)
-
-    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
-        idx = tile_bh.id
-        dh_acc = dh_init[idx, :, tile_dv].float()
-
-        for i_t in hl.grid(N):
-            i = N - 1 - i_t
-            dh_all[idx, i, :, tile_dv] = dh_acc.to(dh_all.dtype)
-            dh_orig = dh_acc
-
-            a_sc_i = a_scaled[idx, i, :, :]
-            dvi = dv_new_intra[idx, i, :, tile_dv]
-            dv_new = dvi.float() + torch.mm(a_sc_i, dh_orig)
-            dv_new_all[idx, i, :, tile_dv] = dv_new.to(dv_new_all.dtype)
-
-            gl_d = g_last_d[idx, i, :]
-            dh_acc = dh_orig * torch.exp(gl_d)[:, None]
-
-            q_sc_i = q_scaled[idx, i, :, :]
-            do_i = do[idx, i, :, tile_dv]
-            dh_acc = dh_acc + torch.mm(q_sc_i.T, do_i.float())
-
-            w_i = w[idx, i, :, :]
-            dh_acc = dh_acc - torch.mm(w_i.T, dv_new)
-
-    return dh_all, dv_new_all
-
-
-@helion.kernel()
 def chunk_bwd_dqk_helion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1751,60 +1621,6 @@ def chunk_bwd_dv_helion(
     return dv_out
 
 
-@helion.kernel()
-def chunk_bwd_dqkg_diag_helion(
-    q: torch.Tensor,
-    k_intra: torch.Tensor,
-    k_state: torch.Tensor,
-    v: torch.Tensor,
-    h: torch.Tensor,
-    do: torch.Tensor,
-    dh: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute dQ, dK_intra, dK_state for diagonal decay with pre-scaling."""
-    BHN = q.size(0)
-    C = hl.specialize(q.size(1))
-    D = q.size(2)
-    DV = v.size(2)
-
-    dq_out = torch.empty([BHN, C, D], dtype=q.dtype, device=q.device)
-    dk_intra_out = torch.empty([BHN, C, D], dtype=q.dtype, device=q.device)
-    dk_state_out = torch.empty([BHN, C, D], dtype=q.dtype, device=q.device)
-
-    for tile_bhn, tile_d in hl.tile([BHN, D]):
-        # Accumulate DV-dependent work first
-        dA_raw = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
-        dq_cross_acc = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
-        dk_state_acc = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
-
-        for tile_dv in hl.tile(DV):
-            dot = do[tile_bhn, :, tile_dv]
-            vt = v[tile_bhn, :, tile_dv]
-            ht = h[tile_bhn, tile_d, tile_dv]
-            dht = dh[tile_bhn, tile_d, tile_dv]
-
-            dA_raw = torch.baddbmm(dA_raw, dot, vt.transpose(-2, -1))
-            dq_cross_acc = torch.baddbmm(dq_cross_acc, dot, ht.transpose(-2, -1))
-            dk_state_acc = torch.baddbmm(dk_state_acc, vt, dht.transpose(-2, -1))
-
-        # Apply causal mask once after accumulation
-        idx = hl.arange(C)
-        causal = (idx[:, None] >= idx[None, :]).float()
-        dA = dA_raw * causal
-
-        # Compute dq and dk from accumulated terms
-        qt = q[tile_bhn, :, tile_d]
-        kit = k_intra[tile_bhn, :, tile_d]
-        dq_acc = torch.bmm(dA, kit) + dq_cross_acc
-        dk_intra_acc = torch.bmm(dA.transpose(-2, -1), qt)
-
-        dq_out[tile_bhn, :, tile_d] = dq_acc.to(q.dtype)
-        dk_intra_out[tile_bhn, :, tile_d] = dk_intra_acc.to(q.dtype)
-        dk_state_out[tile_bhn, :, tile_d] = dk_state_acc.to(q.dtype)
-
-    return dq_out, dk_intra_out, dk_state_out
-
-
 # Sub-block size for the anchored intra-chunk score matmul, matching FLA's
 BC_DIAG = 16
 
@@ -1910,48 +1726,6 @@ def chunk_fwd_o_diag_anchored_helion(
     return out
 
 
-@helion.kernel()
-def chunk_fwd_correction_helion(
-    q: torch.Tensor,
-    a: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    h: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Correction forward for one chunk: sequential delta-rule recurrence on GPU."""
-    BH, D, DV = h.size()
-    C = hl.specialize(q.size(1))
-
-    out = torch.empty([BH, C, DV], dtype=q.dtype, device=q.device)
-    h_new = torch.empty([BH, D, DV], dtype=h.dtype, device=h.device)
-
-    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
-        idx_bh = tile_bh.id
-        s = h[idx_bh, :, tile_dv].float()
-
-        for j in range(C):
-            gj = g[idx_bh, j, :]
-            s = s * torch.exp(gj)[:, None]
-
-            aj = a[idx_bh, j, :]
-            vj = v[idx_bh, j, tile_dv]
-            bj = beta[idx_bh, j]
-
-            kts = (aj[:, None] * s).sum(0, keepdim=True)
-            s = s - bj * aj[:, None] * kts
-            s = s + bj * aj[:, None] * vj[None, :]
-
-            qj = q[idx_bh, j, :]
-            oj = (qj[:, None] * s).sum(0)
-            out[idx_bh, j, tile_dv] = oj.to(out.dtype)
-
-        h_new[idx_bh, :, tile_dv] = s.to(h.dtype)
-
-    return out, h_new
-
-
-# ════════════════════════════════════════════════════════════════════════════════
 # Autograd integration
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -1989,43 +1763,37 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
 
         input_dtype = q.dtype
         diag_correction = (
-            beta is not None
-            and g is not None
-            and g.dim() == 4
-            and a is None
-            and initial_state is None
-            and not return_final_state
+            beta is not None and g is not None and g.dim() == 4 and a is None
         )
         scalar_decay_correction = (
-            beta is not None
-            and g is not None
-            and g.dim() == 3
-            and a is None
-            and initial_state is None
-            and not return_final_state
+            beta is not None and g is not None and g.dim() == 3 and a is None
         )
         if diag_correction:
             # KDA: beta correction + diagonal per-channel decay.
             ctx.diag_correction = True
-            o, h_all, v_new_all, A_inv, w_wy = _helion_chunked_fwd_kda(
-                q, k, v, g, beta, C
+            o, h_all, v_new_all, A_inv, w_wy, final_state = _helion_chunked_fwd_kda(
+                q, k, v, g, beta, C,
+                initial_state=initial_state,
+                return_final_state=return_final_state,
             )
             ctx.h_all = h_all
             ctx.v_new_all = v_new_all
             ctx.A_inv = A_inv
             ctx.w_wy = w_wy
-            final_state = None
         elif scalar_decay_correction:
             # Gated DeltaNet: beta correction and scalar decay.
             ctx.scalar_decay_correction = True
-            o, h_all, v_new_all, A_inv, w_wy = _helion_chunked_fwd_gated_delta(
-                q, k, v, g, beta, C
+            o, h_all, v_new_all, A_inv, w_wy, final_state = (
+                _helion_chunked_fwd_gated_delta(
+                    q, k, v, g, beta, C,
+                    initial_state=initial_state,
+                    return_final_state=return_final_state,
+                )
             )
             ctx.h_all = h_all
             ctx.v_new_all = v_new_all
             ctx.A_inv = A_inv
             ctx.w_wy = w_wy
-            final_state = None
         elif beta is not None and g is None:
             # DeltaNet: beta correction with no decay.
             o, h_all, v_new_all, A_inv, w_wy = _helion_chunked_fwd_delta(
@@ -2038,7 +1806,6 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
             final_state = None
             if return_final_state:
                 B, H, T_pad, D = q.shape
-                DV = v.shape[-1]
                 N = T_pad // C
                 BH = B * H
                 a_use = a if a is not None else k
@@ -2052,33 +1819,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                     use_g=False,
                 )
         elif beta is not None:
-            o, h_all, v_new_all, A_inv, w_wy = _helion_chunked_fwd_correction(
-                q, k, v, g, beta, a, C, initial_state=initial_state
+            raise NotImplementedError(
+                "beta correction with decay requires a=None"
             )
-            ctx.h_all = h_all
-            ctx.v_new_all = v_new_all
-            ctx.A_inv = A_inv
-            ctx.w_wy = w_wy
-            final_state = None
-            if return_final_state:
-                B, H, T_pad, D = q.shape
-                DV = v.shape[-1]
-                N = T_pad // C
-                BH = B * H
-                a_use = a if a is not None else k
-                g_corr = g.float()
-                if g_corr.dim() == 3:
-                    g_corr = g_corr.unsqueeze(-1).expand(-1, -1, -1, D).contiguous()
-                gc_last = g_corr.reshape(BH, N, C, D)[:, -1]
-                _, h_new = chunk_fwd_correction_helion(
-                    q.float().reshape(BH, N, C, D)[:, -1],
-                    a_use.float().reshape(BH, N, C, D)[:, -1],
-                    v.float().reshape(BH, N, C, DV)[:, -1],
-                    gc_last,
-                    beta.float().reshape(BH, N, C)[:, -1],
-                    h_all[:, -1],
-                )
-                final_state = h_new.reshape(B, H, D, DV)
         else:
             o, h_all, final_state = _helion_chunked_fwd(
                 q,
@@ -2195,22 +1938,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
             )
             return dq, dk, dv, None, dbeta, da, None, None, None, None
 
-        assert g is not None  # correction variants always supply decay
-        dq, dk, dv, dg, dbeta, da = _helion_chunked_bwd_correction(  # pyrefly: ignore
-            q,
-            k,
-            v,
-            g,
-            beta,  # pyrefly: ignore
-            a,
-            grad_output,
-            C,
-            h_all=h_all,
-            v_new_all=v_new_all,
-            A_inv=A_inv,
-            w_wy=w_wy,
+        raise NotImplementedError(
+            "beta correction with decay requires a=None"
         )
-        return dq, dk, dv, dg, dbeta, da, None, None, None, None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2419,13 +2149,19 @@ def _helion_chunked_fwd_gated_delta(
     g: torch.Tensor,
     beta: torch.Tensor,
     C: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    initial_state: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor | None,
+]:
     """Gated DeltaNet forward (beta correction + scalar decay).
 
     Runs the delta kernels with scalar decay folded in: the WY / UT transform
     and serial state pass with scalar_decay=True, and the shared output kernel
     with use_g=True. q is pre-scaled by the caller. Returns the triangular
-    inverse T as A_inv and w so the backward reuses them.
+    inverse T as A_inv and w so the backward reuses them, plus the final state
+    when requested. The final state uses the corrected values v_new (not v).
     """
     B, H, T, D = q.shape
     DV = v.shape[-1]
@@ -2448,7 +2184,7 @@ def _helion_chunked_fwd_gated_delta(
     k4 = k.reshape(BH, N, C, D)
     w4 = w.reshape(BH, N, C, D)
     u4 = u.reshape(BH, N, C, DV)
-    state = q.new_zeros(BH, D, DV, dtype=k.dtype)
+    state = _init_state(initial_state, BH, D, DV, q).to(k.dtype)
     h_all, v_new_all = chunk_fwd_h_delta_helion(
         k4, w4, u4, state, g_cs, decay_last, scalar_decay=True
     )
@@ -2458,7 +2194,18 @@ def _helion_chunked_fwd_gated_delta(
 
     o = chunk_fwd_o_helion(q.reshape(BHN, C, D), kf, vnewf, g_cs_flat, hf, use_g=True)
 
-    return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w
+    final_state = None
+    if return_final_state:
+        g_last_4d = decay_last.unsqueeze(-1).expand(-1, -1, D)  # [BH, N, D]
+        k_state_last = (
+            k4[:, -1].float()
+            * torch.exp(decay_last[:, -1, None, None] - g_cs[:, -1, :, None])
+        ).to(k.dtype)
+        final_state = _final_state_from_h_all(
+            h_all[:, -1], k_state_last, v_new_all[:, -1], g_last_4d[:, -1], B, H
+        )
+
+    return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
 
 
 def _helion_chunked_fwd_kda(
@@ -2468,14 +2215,20 @@ def _helion_chunked_fwd_kda(
     g: torch.Tensor,
     beta: torch.Tensor,
     C: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    initial_state: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor | None,
+]:
     """KDA forward (beta correction + diagonal per-channel decay).
 
     The delta kernels with diagonal decay folded in (diag_anchored=True): the
     anchored double-gram (Aqk, Akk), the WY / UT transform reading Akk, the serial
     state pass with per-channel decay, and the shared anchored output kernel. q is
     pre-scaled by the caller. Returns the triangular inverse T (A_inv), w, and the
-    anchored Aqk so the backward reuses them.
+    anchored Aqk so the backward reuses them, plus the final state when requested.
+    The final state uses the corrected values v_new (not v).
     """
     B, H, T, D = q.shape
     DV = v.shape[-1]
@@ -2504,7 +2257,7 @@ def _helion_chunked_fwd_kda(
     k4 = k.reshape(BH, N, C, D)
     w4 = w.reshape(BH, N, C, D)
     u4 = u.reshape(BH, N, C, DV)
-    state = q.new_zeros(BH, D, DV, dtype=k.dtype)
+    state = _init_state(initial_state, BH, D, DV, q).to(k.dtype)
     h_all, v_new_all = chunk_fwd_h_delta_helion(
         k4, w4, u4, state, g_cs, decay_last, diag_anchored=True
     )
@@ -2515,83 +2268,16 @@ def _helion_chunked_fwd_kda(
     # Output: o = (q * exp2(gc)) @ h + Aqk @ v_new (anchored, per-channel decay).
     o = chunk_fwd_o_diag_anchored_helion(qf, vnewf, g_cs_flat, hf, Aqk, 1.0)
 
-    return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w
+    final_state = None
+    if return_final_state:
+        k_state_last = (
+            k4[:, -1].float() * torch.exp(g_cs[:, -1, -1:, :] - g_cs[:, -1])
+        ).to(k.dtype)
+        final_state = _final_state_from_h_all(
+            h_all[:, -1], k_state_last, v_new_all[:, -1], decay_last[:, -1], B, H
+        )
 
-
-def _helion_chunked_fwd_correction(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    a: torch.Tensor | None,
-    C: int,
-    initial_state: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    B, H, T, D = q.shape
-    DV = v.shape[-1]
-    N = T // C
-    assert T % C == 0
-    BH = B * H
-    BHN = BH * N
-
-    q, k, v, g = q.float(), k.float(), v.float(), g.float()
-    beta = beta.float()
-    if a is not None:
-        a = a.float()
-    else:
-        a = k
-
-    diagonal_decay = g.dim() == 4
-
-    g_scalar: torch.Tensor | None = None
-    if not diagonal_decay:
-        g_scalar = g.reshape(BH, N, C)
-        g = g.unsqueeze(-1).expand(-1, -1, -1, D).contiguous()
-
-    qc = q.reshape(BH, N, C, D)
-    ac = a.reshape(BH, N, C, D)
-    vc = v.reshape(BH, N, C, DV)
-    gc = g.reshape(BH, N, C, D)
-    bc = beta.reshape(BH, N, C)
-
-    g_cs_d = gc.cumsum(-2)
-    g_last_d = g_cs_d[:, :, -1, :]
-
-    ac_flat = ac.reshape(BHN, C, D)
-    vc_flat = vc.reshape(BHN, C, DV)
-    g_cs_d_flat = g_cs_d.reshape(BHN, C, D)
-    bc_flat = bc.reshape(BHN, C)
-
-    w, u, A_buf = chunk_fwd_wy_diag_helion(ac_flat, vc_flat, bc_flat, g_cs_d_flat)
-    A_inv = None
-    w = w.reshape(BH, N, C, D)
-    u = u.reshape(BH, N, C, DV)
-
-    a_scaled_4d = ac * torch.exp(g_last_d[:, :, None, :] - g_cs_d)
-
-    state = _init_state(initial_state, BH, D, DV, q)
-    h_all, v_new_all = chunk_fwd_phase1_diag_fused(w, u, a_scaled_4d, g_last_d, state)
-
-    if diagonal_decay:
-        qf2 = (qc * torch.exp(g_cs_d)).reshape(BHN, C, D)
-        af2 = (ac * torch.exp(-g_cs_d)).reshape(BHN, C, D)
-        g_cs_for_output = q.new_zeros(BHN, C, dtype=torch.float32)
-    else:
-        qf2 = qc.reshape(BHN, C, D)
-        af2 = ac.reshape(BHN, C, D)
-        assert g_scalar is not None
-        g_cs_for_output = g_scalar.cumsum(-1).reshape(BHN, C)
-
-    o = chunk_fwd_o_helion(
-        qf2,
-        af2,
-        v_new_all.reshape(BHN, C, DV),
-        g_cs_for_output,
-        h_all.reshape(BHN, D, DV),
-    )
-
-    return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w
+    return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
 
 
 def _helion_chunked_bwd(
@@ -3014,255 +2700,6 @@ def _helion_chunked_bwd_kda(
     return dq_out, dk_out, dv_out, dg_out, dbeta_out
 
 
-def _recompute_wy(
-    ac_flat: torch.Tensor,
-    vc_flat: torch.Tensor,
-    bc_flat: torch.Tensor,
-    g_cs_d_flat: torch.Tensor,
-    BH: int,
-    N: int,
-    C: int,
-    D: int,
-    DV: int,
-    A_inv: torch.Tensor | None,
-    w_wy: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    w_recomp, u_recomp, A_buf = chunk_fwd_wy_diag_helion(
-        ac_flat, vc_flat, bc_flat, g_cs_d_flat
-    )
-    if A_inv is None:
-        idx_C = torch.arange(C, device=ac_flat.device)
-        mask = (idx_C.unsqueeze(-1) > idx_C.unsqueeze(-2)).float()
-        A = bc_flat.unsqueeze(-1) * A_buf * mask
-        A_inv = solve_tril_inv(A)
-    if w_wy is not None:
-        w = w_wy.reshape(BH, N, C, D)
-    else:
-        w = w_recomp.reshape(BH, N, C, D)
-    u_val = u_recomp.reshape(BH, N, C, DV)
-    return w, u_val, A_inv
-
-
-def _helion_chunked_bwd_correction(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    a: torch.Tensor | None,
-    grad_output: torch.Tensor,
-    C: int,
-    h_all: torch.Tensor | None = None,
-    v_new_all: torch.Tensor | None = None,
-    A_inv: torch.Tensor | None = None,
-    w_wy: torch.Tensor | None = None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor | None,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor | None,
-]:
-    B, H, T, D = q.shape
-    DV = v.shape[-1]
-    N = T // C
-    BH = B * H
-    BHN = BH * N
-
-    q, k, v, g = q.float(), k.float(), v.float(), g.float()
-    beta = beta.float()
-    has_a = a is not None
-    if a is not None:
-        a = a.float()
-    else:
-        a = k
-
-    diagonal_decay = g.dim() == 4
-
-    g_cs_scalar: torch.Tensor | None = None
-    g_last_scalar: torch.Tensor | None = None
-    if not diagonal_decay:
-        g_scalar = g.reshape(BH, N, C)
-        g_cs_scalar = g_scalar.cumsum(-1)
-        g_last_scalar = g_cs_scalar[:, :, -1]
-        g = g.unsqueeze(-1).expand(-1, -1, -1, D).contiguous()
-
-    qc = q.reshape(BH, N, C, D)
-    ac = a.reshape(BH, N, C, D)
-    vc = v.reshape(BH, N, C, DV)
-    gc = g.reshape(BH, N, C, D)
-    bc = beta.reshape(BH, N, C)
-    doc = grad_output.float().reshape(BH, N, C, DV)
-
-    g_cs_d = gc.cumsum(-2)
-    g_last_d = g_cs_d[:, :, -1, :]
-
-    ac_flat = ac.reshape(BHN, C, D)
-    vc_flat = vc.reshape(BHN, C, DV)
-    g_cs_d_flat = g_cs_d.reshape(BHN, C, D)
-    bc_flat = bc.reshape(BHN, C)
-
-    w, u_val, A_inv = _recompute_wy(
-        ac_flat, vc_flat, bc_flat, g_cs_d_flat, BH, N, C, D, DV, A_inv, w_wy
-    )
-
-    if h_all is None or v_new_all is None:
-        a_scaled_4d = ac * torch.exp(g_last_d[:, :, None, :] - g_cs_d)
-        h_all, v_new_all = chunk_fwd_phase1_diag_fused(
-            w,
-            u_val,
-            a_scaled_4d,
-            g_last_d,
-            _init_state(None, BH, D, DV, q),
-        )
-
-    exp_g_cs_d = torch.exp(g_cs_d)
-    exp_neg_g_cs_d = torch.exp(-g_cs_d)
-    exp_gl_gc_d = torch.exp(g_last_d[:, :, None, :] - g_cs_d)
-
-    q_scaled = q.reshape(BH, N, C, D) * exp_g_cs_d
-    a_intra = ac * exp_neg_g_cs_d
-    a_scaled_c = ac * exp_gl_gc_d
-
-    qf = q_scaled.reshape(BHN, C, D)
-    af_intra = a_intra.reshape(BHN, C, D)
-    a_scaled_f = a_scaled_c.reshape(BHN, C, D)
-    v_new_fwd_f = v_new_all.reshape(BHN, C, DV).float()
-    zero_g_cs = q.new_zeros(BHN, C, dtype=torch.float32)
-    hf = h_all.reshape(BHN, D, DV)
-    dof = doc.reshape(BHN, C, DV)
-
-    zero_dh = q.new_zeros(BHN, D, DV, dtype=torch.float32)
-    dv_new_intra_flat = chunk_bwd_dv_helion(
-        qf, af_intra, a_scaled_f, zero_g_cs, dof, zero_dh
-    )
-    dv_new_intra_c = dv_new_intra_flat.reshape(BH, N, C, DV)
-
-    dstate = q.new_zeros(BH, D, DV, dtype=torch.float32)
-    dh_all, dv_new_bwd = chunk_bwd_dh_correction_diag_fused(
-        w,
-        a_scaled_c,
-        q_scaled,
-        doc,
-        dv_new_intra_c,
-        g_last_d,
-        dstate,
-    )
-
-    dv_new_bwd_f = dv_new_bwd.reshape(BHN, C, DV).float()
-    dhf = dh_all.reshape(BHN, D, DV)
-
-    dw = -torch.bmm(dv_new_bwd_f, hf.transpose(-2, -1))
-    du = dv_new_bwd_f
-
-    da_wy, dv_out_flat, dbeta_flat, dg_cs_d_wy = prepare_wy_repr_bwd(
-        ac_flat, vc_flat, bc_flat, g_cs_d_flat, A_inv, dw, du
-    )
-
-    if diagonal_decay:
-        dq_raw, da_intra_raw, da_state_raw = chunk_bwd_dqkg_diag_helion(
-            qf,
-            af_intra,
-            a_scaled_f,
-            v_new_fwd_f,
-            hf,
-            dof,
-            dhf,
-        )
-
-        dq_raw_r = dq_raw.float().reshape(B, H, N, C, D)
-        da_intra_raw_r = da_intra_raw.float().reshape(B, H, N, C, D)
-        da_state_raw_r = da_state_raw.float().reshape(B, H, N, C, D)
-        qc_r = qc.reshape(B, H, N, C, D)
-        ac_r = ac.reshape(B, H, N, C, D)
-        exp_g_cs_d_r = exp_g_cs_d.reshape(B, H, N, C, D)
-        exp_neg_g_cs_d_r = exp_neg_g_cs_d.reshape(B, H, N, C, D)
-        exp_gl_gc_d_r = exp_gl_gc_d.reshape(B, H, N, C, D)
-
-        dg_cs_d_total = (
-            dq_raw_r * qc_r * exp_g_cs_d_r
-            - da_intra_raw_r * ac_r * exp_neg_g_cs_d_r
-            - da_state_raw_r * ac_r * exp_gl_gc_d_r
-        )
-
-        dg_cs_d_combined = dg_cs_d_total + dg_cs_d_wy.reshape(B, H, N, C, D)
-        dg_per_step = dg_cs_d_combined.flip(-2).cumsum(-2).flip(-2)
-
-        h_all_r = h_all.float().reshape(B, H, N, D, DV)
-        dh_all_r = dh_all.float().reshape(B, H, N, D, DV)
-        g_last_d_r = g_last_d.reshape(B, H, N, D)
-        dg_last_d = (dh_all_r * h_all_r * torch.exp(g_last_d_r).unsqueeze(-1)).sum(
-            -1
-        ) + (da_state_raw_r * ac_r * exp_gl_gc_d_r).sum(-2)
-        dg_per_step = dg_per_step + dg_last_d.unsqueeze(-2)
-
-        dq = (
-            (dq_raw.float() * exp_g_cs_d.reshape(BHN, C, D)).reshape(B, H, T, D).float()
-        )
-        da_par = da_intra_raw.float() * exp_neg_g_cs_d.reshape(
-            BHN, C, D
-        ) + da_state_raw.float() * exp_gl_gc_d.reshape(BHN, C, D)
-        da_total_flat = da_par + da_wy
-        dg_out = dg_per_step.reshape(B, H, T, D).float()
-    else:
-        assert g_cs_scalar is not None
-        assert g_last_scalar is not None
-        g_csf = g_cs_scalar.reshape(BHN, C)
-        g_lastf = g_last_scalar.reshape(BHN)
-        qf_raw = qc.reshape(BHN, C, D)
-        af_raw = ac_flat
-
-        dq_raw, da_par, dg_by_d = chunk_bwd_dqkg_scalar_helion(
-            qf_raw,
-            af_raw,
-            v_new_fwd_f,
-            g_csf,
-            hf,
-            dof,
-            dhf,
-            g_last=g_lastf,
-        )
-        dg_attn_state = dg_by_d.sum(-1).reshape(BHN, C)
-
-        dg_cs_wy = dg_cs_d_wy.sum(-1)
-        dg_wy_per_step = (
-            dg_cs_wy.float()
-            .reshape(BH, N, C)
-            .flip(-1)
-            .cumsum(-1)
-            .flip(-1)
-            .reshape(BHN, C)
-        )
-        dg_chunks = dg_attn_state.float() + dg_wy_per_step
-
-        da_total_flat = da_par + da_wy
-        dq = dq_raw.reshape(B, H, T, D).float()
-        dg_out = dg_chunks.reshape(B, H, T).float()
-
-    dv_out = dv_out_flat.reshape(B, H, T, DV).float()
-    dbeta_out = dbeta_flat.reshape(B, H, T).float()
-
-    if has_a:
-        return (
-            dq,
-            None,
-            dv_out,
-            dg_out,
-            dbeta_out,
-            da_total_flat.reshape(B, H, T, D).float(),
-        )
-    return (
-        dq,
-        da_total_flat.reshape(B, H, T, D).float(),
-        dv_out,
-        dg_out,
-        dbeta_out,
-        None,
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════════
 # Public entry point
 # ════════════════════════════════════════════════════════════════════════════════
 
