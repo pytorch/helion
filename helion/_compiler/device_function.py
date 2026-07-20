@@ -1141,10 +1141,12 @@ class DeviceFunction:
         """
         return None
 
-    def register_dma_semaphore(self, name_hint: str = "sem") -> str:
+    def register_dma_semaphore(
+        self, name_hint: str = "sem", shape: tuple[int, ...] = ()
+    ) -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""
         return self.register_scratch(
-            (), None, name_hint=name_hint, scratch_type="dma_semaphore"
+            shape, None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:

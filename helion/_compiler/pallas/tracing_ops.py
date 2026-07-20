@@ -483,6 +483,11 @@ def _classify_loop_tensors(
     return loaded_tensors, stored_tensors
 
 
+def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
+    """Drop rank-expanding ``None`` entries from a tensor subscript."""
+    return [index for index in subscript_meta if index is not None]
+
+
 def _get_dim_block_ids(
     subscript_meta: list[object],
     env: CompileEnvironment,
@@ -491,7 +496,7 @@ def _get_dim_block_ids(
     dim_to_bid: dict[int, int] = {}
     if not isinstance(subscript_meta, (list, tuple)):
         return dim_to_bid
-    for dim_idx, idx in enumerate(subscript_meta):
+    for dim_idx, idx in enumerate(_tensor_dim_subscripts(subscript_meta)):
         if isinstance(idx, torch.SymInt):
             bid = env.get_block_id(idx)
             if bid is not None:
@@ -1936,6 +1941,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
 
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+        tensor_subscripts = _tensor_dim_subscripts(subscript_meta)
         shape = fake.shape
         block_shape_parts: list[str] = []
         lambda_parts: list[str] = []
@@ -2052,8 +2058,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 lambda_parts.append("0")
             else:
                 idx_meta = (
-                    subscript_meta[dim_idx]
-                    if dim_idx < len(subscript_meta)
+                    tensor_subscripts[dim_idx]
+                    if dim_idx < len(tensor_subscripts)
                     else slice(None)
                 )
                 from helion._utils import is_scalar_index
@@ -2392,6 +2398,7 @@ def _is_supported_contiguous_row_slab_dma(
         return False
 
     dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    tensor_subscripts = _tensor_dim_subscripts(sub_meta)
     inner_dims = [dim for dim, bid in dim_to_bid.items() if bid in block_ids]
     if len(inner_dims) != 1:
         return False
@@ -2405,7 +2412,11 @@ def _is_supported_contiguous_row_slab_dma(
     from helion._utils import is_scalar_index
 
     for dim_idx in range(row_dim):
-        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        idx_meta = (
+            tensor_subscripts[dim_idx]
+            if dim_idx < len(tensor_subscripts)
+            else slice(None)
+        )
         if vmem_shape[dim_idx] != 1:
             return False
         if dim_idx in dim_to_bid:
@@ -2414,7 +2425,11 @@ def _is_supported_contiguous_row_slab_dma(
             return False
 
     for dim_idx in range(row_dim + 1, fake.ndim):
-        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        idx_meta = (
+            tensor_subscripts[dim_idx]
+            if dim_idx < len(tensor_subscripts)
+            else slice(None)
+        )
         if idx_meta != slice(None):
             return False
         if dim_idx in dim_to_bid:
@@ -2457,6 +2472,7 @@ def _compute_vmem_shapes(
     vmem_shapes: list[tuple[int, ...]] = []
     for fake, sub_meta, _direction in all_tensor_info:
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        tensor_subscripts = _tensor_dim_subscripts(sub_meta)
         parts: list[int] = []
         for dim_idx in range(len(fake.shape)):
             bid = dim_to_bid.get(dim_idx)
@@ -2478,13 +2494,16 @@ def _compute_vmem_shapes(
                 else:
                     parts.append(int(fake.shape[dim_idx]))
             else:
-                idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+                idx_meta = (
+                    tensor_subscripts[dim_idx]
+                    if dim_idx < len(tensor_subscripts)
+                    else slice(None)
+                )
                 from helion._utils import is_scalar_index
 
-                if is_scalar_index(idx_meta):
-                    parts.append(1)
-                else:
-                    parts.append(int(fake.shape[dim_idx]))
+                parts.append(
+                    1 if is_scalar_index(idx_meta) else int(fake.shape[dim_idx])
+                )
         vmem_shapes.append(tuple(parts))
     return vmem_shapes
 
@@ -2552,6 +2571,21 @@ def _classify_pipelined_tensors(
             if isinstance(val, torch.Tensor):
                 outer_access_tensor_ids.add(id(val))
 
+    # Pallas lowers atomics as direct load/compute/store operations on their
+    # tensor ref. Such a tensor cannot simultaneously be remapped to the
+    # loop-local DMA scratch used by ordinary loads.
+    atomic_storages: set[int] = set()
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in ATOMIC_OPS:
+                continue
+            tensor_node = node.args[0]
+            if not isinstance(tensor_node, torch.fx.Node):
+                continue
+            val = tensor_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                atomic_storages.add(id(val.untyped_storage()))
+
     pipelined_ids: set[int] = set()
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
@@ -2562,6 +2596,8 @@ def _classify_pipelined_tensors(
             continue
         if id(fake) in outer_access_tensor_ids:
             continue
+        if id(fake.untyped_storage()) in atomic_storages:
+            continue
         pipelined_ids.add(id(fake))
     return all_tensor_info, vmem_shapes, pipelined_ids
 
@@ -2569,12 +2605,12 @@ def _classify_pipelined_tensors(
 def _codegen_fori_loop(state: CodegenState) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
-    When inner block shapes satisfy TPU DMA alignment, uses
-    ``pltpu.make_async_copy`` for double-buffered DMA pipelining.
-    Otherwise, falls back to direct ``pl.ds`` slicing on HBM refs
-    (no DMA, no alignment requirement).
+    Tensors admitted by the existing streaming classifier use explicit DMA.
+    Selected read-only input tensors use two DMA buffers; all other routes keep
+    their existing single-buffered lowering.
     """
     from ..device_ir import ForLoopGraphInfo
+    from ..device_ir import LiftTensorArgs
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import ForiLoopState
@@ -2681,23 +2717,63 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     tensor_to_dma_scratch: dict[str, str] = {}
     tensor_to_sem: dict[str, str] = {}
-    for (fake, _sub_meta, _direction), vmem_shape in zip(
+    double_buffered_tensors: set[str] = set()
+    depth_two_loads: list[tuple[torch.Tensor, list[object], str, str]] = []
+    # compact_worklist shares this lowering but keeps its compact/resident routes;
+    # only an actual fori_loop config enables depth-two staging.
+    enable_double_buffering = state.config.get("pallas_loop_type") == "fori_loop"
+
+    input_tensors = cast(
+        "list[torch.Tensor]",
+        LiftTensorArgs(dict(HostFunction.current().params.arguments)).get_tensor_args(),
+    )
+    input_slots_by_id: dict[int, list[int]] = {}
+    input_slots_by_storage: dict[int, list[int]] = {}
+    for input_slot, input_tensor in enumerate(input_tensors):
+        input_slots_by_id.setdefault(id(input_tensor), []).append(input_slot)
+        input_slots_by_storage.setdefault(
+            id(input_tensor.untyped_storage()), []
+        ).append(input_slot)
+    stored_tensor_storages = {
+        id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
+    }
+
+    for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
         if id(fake) not in pipelined_tensor_ids:
             continue
+        storage_id = id(fake.untyped_storage())
+        input_slots = input_slots_by_id.get(id(fake))
+        if input_slots is None:
+            input_slots = input_slots_by_storage.get(storage_id)
+        load_buffer_count = (
+            state.config.pallas_load_buffer_count[input_slots[0]]
+            if enable_double_buffering
+            and direction == "load"
+            and storage_id not in stored_tensor_storages
+            and input_slots is not None
+            and len(input_slots) == 1
+            else 1
+        )
         state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.register_scratch(
-            vmem_shape,
+            (load_buffer_count, *vmem_shape)
+            if load_buffer_count > 1
+            else vmem_shape,
             fake.dtype,
             name_hint=hbm_name.replace("_hbm", "") + "_buf",
         )
         sem_name = state.device_function.register_dma_semaphore(
             name_hint=hbm_name.replace("_hbm", "") + "_sem",
+            shape=(load_buffer_count,) if load_buffer_count > 1 else (),
         )
         tensor_to_dma_scratch[hbm_name] = vmem_name
         tensor_to_sem[hbm_name] = sem_name
+        if load_buffer_count == 2:
+            double_buffered_tensors.add(hbm_name)
+            depth_two_loads.append((fake, sub_meta, vmem_name, sem_name))
 
     # Build the body function
     body_stmts: list[ast.AST] = []
@@ -2753,16 +2829,15 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         offset_expr_fn=lambda i, bs: f"{dim_idx_exprs[i]} * {bs} + jnp.arange({bs})",
     )
 
-    # Create ForiLoopState (body_fn_name and loop_var_name are currently
-    # unused by consumers but stored for debugging; use outermost values)
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
         body_fn_name="_fori_body_0",
-        loop_var_name=loop_vars[0],
+        loop_var_name=loop_vars[-1],
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
+        _double_buffered_tensors=double_buffered_tensors,
     )
     resident_prep_lowerings = _prepare_resident_prep_lowerings(
         state, block_ids, all_tensor_info
@@ -2785,6 +2860,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         subscript_meta: list[object],
         *,
         clamp: bool,
+        iteration_indices: list[str] | None = None,
+        stage_expr: str | None = None,
     ) -> tuple[str, str]:
         """Build (vmem_ref, hbm_ref) ref slices for a DMA copy with loop variable.
 
@@ -2797,7 +2874,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         """
         from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
 
+        if iteration_indices is None:
+            iteration_indices = dim_idx_exprs
+        assert len(iteration_indices) == len(block_ids)
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+        tensor_subscripts = _tensor_dim_subscripts(subscript_meta)
         shape = fake.shape
         hbm_parts: list[str] = []
         vmem_parts: list[str] = []
@@ -2810,7 +2891,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
                 slice_size_expr = slice_size_exprs[bid_idx]
-                dim_idx_expr = dim_idx_exprs[bid_idx]
+                dim_idx_expr = iteration_indices[bid_idx]
                 offset_expr = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
                 # Mosaic requires the lane (/128) and sublane (/8) VMEM dims to
                 # stay tile-aligned, so only clamp dims outside the last two; a
@@ -2856,8 +2937,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 vmem_parts.append(":")
             else:
                 idx_meta = (
-                    subscript_meta[dim_idx]
-                    if dim_idx < len(subscript_meta)
+                    tensor_subscripts[dim_idx]
+                    if dim_idx < len(tensor_subscripts)
                     else slice(None)
                 )
                 from helion._utils import is_scalar_index
@@ -2873,12 +2954,104 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         # dynamically-shaped array; make_async_copy operates on Refs.  Each side
         # falls back to the bare ref when it has no slices.
         hbm = f"{hbm_name}.at[{', '.join(hbm_parts)}]" if hbm_needs_slice else hbm_name
+        vmem_base = (
+            f"{vmem_name}.at[{stage_expr}]" if stage_expr is not None else vmem_name
+        )
         vmem = (
-            f"{vmem_name}.at[{', '.join(vmem_parts)}]"
+            f"{vmem_base}.at[{', '.join(vmem_parts)}]"
             if vmem_needs_slice
-            else vmem_name
+            else vmem_base
         )
         return vmem, hbm
+
+    def _dma_copy_statements(
+        fake: torch.Tensor,
+        sub_meta: list[object],
+        vmem_name: str,
+        sem_name: str,
+        iteration_indices: list[str],
+        stage_expr: str | None,
+        methods: tuple[str, ...],
+        *,
+        store: bool = False,
+    ) -> list[ast.stmt]:
+        hbm_name = state.device_function.tensor_arg(fake).name
+        vmem_ref, hbm_ref = _build_dma_slices(
+            fake,
+            vmem_name,
+            hbm_name,
+            sub_meta,
+            clamp=store,
+            iteration_indices=iteration_indices,
+            stage_expr=stage_expr,
+        )
+        sem_ref = f"{sem_name}.at[{stage_expr}]" if stage_expr is not None else sem_name
+        source, destination = (vmem_ref, hbm_ref) if store else (hbm_ref, vmem_ref)
+        copy_var = state.device_function.new_var("_copy_out" if store else "_copy")
+        return [
+            statement_from_string(
+                f"{copy_var} = pltpu.make_async_copy({source}, {destination}, {sem_ref})"
+            ),
+            *(statement_from_string(f"{copy_var}.{method}()") for method in methods),
+        ]
+
+    def _guarded_statements(
+        condition: str, name_hint: str, statements: list[ast.stmt]
+    ) -> ast.FunctionDef:
+        fn_name = state.device_function.new_var(name_hint)
+        fn_def = statement_from_string(
+            f"@pl.when({condition})\ndef {fn_name}():\n    pass"
+        )
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = statements or [ast.Pass()]
+        return fn_def
+
+    prime_statements: list[ast.stmt] = []
+    body_load_prefix: list[ast.stmt] = []
+    body_depth_two_waits: list[ast.stmt] = []
+    if depth_two_loads:
+        num_iterations = state.device_function.new_var("_num_iterations")
+        prime_statements.append(
+            statement_from_string(f"{num_iterations} = {grid_parts[-1]}")
+        )
+        grid_parts[-1] = num_iterations
+
+        prime_indices = [*loop_vars]
+        prime_indices[-1] = "0"
+        prime_starts: list[ast.stmt] = []
+        for record in depth_two_loads:
+            prime_starts.extend(
+                _dma_copy_statements(*record, prime_indices, "0", ("start",))
+            )
+        prime_statements.append(
+            _guarded_statements(
+                f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
+            )
+        )
+
+        stage_loop_var = loop_vars[-1]
+        next_iteration = f"({stage_loop_var} + 1)"
+        next_indices = [*loop_vars]
+        next_indices[-1] = next_iteration
+        next_stage = f"{next_iteration} % 2"
+        next_starts: list[ast.stmt] = []
+        for record in depth_two_loads:
+            next_starts.extend(
+                _dma_copy_statements(*record, next_indices, next_stage, ("start",))
+            )
+        body_load_prefix.append(
+            _guarded_statements(
+                f"{next_iteration} < {num_iterations}",
+                "_prefetch_fori_loads",
+                next_starts,
+            )
+        )
+
+        current_stage = f"{stage_loop_var} % 2"
+        for record in depth_two_loads:
+            body_depth_two_waits.extend(
+                _dma_copy_statements(*record, [*loop_vars], current_stage, ("wait",))
+            )
 
     # For loop-carried state, remap args to scratch reads inside the body
     body_args = (
@@ -2902,23 +3075,29 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     )
                 )
 
+        for statement in body_load_prefix:
+            state.codegen.add_statement(statement)
+
         for fake, _tensor_node, sub_meta in loaded_tensors.values():
             hbm_name = state.device_function.tensor_arg(fake).name
-            if hbm_name not in tensor_to_dma_scratch:
+            if (
+                hbm_name not in tensor_to_dma_scratch
+                or hbm_name in double_buffered_tensors
+            ):
                 continue
-            vmem_name = tensor_to_dma_scratch[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
-            vmem_ref, hbm_ref = _build_dma_slices(
-                fake, vmem_name, hbm_name, sub_meta, clamp=False
-            )
-            copy_var = state.device_function.new_var("_copy")
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"{copy_var} = pltpu.make_async_copy({hbm_ref}, {vmem_ref}, {sem_name})"
-                )
-            )
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
-            state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
+            for statement in _dma_copy_statements(
+                fake,
+                sub_meta,
+                tensor_to_dma_scratch[hbm_name],
+                tensor_to_sem[hbm_name],
+                [*loop_vars],
+                None,
+                ("start", "wait"),
+            ):
+                state.codegen.add_statement(statement)
+
+        for statement in body_depth_two_waits:
+            state.codegen.add_statement(statement)
 
         with state.codegen.resident_prep_lowering_scope(resident_prep_lowerings):
             graph_results = codegen_call_with_graph(
@@ -2932,21 +3111,17 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             hbm_name = state.device_function.tensor_arg(fake).name
             if hbm_name not in tensor_to_dma_scratch:
                 continue
-            vmem_name = tensor_to_dma_scratch[hbm_name]
-            sem_name = tensor_to_sem[hbm_name]
-            vmem_ref, hbm_ref = _build_dma_slices(
-                fake, vmem_name, hbm_name, sub_meta, clamp=True
-            )
-            copy_out_var = state.device_function.new_var("_copy_out")
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"{copy_out_var} = pltpu.make_async_copy({vmem_ref}, {hbm_ref}, {sem_name})"
-                )
-            )
-            state.codegen.add_statement(
-                statement_from_string(f"{copy_out_var}.start()")
-            )
-            state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+            for statement in _dma_copy_statements(
+                fake,
+                sub_meta,
+                tensor_to_dma_scratch[hbm_name],
+                tensor_to_sem[hbm_name],
+                [*loop_vars],
+                None,
+                ("start", "wait"),
+                store=True,
+            ):
+                state.codegen.add_statement(statement)
 
     # Compact-worklist outer tile: it IS the grid (exactly one tile per work
     # item, since the builder guarantees extent <= BLOCK), so emit the body
@@ -2989,13 +3164,16 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         fori_call = statement_from_string(
             f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None)"
         )
+        call_prefix = prime_statements if dim == len(loop_vars) - 1 else []
         if dim == 0:
             # Outermost: emit function def and fori_loop call into the kernel
             state.add_statement(fn_def)
+            for statement in call_prefix:
+                state.add_statement(statement)
             state.add_statement(fori_call)
         else:
             # Inner: wrap in the next outer function's body
-            current_body = [fn_def, fori_call]
+            current_body = [fn_def, *call_prefix, fori_call]
 
     # After fori_loop: read final loop-carried state from scratch
     if has_loop_state:
@@ -3138,6 +3316,11 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
+            if env.is_jagged_tile(index):
+                mask_shape = env.jagged_tile_mask_shapes[index]
+                expand = state.tile_strategy.jagged_tile_expand_str(
+                    mask_shape, input_sizes
+                )
             # Cast bool mask to float before expanding — Mosaic cannot
             # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
             expr = f"({mask_var}.astype(jnp.float32){expand})"

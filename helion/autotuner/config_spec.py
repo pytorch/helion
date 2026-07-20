@@ -424,6 +424,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_load_buffer_count",
         "pallas_pre_broadcast",
         "xcd_remap",
     }
@@ -453,6 +454,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_load_buffer_count",
         "pallas_pre_broadcast",
         "cute_vector_widths",
         *BACKEND_TUNABLE_KEYS,
@@ -621,6 +623,10 @@ class ConfigSpec:
         )
         self.atomic_indexing = ListOf(
             EnumFragment(choices=self.valid_atomic_indexing_types()),
+            length=0,
+        )
+        self.pallas_load_buffer_count = ListOf(
+            IntegerFragment(1, 2, 1),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -1659,6 +1665,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "pallas_load_buffer_count",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -1692,6 +1699,14 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if (
+            self.supports_config_key("pallas_load_buffer_count")
+            and self.pallas_load_buffer_count.length > 0
+        ):
+            config.setdefault(
+                "pallas_load_buffer_count",
+                self.pallas_load_buffer_count.default(),
+            )
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         if self.backend_name == "cute":
@@ -1708,6 +1723,29 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        if (
+            not self.has_pallas_inner_loops
+            or config.get("pallas_loop_type") != "fori_loop"
+        ):
+            config.pop("pallas_load_buffer_count", None)
+        elif "pallas_load_buffer_count" in config:
+            values = config["pallas_load_buffer_count"]
+            expected = self.pallas_load_buffer_count.length
+            if (
+                not isinstance(values, list)
+                or len(values) != expected
+                or any(
+                    type(value) is not int or value not in (1, 2)
+                    for value in values
+                )
+            ):
+                raise InvalidConfig(
+                    "pallas_load_buffer_count must be a list containing one "
+                    "buffer count (1 or 2) per input tensor "
+                    f"(expected {expected}, got {values!r})"
+                )
+            if expected == 0:
+                config.pop("pallas_load_buffer_count")
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
@@ -2162,6 +2200,12 @@ class ConfigSpec:
             fields["indexing"] = self.indexing
         if self.supports_config_key("atomic_indexing"):
             fields["atomic_indexing"] = self.atomic_indexing
+        if (
+            self.supports_config_key("pallas_load_buffer_count")
+            and self.has_pallas_inner_loops
+            and self.pallas_load_buffer_count.length > 0
+        ):
+            fields["pallas_load_buffer_count"] = self.pallas_load_buffer_count
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
@@ -2314,6 +2358,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "pallas_load_buffer_count",
         ):
             if not config.get(name):
                 config.pop(name, None)

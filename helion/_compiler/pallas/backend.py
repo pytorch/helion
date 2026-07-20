@@ -179,6 +179,7 @@ class PallasBackend(Backend):
             "loop_orders",
             "flatten_loops",
             "pallas_loop_type",
+            "pallas_load_buffer_count",
             "pallas_pre_broadcast",
         }
     )
