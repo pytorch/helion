@@ -147,6 +147,35 @@ class Backend(abc.ABC):
         return True
 
     @property
+    def requires_shape_specialized_module(self) -> bool:
+        """Whether distinct ``static_shapes`` specializations must compile to
+        distinct Python modules (i.e. the generated module holds shape-specific
+        mutable state cached across calls).
+
+        The Pallas runtime treats each generated module as the state container for
+        one static specialization -- the output-meta descriptor
+        (``_helion_output_meta_cache_N``), the launcher cache (``_pallas_cache``),
+        the ``_LauncherFastPath`` ds-pad decision, and ``_DirectCallKernel``'s
+        signature lock are all monomorphic (populated on first call, reused as-is).
+        Since ``PyCodeCache`` keys modules by source text, a shape-polymorphic body
+        (e.g. ``compact_worklist``) would otherwise share one module across shapes
+        and inherit the first shape's state; the compiler folds the input signature
+        into the module cache key to prevent that.
+
+        Backends that allocate outputs fresh each call and hold no shape-dependent
+        module state (e.g. Triton) return False and may freely share a module
+        across shapes.
+
+        The per-module signature only discriminates shapes that ``bind()`` already
+        keys to distinct BoundKernels -- i.e. shapes derived from tensor metadata
+        (shape/dtype/stride/device). An output extent driven by an *unbacked* scalar
+        arg is collapsed by ``bind()`` to a single BoundKernel, so it is not
+        distinguished here; such kernels must ``hl.specialize()`` the scalar to get a
+        distinct module per extent.
+        """
+        return False
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
@@ -1585,6 +1614,13 @@ class PallasBackend(Backend):
     @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         return False
+
+    @property
+    def requires_shape_specialized_module(self) -> bool:
+        # Pallas modules hold monomorphic, shape-specific cached state
+        # (output-meta descriptor, launcher cache, ds-pad decision, signature
+        # lock), so each static-shape specialization needs its own module.
+        return True
 
     def max_reduction_threads(self) -> int | None:
         return None

@@ -1292,6 +1292,44 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         )
         self.assertEqual(tuple(out.shape), (0, H, D))
 
+    def test_static_shapes_output_shape_not_frozen_across_lengths(self):
+        # Two inputs with the same worklist size and owner count but different
+        # total token counts generate byte-identical source (the token dim enters
+        # only via runtime offsets and a data-dependent loop): lengths [10,6]
+        # (lq=16) and [3,2] (lq=5) both give 2 owners / 2 tiles.  Under
+        # static_shapes=True those two BoundKernels must compile to distinct
+        # modules; otherwise PyCodeCache (which keys by source text) returns one
+        # shared module whose cached output-meta placeholder freezes the output
+        # extent to the first call, so the later, smaller q returns the earlier,
+        # larger output shape.
+        B, H, KV, D, block = 2, 2, 16, 16, 16
+        k = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
+        qo_big = _offsets([10, 6])  # lq = 16
+        qo_small = _offsets([3, 2])  # lq = 5
+        lq_big, lq_small = int(qo_big[-1]), int(qo_small[-1])
+        torch.manual_seed(0)
+        q_big = torch.randn(lq_big, H, D, device=DEVICE, dtype=torch.bfloat16)
+        q_small = torch.randn(lq_small, H, D, device=DEVICE, dtype=torch.bfloat16)
+        cfg = {"block_sizes": [block], "pallas_loop_type": "compact_worklist"}
+        # Compile the larger length first, then the smaller one on the SAME kernel.
+        code_big, out_big = code_and_output(
+            _dense_kv_kernel, (q_big, k, v, qo_big.to(DEVICE)), **cfg
+        )
+        code_small, out_small = code_and_output(
+            _dense_kv_kernel, (q_small, k, v, qo_small.to(DEVICE)), **cfg
+        )
+        # Precondition of this test: both lengths emit byte-identical source, so
+        # pre-fix they collide to one PyCodeCache module.  If a future change bakes
+        # the token dim into the source this assertion fails loudly, flagging that
+        # the test no longer exercises the shared-module path (rather than passing
+        # silently on two independently-correct shapes).
+        self.assertEqual(code_big, code_small)
+        self.assertEqual(tuple(out_big.shape), (lq_big, H, D))
+        # Without a shape-distinct module this was (lq_big, H, D), the frozen
+        # first-call extent.
+        self.assertEqual(tuple(out_small.shape), (lq_small, H, D))
+
     @skipIfPallasInterpret(
         "the resident-cache ordered KV path is validated on real TPU, not "
         "Pallas interpret mode"
