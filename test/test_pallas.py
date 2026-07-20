@@ -2335,28 +2335,19 @@ class TestPallas(TestCase):
         """Atomic use of selected storage also keeps the ordinary route."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
-        def load_then_atomic_add(x: torch.Tensor) -> torch.Tensor:
+        def load_then_atomic_add(x: torch.Tensor) -> None:
             m, n = x.size()
             for tile_m in hl.tile(m):
                 for tile_n in hl.tile(n):
                     value = x[tile_m, tile_n]
                     hl.atomic_add(x, [tile_m, tile_n], value)
-            return x
 
         source = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
-        baseline = load_then_atomic_add.bind((source,)).to_code(
-            helion.Config(block_sizes=[8, 128], pallas_loop_type="fori_loop")
+        code = self._assert_load_buffer_count_noop(
+            load_then_atomic_add, (source,), [8, 128], [2]
         )
-        arg = source.clone()
-        code, result = code_and_output(
-            load_then_atomic_add,
-            (arg,),
-            block_sizes=[8, 128],
-            pallas_loop_type="fori_loop",
-            pallas_load_buffer_count=[2],
-        )
-        self.assertEqual(code, baseline)
-        torch.testing.assert_close(result, source * 2)
+        self.assertNotIn("_prime_fori_loads", code)
+        self.assertNotIn("_prefetch_fori_loads", code)
 
     def test_fori_loop_direct_jagged_tile(self) -> None:
         """Staged jagged loads handle eager and downstream nonlinear masks."""
