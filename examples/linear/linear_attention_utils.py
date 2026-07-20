@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Shared test helpers
@@ -92,6 +93,37 @@ def chunked_linear_attn_reference(
     else:
         state = q.new_zeros(B, H, D, DV, dtype=torch.float32)
 
+    def correction_chunk(
+        qi: torch.Tensor,
+        ki: torch.Tensor,
+        vi: torch.Tensor,
+        gi: torch.Tensor,
+        bi: torch.Tensor,
+        ai: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One chunk of the sequential beta-correction recurrence, returning
+        (chunk_output, new_state); tensors are explicit args so it can be
+        gradient-checkpointed."""
+        s = state
+        chunk_out = []
+        for j in range(C):
+            g_j = gi[:, :, j]
+            alpha = (
+                torch.exp(g_j).unsqueeze(-1)
+                if diagonal_decay
+                else torch.exp(g_j).unsqueeze(-1).unsqueeze(-1)
+            )
+            s = alpha * s
+            kj = ai[:, :, j]
+            vj = vi[:, :, j]
+            bj = bi[:, :, j].unsqueeze(-1).unsqueeze(-1)
+            kts = torch.einsum("bhd,bhdv->bhv", kj, s)
+            s = s - bj * torch.einsum("bhd,bhv->bhdv", kj, kts)
+            s = s + bj * torch.einsum("bhd,bhv->bhdv", kj, vj)
+            chunk_out.append(torch.einsum("bhd,bhdv->bhv", qi[:, :, j], s))
+        return torch.stack(chunk_out, dim=2), s
+
     for i in range(N):
         qi = qc[:, :, i]
         ki = kc[:, :, i]
@@ -101,22 +133,15 @@ def chunked_linear_attn_reference(
         bi = bc[:, :, i] if bc is not None else None
         ai = ac[:, :, i] if ac is not None else ki
 
-        if diagonal_decay and bi is not None:
-            chunk_out = []
-            s = state.clone()
-            for j in range(C):
-                alpha = torch.exp(gi[:, :, j])
-                s = alpha.unsqueeze(-1) * s
-                kj = ai[:, :, j]
-                vj = vi[:, :, j]
-                bj = bi[:, :, j].unsqueeze(-1).unsqueeze(-1)
-                kts = torch.einsum("bhd,bhdv->bhv", kj, s)
-                s = s - bj * torch.einsum("bhd,bhv->bhdv", kj, kts)
-                s = s + bj * torch.einsum("bhd,bhv->bhdv", kj, vj)
-                oj = torch.einsum("bhd,bhdv->bhv", qi[:, :, j], s)
-                chunk_out.append(oj)
-            outputs.append(torch.stack(chunk_out, dim=2).to(input_dtype))
-            state = s
+        if bi is not None:
+            # Sequential beta-correction recurrence, checkpointed per chunk to
+            # avoid OOMs.
+            chunk_out, state = checkpoint(
+                correction_chunk,
+                qi, ki, vi, gi, bi, ai, state,
+                use_reentrant=False,
+            )
+            outputs.append(chunk_out.to(input_dtype))
 
         elif diagonal_decay:
             g_cs = gi.cumsum(-2)
@@ -138,23 +163,6 @@ def chunked_linear_attn_reference(
             state = state * torch.exp(g_last).unsqueeze(-1) + torch.einsum(
                 "bhcd,bhcv->bhdv", k_for_state, vi
             )
-
-        elif bi is not None:
-            chunk_out = []
-            s = state.clone()
-            for j in range(C):
-                alpha = torch.exp(gi[:, :, j]).unsqueeze(-1).unsqueeze(-1)
-                s = alpha * s
-                kj = ai[:, :, j]
-                vj = vi[:, :, j]
-                bj = bi[:, :, j].unsqueeze(-1).unsqueeze(-1)
-                kts = torch.einsum("bhd,bhdv->bhv", kj, s)
-                s = s - bj * torch.einsum("bhd,bhv->bhdv", kj, kts)
-                s = s + bj * torch.einsum("bhd,bhv->bhdv", kj, vj)
-                oj = torch.einsum("bhd,bhdv->bhv", qi[:, :, j], s)
-                chunk_out.append(oj)
-            outputs.append(torch.stack(chunk_out, dim=2).to(input_dtype))
-            state = s
 
         else:
             g_cs = gi.cumsum(-1)

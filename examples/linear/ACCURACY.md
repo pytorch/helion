@@ -8,6 +8,6 @@ Forward/backward correctness of each variant vs the fp32 reference kernel, at au
 | simple_gla | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
 | retention | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
 | full_gla | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
-| delta_rule | ok/REF-ERR | ok/ok | ok/ok | ok/REF-ERR | ok/REF-ERR | ok/ok |
-| gated_delta_rule | ok/REF-ERR | ok/ok | ok/ok | ok/REF-ERR | ok/REF-ERR | ok/ok |
-| kda | ok/ok | ok/ok | ok/ok | ok/REF-ERR | ok/REF-ERR | ok/ok |
+| delta_rule | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
+| gated_delta_rule | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
+| kda | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
