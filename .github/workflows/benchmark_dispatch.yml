@@ -51,15 +51,15 @@ on:
         # Triton bug is fixed. Forward `rope` stays in the list.
         default: "flash_attention,gdn_fwd_h,cross_entropy,grouped_gemm,gemm,welford,layer_norm-bwd,int4_gemm,softmax,layer_norm,mamba2_chunk_state,rms_norm-bwd,rope,jsd,mamba2_chunk_scan,kl_div,rms_norm"
       kernels_tpu:
-        description: 'Kernels benchmarked on TPU via run_tpu.py: only the kernels the tritonbench bridge cannot handle — bmm (no tritonbench operator) and cross_entropy (Helion Mosaic-codegen holdout). Everything else runs via the bridge (kernels_tpu_bridge). `all` runs every kernel in benchmarks/run_tpu.py::KERNEL_MAPPINGS.'
+        description: 'Kernels benchmarked on TPU via run_tpu.py: the kernels the tritonbench bridge cannot fully cover on TPU — bmm (no tritonbench operator), cross_entropy (Helion Mosaic-codegen holdout), and flash_attention (the bridge''s torch.compile comparator is flex_attention, which does not run on TPU, so the bridge would drop flash_attention''s torch_compile column; run_tpu.py compiles the SDPA baseline instead and keeps it). Everything else runs via the bridge (kernels_tpu_bridge). `all` runs every kernel in benchmarks/run_tpu.py::KERNEL_MAPPINGS.'
         required: false
         type: string
-        default: "bmm,cross_entropy"
+        default: "bmm,cross_entropy,flash_attention"
       kernels_tpu_bridge:
         description: 'Kernels benchmarked on TPU via the tritonbench bridge (benchmarks/run.py --device tpu). These land in the shared `tpu` dashboard column alongside kernels_tpu (disjoint sets).'
         required: false
         type: string
-        default: "flash_attention,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,kl_div"
+        default: "gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,kl_div"
       kernels_cute:
         description: 'Comma-separated list of kernels to benchmark on B200 with HELION_BACKEND=cute. Defaults to the CuTe-capable TritonBench subset.'
         required: false
