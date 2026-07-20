@@ -138,7 +138,13 @@ def chunked_linear_attn_reference(
             # avoid OOMs.
             chunk_out, state = checkpoint(
                 correction_chunk,
-                qi, ki, vi, gi, bi, ai, state,
+                qi,
+                ki,
+                vi,
+                gi,
+                bi,
+                ai,
+                state,
                 use_reentrant=False,
             )
             outputs.append(chunk_out.to(input_dtype))
