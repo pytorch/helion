@@ -1211,12 +1211,19 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
     def test_example_softmax(self):
         from examples.softmax import softmax
 
-        # examples/softmax.py uses check(4096, 2560)
+        # examples/softmax.py uses check(4096, 2560).
+        # Use a reduction dim of 32 (not 160): the autograd-generated softmax
+        # backward divides repeatedly by the row sum and feeds the result into
+        # further reductions, which Triton lowers into a pathologically large
+        # kernel once the reduction dim is padded up to 256 (~24s of ptxas,
+        # tripping the 60s per-test CI timeout and crashing the xdist worker).
+        # A width-32 reduction avoids that expansion; it exercises the same
+        # backward code path and keeps identical fp semantics.
         self._check_backward(
             softmax,
             lambda x: torch.nn.functional.softmax(x, dim=-1),
             1,
-            shape=(256, 160),
+            shape=(256, 32),
         )
 
     def test_example_batch_softmax(self):
