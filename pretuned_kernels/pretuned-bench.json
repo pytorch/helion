@@ -1,0 +1,138 @@
+[
+  {
+    "kernel": "rms_norm_dynamic_per_token_quant",
+    "pretuned_hardware": [
+      "b200",
+      "h100"
+    ],
+    "helion_wins": 35,
+    "total": 36,
+    "geomean": 1.3608,
+    "best_speedup": 2.0428,
+    "cudagraph": true,
+    "baselines": {
+      "torch": {
+        "wins": 36,
+        "total": 36,
+        "geomean": 16.5884,
+        "best_speedup": 23.1117
+      },
+      "torch_compile": {
+        "wins": 35,
+        "total": 36,
+        "geomean": 1.3608,
+        "best_speedup": 2.0428
+      },
+      "vllm": {
+        "wins": 36,
+        "total": 36,
+        "geomean": 1.81,
+        "best_speedup": 3.1211
+      }
+    },
+    "device": "NVIDIA H100",
+    "compute_capability": "sm90"
+  },
+  {
+    "kernel": "rms_norm_per_block_quant",
+    "pretuned_hardware": [
+      "b200",
+      "h100"
+    ],
+    "helion_wins": 24,
+    "total": 24,
+    "geomean": 2.0662,
+    "best_speedup": 3.0335,
+    "cudagraph": true,
+    "baselines": {
+      "torch": {
+        "wins": 24,
+        "total": 24,
+        "geomean": 15.676,
+        "best_speedup": 20.176
+      },
+      "torch_compile": {
+        "wins": 24,
+        "total": 24,
+        "geomean": 3.2787,
+        "best_speedup": 5.5821
+      },
+      "vllm": {
+        "wins": 24,
+        "total": 24,
+        "geomean": 2.085,
+        "best_speedup": 3.0335
+      }
+    },
+    "device": "NVIDIA H100",
+    "compute_capability": "sm90"
+  },
+  {
+    "kernel": "silu_and_mul_per_block_quant",
+    "pretuned_hardware": [
+      "b200",
+      "h100"
+    ],
+    "helion_wins": 23,
+    "total": 24,
+    "geomean": 1.6394,
+    "best_speedup": 2.5282,
+    "cudagraph": true,
+    "baselines": {
+      "torch": {
+        "wins": 24,
+        "total": 24,
+        "geomean": 13.4254,
+        "best_speedup": 19.5741
+      },
+      "torch_compile": {
+        "wins": 23,
+        "total": 24,
+        "geomean": 2.6502,
+        "best_speedup": 4.9285
+      },
+      "vllm": {
+        "wins": 24,
+        "total": 24,
+        "geomean": 1.7857,
+        "best_speedup": 3.108
+      }
+    },
+    "device": "NVIDIA H100",
+    "compute_capability": "sm90"
+  },
+  {
+    "kernel": "per_token_group_fp8_quant",
+    "pretuned_hardware": [
+      "b200",
+      "h100"
+    ],
+    "helion_wins": 17,
+    "total": 24,
+    "geomean": 1.216,
+    "best_speedup": 2.7331,
+    "cudagraph": true,
+    "baselines": {
+      "torch": {
+        "wins": 24,
+        "total": 24,
+        "geomean": 10.3213,
+        "best_speedup": 17.354
+      },
+      "torch_compile": {
+        "wins": 17,
+        "total": 24,
+        "geomean": 2.118,
+        "best_speedup": 6.2921
+      },
+      "vllm": {
+        "wins": 24,
+        "total": 24,
+        "geomean": 1.4749,
+        "best_speedup": 2.8864
+      }
+    },
+    "device": "NVIDIA H100",
+    "compute_capability": "sm90"
+  }
+]
