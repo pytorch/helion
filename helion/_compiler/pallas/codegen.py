@@ -820,6 +820,6 @@ def vmem_name(state: CodegenState, name: str) -> str:
     from helion._compiler.tile_strategy import ForiLoopState
 
     loop, ref = _find_dma_scratch_loop(state, name)
-    if isinstance(loop, ForiLoopState) and name in loop._double_buffered_tensors:
+    if isinstance(loop, ForiLoopState) and name in loop._prefetched_load_tensors:
         return f"{ref}.at[{loop.loop_var_name} % 2]"
     return ref

@@ -2103,8 +2103,8 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    def test_bmm_fori_loop_double_buffer_non_divisible_k(self) -> None:
-        """Double-buffered fori_loop BMM handles a partial final K tile."""
+    def test_bmm_fori_loop_buffered_non_divisible_k(self) -> None:
+        """Buffered fori_loop BMM handles a partial final K tile."""
         a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
         b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
         code, result = code_and_output(
@@ -2208,7 +2208,7 @@ class TestPallas(TestCase):
         self.assertEqual(preferred, baseline)
         return preferred
 
-    def test_fori_loop_tensor_double_buffer_codegen(self) -> None:
+    def test_fori_loop_tensor_load_buffering_codegen(self) -> None:
         """A selected tensor is primed and prefetched on its existing DMA route."""
         args = (
             torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
@@ -2284,7 +2284,7 @@ class TestPallas(TestCase):
                 self.assertIn(marker, code)
                 torch.testing.assert_close(result, x + 1)
 
-    def test_fori_loop_double_buffer_falls_back_for_stored_input(self) -> None:
+    def test_fori_loop_load_buffering_falls_back_for_stored_input(self) -> None:
         """A requested count of two is ignored for mutable storage."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -2300,7 +2300,7 @@ class TestPallas(TestCase):
         )
         self._assert_load_buffer_count_noop(nested_inplace_add, args, [8, 128], [2, 1])
 
-    def test_fori_loop_double_buffer_falls_back_for_atomic_input(self) -> None:
+    def test_fori_loop_load_buffering_falls_back_for_atomic_input(self) -> None:
         """Atomic use of selected storage also keeps the ordinary route."""
 
         @helion.kernel(backend="pallas", static_shapes=True)

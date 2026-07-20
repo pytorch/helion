@@ -2705,11 +2705,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     tensor_to_dma_scratch: dict[str, str] = {}
     tensor_to_sem: dict[str, str] = {}
-    double_buffered_tensors: set[str] = set()
-    depth_two_loads: list[tuple[torch.Tensor, list[object], str, str]] = []
+    prefetched_load_tensors: set[str] = set()
+    prefetched_loads: list[tuple[torch.Tensor, list[object], str, str]] = []
     # compact_worklist shares this lowering but keeps its compact/resident routes;
     # only an actual fori_loop config enables depth-two staging.
-    enable_double_buffering = state.config.get("pallas_loop_type") == "fori_loop"
+    load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
 
     input_tensors = cast(
         "list[torch.Tensor]",
@@ -2737,7 +2737,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         )
         load_buffer_count = (
             state.config.pallas_load_buffer_count[input_slots[0]]
-            if enable_double_buffering
+            if load_buffer_counts_active
             and direction == "load"
             and storage_id not in stored_tensor_storages
             and input_slots is not None
@@ -2745,23 +2745,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             else 1
         )
         assert load_buffer_count in (1, 2)
-        is_double_buffered = load_buffer_count == 2
+        uses_load_prefetch = load_buffer_count == 2
         state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_name = state.device_function.register_scratch(
-            (load_buffer_count, *vmem_shape) if is_double_buffered else vmem_shape,
+            (load_buffer_count, *vmem_shape) if uses_load_prefetch else vmem_shape,
             fake.dtype,
             name_hint=hbm_name.replace("_hbm", "") + "_buf",
         )
         sem_name = state.device_function.register_dma_semaphore(
             name_hint=hbm_name.replace("_hbm", "") + "_sem",
-            shape=(load_buffer_count,) if is_double_buffered else (),
+            shape=(load_buffer_count,) if uses_load_prefetch else (),
         )
         tensor_to_dma_scratch[hbm_name] = vmem_name
         tensor_to_sem[hbm_name] = sem_name
-        if is_double_buffered:
-            double_buffered_tensors.add(hbm_name)
-            depth_two_loads.append((fake, sub_meta, vmem_name, sem_name))
+        if uses_load_prefetch:
+            prefetched_load_tensors.add(hbm_name)
+            prefetched_loads.append((fake, sub_meta, vmem_name, sem_name))
 
     # Build the body function
     body_stmts: list[ast.AST] = []
@@ -2825,7 +2825,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
-        _double_buffered_tensors=double_buffered_tensors,
+        _prefetched_load_tensors=prefetched_load_tensors,
     )
     resident_prep_lowerings = _prepare_resident_prep_lowerings(
         state, block_ids, all_tensor_info
@@ -2990,8 +2990,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     prime_statements: list[ast.stmt] = []
     body_prefetch: ast.FunctionDef | None = None
-    body_depth_two_waits: list[ast.stmt] = []
-    if depth_two_loads:
+    body_current_stage_waits: list[ast.stmt] = []
+    if prefetched_loads:
         num_iterations = state.device_function.new_var("_num_iterations")
         prime_statements.append(
             statement_from_string(f"{num_iterations} = {grid_parts[-1]}")
@@ -3001,7 +3001,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         prime_indices = [*loop_vars]
         prime_indices[-1] = "0"
         prime_starts: list[ast.stmt] = []
-        for record in depth_two_loads:
+        for record in prefetched_loads:
             prime_starts.extend(
                 _dma_copy_statements(*record, prime_indices, "0", ("start",))
             )
@@ -3017,7 +3017,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         next_indices[-1] = next_iteration
         next_stage = f"{next_iteration} % 2"
         next_starts: list[ast.stmt] = []
-        for record in depth_two_loads:
+        for record in prefetched_loads:
             next_starts.extend(
                 _dma_copy_statements(*record, next_indices, next_stage, ("start",))
             )
@@ -3028,8 +3028,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         )
 
         current_stage = f"{stage_loop_var} % 2"
-        for record in depth_two_loads:
-            body_depth_two_waits.extend(
+        for record in prefetched_loads:
+            body_current_stage_waits.extend(
                 _dma_copy_statements(*record, loop_vars, current_stage, ("wait",))
             )
 
@@ -3062,7 +3062,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             hbm_name = state.device_function.tensor_arg(fake).name
             if (
                 hbm_name not in tensor_to_dma_scratch
-                or hbm_name in double_buffered_tensors
+                or hbm_name in prefetched_load_tensors
             ):
                 continue
             for statement in _dma_copy_statements(
@@ -3076,7 +3076,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             ):
                 state.codegen.add_statement(statement)
 
-        for statement in body_depth_two_waits:
+        for statement in body_current_stage_waits:
             state.codegen.add_statement(statement)
 
         with state.codegen.resident_prep_lowering_scope(resident_prep_lowerings):

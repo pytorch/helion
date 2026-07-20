@@ -1871,8 +1871,8 @@ class ForiLoopState(DeviceLoopOrGridState):
     inner-block shape passes ``_check_dma_alignment``; tensors that fail
     are kept on their outer BlockSpec and accessed via ``pl.ds`` from the
     body. Per-tensor pipelining membership lives in
-    ``_tensor_to_dma_scratch``; selected input tensors are recorded in
-    ``_double_buffered_tensors``.
+    ``_tensor_to_dma_scratch``; input tensors with an overlapped prefetch are
+    recorded in ``_prefetched_load_tensors``.
     """
 
     body_fn_name: str
@@ -1882,7 +1882,7 @@ class ForiLoopState(DeviceLoopOrGridState):
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
-    _double_buffered_tensors: set[str] = dataclasses.field(default_factory=set)
+    _prefetched_load_tensors: set[str] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
