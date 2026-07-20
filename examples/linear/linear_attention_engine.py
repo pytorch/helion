@@ -1749,8 +1749,6 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         ctx.has_g = g is not None
         ctx.has_beta = beta is not None
         ctx.has_a = a is not None
-        ctx.scalar_decay_correction = False
-        ctx.diag_correction = False
         ctx.scale = scale
         if g is not None:
             tensors.append(g)
@@ -1762,30 +1760,17 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         ctx.C = C
 
         input_dtype = q.dtype
-        diag_correction = (
-            beta is not None and g is not None and g.dim() == 4 and a is None
-        )
-        scalar_decay_correction = (
-            beta is not None and g is not None and g.dim() == 3 and a is None
-        )
-        if diag_correction:
-            # KDA: beta correction + diagonal per-channel decay.
-            ctx.diag_correction = True
-            o, h_all, v_new_all, A_inv, w_wy, final_state = _helion_chunked_fwd_kda(
-                q, k, v, g, beta, C,
-                initial_state=initial_state,
-                return_final_state=return_final_state,
-            )
-            ctx.h_all = h_all
-            ctx.v_new_all = v_new_all
-            ctx.A_inv = A_inv
-            ctx.w_wy = w_wy
-        elif scalar_decay_correction:
-            # Gated DeltaNet: beta correction and scalar decay.
-            ctx.scalar_decay_correction = True
+        if beta is not None:
+            # Delta rule (beta correction): the decay mode is read from g
+            # inside the shared host (None / scalar / per-channel). A separate
+            # a-tensor is only supported without decay.
+            if g is not None and a is not None:
+                raise NotImplementedError(
+                    "beta correction with decay requires a=None"
+                )
             o, h_all, v_new_all, A_inv, w_wy, final_state = (
-                _helion_chunked_fwd_gated_delta(
-                    q, k, v, g, beta, C,
+                _helion_chunked_fwd_delta(
+                    q, k, v, beta, a, C, g=g,
                     initial_state=initial_state,
                     return_final_state=return_final_state,
                 )
@@ -1794,34 +1779,6 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
             ctx.v_new_all = v_new_all
             ctx.A_inv = A_inv
             ctx.w_wy = w_wy
-        elif beta is not None and g is None:
-            # DeltaNet: beta correction with no decay.
-            o, h_all, v_new_all, A_inv, w_wy = _helion_chunked_fwd_delta(
-                q, k, v, beta, a, C, initial_state=initial_state
-            )
-            ctx.h_all = h_all
-            ctx.v_new_all = v_new_all
-            ctx.A_inv = A_inv
-            ctx.w_wy = w_wy
-            final_state = None
-            if return_final_state:
-                B, H, T_pad, D = q.shape
-                N = T_pad // C
-                BH = B * H
-                a_use = a if a is not None else k
-                final_state = _final_state_from_h_all(
-                    h_all[:, -1],
-                    a_use.reshape(BH, N, C, D)[:, -1],
-                    v_new_all[:, -1],
-                    None,
-                    B,
-                    H,
-                    use_g=False,
-                )
-        elif beta is not None:
-            raise NotImplementedError(
-                "beta correction with decay requires a=None"
-            )
         else:
             o, h_all, final_state = _helion_chunked_fwd(
                 q,
@@ -1886,42 +1843,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         A_inv = ctx.A_inv
         w_wy = ctx.w_wy
 
-        if ctx.diag_correction:
-            # KDA: beta correction + diagonal per-channel decay.
-            assert g is not None
-            dq, dk, dv, dg, dbeta = _helion_chunked_bwd_kda(
-                q,
-                k,
-                v,
-                g,
-                beta,  # pyrefly: ignore
-                grad_output,
-                C,
-                h_all=h_all,
-                v_new_all=v_new_all,
-                A_inv=A_inv,
-                w_wy=w_wy,
-            )
-            return dq, dk, dv, dg, dbeta, None, None, None, None, None
-
-        if ctx.scalar_decay_correction:
-            # Gated DeltaNet
-            assert g is not None
-            dq, dk, dv, dg, dbeta = _helion_chunked_bwd_gated_delta(
-                q,
-                k,
-                v,
-                g,
-                beta,  # pyrefly: ignore
-                grad_output,
-                C,
-                h_all=h_all,
-                v_new_all=v_new_all,
-                A_inv=A_inv,
-                w_wy=w_wy,
-            )
-            return dq, dk, dv, dg, dbeta, None, None, None, None, None
-
+        # Delta rule: the decay mode is read from g, mirroring the forward.
         if g is None:
             dq, dk, dv, dbeta, da = _helion_chunked_bwd_delta(
                 q,
@@ -1938,9 +1860,23 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
             )
             return dq, dk, dv, None, dbeta, da, None, None, None, None
 
-        raise NotImplementedError(
-            "beta correction with decay requires a=None"
+        bwd = (
+            _helion_chunked_bwd_kda if g.dim() == 4 else _helion_chunked_bwd_gated_delta
         )
+        dq, dk, dv, dg, dbeta = bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,  # pyrefly: ignore
+            grad_output,
+            C,
+            h_all=h_all,
+            v_new_all=v_new_all,
+            A_inv=A_inv,
+            w_wy=w_wy,
+        )
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2103,14 +2039,25 @@ def _helion_chunked_fwd_delta(
     beta: torch.Tensor,
     a: torch.Tensor | None,
     C: int,
+    g: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """DeltaNet forward (beta correction, no decay).
+    return_final_state: bool = False,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor | None,
+]:
+    """Chunked delta-rule forward (beta correction), dispatched by the decay in g:
+      - g is None    -> DeltaNet: beta correction, no decay.
+      - g.dim() == 3 -> Gated DeltaNet: beta correction + scalar decay.
+      - g.dim() == 4 -> KDA: beta correction + diagonal per-channel decay.
 
-    Three passes: the WY / UT transform (Neumann doubling), the serial state
-    pass (v_new = u - w S; S += k^T v_new), and the reused output kernel. q is
-    pre-scaled by the caller. Returns the triangular inverse T as A_inv so the
-    backward reuses it.
+    One pipeline in every mode: the WY / UT transform (Neumann doubling), the
+    serial state pass (v_new = u - w S; decayed carry), and the output kernel.
+    The decay folds into the shared kernels via scalar_decay / diag_anchored;
+    KDA additionally builds the anchored grams (Aqk, Akk) and uses the anchored
+    output kernel. q is pre-scaled by the caller. Returns the triangular inverse
+    T (A_inv) and w for the backward, plus the final state when requested (which
+    uses the corrected values v_new, not v).
     """
     B, H, T, D = q.shape
     DV = v.shape[-1]
@@ -2118,165 +2065,81 @@ def _helion_chunked_fwd_delta(
     BH = B * H
     BHN = BH * N
 
+    scalar_decay = g is not None and g.dim() == 3
+    diag_anchored = g is not None and g.dim() == 4
+
+    # Per-chunk cumulative log-decay (natural log; kernels apply RCP_LN2 at exp2).
+    # g_cs / decay_last are None with no decay, [.,C] scalar, or [.,C,D] diagonal.
+    g_cs = decay_last = g_cs_flat = None
+    if scalar_decay:
+        g_cs = g.float().reshape(BH, N, C).cumsum(-1)
+        decay_last = g_cs[:, :, -1]
+        g_cs_flat = g_cs.reshape(BHN, C)
+    elif diag_anchored:
+        g_cs = g.float().reshape(BH, N, C, D).cumsum(-2)
+        decay_last = g_cs[:, :, -1, :]
+        g_cs_flat = g_cs.reshape(BHN, C, D)
+
     a_use = a if a is not None else k
+    qf = q.reshape(BHN, C, D)
     kf = k.reshape(BHN, C, D)
     af = a_use.reshape(BHN, C, D)
     vf = v.reshape(BHN, C, DV)
     bf = beta.reshape(BHN, C)
 
-    # WY / UT transform: w = T(beta a), u = T(beta v); T saved for backward.
-    w, u, A_inv = chunk_fwd_wy_delta_helion(af, vf, bf)
+    # KDA needs the anchored k-gram Akk to feed the WY transform (its q-gram Aqk
+    # weights the output below); the scalar / no-decay modes form k @ k in-kernel.
+    Aqk = Akk = None
+    if diag_anchored:
+        Aqk, Akk = chunk_fwd_A_diag_anchored_helion(qf, kf, g_cs_flat, 1.0, build_kk=True)
 
-    # Serial state pass: v_new = u - w S; carry S across chunks.
-    k4 = k.reshape(BH, N, C, D)
-    w4 = w.reshape(BH, N, C, D)
-    u4 = u.reshape(BH, N, C, DV)
-    state = _init_state(initial_state, BH, D, DV, q).to(k.dtype)
-    h_all, v_new_all = chunk_fwd_h_delta_helion(k4, w4, u4, state)
-
-    hf = h_all.reshape(BHN, D, DV)
-    vnewf = v_new_all.reshape(BHN, C, DV)
-
-    o = chunk_fwd_o_helion(q.reshape(BHN, C, D), kf, vnewf, None, hf, use_g=False)
-
-    return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w
-
-
-def _helion_chunked_fwd_gated_delta(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    C: int,
-    initial_state: torch.Tensor | None = None,
-    return_final_state: bool = False,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-    torch.Tensor | None,
-]:
-    """Gated DeltaNet forward (beta correction + scalar decay).
-
-    Runs the delta kernels with scalar decay folded in: the WY / UT transform
-    and serial state pass with scalar_decay=True, and the shared output kernel
-    with use_g=True. q is pre-scaled by the caller. Returns the triangular
-    inverse T as A_inv and w so the backward reuses them, plus the final state
-    when requested. The final state uses the corrected values v_new (not v).
-    """
-    B, H, T, D = q.shape
-    DV = v.shape[-1]
-    N = T // C
-    BH = B * H
-    BHN = BH * N
-
-    # Per-chunk cumulative log-decay (natural log; kernels convert to base-2).
-    gc = g.float().reshape(BH, N, C)
-    g_cs = gc.cumsum(-1)  # [BH, N, C]
-    decay_last = g_cs[:, :, -1]  # [BH, N]
-    g_cs_flat = g_cs.reshape(BHN, C)
-
-    kf = k.reshape(BHN, C, D)
-    vf = v.reshape(BHN, C, DV)
-    bf = beta.reshape(BHN, C)
-
-    w, u, A_inv = chunk_fwd_wy_delta_helion(kf, vf, bf, g_cs_flat, scalar_decay=True)
+    w, u, A_inv = chunk_fwd_wy_delta_helion(
+        af, vf, bf, g_cs_flat, Akk,
+        scalar_decay=scalar_decay, diag_anchored=diag_anchored,
+    )
 
     k4 = k.reshape(BH, N, C, D)
     w4 = w.reshape(BH, N, C, D)
     u4 = u.reshape(BH, N, C, DV)
     state = _init_state(initial_state, BH, D, DV, q).to(k.dtype)
     h_all, v_new_all = chunk_fwd_h_delta_helion(
-        k4, w4, u4, state, g_cs, decay_last, scalar_decay=True
+        k4, w4, u4, state, g_cs, decay_last,
+        scalar_decay=scalar_decay, diag_anchored=diag_anchored,
     )
 
     hf = h_all.reshape(BHN, D, DV)
     vnewf = v_new_all.reshape(BHN, C, DV)
 
-    o = chunk_fwd_o_helion(q.reshape(BHN, C, D), kf, vnewf, g_cs_flat, hf, use_g=True)
+    if diag_anchored:
+        # o = (q * exp2(gc)) @ h + Aqk @ v_new (anchored, per-channel decay).
+        o = chunk_fwd_o_diag_anchored_helion(qf, vnewf, g_cs_flat, hf, Aqk, 1.0)
+    else:
+        o = chunk_fwd_o_helion(qf, kf, vnewf, g_cs_flat, hf, use_g=scalar_decay)
 
     final_state = None
     if return_final_state:
-        g_last_4d = decay_last.unsqueeze(-1).expand(-1, -1, D)  # [BH, N, D]
-        k_state_last = (
-            k4[:, -1].float()
-            * torch.exp(decay_last[:, -1, None, None] - g_cs[:, -1, :, None])
-        ).to(k.dtype)
+        # Add the last chunk's writes to its entering state; keys are decayed to
+        # the chunk end (per-channel when diagonal), values are the corrected v_new.
+        if diag_anchored:
+            k_state_last = (
+                k4[:, -1].float() * torch.exp(g_cs[:, -1, -1:, :] - g_cs[:, -1])
+            ).to(k.dtype)
+            g_last_arg = decay_last[:, -1]
+        elif scalar_decay:
+            k_state_last = (
+                k4[:, -1].float()
+                * torch.exp(decay_last[:, -1, None, None] - g_cs[:, -1, :, None])
+            ).to(k.dtype)
+            g_last_arg = decay_last.unsqueeze(-1).expand(-1, -1, D)[:, -1]
+        else:
+            k_state_last = a_use.reshape(BH, N, C, D)[:, -1]
+            g_last_arg = None
         final_state = _final_state_from_h_all(
-            h_all[:, -1], k_state_last, v_new_all[:, -1], g_last_4d[:, -1], B, H
+            h_all[:, -1], k_state_last, v_new_all[:, -1], g_last_arg, B, H,
+            use_g=g is not None,
         )
 
     return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
-
-
-def _helion_chunked_fwd_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    C: int,
-    initial_state: torch.Tensor | None = None,
-    return_final_state: bool = False,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-    torch.Tensor | None,
-]:
-    """KDA forward (beta correction + diagonal per-channel decay).
-
-    The delta kernels with diagonal decay folded in (diag_anchored=True): the
-    anchored double-gram (Aqk, Akk), the WY / UT transform reading Akk, the serial
-    state pass with per-channel decay, and the shared anchored output kernel. q is
-    pre-scaled by the caller. Returns the triangular inverse T (A_inv), w, and the
-    anchored Aqk so the backward reuses them, plus the final state when requested.
-    The final state uses the corrected values v_new (not v).
-    """
-    B, H, T, D = q.shape
-    DV = v.shape[-1]
-    N = T // C
-    BH = B * H
-    BHN = BH * N
-
-    # Per-chunk cumulative log-decay (natural log; kernels apply RCP_LN2 at exp2).
-    gc = g.float().reshape(BH, N, C, D)
-    g_cs = gc.cumsum(-2)  # [BH, N, C, D]
-    decay_last = g_cs[:, :, -1, :]  # [BH, N, D]
-    g_cs_flat = g_cs.reshape(BHN, C, D)
-
-    qf = q.reshape(BHN, C, D)
-    kf = k.reshape(BHN, C, D)
-    vf = v.reshape(BHN, C, DV)
-    bf = beta.reshape(BHN, C)
-
-    # Anchored intra-chunk grams: Aqk (q-rows, for output) and Akk (k-rows, for WY).
-    Aqk, Akk = chunk_fwd_A_diag_anchored_helion(qf, kf, g_cs_flat, 1.0, build_kk=True)
-
-    w, u, A_inv = chunk_fwd_wy_delta_helion(
-        kf, vf, bf, g_cs_flat, Akk, diag_anchored=True
-    )
-
-    k4 = k.reshape(BH, N, C, D)
-    w4 = w.reshape(BH, N, C, D)
-    u4 = u.reshape(BH, N, C, DV)
-    state = _init_state(initial_state, BH, D, DV, q).to(k.dtype)
-    h_all, v_new_all = chunk_fwd_h_delta_helion(
-        k4, w4, u4, state, g_cs, decay_last, diag_anchored=True
-    )
-
-    hf = h_all.reshape(BHN, D, DV)
-    vnewf = v_new_all.reshape(BHN, C, DV)
-
-    # Output: o = (q * exp2(gc)) @ h + Aqk @ v_new (anchored, per-channel decay).
-    o = chunk_fwd_o_diag_anchored_helion(qf, vnewf, g_cs_flat, hf, Aqk, 1.0)
-
-    final_state = None
-    if return_final_state:
-        k_state_last = (
-            k4[:, -1].float() * torch.exp(g_cs[:, -1, -1:, :] - g_cs[:, -1])
-        ).to(k.dtype)
-        final_state = _final_state_from_h_all(
-            h_all[:, -1], k_state_last, v_new_all[:, -1], decay_last[:, -1], B, H
-        )
-
     return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
 
 
