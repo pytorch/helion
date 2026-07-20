@@ -615,8 +615,8 @@ class TestPallas(TestCase):
     def test_slice_addressing_classification(self) -> None:
         """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
         -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
-        from helion._compiler.backend import SliceAddressing as SA
-        from helion._compiler.backend import _slice_addressing as classify
+        from helion._compiler.pallas.backend import SliceAddressing as SA
+        from helion._compiler.pallas.backend import _slice_addressing as classify
 
         f32_2d = torch.empty(16, 128, dtype=torch.float32)
         bf16_2d = torch.empty(16, 128, dtype=torch.bfloat16)
@@ -2235,10 +2235,6 @@ class TestPallas(TestCase):
         compiled under ``pallas_loop_type='fori_loop'``."""
         self._check_scalar_lookup_in_pipeline("fori_loop")
 
-    @xfailIfPallasInterpret(
-        "pl.program_id captured into emit_pipeline body is not supported in "
-        "JAX interpret mode (program_id_p.bind asserts during trace)"
-    )
     def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
         """Grid (``tile_m``) → non-grid device loop (``tile_n``) wrapping
         an inner emit_pipeline (``tile_k``) whose body reads
@@ -2984,7 +2980,6 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallasTpu("Pallas TPU not correctly handling tile index with offset")
     def test_tensor_access_tile_index_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -5090,7 +5085,7 @@ class TestPallasPrinter(TestCase):
         from torch.utils._sympy.functions import FloorDiv
         from torch.utils._sympy.functions import PythonMod
 
-        from helion._compiler.device_function import pallas_texpr
+        from helion._compiler.pallas.printer import pallas_texpr
 
         x, y = sympy.symbols("x y")
         self.assertEqual(pallas_texpr(PythonMod(x, y)), "(x % y)")

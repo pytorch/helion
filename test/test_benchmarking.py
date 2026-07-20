@@ -166,6 +166,53 @@ def test_attention_force_flash_config_falls_back_without_compiler_seed():
     assert config == {"block_sizes": [1, 128, 128]}
 
 
+def test_attention_compiler_flash_seed_config_uses_promoted_default():
+    bound = SimpleNamespace(
+        config_spec=SimpleNamespace(
+            compiler_default_config=object(),
+            compiler_seed_configs=[
+                SimpleNamespace(config={"block_sizes": [1, 128, 128]})
+            ],
+            default_config=lambda: SimpleNamespace(
+                config={
+                    "block_sizes": [1, 128, 128],
+                    "cute_flash_topology": "fa4",
+                }
+            ),
+        )
+    )
+
+    config = compare_attention_backends._compiler_flash_seed_config(bound, "cute")
+
+    assert config == {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_topology": "fa4",
+    }
+
+
+def test_attention_compiler_flash_seed_config_falls_back_to_seed_list():
+    bound = SimpleNamespace(
+        config_spec=SimpleNamespace(
+            compiler_default_config=None,
+            compiler_seed_configs=[
+                SimpleNamespace(
+                    config={
+                        "block_sizes": [1, 128, 128],
+                        "cute_flash_kv_order": "ascending",
+                    }
+                )
+            ],
+        )
+    )
+
+    config = compare_attention_backends._compiler_flash_seed_config(bound, "cute")
+
+    assert config == {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_kv_order": "ascending",
+    }
+
+
 def test_attention_subprocess_forwards_helion_cute_timer():
     args = _attention_subprocess_args(helion_cute_benchmark_timer="event")
 

@@ -23,6 +23,15 @@ on:
         required: false
         type: boolean
         default: false
+      run_tpu_bridge:
+        # Transitional: kept separate (default off) so this PR can land without
+        # the bridge entering the nightly before its dashboard wiring exists. The
+        # dashboard follow-up folds this into `run_tpu` (both TPU jobs gated by
+        # one toggle) and removes this input.
+        description: 'Run TPU v7 benchmark via the tritonbench bridge (WIP; artifact-only until the dashboard follow-up lands). Independent of run_tpu; transitional, folded into run_tpu later.'
+        required: false
+        type: boolean
+        default: false
       run_b200_cute:
         description: 'Run benchmark on B200 with the Helion CuTe backend'
         required: false
@@ -55,6 +64,11 @@ on:
         required: false
         type: string
         default: "flash_attention,bmm,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,cross_entropy,kl_div"
+      kernels_tpu_bridge:
+        description: 'Kernels benchmarked on TPU via the tritonbench bridge (benchmarks/run.py --device tpu). Currently produces artifacts only (manual, gated behind run_tpu_bridge); a follow-up wires these into the shared tpu dashboard column and moves them off kernels_tpu.'
+        required: false
+        type: string
+        default: "flash_attention,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,kl_div"
       kernels_cute:
         description: 'Comma-separated list of kernels to benchmark on B200 with HELION_BACKEND=cute. Defaults to the CuTe-capable TritonBench subset.'
         required: false
@@ -230,9 +244,19 @@ jobs:
       kernels: ${{ github.event.inputs.kernels_linattn }}
       env-vars: ${{ github.event.inputs.env_vars }}
 
+  run-tpu-bridge:
+    if: ${{ github.event.inputs.run_tpu_bridge == 'true' }}
+    uses: ./.github/workflows/benchmark_tpu_bridge.yml
+    permissions:
+      contents: read
+    with:
+      alias: tpu_bridge
+      kernels: ${{ github.event.inputs.kernels_tpu_bridge }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-linattn, run-h100-linattn]
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-linattn, run-h100-linattn, run-tpu-bridge]
     runs-on: ubuntu-latest
     permissions:
       actions: write

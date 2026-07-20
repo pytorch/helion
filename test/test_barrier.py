@@ -217,8 +217,8 @@ class TestBarrier(RefEagerTestBase, TestCase):
         class _FakeRDim:
             block_id = 7
             reduction = True
-            # A static reduction extent so register_rollable_reductions can build a
-            # ReductionFact (static_rnumel reads rdim.size).
+            # A static reduction extent so register_rollable_reductions can register the
+            # reduction_loops spec (reads rdim.size).
             size = 16
 
             def size_hint(self) -> int:
@@ -264,7 +264,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
 
         fake_env = SimpleNamespace(
             block_sizes=[_FakeRDim()],
-            config_spec=SimpleNamespace(reduction_loops=[], reduction_facts=[]),
+            config_spec=SimpleNamespace(reduction_loops=[]),
             backend_name="triton",
         )
 

@@ -164,6 +164,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # Decide once which sibling for-loops need a tl.debug_barrier()
         # to make global writes visible to subsequent reads.
         self._compute_inter_loop_barriers()
+        # Same, for a store->load read-after-write *within* one loop body.
+        self._compute_intra_loop_barriers()
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -260,6 +262,23 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 pending_global_writes |= self._triton_global_barrier_tensor_names(
                     cur_info.host_loop_writes
                 )
+
+    def _compute_intra_loop_barriers(self) -> None:
+        """Mark loads that read a tensor an earlier store in the same body wrote,
+        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them.
+
+        Gated on Triton for the same reason as ``_compute_inter_loop_barriers``:
+        ``tl.debug_barrier()`` lowers to ``ttg.barrier`` which the TileIR pass
+        pipeline does not legalize.
+        """
+        from .loop_dependency_checker import mark_intra_loop_raw_barriers
+
+        env = CompileEnvironment.current()
+        if env.codegen_name != "triton" or env.backend.name == "tileir":
+            return
+        mark_intra_loop_raw_barriers(
+            self.codegen_graphs, self.host_function.device_ir.root_ids
+        )
 
     def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
         """Names that may participate in cross-wavefront global (HBM) coherence.
@@ -1439,13 +1458,13 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
-            small_biased_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind") == "helion_small_biased_attention"
+            shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
+                plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
                 for plan in codegen.cute_wrapper_plans
             )
             if (
                 codegen.cute_uses_matmul or codegen.cute_wrapper_plans
-            ) and not small_biased_wrapper_only:
+            ) and not shape_bake_safe_wrapper_only:
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"

@@ -34,21 +34,12 @@ code today).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from typing import Callable
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .. import exc
-from .._compiler.ast_extension import expr_from_string
 from . import _decorators
-
-if TYPE_CHECKING:
-    import ast
-
-    from .._compiler.inductor_lowering import CodegenState
-
 
 # Tanh-approximation GELU constants. Spelled out as ``float`` literals
 # rather than ``math.sqrt(2.0 / math.pi)`` at import time so the
@@ -103,13 +94,6 @@ _GELU_TANH_APPROX_EXPR_CUTE = (
 # scalar erf while non-fp32 and odd-size TensorSSA inputs keep the
 # scalar cute.math.erf fallback.
 _GELU_ERF_EXPR_CUTE = "_cute_gelu_erf_exact_f32x2({inner})"
-_GELU_TANH_APPROX_EXPR_TRITON = (
-    f"(0.5 * ({{x}}) * (1.0 + libdevice.tanh(({{x32}}) * ({GELU_TANH_APPROX_KAPPA!r}"
-    f" + {GELU_TANH_APPROX_LAMBDA!r} * ({{x32}}) * ({{x32}})))))"
-)
-_GELU_ERF_EXPR_TRITON = (
-    f"(0.5 * ({{x}}) * (1.0 + libdevice.erf(({{x32}}) * {GELU_ERF_INV_SQRT2!r})))"
-)
 
 
 @_decorators.api(is_device_only=True)
@@ -148,124 +132,6 @@ def _(x: torch.Tensor) -> torch.Tensor:
 @_decorators.register_fake(_gelu_erf)
 def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
-
-
-@_decorators.codegen(_gelu_tanh_approx, "triton")
-def _(state: CodegenState) -> ast.AST:
-    # Lift the input to a local so the four ``{x}`` references all
-    # bind to the same Triton SSA name; without the lift, the
-    # rendered expression would textually duplicate the inbound
-    # expression four times (Triton compile-time CSE handles the
-    # values, but generated source size grows quadratically with
-    # chain depth, which we explicitly avoid in cute_epilogue.py too).
-    input_ast = state.codegen.lift(
-        state.ast_arg(0), dce=True, prefix="gelu_tanh_approx_in"
-    )
-    # ``libdevice.tanh`` is fp32-only on Triton/CUDA. For fp16 / bf16
-    # inputs cast the *tanh argument* (``{x32}``) to fp32 (the
-    # surrounding multiplies promote through to fp32 too) and then
-    # narrow the whole result back to the input dtype before
-    # returning, matching ``register_fake``'s ``torch.empty_like(x)``
-    # contract. Mirrors the round-trip Helion installs for
-    # ``aten.tanh.default`` via
-    # ``inductor_lowering_extra.FP32_FALLBACK_OPS_UNARY``.
-    proxy = state.proxy_args[0]
-    orig_dtype: torch.dtype | None = None
-    if isinstance(proxy, torch.Tensor) and proxy.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ):
-        orig_dtype = proxy.dtype
-    if orig_dtype is not None:
-        x32_local = state.codegen.lift(
-            expr_from_string(f"{input_ast.id}.to(tl.float32)"),
-            dce=True,
-            prefix="gelu_tanh_approx_fp32",
-        )
-        x32_id = x32_local.id
-    else:
-        x32_id = input_ast.id
-    expr = _GELU_TANH_APPROX_EXPR_TRITON.replace("{x}", input_ast.id).replace(
-        "{x32}", x32_id
-    )
-    if orig_dtype is not None:
-        # Narrow the fp32 polynomial result back to the input dtype so
-        # the FX-level same-dtype contract holds for callers that do
-        # not immediately follow with ``.to(x.dtype)``.
-        expr = f"({expr}).to({triton_type(orig_dtype)})"
-    return expr_from_string(expr)
-
-
-@_decorators.codegen(_gelu_erf, "triton")
-def _(state: CodegenState) -> ast.AST:
-    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
-    proxy = state.proxy_args[0]
-    orig_dtype: torch.dtype | None = None
-    if isinstance(proxy, torch.Tensor) and proxy.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ):
-        orig_dtype = proxy.dtype
-    if orig_dtype is not None:
-        x32_local = state.codegen.lift(
-            expr_from_string(f"{input_ast.id}.to(tl.float32)"),
-            dce=True,
-            prefix="gelu_erf_fp32",
-        )
-        x32_id = x32_local.id
-    else:
-        x32_id = input_ast.id
-    expr = _GELU_ERF_EXPR_TRITON.replace("{x}", input_ast.id).replace("{x32}", x32_id)
-    if orig_dtype is not None:
-        expr = f"({expr}).to({triton_type(orig_dtype)})"
-    return expr_from_string(expr)
-
-
-@_decorators.codegen(_gelu_tanh_approx, "cute")
-def _(state: CodegenState) -> ast.AST:
-    # Same lift-to-single-local rationale as the triton path: see the
-    # module docstring and :class:`Tcgen05UnaryEpilogueChain`
-    # (``cute_epilogue.py``).
-    input_ast = state.codegen.lift(
-        state.ast_arg(0), dce=True, prefix="gelu_tanh_approx_in"
-    )
-    return expr_from_string(epilogue_unary_step_template().format(inner=input_ast.id))
-
-
-@_decorators.codegen(_gelu_erf, "cute")
-def _(state: CodegenState) -> ast.AST:
-    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
-    return expr_from_string(
-        gelu_erf_epilogue_unary_step_template().format(inner=input_ast.id)
-    )
-
-
-@_decorators.codegen(_gelu_tanh_approx, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    # Pallas does not have a ``cute.math.tanh`` analog wired through
-    # Helion today; raise a structured ``BackendUnsupported`` so the
-    # diagnostic is actionable rather than failing at codegen lookup
-    # with a missing-implementation error. Users can spell
-    # ``jax.nn.gelu(x, approximate=True)`` directly when targeting
-    # Pallas.
-    raise exc.BackendUnsupported(
-        "pallas",
-        "F.gelu(x, approximate='tanh') (cute and triton only)",
-    )
-
-
-@_decorators.codegen(_gelu_erf, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    # ``jax.nn.gelu(x, approximate=False)`` lowers via ``lax.erfc`` which is
-    # unimplemented in Pallas TPU's Mosaic lowering. Render the equivalent
-    # ``erf``-based formula directly so the chain only references the
-    # TPU-supported ``lax.erf`` primitive.
-    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
-    expr = (
-        f"(0.5 * ({input_ast.id}) * "
-        f"(1.0 + lax.erf(({input_ast.id}) * {GELU_ERF_INV_SQRT2!r})))"
-    )
-    return expr_from_string(expr)
 
 
 @_decorators.ref(_gelu_tanh_approx)

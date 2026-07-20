@@ -145,21 +145,29 @@ def use_cudagraph() -> bool:
     return True
 
 
+def _bench_shapes() -> list[tuple[int, int]]:
+    """Shapes main() benchmarks: (num_tokens, hidden_size) pairs."""
+    hidden_sizes = [2048, 4096, 5120]
+    num_tokens_list = [1, 4, 16, 64, 256, 1024, 2048, 8192]
+    return [(t, h) for h in hidden_sizes for t in num_tokens_list]
+
+
 def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
-    num_tokens, hidden_size, group_size = 16, 4096, 128
-    inp = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
-    groups = hidden_size // group_size
-    oq = torch.empty_like(inp, dtype=torch.float8_e4m3fn)
-    os = torch.empty((num_tokens, groups), device="cuda", dtype=torch.float32)
-    oq_ref = torch.empty_like(oq)
-    os_ref = torch.empty_like(os)
+    group_size = 128
     const = (group_size, 1e-10, -448.0, 448.0, False)
-    per_token_group_fp8_quant(inp, oq, os, *const)
-    _per_token_group_fp8_quant_torch(inp, oq_ref, os_ref, *const)
-    torch.testing.assert_close(os, os_ref, rtol=1e-2, atol=1e-6)
-    torch.testing.assert_close(oq.float(), oq_ref.float(), rtol=0.2, atol=0.2)
+    for num_tokens, hidden_size in _bench_shapes():
+        inp = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        groups = hidden_size // group_size
+        oq = torch.empty_like(inp, dtype=torch.float8_e4m3fn)
+        os = torch.empty((num_tokens, groups), device="cuda", dtype=torch.float32)
+        oq_ref = torch.empty_like(oq)
+        os_ref = torch.empty_like(os)
+        per_token_group_fp8_quant(inp, oq, os, *const)
+        _per_token_group_fp8_quant_torch(inp, oq_ref, os_ref, *const)
+        torch.testing.assert_close(os, os_ref, rtol=1e-2, atol=1e-6)
+        torch.testing.assert_close(oq.float(), oq_ref.float(), rtol=0.2, atol=0.2)
 
 
 def main(verbose: bool = True) -> dict:
@@ -175,9 +183,7 @@ def main(verbose: bool = True) -> dict:
     group_size = 128
     scale_ue8m0 = False
 
-    hidden_sizes = [2048, 4096, 5120]
-    num_tokens_list = [1, 4, 16, 64, 256, 1024, 2048, 8192]
-    shapes = [(t, h) for h in hidden_sizes for t in num_tokens_list]
+    shapes = _bench_shapes()
     baselines = _baselines()
 
     def make_calls(shape: tuple) -> tuple:
@@ -234,4 +240,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()
