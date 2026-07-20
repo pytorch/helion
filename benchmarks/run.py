@@ -1576,7 +1576,17 @@ def run_kernel_variants(
                         nonlocal first_call
                         if first_call:
                             first_call = False
-                            torch.cuda.synchronize()
+                            # Flush previously-queued work before the
+                            # compile-time counter starts (a pre-call counter
+                            # flush, not a result sync -- hence
+                            # accelerator.synchronize here, not the autotuner's
+                            # tensor-level synchronize_device). Bare
+                            # torch.cuda.synchronize() raised "Torch not compiled
+                            # with CUDA enabled" on TPU (torch_tpu builds against
+                            # CPU torch), failing every helion impl under
+                            # --measure-compile-time.
+                            if torch.accelerator.is_available():
+                                torch.accelerator.synchronize()
                             reset_compile_time()
                             try:
                                 result = original()
