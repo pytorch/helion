@@ -1704,10 +1704,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             _cute_two_matmuls_force_persistent_kernel.bind(args)
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_multi_root_distributed_raises_invalid_config(
+    def test_cute_tcgen05_multi_root_distributed_keeps_persistent_pid_types_out(
         self,
     ) -> None:
-        """Distributed mode also makes the pid search persistent-only."""
+        """Distributed alone does not force persistent-only; without a
+        barrier/symm-mem signal this kernel narrows to non-persistent pid types."""
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1732,12 +1733,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 return_value="world",
             ),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
-            self.assertRaisesRegex(
-                InvalidConfig,
-                "CuTe tcgen05 multi-root kernels do not support persistent pid types",
-            ),
         ):
-            _cute_two_matmuls_kernel.bind(args)
+            bound = _cute_two_matmuls_kernel.bind(args)
+        spec = bound.config_spec
+        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
 
     def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
         """Direct unit test for the narrowing helper that does not depend
