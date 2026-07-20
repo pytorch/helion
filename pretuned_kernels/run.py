@@ -42,6 +42,8 @@ KERNELS = [
     "softmax",
     "scaled_mm",
     "scale_mm_cute",
+    "nvfp4_gemv",
+    "nvfp4_gemv_cute",
     "cross_entropy",
     # Ported from vLLM (vllm/kernels/helion/ops); torch-native baselines.
     "silu_mul_fp8",
