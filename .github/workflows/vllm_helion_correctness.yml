@@ -73,14 +73,28 @@ jobs:
         # continue-on-error): the check cannot run without it.
         run: |
           source .venv/bin/activate
+          # Install vllm and let it pull its OWN pinned torch. The vllm nightly
+          # wheel pins a *stable* release (currently torch==2.11.0, with matching
+          # torchvision/torchaudio), which lives on the pytorch *stable* cu130
+          # index -- so that is the torch index we point at, NOT the nightly one.
+          #
+          # Do NOT add the pytorch *nightly* cu130 index here: it mirrors a vllm
+          # wheel ("1.0.0.devYYYYMMDD+cu130") whose source commit lags the vllm
+          # repo by days, and under PEP 440 that "1.0.0.dev*" outranks the
+          # genuine vllm nightly ("0.23.*rc1.dev*+g<sha>") on wheels.vllm.ai --
+          # so unsafe-best-match would always resolve the stale pytorch-index
+          # wheel and newer nightlies would never help. The stable cu130 index
+          # carries no competing vllm wheel, so vllm resolves from wheels.vllm.ai
+          # while torch resolves from stable cu130. The stable index also gives a
+          # CUDA build matching the container / GPU (incl. B200).
+          #
           # unsafe-best-match: vLLM nightly pins exact dep versions that live on
-          # PyPI, not the vLLM/pytorch nightly indexes; let uv resolve from any.
-          # The pytorch cu130 nightly index gives a torch CUDA build matching the
-          # container / GPU (incl. B200).
-          uv pip install -U vllm --pre \
+          # PyPI (the default index), not on wheels.vllm.ai -- let uv resolve
+          # those across indexes.
+          uv pip install --pre vllm \
             --index-strategy unsafe-best-match \
             --extra-index-url https://wheels.vllm.ai/nightly \
-            --extra-index-url https://download.pytorch.org/whl/nightly/cu130
+            --extra-index-url https://download.pytorch.org/whl/cu130
           python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
 
       - name: Install Helion (this PR)
