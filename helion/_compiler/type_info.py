@@ -446,8 +446,9 @@ class TensorType(TypeInfo):
                 rhs_rank = value.fake_value.ndim
                 # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
                 if rhs_rank != 0 and lhs_rank != rhs_rank:
+                    env = CompileEnvironment.current()
                     can_squeeze = rhs_rank > lhs_rank and all(
-                        value.fake_value.size(d) == 1
+                        env.known_equal(value.fake_value.size(d), 1)
                         for d in range(rhs_rank - lhs_rank)
                     )
                     if not can_squeeze:
