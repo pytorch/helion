@@ -2718,8 +2718,23 @@ class TestPallas(TestCase):
             pallas_pre_broadcast=True,
             pallas_load_buffer_count=[2, 2, 2],
         )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
         self.assertIn("def _prime_fori_loads", code)
-        self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 2)
+        # The first three entries are pre-broadcast loop-carried state. K and V
+        # then receive two VMEM stages and two semaphore slots each.
+        self.assertIn(
+            "_scratch_shapes=["
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2, 4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2,), None, 'dma_semaphore'), "
+            "((2, 4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2,), None, 'dma_semaphore')]",
+            code,
+        )
+        self.assertIn("_hbm_arg_indices=[1, 2]", code)
         self.assertNotIn("q_view_buf", code)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
