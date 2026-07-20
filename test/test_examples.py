@@ -1974,6 +1974,32 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
+        with self.assertRaisesRegex(ValueError, "x_bf16 must contain"):
+            mod.nvfp4_gemv_bf16in(weight, x_bf16[:-16], weight_scale)
+        with self.assertRaisesRegex(ValueError, "x_packed must contain"):
+            mod.nvfp4_gemv_fp4in(weight, x_packed[:-8], weight_scale, x_scale)
+
+        noncontiguous_weight = torch.randint(
+            0,
+            256,
+            (M, K_bytes + 8),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )[:, :K_bytes]
+        self.assertFalse(noncontiguous_weight.is_contiguous())
+        with self.assertRaisesRegex(ValueError, "weight_packed must be contiguous"):
+            mod.nvfp4_gemv_bf16in(noncontiguous_weight, x_bf16, weight_scale)
+
+        bad_k_weight = torch.randint(
+            0,
+            256,
+            (M, K_bytes - 1),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )
+        with self.assertRaisesRegex(ValueError, "K bytes must be divisible by 8"):
+            mod.nvfp4_gemv_bf16in(bad_k_weight, x_bf16[:-2], weight_scale)
+
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
