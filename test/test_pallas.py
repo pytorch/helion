@@ -609,6 +609,25 @@ def kernel_tile_begin_plus_offset_is_elementwise(
     return out
 
 
+# Module-level (Helion reads it as a constant, not a closure) so torch.topk's k
+# is static; the pallas backend lowers aten.topk to a tallax-style
+# divide-and-filter (see test_topk_divide_and_filter_lowering).
+_TOPK_TEST_K = 32
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _topk_pallas_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    b, _v = x.shape
+    k = hl.specialize(k)  # static top-k width (num_bins is computed at trace time)
+    out_v = torch.empty([b, k], dtype=x.dtype, device=x.device)
+    out_i = torch.empty([b, k], dtype=torch.int32, device=x.device)
+    for tile_b in hl.tile(b):
+        vals, idx = torch.topk(x[tile_b, :], k, dim=-1, largest=True)
+        out_v[tile_b, :] = vals
+        out_i[tile_b, :] = idx.to(torch.int32)
+    return out_v, out_i
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -797,6 +816,35 @@ class TestPallas(TestCase):
         code, result = code_and_output(_swiglu_fwd_pallas, (a, b), block_sizes=[16, 32])
         expected = torch.nn.functional.silu(a) * b
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    def test_topk_divide_and_filter_lowering(self) -> None:
+        """aten.topk lowers to a tallax-style divide-and-filter (Mosaic has no
+        jax.lax.top_k): the generated code calls the helper, the top-1 is exact,
+        values come out descending, and recall vs the exact top-k is high
+        (approximate, like tallax's approx_max_k)."""
+        torch.manual_seed(0)
+        x = torch.randn(64, 4096, device=DEVICE, dtype=torch.float32)
+        code, (vals, idx) = code_and_output(
+            _topk_pallas_kernel, (x, _TOPK_TEST_K), block_sizes=[8]
+        )
+        # (1) the lowering emits the divide-and-filter helper, not jax.lax.top_k
+        self.assertIn("_helion_divide_filter_topk", code)
+        self.assertNotIn("lax.top_k", code)
+        # (2) correctness vs the exact top-k
+        ref_v, ref_i = torch.topk(x, _TOPK_TEST_K, dim=-1, largest=True)
+        idx_c = idx.cpu()
+        vals_c = vals.cpu()
+        # top-1 is exact (required so a greedy argmax is unaffected)
+        self.assertTrue(torch.equal(idx_c[:, 0], ref_i.cpu()[:, 0].to(torch.int32)))
+        # values come out descending
+        self.assertTrue(bool((vals_c[:, :-1] - vals_c[:, 1:] >= -1e-4).all()))
+        # recall vs the true top-k is high (approximate path, like tallax)
+        ref_sets = [set(r.tolist()) for r in ref_i.cpu()]
+        recall = sum(
+            len(set(idx_c[r].tolist()) & ref_sets[r]) / _TOPK_TEST_K
+            for r in range(x.shape[0])
+        ) / x.shape[0]
+        self.assertGreater(recall, 0.9)
 
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
