@@ -2140,7 +2140,6 @@ def _helion_chunked_fwd_delta(
         )
 
     return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
-    return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
 
 
 def _helion_chunked_bwd(
@@ -2421,7 +2420,6 @@ def _helion_chunked_bwd_delta(
     dk_out = dk_full.float().reshape(B, H, T, D)
     dg_out = dg.reshape(B, H, T)
     return dq_out, dk_out, dv_out, dg_out, dbeta_out, None
-    return dq_out, dk_out, dv_out, dg_out, dbeta_out
 
 
 def _helion_chunked_bwd_kda(
