@@ -1975,6 +1975,96 @@ class TestCuteBackend(TestCase):
             f"and grow the config spec mid-autotune",
         )
 
+    def test_flash_attention_fa4_persistent_power2_decode_uses_shift_mask(self) -> None:
+        code = _cute_flash._flash_fa4_wrap(
+            "if warp_idx == 14:",
+            "    cute.arch.setmaxregister_decrease(40)",
+            "        flash_sink = flash_m_pair + flash_bh",
+            persistent=True,
+            prelude="decode",
+            total_tiles=32768,
+            num_m_pairs=512,
+        )
+        self.assertIn(
+            "flash_grid_bh_delta = (flash_grid_dim >> 9)",
+            code,
+        )
+        self.assertIn(
+            "flash_grid_m_pairs_delta = (flash_grid_dim & cutlass.Int32(511))",
+            code,
+        )
+        self.assertIn(
+            "flash_m_pair = (flash_tile_id & cutlass.Int32(511))",
+            code,
+        )
+        self.assertIn("flash_bh = (flash_tile_id >> 9)", code)
+        self.assertNotIn("flash_grid_dim // 512", code)
+        self.assertNotIn("flash_tile_id % 512", code)
+        self.assertNotIn("flash_tile_id // 512", code)
+
+    def test_flash_attention_fa4_no_prelude_uses_counted_loop_for_mid_dense(
+        self,
+    ) -> None:
+        code = _cute_flash._flash_fa4_wrap(
+            "if warp_idx == 0:",
+            "    cute.arch.setmaxregister_increase(200)",
+            "        flash_sink = flash_sink + flash_tile_id",
+            persistent=True,
+            prelude="none",
+            total_tiles=8192,
+            num_m_pairs=128,
+        )
+        self.assertIn("flash_tile_count = cutlass.Int32(0)", code)
+        self.assertIn(
+            "for flash_tile_iter in cutlass.range(flash_tile_count, unroll=1):\n"
+            "        flash_sink = flash_sink + flash_tile_id\n"
+            "        flash_tile_id = flash_tile_id + flash_grid_dim",
+            code,
+        )
+        self.assertNotIn("while flash_tile_id < 8192", code)
+
+    def test_flash_attention_fa4_no_prelude_omits_dead_counted_tile_id_advance(
+        self,
+    ) -> None:
+        code = _cute_flash._flash_fa4_wrap(
+            "if warp_idx == 0:",
+            "    cute.arch.setmaxregister_increase(200)",
+            "        flash_sink = flash_sink + cutlass.Int32(1)",
+            persistent=True,
+            prelude="none",
+            total_tiles=8192,
+            num_m_pairs=128,
+        )
+        self.assertIn("for flash_tile_iter in cutlass.range", code)
+        self.assertNotIn("flash_tile_id = flash_tile_id + flash_grid_dim", code)
+
+    def test_flash_attention_fa4_no_prelude_keeps_while_loop_for_long_sequence(
+        self,
+    ) -> None:
+        code = _cute_flash._flash_fa4_wrap(
+            "if warp_idx == 0:",
+            "    cute.arch.setmaxregister_increase(200)",
+            "        flash_sink = flash_sink + cutlass.Int32(1)",
+            persistent=True,
+            prelude="none",
+            total_tiles=8192,
+            num_m_pairs=1024,
+        )
+        self.assertIn("while flash_tile_id < 8192", code)
+        self.assertNotIn("flash_tile_count = cutlass.Int32(0)", code)
+
+    def test_flash_attention_fa4_first_load_order_variants(self) -> None:
+        def order(first_load_order: int) -> list[str]:
+            return _cute_flash._flash_fa4_load_prologue_for_order(
+                first_load_order, "Q0", "K0", "Q1", "V0"
+            ).splitlines()
+
+        self.assertEqual(order(0), ["Q0", "K0", "Q1", "V0"])
+        self.assertEqual(order(1), ["K0", "V0", "Q0", "Q1"])
+        self.assertEqual(order(2), ["Q0", "Q1", "K0", "V0"])
+        self.assertEqual(order(3), ["K0", "Q0", "V0", "Q1"])
+        self.assertEqual(order(4), ["K0", "Q0", "Q1", "V0"])
+
     def test_flash_attention_fires_and_matches_sdpa(self) -> None:
         """With the gate default-on, square fp16 attention at [1,128,128] lowers
         to the fused tcgen05 flash kernel and matches SDPA for head_dim 64/128."""
@@ -2295,6 +2385,35 @@ class TestCuteBackend(TestCase):
             (q, k, v, bias),
             block_sizes=[1, 128, 128],
         )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias,
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_stage_local_softmax_bias_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(1, 2, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bias = torch.randn(1, 2, 256, 256, dtype=torch.float16, device=DEVICE) * 0.25
+        with patch.dict(
+            os.environ,
+            {"HELION_CUTE_FLASH_STAGE_LOCAL_SOFTMAX_SETUP": "1"},
+            clear=False,
+        ):
+            code, out = code_and_output(
+                cute_biased_attention,
+                (q, k, v, bias),
+                block_sizes=[1, 128, 128],
+                cute_flash_small_biased=False,
+            )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("flash_tiled_ld_coord", code)
+        self.assertIn("add_score_bias_t2r", code)
+        self.assertNotIn("helion_small_biased_attention", code)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -3260,6 +3379,7 @@ class TestCuteBackend(TestCase):
             cfg = resolve_flash_config(64, 2)
         self.assertEqual(cfg.softmax_regs, 200)
         self.assertEqual(cfg.corr_regs, 64)
+        self.assertEqual(cfg.other_regs, 48)
 
         with patch.dict(
             os.environ,
@@ -3267,12 +3387,14 @@ class TestCuteBackend(TestCase):
                 "HELION_CUTE_FLASH_TOPOLOGY": "fa4",
                 "HELION_CUTE_FLASH_SOFTMAX_REGS": "192",
                 "HELION_CUTE_FLASH_CORR_REGS": "80",
+                "HELION_CUTE_FLASH_OTHER_REGS": "32",
             },
             clear=True,
         ):
             cfg = resolve_flash_config(64, 2)
         self.assertEqual(cfg.softmax_regs, 192)
         self.assertEqual(cfg.corr_regs, 80)
+        self.assertEqual(cfg.other_regs, 32)
 
         cfg = resolve_flash_config(
             64,
@@ -3281,10 +3403,12 @@ class TestCuteBackend(TestCase):
                 "cute_flash_topology": "fa4",
                 "cute_flash_softmax_regs": 184,
                 "cute_flash_corr_regs": 88,
+                "cute_flash_other_regs": 40,
             },
         )
         self.assertEqual(cfg.softmax_regs, 184)
         self.assertEqual(cfg.corr_regs, 88)
+        self.assertEqual(cfg.other_regs, 40)
 
         with patch.dict(
             os.environ,
@@ -3301,10 +3425,12 @@ class TestCuteBackend(TestCase):
                 {
                     "cute_flash_softmax_regs": 196,
                     "cute_flash_corr_regs": 72,
+                    "cute_flash_other_regs": 44,
                 },
             )
         self.assertEqual(cfg.softmax_regs, 200)
         self.assertEqual(cfg.corr_regs, 72)
+        self.assertEqual(cfg.other_regs, 48)
 
         cfg = resolve_flash_config(
             64,
@@ -3318,6 +3444,7 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg.topology, "ws_overlap")
         self.assertEqual(cfg.softmax_regs, 200)
         self.assertEqual(cfg.corr_regs, 64)
+        self.assertEqual(cfg.other_regs, 48)
 
         with patch.dict(
             os.environ,
@@ -3331,6 +3458,43 @@ class TestCuteBackend(TestCase):
             cfg = resolve_flash_config(64, 2)
         self.assertEqual(cfg.softmax_regs, 200)
         self.assertEqual(cfg.corr_regs, 64)
+        self.assertEqual(cfg.other_regs, 48)
+
+    def test_flash_attention_dense_hd64_corr_reg_seed_buckets(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg_32k = resolve_flash_config(64, 256)
+            cfg_64k = resolve_flash_config(64, 512)
+            cfg_128k = resolve_flash_config(64, 1024)
+            cfg_256k = resolve_flash_config(64, 2048)
+
+        self.assertEqual(cfg_32k.corr_regs, 64)
+        self.assertEqual(cfg_64k.corr_regs, 72)
+        self.assertEqual(cfg_128k.corr_regs, 72)
+        self.assertEqual(cfg_256k.corr_regs, 80)
+        self.assertEqual(cfg_32k.e2e_schedule, "8/2")
+        self.assertEqual(cfg_64k.e2e_schedule, "8/2")
+        self.assertEqual(cfg_128k.e2e_schedule, "16/4")
+        self.assertEqual(cfg_256k.e2e_schedule, "16/4")
+        self.assertEqual(cfg_32k.first_load_order, 0)
+        self.assertEqual(cfg_64k.first_load_order, 0)
+        self.assertEqual(cfg_128k.first_load_order, 0)
+        self.assertEqual(cfg_256k.first_load_order, 4)
+
+    def test_flash_attention_dense_hd64_epi_tma_seed_buckets(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg_32k = resolve_flash_config(64, 256)
+            cfg_64k = resolve_flash_config(64, 512)
+            cfg_128k = resolve_flash_config(64, 1024)
+            cfg_256k = resolve_flash_config(64, 2048)
+
+        self.assertTrue(cfg_32k.epi_tma)
+        self.assertFalse(cfg_32k.epi_stg)
+        self.assertFalse(cfg_64k.epi_tma)
+        self.assertTrue(cfg_64k.epi_stg)
+        self.assertTrue(cfg_128k.epi_tma)
+        self.assertFalse(cfg_128k.epi_stg)
+        self.assertFalse(cfg_256k.epi_tma)
+        self.assertTrue(cfg_256k.epi_stg)
 
     def test_flash_attention_fa4_persistent_config_overrides_env(self) -> None:
         with patch.dict(os.environ, {"HELION_CUTE_FLASH_PERSISTENT": "1"}, clear=True):
@@ -5517,7 +5681,7 @@ class TestCuteBackend(TestCase):
         self.assertEqual(first, second)
         self.assertEqual(third, ("launched", ("ptr-2", "stream")))
 
-    def test_cute_launcher_bakes_layouts_for_small_biased_wrapper_only(self) -> None:
+    def test_cute_launcher_bakes_layouts_for_shape_bake_safe_wrappers(self) -> None:
         tensor = torch.empty((2, 128, 64), device=DEVICE, dtype=torch.float16)
         small_kernel = type("DummyCuteKernel", (), {})()
         small_kernel._helion_cute_wrapper_plans = [
@@ -5541,8 +5705,11 @@ class TestCuteBackend(TestCase):
             (tensor,),
             (1, 1, 1),
         )
-        self.assertEqual(schema, (("tensor", "torch.float16", 3),))
-        self.assertEqual(len(launch_args), 10)
+        self.assertEqual(
+            schema,
+            (("tensor", "torch.float16", 3, (2, 128, 64), (8192, 64, 1)),),
+        )
+        self.assertEqual(len(launch_args), 4)
 
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))
@@ -6159,20 +6326,40 @@ class TestCuteConfigValuePriors(TestCase):
 
     def test_flash_priors_bias_dense_hd64_fa4_values(self) -> None:
         from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_PDL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
         from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
         from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
+        from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
         from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
         from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+        from helion._compiler.cute.cute_flash import FLASH_S_LOAD_REP_KEY
         from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SKIP_RESCALE_STATS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
         from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
         from helion.autotuner.config_generation import ConfigGeneration
 
@@ -6191,21 +6378,111 @@ class TestCuteConfigValuePriors(TestCase):
             FLASH_S_STAGE_KEY: {2},
             FLASH_TOPOLOGY_KEY: {"fa4", "ws_overlap"},
             FLASH_PERSISTENT_KEY: {True},
+            FLASH_PERSISTENT_CTAS_PER_SM_KEY: {1, 2, 3, 4},
             FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
+            FLASH_SOFTMAX_DISC_KEY: {False, True},
             FLASH_DISC_PIPE_KEY: {2, 3, 4},
+            FLASH_P_STORE_REP_KEY: {16, 32},
+            FLASH_S_LOAD_REP_KEY: {16, 32},
+            FLASH_PRECOMPUTE_QK_DESC_KEY: {False, True},
+            FLASH_FIRST_LOAD_ORDER_KEY: {0, 1, 2, 3, 4},
+            FLASH_KV_ORDER_KEY: {"ascending", "descending"},
             FLASH_RESCALE_THRESHOLD_KEY: {8.0},
+            FLASH_SKIP_RESCALE_STATS_KEY: {False, True},
             FLASH_RESCALE_CHUNK_COLS_KEY: {16, 32},
             FLASH_CORR_REGS_KEY: {64},
+            FLASH_OTHER_REGS_KEY: {32, 40, 48, 56, 64, 80},
+            FLASH_CORR_TILE_SIZE_KEY: {8, 16, 32},
             FLASH_EPI_TMA_KEY: {False, True},
+            FLASH_EPI_STG_KEY: {False, True},
+            FLASH_EPI_STG_STORE_KEY: {"slice", "whole"},
+            FLASH_EPI_STG_GMEM_KEY: {"stage", "pair"},
             FLASH_SOFTMAX_REGS_KEY: {184, 200},
             FLASH_KV_STAGE_KEY: {2, 3},
             FLASH_PACKED_REDUCE_KEY: {True},
-            FLASH_E2E_OFFSET_KEY: {1, 2, 3, 4},
+            FLASH_CGA2_LOCAL_KEY: {False, True},
+            FLASH_CLC_KEY: {False, True},
+            FLASH_CLC_HEADS_PER_BATCH_KEY: {0, 32},
+            FLASH_CLC_PDL_KEY: {False, True},
+            FLASH_CLC_STAGES_KEY: {1, 2, 3},
+            FLASH_LOCAL_TMA_PARTITION_KEY: {False, True},
+            FLASH_TENSOR_4D_TMA_KEY: {False, True},
+            FLASH_E2E_OFFSET_KEY: {0, 1, 2, 3},
             FLASH_E2E_OFFSET0_KEY: {0, 1, 2, 3},
         }
         for key, values in expected.items():
             self.assertIn(key, priors)
             self._assert_prior_choices(priors[key], fragments[key], values)
+
+        bound.config_spec._cute_flash_num_kv = 256
+        very_long_priors = CuteBackend().config_value_priors(bound.config_spec)
+        very_long_fragments = bound.config_spec._flat_fields()
+        self._assert_prior_choices(
+            very_long_priors[FLASH_RESCALE_THRESHOLD_KEY],
+            very_long_fragments[FLASH_RESCALE_THRESHOLD_KEY],
+            {8.0, 16.0, 32.0},
+        )
+        for key, values in {
+            FLASH_TOPOLOGY_KEY: {"fa4", "ws_overlap"},
+            FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
+            FLASH_E2E_OFFSET_KEY: {0},
+            FLASH_E2E_OFFSET0_KEY: {1},
+            FLASH_KV_STAGE_KEY: {2, 3},
+            FLASH_PERSISTENT_CTAS_PER_SM_KEY: {1},
+            FLASH_SOFTMAX_DISC_KEY: {False},
+            FLASH_DISC_PIPE_KEY: {1},
+            FLASH_P_STORE_REP_KEY: {16},
+            FLASH_S_LOAD_REP_KEY: {32},
+            FLASH_PRECOMPUTE_QK_DESC_KEY: {False},
+            FLASH_FIRST_LOAD_ORDER_KEY: {0},
+            FLASH_KV_ORDER_KEY: {"descending"},
+            FLASH_SKIP_RESCALE_STATS_KEY: {False},
+            FLASH_RESCALE_CHUNK_COLS_KEY: {8},
+            FLASH_SOFTMAX_REGS_KEY: {192, 200},
+            FLASH_CORR_REGS_KEY: {64},
+            FLASH_OTHER_REGS_KEY: {40},
+            FLASH_CORR_TILE_SIZE_KEY: {8, 16},
+            FLASH_EPI_TMA_KEY: {True},
+            FLASH_EPI_STG_KEY: {False},
+            FLASH_EPI_STG_STORE_KEY: {"slice"},
+            FLASH_EPI_STG_GMEM_KEY: {"stage"},
+            FLASH_PACKED_REDUCE_KEY: {True},
+            FLASH_CGA2_LOCAL_KEY: {False},
+            FLASH_CLC_KEY: {False},
+            FLASH_CLC_HEADS_PER_BATCH_KEY: {0},
+            FLASH_CLC_PDL_KEY: {False},
+            FLASH_CLC_STAGES_KEY: {1},
+            FLASH_LOCAL_TMA_PARTITION_KEY: {False},
+            FLASH_TENSOR_4D_TMA_KEY: {False},
+        }.items():
+            self._assert_prior_choices(
+                very_long_priors[key],
+                very_long_fragments[key],
+                values,
+            )
+        bound.config_spec._cute_flash_num_kv = 512
+        staged_priors = CuteBackend().config_value_priors(bound.config_spec)
+        staged_fragments = bound.config_spec._flat_fields()
+        for key, values in {
+            FLASH_EPI_TMA_KEY: {False},
+            FLASH_EPI_STG_KEY: {True},
+            FLASH_EPI_STG_STORE_KEY: {"slice"},
+            FLASH_EPI_STG_GMEM_KEY: {"stage"},
+        }.items():
+            self._assert_prior_choices(
+                staged_priors[key], staged_fragments[key], values
+            )
+        bound.config_spec._cute_flash_num_kv = 1024
+        tma_priors = CuteBackend().config_value_priors(bound.config_spec)
+        tma_fragments = bound.config_spec._flat_fields()
+        for key, values in {
+            FLASH_EPI_TMA_KEY: {True},
+            FLASH_EPI_STG_KEY: {False},
+            FLASH_EPI_STG_STORE_KEY: {"slice"},
+            FLASH_EPI_STG_GMEM_KEY: {"stage"},
+        }.items():
+            self._assert_prior_choices(tma_priors[key], tma_fragments[key], values)
+        bound.config_spec._cute_flash_num_kv = 64
 
         gen = ConfigGeneration(bound.config_spec)
         with patch(
@@ -6220,10 +6497,24 @@ class TestCuteConfigValuePriors(TestCase):
         self.assertEqual(biased_config[FLASH_E2E_SCHEDULE_KEY], "8/2")
         self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
         self.assertEqual(biased_config[FLASH_KV_STAGE_KEY], 2)
+        self.assertEqual(biased_config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
         self.assertEqual(biased_config[FLASH_E2E_OFFSET_KEY], 2)
         self.assertEqual(biased_config[FLASH_E2E_OFFSET0_KEY], 2)
+        self.assertTrue(biased_config[FLASH_SOFTMAX_DISC_KEY])
+        self.assertEqual(biased_config[FLASH_P_STORE_REP_KEY], 16)
+        self.assertEqual(biased_config[FLASH_S_LOAD_REP_KEY], 32)
+        self.assertFalse(biased_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+        self.assertEqual(biased_config[FLASH_FIRST_LOAD_ORDER_KEY], 0)
+        self.assertEqual(biased_config[FLASH_KV_ORDER_KEY], "ascending")
+        self.assertEqual(biased_config[FLASH_OTHER_REGS_KEY], 48)
         self.assertTrue(biased_config[FLASH_EPI_TMA_KEY])
+        self.assertFalse(biased_config[FLASH_EPI_STG_KEY])
+        self.assertEqual(biased_config[FLASH_CORR_TILE_SIZE_KEY], 16)
+        self.assertFalse(biased_config[FLASH_SKIP_RESCALE_STATS_KEY])
         self.assertEqual(biased_config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertFalse(biased_config[FLASH_CLC_KEY])
+        self.assertFalse(biased_config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertFalse(biased_config[FLASH_TENSOR_4D_TMA_KEY])
 
     def test_flash_priors_bias_causal_hd64_shape_family_values(self) -> None:
         from helion._compiler.backend import CuteBackend

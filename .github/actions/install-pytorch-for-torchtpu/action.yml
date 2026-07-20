@@ -1,0 +1,16 @@
+name: Install pinned PyTorch for TorchTPU
+description: >
+  Install the CPU PyTorch nightly known to build against the pinned torch_tpu
+  commit. Single source of truth for the torch version used by every TPU job
+  (tests + benchmarks). Assumes a uv-managed .venv already exists in the
+  workspace.
+runs:
+  using: composite
+  steps:
+    - name: Install PyTorch (CPU nightly, pinned for TorchTPU)
+      shell: bash
+      run: |
+        source .venv/bin/activate
+        # The latest PyTorch nightly known to build against the pinned torch_tpu
+        # commit (.github/ci_commit_pins/torch_tpu.txt). Bump the two together.
+        uv pip install -U --pre "torch==2.14.0.dev20260707" --index-url https://download.pytorch.org/whl/nightly/cpu

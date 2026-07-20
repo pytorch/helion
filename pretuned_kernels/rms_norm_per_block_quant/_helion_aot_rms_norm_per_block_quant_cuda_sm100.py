@@ -140,4 +140,13 @@ def autotune_rms_norm_per_block_quant(*args) -> dict:
         {'block_sizes': [8192, 8], 'loop_orders': [[0, 1]], 'range_unroll_factors': [0, 3, 0, 2], 'range_warp_specializes': [None, None, True, None], 'range_num_stages': [], 'range_multi_buffers': [None, None, None, None], 'range_flattens': [None, None, False, False], 'static_ranges': [False], 'load_eviction_policies': ['', '', 'first', 'last', '', 'last'], 'num_warps': 1, 'num_stages': 3, 'indexing': ['pointer', 'pointer', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer'], 'atomic_indexing': [], 'pid_type': 'flat'},
         {'block_sizes': [8192, 8], 'loop_orders': [[0, 1]], 'range_unroll_factors': [0, 3, 0, 2], 'range_warp_specializes': [None, None, True, None], 'range_num_stages': [], 'range_multi_buffers': [None, None, None, None], 'range_flattens': [None, None, False, False], 'static_ranges': [False], 'load_eviction_policies': ['', '', 'first', 'last', '', 'last'], 'num_warps': 1, 'num_stages': 3, 'indexing': ['pointer', 'pointer', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer'], 'atomic_indexing': [], 'pid_type': 'flat'},
     ]
-    return _C[key_rms_norm_per_block_quant(*args)]
+    config = _C[key_rms_norm_per_block_quant(*args)]
+    range_warp_specializes = config.get("range_warp_specializes")
+    if range_warp_specializes and any(x is True for x in range_warp_specializes):
+        # Triton sm100 currently rejects this kernel for some warp-specialized
+        # group-loop configs, failing layout verification around the scale store.
+        config = config.copy()
+        config["range_warp_specializes"] = [
+            False if x is True else x for x in range_warp_specializes
+        ]
+    return config

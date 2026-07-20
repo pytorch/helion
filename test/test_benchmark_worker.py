@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import multiprocessing as mp
+from multiprocessing.connection import Connection
 import os
 from pathlib import Path
 import pickle
@@ -307,6 +308,29 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertLess(time.time() - t0, 15.0)
             self.assertFalse(worker.alive())
             # Next call respawns.
+            self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
+        finally:
+            worker.shutdown()
+
+    def test_watchdog_kills_worker_when_poll_timeout_is_ignored(self) -> None:
+        original_poll = Connection.poll
+
+        def poll_until_ready(
+            self: Connection,
+            timeout: float | None = None,
+        ) -> bool:
+            return original_poll(self, None)
+
+        worker = BenchmarkWorker()
+        try:
+            t0 = time.time()
+            with (
+                patch.object(Connection, "poll", poll_until_ready),
+                self.assertRaises(BenchmarkTimeout),
+            ):
+                worker.run(_Sleep(60), timeout=0.5)
+            self.assertLess(time.time() - t0, 15.0)
+            self.assertFalse(worker.alive())
             self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
             worker.shutdown()

@@ -64,3 +64,12 @@ _MEMORY_OPS = (
     atomic_xchg,
     atomic_xor,
 )
+
+# All language ops are now defined.  Import each registered backend's per-op
+# codegen modules (helion/_compiler/<backend>/_codegen_modules.py) so their
+# @_decorators.codegen / register_codegen handlers register with the same eager
+# timing as the old per-file bottom imports.  This is driven by the backend
+# registry, so adding a backend needs no edits to the core language files.
+from .._compiler.backend_registry import import_backend_codegen  # noqa: E402
+
+import_backend_codegen()

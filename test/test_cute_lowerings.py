@@ -26,21 +26,21 @@ from helion._compiler.ast_read_writes import dead_lane_loop_elimination
 from helion._compiler.aten_lowering import _pallas_argreduce
 from helion._compiler.aten_lowering import _should_use_cute_argreduce_lowering
 from helion._compiler.aten_lowering import _triton_argreduce
-from helion._compiler.aten_lowering import codegen_baddbmm_cute
-from helion._compiler.aten_lowering import codegen_iota_cute
-from helion._compiler.aten_lowering import codegen_mm_cute
-from helion._compiler.aten_lowering import codegen_squeeze_cute
-from helion._compiler.aten_lowering import codegen_stack_cute
-from helion._compiler.aten_lowering import codegen_unsqueeze_cute
-from helion._compiler.aten_lowering import codegen_view_cute
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
-from helion._compiler.backend import _detect_mma_loop
 from helion._compiler.backend import _loop_contains_matmul
-from helion._compiler.backend import _loop_may_use_mma
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
+from helion._compiler.cute.aten_lowering import codegen_baddbmm_cute
+from helion._compiler.cute.aten_lowering import codegen_iota_cute
+from helion._compiler.cute.aten_lowering import codegen_mm_cute
+from helion._compiler.cute.aten_lowering import codegen_squeeze_cute
+from helion._compiler.cute.aten_lowering import codegen_stack_cute
+from helion._compiler.cute.aten_lowering import codegen_unsqueeze_cute
+from helion._compiler.cute.aten_lowering import codegen_view_cute
+from helion._compiler.cute.backend import _detect_mma_loop
+from helion._compiler.cute.backend import _loop_may_use_mma
 from helion._compiler.cute.cute_mma import _TCGEN05_CLUSTER_LEADER_PREDICATE
 from helion._compiler.cute.cute_mma import _build_initial_prefetch_if
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
@@ -7374,7 +7374,7 @@ class TestCuteLowerings(unittest.TestCase):
         # would fire, and no ``BackendUnsupported`` would surface;
         # the test would pass for the wrong reason.
         from helion._compiler.cute import cute_epilogue
-        from helion.language import memory_ops
+        from helion._compiler.cute import memory_ops
 
         seen_fx_kwargs: list[dict[str, object]] = []
         original = cute_epilogue.analyze_tcgen05_unary_epilogue_chain
@@ -11249,7 +11249,7 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion._compiler.aten_lowering._emit_cute_matmul",
+                "helion._compiler.cute.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11296,11 +11296,11 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                "helion._compiler.cute.aten_lowering.cute_static_k_invariant_extent",
                 return_value=16,
             ),
             patch(
-                "helion._compiler.aten_lowering._emit_cute_matmul",
+                "helion._compiler.cute.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11351,7 +11351,7 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion._compiler.aten_lowering._emit_cute_matmul",
+                "helion._compiler.cute.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11391,11 +11391,11 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                "helion._compiler.cute.aten_lowering.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion._compiler.aten_lowering._emit_cute_matmul",
+                "helion._compiler.cute.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11434,11 +11434,11 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                "helion._compiler.cute.aten_lowering.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion._compiler.aten_lowering._emit_cute_matmul",
+                "helion._compiler.cute.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="mm_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11483,11 +11483,11 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion._compiler.aten_lowering.cute_static_k_invariant_extent",
+                "helion._compiler.cute.aten_lowering.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion._compiler.aten_lowering._emit_cute_matmul",
+                "helion._compiler.cute.aten_lowering._emit_cute_matmul",
                 return_value=ast.Name(id="baddbmm_result", ctx=ast.Load()),
             ) as emit,
             self.assertRaisesRegex(exc.BackendUnsupported, "aten.baddbmm"),
@@ -11540,15 +11540,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11601,15 +11601,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
             self.assertRaisesRegex(exc.BackendUnsupported, "hl.dot"),
@@ -11658,15 +11658,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
             self.assertRaisesRegex(
@@ -11720,15 +11720,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=8,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11788,15 +11788,15 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops.cute_static_k_invariant_extent",
+                "helion._compiler.cute.matmul_ops.cute_static_k_invariant_extent",
                 return_value=16,
             ),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -11862,11 +11862,11 @@ class TestCuteLowerings(unittest.TestCase):
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
             patch(
-                "helion.language.matmul_ops._cute_mma_matches_dot_semantics",
+                "helion._compiler.cute.matmul_ops._cute_mma_matches_dot_semantics",
                 return_value=False,
             ),
             patch(
-                "helion.language.matmul_ops._emit_cute_matmul",
+                "helion._compiler.cute.matmul_ops._emit_cute_matmul",
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
@@ -12467,13 +12467,15 @@ class TestCuteLowerings(unittest.TestCase):
                     device_ir=SimpleNamespace(grid_block_ids=[[2]])
                 ),
             ),
-            patch("helion._compiler.backend._loop_contains_matmul", return_value=True),
             patch(
-                "helion._compiler.backend._detect_mma_loop",
+                "helion._compiler.cute.backend._loop_contains_matmul", return_value=True
+            ),
+            patch(
+                "helion._compiler.cute.backend._detect_mma_loop",
                 return_value=True,
             ) as detect_mma_loop,
             patch(
-                "helion._compiler.backend._detect_specialized_mma_loop",
+                "helion._compiler.cute.backend._detect_specialized_mma_loop",
                 return_value=True,
             ),
         ):

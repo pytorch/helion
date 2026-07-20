@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import ast
 from itertools import zip_longest
-from typing import TYPE_CHECKING
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 
 from .. import exc
 from .._compat import min_dot_size
@@ -13,18 +10,7 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
 from .._compiler.compile_environment import shape_env_var_hints
-from .._compiler.cute.indexing import CutePackedAffineLoad
-from .._compiler.cute.indexing import CutePackedTerms
-from .._compiler.cute.matmul_fallback import _emit_cute_matmul
-from .._compiler.cute.matmul_utils import cute_lower_rhs_for_matmul
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
-from .._compiler.cute.matmul_utils import cute_outer_accumulator_dtype
-from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
-from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
-from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
-from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
-from .._compiler.cute.strategies import is_pure_matmul_role_lifecycle_config
-from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -32,15 +18,8 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BL
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
-from .._compiler.matmul_utils import _emit_pallas_matmul
-from .._compiler.matmul_utils import _emit_tl_dot_scaled
-from .._compiler.matmul_utils import _needs_f32_accumulator
-from .._compiler.matmul_utils import emit_tl_dot_with_padding
 from ..autotuner.config_spec import MatmulFact
 from . import _decorators
-
-if TYPE_CHECKING:
-    from .._compiler.inductor_lowering import CodegenState
 
 
 def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int | None:
@@ -63,18 +42,6 @@ def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) ->
     if not isinstance(fx_node, torch.fx.Node):
         fx_node = None
     return cute_outer_accumulates_result(fx_node, is_acc_none=is_acc_none)
-
-
-def _requested_pure_matmul_role_lifecycle(state: CodegenState) -> bool:
-    return is_pure_matmul_role_lifecycle_config(state.device_function.config)
-
-
-def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
-    return bool(
-        state.device_function.config.get(
-            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False
-        )
-    )
 
 
 def _cuda_num_sms_or_zero(device: torch.device) -> int:
@@ -144,18 +111,6 @@ def dot(
         >>> result = hl.dot(a, b, acc=acc)  # int8 x int8 -> int32
     """
     raise exc.NotInsideKernel
-
-
-def _cute_mma_matches_dot_semantics(
-    lhs_dtype: torch.dtype,
-    rhs_dtype: torch.dtype,
-    acc_dtype: torch.dtype | None,
-    out_dtype: torch.dtype | None,
-) -> bool:
-    """Return True when fixed-f32 MMA accumulation matches hl.dot semantics."""
-    if not _needs_f32_accumulator(lhs_dtype, rhs_dtype):
-        return True
-    return out_dtype in (None, torch.float32) and acc_dtype in (None, torch.float32)
 
 
 @_decorators.prepare_args(dot)
@@ -567,248 +522,6 @@ def _(
     return torch.empty(result_shape, dtype=resolved_out_dtype, device=mat1.device)
 
 
-@_decorators.codegen(dot, "triton")
-def _(state: CodegenState) -> object:
-    # Get the AST representations of our arguments
-    lhs_ast = state.ast_arg(0)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
-    assert isinstance(rhs_ast, ast.AST)
-
-    # Get the dtypes of the inputs from proxy args
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor), "lhs_proxy must be a FakeTensor"
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor), "rhs_proxy must be a FakeTensor"
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
-
-    lhs_dtype = lhs_proxy.dtype
-    rhs_dtype = rhs_proxy.dtype
-    acc_dtype: torch.dtype | None = None
-    if acc_proxy is not None:
-        assert isinstance(acc_proxy, FakeTensor), "acc_proxy must be a FakeTensor"
-        acc_dtype = acc_proxy.dtype
-
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype), (
-            "out_dtype must be a torch.dtype"
-        )
-        out_dtype = out_dtype_proxy
-
-    # Check if accumulator is None
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-
-    lhs_shape: list[int | torch.SymInt] = list(lhs_proxy.shape)
-    rhs_shape: list[int | torch.SymInt] = list(rhs_proxy.shape)
-    acc_shape: list[int | torch.SymInt] | None = (
-        list(acc_proxy.shape) if acc_proxy is not None else None
-    )
-    acc_arg = None if is_acc_none else acc_ast
-    acc_dtype_arg = acc_dtype if not is_acc_none else None
-
-    # Perform dot with optional padding
-    return emit_tl_dot_with_padding(
-        lhs_ast,
-        rhs_ast,
-        acc_arg,
-        lhs_dtype,
-        rhs_dtype,
-        acc_dtype=acc_dtype_arg,
-        lhs_shape=lhs_shape,
-        rhs_shape=rhs_shape,
-        acc_shape=acc_shape,
-        out_dtype=out_dtype,
-    )
-
-
-@_decorators.codegen(dot, "cute")
-def _(state: CodegenState) -> object:
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor)
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor)
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
-
-    lhs_ast = state.ast_args[0]
-    if isinstance(lhs_ast, int | float | bool | None):
-        lhs_ast = ast.Constant(value=lhs_ast)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
-
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-
-    acc_dtype: torch.dtype | None = None
-    if not is_acc_none:
-        assert isinstance(acc_proxy, FakeTensor)
-        acc_dtype = acc_proxy.dtype
-        if lhs_proxy.dtype == torch.float32 and rhs_proxy.dtype == torch.float32:
-            if acc_dtype == torch.float16:
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "hl.dot(float32, float32, acc=float16) is not supported on CuTe; use a float32 accumulator or cast after the dot",
-                )
-
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype)
-        out_dtype = out_dtype_proxy
-
-    # Try MMA path first for configurations whose dtype semantics match fp32 MMA.
-    if _cute_mma_matches_dot_semantics(
-        lhs_proxy.dtype, rhs_proxy.dtype, acc_dtype, out_dtype
-    ):
-        from .._compiler.cute.cute_mma import codegen_cute_mma_dot
-
-        result = codegen_cute_mma_dot(state)
-        if result is not None:
-            return result
-
-    resolved_out_dtype = out_dtype or _compute_out_dtype(
-        lhs_proxy.dtype,
-        rhs_proxy.dtype,
-        acc_dtype,
-    )
-    outer_acc_dtype = cute_outer_accumulator_dtype(
-        state.fx_node,
-        is_acc_none=is_acc_none,
-    )
-    effective_out_dtype = cute_outer_accumulator_out_dtype(
-        resolved_out_dtype,
-        outer_acc_dtype,
-    )
-    k_block_id = cute_resolve_active_matmul_k_block_id(
-        state.codegen,
-        lhs_proxy.shape[-1],
-        rhs_proxy.shape[-2],
-        rhs_proxy.shape[-1],
-    )
-    packed_rhs = None
-    if (
-        k_block_id is None
-        and state.fx_node is not None
-        and len(state.fx_node.args) >= 2
-        and isinstance(rhs_node := state.fx_node.args[1], torch.fx.Node)
-    ):
-        rhs_ast, packed_rhs = cute_lower_rhs_for_matmul(
-            state.env,
-            lhs_ast,
-            rhs_node,
-            rhs_ast,
-        )
-    if k_block_id is None and packed_rhs is not None:
-        packed_nodes, _ = packed_rhs
-        packed_node = packed_nodes[0]
-        k_block_id = cute_resolve_active_block_id(
-            state.codegen, packed_node.meta["val"].shape[0]
-        )
-    assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
-    static_k_extent = None
-    if k_block_id is None and state.fx_node is not None:
-        lhs_node = state.fx_node.args[0] if len(state.fx_node.args) > 0 else None
-        rhs_node = state.fx_node.args[1] if len(state.fx_node.args) > 1 else None
-        if isinstance(lhs_node, torch.fx.Node) and isinstance(rhs_node, torch.fx.Node):
-            static_k_extent = cute_static_k_invariant_extent(lhs_node, rhs_node)
-    env = CompileEnvironment.current()
-    static_lhs_k = _static_dim_value(env, lhs_proxy.shape[-1])
-    static_rhs_k = _static_dim_value(env, rhs_proxy.shape[-2])
-    k_is_one = static_lhs_k == 1 and static_rhs_k == 1
-    if static_k_extent is None and k_block_id is None and not k_is_one:
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
-    if _requested_pure_matmul_role_lifecycle(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
-            "to lower through the tcgen05 K-loop path",
-        )
-    if _requested_tcgen05_flat_role_coordinates(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
-            "hl.dot to lower through the tcgen05 K-loop path",
-        )
-    dot_lhs_node = (
-        state.fx_node.args[0]
-        if state.fx_node is not None and len(state.fx_node.args) > 0
-        else None
-    )
-    dot_rhs_node = (
-        state.fx_node.args[1]
-        if state.fx_node is not None and len(state.fx_node.args) > 1
-        else None
-    )
-    dot_acc_node = (
-        state.fx_node.args[2]
-        if state.fx_node is not None and len(state.fx_node.args) > 2
-        else None
-    )
-    return _emit_cute_matmul(
-        state.codegen,
-        lhs_ast,
-        rhs_ast,
-        accumulate_in_lane_loop=not cute_outer_accumulates_result(
-            state.fx_node,
-            is_acc_none=is_acc_none,
-        ),
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        acc=None if is_acc_none else acc_ast,
-        out_dtype=effective_out_dtype,
-        acc_dtype=acc_dtype,
-        lhs_dtype=lhs_proxy.dtype,
-        rhs_dtype=rhs_proxy.dtype,
-        lhs_node=dot_lhs_node,
-        rhs_node=dot_rhs_node,
-        acc_node=None if is_acc_none else dot_acc_node,
-    )
-
-
-@_decorators.codegen(dot, "pallas")
-def _(state: CodegenState) -> object:
-    lhs_ast = state.ast_arg(0)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor)
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor)
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
-
-    lhs_dtype = lhs_proxy.dtype
-    rhs_dtype = rhs_proxy.dtype
-    need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
-
-    # Determine the accumulator AST (None if acc argument is None)
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-    acc = None if is_acc_none else acc_ast
-
-    # Determine desired output dtype
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype)
-        out_dtype = out_dtype_proxy
-    elif acc_proxy is not None and isinstance(acc_proxy, FakeTensor):
-        out_dtype = acc_proxy.dtype
-
-    return _emit_pallas_matmul(
-        lhs_ast,
-        rhs_ast,
-        acc=acc,
-        need_f32_acc=need_f32_acc,
-        out_dtype=out_dtype,
-        lhs_ndim=lhs_proxy.ndim,
-    )
-
-
 @_decorators.ref(dot)
 def _(
     mat1: torch.Tensor,
@@ -998,39 +711,6 @@ def _(
         return acc.new_empty(result_shape)
     resolved_dtype = out_dtype or torch.float32
     return torch.empty(result_shape, dtype=resolved_dtype, device=mat1.device)
-
-
-@_decorators.codegen(dot_scaled, "triton")
-def _(state: CodegenState) -> object:
-    lhs_ast = state.ast_arg(0)  # mat1
-    lhs_scale_ast = state.ast_arg(1)  # mat1_scale
-    lhs_format = state.proxy_args[2]  # "e2m1" etc (string, not AST)
-    assert isinstance(lhs_format, str), "lhs_format must be a string"
-    rhs_ast = state.ast_arg(3)  # mat2
-    rhs_scale_ast = state.ast_arg(4)  # mat2_scale
-    rhs_format = state.proxy_args[5]  # "e2m1" etc (string, not AST)
-    assert isinstance(rhs_format, str), "rhs_format must be a string"
-    acc_ast = state.ast_arg(6)  # acc
-    out_dtype_proxy = state.proxy_args[7] if len(state.proxy_args) > 7 else None
-
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype), (
-            "out_dtype must be a torch.dtype"
-        )
-        out_dtype = out_dtype_proxy
-
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-    return _emit_tl_dot_scaled(
-        lhs_ast,
-        lhs_scale_ast,
-        lhs_format,
-        rhs_ast,
-        rhs_scale_ast,
-        rhs_format,
-        acc=None if is_acc_none else acc_ast,
-        out_dtype=out_dtype,
-    )
 
 
 @_decorators.ref(dot_scaled)
