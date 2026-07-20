@@ -73,25 +73,40 @@ jobs:
         # continue-on-error): the check cannot run without it.
         run: |
           source .venv/bin/activate
-          # Install vllm and let it pull its OWN pinned torch. The vllm nightly
-          # wheel pins a *stable* release (currently torch==2.11.0, with matching
-          # torchvision/torchaudio), which lives on the pytorch *stable* cu130
-          # index -- so that is the torch index we point at, NOT the nightly one.
+          # Install the vLLM NIGHTLY, and let it pull its own pinned torch. The
+          # nightly wheel pins a *stable* torch (currently torch==2.11.0, with
+          # matching torchvision/torchaudio) that lives on the pytorch *stable*
+          # cu130 index -- so that is the torch index below, NOT the nightly one.
           #
-          # Do NOT add the pytorch *nightly* cu130 index here: it mirrors a vllm
-          # wheel ("1.0.0.devYYYYMMDD+cu130") whose source commit lags the vllm
-          # repo by days, and under PEP 440 that "1.0.0.dev*" outranks the
-          # genuine vllm nightly ("0.23.*rc1.dev*+g<sha>") on wheels.vllm.ai --
-          # so unsafe-best-match would always resolve the stale pytorch-index
-          # wheel and newer nightlies would never help. The stable cu130 index
-          # carries no competing vllm wheel, so vllm resolves from wheels.vllm.ai
-          # while torch resolves from stable cu130. The stable index also gives a
-          # CUDA build matching the container / GPU (incl. B200).
+          # We must PIN the exact nightly version, we cannot just ask for "vllm".
+          # uv resolves a name to the globally-highest version across ALL indexes
+          # regardless of index priority or --index-strategy, and vLLM's stable
+          # PyPI releases are versioned HIGHER than main/nightly: nightly is
+          # "0.23.1rc1.dev*+g<sha>" (setuptools-scm off main) while the latest
+          # PyPI stable is e.g. "0.25.1". So a bare "vllm --pre" ALWAYS resolves
+          # the stale PyPI stable -- which predates the Helion kernel fixes this
+          # check depends on (e.g. vllm-project/vllm#48868's non-degenerate
+          # scale_ub), causing spurious silu_and_mul_per_block_quant numerics
+          # failures. Pinning the nightly version is the only reliable override.
           #
+          # The nightly index publishes exactly one version at a time, so scrape
+          # it at run time (never hardcode -- it would go stale within a day).
+          VLLM_NIGHTLY=$(python - <<'PY'
+          import re, urllib.request
+          html = urllib.request.urlopen(
+              'https://wheels.vllm.ai/nightly/vllm/', timeout=60
+          ).read().decode(errors='replace')
+          vers = set(re.findall(r'vllm-([0-9][^"/]*?\.dev[0-9]+\+g[0-9a-f]+)-cp', html))
+          assert vers, 'no vllm nightly version found on wheels.vllm.ai/nightly'
+          print(max(vers, key=lambda v: int(re.search(r'\.dev(\d+)', v).group(1))))
+          PY
+          )
+          echo "Pinning vLLM nightly: ${VLLM_NIGHTLY}"
           # unsafe-best-match: vLLM nightly pins exact dep versions that live on
           # PyPI (the default index), not on wheels.vllm.ai -- let uv resolve
-          # those across indexes.
-          uv pip install --pre vllm \
+          # those across indexes. The pinned version keeps vllm itself locked to
+          # the nightly wheel; only its deps float across indexes.
+          uv pip install --pre "vllm==${VLLM_NIGHTLY}" \
             --index-strategy unsafe-best-match \
             --extra-index-url https://wheels.vllm.ai/nightly \
             --extra-index-url https://download.pytorch.org/whl/cu130
