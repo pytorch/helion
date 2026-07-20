@@ -234,7 +234,7 @@ def codegen_topk_pallas(ctx: LoweringContext, node: Node) -> object:
     ``topk_impl.divide_filter_topk`` -- a tallax-style divide-and-filter top-k
     built only from Mosaic-supported ops (strided slices, iota, where, min/max).
     Being plain jnp emitted inline, it FUSES with the surrounding kernel. Returns
-    ``(values desc, int32 indices)`` over the LAST axis (approximate, recall~0.95;
+    ``(values desc, int32 indices)`` over the LAST axis (approximate, recall~0.99;
     top-1 exact). ``k`` must be static (use ``hl.specialize(k)``).
     """
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
