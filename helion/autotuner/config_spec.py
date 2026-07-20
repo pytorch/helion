@@ -2029,7 +2029,12 @@ class ConfigSpec:
     def default_config(self) -> helion.Config:
         if self.compiler_default_config is None:
             return self._base_default_config()
-        config = helion.Config.from_dict(self.compiler_default_config.config)
+        # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
+        # the full base defaults so every other key — including user register_tunable defaults — is
+        # preserved rather than dropped.
+        merged = dict(self._base_default_config().config)
+        merged.update(self.compiler_default_config.config)
+        config = helion.Config.from_dict(merged)
         self._shrink_for_numel_constraints(config)
         return config
 

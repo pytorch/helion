@@ -95,7 +95,7 @@ def compiler_seed_configs(
         if config is None:
             continue
         configs.append(config)
-        if heuristic.promote_seed_to_default:
+        if heuristic.should_promote(env):
             env.config_spec.compiler_default_config = config
         env.config_spec.autotuner_heuristics.append(heuristic.name)
     return dedupe_configs(configs)
