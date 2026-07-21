@@ -403,6 +403,9 @@ def chunk_fwd_wy_delta_helion(
     C = hl.specialize(k.size(1))
     D = k.size(2)
     DV = v.size(2)
+    # The Neumann-series inverse is exact in n_doublings = log2(C) steps only
+    # when C is a power of two.
+    assert C & (C - 1) == 0, f"chunk size C must be a power of two, got {C}"
     n_doublings = C.bit_length() - 1
 
     w = torch.empty([BHN, C, D], dtype=k.dtype, device=k.device)
