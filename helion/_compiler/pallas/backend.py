@@ -168,6 +168,7 @@ class PallasBackend(Backend):
             "lax": "import jax.lax as lax",
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
+            "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -179,6 +180,7 @@ class PallasBackend(Backend):
             "loop_orders",
             "flatten_loops",
             "pallas_loop_type",
+            "pallas_load_buffer_count",
             "pallas_pre_broadcast",
         }
     )

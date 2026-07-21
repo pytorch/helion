@@ -5,11 +5,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-import helion.experimental
+import helion
 import helion.language as hl
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def softmax(x: torch.Tensor) -> torch.Tensor:
     m, _n = x.size()
     out = torch.empty_like(x)
