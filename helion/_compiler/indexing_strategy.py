@@ -1383,8 +1383,6 @@ class SubscriptIndexing(NamedTuple):
             if k is None:
                 output_size.append(1)
             elif isinstance(k, int):
-                if k < 0:
-                    k += input_size[0]
                 input_size.popleft()
             elif (
                 state is not None
@@ -1603,7 +1601,7 @@ class SubscriptIndexing(NamedTuple):
             elif isinstance(k, int):
                 if k < 0:
                     k += fake_value.size(len(index_values))
-                index_values.append(repr(k))
+                index_values.append(state.device_function.literal_expr(k))
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, n)
             ) is not None:
@@ -2013,7 +2011,7 @@ class BlockedSubscriptIndexing:
             elif isinstance(k, int):
                 if k < 0:
                     k += fake_value.size(len(res.offsets))
-                res.offsets.append(repr(k))
+                res.offsets.append(state.device_function.literal_expr(k))
                 res.block_shape.append(1)
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, n)
