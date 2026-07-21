@@ -10,6 +10,7 @@ imports it at the bottom so registration keeps the same eager timing as before.
 from __future__ import annotations
 
 import ast
+from operator import getitem
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,6 +18,7 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
 from ..aten_lowering import _env_arg
 from ..aten_lowering import _node_dtype_kwarg
 from ..aten_lowering import _pallas_argreduce
@@ -31,7 +33,9 @@ from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
+from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
+from ..aten_lowering import topk_lowering
 from ..aten_lowering import view_lowering
 from ..compile_environment import CompileEnvironment
 from ..matmul_utils import _emit_pallas_matmul
@@ -208,3 +212,104 @@ def codegen_arange_default_pallas(ctx: LoweringContext, node: Node) -> object:
         length_arg=node.args[0],
         dtype=_node_dtype_kwarg(node),
     )
+
+
+def _pallas_last_dim(node: Node, dim: object) -> None:
+    """Assert an aten sort/topk reduces the last dim (all we support on Pallas)."""
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    ndim = input_node.meta["val"].ndim
+    assert isinstance(dim, int)
+    norm = ndim + dim if dim < 0 else dim
+    assert norm == ndim - 1, (
+        f"pallas sort/topk only supports the last dim, got dim={dim} (ndim={ndim})"
+    )
+
+
+@topk_lowering.register_codegen("pallas")
+def codegen_topk_pallas(ctx: LoweringContext, node: Node) -> object:
+    """``torch.topk(x, k, dim=-1, largest=True, sorted=True)`` on Mosaic/TPU.
+
+    ``jax.lax.top_k`` is unimplemented in the Mosaic TPU lowering, so we emit
+    ``topk_impl.divide_filter_topk`` -- a tallax-style divide-and-filter top-k
+    built only from Mosaic-supported ops (strided slices, iota, where, min/max).
+    Being plain jnp emitted inline, it FUSES with the surrounding kernel. Returns
+    ``(values desc, int32 indices)`` over the LAST axis (approximate, recall~0.99;
+    top-1 exact). ``k`` must be static (use ``hl.specialize(k)``).
+    """
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    k = node.args[1]
+    if not isinstance(k, int):
+        # k can arrive as an fx Node / SymInt rather than a Python int; recover it
+        # from the (static) last dim of the output. Requires a static k -- use
+        # hl.specialize(k) in the kernel. (The jax_fn path already gives an int.)
+        try:
+            val = node.meta["val"]
+            out0 = val[0] if isinstance(val, (tuple, list)) else val
+            k = int(out0.shape[-1])
+        except Exception:
+            pass
+    assert isinstance(k, int), (
+        f"pallas topk requires a static int k (use hl.specialize(k)); got {type(k)!r}"
+    )
+    dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", -1)
+    largest = node.args[3] if len(node.args) > 3 else node.kwargs.get("largest", True)
+    assert largest, "pallas topk only supports largest=True"
+    _pallas_last_dim(node, dim)
+
+    result = ctx.cg.device_function.new_var("topk_result")
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{result} = _helion_divide_filter_topk({{t}}, {k})", t=tensor
+        )
+    )
+    # torch.topk returns (values, indices); skip the indices expr when unused.
+    indices_used = any(
+        user.target is getitem and user.args[1] == 1 for user in node.users
+    )
+    values = expr_from_string(f"{result}[0]")
+    indices = expr_from_string(f"{result}[1]") if indices_used else None
+    return (values, indices)
+
+
+@sort_lowering.register_codegen("pallas")
+def codegen_sort_pallas(ctx: LoweringContext, node: Node) -> object:
+    """``torch.sort(x, dim=-1, descending=False)`` via ``jax.lax.sort``.
+
+    Co-sorts ``(x, iota)`` so the permuted iota gives the indices (argsort), which
+    matches torch.sort's (values, indices). Last axis only.
+    """
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
+    descending = (
+        node.args[2] if len(node.args) > 2 else node.kwargs.get("descending", False)
+    )
+    _pallas_last_dim(node, dim)
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    n = int(input_node.meta["val"].shape[-1])
+
+    indices_used = any(
+        user.target is getitem and user.args[1] == 1 for user in node.users
+    )
+    if not indices_used:
+        expr = "jnp.sort({t}, axis=-1)"
+        if descending:
+            expr = f"jnp.flip({expr}, axis=-1)"
+        return (expr_from_string(expr, t=tensor), None)
+
+    # Co-sort values with an index iota to recover argsort indices.
+    result = ctx.cg.device_function.new_var("sort_result")
+    key = "-({t})" if descending else "{t}"
+    ctx.cg.add_statement(
+        statement_from_string(
+            f"{result} = jax.lax.sort(({key}, "
+            f"jnp.broadcast_to(jnp.arange({n}, dtype=jnp.int32), ({{t}}).shape)), "
+            f"dimension=-1, num_keys=1)",
+            t=tensor,
+        )
+    )
+    values = f"(-{result}[0])" if descending else f"{result}[0]"
+    return (expr_from_string(values), expr_from_string(f"{result}[1]"))

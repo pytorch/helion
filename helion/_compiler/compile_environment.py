@@ -326,7 +326,12 @@ class CompileEnvironment:
             ):
                 self.config_spec.disallow_pid_type(pid_type, reason=reason)
 
-        if dist.is_initialized():
+        # CUDA symmetric-memory persistent-kernel sizing only. Guard on CUDA: the
+        # Pallas/TPU backend traces with a cpu-device torch tensor (the torch<->jax
+        # bridge), so under a multi-host (dist-initialized) serve this would call
+        # get_num_sm(cpu) -> "TODO: implement for other devices" and crash the
+        # kernel compile. _SymmetricMemory / SM-multiplier are irrelevant to Pallas.
+        if dist.is_initialized() and device.type == "cuda":
             from torch._C._distributed_c10d import _SymmetricMemory
 
             from .._dist_utils import max_num_blocks_for_symm_mem

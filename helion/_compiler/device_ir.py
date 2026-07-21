@@ -3695,6 +3695,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # graph op; the same pass returns the reduction-body liveness (per-axis peak live tiles).
         memory_op_facts, liveness_by_axis = _collect_memory_op_facts(device_ir)
         config_spec.memory_op_facts = memory_op_facts
+        if config_spec.supports_config_key("pallas_load_buffer_count"):
+            config_spec.pallas_load_buffer_count.length = len(
+                LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
+            )
         load_count = sum(f.kind == "load" for f in memory_op_facts)
         _register_load_store_tunables(
             load_count,

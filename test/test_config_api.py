@@ -15,6 +15,8 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.backend import PallasBackend
+from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
@@ -26,6 +28,7 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 
 
@@ -82,6 +85,9 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             ),
             "range_flattens": st.lists(st.one_of(st.booleans(), st.none()), max_size=4),
             "static_ranges": st.lists(st.booleans(), max_size=4),
+            "pallas_load_buffer_count": st.lists(
+                st.integers(min_value=1, max_value=2), max_size=4
+            ),
             "load_eviction_policies": st.lists(
                 st.sampled_from(["", "first", "last"]), max_size=4
             ),
@@ -119,6 +125,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "range_multi_buffers",
                     "range_flattens",
                     "static_ranges",
+                    "pallas_load_buffer_count",
                     "load_eviction_policies",
                     "load_cache_modifiers",
                     "store_cache_modifiers",
@@ -132,6 +139,101 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
         values=_json_safe_values(),
         max_size=4,
     )
+
+
+class TestPallasLoadBufferCountConfig(TestCase):
+    @staticmethod
+    def _config_spec(
+        num_tensors: int, *, has_pallas_inner_loops: bool = True
+    ) -> ConfigSpec:
+        spec = ConfigSpec(backend=PallasBackend())
+        spec.pallas_load_buffer_count.length = num_tensors
+        spec.has_pallas_inner_loops = has_pallas_inner_loops
+        return spec
+
+    def test_default_and_search_surface(self) -> None:
+        spec = self._config_spec(2)
+        field = spec._flat_fields()["pallas_load_buffer_count"]
+        self.assertEqual(field.default(), [1, 1])
+        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2]])
+        self.assertIn(
+            ("pallas_load_buffer_count", *field.fingerprint()),
+            spec.structural_fingerprint(),
+        )
+        self.assertNotIn("pallas_load_buffer_count", spec.default_config())
+
+        fori_config = helion.Config(pallas_loop_type="fori_loop")
+        spec.normalize(fori_config)
+        self.assertEqual(fori_config.pallas_load_buffer_count, [1, 1])
+
+        config = helion.Config(
+            pallas_loop_type="fori_loop", pallas_load_buffer_count=[2, 1]
+        )
+        spec.normalize(config)
+        self.assertEqual(config.pallas_load_buffer_count, [2, 1])
+
+    def test_inactive_field_is_ignored(self) -> None:
+        cases = (
+            (self._config_spec(2), "emit_pipeline", [2], True),
+            (
+                self._config_spec(2, has_pallas_inner_loops=False),
+                "fori_loop",
+                [2],
+                False,
+            ),
+            (self._config_spec(0), "fori_loop", [], False),
+        )
+        for spec, loop_type, values, present_in_search in cases:
+            with self.subTest(num_tensors=spec.pallas_load_buffer_count.length):
+                self.assertEqual(
+                    "pallas_load_buffer_count" in spec._flat_fields(),
+                    present_in_search,
+                )
+                config = helion.Config.from_dict(
+                    {
+                        "pallas_loop_type": loop_type,
+                        "pallas_load_buffer_count": values,
+                    }
+                )
+                spec.normalize(config)
+                self.assertNotIn("pallas_load_buffer_count", config)
+
+    def test_non_pallas_backend_rejects_the_field(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "Unsupported config keys for backend 'triton'",
+        ):
+            spec.normalize(helion.Config(pallas_load_buffer_count=[]))
+
+    def test_rejects_invalid_explicit_lists(self) -> None:
+        spec = self._config_spec(2)
+        invalid_values = (
+            (2, 1),
+            [1],
+            [1, True],
+            [0, 1],
+            [3, 1],
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pallas_loop_type": "fori_loop",
+                            "pallas_load_buffer_count": value,
+                        }
+                    )
+                )
+
+        zero_tensor_spec = self._config_spec(0)
+        with self.assertRaises(exc.InvalidConfig):
+            zero_tensor_spec.normalize(
+                helion.Config(
+                    pallas_loop_type="fori_loop", pallas_load_buffer_count=[2]
+                )
+            )
 
 
 @onlyBackends(["triton", "cute"])
@@ -181,6 +283,7 @@ class TestConfigAPI(TestCase):
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "pallas_load_buffer_count",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",

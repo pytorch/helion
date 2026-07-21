@@ -1180,11 +1180,20 @@ def _pallas_prepare_args(
     if interpret:
         placeholder_fn = _jax_placeholder_for_tensor
     else:
-        from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
-            jax_placeholder,
-        )
+        try:
+            from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+                jax_placeholder,
+            )
 
-        placeholder_fn = jax_placeholder
+            placeholder_fn = jax_placeholder
+        except ImportError:
+            # torch_tpu is only required for the torch-tensor entry path (its
+            # JaxCallable dispatch). The jax_fn export builds a native
+            # pl.pallas_call and only needs a jax placeholder (shape/dtype) per
+            # output -- the interpret path already uses the native factory below.
+            # Fall back to it so jax_fn works on a JAX-native TPU serve that does
+            # not ship the torch_tpu wheel.
+            placeholder_fn = _jax_placeholder_for_tensor
 
     output_set = set(_output_indices)
     inplace_set = set(_inplace_indices) if _inplace_indices is not None else output_set
@@ -1533,7 +1542,7 @@ def _pallas_build_scratch_shapes(
             shape, dtype_str = entry  # type: ignore[misc]
             scratch_type = "vmem"
         if scratch_type == "dma_semaphore":
-            scratch_shapes.append(pltpu.SemaphoreType.DMA(()))  # type: ignore[union-attr]
+            scratch_shapes.append(pltpu.SemaphoreType.DMA(shape))  # type: ignore[union-attr]
         else:
             assert dtype_str is not None
             jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
