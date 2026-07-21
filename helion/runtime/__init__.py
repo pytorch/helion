@@ -1650,12 +1650,20 @@ def _pallas_pl_kernel_jit_fn(
         )(*pipe_any)
 
     mesh = pltpu.create_tensorcore_mesh("core", num_cores=1)  # type: ignore[union-attr]
+    # jax renamed pl.kernel's scratch kwarg `scratch_shapes` -> `scratch_types` in
+    # 0.10.1; accept whichever the installed pallas exposes so Helion runs on both
+    # (e.g. a TPU serve pinned to jax 0.10.0).
+    scratch_kw = (
+        "scratch_types"
+        if "scratch_types" in inspect.signature(pl.kernel).parameters  # type: ignore[union-attr]
+        else "scratch_shapes"
+    )
     return pl.kernel(  # type: ignore[union-attr]
         kernel_body,
         out_shape_arg,
         mesh=mesh,
-        scratch_types=scratch_shapes,
         interpret=interpret,
+        **{scratch_kw: scratch_shapes},
     )
 
 
