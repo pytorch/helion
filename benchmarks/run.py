@@ -280,11 +280,25 @@ def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> No
     _PATCHED_ROPE_OPERATOR_CLASSES.add(Operator)
 
 
-def patch_gdn_tritonbench_accuracy(operator_name: str, Operator: type[Any]) -> None:
+def patch_gdn_tritonbench(operator_name: str, Operator: type[Any]) -> None:
     if operator_name != "gdn_fwd_h":
         return
     if Operator in _PATCHED_GDN_OPERATOR_CLASSES:
         return
+
+    original_get_shape_iter = Operator.get_shape_iter
+    limit_mi350_inputs = torch.version.hip is not None and "gfx950" in (
+        get_device_name() or ""
+    )
+
+    def get_shape_iter(self: object) -> Iterator[object]:
+        for input_id, shape in enumerate(original_get_shape_iter(self)):
+            # ROCm 7.1 segfaults when the MI350 benchmark advances to input 2.
+            # Keep the two inputs that completed successfully while preserving
+            # the full input set on other GPUs.
+            if limit_mi350_inputs and input_id >= 2:
+                break
+            yield shape
 
     def accuracy(
         self: object,
@@ -305,6 +319,7 @@ def patch_gdn_tritonbench_accuracy(operator_name: str, Operator: type[Any]) -> N
             return torch.allclose(output, baseline_output, rtol=0.5, atol=2.0)
         return torch.allclose(output, baseline_output, rtol=0.1, atol=0.3)
 
+    Operator.get_shape_iter = get_shape_iter
     Operator.accuracy = accuracy
     _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
 
@@ -520,7 +535,8 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.welford",
         "welford",
         {
-            "num_inputs": 6,  # welford takes long time on Benchmark CI, so use fewer inputs instead.
+            # Welford autotuning takes ~15+ minutes per shape on MI350.
+            "num_inputs": 3,
         },
     ),
     "gather_gemv": (
@@ -1475,7 +1491,7 @@ def run_kernel_variants(
         Operator = operator_module.Operator
         patch_rope_tritonbench_inputs(operator_name, Operator)
         patch_mamba2_tritonbench_inputs(operator_name, Operator)
-        patch_gdn_tritonbench_accuracy(operator_name, Operator)
+        patch_gdn_tritonbench(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
