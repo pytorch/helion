@@ -17,6 +17,8 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.backend import TritonBackend
+from helion._testing import DEVICE
+from helion._testing import skipIfRefEager
 from helion.autotuner import benchmark_provider as benchmark_provider_module
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
@@ -1230,6 +1232,7 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 class TestMultiShapeAutotuneIntegration(unittest.TestCase):
     @staticmethod
     def _make_add_case(
@@ -1257,8 +1260,8 @@ class TestMultiShapeAutotuneIntegration(unittest.TestCase):
             return out
 
         arg_sets = [
-            (torch.randn(256, device="cuda"), torch.randn(256, device="cuda")),
-            (torch.randn(2048, device="cuda"), torch.randn(2048, device="cuda")),
+            (torch.randn(256, device=DEVICE), torch.randn(256, device=DEVICE)),
+            (torch.randn(2048, device=DEVICE), torch.randn(2048, device=DEVICE)),
         ]
         return add, arg_sets
 
