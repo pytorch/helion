@@ -892,6 +892,27 @@ class TestPallas(TestCase):
         )
         self.assertGreater(recall, 0.9)
 
+    def test_topk_recall_target_default_099(self) -> None:
+        """Regression guard for the divide-and-filter default recall_target=0.99.
+        At k=64, V=32768 the approximate top-k must recall >=99% of the true
+        top-k; with the previous default (0.95) recall is only ~0.98 and this
+        FAILS. High recall matters when the top-k feeds an exact threshold (e.g. a
+        top-p nucleus, or a rejection sampler's target-prob normalization)."""
+        torch.manual_seed(0)
+        x = torch.randn(128, 32768, device=DEVICE, dtype=torch.float32)
+        _, (_vals, idx) = code_and_output(_topk_pallas_kernel, (x, 64), block_sizes=[8])
+        ref_i = torch.topk(x, 64, dim=-1, largest=True)[1].cpu()
+        idx_c = idx.cpu()
+        ref_sets = [set(r.tolist()) for r in ref_i]
+        recall = (
+            sum(
+                len(set(idx_c[r].tolist()) & ref_sets[r]) / 64
+                for r in range(x.shape[0])
+            )
+            / x.shape[0]
+        )
+        self.assertGreaterEqual(recall, 0.99)
+
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
 

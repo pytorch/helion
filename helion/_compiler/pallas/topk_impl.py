@@ -31,9 +31,11 @@ if TYPE_CHECKING:
 _NUM_LANES = 128
 
 
-def num_bins_for(k: int, vocab: int, recall_target: float = 0.95) -> int:
+def num_bins_for(k: int, vocab: int, recall_target: float = 0.99) -> int:
     """tallax's TPU-KNN recall formula (approx_max_k.py): ceil((k-1)/(1-recall)),
-    rounded up to a lane multiple and capped at the padded vocab."""
+    rounded up to a lane multiple and capped at the padded vocab. Default recall
+    is 0.99 -- callers that feed the top-k into an exact threshold (e.g. a top-p
+    nucleus) need high recall; raising it costs more bins (i.e. more work)."""
     if k <= 1:
         nb = 1
     else:
@@ -44,7 +46,7 @@ def num_bins_for(k: int, vocab: int, recall_target: float = 0.95) -> int:
 
 
 def divide_filter_topk(
-    x: jax.Array, k: int, recall_target: float = 0.95
+    x: jax.Array, k: int, recall_target: float = 0.99
 ) -> tuple[jax.Array, jax.Array]:
     """Approximate top-k over the last axis. x: (rows, V) -> (values, indices),
     each (rows, k); values descending, indices int32 into V. k must be static."""
