@@ -1400,7 +1400,7 @@ def _try_splice_tcgen05_unary_epilogue(
     extra_mask: ast.AST | None,
     value_node: torch.fx.Node | None,
 ) -> ast.AST | None:
-    """Splice attempt for ``out[tile] = chain(acc).to(x.dtype)``.
+    """Splice attempt for ``out[tile] = chain(acc)[.to(x.dtype)]``.
 
     Returns the splice-completion sentinel (``ast.Constant(value=None)``)
     on a successful splice (the caller should return it directly), and
@@ -1628,7 +1628,7 @@ def _(state: CodegenState) -> ast.AST:
             return ast.Constant(value=None)
 
     # Try to splice a whitelisted chain epilogue
-    # (`out[tile] = chain(acc).to(x.dtype)`) into the role-local
+    # (`out[tile] = chain(acc)[.to(x.dtype)]`) into the role-local
     # tcgen05 epilogue's per-thread T2R loop. Implementation in
     # ``_try_splice_tcgen05_unary_epilogue``. Chains the whitelist
     # rejects (broadcast aux loads, reductions, etc.) leave the

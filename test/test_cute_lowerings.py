@@ -53,6 +53,7 @@ from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
+from helion._compiler.cute.cute_mma import _decode_cute_mma_target
 from helion._compiler.cute.cute_mma import _emit_sched_pipeline_setup
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
@@ -13942,6 +13943,40 @@ class TestCuteLowerings(unittest.TestCase):
         # A copied graph with two equally valid structural matches is
         # ambiguous, so tracing must fail closed rather than choose either.
         self.assertFalse(_is_zero_init_acc_node(unknown_acc, device_ir=device_ir))
+
+    def test_mma_accumulator_classification_survives_graph_copy(self) -> None:
+        graph = Graph()
+        acc = graph.placeholder("acc")
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        baddbmm = graph.call_function(
+            torch.ops.aten.baddbmm.default,
+            args=(acc, lhs, rhs),
+        )
+        graph.output(baddbmm)
+
+        with patch(
+            "helion._compiler.cute.cute_mma._is_zero_init_acc_node",
+            return_value=True,
+        ):
+            analyzed = _decode_cute_mma_target(baddbmm, device_ir=DeviceIR())
+        self.assertIsNotNone(analyzed)
+        assert analyzed is not None
+        self.assertFalse(analyzed.requires_accumulator_seed)
+
+        copied = RootGraphInfo(graph_id=0, graph=graph).copy().graph
+        (copied_baddbmm,) = copied.find_nodes(
+            op="call_function",
+            target=torch.ops.aten.baddbmm.default,
+        )
+        with patch(
+            "helion._compiler.cute.cute_mma._is_zero_init_acc_node",
+            side_effect=AssertionError("copied node should use cached analysis"),
+        ):
+            copied_analysis = _decode_cute_mma_target(copied_baddbmm)
+        self.assertIsNotNone(copied_analysis)
+        assert copied_analysis is not None
+        self.assertFalse(copied_analysis.requires_accumulator_seed)
 
     def _build_aux_load_node(
         self,

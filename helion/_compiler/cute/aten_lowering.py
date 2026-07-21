@@ -411,7 +411,7 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if out_dtype is not None
         else None
     )
-    if node.target is torch.ops.aten.bmm.default:
+    if node.target in (torch.ops.aten.bmm.default, torch.ops.aten.bmm.dtype):
         mma_result = codegen_cute_mma(ctx, node, with_acc=False)
         if mma_result is not None:
             return mma_result

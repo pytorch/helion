@@ -899,6 +899,23 @@ def cute_bare_bmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_bare_bmm_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.ops.aten.bmm.dtype(
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+                torch.float32,
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_bare_batched_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     b, m, k = x.size()
     _, _, n = y.size()
@@ -4803,8 +4820,8 @@ class TestCuteBackend(TestCase):
 
         cute_batched_dot_tcgen05.reset()
         args = (
-            torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(4, 256, 64, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(4, 64, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         with (
             patch.dict(
@@ -4927,6 +4944,16 @@ class TestCuteBackend(TestCase):
                 ),
                 {None, "explicit_epi_tile"},
             ),
+            (
+                cute_rhs_batched_dot_tcgen05,
+                (
+                    torch.empty(
+                        64, 256, device=DEVICE, dtype=torch.bfloat16
+                    ).T,
+                    torch.empty(2, 64, 256, device=DEVICE, dtype=torch.bfloat16),
+                ),
+                {None},
+            ),
         )
         with patch(
             "helion.language.matmul_ops._cuda_num_sms_or_zero",
@@ -4972,6 +4999,10 @@ class TestCuteBackend(TestCase):
         expected = torch.bmm(args[0], args[1])
         expected_by_kernel = {
             cute_bare_bmm: expected,
+            cute_bare_bmm_dtype: torch.bmm(
+                args[0].float(),
+                args[1].float(),
+            ),
             cute_bare_batched_dot: torch.bmm(
                 args[0].float(),
                 args[1].float(),
@@ -4979,7 +5010,11 @@ class TestCuteBackend(TestCase):
         }
         config = helion.Config(block_sizes=[1, 64, 8, 16])
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-            for kernel in (cute_bare_bmm, cute_bare_batched_dot):
+            for kernel in (
+                cute_bare_bmm,
+                cute_bare_bmm_dtype,
+                cute_bare_batched_dot,
+            ):
                 with self.subTest(kernel=kernel.name):
                     bound = kernel.bind(args)
                     self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)

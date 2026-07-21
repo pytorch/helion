@@ -138,6 +138,7 @@ _DTYPE_TRACE_EXTRA_TARGETS = {
     torch.ops.aten.div.Tensor,
 }
 _MMA_OUTPUT_STORE_ANALYSIS_META_KEY = "cute_mma_output_store_analysis"
+_MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY = "cute_mma_requires_accumulator_seed"
 
 # Register reallocation budget for tcgen05 warp-specialized kernels.
 # Producer warps (TMA loads, scheduler) only do address arithmetic and
@@ -466,6 +467,17 @@ _MMA_SUPPORTED_DTYPES = {
 }
 
 
+def _tcgen05_tma_matrix_major(tensor: torch.Tensor) -> str | None:
+    """Return the contiguous trailing matrix axis understood by tcgen05 TMA."""
+    if tensor.ndim not in (2, 3):
+        return None
+    if tensor.stride(-1) == 1:
+        return "row"
+    if tensor.stride(-2) == 1:
+        return "col"
+    return None
+
+
 @dataclass(frozen=True)
 class _MmaOperandInfo:
     # ``matrix_rows``/``matrix_cols`` are the trailing two (matmul) axes of the
@@ -688,7 +700,7 @@ def _decode_cute_mma_target(
         lhs, rhs = node.args[1], node.args[2]
         with_acc = True
         is_dot = False
-    elif node.target is torch.ops.aten.bmm.default:
+    elif node.target in (torch.ops.aten.bmm.default, torch.ops.aten.bmm.dtype):
         if len(node.args) < 2:
             return None
         acc = None
@@ -712,6 +724,22 @@ def _decode_cute_mma_target(
 
     if not isinstance(lhs, Node) or not isinstance(rhs, Node):
         return None
+    requires_accumulator_seed = False
+    if isinstance(acc, Node):
+        cached = node.meta.get(_MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY)
+        if isinstance(cached, bool):
+            requires_accumulator_seed = cached
+        else:
+            requires_accumulator_seed = not _is_zero_init_acc_node(
+                acc, device_ir=device_ir
+            )
+            if device_ir is not None:
+                # Codegen deep-copies FX graphs, so graph identity is no longer
+                # available for tracing an accumulator through duplicate loop
+                # bodies. Node metadata survives that copy.
+                node.meta[_MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY] = (
+                    requires_accumulator_seed
+                )
     return _CuteMmaTarget(
         lhs=lhs,
         rhs=rhs,
@@ -719,9 +747,7 @@ def _decode_cute_mma_target(
         out_dtype=node.args[3] if is_dot and len(node.args) > 3 else None,
         with_acc=with_acc,
         is_dot=is_dot,
-        requires_accumulator_seed=(
-            isinstance(acc, Node) and not _is_zero_init_acc_node(acc, device_ir=device_ir)
-        ),
+        requires_accumulator_seed=requires_accumulator_seed,
     )
 
 
@@ -783,9 +809,14 @@ def analyze_cute_mma_node(
         out_dtype=target.out_dtype,
         operands=operands,
         explicit_epi_tile_compatible=(
-            output_store_analysis.explicit_epi_tile_compatible
-            if output_store_analysis is not None
-            else True
+            _tcgen05_tma_matrix_major(operands.lhs.source_fake) == "row"
+            and _tcgen05_tma_matrix_major(operands.rhs.source_fake)
+            in ("row", "col")
+            and (
+                output_store_analysis.explicit_epi_tile_compatible
+                if output_store_analysis is not None
+                else True
+            )
         ),
         with_acc=target.with_acc,
         is_dot=target.is_dot,
@@ -2128,20 +2159,6 @@ def _emit_mma_pipeline(
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
 
-    def _tcgen05_tma_matrix_major(t: torch.Tensor) -> str | None:
-        # The trailing matrix is TMA-eligible if it is contiguous in either axis.
-        # Returns "row" (last-dim contiguous), "col" (first-dim contiguous),
-        # or None (neither -> not TMA-eligible). Row-major contiguous returns
-        # "row"; a transposed/column-major view returns "col".
-        if t.dim() not in (2, 3):
-            return None
-        s = t.stride()
-        if s[-1] == 1:
-            return "row"
-        if s[-2] == 1:
-            return "col"
-        return None
-
     _dtype_tma_ok = input_dtype in (
         torch.float16,
         torch.bfloat16,
@@ -2312,15 +2329,6 @@ def _emit_mma_pipeline(
     if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
         return None
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
-    if (
-        not zero_acc_expr
-        and acc_expr is not None
-        and fx_node is not None
-        and fx_node.target is torch.ops.aten.addmm.default
-    ):
-        acc_node = fx_node.args[0] if fx_node.args else None
-        if isinstance(acc_node, Node) and _is_zero_init_acc_node(acc_node):
-            zero_acc_expr = True
     if acc_expr is not None and mma_impl != "universal" and not zero_acc_expr:
         mma_impl = "universal"
     if mma_impl != "universal" and zero_acc_expr:
@@ -6611,7 +6619,9 @@ def codegen_cute_mma(
         acc_node = candidate.acc
         assert acc_node is not None
         acc_expr = (
-            None if _is_zero_init_acc_node(acc_node) else ctx.to_ast(ctx.env[acc_node])
+            ctx.to_ast(ctx.env[acc_node])
+            if candidate.requires_accumulator_seed
+            else None
         )
     else:
         acc_expr = None
@@ -6894,7 +6904,7 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
         return None
 
     acc_expr = None
-    if candidate.acc is not None and not _is_zero_init_acc_node(candidate.acc):
+    if candidate.acc is not None and candidate.requires_accumulator_seed:
         acc_expr = state.ast_arg(2)
     result = _emit_mma_pipeline(
         state.codegen,
