@@ -860,6 +860,7 @@ class TestPallas(TestCase):
         expected = torch.nn.functional.silu(a) * b
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
     def test_topk_divide_and_filter_lowering(self) -> None:
         """aten.topk lowers to a tallax-style divide-and-filter (Mosaic has no
         jax.lax.top_k): the generated code calls the helper, the top-1 is exact,
@@ -892,6 +893,7 @@ class TestPallas(TestCase):
         )
         self.assertGreater(recall, 0.9)
 
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
     def test_topk_recall_target_default_099(self) -> None:
         """Regression guard for the divide-and-filter default recall_target=0.99.
         At k=64, V=32768 the approximate top-k must recall >=99% of the true

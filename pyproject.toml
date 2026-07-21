@@ -119,6 +119,10 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 # kernels at runtime, not type-checked, so I002 is exempted. The remaining codes
 # (ANN/F841/FURB) are verbatim-vendored-FA4 style nits kept for diff fidelity.
 "helion/_compiler/cute/_flash_gemm_ptx.py" = ["I002", "ANN001", "ANN202", "F841", "FURB113"]
+# topk_impl.py's bitonic top-k (stage 2) is a faithful port of tallax's
+# compressed-transpose kernel (tallax/tax/bitonic/*); its helpers are kept untyped
+# for diff fidelity, so exempt the ANN nits (like the vendored file above).
+"helion/_compiler/pallas/topk_impl.py" = ["ANN001", "ANN202", "ANN003"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
@@ -153,7 +157,10 @@ project-includes = ["helion", "benchmarks", "docs", "examples"]
 # _flash_gemm_ptx.py is verbatim-vendored FA4 code (gemm_ptx_partial +
 # mma_sm100_desc) that indexes cute Tensor .shape/.stride dynamically -- pyrefly
 # cannot model those cute-internal types and flags ~90 false bad-index errors.
-project-excludes = ["test", "_helion_aot_*.py", "helion/_compiler/cute/_flash_gemm_ptx.py"]
+# topk_impl.py's vendored bitonic port has dynamic-arity compare-swap returns +
+# None-placeholder tile lists that pyrefly cannot model (false unpack/None-op
+# errors); it is exercised by test/test_pallas.py + on-TPU benchmarks instead.
+project-excludes = ["test", "_helion_aot_*.py", "helion/_compiler/cute/_flash_gemm_ptx.py", "helion/_compiler/pallas/topk_impl.py"]
 python-version = "3.10"
 search-path = ["../pytorch"]
 
