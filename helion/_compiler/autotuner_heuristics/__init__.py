@@ -18,11 +18,12 @@ from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
+from .triton import TritonNarrowReductionHeuristic
 from .triton import TritonPointwiseSeedHeuristic
 from .triton import TritonSkinnyGemmHeuristic
-from .triton import TritonStandardReductionHeuristic
+from .triton import TritonStandardReductionHeuristicSM90
 from .triton import TritonStandardReductionHeuristicSM100
-from .triton import TritonUserTiledReductionHeuristic
+from .triton import TritonUserTiledReductionHeuristicSM90
 from .triton import TritonUserTiledReductionHeuristicSM100
 
 if TYPE_CHECKING:
@@ -49,10 +50,11 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
-        TritonStandardReductionHeuristic,
+        TritonStandardReductionHeuristicSM90,
         TritonStandardReductionHeuristicSM100,
-        TritonUserTiledReductionHeuristic,
+        TritonUserTiledReductionHeuristicSM90,
         TritonUserTiledReductionHeuristicSM100,
+        TritonNarrowReductionHeuristic,
         TritonPointwiseSeedHeuristic,
     ),
     "pallas": (
