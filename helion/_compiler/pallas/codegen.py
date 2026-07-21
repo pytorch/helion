@@ -156,7 +156,13 @@ def _load_mask_expr(
                 if mask_var is not None:
                     if dtype_str is None:
                         dtype_str = env.backend.dtype_str(tensor.dtype)
-                    expand = state.tile_strategy.expand_str(output_sizes, out_dim)
+                    if env.is_jagged_tile(block_id):
+                        mask_shape = env.jagged_tile_mask_shapes[block_id]
+                        expand = state.tile_strategy.jagged_tile_expand_str(
+                            mask_shape, output_sizes
+                        )
+                    else:
+                        expand = state.tile_strategy.expand_str(output_sizes, out_dim)
                     expr = f"({mask_var}.astype({dtype_str}){expand})"
                     mask_exprs.append(expr)
 
@@ -811,5 +817,9 @@ def _loop_offset_alignment(
 
 def vmem_name(state: CodegenState, name: str) -> str:
     """Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop."""
-    _loop, ref = _find_dma_scratch_loop(state, name)
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    loop, ref = _find_dma_scratch_loop(state, name)
+    if isinstance(loop, ForiLoopState) and name in loop._prefetched_load_tensors:
+        return f"{ref}.at[{loop.loop_var_name} % 2]"
     return ref

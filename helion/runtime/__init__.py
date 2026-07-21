@@ -1533,7 +1533,7 @@ def _pallas_build_scratch_shapes(
             shape, dtype_str = entry  # type: ignore[misc]
             scratch_type = "vmem"
         if scratch_type == "dma_semaphore":
-            scratch_shapes.append(pltpu.SemaphoreType.DMA(()))  # type: ignore[union-attr]
+            scratch_shapes.append(pltpu.SemaphoreType.DMA(shape))  # type: ignore[union-attr]
         else:
             assert dtype_str is not None
             jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
