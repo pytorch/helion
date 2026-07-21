@@ -136,15 +136,27 @@ class LocalAutotuneCache(AutotuneCacheBase):
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:
-        in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
-            self.kernel,
-            tuple(self.args),
-            self.kernel.kernel._base_specialization_key(self.args),
+        from .benchmark_provider import _MultiShapeAutotuneArgs
+
+        multi_args = (
+            self.args if isinstance(self.args, _MultiShapeAutotuneArgs) else None
         )
+        if multi_args is None:
+            in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
+                self.kernel,
+                tuple(self.args),
+                self.kernel.kernel._base_specialization_key(self.args),
+            )
+            specialization_key = in_memory_cache_key.specialization_key
+            extra_results = in_memory_cache_key.extra_results
+            dev = extract_device(self.args)
+        else:
+            specialization_key = multi_args.workload_key
+            extra_results = ()
+            dev = multi_args.cases[0][0].env.device
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
 
-        dev = extract_device(self.args)
         assert dev is not None
 
         hardware = get_device_name(dev)
@@ -187,8 +199,8 @@ class LocalAutotuneCache(AutotuneCacheBase):
             advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
         )
         return LooseAutotuneCacheKey(
-            specialization_key=in_memory_cache_key.specialization_key,
-            extra_results=in_memory_cache_key.extra_results,
+            specialization_key=specialization_key,
+            extra_results=extra_results,
             kernel_source_hash=kernel_source_hash,
             hardware=hardware,
             runtime_name=runtime_name,
