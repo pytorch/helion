@@ -503,17 +503,15 @@ class Tcgen05UnaryEpilogueChain:
         carries the per-thread auxiliary load value. Pure unary
         chains pass ``None``.
 
-        Identity epilogues do not reach this method: the analyzer in
-        :func:`analyze_tcgen05_unary_epilogue_chain` returns ``None``
-        for the no-step case so the splice site stays out of the
-        picture (the ``ast.Name`` fast path already handles identity
-        stores). Empty chains here would indicate a caller bug.
+        Identity epilogues do not reach this method: the analyzer returns an
+        empty chain for that case, and the splice site leaves it to the
+        existing ``ast.Name`` fast path. Empty chains here would indicate a
+        caller bug.
         """
         assert self.steps, (
             "render_prelude_and_expr is only valid for chains with at "
             "least one step; identity epilogues should never reach the "
-            "splice site (the analyzer returns None for them so the "
-            "ast.Name fast path handles them)"
+            "splice site (the ast.Name fast path handles them)"
         )
         aux_steps = self.auxiliary_tensor_steps
         if aux_steps:
@@ -1040,16 +1038,10 @@ def analyze_tcgen05_unary_epilogue_chain(
         cast_input, target_fx_nodes, inner_outputs_by_graph_id
     )
     if matmul_anchor is not None:
-        # Identity epilogue (`out[tile] = acc.to(dtype)`). Return
-        # ``None`` so the splice site stays out of the picture — the
-        # ast.Name fast path in ``store_codegen`` already routes
-        # identity stores through ``_codegen_cute_store_tcgen05_tile``
-        # without an epilogue chain. Routing them through the splice
-        # would emit a no-op prelude + identical RHS, but the
-        # contract that identity stores never see an
-        # ``epilogue_chain`` keeps the no-chain code path
-        # byte-identical to the unary-only golden.
-        return None
+        # Preserve the distinction between a valid identity store and an
+        # unsupported chain. Store codegen leaves the empty-chain case to its
+        # existing ast.Name fast path, while preflight callers can admit it.
+        return Tcgen05UnaryEpilogueChain(steps=()), matmul_anchor
 
     # The chain carrier's expected tile shape and tile-id symbol
     # nodes, used to validate auxiliary-tensor loads. Read once at

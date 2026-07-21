@@ -1004,42 +1004,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_ab_stages_three_refused_for_multi_block_size_triple(
+    def test_cute_tcgen05_ab_stages_three_uses_analyzed_block_indices(
         self,
     ) -> None:
-        """Gate refuses ``ab=3`` when the spec has more than one (M,N,K) triple.
-
-        ``tcgen05_ab_stages`` is a global config knob across the whole
-        bound kernel, but the per-config search-time fixup
-        (``_fix_tcgen05_ab_stages_three_search_config``) only inspects
-        ``block_sizes[0:3]``. A multi-dot or multi-root kernel with
-        more than the single-matmul 3-block-size triple could otherwise
-        sit at ``ab=3`` for a later over-budget triple — that path
-        would survive the fixup and abort at ptxas mid-tuning. Verify
-        ``allow_tcgen05_ab_stages_three_search`` clears the recorded
-        constraints whenever the spec's block-size sequence is not the
-        validated 3-tuple.
-        """
+        """Extra config slots do not hide the analyzed M/N/K axes."""
         b200_budget_bytes = 227 * 1024 - 28 * 1024
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
 
-        # Sanity: the matmul-bound spec with a 3-block-size triple
-        # already admits the arm (this is the standard production path).
         self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
-
-        # Simulate a spec with more than the single-matmul 3-block-size
-        # triple (e.g. a multi-dot or multi-root kernel) and re-invoke
-        # the gate. The recorded constraints must be cleared so the
-        # search surface stays at ``ab_stages_max=2`` — otherwise a
-        # later over-budget triple would survive the per-config fixup
-        # (which inspects only ``block_sizes[0:3]``) and abort at ptxas.
-        # The gate's only check on ``block_sizes`` is its length, so
-        # re-running ``allow_tcgen05_ab_stages_three_search`` against
-        # a spec whose ``block_sizes`` reports a non-3 length is enough
-        # to validate the refusal.
         with patch.object(type(spec.block_sizes), "__len__", lambda self: 9):
-            self.assertEqual(len(spec.block_sizes), 9)
             with patch.object(
                 CuteTcgen05Config,
                 "per_cta_ab_smem_budget_bytes",
@@ -1049,9 +1023,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     dtype_bytes=2,
                     device=torch.device("cuda:0"),
                 )
-            self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+            self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
@@ -1662,11 +1636,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_multi_root_search_keeps_persistent_pid_types_out(
+    def test_cute_tcgen05_multi_root_search_disables_tcgen05(
         self,
     ) -> None:
-        """Multi-root tcgen05 kernels keep persistent pid types out of autotune
-        until the persistent scheduler/grid spans every root case."""
+        """Distinct analyzed matmul axes cannot share one tcgen05 config."""
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1677,16 +1650,37 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with patch_cute_mma_support():
             bound = _cute_two_matmuls_kernel.bind(args)
         spec = bound.config_spec
-        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
-        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertFalse(spec.cute_tcgen05_search_enabled)
+        self.assertIsNone(spec._tcgen05_cluster_m_search_choices)
+        self.assertIsNone(spec._tcgen05_num_epi_warps_search_choices)
+        self.assertIsNone(spec._cute_tcgen05_config.matmul_block_ids)
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_multi_root_forced_persistent_raises_invalid_config(
+    def test_cute_tcgen05_candidate_collection_ignores_ineligible_matmul(
         self,
     ) -> None:
-        """Forced-persistent multi-root tcgen05 has no valid pid search choice."""
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=torch.float32),
+            torch.randn([64, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            spec = _cute_two_matmuls_kernel.bind(args).config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        second_fact = spec.matmul_facts[1]
+        self.assertEqual(
+            spec._cute_tcgen05_config.matmul_block_ids,
+            (second_fact.m_block_id, second_fact.n_block_id, second_fact.k_block_id),
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_multi_root_forced_persistent_disables_tcgen05(
+        self,
+    ) -> None:
+        """Forced persistence remains valid on the generic CuTe path."""
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1694,20 +1688,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with (
-            patch_cute_mma_support(),
-            self.assertRaisesRegex(
-                InvalidConfig,
-                "CuTe tcgen05 multi-root kernels do not support persistent pid types",
-            ),
-        ):
-            _cute_two_matmuls_force_persistent_kernel.bind(args)
+        with patch_cute_mma_support():
+            bound = _cute_two_matmuls_force_persistent_kernel.bind(args)
+        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_multi_root_distributed_raises_invalid_config(
+    def test_cute_tcgen05_multi_root_distributed_disables_tcgen05_search(
         self,
     ) -> None:
-        """Distributed mode also makes the pid search persistent-only."""
+        """Ambiguous distributed matmul axes stay on the generic search."""
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1732,12 +1721,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 return_value="world",
             ),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
-            self.assertRaisesRegex(
-                InvalidConfig,
-                "CuTe tcgen05 multi-root kernels do not support persistent pid types",
-            ),
         ):
-            _cute_two_matmuls_kernel.bind(args)
+            bound = _cute_two_matmuls_kernel.bind(args)
+        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
 
     def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
         """Direct unit test for the narrowing helper that does not depend

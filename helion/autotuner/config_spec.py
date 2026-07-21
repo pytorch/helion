@@ -1173,6 +1173,39 @@ class ConfigSpec:
     def _tcgen05_full_tile_direct_entry_seed_config(self) -> helion.Config | None:
         return self._cute_tcgen05_config.full_tile_direct_entry_seed_config()
 
+    def register_cute_tcgen05_mma_analysis(
+        self,
+        *,
+        m_block_id: int,
+        n_block_id: int,
+        k_block_id: int,
+        input_dtype: torch.dtype,
+        has_leading_passthrough: bool,
+        explicit_epi_tile_compatible: bool,
+    ) -> None:
+        self._cute_tcgen05_config.register_mma_analysis(
+            m_block_id=m_block_id,
+            n_block_id=n_block_id,
+            k_block_id=k_block_id,
+            input_dtype=input_dtype,
+            has_leading_passthrough=has_leading_passthrough,
+            explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        )
+
+    def _tcgen05_matmul_block_fragments(
+        self,
+    ) -> tuple[BlockSizeFragment, BlockSizeFragment, BlockSizeFragment] | None:
+        return self._cute_tcgen05_config._matmul_block_fragments()
+
+    def _tcgen05_matmul_seed_block_sizes(
+        self, *, bm: int, bn: int, bk: int
+    ) -> list[int] | None:
+        return self._cute_tcgen05_config._matmul_seed_block_sizes(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+
     def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
         self._cute_tcgen05_config.restrict_cluster_m_search(choices)
 

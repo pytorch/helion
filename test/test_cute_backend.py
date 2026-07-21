@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import helion
+from helion.autotuner.config_spec import ConfigSpec
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -842,6 +843,46 @@ def cute_batched_dot_tcgen05(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_casted_batched_dot_tcgen05(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_b, tile_m, tile_k].to(torch.bfloat16),
+                y[tile_b, tile_k, tile_n].to(torch.bfloat16),
+                acc=acc,
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_batched_dot_unsupported_epilogue_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+                acc=acc,
+            )
+        out[tile_b, tile_m, tile_n] = (
+            acc + torch.sin(residual[tile_b, tile_m, tile_n])
+        ).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_bare_bmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     b, m, k = x.size()
     _, _, n = y.size()
@@ -912,44 +953,6 @@ def cute_shifted_batched_dot_tcgen05(
 
 
 @helion.kernel(backend="cute")
-def cute_lhs_transformed_batched_dot_tcgen05(
-    x: torch.Tensor, w: torch.Tensor
-) -> torch.Tensor:
-    b, m, k = x.size()
-    _, n = w.size()
-    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
-    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
-        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = hl.dot(
-                x[tile_b, (tile_m + 1) % m, (tile_k + 1) % k],
-                w[tile_k, tile_n],
-                acc=acc,
-            )
-        out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
-    return out
-
-
-@helion.kernel(backend="cute")
-def cute_rhs_transformed_batched_dot_tcgen05(
-    w: torch.Tensor, y: torch.Tensor
-) -> torch.Tensor:
-    m, k = w.size()
-    b, _, n = y.size()
-    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=w.device)
-    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
-        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = hl.dot(
-                w[tile_m, tile_k],
-                y[tile_b, (tile_k + 1) % k, (tile_n + 1) % n],
-                acc=acc,
-            )
-        out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
-    return out
-
-
-@helion.kernel(backend="cute")
 def cute_permuted_store_batched_dot_tcgen05(
     x: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:
@@ -984,9 +987,6 @@ def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
 def cute_mixed_rank_batched_dot_tcgen05(
     x: torch.Tensor, w: torch.Tensor
 ) -> torch.Tensor:
-    # Shared-weight batched dot: x is 3-D (batched), w is 2-D (shared across
-    # the batch). _analyze_mma_operands models this as a single batch axis, so
-    # it should enter the batched tcgen05 search just like a both-3-D bmm.
     b, m, k = x.size()
     _, n = w.size()
     out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
@@ -1022,7 +1022,7 @@ def cute_transposed_operand_batched_dot_tcgen05(
     # _analyze_mma_operands bails and codegen cannot lower this as batched MMA.
     # It is still rank-3, so it exercises the F2 guarantee: batched tcgen05
     # search enablement is gated on the same structural analyzer codegen uses
-    # (can_codegen_cute_mma_dot), NOT on operand rank alone -- so this kernel
+    # (analyze_cute_mma_node), NOT on operand rank alone -- so this kernel
     # must NOT shape the batched search surface.
     b, k, m = x.size()
     _, _, n = y.size()
@@ -4725,9 +4725,6 @@ class TestCuteBackend(TestCase):
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
             bound = cute_batched_dot_tcgen05.bind(args)
-            self.assertFalse(
-                bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
-            )
             config = _leading_tcgen05_direct_entry_config()
             code = bound.to_triton_code(config)
             out = bound.compile_config(config)(*args)
@@ -4804,16 +4801,77 @@ class TestCuteBackend(TestCase):
         if not support.tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
+        cute_batched_dot_tcgen05.reset()
         args = (
             torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+        with (
+            patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+            ),
+            patch(
+                "helion.language.matmul_ops._cuda_num_sms_or_zero",
+                return_value=0,
+            ),
+        ):
             bound = cute_batched_dot_tcgen05.bind(args)
             # The batched search surface is enabled (this is what lets the
             # autotuner reach tcgen05 without a hand-forced config).
             self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            self.assertEqual(
+                bound.config_spec._tcgen05_cluster_m_search_choices,
+                (1, 2),
+            )
+            self.assertEqual(
+                [spec.min_size for spec in bound.config_spec.block_sizes],
+                [1, 128, 8, 16],
+            )
+            self.assertEqual(
+                [spec.max_size for spec in bound.config_spec.block_sizes],
+                [1, 256, 256, 64],
+            )
             self.assertEqual(len(bound.config_spec.matmul_facts), 1)
+            seed_layouts = {
+                seed.config.get("tcgen05_layout_strategy")
+                for seed in bound.config_spec.compiler_seed_configs
+                if seed.block_sizes == [1, 256, 256, 64]
+            }
+            self.assertEqual(seed_layouts, {None, "explicit_epi_tile"})
+
+            projected = {
+                "block_sizes": [1, 128, 128, 64],
+                "pid_type": "flat",
+                "tcgen05_cluster_m": 2,
+            }
+            bound.config_spec.normalize(projected, _fix_invalid=True)
+            self.assertEqual(projected["block_sizes"], [1, 256, 256, 64])
+            self.assertEqual(projected["pid_type"], "persistent_interleaved")
+
+            def search_spec(m: int, n: int, k: int) -> ConfigSpec:
+                operands = (
+                    torch.empty(2, m, k, device=DEVICE, dtype=HALF_DTYPE),
+                    torch.empty(2, k, n, device=DEVICE, dtype=HALF_DTYPE),
+                )
+                return cute_batched_dot_tcgen05.bind(operands).config_spec
+
+            # Leading-axis tcgen05 codegen requires full M/N/K tiles. Shapes
+            # without a legal full tile stay on the generic search surface.
+            self.assertFalse(search_spec(160, 256, 128).cute_tcgen05_search_enabled)
+            divisor_spec = search_spec(320, 256, 128)
+            self.assertTrue(divisor_spec.cute_tcgen05_search_enabled)
+            self.assertEqual(divisor_spec.block_sizes[1].max_size, 64)
+
+            # BMM's N slot is index 2, not the rank-2 index 1. Clamp against
+            # the analyzed axis so a one-cluster N dimension cannot keep 8.
+            swizzle_spec = search_spec(2048, 256, 128)
+            swizzle_config = {
+                "block_sizes": [1, 128, 256, 64],
+                "tcgen05_l2_swizzle_size": 8,
+            }
+            swizzle_spec.normalize(swizzle_config, _fix_invalid=True)
+            self.assertEqual(swizzle_config["tcgen05_l2_swizzle_size"], 1)
+
             config = _batched_tcgen05_two_cta_config()
             code = bound.to_triton_code(config)
             out = bound.compile_config(config)(*args)
@@ -4822,6 +4880,89 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm(", code)
         self.assertIn("CtaGroup.TWO", code)
+
+    def test_batched_two_cta_search_counts_batch_clusters(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        def cluster_choices(batch: int) -> tuple[int, ...] | None:
+            cute_batched_dot_tcgen05.reset()
+            args = (
+                torch.empty(batch, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
+                torch.empty(batch, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+            )
+            return cute_batched_dot_tcgen05.bind(
+                args
+            ).config_spec._tcgen05_cluster_m_search_choices
+
+        with patch(
+            "helion.language.matmul_ops._cuda_num_sms_or_zero",
+            return_value=148,
+        ):
+            self.assertEqual(cluster_choices(32), (1,))
+            self.assertEqual(cluster_choices(64), (1, 2))
+
+    def test_batched_direct_entry_seeds_match_epilogue_support(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        cases = (
+            (
+                cute_batched_dot_residual_tcgen05,
+                (
+                    torch.empty(2, 256, 64, device=DEVICE, dtype=torch.bfloat16),
+                    torch.empty(2, 64, 256, device=DEVICE, dtype=torch.bfloat16),
+                    torch.empty(2, 256, 256, device=DEVICE, dtype=torch.bfloat16),
+                ),
+                {None},
+            ),
+            (
+                cute_batched_baddbmm_rowvec_bias_tcgen05,
+                (
+                    torch.empty(2, 256, 64, device=DEVICE, dtype=torch.bfloat16),
+                    torch.empty(2, 64, 256, device=DEVICE, dtype=torch.bfloat16),
+                    torch.empty(256, device=DEVICE, dtype=torch.bfloat16),
+                ),
+                {None, "explicit_epi_tile"},
+            ),
+        )
+        with patch(
+            "helion.language.matmul_ops._cuda_num_sms_or_zero",
+            return_value=0,
+        ):
+            for kernel, args, expected_layouts in cases:
+                with self.subTest(kernel=kernel.name):
+                    kernel.reset()
+                    bound = kernel.bind(args)
+                    layouts = {
+                        seed.config.get("tcgen05_layout_strategy")
+                        for seed in bound.config_spec.compiler_seed_configs
+                        if seed.block_sizes == [1, 256, 256, 64]
+                    }
+                    self.assertEqual(layouts, expected_layouts)
+                    config_generation = (
+                        bound.config_spec.create_config_generation()
+                    )
+                    normalized_layouts = {
+                        (
+                            seed.config.get("tcgen05_layout_strategy"),
+                            seed.config.get("tcgen05_tvm_ffi_launch") is True,
+                        )
+                        for _, seed in config_generation.seed_flat_config_pairs()
+                        if seed.block_sizes == [1, 256, 256, 64]
+                    }
+                    self.assertEqual(
+                        normalized_layouts,
+                        {
+                            (
+                                layout or "default",
+                                layout == "explicit_epi_tile",
+                            )
+                            for layout in expected_layouts
+                        },
+                    )
 
     def test_bare_batched_matmuls_use_collective_k_reduction(self) -> None:
         args = (
@@ -4936,56 +5077,92 @@ class TestCuteBackend(TestCase):
                     )
                     self.assertNotIn("cute.gemm(", code)
 
-    def test_mixed_rank_batched_dot_enables_tcgen05_and_uses_mma(self) -> None:
-        # A shared-weight batched dot (3-D x, 2-D w) must enter the batched
-        # tcgen05 search and compile to cute.gemm -- the search gate keys on
-        # "at least one operand rank 3", matching _analyze_mma_operands' single
-        # batch axis, not on both operands being rank 3.
+    def test_mixed_rank_batched_dot_uses_tcgen05(self) -> None:
         support = get_cute_mma_support()
         if not support.tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
-        args = (
-            torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
+        cases = (
+            (
+                cute_mixed_rank_batched_dot_tcgen05,
+                (
+                    torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
+                    torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
+                ),
+                "'lhs_leading_passthrough': True",
+            ),
+            (
+                cute_rhs_batched_dot_tcgen05,
+                (
+                    torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE),
+                    torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+                ),
+                "'rhs_leading_passthrough': True",
+            ),
+            (
+                cute_mixed_rank_batched_dot_tcgen05,
+                (
+                    torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
+                    torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE).T,
+                ),
+                "'lhs_leading_passthrough': True",
+            ),
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-            bound = cute_mixed_rank_batched_dot_tcgen05.bind(args)
-            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
-            config = _batched_tcgen05_two_cta_config()
-            code = bound.to_triton_code(config)
-            out = bound.compile_config(config)(*args)
-            torch.cuda.synchronize()
-        expected = torch.matmul(args[0].float(), args[1].float())
-        torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.gemm(", code)
-        self.assertIn("CtaGroup.TWO", code)
+            for kernel, args, plan_marker in cases:
+                with self.subTest(kernel=kernel.name):
+                    kernel.reset()
+                    bound = kernel.bind(args)
+                    self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+                    code = bound.to_triton_code(_batched_tcgen05_two_cta_config())
+                    out = bound.compile_config(_batched_tcgen05_two_cta_config())(*args)
+                    torch.testing.assert_close(
+                        out.float(),
+                        torch.matmul(args[0].float(), args[1].float()),
+                        atol=1e-1,
+                        rtol=1e-2,
+                    )
+                    self.assertIn("cute.gemm(", code)
+                    self.assertIn(plan_marker, code)
 
-    def test_rhs_batched_dot_enables_tcgen05_and_uses_mma(self) -> None:
-        support = get_cute_mma_support()
-        if not support.tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
+    def test_casted_batched_dot_falls_back_correctly(self) -> None:
         args = (
-            torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 128, 64, device=DEVICE, dtype=torch.float16),
+            torch.randn(2, 64, 8, device=DEVICE, dtype=torch.float16),
         )
+        config = helion.Config(block_sizes=[1, 128, 8, 64], pid_type="flat")
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-            bound = cute_rhs_batched_dot_tcgen05.bind(args)
-            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
-            config = _batched_tcgen05_two_cta_config()
+            bound = cute_casted_batched_dot_tcgen05.bind(args)
+            self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
             code = bound.to_triton_code(config)
             out = bound.compile_config(config)(*args)
-            torch.cuda.synchronize()
-        expected = torch.matmul(args[0].float(), args[1].float())
+        expected = torch.bmm(
+            args[0].to(torch.bfloat16).float(),
+            args[1].to(torch.bfloat16).float(),
+        )
+        self.assertNotIn("cute.gemm(", code)
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
-        self.assertIn("cute.gemm(", code)
-        self.assertIn("'rhs_leading_passthrough': True", code)
+
+    def test_unsupported_batched_epilogue_falls_back_correctly(self) -> None:
+        args = (
+            torch.randn(2, 128, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 64, 8, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 128, 8, device=DEVICE),
+        )
+        config = helion.Config(block_sizes=[1, 128, 8, 64], pid_type="flat")
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_dot_unsupported_epilogue_tcgen05.bind(args)
+            self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+        expected = torch.bmm(args[0].float(), args[1].float()) + torch.sin(args[2])
+        self.assertNotIn("cute.gemm(", code)
+        torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
 
     def test_batched_dot_codegen_rejected_does_not_shape_search(self) -> None:
         # F2 regression: batched tcgen05 search enablement for hl.dot must be
         # gated on the SAME structural analyzer codegen uses
-        # (can_codegen_cute_mma_dot), not on operand rank alone. A rank-3 dot
+        # (analyze_cute_mma_node), not on operand rank alone. A rank-3 dot
         # that codegen cannot lower (here: a transposed LHS operand) must NOT
         # shape the batched search surface -- otherwise the autotuner tunes a
         # config family for a kernel codegen later rejects. A clean batched dot
@@ -5012,21 +5189,6 @@ class TestCuteBackend(TestCase):
             self.assertFalse(rejected_bound.config_spec.cute_tcgen05_search_enabled)
             self.assertFalse(shifted_bound.config_spec.cute_tcgen05_search_enabled)
 
-    def test_transformed_matrix_indices_do_not_shape_tcgen05_search(self) -> None:
-        lhs_args = (
-            torch.randn(2, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
-        )
-        rhs_args = (
-            torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn(2, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
-        )
-        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-            lhs_bound = cute_lhs_transformed_batched_dot_tcgen05.bind(lhs_args)
-            rhs_bound = cute_rhs_transformed_batched_dot_tcgen05.bind(rhs_args)
-        self.assertFalse(lhs_bound.config_spec.cute_tcgen05_search_enabled)
-        self.assertFalse(rhs_bound.config_spec.cute_tcgen05_search_enabled)
-
     def test_transformed_2d_dot_does_not_shape_tcgen05_search(self) -> None:
         args = (
             torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE),
@@ -5036,18 +5198,20 @@ class TestCuteBackend(TestCase):
             bound = cute_transformed_dot_tcgen05.bind(args)
         self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
 
-    def test_permuted_output_store_rejected_cleanly(self) -> None:
+    def test_permuted_output_store_falls_back_correctly(self) -> None:
         args = (
-            torch.randn(2, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn(2, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 128, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 64, 8, device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
             bound = cute_permuted_store_batched_dot_tcgen05.bind(args)
-            with self.assertRaisesRegex(
-                helion.exc.BackendUnsupported,
-                "exact zero-offset output tile axes",
-            ):
-                bound.to_triton_code(_batched_tcgen05_two_cta_config())
+            self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+            config = helion.Config(block_sizes=[1, 128, 8, 64], pid_type="flat")
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+        expected = torch.bmm(args[0].float(), args[1].float()).transpose(-1, -2)
+        self.assertNotIn("cute.gemm(", code)
+        torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
 
     def test_batched_two_cta_partial_edge_tiles_rejected(self) -> None:
         # A batched CtaGroup.TWO matmul with ANY partial tile -- M edge, N
@@ -5069,45 +5233,34 @@ class TestCuteBackend(TestCase):
             (256, 256, 100),
             (300, 300, 100),
         ]
-        # Both leading-passthrough forms must reject: both-operands-3D bmm and
-        # mixed-rank ([B, M, K] @ [K, N]) shared-weight dot.
+
         def _bmm_args(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
             return (
                 torch.randn(2, m, k, device=DEVICE, dtype=HALF_DTYPE),
                 torch.randn(2, k, n, device=DEVICE, dtype=HALF_DTYPE),
             )
 
-        def _mixed_args(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-            return (
-                torch.randn(2, m, k, device=DEVICE, dtype=HALF_DTYPE),
-                torch.randn(k, n, device=DEVICE, dtype=HALF_DTYPE),
-            )
-
-        cases = [
-            ("bmm", cute_batched_baddbmm_tcgen05, _bmm_args),
-            ("mixed", cute_mixed_rank_batched_dot_tcgen05, _mixed_args),
-        ]
         for m, n, k in partial_shapes:
-            for label, kernel, make_args in cases:
-                args = make_args(m, n, k)
-                with patch.dict(
-                    os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+            args = _bmm_args(m, n, k)
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+            ):
+                bound = cute_batched_baddbmm_tcgen05.bind(args)
+                self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+                with self.assertRaisesRegex(
+                    helion.exc.InvalidConfig,
+                    "only supported for tcgen05-enabled CuTe matmul kernels",
+                    msg=f"2-CTA partial M={m} N={n} K={k} not rejected",
                 ):
-                    bound = kernel.bind(args)
-                    with self.assertRaises(
-                        helion.exc.BackendUnsupported,
-                        msg=f"{label} 2-CTA partial M={m} N={n} K={k} not rejected",
-                    ):
-                        bound.to_triton_code(config)
+                    bound.to_triton_code(config)
 
-    def test_batched_one_cta_partial_tiles_rejected(self) -> None:
+    def test_batched_one_cta_partial_tiles_fall_back_correctly(self) -> None:
         support = get_cute_mma_support()
         if not support.tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
-        # The leading-passthrough tcgen05 pipeline is currently validated only
-        # for static full M/N/K tiles. Exercise the two partial cases that
-        # previously returned wrong output, including through scalar fallback.
+        # Leading-passthrough MMA is validated only for static full M/N/K
+        # tiles. Partial configs must use the scalar fallback.
         cases = [
             ("N edge", (2, 64, 32), (2, 32, 10)),
             ("K tail", (2, 64, 35), (2, 35, 8)),
@@ -5127,21 +5280,20 @@ class TestCuteBackend(TestCase):
                     ),
                 ):
                     bound = cute_batched_baddbmm_tcgen05.bind(args)
-                    with self.assertRaisesRegex(
-                        helion.exc.BackendUnsupported,
-                        "leading passthrough axis does not support partial",
-                    ):
-                        bound.to_triton_code(
-                            helion.Config(
-                                block_sizes=[1, 64, 8, 16],
-                                tcgen05_cluster_m=1,
-                                tcgen05_cluster_n=1,
-                                pid_type="flat",
-                                tcgen05_ab_stages=2,
-                                tcgen05_acc_stages=2,
-                                tcgen05_c_stages=2,
-                            )
-                        )
+                    self.assertFalse(
+                        bound.config_spec.cute_tcgen05_search_enabled
+                    )
+                    config = helion.Config(
+                        block_sizes=[1, 64, 8, 16],
+                        pid_type="flat",
+                    )
+                    code = bound.to_triton_code(config)
+                    out = bound.compile_config(config)(*args)
+                    expected = torch.bmm(args[0].float(), args[1].float())
+                    self.assertNotIn("cute.gemm(", code)
+                    torch.testing.assert_close(
+                        out, expected, atol=1e-1, rtol=1e-2
+                    )
 
     def test_batched_tcgen05_cluster_n_rejected_cleanly(self) -> None:
         support = get_cute_mma_support()
@@ -6567,35 +6719,49 @@ class TestCuteBackend(TestCase):
         self.assertEqual(first, second)
         self.assertEqual(third, ("launched", ("ptr-2", "stream")))
 
-    def test_cute_launcher_bakes_layouts_for_shape_bake_safe_wrappers(self) -> None:
+    def test_cute_launcher_tensor_shape_baking(self) -> None:
         tensor = torch.empty((2, 128, 64), device=DEVICE, dtype=torch.float16)
-        small_kernel = type("DummyCuteKernel", (), {})()
-        small_kernel._helion_cute_wrapper_plans = [
-            {"kind": "helion_small_biased_attention"}
-        ]
-        schema, launch_args = _build_cute_schema_and_args(
-            small_kernel,
-            (tensor,),
-            (128, 2, 1),
+        full_tcgen05_plan = {
+            "kind": "tcgen05_ab_tma",
+            "m_size": 128,
+            "n_size": 128,
+            "k_total_size": 64,
+            "bm": 128,
+            "bn": 128,
+            "bk": 64,
+        }
+        cases = (
+            ({"kind": "helion_small_biased_attention"}, False, True),
+            (full_tcgen05_plan, False, True),
+            ({**full_tcgen05_plan, "n_size": 136}, False, False),
+            ({"kind": "helion_flash"}, False, False),
+            (full_tcgen05_plan, True, False),
         )
-        self.assertEqual(
-            schema,
-            (("tensor", "torch.float16", 3, (2, 128, 64), (8192, 64, 1)),),
-        )
-        self.assertEqual(len(launch_args), 4)
-
-        flash_kernel = type("DummyCuteKernel", (), {})()
-        flash_kernel._helion_cute_wrapper_plans = [{"kind": "helion_flash"}]
-        schema, launch_args = _build_cute_schema_and_args(
-            flash_kernel,
-            (tensor,),
-            (1, 1, 1),
-        )
-        self.assertEqual(
-            schema,
-            (("tensor", "torch.float16", 3, (2, 128, 64), (8192, 64, 1)),),
-        )
-        self.assertEqual(len(launch_args), 4)
+        for plan, disable_bake, expected_baked in cases:
+            with self.subTest(plan=plan, disable_bake=disable_bake):
+                kernel = type("DummyCuteKernel", (), {})()
+                kernel._helion_cute_wrapper_plans = [plan]
+                kernel._helion_cute_disable_bake_tensor_shapes = disable_bake
+                schema, launch_args = _build_cute_schema_and_args(
+                    kernel, (tensor,), (128, 2, 1)
+                )
+                if expected_baked:
+                    self.assertEqual(
+                        schema,
+                        (
+                            (
+                                "tensor",
+                                "torch.float16",
+                                3,
+                                (2, 128, 64),
+                                (8192, 64, 1),
+                            ),
+                        ),
+                    )
+                    self.assertEqual(len(launch_args), 4)
+                else:
+                    self.assertEqual(schema, (("tensor", "torch.float16", 3),))
+                    self.assertEqual(len(launch_args), 10)
 
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))

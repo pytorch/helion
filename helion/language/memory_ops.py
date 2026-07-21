@@ -1631,12 +1631,9 @@ def _codegen_cute_store_tcgen05_tile(
             )
         return None
     leading_index = base_indices[0] if leading_passthrough_output else None
-    m_index = base_indices[1] if leading_passthrough_output else base_indices[0]
-    n_index = base_indices[2] if leading_passthrough_output else base_indices[1]
-    m_dim = 1 if leading_passthrough_output else 0
-    n_dim = 2 if leading_passthrough_output else 1
-    m_size = _cute_tensor_dim_size_expr(state, tensor, m_dim)
-    n_size = _cute_tensor_dim_size_expr(state, tensor, n_dim)
+    m_index, n_index = base_indices[-2:]
+    m_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 2)
+    n_size = _cute_tensor_dim_size_expr(state, tensor, tensor.ndim - 1)
     tile_coord_m = f"({m_index}) // cutlass.Int32({tcgen05_value.bm})"
     tile_coord_n = f"({n_index}) // cutlass.Int32({tcgen05_value.bn})"
     full_tile = df.new_var("tcgen05_full_tile")

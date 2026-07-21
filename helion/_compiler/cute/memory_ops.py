@@ -1430,7 +1430,8 @@ def _try_splice_tcgen05_unary_epilogue(
     if analyzed is None:
         return None
     chain, anchor = analyzed
-    assert chain.steps
+    if not chain.steps:
+        return None
     anchor_result_var = cute_state.matmul_fx_node_result_vars.get(anchor)
     if anchor_result_var is None:
         return None

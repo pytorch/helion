@@ -130,6 +130,7 @@ def _detect_specialized_mma_loop(
     from ..host_function import HostFunction
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _mma_active_n_threads
+    from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import _tcgen05_root_m_threads
     from .cute_mma import analyze_cute_mma_node
 
@@ -204,6 +205,14 @@ def _detect_specialized_mma_loop(
         return False
     bm, bn = root_block_sizes
     root_m_threads, root_n_threads = root_thread_counts
+    candidates = [
+        candidate
+        for candidate in candidates
+        if not candidate.operands.has_leading_passthrough
+        or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+    ]
+    if not candidates:
+        return False
 
     def root_threads_support_impl(mma_impl: str) -> bool:
         if mma_impl == "tcgen05":
@@ -227,9 +236,7 @@ def _detect_specialized_mma_loop(
         return False
 
     for candidate in candidates:
-        lhs_val = candidate.lhs.meta.get("val")
-        if not isinstance(lhs_val, torch.Tensor):
-            continue
+        lhs_val = candidate.operands.lhs.source_fake
         mma_impl = _choose_mma_impl(
             lhs_val.dtype,
             bm=bm,

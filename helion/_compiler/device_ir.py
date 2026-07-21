@@ -3650,6 +3650,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 )
             else:
                 from ..language.matmul_ops import enable_cute_tcgen05_search
+                from ..language.matmul_ops import plan_cute_tcgen05_search
                 from .cute.cute_mma import analyze_cute_mma_node
 
                 # The same structural analyzer gates tcgen05 search and codegen
@@ -3658,6 +3659,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 root_grid_block_ids = {
                     tuple(block_ids) for block_ids in device_ir.grid_block_ids
                 }
+                search_candidates = []
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         candidate = analyze_cute_mma_node(node, device_ir=device_ir)
@@ -3675,13 +3677,41 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             and isinstance(rhs, torch.Tensor)
                         ):
                             continue
-                        enable_cute_tcgen05_search(
+                        search_plan = plan_cute_tcgen05_search(
                             lhs,
                             rhs,
                             has_leading_passthrough=(
                                 candidate.operands.has_leading_passthrough
                             ),
                         )
+                        if search_plan is None:
+                            continue
+                        search_candidates.append((candidate, lhs, search_plan))
+                analysis_keys = {
+                    (
+                        candidate.operands.output_block_ids,
+                        candidate.operands.k_block_id,
+                        candidate.operands.lhs.source_fake.dtype,
+                    )
+                    for candidate, _lhs, _plan in search_candidates
+                }
+                if len(analysis_keys) == 1:
+                    candidate, lhs, search_plan = search_candidates[0]
+                    enable_cute_tcgen05_search(
+                        lhs,
+                        plan=search_plan,
+                        m_block_id=candidate.operands.m_block_id,
+                        n_block_id=candidate.operands.n_block_id,
+                        k_block_id=candidate.operands.k_block_id,
+                        input_dtype=candidate.operands.lhs.source_fake.dtype,
+                        has_leading_passthrough=(
+                            candidate.operands.has_leading_passthrough
+                        ),
+                        explicit_epi_tile_compatible=all(
+                            item.explicit_epi_tile_compatible
+                            for item, _lhs, _plan in search_candidates
+                        ),
+                    )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05

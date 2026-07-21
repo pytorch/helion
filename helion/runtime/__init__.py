@@ -3168,7 +3168,6 @@ def _append_cute_wrapper_plan(
     lhs_tma = f"{tma_atom_a}_lhs_tma"
     rhs_tma = f"{tma_atom_b}_rhs_tma"
     lhs_tma_operand = lhs_tma if lhs_leading_passthrough else f"arg{lhs_idx}"
-    rhs_tma_operand = rhs_tma
     smem_a_layout_expr = tcgen05_smem_layout_expr(
         tiled_mma=tiled_mma,
         bm=bm,
@@ -3261,7 +3260,7 @@ def _append_cute_wrapper_plan(
                 f"    {tma_atom_b}, {tma_tensor_b} = cute.nvgpu.make_tiled_tma_atom_B("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
-                f"{rhs_tma_operand}, "
+                f"{rhs_tma}, "
                 f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape)"
             ),
@@ -3913,6 +3912,26 @@ def _build_cached_cute_schema_and_args(
     return built
 
 
+def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
+    kind = str(plan.get("kind", ""))
+    if kind == "helion_small_biased_attention":
+        return True
+    if not kind.startswith("tcgen05"):
+        return False
+    if kind != "tcgen05_ab_tma":
+        return True
+    for extent_key, block_key in (
+        ("m_size", "bm"),
+        ("n_size", "bn"),
+        ("k_total_size", "bk"),
+    ):
+        extent = plan.get(extent_key)
+        block = plan.get(block_key)
+        if type(extent) is not int or type(block) is not int or extent % block:
+            return False
+    return True
+
+
 def _build_cute_schema_and_args(
     cute_kernel: object,
     args: tuple[object, ...],
@@ -3929,31 +3948,19 @@ def _build_cute_schema_and_args(
     make_ptr = cast("Any", make_ptr_obj)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     # Universal MMA needs runtime tensor layouts for its SMEM-load guards.
-    # tcgen05 wrapper schemas are specialized by problem shape and stride, so
-    # their tensor metadata can remain baked when every wrapper plan permits it.
+    # Full-tile tcgen05 wrapper schemas are specialized by problem shape and
+    # stride, while partial-tile paths still propagate runtime tensor layouts.
     if bake_tensor_shapes:
         any_obj = cast("Any", cute_kernel)
         wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
-        # tcgen05 matmul plans already bake the static tile/problem shapes into
-        # the device code, so baking the wrapper's tensor shapes is safe here and
-        # drops the redundant runtime shape/stride launch args. For 3-D (batched)
-        # operands those extra args otherwise push the launch onto CUTLASS-DSL's
-        # slow per-arg ``generate_execution_args`` path instead of the TVM-FFI
-        # fast path -- a large per-call host-overhead difference. The dynamic
-        # shape/stride propagation that baking would miscompile only exists on
-        # the universal (non-tcgen05) MMA path, which carries no wrapper plans.
-        plans_bakeable = bool(wrapper_plans) and all(
-            str(plan.get("kind", "")).startswith("tcgen05")
-            or plan.get("kind")
-            in {"helion_small_biased_attention", "helion_flash"}
+        non_bakeable_plan = bool(wrapper_plans) and any(
+            not _cute_wrapper_plan_bakes_tensor_shapes(plan)
             for plan in wrapper_plans
         )
-        wrapper_plans_disable_bake = bool(wrapper_plans) and not plans_bakeable
-        disable_bake = bool(
+        if (
             getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
-            or wrapper_plans_disable_bake
-        )
-        if disable_bake and not plans_bakeable:
+            or non_bakeable_plan
+        ):
             bake_tensor_shapes = False
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []

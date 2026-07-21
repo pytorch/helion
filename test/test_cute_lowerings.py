@@ -59,6 +59,7 @@ from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
 from helion._compiler.cute.cute_mma import _is_zero_init_acc_node
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
+from helion._compiler.cute.cute_mma import _mma_loop_is_exclusive
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
 from helion._compiler.cute.cute_mma import _MmaRoleCoordinatePlan
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
@@ -69,7 +70,6 @@ from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
-from helion._compiler.cute.cute_mma import can_codegen_cute_mma_aten
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
@@ -13162,7 +13162,7 @@ class TestCuteLowerings(unittest.TestCase):
         ):
             codegen_iota_cute(ctx, iota)
 
-    def test_can_codegen_cute_mma_aten_requires_exclusive_loop_body(self) -> None:
+    def test_mma_loop_is_exclusive(self) -> None:
         graph = Graph()
         acc = graph.placeholder("acc")
         lhs = graph.placeholder("lhs")
@@ -13173,11 +13173,7 @@ class TestCuteLowerings(unittest.TestCase):
         lhs.meta["val"] = torch.empty(16, 64, dtype=torch.float16)
         rhs.meta["val"] = torch.empty(64, 8, dtype=torch.float16)
         addmm.meta["val"] = torch.empty(16, 8, dtype=torch.float32)
-        with patch(
-            "helion._compiler.cute.cute_mma.is_mma_compatible_aten",
-            return_value=True,
-        ):
-            self.assertTrue(can_codegen_cute_mma_aten(addmm, with_acc=True))
+        self.assertTrue(_mma_loop_is_exclusive(addmm))
 
         graph = Graph()
         acc = graph.placeholder("acc")
@@ -13190,11 +13186,7 @@ class TestCuteLowerings(unittest.TestCase):
         lhs.meta["val"] = torch.empty(16, 64, dtype=torch.float16)
         rhs.meta["val"] = torch.empty(64, 8, dtype=torch.float16)
         addmm.meta["val"] = torch.empty(16, 8, dtype=torch.float32)
-        with patch(
-            "helion._compiler.cute.cute_mma.is_mma_compatible_aten",
-            return_value=True,
-        ):
-            self.assertFalse(can_codegen_cute_mma_aten(addmm, with_acc=True))
+        self.assertFalse(_mma_loop_is_exclusive(addmm))
 
     def test_lane_loop_store_permute_codegen_stays_inline(self) -> None:
         graph = Graph()

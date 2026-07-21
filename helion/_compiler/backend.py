@@ -2656,6 +2656,7 @@ def _kernel_specialized_mma_plan(
 ) -> _SpecializedMmaPlan | None:
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _choose_mma_impl
+    from .cute.cute_mma import _mma_tiles_are_static_full
     from .cute.cute_mma import analyze_cute_mma_node
     from .device_ir import ForLoopGraphInfo
     from .host_function import HostFunction
@@ -2695,9 +2696,14 @@ def _kernel_specialized_mma_plan(
             bn = env.block_sizes[root_mn_block_ids[1]].from_config(config)
             if not isinstance(bm, int) or not isinstance(bn, int):
                 continue
-            lhs_val = candidate.lhs.meta.get("val")
-            if not isinstance(lhs_val, torch.Tensor):
+            if (
+                candidate.operands.has_leading_passthrough
+                and not _mma_tiles_are_static_full(
+                    candidate.operands, bm=bm, bn=bn, bk=bk
+                )
+            ):
                 continue
+            lhs_val = candidate.operands.lhs.source_fake
             mma_impl = _choose_mma_impl(
                 lhs_val.dtype,
                 bm=bm,
