@@ -18,6 +18,11 @@ MAX_ANCHORS_IN_PROMPT = 2
 MAX_CHANGED_FIELDS_PER_CONFIG = 6
 
 
+def _format_performance(perf: float, performance_unit: str) -> str:
+    suffix = " ms" if performance_unit == "ms" else "x"
+    return f"{perf:.4f}{suffix}"
+
+
 def format_config_for_prompt(cfg: Config | dict[str, object]) -> str:
     """Serialize a config exactly as it should appear in prompt examples."""
     return json.dumps(dict(cfg), sort_keys=True, separators=(",", ":"))
@@ -70,6 +75,7 @@ def format_results_for_llm(
     default_config_dict: dict[str, object],
     *,
     limit: int = MAX_RESULTS_IN_PROMPT,
+    performance_unit: str = "ms",
 ) -> str:
     """Format successful and failed benchmark results into a compact block."""
     if not results:
@@ -81,7 +87,7 @@ def format_results_for_llm(
     lines: list[str] = []
     for index, (cfg, perf) in enumerate(sorted_results[:limit], start=1):
         lines.append(
-            f"  #{index}: {perf:.4f} ms — "
+            f"  #{index}: {_format_performance(perf, performance_unit)} — "
             f"{format_config_diff(default_config_dict, cfg)}"
         )
     if failed_count > 0:
@@ -92,6 +98,8 @@ def format_results_for_llm(
 def summarize_search_state_for_llm(
     results: list[BenchmarkResult],
     default_config_dict: dict[str, object],
+    *,
+    performance_unit: str = "ms",
 ) -> str:
     """Summarize the current best result, coverage, and failure counts."""
     finite = finite_results(results)
@@ -101,7 +109,7 @@ def summarize_search_state_for_llm(
     best_cfg, best_perf = finite[0]
     lines = [
         (
-            f"  Best so far: {best_perf:.4f} ms — "
+            f"  Best so far: {_format_performance(best_perf, performance_unit)} — "
             f"{format_config_diff(default_config_dict, best_cfg)}"
         )
     ]
@@ -155,6 +163,7 @@ def summarize_anchor_configs_for_llm(
     default_config_dict: dict[str, object],
     *,
     limit: int = MAX_ANCHORS_IN_PROMPT,
+    performance_unit: str = "ms",
 ) -> str:
     """Show the strongest current configs that the next round should refine."""
     finite = finite_results(results)
@@ -170,7 +179,8 @@ def summarize_anchor_configs_for_llm(
             gap_pct = ((perf - best_perf) / best_perf) * 100
             delta = f"+{gap_pct:.1f}%"
         lines.append(
-            f"  Anchor {index} ({delta}): {perf:.4f} ms — "
+            f"  Anchor {index} ({delta}): "
+            f"{_format_performance(perf, performance_unit)} — "
             f"{format_config_diff(default_config_dict, cfg)}"
         )
     return "\n".join(lines)

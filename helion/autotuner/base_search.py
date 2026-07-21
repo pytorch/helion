@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
@@ -33,7 +34,9 @@ from ..runtime.settings import _env_get_int
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import LocalBenchmarkProvider
+from .benchmark_provider import MultiShapeBenchmarkProvider
 from .benchmark_provider import _clone_args
+from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _unset_fn
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
@@ -271,6 +274,20 @@ class BaseSearch(BaseAutotuner):
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
 
+    @property
+    def performance_unit(self) -> Literal["ms", "ratio"]:
+        args = getattr(self, "args", ())
+        if isinstance(args, _MultiShapeAutotuneArgs) and args.relative_to is not None:
+            return "ratio"
+        return "ms"
+
+    @property
+    def performance_suffix(self) -> str:
+        return "x" if self.performance_unit == "ratio" else "ms"
+
+    def format_performance(self, value: float) -> str:
+        return f"{value:.4f}{self.performance_suffix}"
+
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
 
@@ -294,9 +311,26 @@ class BaseSearch(BaseAutotuner):
             except OSError:
                 self.log.debug("Failed to read Helion kernel source", exc_info=True)
         kernel_name = getattr(kernel_obj, "name", "")
-        tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
-        input_shapes = str([tuple(t.shape) for t in tensors])
-        dtypes = str([str(t.dtype) for t in tensors])
+        if isinstance(self.args, _MultiShapeAutotuneArgs):
+            case_tensors = []
+            for _, case_args in self.args.cases:
+                leaves, _ = tree_flatten(case_args)
+                case_tensors.append(
+                    [value for value in leaves if isinstance(value, torch.Tensor)]
+                )
+            input_shapes = str(
+                [
+                    [tuple(tensor.shape) for tensor in tensors]
+                    for tensors in case_tensors
+                ]
+            )
+            dtypes = str(
+                [[str(tensor.dtype) for tensor in tensors] for tensors in case_tensors]
+            )
+        else:
+            tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
+            input_shapes = str([tuple(t.shape) for t in tensors])
+            dtypes = str([str(t.dtype) for t in tensors])
         hardware = get_device_name(extract_device(self.args)) or ""
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=kernel_name,
@@ -316,7 +350,12 @@ class BaseSearch(BaseAutotuner):
             settings=self.settings.to_dict(),
             _device_ir=getattr(host_function, "_device_ir", None),
         )
-        self.benchmark_provider = self._benchmark_provider_cls(
+        provider_cls = (
+            MultiShapeBenchmarkProvider
+            if isinstance(self.args, _MultiShapeAutotuneArgs)
+            else self._benchmark_provider_cls
+        )
+        self.benchmark_provider = provider_cls(
             kernel=self.kernel,
             settings=self.settings,
             config_spec=self.config_spec,
@@ -545,10 +584,19 @@ class BaseSearch(BaseAutotuner):
             exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
             self.benchmark_provider.setup()
             exit_stack.callback(self.benchmark_provider.cleanup)
+            best: Config | None = None
             try:
                 best = self._autotune()
+                if isinstance(
+                    self.benchmark_provider, MultiShapeBenchmarkProvider
+                ) and isinstance(self.args, _MultiShapeAutotuneArgs):
+                    if not self.benchmark_provider.has_valid_measurement(best):
+                        raise exc.NoConfigFound
+                    if not self.args.defer_selected_log:
+                        self.benchmark_provider.log_selected(best)
             finally:
-                self._finalize_autotune_metrics()
+                self._finalize_autotune_metrics(best)
+        assert best is not None
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
 
@@ -698,9 +746,17 @@ class BaseSearch(BaseAutotuner):
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
 
-    def _finalize_autotune_metrics(self) -> None:
+    def _finalize_autotune_metrics(self, best_config: Config | None = None) -> None:
+        best_perf = self.best_perf_so_far
+        if self.performance_unit == "ratio":
+            best_perf = (
+                self.benchmark_provider.raw_latency(best_config)
+                if best_config is not None
+                and isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider)
+                else inf
+            )
         self._autotune_metrics.best_perf_ms = (
-            self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+            best_perf if math.isfinite(best_perf) else 0.0
         )
         self._autotune_metrics.finalize()
         _run_post_autotune_hooks(self._autotune_metrics)
@@ -1312,7 +1368,8 @@ class PopulationBasedSearch(BaseSearch):
         if after.config != before.config:
             self.log(
                 "Final verification selected a different config: "
-                f"{before.perf:.4f}ms -> {after.perf:.4f}ms"
+                f"{self.format_performance(before.perf)} -> "
+                f"{self.format_performance(after.perf)}"
             )
         return after
 
@@ -1364,6 +1421,17 @@ class PopulationBasedSearch(BaseSearch):
             desc: Description for the progress bar.
         """
         if len(members) < 2:
+            return
+        if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
+            provider_timings = self.benchmark_provider.rebenchmark(
+                [member.config for member in members],
+                [member.perf for member in members],
+                desc=desc,
+            )
+            for member, timing in zip(members, provider_timings, strict=True):
+                member.perfs.append(timing)
+                if timing < self.best_perf_so_far:
+                    self.best_perf_so_far = timing
             return
 
         # Size the in-process repeat from the candidates being rechecked. A
@@ -1605,8 +1673,10 @@ class PopulationBasedSearch(BaseSearch):
                 delta_pct = (delta / current_perf * 100) if current_perf != 0 else 0
                 status = "ok" if candidate.perf <= current_perf else "worse"
                 self.log.debug(
-                    f"  reset to {candidate.config}: {candidate.perf:.4f}ms "
-                    f"(delta={delta:+.4f}ms, {delta_pct:+.1f}%) [{status}]"
+                    f"  reset to {candidate.config}: "
+                    f"{self.format_performance(candidate.perf)} "
+                    f"(delta={delta:+.4f}{self.performance_suffix}, "
+                    f"{delta_pct:+.1f}%) [{status}]"
                 )
 
             # Collect all single-attribute resets that maintained performance
@@ -1643,7 +1713,8 @@ class PopulationBasedSearch(BaseSearch):
 
             if simplified:
                 self.log(
-                    f"Finishing round {round_num}: simplified to {current.config}, perf={current.perf:.4f}ms"
+                    f"Finishing round {round_num}: simplified to {current.config}, "
+                    f"perf={self.format_performance(current.perf)}"
                 )
             else:
                 self.log(
@@ -1651,8 +1722,13 @@ class PopulationBasedSearch(BaseSearch):
                 )
                 break
 
-        # Minimize the final config by removing values that match defaults
-        minimal_config = current.config.minimize(self.config_spec)
+        # Multi-shape winners must stay explicit: minimizing can collapse an
+        # optional tuned reset and a compiler-promoted default to the same key.
+        minimal_config = (
+            current.config
+            if isinstance(self.args, _MultiShapeAutotuneArgs)
+            else current.config.minimize(self.config_spec)
+        )
         current = PopulationMember(
             fn=current.fn,
             perfs=current.perfs,
@@ -1723,7 +1799,7 @@ class PopulationBasedSearch(BaseSearch):
         if best_member is not best:
             self.log(
                 f"Final-pick re-picked {best_member.config} "
-                f"({best_member.perf:.4f}ms) over {best.config}"
+                f"({self.format_performance(best_member.perf)}) over {best.config}"
             )
         self.best_perf_so_far = min(self.best_perf_so_far, best_member.perf)
         return best_member
@@ -1754,7 +1830,15 @@ class PopulationBasedSearch(BaseSearch):
         # real searches always have them.
         settings = getattr(self, "settings", None)
         config_spec = getattr(self, "config_spec", None)
-        if settings is None or config_spec is None or not settings.static_shapes:
+        if (
+            isinstance(
+                getattr(self, "benchmark_provider", None),
+                MultiShapeBenchmarkProvider,
+            )
+            or settings is None
+            or config_spec is None
+            or not settings.static_shapes
+        ):
             return None
         return config_spec.backend.get_paired_device_micros_bench()
 

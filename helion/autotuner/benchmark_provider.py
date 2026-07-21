@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import copy
+import dataclasses
 import datetime
 import functools
 from itertools import count
@@ -70,6 +71,153 @@ if TYPE_CHECKING:
     from .base_search import _AutotunableKernel
     from .logger import AutotuningLogger
     from .metrics import AutotuneMetrics
+
+
+MultiShapeAggregation = Literal["geomean", "max"]
+MultiShapeReference = Literal["default", "baseline"] | None
+
+
+@dataclasses.dataclass
+class _MultiShapeAutotuneArgs:
+    """Private carrier that keeps existing autotuners anchored to one args tuple."""
+
+    cases: tuple[tuple[BoundKernel, tuple[object, ...]], ...]
+    aggregation: MultiShapeAggregation
+    relative_to: MultiShapeReference
+    cache_tag: str | None
+    workload_key: tuple[object, ...]
+    reference_latencies: tuple[float, ...] | None = None
+    measurements: dict[str, tuple[tuple[float, ...], float, tuple[str, ...]]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    defer_selected_log: bool = False
+    search_started: bool = False
+    found_valid_config: bool = False
+
+    def __len__(self) -> int:
+        return len(self.cases[0][1])
+
+    def __getitem__(self, index: int | slice) -> object:
+        return self.cases[0][1][index]
+
+
+def _aggregate_values(
+    values: Sequence[float], aggregation: MultiShapeAggregation
+) -> float:
+    if not values or any(not math.isfinite(value) or value <= 0 for value in values):
+        return inf
+    if aggregation == "max":
+        return max(values)
+    return math.exp(math.fsum(math.log(value) for value in values) / len(values))
+
+
+def _aggregate_multi_shape_timings(
+    timings: Sequence[float],
+    *,
+    aggregation: MultiShapeAggregation,
+    references: Sequence[float] | None,
+) -> float:
+    """Reduce per-shape timings to the scalar objective used by searches."""
+    raw = _aggregate_values(timings, aggregation)
+    if references is None or not math.isfinite(raw):
+        return raw
+    if len(timings) != len(references) or not math.isfinite(
+        _aggregate_values(references, aggregation)
+    ):
+        return inf
+    ratios = [
+        timing / reference
+        for timing, reference in zip(timings, references, strict=True)
+    ]
+    return _aggregate_values(ratios, aggregation)
+
+
+def _format_multi_shape_measurement(
+    args: _MultiShapeAutotuneArgs,
+    config: Config,
+    timings: Sequence[float],
+    aggregate: float,
+    *,
+    selected: bool,
+    statuses: Sequence[str] | None = None,
+) -> str:
+    """Format one joint result with enough detail to explain its objective."""
+    references = args.reference_latencies
+    rows = []
+    for index, ((_, case_args), timing) in enumerate(
+        zip(args.cases, timings, strict=True)
+    ):
+        leaves, _ = tree_flatten(case_args)
+        tensor_shapes = [
+            tuple(value.shape) for value in leaves if torch.is_tensor(value)
+        ]
+        shape_text = f" tensor_shapes={tensor_shapes}" if tensor_shapes else ""
+        status = statuses[index] if statuses is not None else "ok"
+        if status != "ok" or not math.isfinite(timing) or timing <= 0:
+            row = f"arg_sets[{index}]{shape_text}: status={status}"
+            if math.isfinite(timing):
+                row += f", latency={timing:.6f} ms"
+        else:
+            row = f"arg_sets[{index}]{shape_text}: latency={timing:.6f} ms"
+        if (
+            references is not None
+            and status == "ok"
+            and math.isfinite(timing)
+            and timing > 0
+        ):
+            reference = references[index]
+            row += (
+                f", {args.relative_to} reference={reference:.6f} ms"
+                f", ratio={timing / reference:.6f}x"
+            )
+        rows.append(row)
+
+    if not math.isfinite(aggregate):
+        objective = "rejected"
+    elif references is None:
+        objective = f"{args.aggregation}(latencies)={aggregate:.6f} ms"
+    else:
+        objective = (
+            f"{args.aggregation}(latency ratios vs {args.relative_to})={aggregate:.6f}x"
+        )
+    if selected:
+        details = "\n  ".join([*rows, f"objective: {objective}"])
+        return f"Selected multi-shape config {config}:\n  {details}"
+    return f"Multi-shape candidate {config}: {'; '.join([*rows, f'objective: {objective}'])}"
+
+
+def _format_selected_multi_shape_measurement(
+    args: _MultiShapeAutotuneArgs, config: Config
+) -> str | None:
+    measurement = args.measurements.get(repr(config))
+    if measurement is None:
+        return None
+    timings, aggregate, statuses = measurement
+    return _format_multi_shape_measurement(
+        args,
+        config,
+        timings,
+        aggregate,
+        selected=True,
+        statuses=statuses,
+    )
+
+
+def _materialize_multi_shape_config(config_spec: ConfigSpec, config: Config) -> Config:
+    """Normalize a detached config against the anchor shape."""
+    result = copy.deepcopy(config)
+    config_spec.normalize(result)
+    return result
+
+
+def _has_valid_multi_shape_measurement(
+    args: _MultiShapeAutotuneArgs,
+    config_spec: ConfigSpec,
+    config: Config,
+) -> bool:
+    materialized = _materialize_multi_shape_config(config_spec, config)
+    measurement = args.measurements.get(repr(materialized))
+    return measurement is not None and math.isfinite(measurement[1])
 
 
 def _clone_args(
@@ -317,12 +465,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         log: AutotuningLogger,
         autotune_metrics: AutotuneMetrics,
     ) -> None:
+        if isinstance(args, _MultiShapeAutotuneArgs):
+            raise TypeError(
+                "LocalBenchmarkProvider cannot benchmark multi-shape args directly"
+            )
         self.kernel = kernel
         self.settings = settings
         self.config_spec = config_spec
         self.args = args
         self.log = log
         self._autotune_metrics = autotune_metrics
+        self._accuracy_failure_config_ids: list[int] = []
+        self._compile_failure_config_ids: list[int] = []
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_baseline_path: str | None = None
@@ -345,6 +499,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
+
+    def _record_accuracy_failure(self, config: Config) -> None:
+        self._autotune_metrics.num_accuracy_failures += 1
+        self._accuracy_failure_config_ids.append(id(config))
+
+    def _record_compile_failure(self, config: Config) -> None:
+        self._autotune_metrics.num_compile_failures += 1
+        self._compile_failure_config_ids.append(id(config))
 
     def _compute_baseline(
         self,
@@ -952,7 +1114,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 or self._validate_against_baseline(config, output, working_args)
             )
             if not pass_accuracy_check:
-                self._autotune_metrics.num_accuracy_failures += 1
+                self._record_accuracy_failure(config)
             if not all(
                 all_gather_object(
                     pass_accuracy_check,
@@ -1060,7 +1222,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
 
-            self._autotune_metrics.num_compile_failures += 1
+            self._record_compile_failure(config)
             return inf
         finally:
             self._clear_jit_fast_path_caches(fn)
@@ -1080,7 +1242,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
-            self._autotune_metrics.num_compile_failures += 1
+            self._record_compile_failure(config)
             return inf
         except Exception as e:
             e.__traceback__ = None
@@ -1094,12 +1256,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
                 )
                 self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-                self._autotune_metrics.num_compile_failures += 1
+                self._record_compile_failure(config)
                 return inf
             self.log.debug(
                 f"Benchmark subprocess raised for {config!r}: {type(e).__name__}: {e}"
             )
-            self._autotune_metrics.num_compile_failures += 1
+            self._record_compile_failure(config)
             return inf
 
         if self.settings.autotune_accuracy_check:
@@ -1109,7 +1271,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
                 )
-                self._autotune_metrics.num_compile_failures += 1
+                self._record_compile_failure(config)
                 return inf
             except Exception as e:
                 e.__traceback__ = None
@@ -1125,13 +1287,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
                     )
                     self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-                    self._autotune_metrics.num_compile_failures += 1
+                    self._record_compile_failure(config)
                     return inf
                 self.log.debug(
                     f"Accuracy check subprocess raised for {config!r}: "
                     f"{type(e).__name__}: {e}"
                 )
-                self._autotune_metrics.num_compile_failures += 1
+                self._record_compile_failure(config)
                 return inf
 
             if accuracy_result is not None:
@@ -1142,7 +1304,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                             f"{accuracy_result.message}\n"
                             "Use HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
                         )
-                    self._autotune_metrics.num_accuracy_failures += 1
+                    self._record_accuracy_failure(config)
                     return inf
                 return float(latency)
 
@@ -1153,7 +1315,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     output = fn(*self.args)
                     synchronize_device()
                 if not self._validate_against_baseline(config, output, self.args):
-                    self._autotune_metrics.num_accuracy_failures += 1
+                    self._record_accuracy_failure(config)
                     return inf
             except Exception as e:
                 e.__traceback__ = None
@@ -1171,7 +1333,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.log.debug(
                     f"Accuracy check raised for {config!r}: {type(e).__name__}: {e}"
                 )
-                self._autotune_metrics.num_compile_failures += 1
+                self._record_compile_failure(config)
                 return inf
             finally:
                 # Same as the in-process path: drop JIT fast-path caches so
@@ -1278,3 +1440,412 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     timing = None
             timings.append(None if timing is None else float(timing))
         return timings
+
+
+class MultiShapeBenchmarkProvider(BenchmarkProvider):
+    """Compose ordinary local providers and expose one scalar per config."""
+
+    mutated_arg_indices: Sequence[int] = ()
+
+    def __init__(
+        self,
+        kernel: _AutotunableKernel,
+        settings: Settings,
+        config_spec: ConfigSpec,
+        args: Sequence[object],
+        log: AutotuningLogger,
+        autotune_metrics: AutotuneMetrics,
+    ) -> None:
+        if not isinstance(args, _MultiShapeAutotuneArgs):
+            raise TypeError("MultiShapeBenchmarkProvider requires multi-shape args")
+        from .metrics import AutotuneMetrics
+
+        self.kernel = kernel
+        self.settings = settings
+        self.config_spec = config_spec
+        self.args = args
+        self.log = log
+        self._autotune_metrics = autotune_metrics
+        self.args.search_started = True
+        self.children: list[LocalBenchmarkProvider] = []
+        child_log = copy.copy(log)
+        child_log._log_sink = None
+        case_index = 0
+        try:
+            for index, (case_kernel, case_args) in enumerate(args.cases):
+                case_index = index
+                child = LocalBenchmarkProvider(
+                    kernel=case_kernel,
+                    settings=case_kernel.settings,
+                    config_spec=case_kernel.config_spec,
+                    args=case_args,
+                    # Child rows are implementation details, so only their text logs
+                    # are forwarded to the aggregate logger.
+                    log=child_log,
+                    autotune_metrics=AutotuneMetrics(),
+                )
+                child.set_budget_exceeded_fn(_never_exceeded)
+                self.children.append(child)
+        except Exception as error:
+            for child in reversed(self.children):
+                child.cleanup()
+            if f"arg_sets[{case_index}]" in str(error):
+                raise
+            raise exc.AutotuneError(
+                "Failed to prepare multi-shape autotune "
+                f"arg_sets[{case_index}]: {error}"
+            ) from error
+
+    def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
+        self.budget_exceeded_fn = fn
+        for child in self.children:
+            child.set_budget_exceeded_fn(_never_exceeded)
+
+    def setup(self) -> None:
+        case_index = 0
+        try:
+            for index, child in enumerate(self.children):
+                case_index = index
+                child.setup()
+            if (
+                self.args.relative_to is not None
+                and self.args.reference_latencies is None
+            ):
+                reference_values = []
+                for case_index, child in enumerate(self.children):
+                    reference_values.append(self._measure_reference(child, case_index))
+                references = tuple(reference_values)
+                if _aggregate_values(references, self.args.aggregation) == inf:
+                    raise exc.AutotuneError(
+                        "Multi-shape reference timings must be finite and positive"
+                    )
+                self.args.reference_latencies = references
+        except Exception as error:
+            for child in reversed(self.children):
+                child.cleanup()
+            if f"arg_sets[{case_index}]" in str(error):
+                raise
+            raise exc.AutotuneError(
+                f"Failed to set up multi-shape autotune arg_sets[{case_index}]: {error}"
+            ) from error
+
+    def cleanup(self) -> None:
+        for child in reversed(self.children):
+            child.cleanup()
+        self.budget_exceeded_fn = _never_exceeded
+
+    def _measure_reference(
+        self, child: LocalBenchmarkProvider, case_index: int
+    ) -> float:
+        if self.args.relative_to == "default":
+            result = child.benchmark(
+                [child.config_spec.default_config()],
+                desc="Benchmarking default reference",
+            )[0]
+            if (
+                result.status != "ok"
+                or not math.isfinite(result.perf)
+                or result.perf <= 0
+            ):
+                raise exc.AutotuneError(
+                    "Default config reference benchmark failed for "
+                    f"arg_sets[{case_index}]"
+                )
+            return result.perf
+        baseline_fn = child.settings.autotune_baseline_fn
+        if baseline_fn is None:
+            raise exc.AutotuneError(
+                "relative_to='baseline' requires autotune_baseline_fn for "
+                f"arg_sets[{case_index}]"
+            )
+        if child.mutated_arg_indices:
+            reference_args = _clone_args(
+                child.args,
+                child.kernel.env.process_group_name,
+                idx_to_clone=child.mutated_arg_indices,
+            )
+        else:
+            reference_args = child.args
+        backend = getattr(child.config_spec, "backend", None)
+        benchmark_runner = (
+            backend.get_do_bench() if backend is not None else None
+        ) or do_bench
+        try:
+            timing = benchmark_runner(
+                functools.partial(baseline_fn, *reference_args),
+                return_mode="median",
+                warmup=1,
+                rep=50,
+                process_group_name=child.kernel.env.process_group_name,
+            )
+        except Exception as error:
+            raise exc.AutotuneError(
+                f"Baseline reference benchmark failed for arg_sets[{case_index}]"
+            ) from error
+        if isinstance(timing, tuple):
+            timing = timing[0]
+        timing = float(timing)
+        if not math.isfinite(timing) or timing <= 0:
+            raise exc.AutotuneError(
+                "Baseline reference benchmark returned invalid timing "
+                f"{timing!r} for arg_sets[{case_index}]"
+            )
+        return timing
+
+    def benchmark(
+        self,
+        configs: list[Config],
+        *,
+        desc: str = "Benchmarking",
+    ) -> list[BenchmarkResult]:
+        return self._benchmark(configs, desc=desc, record_results=True)
+
+    def _benchmark(
+        self,
+        configs: list[Config],
+        *,
+        desc: str,
+        record_results: bool,
+        check_budget: bool = True,
+    ) -> list[BenchmarkResult]:
+        if not configs:
+            return []
+        if check_budget and self.budget_exceeded_fn():
+            return [
+                BenchmarkResult(config, _unset_fn, inf, "error", None)
+                for config in configs
+            ]
+
+        materialized: list[Config] = []
+        valid_indices: list[int] = []
+        results = [
+            BenchmarkResult(config, _unset_fn, inf, "error", None) for config in configs
+        ]
+        for config_index, config in enumerate(configs):
+            try:
+                materialized.append(
+                    _materialize_multi_shape_config(self.config_spec, config)
+                )
+            except exc.InvalidConfig as error:
+                self.log.debug(
+                    f"Skipping config that is invalid for the anchor shape: {error}"
+                )
+                if record_results:
+                    self._record_aggregate_result(config, results[config_index])
+            else:
+                valid_indices.append(config_index)
+        if not materialized:
+            return results
+        materialized_keys = [repr(config) for config in materialized]
+        executed_configs = [copy.deepcopy(config) for config in materialized]
+
+        child_failure_snapshots = [
+            (
+                len(child._accuracy_failure_config_ids),
+                len(child._compile_failure_config_ids),
+            )
+            for child in self.children
+        ]
+        child_results = [
+            self._benchmark_child(
+                child,
+                materialized,
+                desc=f"{desc} shape {index + 1}",
+                case_index=index,
+            )
+            for index, child in enumerate(self.children)
+        ]
+        if record_results:
+            accuracy_failure_ids: set[int] = set()
+            compile_failure_ids: set[int] = set()
+            for child, (before_accuracy, before_compile) in zip(
+                self.children, child_failure_snapshots, strict=True
+            ):
+                accuracy_failure_ids.update(
+                    child._accuracy_failure_config_ids[before_accuracy:]
+                )
+                compile_failure_ids.update(
+                    child._compile_failure_config_ids[before_compile:]
+                )
+            self._autotune_metrics.num_accuracy_failures += len(accuracy_failure_ids)
+            self._autotune_metrics.num_compile_failures += len(compile_failure_ids)
+        for child_config_index, config_index in enumerate(valid_indices):
+            original = configs[config_index]
+            row = [child[child_config_index] for child in child_results]
+            timings = [result.perf for result in row]
+            valid = all(
+                result.status == "ok" and math.isfinite(result.perf) and result.perf > 0
+                for result in row
+            )
+            perf = (
+                _aggregate_multi_shape_timings(
+                    timings,
+                    aggregation=self.args.aggregation,
+                    references=self.args.reference_latencies,
+                )
+                if valid
+                else inf
+            )
+            if valid:
+                timing_tuple = tuple(timings)
+                statuses = tuple(result.status for result in row)
+                self.args.measurements[materialized_keys[child_config_index]] = (
+                    timing_tuple,
+                    perf,
+                    statuses,
+                )
+                self.log.debug(
+                    lambda config=original, values=timing_tuple, objective=perf: (
+                        _format_multi_shape_measurement(
+                            self.args,
+                            config,
+                            values,
+                            objective,
+                            selected=False,
+                        )
+                    )
+                )
+            else:
+                statuses = tuple(result.status for result in row)
+                timing_tuple = tuple(timings)
+                measurement_key = materialized_keys[child_config_index]
+                self.args.measurements[measurement_key] = (
+                    timing_tuple,
+                    inf,
+                    statuses,
+                )
+                self.log.debug(
+                    lambda config=original, values=timing_tuple, states=statuses: (
+                        _format_multi_shape_measurement(
+                            self.args,
+                            config,
+                            values,
+                            inf,
+                            selected=False,
+                            statuses=states,
+                        )
+                    )
+                )
+            timed_out = any(result.status == "timeout" for result in row)
+            if timed_out:
+                status: Literal["ok", "error", "timeout"] = "timeout"
+            else:
+                status = "ok" if math.isfinite(perf) else "error"
+            compile_times = [
+                result.compile_time for result in row if result.compile_time is not None
+            ]
+            compile_time = max(compile_times, default=None)
+            anchor_fn = row[0].fn
+            result = BenchmarkResult(
+                config=original,
+                fn=anchor_fn,
+                perf=perf,
+                status=status,
+                compile_time=compile_time,
+            )
+            results[config_index] = result
+            if math.isfinite(perf):
+                self.args.found_valid_config = True
+            if record_results:
+                self._record_aggregate_result(
+                    executed_configs[child_config_index],
+                    result,
+                    timings=timings,
+                )
+        return results
+
+    def _benchmark_child(
+        self,
+        child: LocalBenchmarkProvider,
+        configs: list[Config],
+        *,
+        desc: str,
+        case_index: int,
+    ) -> list[BenchmarkResult]:
+        try:
+            return child.benchmark(configs, desc=desc)
+        except Exception as error:
+            if not self._is_skippable_child_failure(child, error):
+                raise
+            self.log.debug(
+                "Skipping all configs for "
+                f"arg_sets[{case_index}] after {type(error).__name__}: {error}"
+            )
+            return [
+                BenchmarkResult(config, _unset_fn, inf, "error", None)
+                for config in configs
+            ]
+
+    @staticmethod
+    def _is_skippable_child_failure(
+        child: LocalBenchmarkProvider, error: Exception
+    ) -> bool:
+        if match_unrecoverable_runtime_error(error):
+            return False
+        if isinstance(error, exc.InvalidConfig):
+            return True
+        backend = getattr(child.config_spec, "backend", None)
+        action = (
+            backend.classify_autotune_exception(error) if backend is not None else None
+        ) or classify_triton_exception(error)
+        return child.settings.autotune_ignore_errors or action == "debug"
+
+    def _record_aggregate_result(
+        self,
+        config: Config,
+        result: BenchmarkResult,
+        *,
+        timings: Sequence[float] | None = None,
+    ) -> None:
+        self._autotune_metrics.num_configs_tested += 1
+        config_id = self.log.register_config(config)
+        if config_id is None:
+            return
+        self.log.record_autotune_entry(
+            AutotuneLogEntry(
+                generation=self._autotune_metrics.num_generations,
+                status=result.status,
+                perf_ms=(
+                    _aggregate_values(timings, self.args.aggregation)
+                    if timings is not None and math.isfinite(result.perf)
+                    else None
+                ),
+                compile_time=result.compile_time,
+                config_id=config_id,
+                config=config,
+            )
+        )
+
+    def raw_latency(self, config: Config) -> float:
+        materialized = _materialize_multi_shape_config(self.config_spec, config)
+        measurement = self.args.measurements.get(repr(materialized))
+        if measurement is None:
+            return inf
+        timings, _, _ = measurement
+        return _aggregate_values(timings, self.args.aggregation)
+
+    def has_valid_measurement(self, config: Config) -> bool:
+        return _has_valid_multi_shape_measurement(self.args, self.config_spec, config)
+
+    def log_selected(self, config: Config) -> None:
+        materialized = _materialize_multi_shape_config(self.config_spec, config)
+        summary = _format_selected_multi_shape_measurement(self.args, materialized)
+        if summary is not None:
+            self.log(summary)
+
+    def rebenchmark(
+        self,
+        configs: list[Config],
+        previous_timings: list[float],
+        *,
+        desc: str,
+    ) -> list[float]:
+        if self.budget_exceeded_fn():
+            return list(previous_timings)
+        results = self._benchmark(
+            configs,
+            desc=desc,
+            record_results=False,
+            check_budget=False,
+        )
+        return [result.perf for result in results]
