@@ -2598,6 +2598,17 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if value is None:
             return None
         normalized = super()._normalize(name, value)
+        # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
+        # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
+        # block size <= 1.  The autotuner search never proposes < 8 (its fragment
+        # ``low`` is 8), but the reduction seed's byte budget can collapse the chunk
+        # to 1 on a reduction co-resident with a wide feature.  Floor a stray 1 up to
+        # that same search floor of 8; for a small extent the ``>= size_hint`` rule
+        # below then collapses it to persistent ``None``, and 1 is the only
+        # power-of-two chunk that can hit this (so legal chunks 2, 4, 8, ... are
+        # left byte-identical).
+        if isinstance(normalized, int) and normalized < 2:
+            normalized = 8
         # A looped reduction whose chunk equals or exceeds the reduction
         # extent has only one iteration — it is semantically identical to a
         # persistent reduction, but the looped codegen path occasionally

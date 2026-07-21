@@ -209,7 +209,13 @@ def _materialize_config(
         and allowed_pid_types
         and supported["pid_type"] not in allowed_pid_types
     ):
-        supported.pop("pid_type")
+        # Replace an illegal pid_type with the highest-preference legal one rather
+        # than popping it: a plain pop lets ``normalize`` refill the field with
+        # ``VALID_PID_TYPES[0]`` (== 'flat'), which re-introduces the disallowed value
+        # (e.g. under ``hl.barrier()`` / a data-dependent grid bound / force-persistent,
+        # where 'flat' is disallowed). ``allowed_pid_types`` is guaranteed non-empty and
+        # order-preserving, so ``[0]`` is a valid persistent choice when 'flat' is stripped.
+        supported["pid_type"] = allowed_pid_types[0]
     config_spec.normalize(supported, _fix_invalid=True)
     config = Config(**cast("dict[str, Any]", supported))
     config_spec._shrink_for_numel_constraints(config)
@@ -543,6 +549,14 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     backend = "triton"
     # Widen the declared type so the sm100 subclass can retarget it (the base is sm90-only).
     HARDWARE_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", "sm90"),)
+    # Promote the reduction seed to the compiler default (autotune off) for every tuned track
+    # that derives from this base -- sm90/H100 AND sm100/B200. The narrow fallback
+    # (TritonNarrowReductionHeuristic) does NOT derive from this base, so it stays unpromoted.
+    # This is safe because the seed only emits valid configs: it materializes through
+    # ``_materialize_config`` (an illegal ``pid_type`` is repaired to a legal persistent type),
+    # ``ReductionLoopSpec._normalize`` floors a degenerate looped chunk of 1, and the reduction
+    # roller refuses to roll a scan-containing reduction (which would drop the scan's chunk carry).
+    promote_seed_to_default = True
 
     # ----- THE BUDGET (a register/byte capacity; everything else is a per-axis desire) -----
     # Per-program persistent byte ceiling: the group's resident working set — the sum over its live
@@ -1250,7 +1264,11 @@ class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
             evict = cls._eviction_policies(env, "reread", pd.reread_eviction_index)
         if evict is not None:
             seed["load_eviction_policies"] = evict
-        return Config(**seed)
+        # Materialize through the shared guard so an emitted config value that is
+        # illegal for this kernel is repaired rather than shipped raw: a hardcoded
+        # ``pid_type='flat'`` is replaced with a legal persistent type when 'flat' is
+        # disallowed (barrier / data-dependent grid bound), matching the matmul seed path.
+        return _materialize_config(seed, config_spec=spec)
 
 
 class TritonUserTiledReductionHeuristicSM90(_TritonReductionSeedBase):
@@ -1312,7 +1330,10 @@ class TritonUserTiledReductionHeuristicSM90(_TritonReductionSeedBase):
             ev = cls._eviction_policies(env, "reread", pd.reread_eviction_index)
             if ev is not None:
                 seed["load_eviction_policies"] = ev
-        return Config(**seed)
+        # See the standard branch: materialize through the shared guard so an illegal
+        # ``pid_type='flat'`` (disallowed under a barrier / data-dependent bound) is
+        # repaired to a legal persistent type instead of shipping the raw seed.
+        return _materialize_config(seed, config_spec=spec)
 
 
 def _config_with_num_warps(cfg: Config, num_warps: int) -> Config:
@@ -1332,9 +1353,8 @@ class _TritonReductionSeedSM100(_TritonReductionSeedBase):
     ``cls.HARDWARE_TARGETS`` (sm100 here) — so hardware selection lives in ``is_eligible``, not in
     this ``get_seed_config``. Not registered; the two concrete subclasses below are.
 
-    ``promote_seed_to_default`` is left at the base default (``False``) here: the sm100 reduction
-    seed is still contributed as an autotuner seed, but is NOT promoted to the compiler default until
-    a later change flips it on (together with the config-validity fixes that make promotion safe)."""
+    ``promote_seed_to_default`` is inherited from :class:`_TritonReductionSeedBase` (``True`` for
+    every tuned track, sm90 and sm100 alike)."""
 
     HARDWARE_TARGETS = (("cuda", "sm100"),)
     # --- B200 constant overrides (re-tuned during the climb; unset = direct port of H100) ---
