@@ -13457,9 +13457,7 @@ class TestCuteLowerings(unittest.TestCase):
                 "per_cta_smem_budget_bytes",
                 return_value=200 * 1024,
             ) as smem_budget,
-            patch.dict(
-                "os.environ", {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False
-            ),
+            patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False),
         ):
             self.assertEqual(
                 _choose_mma_impl(
@@ -14609,7 +14607,7 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         """
         from helion._compiler.cute import cute_mma as cute_mma_module
         from helion._compiler.cute.aux_tensor import (
-            _store_value_pairs as _aux_store_value_pairs,
+            _store_value_pairs_from_graph as _aux_store_value_pairs_from_graph,
         )
         from helion._compiler.cute.device_state import (
             CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
@@ -14626,7 +14624,7 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         # Snapshot the live codegen graphs' store value-nodes at the
         # time the walker actually runs. The walker is the only
         # caller that consults ``cg.codegen_graphs`` for stores, so
-        # invoking ``_store_value_pairs`` on every walker call gives
+        # invoking the per-graph store enumerator on every walker call gives
         # the test the same enumeration the walker saw — without
         # depending on internal codegen state surviving past
         # ``to_triton_code``.
@@ -14635,7 +14633,11 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         original_discover = aux_tensor_module.discover_tcgen05_aux_tensor_descriptors
 
         def sniffing_discover(cg, matmul_fx_node):  # type: ignore[no-untyped-def]
-            store_value_nodes.update(value for _, value in _aux_store_value_pairs(cg))
+            store_value_nodes.update(
+                value
+                for graph_info in cg.codegen_graphs
+                for _, value in _aux_store_value_pairs_from_graph(graph_info.graph)
+            )
             return original_discover(cg, matmul_fx_node)
 
         with patch_cute_mma_support():

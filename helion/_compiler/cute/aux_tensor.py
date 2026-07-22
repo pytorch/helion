@@ -32,8 +32,8 @@ import torch
 from ...language import matmul_ops
 from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
-from .cute_epilogue import _AuxiliaryTensorStep
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
+from .cute_epilogue import _AuxiliaryTensorStep
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors

@@ -54,11 +54,11 @@ from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
+from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
-from .indexing_strategy import subscript_tile_info
 from .loop_dependency_checker import LoopDependencyChecker
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement

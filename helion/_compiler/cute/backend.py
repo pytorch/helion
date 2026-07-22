@@ -2191,9 +2191,7 @@ class CuteBackend(Backend):
                     m_block_size = nd_block_size[m_axis]
                     n_block_size = nd_block_size[n_axis]
                     root_m_threads = (
-                        _tcgen05_root_m_threads(
-                            int(m_block_size), int(n_block_size)
-                        )
+                        _tcgen05_root_m_threads(int(m_block_size), int(n_block_size))
                         if num_threads_config[m_axis] == 0
                         and isinstance(m_block_size, int)
                         and isinstance(n_block_size, int)

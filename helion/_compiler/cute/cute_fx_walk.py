@@ -333,12 +333,9 @@ def aux_tensor_load_kind(
                 and aux_shape[0] == carrier_tile_shape[0]
             ):
                 return None
-            if (
-                carrier_global_shape is not None
-                and (
-                    len(carrier_global_shape) != 3
-                    or aux_tensor_shape[0] != carrier_global_shape[0]
-                )
+            if carrier_global_shape is not None and (
+                len(carrier_global_shape) != 3
+                or aux_tensor_shape[0] != carrier_global_shape[0]
             ):
                 return None
             aux_shape = aux_shape[1:]

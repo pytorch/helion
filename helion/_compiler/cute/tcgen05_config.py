@@ -848,12 +848,13 @@ class CuteTcgen05Config:
         # + runtime own this tile via ``_tcgen05_use_2cta_instrs``
         # (``bm == 128 and is_fp8``). Edge+K-tail candidates keep the bm=256
         # double-edge family unconditionally.
+        sampled_bm = block_sizes[m_index]
         if (
             constraints.allow_fp8_small_grid
             and not edge_k_tail_family
-            and isinstance(block_sizes[m_index], int)
-            and not isinstance(block_sizes[m_index], bool)
-            and block_sizes[m_index] <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+            and isinstance(sampled_bm, int)
+            and not isinstance(sampled_bm, bool)
+            and sampled_bm <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
         ):
             block_sizes[m_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
             block_sizes[n_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
@@ -1964,9 +1965,7 @@ class CuteTcgen05Config:
             # ``_validate_direct_entry_ab_stage_envelope``;
             # SEARCH stays capped at 3 (budget-aware) since the generalized seed
             # runs at ab=3 and deeper pipelines are not worth searching.
-            ab_stages_max = (
-                6 if self.deep_direct_entry_validation_enabled else 3
-            )
+            ab_stages_max = 6 if self.deep_direct_entry_validation_enabled else 3
             # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
             # cap; admit a frozen deep-staged fp8 config on the validation
             # surface too (``_validate_direct_entry_ab_stage_envelope`` clamps it to
@@ -2361,7 +2360,9 @@ class CuteTcgen05Config:
                     else:
                         config[key] = optional_search_fragments[key].default()
             self._clamp_l2_swizzle_size_to_shape(config)
-            self._validate_direct_entry_ab_stage_envelope(config, fix_invalid=fix_invalid)
+            self._validate_direct_entry_ab_stage_envelope(
+                config, fix_invalid=fix_invalid
+            )
         else:
             for key in optional_fragments:
                 if key not in config:

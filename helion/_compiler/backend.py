@@ -987,9 +987,9 @@ def _specialized_mma_root_mn_block_ids(
     if tuple(device_ir.grid_block_ids[0]) != operands.output_block_ids:
         return None
     if (leading_id := operands.leading_passthrough_block_id) is not None:
-        block_size = CompileEnvironment.current().block_sizes[
-            leading_id
-        ].from_config(config)
+        block_size = (
+            CompileEnvironment.current().block_sizes[leading_id].from_config(config)
+        )
         if not isinstance(block_size, int) or block_size != 1:
             return None
     return operands.m_block_id, operands.n_block_id
@@ -2687,9 +2687,7 @@ def _kernel_specialized_mma_plan(
                 or candidate.operands.k_block_id != block_ids[0]
             ):
                 continue
-            root_mn_block_ids = _specialized_mma_root_mn_block_ids(
-                candidate, config
-            )
+            root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidate, config)
             if root_mn_block_ids is None:
                 continue
             bm = env.block_sizes[root_mn_block_ids[0]].from_config(config)

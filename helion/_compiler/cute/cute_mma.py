@@ -492,12 +492,12 @@ class _MmaOperandInfo:
     block_ids: tuple[int, ...]
 
     @property
-    def matrix_rows(self) -> object:
-        return self.source_fake.shape[-2]
+    def matrix_rows(self) -> int | torch.SymInt:
+        return self.source_fake.size(-2)
 
     @property
-    def matrix_cols(self) -> object:
-        return self.source_fake.shape[-1]
+    def matrix_cols(self) -> int | torch.SymInt:
+        return self.source_fake.size(-1)
 
     @property
     def matrix_row_block_id(self) -> int:
@@ -591,11 +591,12 @@ def _analyze_mma_operand(
     block_ids = exact_tile_block_ids(env, subscript)
     if block_ids is None:
         return None
-    if any(
-        not env.known_equal(env.block_sizes[block_id].size, extent)
-        for block_id, extent in zip(block_ids, source_fake.shape, strict=True)
-    ):
-        return None
+    for dim, block_id in enumerate(block_ids):
+        block_size = env.block_sizes[block_id].size
+        if not isinstance(block_size, int | torch.SymInt) or not env.known_equal(
+            block_size, source_fake.size(dim)
+        ):
+            return None
     if source_fake.ndim not in (2, 3):
         return None
     if value_fake.ndim not in (2, source_fake.ndim):
@@ -667,10 +668,7 @@ class _CuteMmaNode(_CuteMmaTarget):
     @property
     def requires_scalar_fallback(self) -> bool:
         """Whether the incoming accumulator cannot seed a collective fragment."""
-        return (
-            self.requires_accumulator_seed
-            and self.operands.has_leading_passthrough
-        )
+        return self.requires_accumulator_seed and self.operands.has_leading_passthrough
 
 
 def _decode_cute_mma_target(
@@ -711,8 +709,7 @@ def _decode_cute_mma_target(
         from ...language._decorators import is_api_func
 
         if not (
-            is_api_func(node.target)
-            and getattr(node.target, "__name__", "") == "dot"
+            is_api_func(node.target) and getattr(node.target, "__name__", "") == "dot"
         ):
             return None
         if len(node.args) < 2:
@@ -810,8 +807,7 @@ def analyze_cute_mma_node(
         operands=operands,
         explicit_epi_tile_compatible=(
             _tcgen05_tma_matrix_major(operands.lhs.source_fake) == "row"
-            and _tcgen05_tma_matrix_major(operands.rhs.source_fake)
-            in ("row", "col")
+            and _tcgen05_tma_matrix_major(operands.rhs.source_fake) in ("row", "col")
             and (
                 output_store_analysis.explicit_epi_tile_compatible
                 if output_store_analysis is not None
@@ -1071,12 +1067,12 @@ def _get_mma_k_loop_info(
     lhs_fake: torch.Tensor,
     rhs_fake: torch.Tensor,
     fx_node: Node | None = None,
-    lhs_k_size: object | None = None,
-    rhs_k_size: object | None = None,
+    lhs_k_size: int | torch.SymInt | None = None,
+    rhs_k_size: int | torch.SymInt | None = None,
 ) -> tuple[DeviceLoopState, int, str, int] | None:
     """Return the active reduction loop for the operands' shared K dimension."""
-    lhs_k_size = lhs_fake.shape[1] if lhs_k_size is None else lhs_k_size
-    rhs_k_size = rhs_fake.shape[0] if rhs_k_size is None else rhs_k_size
+    lhs_k_size = lhs_fake.size(-1) if lhs_k_size is None else lhs_k_size
+    rhs_k_size = rhs_fake.size(-2) if rhs_k_size is None else rhs_k_size
     if fx_node is not None:
         from ..device_ir import ForLoopGraphInfo
 
@@ -1135,9 +1131,7 @@ def _get_mma_k_loop_info(
             size = env.block_sizes[block_id].size
             if not isinstance(size, int | torch.SymInt):
                 continue
-            if env.known_equal(size, lhs_k_size) and env.known_equal(
-                size, rhs_k_size
-            ):
+            if env.known_equal(size, lhs_k_size) and env.known_equal(size, rhs_k_size):
                 candidate_block_ids.add(block_id)
 
     if len(candidate_block_ids) != 1:
@@ -2080,10 +2074,7 @@ def _analyze_mma_output_stores(
             return None
         explicit_epi_tile_compatible &= (
             tensor_fake.dtype == analysis.lhs.source_fake.dtype
-            and all(
-                step.broadcast_axis == 1
-                for step in chain.auxiliary_tensor_steps
-            )
+            and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_steps)
         )
     return _MmaOutputStoreAnalysis(
         explicit_epi_tile_compatible=explicit_epi_tile_compatible
@@ -2106,8 +2097,6 @@ def _emit_mma_pipeline(
     from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
-    lhs_node = candidate.lhs
-    rhs_node = candidate.rhs
     analysis = candidate.operands
     lhs_operand = analysis.lhs
     rhs_operand = analysis.rhs
@@ -2797,6 +2786,7 @@ def _emit_mma_pipeline(
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
+
     def tcgen05_tma_store_full_tiles_only_for(
         partial_output_tma_store: bool,
     ) -> bool:
@@ -4460,9 +4450,7 @@ def _emit_mma_pipeline(
                 )
             else:
                 gmem_a_tma_tiler = f"({bm}, {bk})"
-                gmem_a_tma_coord = (
-                    f"({m_offset_var} // cutlass.Int32({bm}), None)"
-                )
+                gmem_a_tma_coord = f"({m_offset_var} // cutlass.Int32({bm}), None)"
             if rhs_operand.is_leading_passthrough:
                 assert leading_global is not None
                 gmem_b_tma_tiler = f"({bn}, {bk}, 1)"
@@ -4471,9 +4459,7 @@ def _emit_mma_pipeline(
                 )
             else:
                 gmem_b_tma_tiler = f"({bn}, {bk})"
-                gmem_b_tma_coord = (
-                    f"({n_offset_var} // cutlass.Int32({bn}), None)"
-                )
+                gmem_b_tma_coord = f"({n_offset_var} // cutlass.Int32({bn}), None)"
             _emit_per_tile(
                 f"{gmem_a_tma} = cute.local_tile("
                 f"{tma_tensor_a}, {gmem_a_tma_tiler}, {gmem_a_tma_coord})",

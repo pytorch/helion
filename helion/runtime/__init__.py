@@ -3954,8 +3954,7 @@ def _build_cute_schema_and_args(
         any_obj = cast("Any", cute_kernel)
         wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
         non_bakeable_plan = bool(wrapper_plans) and any(
-            not _cute_wrapper_plan_bakes_tensor_shapes(plan)
-            for plan in wrapper_plans
+            not _cute_wrapper_plan_bakes_tensor_shapes(plan) for plan in wrapper_plans
         )
         if (
             getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)

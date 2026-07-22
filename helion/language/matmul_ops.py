@@ -269,9 +269,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                     min_size = min(min_size, bspec.size_hint)
                 except KeyError:
                     pass
-            env.block_sizes[block_idx].update_min_block(
-                min_size, allow_flattened=True
-            )
+            env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
             # Let the autotuner try output block sizes larger than a small matmul
             # dimension: masked rows/cols can map to a more efficient MMA tile.
             if is_output_dim and env.backend_name == "triton":
@@ -386,11 +384,7 @@ def plan_cute_tcgen05_search(
         max_search_m = min(max_search_m, static_m & -static_m)
         max_search_n = min(max_search_n, static_n & -static_n)
         max_search_k = min(max_search_k, static_k & -static_k)
-        if (
-            max_search_m < min_search_m
-            or max_search_n < 8
-            or max_search_k < mma_k
-        ):
+        if max_search_m < min_search_m or max_search_n < 8 or max_search_k < mma_k:
             return None
     if static_m % max_search_m != 0 and static_n % max_search_n != 0:
         max_search_m = min(max_search_m, 128)
@@ -520,9 +514,7 @@ def enable_cute_tcgen05_search(
             min_size = plan.min_search_m
         else:
             min_size = 8
-        env.block_sizes[block_idx].update_min_block(
-            min_size, allow_flattened=True
-        )
+        env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
         env.block_sizes[block_idx].update_max_block(max_size)
 
 

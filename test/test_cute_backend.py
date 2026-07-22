@@ -4,6 +4,7 @@ import ast
 import importlib
 import math
 import os
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -13,7 +14,6 @@ import pytest
 import torch
 
 import helion
-from helion.autotuner.config_spec import ConfigSpec
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -29,6 +29,9 @@ from helion.runtime import _cute_cluster_shape_from_wrapper_plans
 from helion.runtime import _ensure_cute_dsl_arch_env
 from helion.runtime import _get_compiled_cute_launcher
 from helion.runtime import default_cute_launcher
+
+if TYPE_CHECKING:
+    from helion.autotuner.config_spec import ConfigSpec
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -788,9 +791,7 @@ def cute_batched_baddbmm_rowvec_bias_tcgen05(
 
 
 @helion.kernel(backend="cute")
-def cute_transformed_dot_tcgen05(
-    x: torch.Tensor, y: torch.Tensor
-) -> torch.Tensor:
+def cute_transformed_dot_tcgen05(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     _, n = y.size()
     out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
@@ -819,9 +820,9 @@ def cute_batched_dot_residual_tcgen05(
                 y[tile_b, tile_k, tile_n],
                 acc=acc,
             )
-        out[tile_b, tile_m, tile_n] = (
-            acc + residual[tile_b, tile_m, tile_n]
-        ).to(torch.bfloat16)
+        out[tile_b, tile_m, tile_n] = (acc + residual[tile_b, tile_m, tile_n]).to(
+            torch.bfloat16
+        )
     return out
 
 
@@ -951,9 +952,7 @@ def cute_repeated_2d_dot(
 
 
 @helion.kernel(backend="cute")
-def cute_shifted_batched_dot_tcgen05(
-    x: torch.Tensor, y: torch.Tensor
-) -> torch.Tensor:
+def cute_shifted_batched_dot_tcgen05(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     b, m, k = x.size()
     _, _, n = y.size()
     out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
@@ -1016,9 +1015,7 @@ def cute_mixed_rank_batched_dot_tcgen05(
 
 
 @helion.kernel(backend="cute")
-def cute_rhs_batched_dot_tcgen05(
-    w: torch.Tensor, y: torch.Tensor
-) -> torch.Tensor:
+def cute_rhs_batched_dot_tcgen05(w: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = w.size()
     b, _, n = y.size()
     out = torch.empty([b, m, n], dtype=torch.bfloat16, device=w.device)
@@ -4654,9 +4651,7 @@ class TestCuteBackend(TestCase):
             tcgen05_ab_stages=2,
         )
         with (
-            patch.dict(
-                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
-            ),
+            patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
             patch(
                 "helion._compiler.cute.cute_mma.CuteTcgen05Config."
                 "per_cta_smem_budget_bytes",
@@ -4777,9 +4772,9 @@ class TestCuteBackend(TestCase):
             code = bound.to_triton_code(config)
             out = bound.compile_config(config)(*args)
             torch.cuda.synchronize()
-        expected = (
-            torch.bmm(args[0].float(), args[1].float()) + args[2].float()
-        ).to(torch.bfloat16)
+        expected = (torch.bmm(args[0].float(), args[1].float()) + args[2].float()).to(
+            torch.bfloat16
+        )
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm(", code)
         self.assertIn("CtaGroup.TWO", code)
@@ -4803,9 +4798,9 @@ class TestCuteBackend(TestCase):
             code = bound.to_triton_code(config)
             out = bound.compile_config(config)(*args)
             torch.cuda.synchronize()
-        expected = (
-            torch.bmm(args[0].float(), args[1].float()) + args[2].float()
-        ).to(torch.bfloat16)
+        expected = (torch.bmm(args[0].float(), args[1].float()) + args[2].float()).to(
+            torch.bfloat16
+        )
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm(", code)
         self.assertEqual(code.count("@cute.kernel"), 1)
@@ -4824,9 +4819,7 @@ class TestCuteBackend(TestCase):
             torch.randn(4, 64, 256, device=DEVICE, dtype=torch.bfloat16),
         )
         with (
-            patch.dict(
-                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
-            ),
+            patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
             patch(
                 "helion.language.matmul_ops._cuda_num_sms_or_zero",
                 return_value=0,
@@ -4947,9 +4940,7 @@ class TestCuteBackend(TestCase):
             (
                 cute_rhs_batched_dot_tcgen05,
                 (
-                    torch.empty(
-                        64, 256, device=DEVICE, dtype=torch.bfloat16
-                    ).T,
+                    torch.empty(64, 256, device=DEVICE, dtype=torch.bfloat16).T,
                     torch.empty(2, 64, 256, device=DEVICE, dtype=torch.bfloat16),
                 ),
                 {None},
@@ -4969,9 +4960,7 @@ class TestCuteBackend(TestCase):
                         if seed.block_sizes == [1, 256, 256, 64]
                     }
                     self.assertEqual(layouts, expected_layouts)
-                    config_generation = (
-                        bound.config_spec.create_config_generation()
-                    )
+                    config_generation = bound.config_spec.create_config_generation()
                     normalized_layouts = {
                         (
                             seed.config.get("tcgen05_layout_strategy"),
@@ -5315,9 +5304,7 @@ class TestCuteBackend(TestCase):
                     ),
                 ):
                     bound = cute_batched_baddbmm_tcgen05.bind(args)
-                    self.assertFalse(
-                        bound.config_spec.cute_tcgen05_search_enabled
-                    )
+                    self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
                     config = helion.Config(
                         block_sizes=[1, 64, 8, 16],
                         pid_type="flat",
@@ -5326,9 +5313,7 @@ class TestCuteBackend(TestCase):
                     out = bound.compile_config(config)(*args)
                     expected = torch.bmm(args[0].float(), args[1].float())
                     self.assertNotIn("cute.gemm(", code)
-                    torch.testing.assert_close(
-                        out, expected, atol=1e-1, rtol=1e-2
-                    )
+                    torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
 
     def test_batched_tcgen05_cluster_n_rejected_cleanly(self) -> None:
         support = get_cute_mma_support()

@@ -2288,22 +2288,40 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32)
         self.assertIs(seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
 
-        # The same generalized seed is what the search projection uses to map
-        # FFI-requesting cluster_m=2 candidates onto the validated envelope.
-        projected_cluster_m2_config = helion.Config(
+        # An ordinary cluster_m=2 candidate remains on the DEFAULT-layout path
+        # so the autotuner can measure it independently from the FFI seed.
+        default_cluster_m2_config = helion.Config(
             block_sizes=[256, 256, 128],
             indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
             pid_type="persistent_interleaved",
             tcgen05_cluster_m=2,
             tcgen05_cluster_n=1,
         )
-        bound.config_spec.normalize(projected_cluster_m2_config, _fix_invalid=True)
+        bound.config_spec.normalize(default_cluster_m2_config, _fix_invalid=True)
         self.assertIs(
-            projected_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
-            True,
+            default_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
+            False,
         )
         self.assertEqual(
-            projected_cluster_m2_config.config["block_sizes"],
+            default_cluster_m2_config.config["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        )
+
+        # An explicit FFI request still projects onto the generalized seed.
+        requested_ffi_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        bound.config_spec.normalize(requested_ffi_config, _fix_invalid=True)
+        self.assertIs(
+            requested_ffi_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True
+        )
+        self.assertEqual(
+            requested_ffi_config.config["block_sizes"],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
         )
 
