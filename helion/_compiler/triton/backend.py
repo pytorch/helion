@@ -102,7 +102,6 @@ class TritonBackend(Backend):
         from ..._compat import get_mtia_tunable_fragments
         from ..._compat import is_hip
         from ..._compat import supports_amd_cdna_tunables
-        from ..._compat import supports_matrix_instr_nonkdim_32
         from ..._compat import supports_mtia_tunables
         from ...autotuner.config_fragment import EnumFragment
 
@@ -113,12 +112,7 @@ class TritonBackend(Backend):
             # A value of 0 leaves occupancy unconstrained, matching Triton's default.
             fragments["waves_per_eu"] = EnumFragment(choices=(0, 1, 2, 3, 4))
             if supports_amd_cdna_tunables():
-                matrix_instr_nonkdim = (
-                    (0, 16, 32) if supports_matrix_instr_nonkdim_32() else (0, 16)
-                )
-                fragments["matrix_instr_nonkdim"] = EnumFragment(
-                    choices=matrix_instr_nonkdim
-                )
+                fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
 
         if supports_mtia_tunables():
             fragments.update(get_mtia_tunable_fragments())

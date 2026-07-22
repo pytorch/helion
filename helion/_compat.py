@@ -475,19 +475,6 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
-@functools.cache
-def supports_matrix_instr_nonkdim_32() -> bool:
-    """Whether the current AMD target should autotune 32-wide non-K MFMA."""
-    if not supports_amd_cdna_tunables():
-        return False
-    try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        arch = getattr(props, "gcnArchName", None)
-        return arch is not None and arch.split(":")[0] in {"gfx950", "gfx951"}
-    except Exception:
-        return False
-
-
 # CUs per XCD by base CDNA architecture.  Used to derive the live,
 # partition-visible XCD count from the observed CU count (see get_num_xcd).
 _CUS_PER_XCD: dict[str, int] = {
