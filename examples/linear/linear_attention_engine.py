@@ -704,8 +704,8 @@ def chunk_bwd_dqkw_delta_helion(
     dW_out = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
     dq_out = torch.empty([BHN, C, D], dtype=q.dtype, device=q.device)
     dk_as_out = torch.empty([BHN, C, D], dtype=torch.float32, device=k.device)
-    dg_p_out = torch.empty([BHN, C], dtype=torch.float32, device=q.device)
-    dg_last_out = torch.empty([BHN], dtype=torch.float32, device=q.device)
+    dg_p_out = torch.zeros([BHN, C], dtype=torch.float32, device=q.device)
+    dg_last_out = torch.zeros([BHN], dtype=torch.float32, device=q.device)
 
     hdt = q.dtype
     for tile_bhn in hl.tile(BHN, block_size=1):
@@ -821,7 +821,7 @@ def chunk_bwd_wy_dL_delta_helion(
     dv_out = torch.empty([BHN, C, DV], dtype=v.dtype, device=v.device)
     dbeta_out = torch.empty([BHN, C], dtype=torch.float32, device=k.device)
     d_ba_out = torch.empty([BHN, C, D], dtype=torch.float32, device=k.device)
-    dg_wy_out = torch.empty([BHN, C], dtype=torch.float32, device=k.device)
+    dg_wy_out = torch.zeros([BHN, C], dtype=torch.float32, device=k.device)
 
     hdt = k.dtype
     for tile_bhn in hl.tile(BHN, block_size=1):
@@ -1490,7 +1490,7 @@ def chunk_bwd_dqkg_scalar_helion(
 
     dq_out = torch.empty([BHN, C, D], dtype=q.dtype, device=q.device)
     dk_out = torch.empty([BHN, C, D], dtype=k.dtype, device=k.device)
-    dg_by_d = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
+    dg_by_d = torch.zeros([BHN, C, D], dtype=torch.float32, device=q.device)
 
     for tile_bhn, tile_d in hl.tile([BHN, D]):
         dA_raw = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
