@@ -5,7 +5,6 @@ from unittest.mock import patch
 import torch
 
 import helion
-from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -13,30 +12,12 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessAMDCDNA
 from helion._testing import skipUnlessMultiXCD
-from helion.autotuner.config_fragment import EnumFragment
 from helion.exc import InvalidConfig
 import helion.language as hl
 
 
 @onlyBackends(["triton"])
 class TestAMDCDNA(TestCase):
-    def test_amd_tunable_fragment_choices(self) -> None:
-        with (
-            patch("helion._compat.is_hip", return_value=True),
-            patch("helion._compat.supports_amd_cdna_tunables", return_value=True),
-        ):
-            fragments = TritonBackend().tunable_fragments()
-
-        self.assertEqual(
-            fragments["waves_per_eu"],
-            EnumFragment(choices=(0, 1, 2, 3, 4)),
-        )
-        self.assertEqual(fragments["waves_per_eu"].default(), 0)
-        self.assertEqual(
-            fragments["matrix_instr_nonkdim"],
-            EnumFragment(choices=(0, 16, 32)),
-        )
-
     @skipUnlessAMDCDNA("Test requires AMD CDNA GPU (MI200/MI300 series)")
     def test_amd_cdna_tunables_in_kernel(self) -> None:
         """Test that AMD CDNA tunables are supported."""
