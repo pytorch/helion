@@ -60,9 +60,9 @@ class TestAMDCDNA(TestCase):
 
         self.assertEqual(
             fragments["waves_per_eu"],
-            EnumFragment(choices=(1, 2, 3, 4, 0)),
+            EnumFragment(choices=(0, 1, 2, 3, 4)),
         )
-        self.assertEqual(fragments["waves_per_eu"].default(), 1)
+        self.assertEqual(fragments["waves_per_eu"].default(), 0)
         self.assertEqual(
             fragments["matrix_instr_nonkdim"],
             EnumFragment(choices=(0, 16, 32)),

@@ -110,9 +110,8 @@ class TritonBackend(Backend):
             return {}
         fragments: dict[str, ConfigSpecFragment] = {}
         if is_hip():
-            # Keep 1 first to preserve the existing default.  A value of 0 lets
-            # the compiler choose occupancy and is useful as an autotune candidate.
-            fragments["waves_per_eu"] = EnumFragment(choices=(1, 2, 3, 4, 0))
+            # A value of 0 leaves occupancy unconstrained, matching Triton's default.
+            fragments["waves_per_eu"] = EnumFragment(choices=(0, 1, 2, 3, 4))
             if supports_amd_cdna_tunables():
                 matrix_instr_nonkdim = (
                     (0, 16, 32) if supports_matrix_instr_nonkdim_32() else (0, 16)
