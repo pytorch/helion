@@ -671,6 +671,17 @@ def _topk_pallas_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Te
     return out_v, out_i
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def _constant_pad_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
+    """F.pad -> aten.constant_pad_nd -> jnp.pad on the pallas backend (pad the
+    lane dim, mirroring the spec-decode sampler's in-kernel output padding)."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols + 128], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(rows):
+        out[tile, :] = torch.nn.functional.pad(x[tile, :], (0, 128), value=0.0)
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -944,6 +955,17 @@ class TestPallas(TestCase):
             / xf.shape[0]
         )
         self.assertGreater(recall, 0.9)
+
+    def test_constant_pad_nd_lowering(self) -> None:
+        """F.pad lowers to aten.constant_pad_nd -> jnp.pad on the pallas backend."""
+        torch.manual_seed(0)
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            _constant_pad_pallas_kernel, (x,), block_sizes=[8]
+        )
+        self.assertIn("jnp.pad", code)
+        expected = torch.nn.functional.pad(x, (0, 128), value=0.0)
+        torch.testing.assert_close(result, expected)
 
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
