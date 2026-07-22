@@ -467,28 +467,40 @@ def divide_filter_topk(
     each (rows, k); values descending, indices int32 into V. k must be static."""
     rows, vocab = x.shape
     orig_dtype = x.dtype
-    # Mosaic can't relayout the i1 masks produced by sub-32-bit (e.g. bf16)
-    # compares in the strided loop ("Invalid relayout ... vector<8x128xi1>"), so
-    # run the reduction in f32 and cast the returned values back. (tallax instead
-    # packs a bf16 value + its index into a single i32.)
-    if jnp.issubdtype(orig_dtype, jnp.floating) and orig_dtype != jnp.float32:
-        x = x.astype(jnp.float32)
+    # The [rows, vocab] buffer dominates scoped VMEM. Mosaic can't relayout the i1
+    # masks from sub-32-bit compares in the strided loop ("Invalid relayout ...
+    # vector<8x128xi1>"), but rather than upcast the WHOLE vocab to f32 (which doubles
+    # that dominant buffer for bf16 inputs), keep x in its native dtype and upcast
+    # each num_bins-wide slice to f32 for the compare below -- a small transient.
+    # best_val and the compares run in f32; returned values cast back to orig_dtype.
+    # (tallax instead packs a bf16 value + its index into a single i32.)
     num_bins = num_bins_for(k, vocab, recall_target)
-    neg = jnp.finfo(x.dtype).min
+    neg = jnp.finfo(jnp.float32).min  # best_val + compares run in f32 (see above)
     col = lax.broadcasted_iota(jnp.int32, (rows, num_bins), 1)  # (rows, num_bins)
 
-    # Pad V up to a whole number of strided passes of width num_bins.
-    num_slices = -(-vocab // num_bins)  # ceil
-    pad = num_slices * num_bins - vocab
-    if pad:
-        x = jnp.pad(x, ((0, 0), (0, pad)), constant_values=neg)
-
-    # Step 1: per-bin running max + carried global index (strided bins).
-    best_val = jnp.full((rows, num_bins), neg, x.dtype)
+    # Step 1: per-bin running max + carried global index (strided bins). Slice the
+    # ORIGINAL x in full num_bins-wide passes and pad ONLY the ragged tail -- never
+    # materialize a second full-vocab copy (jnp.pad of all of V doubles the scoped
+    # VMEM; tallax likewise handles the remainder in-loop via a small padded slice).
+    num_full_slices = vocab // num_bins
+    remainder = vocab - num_full_slices * num_bins
+    best_val = jnp.full((rows, num_bins), neg, jnp.float32)
     best_idx = jnp.zeros((rows, num_bins), jnp.int32)
-    for i in range(num_slices):
-        seg = x[:, i * num_bins : (i + 1) * num_bins]  # (rows, num_bins)
+    for i in range(num_full_slices):
+        seg = x[:, i * num_bins : (i + 1) * num_bins].astype(
+            jnp.float32
+        )  # f32 for compare
         gidx = i * num_bins + col  # global vocab index
+        take = seg > best_val
+        best_val = jnp.where(take, seg, best_val)
+        best_idx = jnp.where(take, gidx, best_idx)
+    if remainder:
+        seg = jnp.pad(
+            x[:, num_full_slices * num_bins :].astype(jnp.float32),
+            ((0, 0), (0, num_bins - remainder)),
+            constant_values=neg,
+        )  # pad only the small ragged tail (<= num_bins wide), not all of V
+        gidx = num_full_slices * num_bins + col
         take = seg > best_val
         best_val = jnp.where(take, seg, best_val)
         best_idx = jnp.where(take, gidx, best_idx)

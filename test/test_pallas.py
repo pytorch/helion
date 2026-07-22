@@ -915,6 +915,36 @@ class TestPallas(TestCase):
         )
         self.assertGreaterEqual(recall, 0.99)
 
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
+    def test_topk_bf16_vocab_reduction(self) -> None:
+        """bf16 input: the (rows, vocab) reduction buffer stays bf16 (halves the
+        scoped VMEM) while each num_bins slice upcasts to f32 for the compare, so
+        the top-1 value and a high recall survive."""
+        torch.manual_seed(0)
+        xf = torch.randn(64, 4096, device=DEVICE, dtype=torch.float32)
+        x = xf.to(torch.bfloat16)
+        _, (vals, idx) = code_and_output(
+            _topk_pallas_kernel, (x, _TOPK_TEST_K), block_sizes=[8]
+        )
+        # top-1 value matches the true max (index may differ under bf16 ties)
+        torch.testing.assert_close(
+            vals[:, 0].float().cpu(),
+            xf.max(dim=-1).values.cpu(),
+            rtol=0.03,
+            atol=0.05,
+        )
+        ref_i = torch.topk(xf, _TOPK_TEST_K, dim=-1, largest=True)[1].cpu()
+        idx_c = idx.cpu()
+        ref_sets = [set(r.tolist()) for r in ref_i]
+        recall = (
+            sum(
+                len(set(idx_c[r].tolist()) & ref_sets[r]) / _TOPK_TEST_K
+                for r in range(xf.shape[0])
+            )
+            / xf.shape[0]
+        )
+        self.assertGreater(recall, 0.9)
+
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
 
