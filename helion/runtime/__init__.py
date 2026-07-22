@@ -203,6 +203,26 @@ def default_launcher(
         raise
 
 
+def _pallas_round_full_dim(n: int, d: int, ndim: int) -> int:
+    """Round a full (``None``-template) block dim UP to the Mosaic tiling: the last
+    dim to a 128-multiple, the second-last to an 8-multiple.
+
+    On jax 0.10.0 Mosaic rejects a slice of a *tiled* (pipelined / double-buffered)
+    memref whose last dim isn't 128-aligned -- ``emit_pipeline``'s scratch
+    buffer-select fails with "Slice shape ... must be aligned to tiling (128), but
+    is <n>". Rounding the full dim up is free (a VMEM lane/sublane tile is that size
+    regardless); the pipeline clamps the ragged tail on reads, and the store codegen
+    (``sliced_value_for_store``) pads written values to fill the widened ref, so the
+    two MUST stay in sync. jax 0.10.1 tolerates the ragged tile (a harmless no-op for
+    already-aligned dims).
+    """
+    if d == ndim - 1:
+        return -(-n // 128) * 128
+    if d == ndim - 2:
+        return -(-n // 8) * 8
+    return n
+
+
 def _pallas_make_block_spec(
     pl: object,
     jnp: object,
@@ -230,10 +250,20 @@ def _pallas_make_block_spec(
         return pl.BlockSpec(full_shape, index_map_full, memory_space=memory_space)  # type: ignore[union-attr]
 
     block_shape_template, grid_dims = entry
+    ndim = len(block_shape_template)
+
     # Clamp to >= 1: empty tensors (zero-work grids) would otherwise produce
-    # 0-sized block dims, which the interpret machinery divides by.
+    # 0-sized block dims, which the interpret machinery divides by. A ``None``
+    # template ("keep the whole dim") is rounded UP to the Mosaic tiling via
+    # ``_pallas_round_full_dim`` so the pipelined double-buffered scratch slice is
+    # 128-aligned on jax 0.10.0 (the store codegen pads written values to match).
     block_shape = tuple(
-        max(min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d], 1)
+        max(
+            min(bs, tensor.shape[d])
+            if bs is not None
+            else _pallas_round_full_dim(tensor.shape[d], d, ndim),
+            1,
+        )
         for d, bs in enumerate(block_shape_template)
     )
     # Block indices past the last block are clamped, matching pallas_call's

@@ -945,6 +945,32 @@ class TestPallas(TestCase):
         )
         self.assertGreater(recall, 0.9)
 
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
+    def test_topk_ragged_vocab_roundup(self) -> None:
+        """Ragged vocab (V % 128 != 0) plus ragged k: the launcher rounds the full
+        block dims up to the Mosaic tiling, the load codegen narrows the loaded
+        value back (so the rounded tail can't leak a >=V index) and the store
+        codegen pads the k-wide result (the writeback DMA clamps it to k). The
+        output is the logical (rows, k) and every index is in-vocab."""
+        torch.manual_seed(0)
+        rows, vocab, k = 64, 4160, 50  # 4160 % 128 == 64, 50 % 128 == 50 (both ragged)
+        x = torch.randn(rows, vocab, device=DEVICE, dtype=torch.float32)
+        _, (vals, idx) = code_and_output(_topk_pallas_kernel, (x, k), block_sizes=[8])
+        idx_c = idx.cpu()
+        # logical output shape (not the rounded-up width)
+        self.assertEqual(tuple(idx_c.shape), (rows, k))
+        # the rounded tail must not leak an out-of-vocab index
+        self.assertGreaterEqual(int(idx_c.min()), 0)
+        self.assertLess(int(idx_c.max()), vocab)
+        ref_i = torch.topk(x, k, dim=-1, largest=True)[1].cpu()
+        self.assertTrue(torch.equal(idx_c[:, 0], ref_i[:, 0].to(torch.int32)))
+        ref_sets = [set(r.tolist()) for r in ref_i]
+        recall = (
+            sum(len(set(idx_c[r].tolist()) & ref_sets[r]) / k for r in range(rows))
+            / rows
+        )
+        self.assertGreater(recall, 0.9)
+
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
 
