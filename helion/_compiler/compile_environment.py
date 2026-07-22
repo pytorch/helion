@@ -627,6 +627,11 @@ class CompileEnvironment:
             source_expr = _symint_expr(source.value)
             if isinstance(source_expr, sympy.Symbol):
                 self.shape_env._constrain_unify(source.value, info.var)
+                # Match the block var's hint to the size it is now unified with,
+                # so both agree once the shared range is narrowed.
+                shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
+                    self.size_hint(source.value)
+                )
 
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
