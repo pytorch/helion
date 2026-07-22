@@ -1,0 +1,164 @@
+name: vLLM Helion Kernel Correctness
+
+# On every PR push (and pushes to main), install vLLM nightly + this PR's Helion
+# and verify every vLLM-registered Helion kernel COMPILES at all its committed
+# config/shape points and matches its baseline, on both H100 and B200.
+#
+# Correctness only -- no perf. Its purpose is to catch codegen/compile
+# regressions that break a specific config on a specific GPU (e.g. the
+# rms_norm_per_block_quant B200 Triton MLIR "PassManager::run failed" bug)
+# before a Helion change lands. Runs the check via
+# .github/scripts/check_vllm_helion_correctness.py.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  correctness:
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu:
+          - runner: mt-l-x86iamx-22-225-h100
+            alias: h100
+          - runner: linux.dgx.b200
+            alias: b200
+    name: vllm-helion-correctness-${{ matrix.gpu.alias }}
+    runs-on: ${{ matrix.gpu.runner }}
+    container:
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      options: --gpus all
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: GPU check
+        run: nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Setup toolchain
+        run: |
+          set -x
+          apt-get update
+          apt-get install -y git
+
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
+      - name: Install vLLM (required)
+        # Install vLLM FIRST so it brings its own pinned, self-consistent torch;
+        # Helion is then installed against that torch (below). vLLM registers the
+        # Helion kernels + ships their per-hardware configs, and this check runs
+        # those kernels against the PR's Helion -- so vLLM is required (not
+        # continue-on-error): the check cannot run without it.
+        run: |
+          source .venv/bin/activate
+          # Install the vLLM NIGHTLY, and let it pull its own pinned torch. The
+          # nightly wheel pins a *stable* torch (currently torch==2.11.0, with
+          # matching torchvision/torchaudio) that lives on the pytorch *stable*
+          # cu130 index -- so that is the torch index below, NOT the nightly one.
+          #
+          # We must PIN the exact nightly version, we cannot just ask for "vllm".
+          # uv resolves a name to the globally-highest version across ALL indexes
+          # regardless of index priority or --index-strategy, and vLLM's stable
+          # PyPI releases are versioned HIGHER than main/nightly: nightly is
+          # "0.23.1rc1.dev*+g<sha>" (setuptools-scm off main) while the latest
+          # PyPI stable is e.g. "0.25.1". So a bare "vllm --pre" ALWAYS resolves
+          # the stale PyPI stable -- which predates the Helion kernel fixes this
+          # check depends on (e.g. vllm-project/vllm#48868's non-degenerate
+          # scale_ub), causing spurious silu_and_mul_per_block_quant numerics
+          # failures. Pinning the nightly version is the only reliable override.
+          #
+          # The nightly index publishes exactly one version at a time, so scrape
+          # it at run time (never hardcode -- it would go stale within a day).
+          VLLM_NIGHTLY=$(python - <<'PY'
+          import re, urllib.request
+          html = urllib.request.urlopen(
+              'https://wheels.vllm.ai/nightly/vllm/', timeout=60
+          ).read().decode(errors='replace')
+          vers = set(re.findall(r'vllm-([0-9][^"/]*?\.dev[0-9]+\+g[0-9a-f]+)-cp', html))
+          assert vers, 'no vllm nightly version found on wheels.vllm.ai/nightly'
+          print(max(vers, key=lambda v: int(re.search(r'\.dev(\d+)', v).group(1))))
+          PY
+          )
+          echo "Pinning vLLM nightly: ${VLLM_NIGHTLY}"
+          # unsafe-best-match: vLLM nightly pins exact dep versions that live on
+          # PyPI (the default index), not on wheels.vllm.ai -- let uv resolve
+          # those across indexes. The pinned version keeps vllm itself locked to
+          # the nightly wheel; only its deps float across indexes.
+          uv pip install --pre "vllm==${VLLM_NIGHTLY}" \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://wheels.vllm.ai/nightly \
+            --extra-index-url https://download.pytorch.org/whl/cu130
+          python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
+
+      - name: Install Helion (this PR)
+        # Installed after vLLM so it builds against the torch vLLM pinned. The
+        # guard below fails loudly if Helion's extras silently moved torch.
+        run: |
+          source .venv/bin/activate
+          uv pip install setuptools ninja
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          # Guard: Helion's install must not have changed the torch vLLM pinned.
+          python -c "import helion, torch, vllm; print('helion ok | torch', torch.__version__, '| vllm', vllm.__version__)"
+
+      - name: CUDA compute check
+        run: |
+          source .venv/bin/activate
+          python -c "import torch; assert torch.cuda.is_available(), 'FATAL: CUDA not available'; print(torch.cuda.get_device_name(0))"
+
+      - name: Check vLLM Helion kernels compile + are correct (all configs/shapes)
+        # check_vllm_helion_correctness.py reuses check_kernel_correctness from
+        # vLLM's scripts/benchmark_helion_kernels.py -- but scripts/ is NOT part
+        # of the installed wheel (pyproject packages only "vllm*"). Fetch just
+        # that module NEXT TO the check script: Python puts the script's own
+        # directory on sys.path[0], so the import resolves with no PYTHONPATH.
+        # Fetch + run live in one step (set -e) so a failed download fails loud
+        # instead of a later confusing ModuleNotFoundError.
+        #
+        # TODO(shangdiy): check_kernel_correctness is not merged into vLLM yet
+        # (vllm-project/vllm#48968), so the nightly wheel doesn't ship it. Until
+        # that lands, fetch the module from the PR branch below. AFTER #48968
+        # merges, switch to fetching from the real repo at the commit matching
+        # the installed wheel (embedded in vllm.__version__ as "+g<sha>"):
+        #   VLLM_SHA=$(python -c "import re, vllm; m = re.search(r'\+g([0-9a-f]+)', vllm.__version__); print(m.group(1) if m else 'main')")
+        #   curl -fsSL "https://raw.githubusercontent.com/vllm-project/vllm/${VLLM_SHA}/scripts/benchmark_helion_kernels.py" -o ...
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          # Fetch with Python's urllib, not curl: the CUDA container doesn't ship
+          # curl and the toolchain step only installs git.
+          python - <<'PY'
+          import urllib.request
+          url = ("https://raw.githubusercontent.com/yushangdi/vllm/"
+                 "add-helion-benchmark-correctness/scripts/benchmark_helion_kernels.py")
+          dst = ".github/scripts/benchmark_helion_kernels.py"
+          urllib.request.urlretrieve(url, dst)
+          src = open(dst).read()
+          assert "def check_kernel_correctness" in src, (
+              "fetched benchmark_helion_kernels.py lacks check_kernel_correctness"
+          )
+          print(f"Fetched {dst} from PR #48968 branch "
+                "(yushangdi:add-helion-benchmark-correctness)")
+          PY
+          python .github/scripts/check_vllm_helion_correctness.py
