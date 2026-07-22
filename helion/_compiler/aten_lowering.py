@@ -265,6 +265,9 @@ argmax_lowering = register_lowering(torch.ops.aten.argmax.default)
 argmin_lowering = register_lowering(torch.ops.aten.argmin.default)
 
 
+constant_pad_nd_lowering = register_lowering(torch.ops.aten.constant_pad_nd.default)
+
+
 def _argreduce_schema(node: Node) -> tuple[torch.Tensor, int | None, bool]:
     input_node = cast("Node", node.args[0])
     input_val = input_node.meta["val"]
