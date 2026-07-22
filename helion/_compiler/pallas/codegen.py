@@ -40,12 +40,16 @@ def load_expr(
         if isinstance(pattern, IndirectGatherPattern):
             return emit_gather(state, pattern.plan, name)
 
-    idx_str, none_dims = index_str(state, subscript, tensor)
+    parts, none_dims = index_parts(state, list(subscript), tensor)
+    idx_str = ", ".join(parts)
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
     else:
         result = expr_from_string(f"{name}[{idx_str}]")
+    result = _narrow_loaded_value_for_roundup(
+        state, list(subscript), tensor, parts, result
+    )
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
@@ -227,6 +231,75 @@ def _tensor_routed_to_fori_scratch(state: CodegenState, tensor: torch.Tensor) ->
     return isinstance(loop, ForiLoopState)
 
 
+def _pallas_round_full_dim(n: int, d: int, ndim: int) -> int:
+    """Mirror of ``helion.runtime._pallas_round_full_dim`` -- keep the two in sync.
+
+    Round a full (``None``-template) block dim UP to the Mosaic tiling (128 last,
+    8 second-last). The launcher widens the ``BlockSpec`` by exactly this amount so
+    the pipelined double-buffered scratch slice is 128-aligned on jax 0.10.0; here
+    we pad stored values by the same amount to fill the widened ref.
+    """
+    if d == ndim - 1:
+        return -(-n // 128) * 128
+    if d == ndim - 2:
+        return -(-n // 8) * 8
+    return n
+
+
+def _narrow_loaded_value_for_roundup(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    parts: list[str],
+    result: ast.AST,
+) -> ast.AST:
+    """Read-side mirror of ``sliced_value_for_store``'s value padding.
+
+    When the launcher rounds a full block dim UP (``_pallas_round_full_dim``), the
+    loaded ref includes rounded tail lanes holding clamped / garbage data. Slice the
+    loaded value back to the logical width so the kernel never sees them -- e.g. so a
+    top-k over a ragged vocab cannot return an out-of-range index. Only full (``:``,
+    non-tile) dims that the launcher actually widened are narrowed; everything else
+    is left untouched, so this is a no-op for already-aligned / non-rounded loads.
+    """
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    assert state.fx_node is not None
+    patterns = state.fx_node.meta.get("indexing_patterns")
+    if patterns is None:
+        return result
+
+    slices: list[str] = []
+    needs_slice = False
+    tensor_dim = 0
+    index_part_idx = 0
+    ndim = tensor.ndim
+    for idx, pattern in zip(subscript, patterns, strict=True):
+        if idx is None:
+            continue
+        value_slice = ":"
+        index_part = parts[index_part_idx]
+        index_part_idx += 1
+        dim_size = tensor.shape[tensor_dim]
+        if (
+            not isinstance(pattern, TilePattern)
+            and index_part == ":"
+            and isinstance(dim_size, int)
+            and _pallas_round_full_dim(dim_size, tensor_dim, ndim) > dim_size
+        ):
+            value_slice = f":{dim_size}"
+            needs_slice = True
+        slices.append(value_slice)
+        tensor_dim += 1
+
+    if not needs_slice:
+        return result
+    return expr_from_string(
+        f"{{result}}[{', '.join(slices)}]",
+        result=result,
+    )
+
+
 def sliced_value_for_store(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -257,12 +330,18 @@ def sliced_value_for_store(
     if patterns is None:
         return value
 
-    if _tensor_routed_to_fori_scratch(state, tensor):
-        return value
+    # Clamp-slicing (block clamped DOWN to the tensor) is exempt for fori-scratch
+    # destinations -- their ref is block-shaped, not clamped. Round-up padding
+    # (block rounded UP past the tensor by _pallas_round_full_dim) applies either
+    # way: the ref is the widened block, so a narrower computed value (e.g. a top-k
+    # width) must be padded to fill it; the writeback DMA clamps the extra lanes.
+    slice_exempt = _tensor_routed_to_fori_scratch(state, tensor)
 
     env = CompileEnvironment.current()
     slices: list[str] = []
+    pad_afters: list[int] = []
     needs_slice = False
+    needs_pad = False
     tensor_dim = 0
 
     index_part_idx = 0
@@ -271,29 +350,42 @@ def sliced_value_for_store(
             continue
 
         value_slice = ":"
+        pad_after = 0
         index_part = index_parts[index_part_idx]
         index_part_idx += 1
+        dim_size = tensor.shape[tensor_dim]
         if isinstance(pattern, TilePattern) and index_part == ":":
-            block_size = env.block_sizes[pattern.block_id].from_config(state.config)
-            dim_size = tensor.shape[tensor_dim]
-            if (
-                isinstance(block_size, int)
-                and isinstance(dim_size, int)
-                and dim_size < block_size
-            ):
-                value_slice = f":{dim_size}"
-                needs_slice = True
+            if not slice_exempt:
+                block_size = env.block_sizes[pattern.block_id].from_config(state.config)
+                if (
+                    isinstance(block_size, int)
+                    and isinstance(dim_size, int)
+                    and dim_size < block_size
+                ):
+                    value_slice = f":{dim_size}"
+                    needs_slice = True
+        elif index_part == ":" and isinstance(dim_size, int):
+            rounded = _pallas_round_full_dim(dim_size, tensor_dim, tensor.ndim)
+            if rounded > dim_size:
+                pad_after = rounded - dim_size
+                needs_pad = True
 
         slices.append(value_slice)
+        pad_afters.append(pad_after)
         tensor_dim += 1
 
-    if not needs_slice:
-        return value
-
-    return expr_from_string(
-        f"{{value}}[{', '.join(slices)}]",
-        value=value,
-    )
+    if needs_slice:
+        value = expr_from_string(
+            f"{{value}}[{', '.join(slices)}]",
+            value=value,
+        )
+    if needs_pad:
+        pad_width = ", ".join(f"(0, {a})" for a in pad_afters)
+        value = expr_from_string(
+            f"jnp.pad({{value}}, ({pad_width}))",
+            value=value,
+        )
+    return value
 
 
 def _tile_needs_mask(
