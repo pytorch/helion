@@ -1325,11 +1325,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
         ]
-        # For an FFI-eligible 16-bit shape BOTH the DEFAULT-layout cluster_m=2
-        # heuristic and the generalized TVM-FFI direct-entry heuristic emit a
-        # cluster_m=2 seed; the FFI search projection then normalizes both onto
-        # the same validated CtaGroup.TWO envelope. Require at least one and
-        # check that every cluster_m=2 seed matches that envelope.
+        # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds.
+        # Callers decide whether both are expected in the supplied population;
+        # every cluster_m=2 seed must still match the common tile envelope.
         self.assertGreaterEqual(len(seeded), 1)
         for seed in seeded:
             self.assertEqual(
@@ -2290,22 +2288,40 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32)
         self.assertIs(seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
 
-        # The same generalized seed is what the search projection uses to map
-        # FFI-requesting cluster_m=2 candidates onto the validated envelope.
-        projected_cluster_m2_config = helion.Config(
+        # An ordinary cluster_m=2 candidate remains on the DEFAULT-layout path
+        # so the autotuner can measure it independently from the FFI seed.
+        default_cluster_m2_config = helion.Config(
             block_sizes=[256, 256, 128],
             indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
             pid_type="persistent_interleaved",
             tcgen05_cluster_m=2,
             tcgen05_cluster_n=1,
         )
-        bound.config_spec.normalize(projected_cluster_m2_config, _fix_invalid=True)
+        bound.config_spec.normalize(default_cluster_m2_config, _fix_invalid=True)
         self.assertIs(
-            projected_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
-            True,
+            default_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
+            False,
         )
         self.assertEqual(
-            projected_cluster_m2_config.config["block_sizes"],
+            default_cluster_m2_config.config["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        )
+
+        # An explicit FFI request still projects onto the generalized seed.
+        requested_ffi_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        bound.config_spec.normalize(requested_ffi_config, _fix_invalid=True)
+        self.assertIs(
+            requested_ffi_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True
+        )
+        self.assertEqual(
+            requested_ffi_config.config["block_sizes"],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
         )
 
@@ -2522,10 +2538,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         k_fragment = MagicMock()
         k_fragment.low = 16
         k_fragment.high = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-        k_block = MagicMock()
-        k_block._fragment.return_value = k_fragment
         spec = MagicMock()
-        spec.block_sizes = [MagicMock(), MagicMock(), k_block]
+        spec._tcgen05_matmul_block_fragments.return_value = (
+            MagicMock(),
+            MagicMock(),
+            k_fragment,
+        )
         spec._tcgen05_cluster_m2_bk_is_valid.side_effect = (
             CuteTcgen05Config.cluster_m2_bk_is_valid
         )
@@ -4335,7 +4353,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # generalized TVM-FFI direct-entry cluster_m=2 seed (previously fp16 was
         # bf16-only for the FFI seed, so the leading seed was the cluster_m=1
         # universal default). The DEFAULT-layout cluster_m=2 seed is also
-        # emitted; both normalize onto the validated CtaGroup.TWO envelope.
+        # emitted and remains distinct after normalization.
         config_gen = bound.config_spec.create_config_generation()
         zero_flat = config_gen.random_population_flat(0)
         self.assertEqual(len(zero_flat), 1)
@@ -4348,11 +4366,24 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         one_config_population = config_gen.random_population(1)
         self.assertEqual(len(one_config_population), 1)
         self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 2)
+        seeded_configs = config_gen.random_population(3)
         self._assert_cute_tcgen05_cluster_m2_seeded(
-            config_gen.random_population(2),
+            seeded_configs,
             expected_block_k=128,
             expected_indexing_length=3,
         )
+        expected_seed_modes = {
+            (Tcgen05LayoutStrategy.DEFAULT.value, False),
+            (Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value, True),
+        }
+        seeded_modes = {
+            (
+                config.config.get("tcgen05_layout_strategy"),
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True,
+            )
+            for config in seeded_configs
+        }
+        self.assertTrue(expected_seed_modes.issubset(seeded_modes))
 
         acf_config_gen = bound.config_spec.create_config_generation(
             advanced_controls_files=["/tmp/helion-test.acf"]
@@ -4385,16 +4416,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 search.config_gen.unflatten(flat)
                 for flat in search._generate_initial_population_flat()
             ]
-        # This test only requires the CuTe cluster-m2 seed to be present. For an
-        # FFI-eligible shape the DEFAULT and TVM-FFI cluster_m=2 seeds normalize
-        # to the same validated config, so the dedup'd FROM_BEST_AVAILABLE
-        # initial population can collapse to a single distinct config.
-        self.assertGreaterEqual(len(configs), 1)
+        # FROM_BEST_AVAILABLE must retain both compiler-owned strategies so the
+        # autotuner measures the ordinary and direct-entry kernels.
+        self.assertGreaterEqual(len(configs), 2)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             configs,
             expected_block_k=128,
             expected_indexing_length=3,
         )
+        best_available_modes = {
+            (
+                config.config.get("tcgen05_layout_strategy"),
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True,
+            )
+            for config in configs
+        }
+        self.assertTrue(expected_seed_modes.issubset(best_available_modes))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:

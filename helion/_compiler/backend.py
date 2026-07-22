@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.settings import DotPrecision
+    from .cute.cute_mma import _CuteMmaNode
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import DeviceIR
@@ -969,6 +970,29 @@ def _largest_divisor_at_most(size: int, limit: int) -> int:
         if size % divisor == 0:
             return divisor
     return 1
+
+
+def _specialized_mma_root_mn_block_ids(
+    candidate: _CuteMmaNode,
+    config: Config,
+) -> tuple[int, int] | None:
+    """Return exact root-grid matrix axes for an analyzed MMA candidate."""
+    from .compile_environment import CompileEnvironment
+    from .host_function import HostFunction
+
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    operands = candidate.operands
+    if tuple(device_ir.grid_block_ids[0]) != operands.output_block_ids:
+        return None
+    if (leading_id := operands.leading_passthrough_block_id) is not None:
+        block_size = (
+            CompileEnvironment.current().block_sizes[leading_id].from_config(config)
+        )
+        if not isinstance(block_size, int) or block_size != 1:
+            return None
+    return operands.m_block_id, operands.n_block_id
 
 
 def _attention_flash_gate_enabled() -> bool:
@@ -2619,16 +2643,21 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
     return None
 
 
-def _kernel_specialized_mma_impl(
+class _SpecializedMmaPlan(NamedTuple):
+    impl: str
+    m_block_id: int
+    n_block_id: int
+
+
+def _kernel_specialized_mma_plan(
     fn: DeviceFunction,
     *,
     config: Config,
-) -> str | None:
-    from ..language._decorators import is_api_func
+) -> _SpecializedMmaPlan | None:
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _choose_mma_impl
-    from .cute.cute_mma import can_codegen_cute_mma_aten
-    from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .cute.cute_mma import _mma_tiles_are_static_full
+    from .cute.cute_mma import analyze_cute_mma_node
     from .device_ir import ForLoopGraphInfo
     from .host_function import HostFunction
 
@@ -2650,44 +2679,49 @@ def _kernel_specialized_mma_impl(
         if len(block_sizes) != 1 or not isinstance(block_sizes[0], int):
             continue
         bk = block_sizes[0]
-        host_device_ir = HostFunction.current().device_ir
-        if len(host_device_ir.grid_block_ids) != 1:
-            continue
-        root_grid_ids = host_device_ir.grid_block_ids[0]
-        if len(root_grid_ids) != 2:
-            continue
-        bm = env.block_sizes[root_grid_ids[0]].from_config(config)
-        bn = env.block_sizes[root_grid_ids[1]].from_config(config)
-        if not isinstance(bm, int) or not isinstance(bn, int):
-            continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in (
-                torch.ops.aten.addmm.default,
-                torch.ops.aten.baddbmm.default,
-            ) and can_codegen_cute_mma_aten(node, with_acc=True):
-                lhs_node = node.args[1]
-            elif (
-                callable(node.target)
-                and is_api_func(node.target)
-                and getattr(node.target, "__name__", "") == "dot"
-                and can_codegen_cute_mma_dot(node)
+            candidate = analyze_cute_mma_node(node)
+            if (
+                candidate is None
+                or candidate.requires_accumulator_seed
+                or candidate.operands.k_block_id != block_ids[0]
             ):
-                lhs_node = node.args[0]
-            else:
                 continue
-            if not isinstance(lhs_node, torch.fx.Node):
+            root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidate, config)
+            if root_mn_block_ids is None:
                 continue
-            lhs_val = lhs_node.meta.get("val")
-            if not isinstance(lhs_val, torch.Tensor):
+            bm = env.block_sizes[root_mn_block_ids[0]].from_config(config)
+            bn = env.block_sizes[root_mn_block_ids[1]].from_config(config)
+            if not isinstance(bm, int) or not isinstance(bn, int):
                 continue
+            if (
+                candidate.operands.has_leading_passthrough
+                and not _mma_tiles_are_static_full(
+                    candidate.operands, bm=bm, bn=bn, bk=bk
+                )
+            ):
+                continue
+            lhs_val = candidate.operands.lhs.source_fake
             mma_impl = _choose_mma_impl(
-                lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
+                lhs_val.dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=config,
+                input_device=lhs_val.device,
             )
             if mma_impl != "universal":
-                return mma_impl
+                return _SpecializedMmaPlan(mma_impl, *root_mn_block_ids)
     return None
+
+
+def _kernel_specialized_mma_impl(
+    fn: DeviceFunction,
+    *,
+    config: Config,
+) -> str | None:
+    plan = _kernel_specialized_mma_plan(fn, config=config)
+    return None if plan is None else plan.impl
 
 
 def _loop_contains_matmul(

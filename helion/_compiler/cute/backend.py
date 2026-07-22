@@ -27,8 +27,10 @@ from ..backend import _attention_flash_gate_enabled
 from ..backend import _attention_flash_supported
 from ..backend import _attention_softmax_pattern_head_dim
 from ..backend import _kernel_specialized_mma_impl
+from ..backend import _kernel_specialized_mma_plan
 from ..backend import _largest_divisor_at_most
 from ..backend import _loop_contains_matmul
+from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -63,15 +65,14 @@ def _detect_mma_loop(
     """Check if a device loop contains a matmul with MMA-compatible dtypes.
 
     Returns True only when the loop contains a compatible addmm/dot AND
-    the grid has at least 2 block IDs (M and N), so the MMA pipeline
-    can map them to tile offsets.  Three-level loops (grid[M] +
-    device_loop[N] + device_loop[K]) are NOT supported yet.
+    the grid has M and N block IDs, so the MMA pipeline can map them to tile
+    offsets. Leading-batch matmul may add one extra root grid axis.
+    Three-level loops (grid[M] + device_loop[N] + device_loop[K]) are NOT
+    supported yet.
     """
-    from ...language._decorators import is_api_func
     from ..device_ir import ForLoopGraphInfo
     from ..host_function import HostFunction
-    from .cute_mma import can_codegen_cute_mma_aten
-    from .cute_mma import can_codegen_cute_mma_dot
+    from .cute_mma import analyze_cute_mma_node
 
     # MMA lowering currently relies on a single grid state that carries
     # both the M and N axes. Nested grid loops like grid[M] + grid[N] do
@@ -80,9 +81,10 @@ def _detect_mma_loop(
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1:
         return False
-    if len(device_ir.grid_block_ids[0]) != 2:
+    if len(device_ir.grid_block_ids[0]) not in (2, 3):
         return False
-    root_grid_ids = set(device_ir.grid_block_ids[0])
+    root_grid_block_ids = tuple(device_ir.grid_block_ids[0])
+    root_grid_ids = set(root_grid_block_ids)
     # CuTe MMA fragment partitioning is currently keyed to physical threads.
     # When an M/N tile is partially serialized into lane loops, the same
     # fragment would be reused for multiple logical lanes and produce
@@ -105,20 +107,13 @@ def _detect_mma_loop(
         if graph_info.block_ids != block_ids:
             continue
         for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            # Only addmm/baddbmm trigger MMA mode — mm/bmm don't have
-            # a built-in accumulator so their result is needed per iteration.
-            if node.target in (
-                torch.ops.aten.addmm.default,
-                torch.ops.aten.baddbmm.default,
-            ) and can_codegen_cute_mma_aten(node, with_acc=True):
-                return True
+            candidate = analyze_cute_mma_node(node)
             if (
-                callable(node.target)
-                and is_api_func(node.target)
-                and getattr(node.target, "__name__", "") == "dot"
-                and can_codegen_cute_mma_dot(node)
+                candidate is not None
+                and not candidate.requires_scalar_fallback
+                and candidate.operands.output_block_ids == root_grid_block_ids
+                and candidate.operands.k_block_id in block_ids
+                and (candidate.with_acc or candidate.is_dot)
             ):
                 return True
     return False
@@ -131,29 +126,45 @@ def _detect_specialized_mma_loop(
     block_sizes: Sequence[int | torch.SymInt],
     config: Config,
 ) -> bool:
-    from ...language._decorators import is_api_func
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _mma_active_n_threads
+    from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import _tcgen05_root_m_threads
-    from .cute_mma import can_codegen_cute_mma_aten
-    from .cute_mma import can_codegen_cute_mma_dot
+    from .cute_mma import analyze_cute_mma_node
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1:
         return False
     root_grid_ids = device_ir.grid_block_ids[0]
-    if len(root_grid_ids) != 2:
-        return False
     if len(block_ids) != 1 or any(block_id in root_grid_ids for block_id in block_ids):
         return False
+
+    candidates = []
+    for graph_info in fn.codegen.codegen_graphs:
+        if getattr(graph_info, "block_ids", None) != block_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            candidate = analyze_cute_mma_node(node)
+            if (
+                candidate is not None
+                and not candidate.requires_scalar_fallback
+                and candidate.operands.k_block_id == block_ids[0]
+                and _specialized_mma_root_mn_block_ids(candidate, config) is not None
+            ):
+                candidates.append(candidate)
+    if not candidates:
+        return False
+
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0], config)
+    assert root_mn_block_ids is not None
 
     env = CompileEnvironment.current()
     root_block_sizes: list[int] = []
     root_thread_counts: list[int] = []
     root_thread_auto: list[bool] = []
-    for block_id in root_grid_ids:
+    for block_id in root_mn_block_ids:
         block_size = env.block_sizes[block_id].from_config(config)
         if not isinstance(block_size, int):
             return False
@@ -194,6 +205,14 @@ def _detect_specialized_mma_loop(
         return False
     bm, bn = root_block_sizes
     root_m_threads, root_n_threads = root_thread_counts
+    candidates = [
+        candidate
+        for candidate in candidates
+        if not candidate.operands.has_leading_passthrough
+        or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+    ]
+    if not candidates:
+        return False
 
     def root_threads_support_impl(mma_impl: str) -> bool:
         if mma_impl == "tcgen05":
@@ -212,46 +231,26 @@ def _detect_specialized_mma_loop(
             return root_m_threads * root_n_threads <= 1024
         if mma_impl == "warp":
             return root_m_threads == bm and root_n_threads == bn
+        if mma_impl == "universal":
+            return root_m_threads == bm and root_n_threads == bn
         return False
 
-    for graph_info in fn.codegen.codegen_graphs:
-        if getattr(graph_info, "block_ids", None) != block_ids:
+    for candidate in candidates:
+        lhs_val = candidate.operands.lhs.source_fake
+        mma_impl = _choose_mma_impl(
+            lhs_val.dtype,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            config=config,
+            input_device=lhs_val.device,
+        )
+        if candidate.requires_accumulator_seed:
+            if root_threads_support_impl("universal"):
+                return True
             continue
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in (
-                torch.ops.aten.addmm.default,
-                torch.ops.aten.baddbmm.default,
-            ) and can_codegen_cute_mma_aten(node, with_acc=True):
-                lhs_node = node.args[1]
-                if not isinstance(lhs_node, torch.fx.Node):
-                    continue
-                lhs_val = lhs_node.meta.get("val")
-                if not isinstance(lhs_val, torch.Tensor):
-                    continue
-                mma_impl = _choose_mma_impl(
-                    lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
-                )
-                if mma_impl != "universal" and root_threads_support_impl(mma_impl):
-                    return True
-            if (
-                callable(node.target)
-                and is_api_func(node.target)
-                and getattr(node.target, "__name__", "") == "dot"
-                and can_codegen_cute_mma_dot(node)
-            ):
-                lhs_node = node.args[0]
-                if not isinstance(lhs_node, torch.fx.Node):
-                    continue
-                lhs_val = lhs_node.meta.get("val")
-                if not isinstance(lhs_val, torch.Tensor):
-                    continue
-                mma_impl = _choose_mma_impl(
-                    lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
-                )
-                if mma_impl != "universal" and root_threads_support_impl(mma_impl):
-                    return True
+        if mma_impl != "universal" and root_threads_support_impl(mma_impl):
+            return True
     return False
 
 
@@ -436,8 +435,7 @@ def _loop_may_use_mma(
     from ...language._decorators import is_api_func
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
-    from .cute_mma import can_codegen_cute_mma_aten
-    from .cute_mma import can_codegen_cute_mma_dot
+    from .cute_mma import analyze_cute_mma_node
 
     device_ir = HostFunction.current().device_ir
     graph_by_id = {
@@ -450,18 +448,11 @@ def _loop_may_use_mma(
         if not isinstance(graph, torch.fx.Graph):
             return False
         for node in graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in (
-                torch.ops.aten.addmm.default,
-                torch.ops.aten.baddbmm.default,
-            ) and can_codegen_cute_mma_aten(node, with_acc=True):
-                return True
+            candidate = analyze_cute_mma_node(node)
             if (
-                callable(node.target)
-                and is_api_func(node.target)
-                and getattr(node.target, "__name__", "") == "dot"
-                and can_codegen_cute_mma_dot(node)
+                candidate is not None
+                and not candidate.requires_scalar_fallback
+                and (candidate.with_acc or candidate.is_dot)
             ):
                 return True
             if is_api_func(node.target) and getattr(node.target, "__name__", "") in {
@@ -2188,28 +2179,48 @@ class CuteBackend(Backend):
                 len(device_ir.grid_block_ids) == 1
                 and block_ids == device_ir.grid_block_ids[0]
             ):
-                specialized_mma_impl = _kernel_specialized_mma_impl(fn, config=config)
-                if specialized_mma_impl == "tcgen05" and len(nd_block_size) == 2:
+                specialized_mma_plan = _kernel_specialized_mma_plan(fn, config=config)
+                if (
+                    specialized_mma_plan is not None
+                    and specialized_mma_plan.impl == "tcgen05"
+                ):
                     from .cute_mma import _tcgen05_root_m_threads
 
+                    m_axis = block_ids.index(specialized_mma_plan.m_block_id)
+                    n_axis = block_ids.index(specialized_mma_plan.n_block_id)
+                    m_block_size = nd_block_size[m_axis]
+                    n_block_size = nd_block_size[n_axis]
                     root_m_threads = (
-                        _tcgen05_root_m_threads(
-                            int(nd_block_size[0]), int(nd_block_size[1])
-                        )
-                        if num_threads_config[0] == 0
-                        and isinstance(nd_block_size[0], int)
-                        and isinstance(nd_block_size[1], int)
-                        else num_threads_config[0]
+                        _tcgen05_root_m_threads(int(m_block_size), int(n_block_size))
+                        if num_threads_config[m_axis] == 0
+                        and isinstance(m_block_size, int)
+                        and isinstance(n_block_size, int)
+                        else num_threads_config[m_axis]
                     )
                     root_n_threads = (
-                        min(int(nd_block_size[1]), 8)
-                        if num_threads_config[1] == 0
-                        and isinstance(nd_block_size[1], int)
-                        else num_threads_config[1]
+                        min(int(n_block_size), 8)
+                        if num_threads_config[n_axis] == 0
+                        and isinstance(n_block_size, int)
+                        else num_threads_config[n_axis]
                     )
-                    num_threads_config[0] = root_m_threads
-                    num_threads_config[1] = root_n_threads
-                    static_threads = root_m_threads * root_n_threads
+                    num_threads_config[m_axis] = root_m_threads
+                    num_threads_config[n_axis] = root_n_threads
+                    static_threads = functools.reduce(
+                        operator.mul,
+                        (
+                            threads
+                            if threads > 0
+                            else int(block_size)
+                            if isinstance(block_size, int)
+                            else 0
+                            for block_size, threads in zip(
+                                nd_block_size,
+                                num_threads_config,
+                                strict=True,
+                            )
+                        ),
+                        1,
+                    )
 
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(
