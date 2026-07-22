@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 import helion
+from helion._compat import supports_matrix_instr_nonkdim_32
+from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -12,12 +15,75 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessAMDCDNA
 from helion._testing import skipUnlessMultiXCD
+from helion.autotuner.config_fragment import EnumFragment
 from helion.exc import InvalidConfig
 import helion.language as hl
 
 
 @onlyBackends(["triton"])
 class TestAMDCDNA(TestCase):
+    def test_matrix_instr_nonkdim_32_targets_cdna4(self) -> None:
+        self.addCleanup(supports_matrix_instr_nonkdim_32.cache_clear)
+        for arch, expected in (
+            ("gfx942:sramecc+:xnack-", False),
+            ("gfx950:sramecc+:xnack-", True),
+            ("gfx951", True),
+        ):
+            with self.subTest(arch=arch):
+                supports_matrix_instr_nonkdim_32.cache_clear()
+                with (
+                    patch(
+                        "helion._compat.supports_amd_cdna_tunables",
+                        return_value=True,
+                    ),
+                    patch("helion._compat.torch.cuda.current_device", return_value=0),
+                    patch(
+                        "helion._compat.torch.cuda.get_device_properties",
+                        return_value=SimpleNamespace(gcnArchName=arch),
+                    ),
+                ):
+                    self.assertEqual(
+                        supports_matrix_instr_nonkdim_32(),
+                        expected,
+                    )
+
+    def test_amd_tunable_fragment_choices(self) -> None:
+        with (
+            patch("helion._compat.is_hip", return_value=True),
+            patch("helion._compat.supports_amd_cdna_tunables", return_value=True),
+            patch(
+                "helion._compat.supports_matrix_instr_nonkdim_32",
+                return_value=True,
+            ),
+        ):
+            fragments = TritonBackend().tunable_fragments()
+
+        self.assertEqual(
+            fragments["waves_per_eu"],
+            EnumFragment(choices=(1, 2, 3, 4, 0)),
+        )
+        self.assertEqual(fragments["waves_per_eu"].default(), 1)
+        self.assertEqual(
+            fragments["matrix_instr_nonkdim"],
+            EnumFragment(choices=(0, 16, 32)),
+        )
+
+    def test_older_cdna_does_not_search_matrix_instr_nonkdim_32(self) -> None:
+        with (
+            patch("helion._compat.is_hip", return_value=True),
+            patch("helion._compat.supports_amd_cdna_tunables", return_value=True),
+            patch(
+                "helion._compat.supports_matrix_instr_nonkdim_32",
+                return_value=False,
+            ),
+        ):
+            fragments = TritonBackend().tunable_fragments()
+
+        self.assertEqual(
+            fragments["matrix_instr_nonkdim"],
+            EnumFragment(choices=(0, 16)),
+        )
+
     @skipUnlessAMDCDNA("Test requires AMD CDNA GPU (MI200/MI300 series)")
     def test_amd_cdna_tunables_in_kernel(self) -> None:
         """Test that AMD CDNA tunables are supported."""
