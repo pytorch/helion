@@ -435,14 +435,3 @@ def _(node: torch.fx.Node) -> float | bool | None:
     (arg,) = node.args
     assert isinstance(arg, torch.fx.Node)
     return cached_masked_value(arg)
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.tracing_ops  # noqa: E402, F401
-import helion._compiler.metal.tracing_ops  # noqa: E402, F401
-import helion._compiler.pallas.tracing_ops  # noqa: E402, F401
-import helion._compiler.triton.tracing_ops  # noqa: E402, F401

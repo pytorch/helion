@@ -10,7 +10,10 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -1057,6 +1060,35 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("def argmax_combine_tuple_fn_", code)
             self.assertIn("tl.associative_scan", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager(
+        "promoted-seed reduction_loops is only materialized in compiled mode"
+    )
+    @skipIfTileIR("TileIR reduction tiling differs")
+    @skipIfCute("reduction seed is Triton-only; CuTe uses its own reduction tiling")
+    def test_scan_in_reduction_default_config_not_looped(self) -> None:
+        """Regression: a scan (cumsum) inside a reduction over an axis co-resident with
+        a wide feature must not be emitted as a LOOPED reduction. The looped path
+        re-runs the scan per chunk with no cross-chunk prefix carry (silently wrong);
+        the reduction roller now refuses to roll a scan-containing reduction, keeping
+        it persistent. Run with the promoted default (no explicit config) and match
+        torch.cumsum; before the fix the seed looped this and was ~55% wrong. Shapes
+        are kept small so the persistent tile fits a small GPU."""
+
+        @helion.kernel(autotune_effort="none")
+        def cumsum_mid_reduce(x: torch.Tensor) -> torch.Tensor:
+            m, _r, n = x.shape
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                c = torch.cumsum(x[tile_m, :, :].to(torch.float32), dim=1)
+                out[tile_m, :] = c.amax(1)
+            return out
+
+        x = torch.randn([8, 4, 2048], device=DEVICE, dtype=torch.float32)
+        expected = torch.cumsum(x.double(), dim=1).amax(1).float()
+        _code, out = code_and_output(cumsum_mid_reduce, (x,))
+        torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

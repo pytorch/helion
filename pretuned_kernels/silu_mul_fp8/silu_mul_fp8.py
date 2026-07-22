@@ -11,7 +11,6 @@ from __future__ import annotations
 import torch
 
 import helion
-import helion.experimental
 import helion.language as hl
 
 # Optional vLLM baseline: the production kernel this is benchmarked against. The
@@ -25,7 +24,7 @@ except ImportError:
     _HAS_VLLM = False
 
 
-@helion.experimental.aot_kernel(
+@helion.aot_kernel(
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def silu_mul_fp8(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:  # noqa: A002

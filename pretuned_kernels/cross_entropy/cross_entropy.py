@@ -6,11 +6,10 @@ import torch
 import torch.nn.functional as F
 
 import helion
-import helion.experimental
 import helion.language as hl
 
 
-@helion.experimental.aot_kernel(
+@helion.aot_kernel(
     static_shapes=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )

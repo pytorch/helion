@@ -8,7 +8,7 @@ dependencies** at runtime — only ``torch``, ``triton``, and
 
 Run the full AOT workflow with ``--standalone`` to produce standalone files::
 
-    python -m helion.experimental.aot_runner --standalone \\
+    python -m helion.autotuner.aot_runner --standalone \\
         -- python examples/aot_compile_example.py
 
 This runs collect → measure → build → evaluate, then compiles standalone
@@ -32,13 +32,13 @@ import os
 
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import do_bench
-import helion.experimental
 import helion.language as hl
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Element-wise addition of two 2-D tensors."""
     m, n = x.shape

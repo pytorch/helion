@@ -109,6 +109,7 @@ def _pure_store_value(loop: DeviceLoopState) -> CuteTcgen05StoreValue:
     pure_object = _pure_object(loop)
     return CuteTcgen05StoreValue(
         lifecycle_context=pure_object.lifecycle_context,
+        output_block_ids=(0, 1),
         pure_matmul_object=pure_object,
     )
 
@@ -149,7 +150,9 @@ class _StatementCaptureGenerateAST(GenerateAST):
 class TestCuteDeviceFunctionState(unittest.TestCase):
     def test_get_tcgen05_store_value_checks_candidate_names(self) -> None:
         state = CuteDeviceFunctionState()
-        value = CuteTcgen05StoreValue(lifecycle_context=_lifecycle(), bm=256)
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(), output_block_ids=(0, 1), bm=256
+        )
         state.register_tcgen05_store_value("matmul_result", value)
 
         self.assertIsNone(state.get_tcgen05_store_value(["store_value"]))
@@ -161,7 +164,9 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
     def test_tcgen05_store_value_carries_lifecycle_context(self) -> None:
         state = CuteDeviceFunctionState()
         lifecycle = _lifecycle()
-        value = CuteTcgen05StoreValue(lifecycle_context=lifecycle, bm=256)
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=lifecycle, output_block_ids=(0, 1), bm=256
+        )
 
         state.register_tcgen05_store_value("matmul_result", value)
 
@@ -184,6 +189,7 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
             "acc",
             CuteTcgen05StoreValue(
                 lifecycle_context=pure_object.lifecycle_context,
+                output_block_ids=(0, 1),
                 pure_matmul_object=pure_object,
             ),
         )
@@ -719,7 +725,9 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
 
     def test_tcgen05_store_value_consume_rejects_fanout(self) -> None:
         state = CuteDeviceFunctionState()
-        value = CuteTcgen05StoreValue(lifecycle_context=_lifecycle(), bm=256)
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(), output_block_ids=(0, 1), bm=256
+        )
         state.register_tcgen05_store_value("matmul_result", value)
 
         self.assertIs(

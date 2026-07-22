@@ -2,7 +2,7 @@
 #
 # NOTE: deliberately NO ``from __future__ import annotations`` -- it stringifies
 # annotations, which breaks ``@cute.struct`` field-type resolution
-# (MemRange/Align). See ``.notes/spikes/STAGE0_FINDINGS.md`` Gotcha G. The
+# (MemRange/Align). The
 # generated Helion module DOES carry ``from __future__ import annotations`` at
 # its top, so the struct + the inline-traced rescale helper must live here, in a
 # real module compiled without that flag, and be imported by the generated code.
@@ -76,6 +76,8 @@ def flash_fa4_shared_storage(
     s_corr_stage: int = 2,
     dtype: object = cutlass.Float16,
     epi_tma: bool = False,
+    use_clc_scheduler: bool = False,
+    clc_stages: int = 1,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
@@ -92,6 +94,8 @@ def flash_fa4_shared_storage(
     can load the next Q tile while the epilogue drains the previous O tile.
     """
     softmax_threads = 128
+    clc_response_size = clc_stages * 4 if use_clc_scheduler else 0
+    clc_mbar_size = clc_stages * 2 if use_clc_scheduler else 0
 
     if epi_tma:
 
@@ -115,6 +119,10 @@ def flash_fa4_shared_storage(
             sScale: cute.struct.MemRange[
                 cutlass.Float32, s_corr_stage * q_stage * softmax_threads
             ]
+            # PipelineClcFetchAsync expects one full and one empty mbarrier per
+            # CLC stage. The response is 16 bytes, stored as 4 Int32s.
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
+            clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
@@ -144,6 +152,10 @@ def flash_fa4_shared_storage(
         sScale: cute.struct.MemRange[
             cutlass.Float32, s_corr_stage * q_stage * softmax_threads
         ]
+        # PipelineClcFetchAsync expects one full and one empty mbarrier per
+        # CLC stage. The response is 16 bytes, stored as 4 Int32s.
+        clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
+        clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
@@ -185,6 +197,30 @@ def mbar_spin_wait(mbar_ptr: object, phase: object) -> None:
     )
 
 
+def mbarrier_arrive(
+    pfor_ptr_stage: object,
+    peer_cta_rank: object = None,
+    self_cta_rank: object = None,
+) -> None:
+    if cutlass.const_expr(peer_cta_rank is None):
+        cute.arch.mbarrier_arrive(pfor_ptr_stage)
+    else:
+
+        def local_arrive() -> None:
+            cute.arch.mbarrier_arrive(pfor_ptr_stage)
+
+        def remote_arrive() -> None:
+            cute.arch.mbarrier_arrive(pfor_ptr_stage, peer_cta_rank)
+
+        cutlass.cutlass_dsl.if_generate(
+            self_cta_rank == peer_cta_rank,
+            local_arrive,
+            remote_arrive,
+            [],
+            [],
+        )
+
+
 @dsl_user_op
 def rcp_approx_ftz(x: object, *, loc: object = None, ip: object = None) -> Float32:
     """FA4-style approximate reciprocal that lowers to ``rcp.approx.ftz.f32``."""
@@ -203,8 +239,8 @@ def rcp_approx_ftz(x: object, *, loc: object = None, ip: object = None) -> Float
 
 # ===========================================================================
 # FA4 ex2_emulation_2: degree-3 minimax poly software-exp2 on the FMA/ALU
-# pipe (packed-f32x2).  Ported from flash_attn.cute.utils.py via the spike
-# at .scratch/fa4_step21a_spike.py.  STRING rounding modes ('rn'/'rm') are
+# pipe (packed-f32x2). Ported from flash_attn.cute.utils.py. STRING rounding
+# modes ('rn'/'rm') are
 # used here -- the installed CuTe DSL requires strings, NOT
 # nvvm.RoundingModeKind enums (those TypeError at trace time).
 # ===========================================================================
@@ -633,9 +669,9 @@ def fa4_exp2_convert_rowsum(
     """FUSED FA4 softmax: scale-subtract + exp2(pipe-split) + f32->f16 convert +
     deferred packed row-sum, returning the row-sum.
 
-    Faithful port of the spike's PROVEN zero-spill structure
-    (.scratch/fa4_faithful_spike.py ``_lean_exp_convert`` FA4_EXP=="sp"/"fa4ip" ->
-    ``_sp_exp2_convert`` + ``_row_sum_packed``). Replaces the prior 3-pass
+    Faithful port of the verified zero-spill structure:
+    ``_lean_exp_convert`` FA4_EXP=="sp"/"fa4ip" ->
+    ``_sp_exp2_convert`` + ``_row_sum_packed``. Replaces the prior 3-pass
     [exp2_split_inplace (full-row scale-subtract THEN a full-row exp2 split) +
     fadd_reduce_packed (a 3rd full-row sum pass) + separate frag-by-frag convert]
     sequence whose simultaneous live set (full f32 row + the exp2-emulation temps +
@@ -712,8 +748,7 @@ def fa4_exp2_convert_rowsum(
 def _fmax_reduce_chunk(frg: cute.Tensor, init_val: Float32) -> Float32:
     """fmax over a small fragment ``frg`` (one 32-elem t2r chunk) with 2 scalar
     accumulators, folding the running ``init_val`` row-max in. Used by the
-    chunked-t2r row-max pass so the full 128-elem row is NEVER held -- verbatim
-    port of the spike ``_fmax_reduce_chunk`` (.scratch/fa4_faithful_spike.py)."""
+    chunked-t2r row-max pass so the full 128-elem row is NEVER held."""
     n = cute.size(frg)
     lm0 = cute.arch.fmax(init_val, frg[0])
     lm0 = cute.arch.fmax(lm0, frg[1])
@@ -734,9 +769,8 @@ def fa4_disc_rowmax(
     """CHUNKED-t2r PASS 1 (row-max). For each of ``ld_chunks`` 32-elem column
     chunks, t2r ONE chunk into a small fragment, fold into the running max via
     scalar fmax, then FREE the chunk -- so the full fp32 row is NEVER simultaneously
-    resident (peak live = ONE 32-elem fragment). This is the spike's PROVEN
-    zero-spill ``_disc_pass1_max`` structure (.scratch/fa4_faithful_spike.py): the
-    KEYSTONE finding is that the chunked-t2r ("disc") softmax body is the ONLY one
+    resident (peak live = ONE 32-elem fragment). The chunked-t2r
+    ``_disc_pass1_max`` structure is the key reason the softmax body is the only one
     that closes the FA4 200/64/48/24 setmaxnreg split with ZERO spill, whereas the
     whole-row ("sp") body keeps a 128-f32 row resident and spills past the grant.
 
@@ -800,6 +834,11 @@ def fa4_disc_exp_convert_store(
     p_store_split: int,
     p_store_chunks: int,
     io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    *,
+    loc: object = None,
+    ip: object = None,
 ) -> Float32:
     """CHUNKED-t2r PASS 2 (exp + convert + r2t-store, FUSED with row-sum + the
     staged-P MMA handshake). For each P-store chunk ci: t2r 32 S cols into a small
@@ -807,8 +846,8 @@ def fa4_disc_exp_convert_store(
     convert that 32-elem fragment to a 16-reg fp16 chunk and r2t-STORE it in place
     over the same TMEM cols, fold the post-exp f32 chunk into the running row-sum,
     then FREE the chunk. Neither the full fp32 S NOR the full fp16 P is ever fully
-    materialized -- peak live = ONE 32-elem fragment + its 16-reg fp16 temp. Verbatim
-    port of the spike's ``_disc_pass2_exp`` serial form (.scratch/fa4_faithful_spike.py).
+    materialized -- peak live = ONE 32-elem fragment + its 16-reg fp16 temp. This is
+    the serial ``_disc_pass2_exp`` form.
 
     STAGED-P handshake preserved EXACTLY: after the chunk at ``p_store_split - 1``
     (the 3/4 boundary = first 96 kv) a fence + ``mbarrier_arrive(pfor)`` releases the
@@ -834,11 +873,15 @@ def fa4_disc_exp_convert_store(
         )
         _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
-        if ci == p_store_split - 1:
-            cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(pfor_ptr_stage)
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
-    cute.arch.mbarrier_arrive(pfor2_ptr_stage)
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
 
 
@@ -861,6 +904,8 @@ def fa4_disc_exp_convert_store_causal(
     m_block: cutlass.Int32,
     n_block: cutlass.Int32,
     io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store``."""
     p_sum = cutlass.Float32(0.0)
@@ -881,11 +926,15 @@ def fa4_disc_exp_convert_store_causal(
         )
         _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
-        if ci == p_store_split - 1:
-            cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(pfor_ptr_stage)
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
-    cute.arch.mbarrier_arrive(pfor2_ptr_stage)
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
 
 
@@ -940,6 +989,724 @@ def _disc_chunk_convert_store(
     cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
 
 
+def _disc_chunk_pair_convert_store(
+    frg0: cute.Tensor,
+    frg1: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    ci: int,
+    io_dtype: object,
+) -> None:
+    """Pack two 32-column fp32 score chunks into one Rep32 fp16 P-store."""
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+    half_f32 = cute.size(pchunk) // 2
+    pchunk0 = cute.make_tensor(
+        cute.recast_ptr(pchunk.iterator, dtype=io_dtype), frg0.layout
+    )
+    pchunk1 = cute.make_tensor(
+        cute.recast_ptr(pchunk.iterator + half_f32, dtype=io_dtype), frg1.layout
+    )
+    pchunk0.store(frg0.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+    pchunk1.store(frg1.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+    cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
+
+
+def fa4_disc_exp_convert_store_rep32(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """PASS2 variant for Rep32 P stores.
+
+    The score t2r path remains 32-column chunks, but the P r2t atom stores two
+    converted chunks at a time. This keeps all 128 score columns while halving
+    the number of P-store instructions versus Rep16.
+    """
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    for ci in range(p_store_chunks):
+        ld_ci0 = ci * 2
+        ld_ci1 = ld_ci0 + 1
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        half_f32 = cute.size(pchunk) // 2
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg)
+        _disc_chunk_exp(
+            frg, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+        )
+        pchunk0 = cute.make_tensor(
+            cute.recast_ptr(pchunk.iterator, dtype=io_dtype), frg.layout
+        )
+        pchunk0.store(frg.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg)
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= p_store_chunks - 1,
+        )
+        pchunk1 = cute.make_tensor(
+            cute.recast_ptr(pchunk.iterator + half_f32, dtype=io_dtype), frg.layout
+        )
+        pchunk1.store(frg.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_rep32_split(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st32: object,
+    tST32tS: cute.Tensor,
+    tST32cS: cute.Tensor,
+    tiled_st16: object,
+    tST16tS: cute.Tensor,
+    tST16cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    ld_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> Float32:
+    """Rep32 P store while preserving the 3/4 staged-P release.
+
+    Store LD chunks 0-1 with one Rep32 r2t, chunk 2 with Rep16, release pfor at
+    96 columns, then store the final Rep16 chunk and release pfor2.
+    """
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    split_ld_chunks = ld_chunks * 3 // 4
+    pair_chunks = split_ld_chunks // 2
+    for pair_ci in range(pair_chunks):
+        ld_ci0 = pair_ci * 2
+        ld_ci1 = ld_ci0 + 1
+        frg0 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        frg1 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg0)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg1)
+        _disc_chunk_exp(
+            frg0, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+        )
+        _disc_chunk_exp(
+            frg1,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ld_ci1 >= ld_chunks - 1,
+        )
+        _disc_chunk_pair_convert_store(
+            frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
+        )
+        p_sum = p_sum + _disc_chunk_rowsum(frg0) + _disc_chunk_rowsum(frg1)
+    ld_ci = pair_chunks * 2
+    if cutlass.const_expr(split_ld_chunks % 2 != 0):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci, None, None], frg)
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ld_ci >= ld_chunks - 1,
+        )
+        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ld_ci, io_dtype)
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+        ld_ci += 1
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    for ci in range(ld_ci, ld_chunks):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= ld_chunks - 1,
+        )
+        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_rep32_pipe(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    pipe_depth: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> Float32:
+    """Software-pipelined Rep32 PASS2.
+
+    The LD stream is still 32-column chunks, while the R2T stream stores two
+    converted chunks at a time. This keeps one score fragment live at the
+    conversion point, unlike the serial Rep32 helper's original two-fragment
+    pack, while letting ``disc_pipe_depth`` overlap upcoming TMEM reads.
+    """
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    ld_chunks = p_store_chunks * 2
+    n_buf = pipe_depth + 1
+    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
+
+    def _prefetch(slot: int, idx: int) -> None:
+        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
+
+    for j in range(min(pipe_depth, ld_chunks)):
+        _prefetch(j % n_buf, j)
+        _disc_pin_frag(frgs[j % n_buf])
+    for pair_ci in range(p_store_chunks):
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        half_f32 = cute.size(pchunk) // 2
+        for half in range(2):
+            ld_ci = pair_ci * 2 + half
+            nxt = ld_ci + pipe_depth
+            cur = frgs[ld_ci % n_buf]
+            if nxt < ld_chunks:
+                _prefetch(nxt % n_buf, nxt)
+                _disc_pin_frag(frgs[nxt % n_buf])
+            cute.arch.fence_view_async_tmem_load()
+            _disc_chunk_exp(
+                cur,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ld_ci >= ld_chunks - 1,
+            )
+            pchunk_half = cute.make_tensor(
+                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
+                cur.layout,
+            )
+            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+            p_sum = p_sum + _disc_chunk_rowsum(cur)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if pair_ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_sload16_pair_pipe(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    pipe_depth: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> Float32:
+    """PASS2 for Rep16 S-loads paired into the regular Rep16 P-store.
+
+    ``Ld32x32bOp(Repetition(16))`` splits the 128 score columns into eight
+    16-column load chunks, while the fp16 P layout still uses four 32-column
+    store chunks. Pack two loaded score fragments into each P-store fragment so
+    all score columns are consumed without changing the PV-side layout.
+    """
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    ld_chunks = p_store_chunks * 2
+    n_buf = pipe_depth + 1
+    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
+
+    def _prefetch(slot: int, idx: int) -> None:
+        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
+
+    for j in range(min(pipe_depth, ld_chunks)):
+        _prefetch(j % n_buf, j)
+        _disc_pin_frag(frgs[j % n_buf])
+    for pair_ci in range(p_store_chunks):
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        half_f32 = cute.size(pchunk) // 2
+        for half in range(2):
+            ld_ci = pair_ci * 2 + half
+            nxt = ld_ci + pipe_depth
+            cur = frgs[ld_ci % n_buf]
+            if nxt < ld_chunks:
+                _prefetch(nxt % n_buf, nxt)
+                _disc_pin_frag(frgs[nxt % n_buf])
+            cute.arch.fence_view_async_tmem_load()
+            _disc_chunk_exp(
+                cur,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ld_ci >= ld_chunks - 1,
+            )
+            pchunk_half = cute.make_tensor(
+                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
+                cur.layout,
+            )
+            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+            p_sum = p_sum + _disc_chunk_rowsum(cur)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if pair_ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_rep32_causal(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> Float32:
+    """Causal Rep32 PASS2 variant."""
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    for ci in range(p_store_chunks):
+        ld_ci0 = ci * 2
+        ld_ci1 = ld_ci0 + 1
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        half_f32 = cute.size(pchunk) // 2
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg)
+        causal_mask_t2r_chunk(
+            frg,
+            cast("cute.Tensor", tLDcS[None, ld_ci0, None, None]),
+            m_block,
+            n_block,
+            ld_ci0,
+        )
+        _disc_chunk_exp(
+            frg, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+        )
+        pchunk0 = cute.make_tensor(
+            cute.recast_ptr(pchunk.iterator, dtype=io_dtype), frg.layout
+        )
+        pchunk0.store(frg.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg)
+        causal_mask_t2r_chunk(
+            frg,
+            cast("cute.Tensor", tLDcS[None, ld_ci1, None, None]),
+            m_block,
+            n_block,
+            ld_ci1,
+        )
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= p_store_chunks - 1,
+        )
+        pchunk1 = cute.make_tensor(
+            cute.recast_ptr(pchunk.iterator + half_f32, dtype=io_dtype), frg.layout
+        )
+        pchunk1.store(frg.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_rep32_pipe_causal(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    pipe_depth: int,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> Float32:
+    """Causal variant of ``fa4_disc_exp_convert_store_rep32_pipe``."""
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    ld_chunks = p_store_chunks * 2
+    n_buf = pipe_depth + 1
+    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
+
+    def _prefetch(slot: int, idx: int) -> None:
+        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
+
+    for j in range(min(pipe_depth, ld_chunks)):
+        _prefetch(j % n_buf, j)
+        _disc_pin_frag(frgs[j % n_buf])
+    for pair_ci in range(p_store_chunks):
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        half_f32 = cute.size(pchunk) // 2
+        for half in range(2):
+            ld_ci = pair_ci * 2 + half
+            nxt = ld_ci + pipe_depth
+            cur = frgs[ld_ci % n_buf]
+            if nxt < ld_chunks:
+                _prefetch(nxt % n_buf, nxt)
+                _disc_pin_frag(frgs[nxt % n_buf])
+            cute.arch.fence_view_async_tmem_load()
+            causal_mask_t2r_chunk(
+                cur,
+                cast("cute.Tensor", tLDcS[None, ld_ci, None, None]),
+                m_block,
+                n_block,
+                ld_ci,
+            )
+            _disc_chunk_exp(
+                cur,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ld_ci >= ld_chunks - 1,
+            )
+            pchunk_half = cute.make_tensor(
+                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
+                cur.layout,
+            )
+            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+            p_sum = p_sum + _disc_chunk_rowsum(cur)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if pair_ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_sload16_pair_pipe_causal(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    pipe_depth: int,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> Float32:
+    """Causal variant of ``fa4_disc_exp_convert_store_sload16_pair_pipe``."""
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    ld_chunks = p_store_chunks * 2
+    n_buf = pipe_depth + 1
+    frgs = [cute.make_rmem_tensor(ld_shape, cutlass.Float32) for _ in range(n_buf)]
+
+    def _prefetch(slot: int, idx: int) -> None:
+        cute.copy(tiled_ld, tLDtS[None, idx, None, None], frgs[slot])
+
+    for j in range(min(pipe_depth, ld_chunks)):
+        _prefetch(j % n_buf, j)
+        _disc_pin_frag(frgs[j % n_buf])
+    for pair_ci in range(p_store_chunks):
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        half_f32 = cute.size(pchunk) // 2
+        for half in range(2):
+            ld_ci = pair_ci * 2 + half
+            nxt = ld_ci + pipe_depth
+            cur = frgs[ld_ci % n_buf]
+            if nxt < ld_chunks:
+                _prefetch(nxt % n_buf, nxt)
+                _disc_pin_frag(frgs[nxt % n_buf])
+            cute.arch.fence_view_async_tmem_load()
+            causal_mask_t2r_chunk(
+                cur,
+                cast("cute.Tensor", tLDcS[None, ld_ci, None, None]),
+                m_block,
+                n_block,
+                ld_ci,
+            )
+            _disc_chunk_exp(
+                cur,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ld_ci >= ld_chunks - 1,
+            )
+            pchunk_half = cute.make_tensor(
+                cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
+                cur.layout,
+            )
+            pchunk_half.store(cur.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
+            p_sum = p_sum + _disc_chunk_rowsum(cur)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, pair_ci])
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if pair_ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
+def fa4_disc_exp_convert_store_rep32_split_causal(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st32: object,
+    tST32tS: cute.Tensor,
+    tST32cS: cute.Tensor,
+    tiled_st16: object,
+    tST16tS: cute.Tensor,
+    tST16cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    ld_chunks: int,
+    m_block: cutlass.Int32,
+    n_block: cutlass.Int32,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+) -> Float32:
+    """Causal Rep32 staged-P variant."""
+    p_sum = cutlass.Float32(0.0)
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    split_ld_chunks = ld_chunks * 3 // 4
+    pair_chunks = split_ld_chunks // 2
+    for pair_ci in range(pair_chunks):
+        ld_ci0 = pair_ci * 2
+        ld_ci1 = ld_ci0 + 1
+        frg0 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        frg1 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg0)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg1)
+        causal_mask_t2r_chunk(
+            frg0,
+            cast("cute.Tensor", tLDcS[None, ld_ci0, None, None]),
+            m_block,
+            n_block,
+            ld_ci0,
+        )
+        causal_mask_t2r_chunk(
+            frg1,
+            cast("cute.Tensor", tLDcS[None, ld_ci1, None, None]),
+            m_block,
+            n_block,
+            ld_ci1,
+        )
+        _disc_chunk_exp(
+            frg0, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+        )
+        _disc_chunk_exp(
+            frg1,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ld_ci1 >= ld_chunks - 1,
+        )
+        _disc_chunk_pair_convert_store(
+            frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
+        )
+        p_sum = p_sum + _disc_chunk_rowsum(frg0) + _disc_chunk_rowsum(frg1)
+    ld_ci = pair_chunks * 2
+    if cutlass.const_expr(split_ld_chunks % 2 != 0):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ld_ci, None, None], frg)
+        causal_mask_t2r_chunk(
+            frg,
+            cast("cute.Tensor", tLDcS[None, ld_ci, None, None]),
+            m_block,
+            n_block,
+            ld_ci,
+        )
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ld_ci >= ld_chunks - 1,
+        )
+        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ld_ci, io_dtype)
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+        ld_ci += 1
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    for ci in range(ld_ci, ld_chunks):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
+        causal_mask_t2r_chunk(
+            frg,
+            cast("cute.Tensor", tLDcS[None, ci, None, None]),
+            m_block,
+            n_block,
+            ci,
+        )
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= ld_chunks - 1,
+        )
+        _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
+        p_sum = p_sum + _disc_chunk_rowsum(frg)
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    return p_sum
+
+
 def fa4_disc_zero_store(
     tiled_st: object,
     tSTtS: cute.Tensor,
@@ -948,6 +1715,8 @@ def fa4_disc_zero_store(
     pfor2_ptr_stage: object,
     p_store_split: int,
     p_store_chunks: int,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
 ) -> Float32:
     """Store a zero P tile while preserving the staged-P MMA handshake."""
     st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
@@ -956,12 +1725,379 @@ def fa4_disc_zero_store(
         for i in range(cute.size(pchunk)):
             pchunk[i] = cutlass.Float32(0.0)
         cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
-        if ci == p_store_split - 1:
-            cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(pfor_ptr_stage)
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
-    cute.arch.mbarrier_arrive(pfor2_ptr_stage)
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return cutlass.Float32(0.0)
+
+
+@dsl_user_op
+def fa4_store_o_smem_to_gmem(
+    gmem_tiled_copy: object,
+    gmem_thr_copy: object,
+    tOsO: cute.Tensor,
+    tOgO: cute.Tensor,
+    io_dtype: type[Numeric] = cutlass.Float16,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """FA4-style epilogue-warp vector store from staged sO to gmem."""
+    tOgO_epi = cast("Any", gmem_thr_copy).partition_D(tOgO)
+    for rest_m in range(cute.size(tOsO, mode=[1])):
+        src = cast("cute.Tensor", tOsO[None, rest_m, None])
+        out = cute.make_fragment_like(src, io_dtype)
+        cute.autovec_copy(src, out)
+        cute.copy(
+            gmem_tiled_copy,
+            out,
+            tOgO_epi[None, rest_m, None],
+        )
+
+
+@dsl_user_op
+def fa4_store_o_smem_to_gmem_whole(
+    gmem_tiled_copy: object,
+    gmem_thr_copy: object,
+    tOsO: cute.Tensor,
+    tOgO: cute.Tensor,
+    io_dtype: type[Numeric] = cutlass.Float16,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """FA4-style epilogue store with one whole-tile smem-to-register copy."""
+    tOgO_epi = cast("Any", gmem_thr_copy).partition_D(tOgO)
+    out = cute.make_fragment_like(tOsO, io_dtype)
+    cute.autovec_copy(tOsO, out)
+    for rest_m in range(cute.size(out, mode=[1])):
+        cute.copy(
+            gmem_tiled_copy,
+            out[None, rest_m, None],
+            tOgO_epi[None, rest_m, None],
+        )
+
+
+def _fa4_sp_exp_convert_store_impl(
+    tLDrS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    whole_row_sum: bool = False,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    tSTrS = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
+    tSTrS_e = cute.make_tensor(
+        cute.recast_ptr(tSTrS.iterator, dtype=io_dtype), tLDrS.layout
+    )
+    src = cute.logical_divide(tLDrS, cute.make_layout(32))
+    dst = cute.logical_divide(tSTrS_e, cute.make_layout(32))
+    frag_count = cute.size(tLDrS) // 32
+    for ci in range(frag_count):
+        frg = cast("cute.Tensor", src[None, ci])
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= frag_count - 1,
+        )
+        cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
+    for ci in range(p_store_chunks):
+        cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    if cutlass.const_expr(whole_row_sum):
+        return fadd_reduce_packed(tLDrS)
+    p_sum = cutlass.Float32(0.0)
+    for ci in range(frag_count):
+        p_sum = p_sum + _disc_chunk_rowsum(cast("cute.Tensor", src[None, ci]))
+    return p_sum
+
+
+@dsl_user_op
+def fa4_sp_exp_convert_store(
+    tLDrS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """Whole-row PASS2 with fused exp2, row-sum, convert, and P-store."""
+    return _fa4_sp_exp_convert_store_impl(
+        tLDrS,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        pfor_ptr_stage,
+        pfor2_ptr_stage,
+        p_store_split,
+        p_store_chunks,
+        io_dtype,
+        pfor_peer_cta_rank,
+        pfor_self_cta_rank,
+    )
+
+
+@dsl_user_op
+def fa4_sp_exp_convert_store_whole_rowsum(
+    tLDrS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """Whole-row PASS2 with a single packed row-sum over the full row."""
+    return _fa4_sp_exp_convert_store_impl(
+        tLDrS,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        pfor_ptr_stage,
+        pfor2_ptr_stage,
+        p_store_split,
+        p_store_chunks,
+        io_dtype,
+        pfor_peer_cta_rank,
+        pfor_self_cta_rank,
+        True,
+    )
+
+
+def _fa4_sp_exp_convert_store_rep32_split_impl(
+    tLDrS: cute.Tensor,
+    tiled_st32: object,
+    tST32tS: cute.Tensor,
+    tST32cS: cute.Tensor,
+    tiled_st16: object,
+    tST16tS: cute.Tensor,
+    tST16cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    whole_row_sum: bool = False,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    src = cute.logical_divide(tLDrS, cute.make_layout(32))
+    frag_count = cute.size(tLDrS) // 32
+    for ci in range(frag_count):
+        frg = cast("cute.Tensor", src[None, ci])
+        _disc_chunk_exp(
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            ci >= frag_count - 1,
+        )
+    split_ld_chunks = frag_count * 3 // 4
+    pair_chunks = split_ld_chunks // 2
+    for pair_ci in range(pair_chunks):
+        _disc_chunk_pair_convert_store(
+            cast("cute.Tensor", src[None, pair_ci * 2]),
+            cast("cute.Tensor", src[None, pair_ci * 2 + 1]),
+            tiled_st32,
+            tST32tS,
+            tST32cS,
+            pair_ci,
+            io_dtype,
+        )
+    ld_ci = pair_chunks * 2
+    if cutlass.const_expr(split_ld_chunks % 2 != 0):
+        _disc_chunk_convert_store(
+            cast("cute.Tensor", src[None, ld_ci]),
+            tiled_st16,
+            tST16tS,
+            tST16cS,
+            ld_ci,
+            io_dtype,
+        )
+        ld_ci += 1
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    for ci in range(ld_ci, frag_count):
+        _disc_chunk_convert_store(
+            cast("cute.Tensor", src[None, ci]),
+            tiled_st16,
+            tST16tS,
+            tST16cS,
+            ci,
+            io_dtype,
+        )
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    if cutlass.const_expr(whole_row_sum):
+        return fadd_reduce_packed(tLDrS)
+    p_sum = cutlass.Float32(0.0)
+    for ci in range(frag_count):
+        p_sum = p_sum + _disc_chunk_rowsum(cast("cute.Tensor", src[None, ci]))
+    return p_sum
+
+
+def fa4_sp_exp_convert_store_rep32_split(
+    tLDrS: cute.Tensor,
+    tiled_st32: object,
+    tST32tS: cute.Tensor,
+    tST32cS: cute.Tensor,
+    tiled_st16: object,
+    tST16tS: cute.Tensor,
+    tST16cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """Whole-row PASS2 with Rep32 stores before the staged-P split boundary."""
+    return _fa4_sp_exp_convert_store_rep32_split_impl(
+        tLDrS,
+        tiled_st32,
+        tST32tS,
+        tST32cS,
+        tiled_st16,
+        tST16tS,
+        tST16cS,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        pfor_ptr_stage,
+        pfor2_ptr_stage,
+        io_dtype,
+        pfor_peer_cta_rank,
+        pfor_self_cta_rank,
+    )
+
+
+def fa4_sp_exp_convert_store_rep32_split_whole_rowsum(
+    tLDrS: cute.Tensor,
+    tiled_st32: object,
+    tST32tS: cute.Tensor,
+    tST32cS: cute.Tensor,
+    tiled_st16: object,
+    tST16tS: cute.Tensor,
+    tST16cS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """Whole-row PASS2 with Rep32 stores and one packed full-row sum."""
+    return _fa4_sp_exp_convert_store_rep32_split_impl(
+        tLDrS,
+        tiled_st32,
+        tST32tS,
+        tST32cS,
+        tiled_st16,
+        tST16tS,
+        tST16cS,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        pfor_ptr_stage,
+        pfor2_ptr_stage,
+        io_dtype,
+        pfor_peer_cta_rank,
+        pfor_self_cta_rank,
+        True,
+    )
 
 
 def _disc_chunk_rowsum(frg: cute.Tensor) -> Float32:
@@ -983,8 +2119,8 @@ def _disc_pin_frag(frg: cute.Tensor, *, loc: object = None, ip: object = None) -
     NOR sink the producing LDTM past it, so the prefetched load stays live ABOVE the
     barrier and its TMEM-read latency overlaps the current chunk's exp2 burst. The body
     emits NOTHING (the values pass through), so it costs zero SASS instructions; it only
-    constrains scheduling. Verbatim port of the spike ``_sched_barrier`` "operand" form
-    (.scratch/fa4_faithful_spike.py), which was the DECISIVE pin mechanism (the empty
+    constrains scheduling. This follows the ``_sched_barrier`` operand form, which
+    was the decisive pin mechanism (the empty
     "bar"/"memfence" forms were re-derived to byte-identical SASS)."""
     n = cute.size(frg)
     ops = [
@@ -1021,6 +2157,8 @@ def fa4_disc_exp_convert_store_pipe(
     p_store_chunks: int,
     pipe_depth: int,
     io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
 ) -> Float32:
     """SOFTWARE-PIPELINED chunked-t2r PASS 2 (the L1 lever). Same numerics + staged-P
     handshake + zero-spill peak (ONE chunk + a bounded pipeline window) as the serial
@@ -1029,8 +2167,8 @@ def fa4_disc_exp_convert_store_pipe(
     chunk's TMEM-read latency overlaps the current chunk's XU(exp2) burst instead of
     stalling on the bulk ``tcgen05.wait::ld`` (attacks long_scoreboard).
 
-    Ordering per the spike's PROVEN FA4_T2R_PIN form (.scratch/fa4_faithful_spike.py
-    ``_disc_pass2_exp``): issue the next prefetch, then ``_disc_pin_frag`` (a
+    Ordering follows the FA4_T2R_PIN ``_disc_pass2_exp`` form: issue the next
+    prefetch, then ``_disc_pin_frag`` (a
     side-effecting inline-asm scheduling barrier with a live data dependency on the
     prefetched fragment) so ptxas cannot sink the freshly-issued LDTM down to be
     adjacent to its later FFMA2 consumer, then ``fence_view_async_tmem_load`` to drain
@@ -1078,11 +2216,15 @@ def fa4_disc_exp_convert_store_pipe(
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)
-        if ci == p_store_split - 1:
-            cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(pfor_ptr_stage)
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
-    cute.arch.mbarrier_arrive(pfor2_ptr_stage)
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
 
 
@@ -1106,6 +2248,8 @@ def fa4_disc_exp_convert_store_pipe_causal(
     m_block: cutlass.Int32,
     n_block: cutlass.Int32,
     io_dtype: object = cutlass.Float16,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store_pipe``."""
     p_sum = cutlass.Float32(0.0)
@@ -1139,11 +2283,15 @@ def fa4_disc_exp_convert_store_pipe_causal(
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)
-        if ci == p_store_split - 1:
-            cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(pfor_ptr_stage)
+        if cutlass.const_expr(pfor2_ptr_stage is not None):
+            if ci == p_store_split - 1:
+                cute.arch.fence_view_async_tmem_store()
+                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     cute.arch.fence_view_async_tmem_store()
-    cute.arch.mbarrier_arrive(pfor2_ptr_stage)
+    if cutlass.const_expr(pfor2_ptr_stage is None):
+        mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
 
 
@@ -1157,11 +2305,12 @@ def rescale_o_tmem(
     """O = alpha * O in place in TMEM (t2r -> scale -> r2t).
 
     hd64 defaults to 32-col chunks to stay within the tightest register budgets.
-    Manual FA4 experiments can opt into 64-col chunks to reduce loop/address
+    FA4-style kernels may use 8-col chunks to lower correction-register pressure,
+    while manual experiments can opt into 64-col chunks to reduce loop/address
     overhead where that larger fragment still compiles.
     """
     corr_tile_size = 32 if head_dim == 64 else 16
-    if rescale_chunk_cols in (16, 32, 64) and head_dim % rescale_chunk_cols == 0:
+    if rescale_chunk_cols in (8, 16, 32, 64) and head_dim % rescale_chunk_cols == 0:
         corr_tile_size = rescale_chunk_cols
     cO = cute.make_identity_tensor((128, head_dim))
     tOcO = cute.make_tensor(cO.iterator, cO.layout)
@@ -1213,8 +2362,8 @@ def _scale_fragment_packed_f32x2(frg: cute.Tensor, scale: object) -> None:
 # fmax_reduce, arch>=100 path).  The naive cute TensorSSA ``.reduce(ADD/MAX)``
 # over the per-thread 128-wide softmax row lowers to a SINGLE-accumulator
 # serial FADD/FMNMX chain (~128 deep -> a ~512-cycle serial critical path per
-# KV tile).  SASS diff vs FA4 (.scratch/sass_diff/SASS_DIFF_REPORT.md) pinned
-# this as the dominant softmax-consumer stall: the scheduler blocks on the
+# KV tile). SASS comparison against FA4 pinned this as the dominant
+# softmax-consumer stall: the scheduler blocks on the
 # running accumulator even though independent exp2 work exists, dropping issue
 # rate to ~1/14 cyc and starving the XU (exp2) pipe to ~42% (FA4 ~75%).  These
 # helpers break the chain into 4 INDEPENDENT packed-f32x2 accumulators (8
@@ -1234,7 +2383,7 @@ def _fmax3(
 
     The installed CuTe-DSL ``nvvm.fmax`` infers its result type (no leading
     result-type positional, unlike the FA4 reference); passing ``T.f32()`` as a
-    3rd positional is rejected. Validated in .scratch/red_validate_spike.py.
+    3rd positional is rejected.
     """
     return cutlass.Float32(
         nvvm.fmax(
@@ -1301,3 +2450,88 @@ def fmax_reduce_packed(frg: cute.Tensor, init_val: object = None) -> Float32:
         local_max[3] = _fmax3(local_max[3], frg[i + 6], frg[i + 7])
     local_max[0] = _fmax3(local_max[0], local_max[1])
     return _fmax3(local_max[0], local_max[2], local_max[3])
+
+
+# ===========================================================================
+# Position-independent swizzled SMEM store helpers. Faithful inlined ports of
+# the ``quack.copy_utils`` / ``quack.layout_utils`` utilities the flash epilogue
+# uses, kept here so the generated flash module does NOT ``import quack`` at
+# runtime -- Helion never hard-depends on quack being installed (see
+# ``clc_helpers.py``). Behaviour is identical to the quack originals.
+# ===========================================================================
+
+
+def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    """Reselect layout modes of ``a`` while keeping its iterator."""
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
+def swizzle_int(ptr_int: object, b: int, m: int, s: int) -> object:
+    """Apply a CuTe swizzle to a raw integer pointer value."""
+    bit_msk = (1 << b) - 1
+    yyy_msk = bit_msk << (m + s)
+    return ptr_int ^ ((ptr_int & yyy_msk) >> s)  # pyrefly: ignore[unsupported-operation]
+
+
+def swizzle_ptr(ptr: cute.Pointer) -> cute.Pointer:
+    """Bake a pointer's swizzle into its address."""
+    swz = ptr.type.swizzle_type  # pyrefly: ignore[missing-attribute]
+    ptr_int = swizzle_int(ptr.toint(), swz.num_bits, swz.num_base, swz.num_shift)
+    return cute.make_ptr(ptr.dtype, ptr_int, ptr.memspace, assumed_align=ptr.alignment)
+
+
+def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
+    """Recast a swizzled smem tensor to an equivalent position-independent layout."""
+    outer = tensor.layout
+    width = tensor.element_type.width  # pyrefly: ignore[missing-attribute]
+    swizzle_type = tensor.iterator.type.swizzle_type  # pyrefly: ignore[missing-attribute]
+    inner = cute.make_swizzle(
+        swizzle_type.num_bits, swizzle_type.num_base, swizzle_type.num_shift
+    )
+    # Recast the swizzle from byte units (e.g. <3, 4, 3>) to element units (e.g.
+    # <3, 3, 3> for 16-bit and <3, 2, 3> for 32-bit).
+    new_layout = cute.recast_layout(
+        width,
+        8,
+        cute.make_composed_layout(inner, 0, cute.recast_layout(8, width, outer)),
+    )
+    # recast_ptr to remove the pointer swizzle.
+    return cute.make_tensor(
+        cute.recast_ptr(tensor.iterator, dtype=tensor.element_type), new_layout
+    )
+
+
+def partition_D_position_independent(
+    thr_copy: object, tensor: cute.Tensor
+) -> cute.Tensor:
+    """Partition ``tensor`` for a store while keeping the swizzle position-independent."""
+    return cute.make_tensor(
+        swizzle_ptr(thr_copy.partition_D(tensor).iterator),  # pyrefly: ignore[missing-attribute]
+        thr_copy.partition_D(as_position_independent_swizzle_tensor(tensor)).layout,  # pyrefly: ignore[missing-attribute]
+    )
+
+
+@dsl_user_op
+def cvt_copy(
+    tiled_copy: object,
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    *,
+    pred: object = None,
+    retile: bool = False,
+    loc: object = None,
+    ip: object = None,
+    **kwargs: object,
+) -> None:
+    """Convert an rmem source fragment to ``dst``'s dtype (if needed) then copy."""
+    assert (
+        isinstance(src.iterator, cute.Pointer)
+        and src.memspace == cute.AddressSpace.rmem
+    )
+    if cutlass.const_expr(src.element_type != dst.element_type):
+        src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
+        src_cvt.store(src.load().to(dst.element_type))
+        src = src_cvt
+    if cutlass.const_expr(retile):
+        src = tiled_copy.retile(src)  # pyrefly: ignore[missing-attribute]
+    cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)

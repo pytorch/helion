@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ... import exc
 from ...language import _decorators
 from ...language.quantized_ops import float4_e2m1fn_x2_to_float32
+from ...language.quantized_ops import load_float4_e2m1fn_x16_to_float16
 from ..ast_extension import expr_from_string
 
 if TYPE_CHECKING:
@@ -31,3 +33,8 @@ def _(state: CodegenState) -> list[ast.AST]:
         expr_from_string(f"{result.id}[0]"),
         expr_from_string(f"{result.id}[1]"),
     ]
+
+
+@_decorators.codegen(load_float4_e2m1fn_x16_to_float16, "cute")
+def _(state: CodegenState) -> list[ast.AST]:
+    raise exc.BackendUnsupported("cute", "load_float4_e2m1fn_x16_to_float16")
