@@ -1641,11 +1641,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_multi_root_search_keeps_persistent_pid_types_out(
+    def test_cute_tcgen05_multi_root_search_disables_tcgen05(
         self,
     ) -> None:
-        """Multi-root tcgen05 kernels keep persistent pid types out of autotune
-        until the persistent scheduler/grid spans every root case."""
+        """Distinct analyzed matmul axes cannot share one tcgen05 config."""
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1656,10 +1655,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with patch_cute_mma_support():
             bound = _cute_two_matmuls_kernel.bind(args)
         spec = bound.config_spec
-        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
-        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
-        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertFalse(spec.cute_tcgen05_search_enabled)
+        self.assertIsNone(spec._tcgen05_cluster_m_search_choices)
+        self.assertIsNone(spec._tcgen05_num_epi_warps_search_choices)
+        self.assertIsNone(spec._cute_tcgen05_config.matmul_block_ids)
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_candidate_collection_ignores_ineligible_matmul(
@@ -1681,10 +1682,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_multi_root_forced_persistent_raises_invalid_config(
+    def test_cute_tcgen05_multi_root_forced_persistent_disables_tcgen05(
         self,
     ) -> None:
-        """Forced-persistent multi-root tcgen05 has no valid pid search choice."""
+        """Forced persistence remains valid on the generic CuTe path."""
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1692,21 +1693,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with (
-            patch_cute_mma_support(),
-            self.assertRaisesRegex(
-                InvalidConfig,
-                "CuTe tcgen05 multi-root kernels do not support persistent pid types",
-            ),
-        ):
-            _cute_two_matmuls_force_persistent_kernel.bind(args)
+        with patch_cute_mma_support():
+            bound = _cute_two_matmuls_force_persistent_kernel.bind(args)
+        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_multi_root_distributed_keeps_persistent_pid_types_out(
+    def test_cute_tcgen05_multi_root_distributed_disables_tcgen05_search(
         self,
     ) -> None:
-        """Distributed alone does not force persistent-only; without a
-        barrier/symm-mem signal this kernel narrows to non-persistent pid types."""
+        """Ambiguous distributed matmul axes stay on the generic search."""
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
@@ -1733,9 +1728,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
         ):
             bound = _cute_two_matmuls_kernel.bind(args)
-        spec = bound.config_spec
-        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
-        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
 
     def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
         """Direct unit test for the narrowing helper that does not depend
