@@ -837,7 +837,9 @@ def chunk_bwd_wy_dL_delta_helion(
             decay_exp = torch.exp2(decay * RCP_LN2)[:, :, None]  # [1, C, 1]
             causal = idx[:, None] >= idx[None, :]
             L = torch.where(
-                causal, torch.exp2((decay[:, :, None] - decay[:, None, :]) * RCP_LN2), 0.0
+                causal,
+                torch.exp2((decay[:, :, None] - decay[:, None, :]) * RCP_LN2),
+                0.0,
             )
 
         dAinv = hl.zeros([tile_bhn, C, C], dtype=torch.float32)

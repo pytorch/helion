@@ -136,7 +136,7 @@ def chunked_linear_attn_reference(
         if bi is not None:
             # Sequential beta-correction recurrence, checkpointed per chunk to
             # avoid OOMs.
-            chunk_out, state = checkpoint(
+            chunk_out, state = checkpoint(  # pyrefly: ignore[not-iterable]
                 correction_chunk,
                 qi,
                 ki,
