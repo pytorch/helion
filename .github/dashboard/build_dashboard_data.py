@@ -75,9 +75,12 @@ def get_expected_kernels_per_platform(workflow_path):
             continue
         md = input_default.match(line)
         if md:
-            input_defaults[current] = {
-                k.strip() for k in md.group(1).split(",") if k.strip()
-            }
+            names = {k.strip() for k in md.group(1).split(",") if k.strip()}
+            # The linattn suite lists variant names only; each variant emits a
+            # forward and a forward+backward ("-bwd") dashboard row, so expect both.
+            if current == "kernels_linattn":
+                names |= {f"{n}-bwd" for n in names}
+            input_defaults[current] = names
             current = None
     return {
         plat: set().union(

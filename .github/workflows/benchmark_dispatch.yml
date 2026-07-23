@@ -75,10 +75,10 @@ on:
         type: string
         default: "vector_add,layer_norm,rms_norm,vector_exp,sum"
       kernels_linattn:
-        description: 'Comma-separated list of linear-attention variants (vs FLA) from benchmarks/run_linattn.py::VARIANTS; each appears on the dashboard as both a forward and a -bwd row.'
+        description: 'Comma-separated list of linear-attention variants (vs FLA) from benchmarks/run_linattn.py::VARIANTS; the matrix shards these and each run emits a forward and a forward+backward ("-bwd") dashboard row.'
         required: false
         type: string
-        default: "vanilla_linear_attn,vanilla_linear_attn-bwd,simple_gla,simple_gla-bwd,retention,retention-bwd,full_gla,full_gla-bwd,delta_rule,delta_rule-bwd,gated_delta_rule,gated_delta_rule-bwd,kda,kda-bwd"
+        default: "vanilla_linear_attn,simple_gla,retention,full_gla,delta_rule,gated_delta_rule,kda"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -210,9 +210,19 @@ jobs:
       kernels: ${{ github.event.inputs.kernels_tpu }}
       env-vars: ${{ github.event.inputs.env_vars }}
 
-  run-b200-linattn:
+  gen-matrix-b200-linattn:
     if: ${{ github.event.inputs.run_b200_linattn == 'true' }}
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    with:
+      max-runners: 7
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+
+  run-b200-linattn:
+    needs: gen-matrix-b200-linattn
     uses: ./.github/workflows/benchmark.yml
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gen-matrix-b200-linattn.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
@@ -224,12 +234,22 @@ jobs:
       container-options: --gpus all
       alias: b200
       suite: linattn
-      kernels: ${{ github.event.inputs.kernels_linattn }}
+      kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
 
-  run-h100-linattn:
+  gen-matrix-h100-linattn:
     if: ${{ github.event.inputs.run_h100_linattn == 'true' }}
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    with:
+      max-runners: 7
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+
+  run-h100-linattn:
+    needs: gen-matrix-h100-linattn
     uses: ./.github/workflows/benchmark.yml
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gen-matrix-h100-linattn.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
@@ -241,7 +261,7 @@ jobs:
       container-options: --gpus all
       alias: h100
       suite: linattn
-      kernels: ${{ github.event.inputs.kernels_linattn }}
+      kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
 
   run-tpu-bridge:
