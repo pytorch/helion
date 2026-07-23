@@ -146,6 +146,8 @@ class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
         self, settings: Settings, *, args: tuple[object, ...] = ()
     ) -> BaseSearch:
+        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
+        # its attributes, so new __init__ fields don't need to be added here.
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
@@ -161,6 +163,8 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
+        search._search_summary = None
+        search._exploration_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,
@@ -5890,6 +5894,8 @@ class TestFiniteSearchWarmStart(TestCase):
 @onlyBackends(["triton", "cute"])
 class TestAutotuneBudget(TestCase):
     def _make_search(self, settings: Settings) -> BaseSearch:
+        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
+        # its attributes, so new __init__ fields don't need to be added here.
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
@@ -5905,6 +5911,8 @@ class TestAutotuneBudget(TestCase):
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
+        search._search_summary = None
+        search._exploration_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,

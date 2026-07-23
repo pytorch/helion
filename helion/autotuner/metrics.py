@@ -40,6 +40,7 @@ class AutotuneMetrics:
     kernel_name: str = ""
     kernel_source: str = ""
     input_shapes: str = ""
+    dtypes: str = ""
     hardware: str = ""
     random_seed: int = 0
     search_algorithm: str = ""
@@ -52,6 +53,7 @@ class AutotuneMetrics:
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
+            "dtypes": self.dtypes,
             "hardware": self.hardware,
             "random_seed": self.random_seed,
             "search_algorithm": self.search_algorithm,

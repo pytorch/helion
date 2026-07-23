@@ -265,6 +265,7 @@ class CompileEnvironment:
             target_device_capability=target_device_capability(device),
             device=device,
             num_sm=_num_sm,
+            log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
@@ -313,11 +314,17 @@ class CompileEnvironment:
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
         if settings.autotune_force_persistent or dist.is_initialized():
+            reason = (
+                "autotune_force_persistent is set"
+                if settings.autotune_force_persistent
+                else "a distributed process group is initialized (persistent "
+                "kernels required)"
+            )
             for pid_type in (
                 "flat",
                 "xyz",
             ):
-                self.config_spec.disallow_pid_type(pid_type)
+                self.config_spec.disallow_pid_type(pid_type, reason=reason)
 
         # CUDA symmetric-memory persistent-kernel sizing only. Guard on CUDA: the
         # Pallas/TPU backend traces with a cpu-device torch tensor (the torch<->jax
