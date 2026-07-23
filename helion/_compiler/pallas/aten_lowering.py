@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 from torch.fx.node import Node
@@ -28,6 +29,7 @@ from ..aten_lowering import argmax_lowering
 from ..aten_lowering import argmin_lowering
 from ..aten_lowering import baddbmm_lowering
 from ..aten_lowering import bmm_lowering
+from ..aten_lowering import constant_pad_nd_lowering
 from ..aten_lowering import expand_lowering
 from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
@@ -75,6 +77,36 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
                 tensor=tensor,
             )
     return expr_from_string(f"jnp.reshape({{tensor}}, {shape_str})", tensor=tensor)
+
+
+@constant_pad_nd_lowering.register_codegen("pallas")
+def codegen_constant_pad_nd_pallas(ctx: LoweringContext, node: Node) -> object:
+    """``F.pad(x, pad, value)`` (aten.constant_pad_nd) -> inline ``jnp.pad``.
+
+    Mosaic lacks a direct constant_pad_nd lowering, so emit a fused ``jnp.pad``.
+    ``pad`` is aten's flat, from-the-last-dim format
+    ``[last_lo, last_hi, 2ndlast_lo, 2ndlast_hi, ...]``; convert to jnp's per-dim
+    ``((lo, hi), ...)`` ordered from the first dim. Used e.g. to pad a top-k
+    output up to a 128-aligned width so the store is Mosaic-tile-aligned on jax
+    0.10.0 without computing a wider top-k.
+    """
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    pad = [int(p) for p in cast("list[int]", node.args[1])]  # static pad widths
+    value = node.args[2] if len(node.args) > 2 else node.kwargs.get("value", 0)
+    ndim = node.meta["val"].ndim
+    npad = len(pad) // 2
+    pad_width = [
+        (pad[2 * (ndim - 1 - j)], pad[2 * (ndim - 1 - j) + 1])
+        if (ndim - 1 - j) < npad
+        else (0, 0)
+        for j in range(ndim)
+    ]
+    pw = "(" + ", ".join(f"({lo}, {hi})" for lo, hi in pad_width) + ")"
+    return expr_from_string(
+        f"jnp.pad({{t}}, {pw}, mode='constant', constant_values={value!r})",
+        t=tensor,
+    )
 
 
 @permute_lowering.register_codegen("pallas")
