@@ -15,6 +15,7 @@ from typing import Callable
 from typing import TypeVar
 
 import torch
+from torch.utils._pytree import tree_leaves
 
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
@@ -129,6 +130,37 @@ def synchronize_device() -> None:
         torch.accelerator.synchronize()
 
 
+def _materialize_output(out: object) -> None:
+    """Force ``out`` to finish computing on-device, then drain the device.
+
+    ``synchronize_device()`` is a device-wide barrier: it waits for work that
+    has already been *dispatched*, but it does not *trigger* a lazily-executed
+    graph. On TorchTPU a ``torch.compile`` baseline (and lazily-materialized
+    kernels) record their work and defer it, so the barrier returns before that
+    work runs; the deferred work then executes inside the *next* timed
+    candidate's window, inflating that candidate's time while the lazy one is
+    measured as ~0ms. Waiting on the specific output tensor forces this
+    candidate's work to materialize inside its own timing window.
+
+    Non-TPU tensors dispatch eagerly (CUDA/CuTe), so there is nothing to force
+    and we just drain the device — leaving those backends' timing unchanged.
+    """
+    tpu_tensors = [
+        leaf
+        for leaf in tree_leaves(out)
+        if isinstance(leaf, torch.Tensor) and leaf.device.type == "tpu"
+    ]
+    if tpu_tensors:
+        # A device-wide sync alone will not trigger the lazy graph; wait on the
+        # produced tensors so their work runs before we stop the timer.
+        from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
+            synchronize as _tpu_sync,
+        )
+
+        _tpu_sync(tpu_tensors, wait=True)
+    synchronize_device()
+
+
 def compute_repeat(
     fn: Callable[[], object],
     *,
@@ -185,7 +217,7 @@ def compute_repeat_generic(
     """
     # Warm the pipeline once before collecting timing samples.
     _output = fn()
-    synchronize_device()
+    _materialize_output(_output)
 
     clear_l2 = _make_l2_cache_clearer()
     start = time.perf_counter()
@@ -193,7 +225,7 @@ def compute_repeat_generic(
         clear_l2()
         # Keep the latest asynchronous output alive through synchronization.
         _output = fn()
-    synchronize_device()
+    _materialize_output(_output)
     end = time.perf_counter()
 
     estimate_ms = (end - start) * 1000 / max(estimate_runs, 1)
@@ -286,7 +318,7 @@ def interleaved_bench_generic(
     _output: object = None
     for fn in fns:
         _output = fn()
-    synchronize_device()
+    _materialize_output(_output)
 
     clear_l2 = _make_l2_cache_clearer()
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
@@ -302,10 +334,11 @@ def interleaved_bench_generic(
             clear_l2()
             synchronize_device()
             start = time.perf_counter()
-            # Dropping an asynchronous output before the sync can trigger device
-            # buffer destruction inside the timed region.
+            # Wait on this candidate's own output so its (possibly lazy) work
+            # materializes inside its timing window; a device-wide barrier
+            # would let a lazy candidate defer work into the next one's window.
             _output = fns[j]()
-            synchronize_device()
+            _materialize_output(_output)
             end = time.perf_counter()
             all_times[j].append((end - start) * 1000)  # convert to ms
 
@@ -599,7 +632,7 @@ def do_bench_generic(
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
     _output = fn()
-    synchronize_device()
+    _materialize_output(_output)
 
     clear_l2 = _make_l2_cache_clearer()
 
@@ -610,7 +643,7 @@ def do_bench_generic(
         clear_l2()
         # Keep the latest asynchronous output alive through synchronization.
         _output = fn()
-    synchronize_device()
+    _materialize_output(_output)
     end = time.perf_counter()
     estimate_ms = sync_object(
         (end - start) * 1000 / 5, process_group_name=process_group_name
@@ -632,7 +665,7 @@ def do_bench_generic(
         synchronize_device()
         t0 = time.perf_counter()
         _output = fn()
-        synchronize_device()
+        _materialize_output(_output)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)
