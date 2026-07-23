@@ -127,6 +127,11 @@ _cute_two_matmuls_force_persistent_kernel = helion.kernel(
     backend="cute",
     autotune_force_persistent=True,
 )
+_cute_two_matmuls_distributed_kernel = helion.kernel(
+    _cute_two_matmuls_impl,
+    backend="cute",
+    distributed=True,
+)
 
 
 @helion.kernel(backend="cute")
@@ -1727,7 +1732,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             ),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
         ):
-            bound = _cute_two_matmuls_kernel.bind(args)
+            bound = _cute_two_matmuls_distributed_kernel.bind(args)
         self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
 
     def test_narrow_tcgen05_autotune_to_validated_configs_helper(self) -> None:
