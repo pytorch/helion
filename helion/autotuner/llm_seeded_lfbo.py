@@ -22,8 +22,10 @@ import time
 from typing import TYPE_CHECKING
 from typing import cast
 
+from .. import exc
 from .base_search import BaseSearch
 from .base_search import PopulationBasedSearch
+from .benchmark_provider import _MultiShapeAutotuneArgs
 from .effort_profile import QUICK_LLM_SEARCH_DEFAULTS
 from .llm.transport import DEFAULT_REQUEST_TIMEOUT_S
 from .llm_search import LLMGuidedSearch
@@ -283,7 +285,16 @@ class LLMSeededSearch(BaseSearch):
         )
         llm_search = self._make_llm_search()
         llm_start = time.perf_counter()
-        llm_seed_config = llm_search.autotune(skip_cache=True)
+        try:
+            llm_seed_config = llm_search.autotune(skip_cache=True)
+        except exc.NoConfigFound:
+            if not isinstance(self.args, _MultiShapeAutotuneArgs):
+                raise
+            llm_seed_config = None
+        if isinstance(self.args, _MultiShapeAutotuneArgs) and not math.isfinite(
+            llm_search.best_perf_so_far
+        ):
+            llm_seed_config = None
         llm_wall_time = time.perf_counter() - llm_start
         return llm_search, llm_seed_config, llm_wall_time
 
@@ -291,7 +302,7 @@ class LLMSeededSearch(BaseSearch):
         self,
         llm_seed_config: Config | None,
         llm_search: LLMGuidedSearch | None = None,
-    ) -> tuple[BaseSearch, Config, float]:
+    ) -> tuple[BaseSearch, Config | None, float]:
         """Run stage 2, optionally seeded from the stage-1 best config."""
         seeded = llm_seed_config is not None
         self.log(
@@ -308,7 +319,16 @@ class LLMSeededSearch(BaseSearch):
                 second_stage_search, llm_seed_config, llm_search
             )
         second_stage_start = time.perf_counter()
-        best_config = second_stage_search.autotune()
+        try:
+            best_config = second_stage_search.autotune()
+        except exc.NoConfigFound:
+            if not isinstance(self.args, _MultiShapeAutotuneArgs):
+                raise
+            best_config = None
+        if isinstance(self.args, _MultiShapeAutotuneArgs) and not math.isfinite(
+            second_stage_search.best_perf_so_far
+        ):
+            best_config = None
         second_stage_wall_time = time.perf_counter() - second_stage_start
         return second_stage_search, best_config, second_stage_wall_time
 
@@ -325,10 +345,15 @@ class LLMSeededSearch(BaseSearch):
         llm_metrics = llm_search._autotune_metrics if llm_search else None
         second_stage_metrics = second_stage_search._autotune_metrics
         second_stage_tested = second_stage_metrics.num_configs_tested
+        llm_perf = self._finite_perf(llm_search)
+        second_stage_perf = self._finite_perf(second_stage_search)
+        performance_unit = self.performance_unit
 
         self.hybrid_stage_breakdown = {
-            "used_llm_seed": llm_search is not None,
-            "llm_seed_perf_ms": self._finite_perf(llm_search),
+            "used_llm_seed": llm_seed_config is not None,
+            "objective_unit": performance_unit,
+            "llm_seed_objective": llm_perf,
+            "llm_seed_perf_ms": llm_perf if performance_unit == "ms" else None,
             "llm_seed_time_s": llm_wall_time,
             "llm_seed_configs_tested": (
                 llm_metrics.num_configs_tested if llm_metrics else 0
@@ -337,7 +362,10 @@ class LLMSeededSearch(BaseSearch):
                 dict(llm_seed_config) if llm_seed_config is not None else None
             ),
             "second_stage_algorithm": self.second_stage_algorithm,
-            "second_stage_perf_ms": self._finite_perf(second_stage_search),
+            "second_stage_objective": second_stage_perf,
+            "second_stage_perf_ms": (
+                second_stage_perf if performance_unit == "ms" else None
+            ),
             "second_stage_time_s": second_stage_wall_time,
             "second_stage_configs_tested": second_stage_tested,
         }
@@ -382,7 +410,11 @@ class LLMSeededSearch(BaseSearch):
             second_stage_search,
             second_stage_wall_time,
         )
-        return best_config
+        if best_config is not None:
+            return best_config
+        if llm_seed_config is not None:
+            return llm_seed_config
+        raise exc.NoConfigFound
 
 
 class LLMSeededLFBOTreeSearch(LLMSeededSearch):

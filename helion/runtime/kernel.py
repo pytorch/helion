@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
 import contextlib
 import dataclasses
 import functools
@@ -18,7 +19,7 @@ from typing import Any
 from typing import Callable
 from typing import Generic
 from typing import Hashable
-from typing import Sequence
+from typing import Literal
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -65,7 +66,6 @@ from .settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
-    from collections.abc import Sequence
 
     from torch._guards import Source
 
@@ -109,6 +109,52 @@ _TPU_COMPILE_CAPTURE = os.environ.get("HELION_TPU_COMPILE_CAPTURE", "0") == "1"
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
 _INT32_INDEX_LIMIT = torch.iinfo(torch.int32).max
+
+
+def _current_device_index(device_type: str) -> int:
+    device_module = getattr(torch, device_type, None)
+    current_device = getattr(device_module, "current_device", None)
+    if callable(current_device):
+        return cast("int", current_device())
+
+    accelerator = getattr(torch, "accelerator", None)
+    current_accelerator = getattr(accelerator, "current_accelerator", None)
+    current_device_index = getattr(accelerator, "current_device_index", None)
+    if callable(current_accelerator) and callable(current_device_index):
+        accelerator_device = cast("torch.device", current_accelerator())
+        if accelerator_device.type == device_type:
+            return cast("int", current_device_index())
+    raise exc.InvalidAPIUsage(
+        f"autotune_multi requires a current indexed accelerator, got {device_type!r}"
+    )
+
+
+def _canonicalize_multi_shape_device(device: torch.device) -> torch.device:
+    if device.type in ("cpu", "meta", "mps"):
+        raise exc.InvalidAPIUsage(
+            f"autotune_multi requires an indexed accelerator device, got {device}"
+        )
+    if device.index is not None:
+        return device
+    return torch.device(device.type, _current_device_index(device.type))
+
+
+def _has_unspecialized_numeric_value(value: object) -> bool:
+    """Return whether normal specialization records only a numeric value's type."""
+    if isinstance(value, ConstExpr):
+        return False
+    if type(value) in (bool, int, float):
+        return True
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return any(
+            _has_unspecialized_numeric_value(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        )
+    if isinstance(value, dict):
+        return any(_has_unspecialized_numeric_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_unspecialized_numeric_value(item) for item in value)
+    return False
 
 
 def _resolve_index_dtype(
@@ -476,6 +522,260 @@ class Kernel(Generic[_R]):
         """
         args = self.normalize_args(*args)
         return self.bind(args).autotune(args, force=force, **options)
+
+    def autotune_multi(
+        self,
+        arg_sets: Sequence[Sequence[object]],
+        *,
+        aggregation: Literal["geomean", "max"] = "geomean",
+        relative_to: Literal["default", "baseline"] | None = None,
+        cache_tag: str | None = None,
+        force: bool = True,
+        **options: object,
+    ) -> Config:
+        """Find one config using an objective measured across several inputs.
+
+        The first argument set anchors config generation. Each candidate is measured
+        on every set, then reduced with a geometric mean or maximum. ``relative_to``
+        optionally optimizes per-shape latency relative to each shape's default config
+        or custom baseline. Only the supplied bound specializations are configured.
+
+        Every argument set must bind normally to the same exact, current accelerator
+        device. Distributed processes are not supported. A non-empty ``cache_tag`` is
+        required for custom callbacks, dynamic-shape tuning, and runtime numeric
+        arguments; callers own tag invalidation in those cases.
+
+        Args:
+            arg_sets: Non-empty sequence of representative kernel argument sequences.
+            aggregation: Joint objective, either ``"geomean"`` or ``"max"``.
+            relative_to: Optional ``"default"`` or ``"baseline"`` normalization.
+            cache_tag: User-managed cache discriminator for dynamic shapes, runtime
+                numeric arguments, or callbacks.
+            force: If true, ignore pinned configs and cache reads during the search.
+            options: Additional options forwarded to the registered autotuner.
+
+        Returns:
+            The config selected for all supplied specializations.
+        """
+        from ..autotuner.benchmark_provider import LocalBenchmarkProvider
+        from ..autotuner.benchmark_provider import _has_valid_multi_shape_measurement
+        from ..autotuner.benchmark_provider import _materialize_multi_shape_config
+        from ..autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+        from .settings import default_autotuner_fn
+
+        if aggregation not in ("geomean", "max"):
+            raise exc.InvalidAPIUsage(
+                "autotune_multi aggregation must be 'geomean' or 'max'"
+            )
+        if relative_to not in (None, "default", "baseline"):
+            raise exc.InvalidAPIUsage(
+                "autotune_multi relative_to must be None, 'default', or 'baseline'"
+            )
+        if cache_tag is not None and (not isinstance(cache_tag, str) or not cache_tag):
+            raise exc.InvalidAPIUsage(
+                "autotune_multi cache_tag must be a non-empty string"
+            )
+        if (
+            not isinstance(arg_sets, Sequence)
+            or isinstance(arg_sets, (str, bytes))
+            or not arg_sets
+        ):
+            raise exc.InvalidAPIUsage(
+                "autotune_multi arg_sets must be a non-empty sequence"
+            )
+        if dist.is_initialized():
+            raise exc.InvalidAPIUsage(
+                "autotune_multi does not support an initialized distributed process group"
+            )
+        if self.settings.backend not in {"triton", "tileir", "cute", "pallas"}:
+            raise exc.InvalidAPIUsage(
+                f"autotune_multi does not support backend {self.settings.backend!r}"
+            )
+        if self.settings.autotuner_fn is not default_autotuner_fn:
+            raise exc.InvalidAPIUsage(
+                "autotune_multi requires the default registered autotuner"
+            )
+        if self.settings.autotune_cache == "AOTAutotuneCache":
+            raise exc.InvalidAPIUsage(
+                "autotune_multi does not support AOTAutotuneCache"
+            )
+        if self.settings.autotune_cache not in {
+            "LocalAutotuneCache",
+            "StrictLocalAutotuneCache",
+            "RemoteAutotuneCache",
+            "StrictRemoteAutotuneCache",
+        }:
+            raise exc.InvalidAPIUsage(
+                "autotune_multi requires a built-in local or remote best-config cache"
+            )
+        if "benchmark_provider_cls" in options:
+            if options.pop("benchmark_provider_cls") is not LocalBenchmarkProvider:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi does not support a custom benchmark provider"
+                )
+        if relative_to == "baseline" and self.settings.autotune_baseline_fn is None:
+            raise exc.InvalidAPIUsage(
+                "autotune_multi relative_to='baseline' requires autotune_baseline_fn"
+            )
+        if self.settings.autotune_benchmark_fn is not None:
+            raise exc.InvalidAPIUsage(
+                "autotune_multi does not support autotune_benchmark_fn"
+            )
+
+        custom_callbacks = (
+            self.settings.autotune_baseline_fn,
+            self.settings.autotune_baseline_accuracy_check_fn,
+            self.settings.autotune_config_filter,
+        )
+        if cache_tag is None and any(fn is not None for fn in custom_callbacks):
+            raise exc.InvalidAPIUsage(
+                "autotune_multi requires cache_tag when a custom baseline, "
+                "accuracy check, or config filter is configured"
+            )
+        if cache_tag is None and not self.settings.static_shapes:
+            raise exc.InvalidAPIUsage(
+                "autotune_multi requires cache_tag when static_shapes=False"
+            )
+
+        normalized_arg_sets: list[tuple[object, ...]] = []
+        for case_index, arg_set in enumerate(arg_sets):
+            if not isinstance(arg_set, Sequence) or isinstance(arg_set, (str, bytes)):
+                raise exc.InvalidAPIUsage(
+                    f"autotune_multi arg_sets[{case_index}] must be a sequence"
+                )
+            try:
+                normalized_arg_sets.append(self.normalize_args(*arg_set))
+            except TypeError as error:
+                raise exc.InvalidAPIUsage(
+                    f"autotune_multi arg_sets[{case_index}] does not match the "
+                    f"kernel signature: {error}"
+                ) from error
+
+        if cache_tag is None:
+            for case_index, normalized_args in enumerate(normalized_arg_sets):
+                if any(
+                    annotation is not ConstExpr
+                    and _has_unspecialized_numeric_value(value)
+                    for value, annotation in zip(
+                        normalized_args, self._annotations, strict=True
+                    )
+                ):
+                    raise exc.InvalidAPIUsage(
+                        "autotune_multi requires cache_tag when an argument set "
+                        "contains a runtime numeric value; "
+                        f"arg_sets[{case_index}] does"
+                    )
+
+        cases: list[tuple[BoundKernel[_R], tuple[object, ...]]] = []
+        case_keys: list[BoundKernelInMemoryCacheKey] = []
+        for case_index, normalized_args in enumerate(normalized_arg_sets):
+            try:
+                bound_kernel = self.bind(normalized_args)
+            except exc.NoTensorArgs as error:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi requires each argument set to have a device "
+                    f"discoverable by normal kernel binding; arg_sets[{case_index}] did not"
+                ) from error
+            signature = self._base_specialization_key(normalized_args)
+            case_key = self._get_bound_kernel_cache_key(normalized_args, signature)
+            assert case_key is not None
+            cases.append((bound_kernel, normalized_args))
+            case_keys.append(case_key)
+
+        anchor = cases[0][0]
+        canonical_device = _canonicalize_multi_shape_device(anchor.env.device)
+        current_index = _current_device_index(canonical_device.type)
+        if canonical_device.index != current_index:
+            raise exc.InvalidAPIUsage(
+                "autotune_multi requires the indexed accelerator to be current: "
+                f"got {canonical_device}, current index is {current_index}"
+            )
+
+        unique_bound_kernels: list[BoundKernel[_R]] = []
+        seen_bound_kernel_ids: set[int] = set()
+        for bound_kernel, _ in cases:
+            if id(bound_kernel) not in seen_bound_kernel_ids:
+                seen_bound_kernel_ids.add(id(bound_kernel))
+                unique_bound_kernels.append(bound_kernel)
+
+        anchor_backend = anchor.env.backend.name
+        anchor_capability = target_device_capability(anchor.env.device)
+        advanced_controls_files = self.settings.autotune_search_acf or None
+        anchor_fingerprint = anchor.config_spec.structural_fingerprint(
+            advanced_controls_files=advanced_controls_files
+        )
+        for case_index, (bound_kernel, _) in enumerate(cases):
+            if bound_kernel.env.process_group_name is not None:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi does not support a bound kernel with a process group"
+                )
+            bound_device = _canonicalize_multi_shape_device(bound_kernel.env.device)
+            if bound_device != canonical_device:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi bound a different device for "
+                    f"arg_sets[{case_index}]: {bound_device} != {canonical_device}"
+                )
+            if bound_kernel.env.backend.name != anchor_backend:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi requires every case to use the same backend"
+                )
+            if target_device_capability(bound_kernel.env.device) != anchor_capability:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi requires every case to have the same device capability"
+                )
+            fingerprint = bound_kernel.config_spec.structural_fingerprint(
+                advanced_controls_files=advanced_controls_files
+            )
+            if fingerprint != anchor_fingerprint:
+                raise exc.InvalidAPIUsage(
+                    "autotune_multi requires structurally compatible ConfigSpec "
+                    f"instances; arg_sets[{case_index}] is incompatible with the anchor"
+                )
+        multi_args = _MultiShapeAutotuneArgs(
+            cases=tuple(cases),
+            aggregation=aggregation,
+            relative_to=relative_to,
+            cache_tag=cache_tag,
+            workload_key=(
+                "multi_shape:v1",
+                aggregation,
+                relative_to,
+                cache_tag,
+                tuple(
+                    (case_key.specialization_key, case_key.extra_results)
+                    for case_key in case_keys
+                ),
+            ),
+            reference_latencies=None,
+        )
+
+        ephemeral = anchor.env.backend.make_ephemeral_cache()
+        ctx = ephemeral if ephemeral is not None else contextlib.nullcontext()
+        with ctx:
+            config = anchor.env.backend.autotune(
+                anchor,
+                cast("Sequence[object]", multi_args),
+                force=force,
+                **options,
+            )
+        if multi_args.search_started and not multi_args.found_valid_config:
+            raise exc.NoConfigFound
+        if multi_args.search_started and not _has_valid_multi_shape_measurement(
+            multi_args,
+            anchor.config_spec,
+            config,
+        ):
+            raise exc.NoConfigFound
+        winner = _materialize_multi_shape_config(anchor.config_spec, config)
+        if ephemeral is not None:
+            for bound_kernel in unique_bound_kernels:
+                bound_kernel.env.backend.finalize_ephemeral_cache(bound_kernel, winner)
+
+        for bound_kernel in unique_bound_kernels:
+            bound_kernel.compile_config(winner)
+        for bound_kernel in unique_bound_kernels:
+            bound_kernel.set_config(winner)
+        return winner
 
     def __call__(self, *args: object, **kwargs: object) -> _R:
         """
