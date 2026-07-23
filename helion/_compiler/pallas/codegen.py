@@ -40,12 +40,16 @@ def load_expr(
         if isinstance(pattern, IndirectGatherPattern):
             return emit_gather(state, pattern.plan, name)
 
-    idx_str, none_dims = index_str(state, subscript, tensor)
+    parts, none_dims = index_parts(state, list(subscript), tensor)
+    idx_str = ", ".join(parts)
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
     else:
         result = expr_from_string(f"{name}[{idx_str}]")
+    result = _narrow_loaded_value_for_pipeline_roundup(
+        state, list(subscript), tensor, parts, result
+    )
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
@@ -227,6 +231,105 @@ def _tensor_routed_to_fori_scratch(state: CodegenState, tensor: torch.Tensor) ->
     return isinstance(loop, ForiLoopState)
 
 
+def _tensor_in_emit_pipeline(state: CodegenState, tensor: torch.Tensor) -> bool:
+    """True if ``tensor`` is DMA-routed through an ``emit_pipeline`` loop.
+
+    ``emit_pipeline`` double-buffers its pipe inputs into a ``[2, *block_shape]``
+    VMEM scratch and slices them per step; on jax 0.10.0 Mosaic requires the
+    scratch dims to be aligned to the VMEM tile (see ``_pallas_round_full_dim``).
+    The launcher already rounds up the BlockSpec for these tensors (see
+    ``_pallas_build_pipeline_specs``); the codegen must mirror the rounding so
+    the store-pad / load-narrow it emits match.
+
+    Reuses the same active-loop scan as ``index_parts``, but filters specifically
+    for ``EmitPipelineLoopState`` (not ``ForiLoopState``, whose VMEM scratch for
+    loop-carried state does not have the alignment constraint).
+    """
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
+
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    for loop, _ref in _iter_dma_scratch_loops(state, tensor_name):
+        if isinstance(loop, EmitPipelineLoopState):
+            return True
+    return False
+
+
+def _narrow_loaded_value_for_pipeline_roundup(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    parts: list[str],
+    result: ast.AST,
+) -> ast.AST:
+    """Narrow a loaded value back to its logical width after pipeline round-up.
+
+    When a tensor is DMA-routed through an ``emit_pipeline`` loop, the launcher
+    rounds untiled full block dims UP to the Mosaic VMEM tile (see
+    ``_pallas_build_pipeline_specs`` / ``_pallas_round_full_dim``).  The loaded
+    ref therefore includes rounded tail lanes that hold clamped / undefined data.
+    Slicing the result back to the logical width (``tensor.shape[d]``) ensures
+    the kernel body only sees valid elements -- e.g. so a top-k cannot return an
+    out-of-range index.  Only dims that were actually rounded get a slice entry;
+    already-aligned dims are left as ``:``.
+    """
+    if not _tensor_in_emit_pipeline(state, tensor):
+        return result
+
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+    from helion.runtime import _pallas_round_full_dim
+
+    assert state.fx_node is not None
+    patterns = state.fx_node.meta.get("indexing_patterns")
+    if patterns is None:
+        return result
+
+    squeezing_patterns = (
+        ArbitraryIndexPattern,
+        TileIndexWithOffsetPattern,
+        TileBeginWithOffsetPattern,
+    )
+
+    ndim = tensor.ndim
+    slices: list[str] = []
+    needs_slice = False
+    tensor_dim = 0
+    part_idx = 0
+
+    for idx, pattern in zip(subscript, patterns, strict=True):
+        if idx is None:
+            continue
+        part = parts[part_idx]
+        part_idx += 1
+        if isinstance(pattern, squeezing_patterns):
+            tensor_dim += 1
+            continue
+        value_slice = ":"
+        dim_size = tensor.shape[tensor_dim]
+        if (
+            not isinstance(pattern, TilePattern)
+            and part == ":"
+            and isinstance(dim_size, int)
+        ):
+            rounded = _pallas_round_full_dim(
+                dim_size, tensor_dim, ndim, tensor.dtype.itemsize
+            )
+            if rounded > dim_size:
+                value_slice = f":{dim_size}"
+                needs_slice = True
+        slices.append(value_slice)
+        tensor_dim += 1
+
+    if not needs_slice:
+        return result
+    return expr_from_string(
+        f"{{result}}[{', '.join(slices)}]",
+        result=result,
+    )
+
+
 def sliced_value_for_store(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -234,38 +337,47 @@ def sliced_value_for_store(
     index_parts: list[str],
     value: ast.AST,
 ) -> ast.AST:
-    """Slice the store value when the Pallas ref is smaller than the tile.
+    """Slice or pad the store value to match the Pallas ref's block shape.
 
-    The launcher clamps each BlockSpec dimension to
-    ``min(block_size, tensor.shape[d])``.  When ``block_size > dim_size``
-    the kernel ref is ``dim_size``-shaped but the computed value is
-    ``block_size``-shaped, so we must slice the value before storing.
+    Two situations require adjusting the value before the store:
 
-    This only applies to grid-tiled dimensions that produce ``:`` in the
-    generated Pallas index.  Dimensions indexed via ``pl.ds()`` are padded
-    instead of clamped, so they must keep their full block-size value.
+    1. **Clamp-down** (existing): the launcher clamps grid-tiled dims to
+       ``min(block_size, tensor.shape[d])``.  When ``block_size > dim_size``
+       the kernel ref is ``dim_size``-shaped but the computed value is
+       ``block_size``-shaped, so we slice the value down before storing.
 
-    fori_loop-scratch stores are exempt: their destination is a block-sized
-    VMEM scratch (not a clamped ref), so the value stays block-shaped and the
-    writeback DMA clamps the extent instead (see ``_build_dma_slices``).
+    2. **Round-up** (pipeline only): when ``tensor`` is DMA-routed through an
+       ``emit_pipeline`` loop (detected by ``_tensor_in_emit_pipeline``), the launcher rounds
+       untiled full dims UP to the Mosaic VMEM tile (see
+       ``_pallas_round_full_dim`` / ``round_full_dims=True`` in
+       ``_pallas_build_pipeline_specs``).  The kernel ref is now wider than the
+       logical value, so we pad the value UP to fill the ref; the writeback DMA
+       clamps the extra elements back to the logical size.
+
+    Dimensions indexed via ``pl.ds()`` are handled separately (padded at the
+    DS level) and are not affected here.  fori_loop scratch stores are exempt
+    from clamp-slicing (the scratch is block-sized; the writeback DMA clamps),
+    but round-up padding applies both ways so the value fills the widened ref.
+    Scalar/offset index patterns that squeeze a tensor dim out of the value's
+    shape are skipped so the slice/pad is built against the dims the value has.
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
+    from helion.runtime import _pallas_round_full_dim
 
     assert state.fx_node is not None
     patterns = state.fx_node.meta.get("indexing_patterns")
     if patterns is None:
         return value
 
-    if _tensor_routed_to_fori_scratch(state, tensor):
-        return value
+    # fori-scratch stores: not clamped, but still need round-up padding.
+    slice_exempt = _tensor_routed_to_fori_scratch(state, tensor)
+    is_pipeline = _tensor_in_emit_pipeline(state, tensor)
 
-    # Patterns that consume a tensor dim without it surviving into the stored
-    # value's shape (a scalar/offset index squeezes that dim) don't get a
-    # slice entry -- the value has no such dimension to slice.
+    # Scalar/offset patterns squeeze a tensor dim out of the value's shape.
     squeezing_patterns = (
         ArbitraryIndexPattern,
         TileIndexWithOffsetPattern,
@@ -273,8 +385,11 @@ def sliced_value_for_store(
     )
 
     env = CompileEnvironment.current()
+    ndim = tensor.ndim
     slices: list[str] = []
+    pad_afters: list[int] = []
     needs_slice = False
+    needs_pad = False
     tensor_dim = 0
 
     index_part_idx = 0
@@ -289,27 +404,42 @@ def sliced_value_for_store(
             continue
 
         value_slice = ":"
+        pad_after = 0
+        dim_size = tensor.shape[tensor_dim]
         if isinstance(pattern, TilePattern) and index_part == ":":
-            block_size = env.block_sizes[pattern.block_id].from_config(state.config)
-            dim_size = tensor.shape[tensor_dim]
-            if (
-                isinstance(block_size, int)
-                and isinstance(dim_size, int)
-                and dim_size < block_size
-            ):
-                value_slice = f":{dim_size}"
-                needs_slice = True
+            if not slice_exempt:
+                block_size = env.block_sizes[pattern.block_id].from_config(state.config)
+                if (
+                    isinstance(block_size, int)
+                    and isinstance(dim_size, int)
+                    and dim_size < block_size
+                ):
+                    value_slice = f":{dim_size}"
+                    needs_slice = True
+        elif index_part == ":" and is_pipeline and isinstance(dim_size, int):
+            rounded = _pallas_round_full_dim(
+                dim_size, tensor_dim, ndim, tensor.dtype.itemsize
+            )
+            if rounded > dim_size:
+                pad_after = rounded - dim_size
+                needs_pad = True
 
         slices.append(value_slice)
+        pad_afters.append(pad_after)
         tensor_dim += 1
 
-    if not needs_slice:
-        return value
-
-    return expr_from_string(
-        f"{{value}}[{', '.join(slices)}]",
-        value=value,
-    )
+    if needs_slice:
+        value = expr_from_string(
+            f"{{value}}[{', '.join(slices)}]",
+            value=value,
+        )
+    if needs_pad:
+        pad_width = ", ".join(f"(0, {a})" for a in pad_afters)
+        value = expr_from_string(
+            f"jnp.pad({{value}}, ({pad_width}))",
+            value=value,
+        )
+    return value
 
 
 def _tile_needs_mask(

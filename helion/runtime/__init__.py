@@ -203,6 +203,36 @@ def default_launcher(
         raise
 
 
+def _pallas_round_full_dim(n: int, d: int, ndim: int, itemsize: int = 4) -> int:
+    """Round dim ``d`` of an ``ndim``-dimensional tensor UP to Mosaic's VMEM tile.
+
+    Mosaic's ``emit_pipeline`` double-buffers each pipe-input into a
+    ``[2, *block_shape]`` VMEM scratch and slices it per grid step.  On jax
+    0.10.0 it rejects a scratch whose shape isn't aligned to the native VMEM
+    tile -- "Slice shape along dimension N must be aligned to tiling (T), but
+    is <n>".  Rounding the full-dim block size up to ``T`` is free (the VMEM
+    tile is always that size); the load/store codegen (``_narrow_loaded_value``
+    / ``sliced_value_for_store``) mirrors the rounding so the kernel body only
+    ever sees the logical (unrounded) shape.
+
+    The tile matches jax's ``infer_tiling(Tiling.COMPACT)`` for v4+ TPUs:
+    a physical tile spans one f32 (8, 128) worth of bytes, so a narrower dtype
+    packs ``packing = 4 // itemsize`` more elements into it.  A 1-D ref has no
+    separate sublane dimension, so packing folds into the 128-wide lane count;
+    a 2-D+ ref keeps the lane dim at 128 and scales the sublane dim.
+    """
+    packing = max(1, 4 // itemsize)
+    if ndim == 1:
+        tile = packing * 128
+    elif d == ndim - 1:
+        tile = 128
+    elif d == ndim - 2:
+        tile = max(8, packing)
+    else:
+        return n
+    return -(-n // tile) * tile
+
+
 def _pallas_make_block_spec(
     pl: object,
     jnp: object,
@@ -211,8 +241,16 @@ def _pallas_make_block_spec(
     entry: tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
     | None,
     should_use_smem: bool = False,
+    round_full_dims: bool = False,
 ) -> object:
-    """Build one ``pl.BlockSpec`` from compile-time ``(block_shape, grid_dims)``."""
+    """Build one ``pl.BlockSpec`` from compile-time ``(block_shape, grid_dims)``.
+
+    When *round_full_dims* is ``True`` (only set by ``_pallas_build_pipeline_specs``),
+    ``None``-template (full-dim) block sizes are rounded UP to the Mosaic VMEM
+    tile via ``_pallas_round_full_dim`` instead of keeping the raw tensor size.
+    This satisfies ``emit_pipeline``'s alignment requirement on jax 0.10.0;
+    SMEM tensors and dynamic-size dims are exempt.
+    """
 
     memory_space = None  # default value (pallas will default to VMEM)
     if should_use_smem:
@@ -230,10 +268,22 @@ def _pallas_make_block_spec(
         return pl.BlockSpec(full_shape, index_map_full, memory_space=memory_space)  # type: ignore[union-attr]
 
     block_shape_template, grid_dims = entry
+    ndim = len(block_shape_template)
+
+    def _full_dim_size(d: int, dim_size: int) -> int:
+        if round_full_dims and not should_use_smem:
+            return _pallas_round_full_dim(dim_size, d, ndim, tensor.dtype.itemsize)
+        return dim_size
+
     # Clamp to >= 1: empty tensors (zero-work grids) would otherwise produce
     # 0-sized block dims, which the interpret machinery divides by.
     block_shape = tuple(
-        max(min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d], 1)
+        max(
+            min(bs, tensor.shape[d])
+            if bs is not None
+            else _full_dim_size(d, tensor.shape[d]),
+            1,
+        )
         for d, bs in enumerate(block_shape_template)
     )
     # Block indices past the last block are clamped, matching pallas_call's
@@ -676,6 +726,7 @@ def _pallas_build_pipeline_specs(
     hbm_arg_indices: list[int] | None,
     output_only_indices: list[int] | None = None,
     smem_arg_indices: list[int] | None = None,
+    scratch_shapes: list[object] | None = None,
 ) -> tuple[list[object], object]:
     """Build in/out specs for the pipeline/scratch path.
 
@@ -687,11 +738,26 @@ def _pallas_build_pipeline_specs(
     e.g. group offset tables) are placed in SMEM so dynamic scalar
     reads don't require 128-lane alignment proofs against a small
     VMEM ref.
+
+    When *scratch_shapes* includes a DMA-semaphore entry the kernel uses
+    ``emit_pipeline``, which double-buffers pipe inputs into a
+    ``[2, *block_shape]`` VMEM scratch.  On jax 0.10.0 Mosaic requires
+    the scratch dims to be aligned to the VMEM tile (see
+    ``_pallas_round_full_dim``).  ``round_full_dims`` is set only in this
+    case so kernels that use scratch for other purposes (e.g. fori_loop
+    carry buffers) are not affected.
     """
     hbm_set = set(hbm_arg_indices or [])
     smem_set = set(smem_arg_indices or [])
     all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
     arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
+    # emit_pipeline kernels register at least one DMA semaphore; fori_loop
+    # accumulator kernels only have vmem-type scratches.
+    is_emit_pipeline = any(
+        len(s) >= 3 and s[2] == "dma_semaphore"
+        for s in (scratch_shapes or [])
+        if isinstance(s, (list, tuple))
+    )
 
     def _spec_for(idx: int) -> object:
         if idx in hbm_set:
@@ -699,8 +765,15 @@ def _pallas_build_pipeline_specs(
         tpos = arg_to_tpos[idx]
         t = args[idx]
         assert isinstance(t, torch.Tensor)
+        is_smem = tpos in smem_set
         return _pallas_make_block_spec(
-            pl, jnp, pltpu, t, block_spec_info[tpos], tpos in smem_set
+            pl,
+            jnp,
+            pltpu,
+            t,
+            block_spec_info[tpos],
+            should_use_smem=is_smem,
+            round_full_dims=is_emit_pipeline and not is_smem,
         )
 
     in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
@@ -1782,6 +1855,7 @@ def _pallas_compile_jit_fn(
             _hbm_arg_indices,
             output_only_indices,
             smem_arg_indices=_smem_arg_indices,
+            scratch_shapes=_scratch_shapes,
         )
         skip_inplace_copy: set[int] = set(_hbm_arg_indices or [])
     else:
