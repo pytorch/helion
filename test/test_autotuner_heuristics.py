@@ -2396,12 +2396,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for_search=True
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
-        # Cycle 97: the for_search ab cap is BUDGET-AWARE — lifted to 3 wherever
-        # ab=3 is admissible (the SMEM-budget constraints were recorded at bind
-        # time, i.e. bf16/fp16 on a B200-class optin cap), else 2. Conditioning on
-        # the recorded constraints keeps the assertion deterministic across hosts.
+        # Stage 2: the for_search ab cap is BUDGET-AWARE — lifted to 4 for 16-bit
+        # wherever the SMEM-budget constraints were recorded at bind time (bf16/fp16
+        # on a B200-class optin cap) so the narrow-N cluster_m=2 tile can search
+        # ab=4, else 2. Conditioning on the recorded constraints keeps the assertion
+        # deterministic across hosts.
         expected_search_ab_high = (
-            3
+            4
             if bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
             is not None
             else 2
@@ -2826,7 +2827,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             and config["block_sizes"][1] == TCGEN05_TWO_CTA_BLOCK_N
         )
         projected_wide_clc_aux_tma_config = dict(raw_wide_clc_aux_tma_seed)
-        projected_wide_clc_aux_tma_config["block_sizes"] = [128, 64, 64]
+        # Mangle bm (128->256) and bk (64->128) but keep bn on the wide 256
+        # tile: the block_n normalizer now rounds a sub-128 sampled bn UP to the
+        # narrow 128 tile, so only bn=256 stays on the wide CLC+aux-TMA path this
+        # assertion (wide l2/acc knobs, [256,256,128]) covers. The sub-128 ->
+        # narrow-128 round-up is covered separately by the cluster_m1 persistent
+        # search test's [256,32,16] -> [256,128,16] case.
+        projected_wide_clc_aux_tma_config["block_sizes"] = [128, 256, 64]
         projected_wide_clc_aux_tma_config["pid_type"] = "flat"
         projected_wide_clc_aux_tma_config["tcgen05_acc_stages"] = (
             TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
@@ -3207,7 +3214,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         def make_minimal_preprojection_clc_aux_tma_config() -> dict[str, object]:
             return {
-                "block_sizes": [128, 64, 64],
+                # bn stays on the wide 256 tile: this exercises the wide
+                # CLC+aux-TMA recovery ([256,256,128] + wide knobs). A sub-128 bn
+                # would now round UP to the narrow 128 tile instead of the 256
+                # this assertion checks.
+                "block_sizes": [128, 256, 64],
                 "indexing": ["tensor_descriptor"] * bound.config_spec.indexing.length,
                 "pid_type": "flat",
                 "tcgen05_cluster_m": 2,
@@ -3289,11 +3300,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             TCGEN05_AUX_LOAD_MODE_TMA
         )
         bound.config_spec.normalize(narrow_invalid_cluster_n_config, _fix_invalid=True)
+        # cluster_n=2 disqualifies the narrow-N CLC + aux-TMA seed path
+        # (``is_narrow_clc_aux_tma`` requires cluster_n=1), so the candidate is
+        # shaped as a generic cluster_m=2 edge tile. Stage 2b made a generic
+        # DEFAULT-layout bn=128 edge tile searchable, so block_n now SURVIVES at
+        # 128 (with the generic edge K tail) instead of snapping to the canonical
+        # 256; the persistence model still falls back to STATIC_PERSISTENT, which
+        # is what this sub-case guards.
         self.assertEqual(
             narrow_invalid_cluster_n_config["block_sizes"][:3],
             [
                 TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
@@ -3407,17 +3425,27 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             ),
         }
         spec.normalize(narrow_config, _fix_invalid=True)
+        # Stage 2b made a generic DEFAULT-layout bn=128 cluster_m=2 edge tile
+        # searchable, so block_n now SURVIVES at 128 (with the generic edge K
+        # tail) instead of snapping to the canonical 256. The narrow-N CLC +
+        # aux-TMA SEED still requires an N edge at 128 (which this N=4224 shape
+        # lacks -- 128 is a full tile), so the CLC-persistent validation fails
+        # and the persistence model correctly falls back to STATIC_PERSISTENT.
+        # (This surviving bn=128 tile fails cleanly -- BackendUnsupported /
+        # runtime guard -- on this M-edge, N-full shape, so autotune drops it;
+        # it is numerically correct on shapes where a bn=128 edge tile is
+        # eligible. It is never compiles-but-wrong.)
         self.assertEqual(
             narrow_config["block_sizes"][:3],
             [
                 TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
         self.assertEqual(
             narrow_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
-            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
         )
 
     @onlyBackends(["cute"])
@@ -4125,11 +4153,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.aux_kernel_detected)
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
-        # The for_search ab fragment is lifted to 3 (the budget was recorded at
-        # bind via the mocked B200 cap) for every family.
+        # Stage 2: the for_search ab fragment is lifted to 4 for 16-bit (the
+        # budget was recorded at bind via the mocked B200 cap) for every family,
+        # so the narrow-N DEFAULT-layout cluster_m=2 tile can search ab=4. A
+        # sampled ab=4 that does not fit the shaped tile is demoted before codegen
+        # by the envelope validator (cluster_m=1 / canonical 256x256) or
+        # ``_fix_ab_stages_search_config`` (shaped-to-256x256 cm2 overflow).
         for tcfg in (plain_tcfg, bias_tcfg, residual_tcfg):
             ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(ab_fragment.high, 3)
+            self.assertEqual(ab_fragment.high, 4)
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(
@@ -4310,11 +4342,16 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         self.assertEqual(config_dict["tcgen05_cluster_m"], 2)
         self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
+        # Stage 2b made a generic DEFAULT-layout bn=128 cluster_m=2 edge tile
+        # searchable, so the sampled block_n=128 now SURVIVES at 128 (with the
+        # generic edge K tail) instead of snapping to the canonical 256. block_m
+        # is still pinned to 256 and the edge ab2 seed overrides still apply
+        # (this test's subject).
         self.assertEqual(
             config_dict["block_sizes"][:3],
             [
                 TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )

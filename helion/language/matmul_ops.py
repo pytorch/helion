@@ -15,6 +15,9 @@ from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
@@ -482,7 +485,15 @@ def enable_cute_tcgen05_search(
                 cluster_n = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
             else:
                 cluster_m = TCGEN05_TWO_CTA_BLOCK_M
-                cluster_n = TCGEN05_TWO_CTA_BLOCK_N
+                # Count clusters at the narrowest tile these families can emit
+                # (block_n=128, a 256x128 output tile), not the 256x256 artifact:
+                # bn=128 yields 2x the clusters and fills where a 256x256 cm2 would
+                # underfill. Both non-fp8 families reaching here can emit bn=128
+                # (full-tile: the +8.3% S2 win; edge-K-tail: Stage 2b made its
+                # generic [256,128,128] tile searchable), so bn=128 is the honest
+                # best-fill count for both. fp8-small-grid counts at its own
+                # 128x128 tile in the branch above.
+                cluster_n = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
             work_clusters = (
                 plan.leading_work_multiplier
                 * (static_m // cluster_m)

@@ -860,9 +860,53 @@ class CuteTcgen05Config:
             block_sizes[n_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
             return
         block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
-        # Only the fully validated narrow-N CLC+aux-TMA seed may keep
-        # block_n=128; other candidates use the canonical block_n=256.
-        if is_narrow_clc_aux_tma:
+        # Block-N shaping for the surviving cluster_m=2 candidates. A CtaGroup.TWO
+        # matmul has exactly two validated N tiles: 128 (a 256x128 output tile)
+        # and 256. Both are hardware-legal because the 2-CTA MMA decision keys
+        # only on ``block_m`` (pinned to 256 here), not ``block_n``; a prior
+        # investigation verified bn=128 cm2 compiles + is numerically correct on
+        # the eligible shapes of all three families and fails cleanly (inf-able,
+        # never wrong-output) elsewhere, so the historical bn=256 pin on the
+        # edge/batched families was coverage-conservatism, not a hardware limit.
+        # We therefore round every sampled block_n to one of those two tiles: the
+        # narrow band (<=128) snaps DOWN to 128, and 256 stays 256. Rounding the
+        # band up to 128 rather than up to 256 is deliberate -- the 256x256 tile
+        # is already emitted by every cluster_m=2 seed builder
+        # (``get_seed_config``, ``full_tile_direct_entry_seed_config``,
+        # ``_c_input_seed_config``), so it is in the initial population by
+        # construction and does not need a search draw to be discovered, whereas
+        # the generic ``[256,128,*]`` tile (the +8.3% Stage-2 win) is NOT seeded
+        # and is reachable ONLY via search. Biasing the band toward the un-seeded
+        # tile spends search draws where discovery is actually needed. The three
+        # families this covers, all verified to compile + pass at bn=128:
+        #   * plain 2-D DEFAULT-layout full-tile path -- the +8.3% ``[256,128,*]``
+        #     cm2 tile (Stage 2);
+        #   * the edge-K-tail family -- a generic (non-narrow-CLC) bn=128 edge
+        #     candidate carries bk=``TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K`` (128)
+        #     from the K shaping above and the coherent edge seed pipeline applied
+        #     in the ``edge_k_tail_family`` block below (the narrow-seed acc/l2
+        #     overrides stay gated on ``is_narrow_clc_aux_tma`` and are NOT
+        #     half-applied to it); its ``[256,128,128]`` tile;
+        #   * the batched leading-passthrough family -- its ``[*,256,128,*]`` cm2
+        #     tile (Stage 2b).
+        # The bm==bn==256 requirement lives only in the FFI/EXPLICIT_EPI_TILE
+        # envelope, which ``_fix_target1_tvm_ffi_search_config`` has already
+        # settled before this runs: an explicit FFI request carries the seed's
+        # own 256x256 tile, and a partial one has been repaired back to the
+        # DEFAULT layout. The ``layout == DEFAULT`` guard below therefore snaps
+        # only candidates that are genuinely on the default path. block_m stays
+        # pinned to 256 (block_m=128 is the fp8-small-grid path handled above).
+        sampled_bn = block_sizes[n_index]
+        layout = config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        )
+        if is_narrow_clc_aux_tma or (
+            layout == Tcgen05LayoutStrategy.DEFAULT.value
+            and isinstance(sampled_bn, int)
+            and not isinstance(sampled_bn, bool)
+            and sampled_bn <= TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        ):
             block_sizes[n_index] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
         else:
             block_sizes[n_index] = TCGEN05_TWO_CTA_BLOCK_N
@@ -1207,29 +1251,35 @@ class CuteTcgen05Config:
             config["tcgen05_ab_stages"] = 2
 
     def _fix_ab_stages_search_config(self, config: dict[str, object]) -> None:
-        # Budget-aware ab=3 admission for the lifted ``for_search`` cap (see
+        # Budget-aware deep-AB admission for the lifted ``for_search`` cap (see
         # ``optional_fragments`` and cute_plan.md §4.5 for the empirical narrative).
         # Mirror ``_fix_c_stages_search_config`` (fail-CLOSED, cast-based): on the
         # canonical 256x256 DEFAULT-layout role-local path, demote a directly-sampled
-        # ab=3 to 2 when it does not fit the per-CTA SMEM budget. The invariant — the
-        # new dimension over the bare-AB ``_fix_ab_stages_three_search_config`` gate —
-        # is REAL source-C presence, keyed on the PRECISE
-        # ``exact_shape_aux_kernel_detected`` (rank-2 exact-shape residual_add), NOT
-        # the broad ``aux_kernel_detected`` (also True for a rowvec broadcast bias
-        # that has no source-C ring): a real source-C materializes the larger
-        # (128, 64) C ring, so AB(ab=3) + C overflows the cap even at c=2 and MUST
+        # ab>=3 to the deepest depth that fits the per-CTA SMEM budget. This runs
+        # AFTER ``_fix_cluster_m2_search_config`` shapes the block sizes, so it judges
+        # the tile that will actually reach codegen: a sampled bn that snapped to the
+        # canonical 256 -> [256,256,128] cm2 ab4 overflows at 262144 B and is demoted
+        # to the fitting ab=3. The Stage-2 searchable narrow-N [256,128,*] cm2 tile is
+        # NOT the canonical 256x256 tile, so it stays out of this gate entirely and
+        # keeps its sampled ab4 (196608 B, fits) — its budget was already enforced by
+        # ``_validate_direct_entry_ab_stage_envelope`` (16-bit cm2 default-layout
+        # branch). The invariant — the new dimension over the bare-AB
+        # ``_fix_ab_stages_three_search_config`` gate — is REAL source-C presence,
+        # keyed on the PRECISE ``exact_shape_aux_kernel_detected`` (rank-2 exact-shape
+        # residual_add), NOT the broad ``aux_kernel_detected`` (also True for a rowvec
+        # broadcast bias that has no source-C ring): a real source-C materializes the
+        # larger (128, 64) C ring, so AB + C overflows the cap even at c=2 and MUST
         # demote, while the plain / rowvec-bias family (no source-C ring) keeps the
         # bare-AB calibration so its ab=3 winner stays searchable. The exact-shape
         # residual cluster_m=2 full-tile candidates are already forced to ab=2 by
-        # ``_fix_aux_tma_full_tile_search_config`` (runs first); this gate's source-C
-        # branch is the fail-closed backstop for any exact-shape residual ab=3 that
-        # projection does not claim (e.g. cluster_m=1). The EXPLICIT_EPI_TILE
+        # ``_fix_aux_tma_full_tile_search_config`` (runs first). The EXPLICIT_EPI_TILE
         # direct-entry (TVM-FFI) seeds use a separate (128, 32) tile + own admission
         # and are out of the DEFAULT-layout scope, so their seeded ab=3/ab=6 is
         # untouched.
         if not self.search_enabled:
             return
-        if config.get("tcgen05_ab_stages") != 3:
+        ab_stages = config.get("tcgen05_ab_stages")
+        if type(ab_stages) is not int or ab_stages < 3:
             return
         if not self._is_default_layout_full_tile_config(config):
             return
@@ -1238,35 +1288,42 @@ class CuteTcgen05Config:
             config["tcgen05_ab_stages"] = 2
             return
         block_sizes, m_index, n_index, k_index = config_view
+        bm = cast("int", block_sizes[m_index])
+        bn = cast("int", block_sizes[n_index])
+        bk = cast("int", block_sizes[k_index])
         cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
         if self.exact_shape_aux_kernel_detected:
-            # Real source-C present: require AB(ab=3) + the (128, 64) C ring to fit
-            # together. ``c_stages_fits`` fails CLOSED when no SMEM budget is
-            # recorded (non-B200 / CPU host), so the over-budget and no-budget
-            # arms are both covered by a single ``not c_stages_fits`` check.
+            # Real source-C present: require AB + the (128, 64) C ring to fit
+            # together at the sampled depth. ``c_stages_fits`` fails CLOSED when no
+            # SMEM budget is recorded (non-B200 / CPU host), so the over-budget and
+            # no-budget arms are both covered.
             c_stages = cast("int", config.get("tcgen05_c_stages", 2))
-            fits = self.c_stages_fits(
-                bm=cast("int", block_sizes[m_index]),
-                bn=cast("int", block_sizes[n_index]),
-                bk=cast("int", block_sizes[k_index]),
-                cluster_m=cluster_m,
-                ab_stages=3,
-                c_stages=c_stages,
-                has_source_c=True,
-            )
+
+            def _fits(ab: int) -> bool:
+                return self.c_stages_fits(
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    cluster_m=cluster_m,
+                    ab_stages=ab,
+                    c_stages=c_stages,
+                    has_source_c=True,
+                )
         else:
             # Plain / rowvec-bias store (no source-C ring): the bare-AB gate is the
             # calibrated admission — the small no-source-C epilogue D ring rides the
             # non-AB reservation. ``ab_stages_three_fits`` returns False with no
             # budget recorded, so this also fails CLOSED.
-            fits = self.ab_stages_three_fits(
-                bm=cast("int", block_sizes[m_index]),
-                bn=cast("int", block_sizes[n_index]),
-                bk=cast("int", block_sizes[k_index]),
-                cluster_m=cluster_m,
-            )
-        if not fits:
-            config["tcgen05_ab_stages"] = 2
+            def _fits(ab: int) -> bool:
+                return self.ab_stages_three_fits(
+                    bm=bm, bn=bn, bk=bk, cluster_m=cluster_m, ab_stages=ab
+                )
+
+        # Demote to the deepest depth in [2, ab_stages] that fits (floor 2, the
+        # historical demote target for a non-fitting ab=3 on this path).
+        while ab_stages > 2 and not _fits(ab_stages):
+            ab_stages -= 1
+        config["tcgen05_ab_stages"] = ab_stages
 
     def _fix_with_scheduler_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and self.aux_kernel_detected):
@@ -1478,12 +1535,40 @@ class CuteTcgen05Config:
             )
         ):
             return
-        # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
-        # cap of 3; admit ab_stages > 3 for fp8 as long as the AB SMEM fits the
-        # per-CTA budget. This lets Helion emit the same deeply-pipelined
-        # CtaGroup.TWO kernel CUTLASS uses for fp8 compute-bound GEMMs.
+        # A deeper AB pipeline than the bf16-tuned cap of 3 is admitted whenever
+        # the per-CTA AB SMEM fits the budget, for two families:
+        #   * FP8 (1-byte) operands, any tile — lets Helion emit the same
+        #     deeply-pipelined CtaGroup.TWO kernel CUTLASS uses for fp8
+        #     compute-bound GEMMs.
+        #   * Stage 2: 16-bit ``cluster_m=2`` on the DEFAULT layout — the
+        #     narrow-N (block_n=128) full-tile cm2 tile fits ab=4 in the
+        #     203776 B budget (196608 B at [256,128,128]) and runs +8.3% over the
+        #     cm1 winner on 512x4096x4096 bf16. ``max_ab_stages_that_fit`` applies
+        #     the 16-bit hard cap (6) AND the SMEM budget, so the real ab6/bk128
+        #     overflow (294912 B) is still rejected -> clamped to what fits. The
+        #     canonical 256x256 cm2 tile only fits ab<=3, so a snapped ab4 there
+        #     is clamped back to 3 here. cluster_m=1 keeps the strict ab<=3 cap
+        #     (its reachable bf16 tiles overflow beyond ab3), and EXPLICIT_EPI_TILE
+        #     / FFI configs are handled by the direct-entry tuple branch above.
+        #     The batched leading-passthrough family is admitted too: per-CTA AB
+        #     SMEM is batch-invariant (``tcgen05_ab_smem_bytes_per_cta`` takes only
+        #     bm/bn/bk/dtype/stages/cluster_m, and the leading axis is squeezed to
+        #     block size 1 in codegen), so a batched ``[*,256,128,128]`` cm2 tile
+        #     fits ab=4 identically and ``max_ab_stages_that_fit`` still enforces
+        #     the real per-CTA cap.
         constraints = self.ab_stages_three_search_constraints
-        if constraints is not None and constraints.dtype_bytes == 1:  # FP8
+        is_fp8 = constraints is not None and constraints.dtype_bytes == 1
+        layout = config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        )
+        is_16bit_default_cm2 = (
+            constraints is not None
+            and constraints.dtype_bytes == 2
+            and config.get("tcgen05_cluster_m") == 2
+            and layout == Tcgen05LayoutStrategy.DEFAULT.value
+        )
+        if is_fp8 or is_16bit_default_cm2:
             config_view = self._matmul_config_view(config)
             cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
             if config_view is not None:
@@ -1504,7 +1589,8 @@ class CuteTcgen05Config:
             return
         raise InvalidConfig(
             "tcgen05_ab_stages > 3 is only supported by the validated "
-            "TVM-FFI direct-entry path (or fp8 within the SMEM budget)"
+            "TVM-FFI direct-entry path, a 16-bit cluster_m=2 DEFAULT-layout "
+            "tile within the SMEM budget, or fp8 within the SMEM budget"
         )
 
     def _is_validated_clc_persistence_search_candidate(
@@ -1981,13 +2067,21 @@ class CuteTcgen05Config:
             # Cycle 97: make ab=3 BUDGET-AWARE-SEARCHABLE. Where the device/dtype
             # admits ab=3 at all (the SMEM-budget constraints were recorded by
             # ``allow_ab_stages_three_search`` at bind time — B200-class optin cap,
-            # bf16/fp16), lift the ``for_search`` cap to 3 so the autotuner can
-            # SAMPLE ab=3 directly instead of reaching it only through the per-shape
+            # bf16/fp16), lift the ``for_search`` cap so the autotuner can SAMPLE
+            # deeper AB directly instead of reaching it only through the per-shape
             # FFI / gelu seeds. ``_fix_ab_stages_search_config`` then demotes any
-            # sampled ab=3 that does not fit (the residual/source-C ring overflows;
-            # cluster_m=1 256x256 overflows bare-AB) before codegen, so admission is
-            # free but an overflowing kernel is never generated.
-            ab_stages_max = 3
+            # sampled candidate that does not fit (the residual/source-C ring
+            # overflows; cluster_m=1 256x256 overflows bare-AB) before codegen, so
+            # admission is free but an overflowing kernel is never generated.
+            #
+            # Stage 2: the cap is 4 (not 3) for 16-bit so the DEFAULT-layout
+            # narrow-N (block_n=128) cluster_m=2 tile can search ab=4 — the
+            # ``[256,128,128] cm2 ab4`` config that runs +8.3% over the cm1 winner
+            # on 512x4096x4096 bf16 (fits the 203776 B per-CTA budget at 196608 B).
+            # ab=4 at the canonical 256x256 tile overflows (262144 B) and is
+            # demoted by ``_fix_ab_stages_search_config`` after shaping; ab>=5 stays
+            # a seed/validation-only depth (the ab6/bk128 overflow guard is real).
+            ab_stages_max = 4
             # FP8 (1-byte) operands fit a deeper AB pipeline; widen the
             # validation range so an explicit deep-staged fp8 config is
             # accepted (``_validate_direct_entry_ab_stage_envelope`` clamps it to

@@ -203,6 +203,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
 )
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
@@ -18053,9 +18056,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             config_dict["indexing"],
             ["tensor_descriptor"] * spec.indexing.length,
         )
+        # Stage 2b: a sampled block_n=128 now survives as its own valid cm2 tile
+        # for the edge-K-tail family (block_m still pinned to 256), instead of
+        # snapping to the canonical block_n=256.
         self.assertEqual(
             config_dict["block_sizes"],
-            [256, 256, TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K],
+            [
+                256,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
         )
         self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
         self.assertNotIn("epilogue_subtile", config_dict)
