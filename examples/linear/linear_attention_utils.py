@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Shared test helpers
@@ -92,6 +93,37 @@ def chunked_linear_attn_reference(
     else:
         state = q.new_zeros(B, H, D, DV, dtype=torch.float32)
 
+    def correction_chunk(
+        qi: torch.Tensor,
+        ki: torch.Tensor,
+        vi: torch.Tensor,
+        gi: torch.Tensor,
+        bi: torch.Tensor,
+        ai: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One chunk of the sequential beta-correction recurrence, returning
+        (chunk_output, new_state); tensors are explicit args so it can be
+        gradient-checkpointed."""
+        s = state
+        chunk_out = []
+        for j in range(C):
+            g_j = gi[:, :, j]
+            alpha = (
+                torch.exp(g_j).unsqueeze(-1)
+                if diagonal_decay
+                else torch.exp(g_j).unsqueeze(-1).unsqueeze(-1)
+            )
+            s = alpha * s
+            kj = ai[:, :, j]
+            vj = vi[:, :, j]
+            bj = bi[:, :, j].unsqueeze(-1).unsqueeze(-1)
+            kts = torch.einsum("bhd,bhdv->bhv", kj, s)
+            s = s - bj * torch.einsum("bhd,bhv->bhdv", kj, kts)
+            s = s + bj * torch.einsum("bhd,bhv->bhdv", kj, vj)
+            chunk_out.append(torch.einsum("bhd,bhdv->bhv", qi[:, :, j], s))
+        return torch.stack(chunk_out, dim=2), s
+
     for i in range(N):
         qi = qc[:, :, i]
         ki = kc[:, :, i]
@@ -101,22 +133,21 @@ def chunked_linear_attn_reference(
         bi = bc[:, :, i] if bc is not None else None
         ai = ac[:, :, i] if ac is not None else ki
 
-        if diagonal_decay and bi is not None:
-            chunk_out = []
-            s = state.clone()
-            for j in range(C):
-                alpha = torch.exp(gi[:, :, j])
-                s = alpha.unsqueeze(-1) * s
-                kj = ai[:, :, j]
-                vj = vi[:, :, j]
-                bj = bi[:, :, j].unsqueeze(-1).unsqueeze(-1)
-                kts = torch.einsum("bhd,bhdv->bhv", kj, s)
-                s = s - bj * torch.einsum("bhd,bhv->bhdv", kj, kts)
-                s = s + bj * torch.einsum("bhd,bhv->bhdv", kj, vj)
-                oj = torch.einsum("bhd,bhdv->bhv", qi[:, :, j], s)
-                chunk_out.append(oj)
-            outputs.append(torch.stack(chunk_out, dim=2).to(input_dtype))
-            state = s
+        if bi is not None:
+            # Sequential beta-correction recurrence, checkpointed per chunk to
+            # avoid OOMs.
+            chunk_out, state = checkpoint(  # pyrefly: ignore[not-iterable]
+                correction_chunk,
+                qi,
+                ki,
+                vi,
+                gi,
+                bi,
+                ai,
+                state,
+                use_reentrant=False,
+            )
+            outputs.append(chunk_out.to(input_dtype))
 
         elif diagonal_decay:
             g_cs = gi.cumsum(-2)
@@ -138,23 +169,6 @@ def chunked_linear_attn_reference(
             state = state * torch.exp(g_last).unsqueeze(-1) + torch.einsum(
                 "bhcd,bhcv->bhdv", k_for_state, vi
             )
-
-        elif bi is not None:
-            chunk_out = []
-            s = state.clone()
-            for j in range(C):
-                alpha = torch.exp(gi[:, :, j]).unsqueeze(-1).unsqueeze(-1)
-                s = alpha * s
-                kj = ai[:, :, j]
-                vj = vi[:, :, j]
-                bj = bi[:, :, j].unsqueeze(-1).unsqueeze(-1)
-                kts = torch.einsum("bhd,bhdv->bhv", kj, s)
-                s = s - bj * torch.einsum("bhd,bhv->bhdv", kj, kts)
-                s = s + bj * torch.einsum("bhd,bhv->bhdv", kj, vj)
-                oj = torch.einsum("bhd,bhdv->bhv", qi[:, :, j], s)
-                chunk_out.append(oj)
-            outputs.append(torch.stack(chunk_out, dim=2).to(input_dtype))
-            state = s
 
         else:
             g_cs = gi.cumsum(-1)
@@ -227,74 +241,6 @@ def naive_recurrent_reference(
         outputs.append(out_t)
 
     return torch.stack(outputs, dim=2)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# WY decomposition helpers
-# ════════════════════════════════════════════════════════════════════════════════
-
-
-def solve_tril_inv(A: torch.Tensor) -> torch.Tensor:
-    """Compute (I + A)^{-1} where A is strictly lower triangular."""
-    BHN, C, _ = A.shape
-    eye = torch.eye(C, device=A.device, dtype=A.dtype).unsqueeze(0).expand(BHN, -1, -1)
-    return torch.linalg.solve_triangular(eye + A, eye, upper=False, unitriangular=True)
-
-
-def prepare_wy_repr_bwd(
-    a: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    g_cs_d: torch.Tensor,
-    A_inv: torch.Tensor,
-    dw: torch.Tensor,
-    du: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backprop through WY decomposition (unified scalar/diagonal)."""
-    C = a.shape[1]
-
-    exp_g = torch.exp(g_cs_d)
-    exp_neg_g = torch.exp(-g_cs_d)
-    a_fwd = a * exp_g
-    a_bwd = a * exp_neg_g
-    ba = beta.unsqueeze(-1) * a_fwd
-    bv = beta.unsqueeze(-1) * v
-
-    A_inv_T = A_inv.transpose(-2, -1)
-
-    d_ba = torch.bmm(A_inv_T, dw)
-    d_bv = torch.bmm(A_inv_T, du)
-
-    dAinv = torch.bmm(dw, ba.transpose(-2, -1)) + torch.bmm(du, bv.transpose(-2, -1))
-    dA = -torch.bmm(A_inv_T, torch.bmm(dAinv, A_inv_T))
-
-    idx = torch.arange(C, device=a.device)
-    mask = (idx.unsqueeze(-1) > idx.unsqueeze(-2)).float()
-    dA = dA * mask
-
-    dL_dots = dA * beta.unsqueeze(-1)
-
-    da_fwd_from_A = torch.bmm(dL_dots, a_bwd)
-    da_bwd_from_A = torch.bmm(dL_dots.transpose(-2, -1), a_fwd)
-
-    da_from_A = da_fwd_from_A * exp_g + da_bwd_from_A * exp_neg_g
-    dg_d_from_A = da_fwd_from_A * a_fwd - da_bwd_from_A * a_bwd
-
-    dots = torch.bmm(a_fwd, a_bwd.transpose(-2, -1))
-    dbeta_from_A = (dA * dots).sum(-1)
-
-    da_from_ba = d_ba * beta.unsqueeze(-1) * exp_g
-    dbeta_from_ba = (d_ba * a_fwd).sum(-1)
-    dg_d_from_ba = d_ba * ba
-
-    dv_out = d_bv * beta.unsqueeze(-1)
-    dbeta_from_bv = (d_bv * v).sum(-1)
-
-    da = da_from_A + da_from_ba
-    dbeta = dbeta_from_A + dbeta_from_ba + dbeta_from_bv
-    dg_cs_d = dg_d_from_A + dg_d_from_ba
-
-    return da, dv_out, dbeta, dg_cs_d
 
 
 # ════════════════════════════════════════════════════════════════════════════════
