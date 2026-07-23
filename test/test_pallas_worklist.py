@@ -1,8 +1,8 @@
-"""Tests for the ``compact_worklist`` Pallas loop type.
+"""Tests for Pallas flattened worklists.
 
 Layered bottom-up so each layer is tested before the next depends on it:
 
-1. Builder unit tests (this file, ``TestCompactWorklistBuilder``) -- pure JAX,
+1. Builder unit tests (this file, ``TestWorklistBuilder``) -- pure JAX,
    CPU-only, no Helion compiler.  Assert :func:`flatten_worklist` matches a slow
    Python reference across length distributions and edge cases.
 
@@ -35,6 +35,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
+from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
 try:
@@ -86,7 +87,7 @@ def _python_flatten_reference(base, length, block, *, dep_base=None, dep_len=Non
 
 @onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
-class TestCompactWorklistBuilder(unittest.TestCase):
+class TestWorklistBuilder(unittest.TestCase):
     """Unit tests for :func:`flatten_worklist`."""
 
     def _check(self, lengths, block, *, dep_lengths=None):
@@ -560,9 +561,19 @@ def _offsets(lengths):
     )
 
 
+def _worklist_config(
+    block_sizes: list[int], *, loop_type: str = "unroll"
+) -> helion.Config:
+    return helion.Config(
+        block_sizes=block_sizes,
+        pallas_loop_type=loop_type,
+        pallas_worklist_grouping=1,
+    )
+
+
 @onlyBackends(["pallas"])
 class TestDetectAndGating(unittest.TestCase):
-    """detect_compact_worklist_plan + autotuner gating over real traces.
+    """Flattened-worklist detection and autotuner gating over real traces.
 
     Runs on CPU: ``kernel.bind`` traces with fake tensors, no device needed.
     """
@@ -605,10 +616,10 @@ class TestDetectAndGating(unittest.TestCase):
     def test_dense_kv_bounds_general(self):
         # Proves capture is general (no +1 pattern-match): length is end - begin.
         plan = self._dense_kv_plan()
-        compact = plan.compact_axis
-        self.assertEqual(ast.unparse(compact.base), "q_offsets[seq_idx]")
+        axis = plan.compact_axis
+        self.assertEqual(ast.unparse(axis.base), "q_offsets[seq_idx]")
         self.assertEqual(
-            ast.unparse(compact.length),
+            ast.unparse(axis.length),
             "q_offsets[seq_idx + 1] - q_offsets[seq_idx]",
         )
 
@@ -645,7 +656,7 @@ class TestDetectAndGating(unittest.TestCase):
             ["work_seq", "q_begin", "q_extent", "kv_begin", "kv_len"],
         )
 
-    def test_gating_offers_compact_worklist_for_jagged(self):
+    def test_gating_offers_worklist_grouping_for_jagged(self):
         qo = _offsets([16, 16, 16, 16])
         lq = int(qo[-1])
         bk = _dense_kv_kernel.bind(
@@ -657,8 +668,13 @@ class TestDetectAndGating(unittest.TestCase):
             )
         )
         fields = bk.env.config_spec._flat_fields()
-        choices = fields["pallas_loop_type"].choices
-        self.assertIn("compact_worklist", choices)
+        loop_type_field = fields["pallas_loop_type"]
+        grouping_field = fields["pallas_worklist_grouping"]
+        self.assertIsInstance(loop_type_field, EnumFragment)
+        self.assertIsInstance(grouping_field, EnumFragment)
+        choices = loop_type_field.choices
+        self.assertEqual(choices, ("fori_loop", "emit_pipeline", "unroll"))
+        self.assertEqual(grouping_field.choices, (0, 1))
         self.assertEqual(list(bk.env.config_spec.grid_block_ids), [0])
 
     def test_gating_absent_for_non_jagged(self):
@@ -666,11 +682,12 @@ class TestDetectAndGating(unittest.TestCase):
         fields = bk.env.config_spec._flat_fields()
         # No inner Pallas loops -> no pallas_loop_type field at all.
         self.assertNotIn("pallas_loop_type", fields)
+        self.assertNotIn("pallas_worklist_grouping", fields)
 
 
 @onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
-class TestBuildWorklistRender(unittest.TestCase):
+class TestWorklistRender(unittest.TestCase):
     """The generated jnp _build_worklist.
 
     Renders the builder from a real plan, execs it under JAX (CPU), and checks
@@ -923,7 +940,7 @@ class TestHostBoundValidation(unittest.TestCase):
 
 @onlyBackends(["pallas"])
 class TestPolicyClassification(unittest.TestCase):
-    """Unsupported compact indexing is rejected, not silently dropped."""
+    """Unsupported flattened-axis indexing is rejected, not silently dropped."""
 
     def _grid_loop(self, src):
         return ast.parse(src).body[0]
@@ -941,7 +958,7 @@ class TestPolicyClassification(unittest.TestCase):
         self.assertEqual(policies["q"], "compact_aligned_load")
         self.assertEqual(policies["out"], "compact_exact_store")
 
-    def test_non_leading_compact_dim_rejected(self):
+    def test_non_leading_flattened_dim_rejected(self):
         loop = self._grid_loop(
             "for seq in g:\n"
             "    for tile_q in t:\n"
@@ -962,15 +979,13 @@ class TestPolicyClassification(unittest.TestCase):
 
 
 @onlyBackends(["pallas"])
-class TestNoSilentFallback(unittest.TestCase):
-    """compact_worklist routes to the compact launcher, never the default."""
+class TestWorklistConfig(unittest.TestCase):
+    """Flattening is explicit, validated, and emitted only for matching kernels."""
 
-    def _kernel(self, fn, **cfg):
-        return helion.kernel(
-            fn, config=helion.Config(**cfg), static_shapes=True, backend="pallas"
-        )
+    def _kernel(self, fn, config):
+        return helion.kernel(fn, config=config, static_shapes=True, backend="pallas")
 
-    def test_matching_kernel_generates_compact(self):
+    def test_grouping_one_generates_worklist(self):
         def fn(q, k, v, q_offsets):
             out = torch.empty_like(q)
             for seq_idx in hl.grid(q_offsets.size(0) - 1):
@@ -994,14 +1009,11 @@ class TestNoSilentFallback(unittest.TestCase):
             torch.randn(4, 16, 2, 8),
             qo,
         )
-        kernel = self._kernel(fn, block_sizes=[8], pallas_loop_type="compact_worklist")
+        kernel = self._kernel(fn, _worklist_config([8]))
         bound = kernel.bind(args)
-        code = bound.to_triton_code(
-            helion.Config(block_sizes=[8], pallas_loop_type="compact_worklist")
-        )
-        # Emits the compact-worklist-specific launcher kwargs and the
-        # in-jit worklist builder; the unified launcher dispatches to
-        # the compact compile path based on ``_compact_build_worklist``.
+        code = bound.to_triton_code(_worklist_config([8]))
+        # The unified launcher selects its flattened path from the generated
+        # builder kwargs; there is no separate launcher name.
         self.assertIn("_compact_build_worklist=_build_worklist", code)
         self.assertIn("def _build_worklist(", code)
         # Offsets arg index is non-empty (q_offsets feeds the builder).
@@ -1017,44 +1029,117 @@ class TestNoSilentFallback(unittest.TestCase):
                 out[tile] = x[tile] + y[tile]
             return out
 
-        kernel = self._kernel(
-            fn, block_sizes=[16, 16], pallas_loop_type="compact_worklist"
-        )
+        kernel = self._kernel(fn, _worklist_config([16, 16]))
         args = (torch.randn(64, 64), torch.randn(64, 64))
         bound = kernel.bind(args)
         with self.assertRaises(exc.InvalidConfig):
             bound.ensure_config_exists(args)
             bound.to_triton_code(bound._config)
 
+    def test_invalid_worklist_grouping_raises(self):
+        args = (torch.randn(64, 64), torch.randn(64, 64))
+        bound = _add_kernel.bind(args)
+        for grouping in (True, 2):
+            with (
+                self.subTest(grouping=grouping),
+                self.assertRaisesRegex(
+                    exc.InvalidConfig, "Invalid pallas_worklist_grouping"
+                ),
+            ):
+                bound.to_triton_code(
+                    helion.Config(
+                        block_sizes=[16, 16],
+                        pallas_worklist_grouping=grouping,
+                    )
+                )
+
+    def test_grouping_zero_is_noop_for_unsupported_kernel(self):
+        args = (torch.randn(64, 64), torch.randn(64, 64))
+        code = _add_kernel.bind(args).to_triton_code(
+            helion.Config(
+                block_sizes=[16, 16],
+                pallas_worklist_grouping=0,
+            )
+        )
+        self.assertNotIn("_compact_build_worklist", code)
+        self.assertNotIn("_build_worklist", code)
+
+    def test_grouping_zero_dynamic_unroll_raises(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        args = (
+            torch.randn(lq, 2, 8),
+            torch.randn(4, 16, 2, 8),
+            torch.randn(4, 16, 2, 8),
+            qo,
+        )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig, "requires static inner-loop bounds"
+        ):
+            _dense_kv_kernel.bind(args).to_triton_code(
+                helion.Config(
+                    block_sizes=[8],
+                    pallas_loop_type="unroll",
+                    pallas_worklist_grouping=0,
+                )
+            )
+
 
 @onlyBackends(["pallas"])
-class TestOrderedResidencyClassification(unittest.TestCase):
-    def test_fully_jagged_ordered_kv_uses_resident_fori_without_new_launcher_api(self):
+class TestWorklistLoopDispatch(unittest.TestCase):
+    @staticmethod
+    def _fully_jagged_args():
         qo = _offsets([12, 20, 5, 30])
         kvo = _offsets([13, 7, 19, 11])
         lq, lkv = int(qo[-1]), int(kvo[-1])
-        args = (
+        return (
             torch.randn(lq, 4, 128),
             torch.randn(lkv, 4, 128),
             torch.randn(lkv, 4, 128),
             qo,
             kvo,
         )
-        code = _fully_jagged_kernel.bind(args).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+
+    def test_unroll_uses_resident_fori(self):
+        code = _fully_jagged_kernel.bind(self._fully_jagged_args()).to_triton_code(
+            _worklist_config([8, 8])
         )
 
-        # A jagged ordered reduction lowers via the resident-cache fori path (the
-        # default for compact_worklist), not emit_pipeline. This test covers only
-        # that classification: the reduction uses jax.lax.fori_loop, it reuses the
-        # existing compact launcher (no extra launcher API), and q/out remain
-        # compact aligned windows. The transpose-cache structure emitted inside the
-        # fori is asserted separately by TestResidentPrepHoistCodegen.
+        # A flattened unroll reduction lowers via the resident-cache fori path,
+        # reuses the unified launcher, and keeps q/out in aligned windows. The
+        # transpose-cache structure is covered by TestResidentPrepHoistCodegen.
         self.assertIn("lax.fori_loop", code)
         self.assertNotIn("pltpu.emit_pipeline(", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
 
-    def test_dense_kv_owner_indexed_tensors_have_no_ordered_pipeline(self):
+    def test_emit_pipeline_streams(self):
+        code = _fully_jagged_kernel.bind(self._fully_jagged_args()).to_triton_code(
+            _worklist_config([8, 8], loop_type="emit_pipeline")
+        )
+
+        self.assertIn("_compact_build_worklist=_build_worklist", code)
+        self.assertIn("pltpu.emit_pipeline(", code)
+        self.assertNotIn("_rc_prep_refill", code)
+        self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
+        self.assertIn("_compact_ordered_window=0", code)
+
+    def test_default_loop_type_streams_with_fori(self):
+        code = _fully_jagged_kernel.bind(self._fully_jagged_args()).to_triton_code(
+            helion.Config(
+                block_sizes=[8, 8],
+                pallas_worklist_grouping=1,
+            )
+        )
+
+        self.assertIn("_compact_build_worklist=_build_worklist", code)
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertNotIn("pltpu.emit_pipeline(", code)
+        self.assertNotIn("_rc_prep_refill", code)
+        self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
+        self.assertIn("_compact_ordered_window=0", code)
+
+    def test_no_ordered_axis_skips_inner_pipeline(self):
         qo = _offsets([12, 20, 5, 30])
         lq = int(qo[-1])
         args = (
@@ -1063,16 +1148,14 @@ class TestOrderedResidencyClassification(unittest.TestCase):
             torch.randn(4, 16, 4, 128),
             qo,
         )
-        code = _dense_kv_kernel.bind(args).to_triton_code(
-            helion.Config(block_sizes=[8], pallas_loop_type="compact_worklist")
-        )
+        code = _dense_kv_kernel.bind(args).to_triton_code(_worklist_config([8]))
 
         self.assertNotIn("_hbm_arg_indices=", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         # Dense-KV has no ordered axis, so no inner pipeline either.
         self.assertNotIn("pltpu.emit_pipeline", code)
 
-    def test_kv_owned_backward_shape_uses_resident_ordered_q_like_loads(self):
+    def test_unroll_uses_resident_q_like_loads(self):
         qo = _offsets([12, 20, 5, 30])
         kvo = _offsets([13, 7, 19, 11])
         lq, lkv = int(qo[-1]), int(kvo[-1])
@@ -1084,12 +1167,11 @@ class TestOrderedResidencyClassification(unittest.TestCase):
             kvo,
         )
         code = _kv_owned_jagged_kernel.bind(args).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+            _worklist_config([8, 8])
         )
 
         # Here the ordered axis is the q-like loop; under resident caching it
-        # lowers via the fori path (not emit_pipeline).  out stays the compact
-        # exact-store window.
+        # lowers via the fori path while out stays the exact-store window.
         self.assertIn("lax.fori_loop", code)
         self.assertNotIn("pltpu.emit_pipeline(", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
@@ -1179,15 +1261,15 @@ class TestUpperBoundPacking(unittest.TestCase):
 
 @onlyBackends(["pallas"])
 class TestConfigStateIsolation(unittest.TestCase):
-    """compact plan must not leak into a later config.
+    """A worklist plan must not leak into a later config.
 
     One CompileEnvironment is reused across all configs of a BoundKernel, and
     many lowering paths gate on ``env.compact_worklist_plan is not None``.  If a
-    compact config is codegen'd first, a later fori/emit/unroll config on the
-    same kernel must NOT inherit the stale plan and emit compact codegen.
+    worklist config is codegen'd first, a later fori/emit/unroll config on the
+    same kernel must not inherit the stale plan.
     """
 
-    def test_no_stale_compact_plan_in_later_config(self):
+    def test_worklist_plan_does_not_leak_to_later_config(self):
         kernel = helion.kernel(
             _dense_kv_kernel.fn, static_shapes=True, backend="pallas"
         )
@@ -1200,11 +1282,9 @@ class TestConfigStateIsolation(unittest.TestCase):
             qo,
         )
         bound = kernel.bind(args)
-        # Compact config first -> sets env.compact_worklist_plan.
-        compact = bound.to_triton_code(
-            helion.Config(block_sizes=[8], pallas_loop_type="compact_worklist")
-        )
-        self.assertIn("work_seq_ref", compact)  # sanity: compact really compiled
+        # Worklist config first -> sets env.compact_worklist_plan.
+        worklist = bound.to_triton_code(_worklist_config([8], loop_type="fori_loop"))
+        self.assertIn("work_seq_ref", worklist)
         # Then a fori config on the SAME bound kernel (same env): must be clean.
         fori = bound.to_triton_code(
             helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
@@ -1235,20 +1315,20 @@ class TestPrologueScoping(unittest.TestCase):
         self.assertEqual(ast.unparse(unscoped["x"]), "a[g] + 5")
 
 
-@skipUnlessPallas("compact_worklist numerics need Pallas TPU or interpret mode")
-class TestCompactWorklistNumerics(unittest.TestCase):
-    """Device/interpret numerics for compact_worklist vs an eager ground truth.
+@skipUnlessPallas("worklist-flattening numerics need Pallas TPU or interpret mode")
+class TestWorklistNumerics(unittest.TestCase):
+    """Device/interpret numerics for worklist flattening vs eager ground truth.
 
-    These are the device-side guards the host tests can't give: compact_worklist's
-    masked full-block ordered-overwrite store and its ordered inner loop (lowered
-    via ``emit_pipeline``) must reproduce the exact result of a plain per-sequence
-    torch computation.  Dense-KV (no ordered axis) runs in pallas interpret on
-    CPU; the fully-jagged ordered-loop cases are TPU-only (see per-test skips).
+    These are the device-side guards the host tests can't give: the masked
+    full-block ordered-overwrite store and resident ordered loop must reproduce
+    the exact result of a plain per-sequence torch computation. Dense-KV (no
+    ordered axis) runs in Pallas interpret on CPU; fully jagged ordered-loop
+    cases are TPU-only (see per-test skips).
 
     NB: the comparison is against an INDEPENDENT eager reference.  The ordered
     inner loop's lowering miscompiles these jagged patterns in interpret mode
     (verified: large abs error vs eager), so interpret is not a sound oracle for
-    it.  On real TPU, compact_worklist matches eager to bf16-matmul roundoff.
+    it. On real TPU, worklist flattening matches eager to bf16-matmul roundoff.
     """
 
     def test_dense_kv_unaligned_matches_eager(self):
@@ -1269,8 +1349,7 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         _, out = code_and_output(
             _dense_kv_kernel,
             (q, k, v, qo.to(DEVICE)),
-            block_sizes=[block],
-            pallas_loop_type="compact_worklist",
+            **_worklist_config([block]),
         )
         ref = _eager_dense_kv(q.cpu(), k.cpu(), v.cpu(), qo)
         torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
@@ -1287,13 +1366,12 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         _, out = code_and_output(
             _dense_kv_kernel,
             (q, k, v, qo.to(DEVICE)),
-            block_sizes=[block],
-            pallas_loop_type="compact_worklist",
+            **_worklist_config([block]),
         )
         self.assertEqual(tuple(out.shape), (0, H, D))
 
     @skipIfPallasInterpret(
-        "the resident-cache ordered KV path is validated on real TPU, not "
+        "the flattened ordered KV paths are validated on real TPU, not "
         "Pallas interpret mode"
     )
     def test_fully_jagged_with_empty_kv_matches_eager(self):
@@ -1307,14 +1385,15 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
         k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
         v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
-        _, out = code_and_output(
-            _fully_jagged_kernel,
-            (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
-            block_sizes=[block, block],  # compact Q tile + ordered KV tile
-            pallas_loop_type="compact_worklist",
-        )
         ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo)
-        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+        for loop_type in ("unroll", "fori_loop"):
+            with self.subTest(loop_type=loop_type):
+                _, out = code_and_output(
+                    _fully_jagged_kernel,
+                    (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
+                    **_worklist_config([block, block], loop_type=loop_type),
+                )
+                torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
     @skipIfPallasInterpret(
         "the resident-cache ordered KV path is validated on real TPU, not "
@@ -1344,8 +1423,7 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         _, out = code_and_output(
             _fully_jagged_kernel,
             (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
-            block_sizes=[qblock, kvblock],
-            pallas_loop_type="compact_worklist",
+            **_worklist_config([qblock, kvblock]),
         )
         ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo).float()
         rel_l2 = ((out.cpu().float() - ref).norm() / ref.norm()).item()
@@ -1354,8 +1432,8 @@ class TestCompactWorklistNumerics(unittest.TestCase):
 
 @unittest.skipUnless(HAS_JAX, "jax not available")
 @skipUnlessPallas("jax_fn export needs Pallas TPU or interpret mode")
-class TestCompactWorklistJaxExport(unittest.TestCase):
-    """compact_worklist embeds in an outer ``jax.jit`` via ``Kernel.jax_fn``.
+class TestWorklistJaxExport(unittest.TestCase):
+    """Worklist flattening embeds in outer ``jax.jit`` via ``Kernel.jax_fn``.
 
     Guards the pure-JAX export path: ``jax.jit(kernel.jax_fn)`` must match the
     eager result.
@@ -1374,9 +1452,7 @@ class TestCompactWorklistJaxExport(unittest.TestCase):
         qod = jnp.asarray(qo.numpy())
         kernel = helion.kernel(
             _dense_kv_kernel.fn,
-            config=helion.Config(
-                block_sizes=[block], pallas_loop_type="compact_worklist"
-            ),
+            config=_worklist_config([block]),
             static_shapes=True,
             backend="pallas",
         )
@@ -1458,7 +1534,7 @@ class TestResidentCacheWindowGuard(unittest.TestCase):
     def test_active_window_uncheckable_bound_raises(self):
         guard, k, c = self._setup()
         offsets = torch.tensor([0, c + 1, 2 * c + 1], dtype=torch.int32)
-        # Window active ([1, 2]) but the ordered bound or compact active-owner mask
+        # Window active ([1, 2]) but the ordered bound or active-owner mask
         # is not checkable (index -1): must RAISE rather than silently proceed.
         with self.assertRaisesRegex(RuntimeError, "not a.*checkable"):
             guard((offsets, k, k), [1, 2], -1, 0, c)
@@ -1472,7 +1548,7 @@ class TestResidentCacheWindowGuard(unittest.TestCase):
         offsets = torch.tensor([0], dtype=torch.int32)
         guard((offsets, k, k), [1, 2], 0, 0, c)
 
-    def test_zero_compact_source_is_not_guarded(self):
+    def test_zero_work_source_is_not_guarded(self):
         guard, k, c = self._setup()
         # Source 0 has a KV range larger than the window, but q_len==0, so it
         # produces no worklist item and never refills the resident cache.
@@ -1480,7 +1556,7 @@ class TestResidentCacheWindowGuard(unittest.TestCase):
         kv_offsets = torch.tensor([0, c + 1, c + 1], dtype=torch.int32)
         guard((q_offsets, kv_offsets, k, k), [2, 3], 1, 0, c)
 
-    def test_live_compact_source_is_guarded(self):
+    def test_active_work_source_is_guarded(self):
         guard, k, c = self._setup()
         q_offsets = torch.tensor([0, 1, 1], dtype=torch.int32)
         kv_offsets = torch.tensor([0, c + 1, c + 1], dtype=torch.int32)
@@ -1536,8 +1612,7 @@ class TestOrderedWindowBudget(unittest.TestCase):
         self.assertEqual(self._physical(operands, 128, prep_operands=operands), 128)
 
     def test_budget_too_small_returns_zero_physical_window(self):
-        # resident caching falls back to streaming when VMEM cannot hold one ordered
-        # block of the cached operands.
+        # A resident config is invalid when VMEM cannot hold one ordered block.
         operands = [((1_000_000, 4, 128), 4)]
         self.assertLess(self._budget(operands, vmem=1024, prep_operands=operands), 128)
         self.assertEqual(
@@ -1564,18 +1639,8 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
     """Codegen checks for optional resident-prep cache lowering."""
 
     def test_jagged_gdpa_emits_resident_prep_cache(self):
-        qo = _offsets([12, 20, 5, 30])
-        kvo = _offsets([13, 7, 19, 11])
-        lq, lkv = int(qo[-1]), int(kvo[-1])
-        args = (
-            torch.randn(lq, 4, 128),
-            torch.randn(lkv, 4, 128),
-            torch.randn(lkv, 4, 128),
-            qo,
-            kvo,
-        )
-        code = _fully_jagged_kernel.bind(args).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
+            _worklist_config([8, 8])
         )
         self.assertIn("_rc_prep_refill", code)
         self.assertIn("jnp.maximum(_wid - 1, 0)", code)
@@ -1623,7 +1688,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         import re
 
         code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+            _worklist_config([8, 8])
         )
         body = code[code.index("def _fori_body_0") :]
         dot = re.search(r"dot_general\(\w+, (permute_\d+),", body)
@@ -1643,7 +1708,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         # of the dot, so it is preserved.  Assert the score mask specifically: a
         # jnp.where whose fill is a -inf full (not merely the m_i init's -inf full).
         code = _flash_prep_kernel.bind(self._resident_args()).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+            _worklist_config([8, 8])
         )
         self.assertIn("_rc_prep_refill", code)  # prep cache installed
         self.assertRegex(code, r"jnp\.where\([^\n]*jnp\.full\(\[\], float\('-inf'\)")
@@ -1658,7 +1723,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
             return_value=[],
         ):
             code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
-                helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+                _worklist_config([8, 8])
             )
         self.assertNotIn("_prep[", code)  # no prep cache installed -> none read
         self.assertIn("jnp.where", code)  # per-tile masks preserved
@@ -1672,7 +1737,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
             qo,
         )
         code = _four_dim_major_permute_ordered_kernel.bind(args).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+            _worklist_config([8, 8])
         )
         self.assertIn("_rc_prep_refill", code)
         self.assertIn("jnp.transpose", code)
@@ -1732,7 +1797,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         from helion._compiler.pallas.compact_worklist import detect_resident_prep_hoists
         from helion._compiler.pallas.plan_tiling import plan_tiling
 
-        config = helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        config = _worklist_config([8, 8])
         bk = kernel.bind(args)
         with bk.env, bk.host_function:
             codegen = GenerateAST(bk.host_function, config)
@@ -1803,7 +1868,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         lq = int(qo[-1])
         args = (torch.randn(lq, 4, 128), torch.randn(lq, 4, 128), qo)
         code = _noprep_ordered_kernel.bind(args).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+            _worklist_config([8, 8])
         )
         self.assertNotIn("_rc_prep_refill", code)
         self.assertNotIn("_prep", code)
@@ -1814,6 +1879,18 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertNotIn("_compact_ordered_offset_arg_index=-1", code)
         self.assertNotIn("_compact_active_mask_arg_index=-1", code)
         self.assertNotIn("_compact_ordered_window=0", code)
+
+    def test_resident_unroll_rejects_insufficient_vmem(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        args = (torch.randn(lq, 4, 128), torch.randn(lq, 4, 128), qo)
+        with (
+            patch("helion.runtime._get_vmem_limit_bytes", return_value=1),
+            self.assertRaisesRegex(
+                exc.InvalidConfig, "VMEM budget cannot hold one ordered block"
+            ),
+        ):
+            _noprep_ordered_kernel.bind(args).to_triton_code(_worklist_config([8, 8]))
 
     def test_active_resident_cache_requires_range_start_metadata(self):
         from helion._compiler.backend import PallasBackend
@@ -1848,7 +1925,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         ):
             PallasBackend()._compact_worklist_launcher_args(args)
 
-    def test_unpacked_ordered_bound_stays_streamed(self):
+    def test_unpacked_ordered_bound_streams_with_emit_pipeline(self):
         qo = _offsets([12, 20, 5, 30])
         kvo = _offsets([13, 7, 19, 11])
         lq, lkv = int(qo[-1]), int(kvo[-1])
@@ -1860,7 +1937,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
             kvo,
         )
         code = _unpacked_ordered_kernel.bind(args).to_triton_code(
-            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+            _worklist_config([8, 8], loop_type="emit_pipeline")
         )
         self.assertNotIn("_rc_prep_refill", code)
         self.assertNotIn("_prep", code)
@@ -1869,6 +1946,20 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertIn("_compact_ordered_offset_arg_index=-1", code)
         self.assertIn("_compact_active_mask_arg_index=-1", code)
         self.assertIn("_compact_ordered_window=0", code)
+
+    def test_unpacked_ordered_bound_rejects_resident_unroll(self):
+        qo = _offsets([12, 20, 5, 30])
+        kvo = _offsets([13, 7, 19, 11])
+        lq, lkv = int(qo[-1]), int(kvo[-1])
+        args = (
+            torch.randn(lq, 4, 128),
+            torch.randn(lkv + 8, 4, 128),
+            torch.randn(lkv + 8, 4, 128),
+            qo,
+            kvo,
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "ordered bound is not packed"):
+            _unpacked_ordered_kernel.bind(args).to_triton_code(_worklist_config([8, 8]))
 
     def test_resident_ordered_entries_filter_ordered_operands(self):
         from helion._compiler.pallas.compact_worklist import resident_ordered_entries
@@ -1924,7 +2015,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertEqual(decision.resident_key_fields, ("range_start",))
         self.assertEqual(decision.prep_key_fields, ("range_start", "range_len"))
 
-    def test_resident_cache_decision_falls_back_when_window_not_viable(self):
+    def test_resident_cache_decision_is_inactive_when_window_not_viable(self):
         from helion._compiler.pallas.compact_worklist import (
             build_resident_cache_decision,
         )

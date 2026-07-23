@@ -179,6 +179,7 @@ class PallasBackend(Backend):
             "block_sizes",
             "loop_orders",
             "flatten_loops",
+            "pallas_worklist_grouping",
             "pallas_loop_type",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
@@ -1081,7 +1082,6 @@ class PallasBackend(Backend):
                 launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
-        pallas_loop_type = config.get("pallas_loop_type", "unroll")
         scratch_shapes = [
             (
                 s.shape,
@@ -1125,7 +1125,10 @@ class PallasBackend(Backend):
         if matmul_spec is not None:
             launcher_args.append(f"_matmul_dot_general={matmul_spec!r}")
 
-        if pallas_loop_type == "compact_worklist" and sorted_args is not None:
+        if (
+            CompileEnvironment.current().compact_worklist_plan is not None
+            and sorted_args is not None
+        ):
             launcher_args.extend(self._compact_worklist_launcher_args(sorted_args))
 
         return launcher_args
@@ -1240,10 +1243,9 @@ class PallasBackend(Backend):
     def build_launcher_name(self, config: Config) -> str:
         """Return the single Pallas launcher name.
 
-        All ``pallas_loop_type`` values (``unroll``, ``emit_pipeline``,
-        ``fori_loop``, ``compact_worklist``) route through the same
-        ``default_pallas_launcher``; the loop-shape choice happens
-        inside based on the launcher-observable kwargs codegen emits.
+        All ``pallas_loop_type`` values route through the same
+        ``default_pallas_launcher``; worklist flattening is selected separately
+        by its launcher-observable kwargs.
         """
         from ...autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
 
@@ -1272,19 +1274,39 @@ class PallasBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from ...autotuner.config_spec import VALID_PALLAS_WORKLIST_GROUPINGS
         from ..compile_environment import CompileEnvironment
         from .plan_tiling import plan_tiling
+
+        # Validate pallas_loop_type before any codegen setup.
+        self.build_launcher_name(config)
+        grouping = config.get("pallas_worklist_grouping", 0)
+        if type(grouping) is not int or grouping not in VALID_PALLAS_WORKLIST_GROUPINGS:
+            raise exc.InvalidConfig(
+                "Invalid pallas_worklist_grouping "
+                f"{grouping!r}. Expected one of {VALID_PALLAS_WORKLIST_GROUPINGS}."
+            )
+
+        env = CompileEnvironment.current()
+        if (
+            grouping == 0
+            and config.get("pallas_loop_type", "unroll") == "unroll"
+            and env.config_spec.has_symbolic_or_data_dependent_bounds
+        ):
+            raise exc.InvalidConfig(
+                "pallas_loop_type='unroll' requires static inner-loop bounds or "
+                "pallas_worklist_grouping=1."
+            )
 
         plan_tiling(graphs, config, tile_strategy)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
         # reused across all configs of a BoundKernel (see CompileEnvironment's
-        # "no config-specific state" contract).  Reset before re-detecting so a
-        # later non-compact config never inherits a prior compact config's plan
+        # "no config-specific state" contract). Reset before re-detecting so a
+        # later non-flattened config never inherits a prior compact config's plan
         # -- many lowering paths gate on ``env.compact_worklist_plan is not None``
         # (PID strategy, loop-bound remap, fori handling, ds slicing), not on
-        # pallas_loop_type, so a stale plan would mis-lower a fori/emit config.
-        env = CompileEnvironment.current()
+        # config values, so a stale plan would mis-lower a later config.
         env.compact_worklist_plan = None
         env.compact_worklist_resident_cache_decision = None
         env.compact_worklist_resident_prep_hoists = ()
@@ -1293,7 +1315,7 @@ class PallasBackend(Backend):
         env.compact_worklist_ordered_block = 1
         env.compact_worklist_offset_params = []
 
-        if config.get("pallas_loop_type") == "compact_worklist":
+        if grouping == 1:
             self._setup_compact_worklist(graphs, config)
 
     def _setup_compact_worklist(self, graphs: list[GraphInfo], config: Config) -> None:
@@ -1306,11 +1328,9 @@ class PallasBackend(Backend):
         megablocks ``UPPER``.  ``detect_*`` raises ``exc.InvalidConfig`` on a
         non-matching kernel (autotuner-skippable).
         """
-        from ...runtime import _get_vmem_limit_bytes
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
-        from .compact_worklist import build_resident_cache_admission
         from .compact_worklist import detect_compact_worklist_plan
         from .compact_worklist import metadata_arg_names
 
@@ -1342,22 +1362,31 @@ class PallasBackend(Backend):
                 env.compact_worklist_ordered_block = int(ordered_block)
         env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
 
-        import jax.experimental.pallas.tpu as pltpu
+        if config.get("pallas_loop_type", "unroll") == "unroll" and (
+            plan.ordered_axis is not None
+        ):
+            import jax.experimental.pallas.tpu as pltpu
 
-        # Choose C from the conservative device-reported VMEM budget.  The runtime
-        # may pass a higher Mosaic compile ceiling for resident-window kernels so TPU7x
-        # accepts this already-sized allocation, but that ceiling is deliberately
-        # not used here as an allocation budget.
-        vmem_bytes = _get_vmem_limit_bytes(pltpu)
-        admission = build_resident_cache_admission(
-            graphs,
-            plan,
-            host_fn.params.arguments,
-            ordered_block=env.compact_worklist_ordered_block,
-            vmem_bytes=vmem_bytes,
-        )
-        env.compact_worklist_resident_prep_hoists = admission.prep_hoists
-        env.compact_worklist_resident_cache_decision = admission.decision
+            from ...runtime import _get_vmem_limit_bytes
+            from .compact_worklist import build_resident_cache_admission
+
+            # Choose C from the conservative device-reported VMEM budget. The
+            # higher Mosaic compile ceiling used by the runtime is not an
+            # allocation budget.
+            admission = build_resident_cache_admission(
+                graphs,
+                plan,
+                host_fn.params.arguments,
+                ordered_block=env.compact_worklist_ordered_block,
+                vmem_bytes=_get_vmem_limit_bytes(pltpu),
+            )
+            if not admission.decision.active:
+                raise exc.InvalidConfig(
+                    "pallas_loop_type='unroll' requires resident ordered-loop "
+                    f"admission: {admission.decision.inactive_reason}."
+                )
+            env.compact_worklist_resident_prep_hoists = admission.prep_hoists
+            env.compact_worklist_resident_cache_decision = admission.decision
 
     def _compact_worklist_upper(
         self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction

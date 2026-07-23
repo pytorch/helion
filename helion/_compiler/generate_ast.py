@@ -1338,10 +1338,8 @@ if __name__ == "__main__":
     """)
 
 
-def _maybe_emit_compact_worklist_builder(codegen: GenerateAST, config: Config) -> None:
+def _maybe_emit_compact_worklist_builder(codegen: GenerateAST) -> None:
     """Emit the module-level jnp ``_build_worklist`` for a compact-worklist kernel."""
-    if config.get("pallas_loop_type") != "compact_worklist":
-        return
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     if plan is None:
@@ -1387,7 +1385,7 @@ def generate_ast(
             # Emit the worklist builder + record its offset params BEFORE the host
             # body is visited (the launcher call -- which reads the offset params
             # via build_launcher_args -- is generated during that visit).
-            _maybe_emit_compact_worklist_builder(codegen, config)
+            _maybe_emit_compact_worklist_builder(codegen)
 
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))

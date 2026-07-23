@@ -1,4 +1,4 @@
-"""JAX worklist builder for the ``compact_worklist`` Pallas loop type.
+"""JAX builder for Pallas compact-worklist flattening.
 
 Pure JAX and unit-testable on CPU, with no dependency on the Helion compiler.
 

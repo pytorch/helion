@@ -112,27 +112,23 @@ def _extract_subscript_vals(subscript: object) -> list[object]:
 def _(state: CodegenState) -> object:
     """Emit inner device loops for Pallas/TPU.
 
-    When ``pallas_loop_type="emit_pipeline"``, generates ``pltpu.emit_pipeline``
-    calls with automatic DMA pipelining.  When ``pallas_loop_type="fori_loop"``,
-    generates ``jax.lax.fori_loop`` with explicit ``pltpu.make_async_copy`` DMA.
-    Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
+    Worklist flattening is handled before the ordinary loop-type dispatch: its
+    compact tile is already represented by the work-item grid, while its ordered
+    loop uses the configured resident or streaming lowering.
     """
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
+    if CompileEnvironment.current().compact_worklist_plan is not None:
+        if _is_compact_ordered_inner_loop(state):
+            if pallas_loop_type == "unroll":
+                return _codegen_resident_cache(state)
+            if pallas_loop_type == "emit_pipeline":
+                return _codegen_emit_pipeline(state)
+            assert pallas_loop_type == "fori_loop"
+        return _codegen_fori_loop(state)
     if pallas_loop_type == "emit_pipeline":
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
-        return _codegen_fori_loop(state)
-    if pallas_loop_type == "compact_worklist":
-        # The compact tile becomes the grid (no loop).  The ordered inner tile
-        # uses the resident-cache fori path when the ordered range can be
-        # proven/windowed; otherwise it streams through emit_pipeline.  The
-        # single-iteration compact tile lowers through the fori path.  Both have
-        # begin/end remapped to metadata refs (see _compact_worklist_bounds).
-        if _is_compact_ordered_inner_loop(state):
-            if _resident_cache_applies(state):
-                return _codegen_resident_cache(state)
-            return _codegen_emit_pipeline(state)
         return _codegen_fori_loop(state)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
@@ -144,58 +140,40 @@ def _(state: CodegenState) -> None:
     """Emit inner stepped device loops for Pallas/TPU."""
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
+    if CompileEnvironment.current().compact_worklist_plan is not None:
+        if _is_compact_ordered_inner_loop(state):
+            if pallas_loop_type == "unroll":
+                _codegen_resident_cache(state)
+                return None
+            if pallas_loop_type == "emit_pipeline":
+                _codegen_emit_pipeline(state)
+                return None
+            assert pallas_loop_type == "fori_loop"
+        _codegen_fori_loop(state)
+        return None
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None
-    if pallas_loop_type in ("fori_loop", "compact_worklist"):
-        # Route compact_worklist through the same lowering as _for_loop so the
-        # compact metadata (begin/end remap, synthetic compact tile) is applied
-        # rather than falling through to the common (non-compact) codegen.
-        if pallas_loop_type == "compact_worklist" and _is_compact_ordered_inner_loop(
-            state
-        ):
-            if _resident_cache_applies(state):
-                _codegen_resident_cache(state)
-                return None
-            _codegen_emit_pipeline(state)
-            return None
+    if pallas_loop_type == "fori_loop":
         _codegen_fori_loop(state)
         return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
 
-def _resident_cache_applies(state: CodegenState) -> bool:
-    """Whether the ordered reduction should use the resident-cache path.
-
-    Automatic compile-time decision (not a tuning knob), gated on:
-    - a bound-checkable ordered range plus compact active-owner mask: packed offset
-      arrays prove both the ordered length and which owners produce work; and
-    - a viable physical window: VMEM can hold at least one ordered block of the
-      resident operands.
-
-    If the range/window proof is absent -- unusual ordered bounds or an oversized
-    per-token footprint -- the ordered loop stays on the streamed
-    ``emit_pipeline`` path unchanged.
-    """
-    env = CompileEnvironment.current()
-    decision = env.compact_worklist_resident_cache_decision
-    return decision is not None and decision.active
-
-
 def _codegen_resident_cache(state: CodegenState) -> object:
     """Range-keyed resident-window lowering for the compact-worklist ordered loop.
 
-    Selected by :func:`_resident_cache_applies` for an ordered inner reduction
-    with a guardable packed range and a viable VMEM window.  The ordered operand
-    is held in a per-range resident ``pl.Element(C)`` window keyed on
-    ``range_start`` (``C`` is the compile-threaded physical window).  Optional
-    prep-cache descriptors are handled inside ``_codegen_fori_loop``.
+    The ordered operand is held in a per-range resident ``pl.Element(C)`` window
+    keyed on ``range_start`` (``C`` is the compile-threaded physical window).
+    Optional prep-cache descriptors are handled inside ``_codegen_fori_loop``.
 
-    Ranges longer than ``C`` are NOT handled in-kernel: the launcher raises
-    (``runtime._compact_raise_if_range_exceeds_window``) rather than over-read the
-    fixed window -- there is no in-kernel streamed ``else``.
+    Ranges longer than ``C`` are NOT handled in-kernel: the torch launcher raises
+    (``runtime._compact_raise_if_range_exceeds_window``), while JAX export keeps
+    this as a caller precondition. There is no in-kernel streamed ``else``.
     """
+    decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
+    assert decision is not None and decision.active
     return _codegen_fori_loop(state)
 
 
@@ -563,10 +541,9 @@ def _compact_axis_kind(state: CodegenState, loop_dim_index: int) -> str | None:
 def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
     """True if this ``_for_loop`` is the compact-worklist ordered inner tile.
 
-    The ordered tile is the carried inner reduction; it is the only
-    compact-worklist loop that may stream via ``_codegen_emit_pipeline`` when the
-    resident-cache window is inactive.  The owner grid and the single-iteration
-    compact tile stay on the fori path.
+    The ordered tile is the carried inner reduction selected by
+    ``pallas_loop_type``. The owner grid and single-iteration compact tile stay
+    on the fori path.
     """
     from ..device_ir import ForLoopGraphInfo
 
@@ -601,7 +578,7 @@ def _get_loop_begin_and_end(
 ) -> tuple[str, str]:
     """Extract the begin and end values from the _for_loop state args.
 
-    Under ``compact_worklist`` the compact tile's begin/end are remapped to the
+    Under worklist flattening the compact tile's begin/end are remapped to the
     per-work-item metadata refs: begin =
     ``tile_starts_ref[_wid]``, end =
     ``tile_starts_ref[_wid] + tile_extents_ref[_wid]`` (and likewise the ordered
@@ -3107,9 +3084,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # item, since the builder guarantees extent <= BLOCK), so emit the body
     # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
     # would add control-flow overhead and block pipelining for the common
-    # no-ordered-axis case).  The ordered inner tile does not reach here: it lowers
-    # separately via the resident-cache path or emit_pipeline fallback (see the
-    # _for_loop pallas dispatch).
+    # no-ordered-axis case). The ordered inner tile does not reach here: it lowers
+    # separately through the loop type selected by the _for_loop Pallas dispatch.
     plan = CompileEnvironment.current().compact_worklist_plan
     is_compact_tile = (
         plan is not None
