@@ -1659,13 +1659,15 @@ class CuteTcgen05Config:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if key == TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY:
-            # The autotuner search surface for this key is the collapsed
-            # ``EnumFragment((True,))``; autotuner-generated configs always
-            # set it via ``default_flat()`` mutation. ``flatten`` only hits
-            # this branch on user-supplied configs that omit the key, where
-            # absence means "no FFI promotion requested" — matches the
+            # The search surface for this key draws False only
+            # (``EnumFragment((True, False), search_choices=(False,))``), so an
+            # absent key can only come from a config that did not go through the
+            # search: a user-supplied config, a partial seed, or a cache entry.
+            # Absence there means "no FFI promotion requested" — matching the
             # validation-view default and the special case at
-            # ``normalize_pre_pid_type``.
+            # ``normalize_pre_pid_type``. Back-filling False (rather than the
+            # fragment default, True) is also what keeps a partial seed from
+            # encoding an FFI request it never made.
             return True, False
         if key != TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY:
             return False, None
@@ -2019,8 +2021,28 @@ class CuteTcgen05Config:
             # Validation exposes the two direct-entry controls for explicit
             # configs. Layout overrides already have a generic validation path
             # below; only the seed/search surface narrows them to its fixed tile.
+            #
+            # FFI direct-entry is a seed, not a search dimension:
+            # ``search_choices=(False,)`` makes the search only ever draw
+            # False, so the FFI envelope enters solely via the
+            # eligibility-gated ``CuteTcgen05ClusterM2FfiHeuristic`` seed
+            # (which still round-trips ``tvm_ffi_launch=True`` verbatim
+            # because ``choices`` carries True and the round-trip reads the
+            # stored value, not ``_active_choices()``). Keeping True *first*
+            # preserves ``EnumFragment.default() == choices[0] == True`` so
+            # the no-autotune ``default_config()`` still promotes to the
+            # validated full-tile FFI envelope on eligible shapes (the
+            # search view and the fragment-default path share this
+            # fragment). ``choices`` carrying both values also lets the
+            # surrogate encode the seed's True without raising
+            # ``Invalid enum value`` (``encode()`` uses full ``choices``,
+            # config_fragment.py). Validation keeps a Boolean surface so an
+            # absent user-config key still means "no FFI promotion
+            # requested" (default False).
             tvm_ffi_launch_fragment: ConfigSpecFragment = (
-                EnumFragment((True,)) if for_search else BooleanFragment()
+                EnumFragment((True, False), search_choices=(False,))
+                if for_search
+                else BooleanFragment()
             )
             fragments.update(
                 {
