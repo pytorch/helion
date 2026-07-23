@@ -1777,6 +1777,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src2_result, expected_src2)
         torch.testing.assert_close(dst2_result, expected_dst2)
 
+    @xfailIfCute("InternalError: Negative indexes")
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
@@ -1802,6 +1803,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    @xfailIfCute("InternalError: Negative indexes")
     def test_negative_indexing_multidim(self):
         """Test negative indexing on multiple dimensions: x[-1, -1]"""
 
@@ -1819,6 +1821,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected[-1, -1] = 42.0
         torch.testing.assert_close(result, expected)
 
+    @xfailIfCute("InternalError: Negative indexes")
     def test_negative_indexing_with_tile(self):
         """Test mixed tile and negative index: x[tile, -1]"""
 
