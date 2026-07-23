@@ -16,13 +16,17 @@ from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeurist
 from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonNarrowReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.autotuner_heuristics.triton import (
-    TritonStandardReductionHeuristic,
+    TritonStandardReductionHeuristicSM90,
 )
 from helion._compiler.autotuner_heuristics.triton import (
-    TritonUserTiledReductionHeuristic,
+    TritonStandardReductionHeuristicSM100,
+)
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonUserTiledReductionHeuristicSM90,
 )
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
@@ -950,7 +954,9 @@ class TestTritonStandardReductionHeuristic(TestCase):
             patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
             patch("helion.runtime.get_num_sm", return_value=132),
         ):
-            seed = TritonStandardReductionHeuristic.get_seed_config(env, MagicMock())
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                env, MagicMock()
+            )
         self.assertEqual(seed.config["block_sizes"], [1])
         self.assertEqual(seed.config["reduction_loops"], [None])
         # rnumel ramp: 1024 falls in the <=1024 band -> 4 warps.
@@ -976,7 +982,9 @@ class TestTritonStandardReductionHeuristic(TestCase):
             patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
             patch("helion.runtime.get_num_sm", return_value=132),
         ):
-            seed = TritonStandardReductionHeuristic.get_seed_config(env, MagicMock())
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                env, MagicMock()
+            )
         self.assertEqual(
             seed.config["load_eviction_policies"],
             ["first", "first", "first", "first"],
@@ -999,7 +1007,9 @@ class TestTritonStandardReductionHeuristic(TestCase):
             patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
             patch("helion.runtime.get_num_sm", return_value=132),
         ):
-            seed = TritonStandardReductionHeuristic.get_seed_config(env, MagicMock())
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                env, MagicMock()
+            )
         spec.compiler_seed_configs = [seed]
         pairs = ConfigGeneration(spec).seed_flat_config_pairs()
         self.assertEqual(len(pairs), 1)
@@ -1008,16 +1018,23 @@ class TestTritonStandardReductionHeuristic(TestCase):
 
     def test_not_eligible_without_single_reduction_tile(self) -> None:
         env = MagicMock()
-        # No reduction loop -> not a reduction.
-        spec = ConfigSpec(backend=TritonBackend())
-        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
-        env.config_spec = spec
-        self.assertFalse(TritonStandardReductionHeuristic.is_eligible(env, MagicMock()))
-        # A matmul fact disqualifies even a 1-tile/1-reduction shape.
-        spec_mm = self._reduction_spec(reduction_size_hint=1024)
-        spec_mm.matmul_facts = [MagicMock()]
-        env.config_spec = spec_mm
-        self.assertFalse(TritonStandardReductionHeuristic.is_eligible(env, MagicMock()))
+        # Pin the sm90 target so this exercises the STRUCTURAL gate, not the hardware gate
+        # (is_eligible now checks hardware first).
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            # No reduction loop -> not a reduction.
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+            env.config_spec = spec
+            self.assertFalse(
+                TritonStandardReductionHeuristicSM90.is_eligible(env, MagicMock())
+            )
+            # A matmul fact disqualifies even a 1-tile/1-reduction shape.
+            spec_mm = self._reduction_spec(reduction_size_hint=1024)
+            spec_mm.matmul_facts = [MagicMock()]
+            env.config_spec = spec_mm
+            self.assertFalse(
+                TritonStandardReductionHeuristicSM90.is_eligible(env, MagicMock())
+            )
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
@@ -1047,36 +1064,92 @@ class TestTritonStandardReductionHeuristic(TestCase):
         red = row_reduction.bind(
             (torch.randn(1024, 1024, device=DEVICE, dtype=HALF_DTYPE),)
         )
-        self.assertTrue(
-            TritonStandardReductionHeuristic.is_eligible(
-                red.env, red.host_function.device_ir
-            )
-        )
-        # Pin the sm90/H100 target so the tuned seed path runs regardless of the CI runner's
-        # GPU: on sm100 (B200) this class declines (returns None) so the dedicated
-        # ``TritonStandardReductionHeuristicSM100`` subclass is the sole reduction seed, so an
-        # unpatched call would return None on a B200 runner.
-        with (
-            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
-            patch("helion.runtime.get_num_sm", return_value=132),
-        ):
-            seed = TritonStandardReductionHeuristic.get_seed_config(
-                red.env, red.host_function.device_ir
-            )
-        self.assertEqual(seed.config["block_sizes"], [1])
-        self.assertEqual(seed.config["reduction_loops"], [None])
-
         mm = matmul.bind(
             (
                 torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE),
                 torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE),
             )
         )
-        self.assertFalse(
-            TritonStandardReductionHeuristic.is_eligible(
-                mm.env, mm.host_function.device_ir
+        # Pin the sm90/H100 target so the sm90 heuristic is exercised regardless of the CI
+        # runner's GPU: the hardware gate now lives in ``is_eligible`` (sm100/B200 routes to
+        # ``TritonStandardReductionHeuristicSM100``, other GPUs to the narrow fallback), so on a
+        # B200 runner the unpatched ``is_eligible`` would be False.
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            self.assertTrue(
+                TritonStandardReductionHeuristicSM90.is_eligible(
+                    red.env, red.host_function.device_ir
+                )
             )
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                red.env, red.host_function.device_ir
+            )
+            # A matmul is not a reduction, so the reduction seed declines even on its own target.
+            self.assertFalse(
+                TritonStandardReductionHeuristicSM90.is_eligible(
+                    mm.env, mm.host_function.device_ir
+                )
+            )
+        self.assertEqual(seed.config["block_sizes"], [1])
+        self.assertEqual(seed.config["reduction_loops"], [None])
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_exactly_one_reduction_track_eligible_per_hardware(self) -> None:
+        # The hardware gate lives in ``is_eligible``: for a standard reduction, EXACTLY one of
+        # the three standard-track classes fires per GPU — sm90 -> SM90, sm100 -> SM100, anything
+        # else -> the narrow fallback — and none of them return None-for-deferral from
+        # ``get_seed_config``. This is the invariant the class split exists to guarantee.
+        @helion.kernel(backend="triton")
+        def row_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                shifted = row - torch.amax(row, dim=-1, keepdim=True)
+                out[tile_m] = torch.log(torch.sum(torch.exp(shifted), dim=-1))
+            return out
+
+        red = row_reduction.bind(
+            (torch.randn(1024, 1024, device=DEVICE, dtype=HALF_DTYPE),)
         )
+        env, device_ir = red.env, red.host_function.device_ir
+        # (hardware, the one class expected to fire).
+        cases = [
+            (HOPPER_HARDWARE, TritonStandardReductionHeuristicSM90),
+            (BLACKWELL_HARDWARE, TritonStandardReductionHeuristicSM100),
+            (
+                HardwareInfo(
+                    device_kind="cuda",
+                    hardware_name="NVIDIA A10G",
+                    runtime_version="12.8",
+                    compute_capability="sm86",
+                ),
+                TritonNarrowReductionHeuristic,
+            ),
+        ]
+        tracks = [
+            TritonStandardReductionHeuristicSM90,
+            TritonStandardReductionHeuristicSM100,
+            TritonNarrowReductionHeuristic,
+        ]
+        for hardware, expected in cases:
+            with (
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+                patch("helion.runtime.get_num_sm", return_value=132),
+            ):
+                eligible = [t for t in tracks if t.is_eligible(env, device_ir)]
+                self.assertEqual(
+                    eligible,
+                    [expected],
+                    f"{hardware.compute_capability}: expected only {expected.__name__}",
+                )
+                # The eligible class always yields a real Config (never None-for-deferral).
+                seed = expected.get_seed_config(env, device_ir)
+                self.assertIsNotNone(seed)
+                self.assertEqual(seed.config["block_sizes"], [1])
 
 
 _FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
@@ -1252,11 +1325,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
         ]
-        # For an FFI-eligible 16-bit shape BOTH the DEFAULT-layout cluster_m=2
-        # heuristic and the generalized TVM-FFI direct-entry heuristic emit a
-        # cluster_m=2 seed; the FFI search projection then normalizes both onto
-        # the same validated CtaGroup.TWO envelope. Require at least one and
-        # check that every cluster_m=2 seed matches that envelope.
+        # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds.
+        # Callers decide whether both are expected in the supplied population;
+        # every cluster_m=2 seed must still match the common tile envelope.
         self.assertGreaterEqual(len(seeded), 1)
         for seed in seeded:
             self.assertEqual(
@@ -2217,22 +2288,40 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32)
         self.assertIs(seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
 
-        # The same generalized seed is what the search projection uses to map
-        # FFI-requesting cluster_m=2 candidates onto the validated envelope.
-        projected_cluster_m2_config = helion.Config(
+        # An ordinary cluster_m=2 candidate remains on the DEFAULT-layout path
+        # so the autotuner can measure it independently from the FFI seed.
+        default_cluster_m2_config = helion.Config(
             block_sizes=[256, 256, 128],
             indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
             pid_type="persistent_interleaved",
             tcgen05_cluster_m=2,
             tcgen05_cluster_n=1,
         )
-        bound.config_spec.normalize(projected_cluster_m2_config, _fix_invalid=True)
+        bound.config_spec.normalize(default_cluster_m2_config, _fix_invalid=True)
         self.assertIs(
-            projected_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
-            True,
+            default_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
+            False,
         )
         self.assertEqual(
-            projected_cluster_m2_config.config["block_sizes"],
+            default_cluster_m2_config.config["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        )
+
+        # An explicit FFI request still projects onto the generalized seed.
+        requested_ffi_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        bound.config_spec.normalize(requested_ffi_config, _fix_invalid=True)
+        self.assertIs(
+            requested_ffi_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True
+        )
+        self.assertEqual(
+            requested_ffi_config.config["block_sizes"],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
         )
 
@@ -2449,10 +2538,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         k_fragment = MagicMock()
         k_fragment.low = 16
         k_fragment.high = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-        k_block = MagicMock()
-        k_block._fragment.return_value = k_fragment
         spec = MagicMock()
-        spec.block_sizes = [MagicMock(), MagicMock(), k_block]
+        spec._tcgen05_matmul_block_fragments.return_value = (
+            MagicMock(),
+            MagicMock(),
+            k_fragment,
+        )
         spec._tcgen05_cluster_m2_bk_is_valid.side_effect = (
             CuteTcgen05Config.cluster_m2_bk_is_valid
         )
@@ -4262,7 +4353,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # generalized TVM-FFI direct-entry cluster_m=2 seed (previously fp16 was
         # bf16-only for the FFI seed, so the leading seed was the cluster_m=1
         # universal default). The DEFAULT-layout cluster_m=2 seed is also
-        # emitted; both normalize onto the validated CtaGroup.TWO envelope.
+        # emitted and remains distinct after normalization.
         config_gen = bound.config_spec.create_config_generation()
         zero_flat = config_gen.random_population_flat(0)
         self.assertEqual(len(zero_flat), 1)
@@ -4275,11 +4366,24 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         one_config_population = config_gen.random_population(1)
         self.assertEqual(len(one_config_population), 1)
         self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 2)
+        seeded_configs = config_gen.random_population(3)
         self._assert_cute_tcgen05_cluster_m2_seeded(
-            config_gen.random_population(2),
+            seeded_configs,
             expected_block_k=128,
             expected_indexing_length=3,
         )
+        expected_seed_modes = {
+            (Tcgen05LayoutStrategy.DEFAULT.value, False),
+            (Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value, True),
+        }
+        seeded_modes = {
+            (
+                config.config.get("tcgen05_layout_strategy"),
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True,
+            )
+            for config in seeded_configs
+        }
+        self.assertTrue(expected_seed_modes.issubset(seeded_modes))
 
         acf_config_gen = bound.config_spec.create_config_generation(
             advanced_controls_files=["/tmp/helion-test.acf"]
@@ -4312,16 +4416,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 search.config_gen.unflatten(flat)
                 for flat in search._generate_initial_population_flat()
             ]
-        # This test only requires the CuTe cluster-m2 seed to be present. For an
-        # FFI-eligible shape the DEFAULT and TVM-FFI cluster_m=2 seeds normalize
-        # to the same validated config, so the dedup'd FROM_BEST_AVAILABLE
-        # initial population can collapse to a single distinct config.
-        self.assertGreaterEqual(len(configs), 1)
+        # FROM_BEST_AVAILABLE must retain both compiler-owned strategies so the
+        # autotuner measures the ordinary and direct-entry kernels.
+        self.assertGreaterEqual(len(configs), 2)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             configs,
             expected_block_k=128,
             expected_indexing_length=3,
         )
+        best_available_modes = {
+            (
+                config.config.get("tcgen05_layout_strategy"),
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True,
+            )
+            for config in configs
+        }
+        self.assertTrue(expected_seed_modes.issubset(best_available_modes))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:
@@ -4370,10 +4480,10 @@ class TestTritonReductionHeuristic(TestCase):
     track:
 
     - rms_norm wide (rnumel=16384): the standard path
-      (``TritonStandardReductionHeuristic``) seeds a persistent reduction
+      (``TritonStandardReductionHeuristicSM90``) seeds a persistent reduction
       (``reduction_loops=[None]``) with the rnumel-ramp warp count.
     - kl_div wide (rnumel=131072): the Band-B (user-tiled) path
-      (``TritonUserTiledReductionHeuristic``) caps R_BLOCK by the accumulator footprint
+      (``TritonUserTiledReductionHeuristicSM90``) caps R_BLOCK by the accumulator footprint
       instead of going full-N persistent, with M at floor 1.
     """
 
@@ -4388,7 +4498,7 @@ class TestTritonReductionHeuristic(TestCase):
             torch.randn([n], device=DEVICE, dtype=torch.float32),
             1e-5,
         )
-        heuristic = TritonStandardReductionHeuristic
+        heuristic = TritonStandardReductionHeuristicSM90
 
         # Pin the kernel to the triton backend: autotuner_heuristics is keyed on
         # env.backend_name, and the tileir lane (where @onlyBackends(["triton"]) still
@@ -4397,7 +4507,8 @@ class TestTritonReductionHeuristic(TestCase):
         kernel = helion.kernel(rms_norm_fwd.fn, backend="triton")
 
         # Force the sm90 deep path so the test exercises the H100-tuned seed on any
-        # runner (off-sm90 the heuristic falls back to the conservative narrow seed).
+        # runner (off-sm90 a different class fires: SM100 on B200, the narrow fallback
+        # elsewhere).
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
             bound = kernel.bind(args)
 
@@ -4410,7 +4521,7 @@ class TestTritonReductionHeuristic(TestCase):
             # row in the reduction scope), so no reduce-then-apply tile is captured.
             self.assertEqual(kf.non_reduction_loop_block_ids, ())
             self.assertIn(
-                TritonStandardReductionHeuristic.name,
+                TritonStandardReductionHeuristicSM90.name,
                 bound.config_spec.autotuner_heuristics,
             )
             self.assertTrue(
@@ -4436,7 +4547,7 @@ class TestTritonReductionHeuristic(TestCase):
         log_q = torch.log_softmax(torch.randn([m, n], device=DEVICE), dim=-1)
         p = torch.softmax(torch.randn([m, n], device=DEVICE), dim=-1)
         args = (log_q, p)
-        heuristic = TritonUserTiledReductionHeuristic
+        heuristic = TritonUserTiledReductionHeuristicSM90
 
         # Pin the kernel to the triton backend: autotuner_heuristics is keyed on
         # env.backend_name, and the tileir lane (where @onlyBackends(["triton"]) still
@@ -4445,7 +4556,8 @@ class TestTritonReductionHeuristic(TestCase):
         kernel = helion.kernel(kl_div_forward.fn, backend="triton")
 
         # Force the sm90 deep path so the Band-B seed is exercised on any runner
-        # (off-sm90 the heuristic declines to the conservative narrow seed).
+        # (off-sm90 a different class fires: SM100 on B200; the narrow fallback covers
+        # only the standard track, so user-tiled simply does not seed elsewhere).
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
             bound = kernel.bind(args)
 
@@ -4458,7 +4570,7 @@ class TestTritonReductionHeuristic(TestCase):
             self.assertGreaterEqual(fact.carried_2d_count, 1)
             self.assertEqual(kf.non_reduction_loop_block_ids, ())
             self.assertIn(
-                TritonUserTiledReductionHeuristic.name,
+                TritonUserTiledReductionHeuristicSM90.name,
                 bound.config_spec.autotuner_heuristics,
             )
             self.assertTrue(
@@ -4518,8 +4630,8 @@ class TestTritonReductionHeuristic(TestCase):
 
         def check(m: int, n: int, expect_looped: bool) -> None:
             # Force the sm90 deep path so the standard+normalize seed is exercised on
-            # any runner (off-sm90 the heuristic falls back to the narrow seed, which
-            # does not widen the normalize tile).
+            # any runner (off-sm90 the narrow fallback fires instead, which does not
+            # widen the normalize tile).
             with patch(
                 "helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE
             ):
@@ -4538,7 +4650,7 @@ class TestTritonReductionHeuristic(TestCase):
                 self.assertNotIn(fact.block_id, kf.non_reduction_loop_block_ids)
                 self.assertEqual(fact.carried_2d_count, 0)
                 self.assertIn(
-                    TritonStandardReductionHeuristic.name,
+                    TritonStandardReductionHeuristicSM90.name,
                     bound.config_spec.autotuner_heuristics,
                 )
                 # Exactly one seed; block_sizes has an entry per tiled dim (grid +
@@ -4560,7 +4672,7 @@ class TestTritonReductionHeuristic(TestCase):
             if expect_looped:
                 self.assertEqual(
                     seed["reduction_loops"],
-                    [TritonStandardReductionHeuristic.LOOPED_CHUNK],
+                    [TritonStandardReductionHeuristicSM90.LOOPED_CHUNK],
                 )
                 # At m_block==1 the normalize tile is clamped to the SAME ÷M_BLOCK
                 # register-resident footprint as the reduction tile, NOT left at
@@ -4572,7 +4684,8 @@ class TestTritonReductionHeuristic(TestCase):
                 from helion._utils import prev_power_of_2
 
                 expected_norm = prev_power_of_2(
-                    TritonStandardReductionHeuristic.ROW_PERSIST_MAX_BYTES // (1 * 4)
+                    TritonStandardReductionHeuristicSM90.ROW_PERSIST_MAX_BYTES
+                    // (1 * 4)
                 )
                 self.assertEqual(expected_norm, 32768)
                 self.assertEqual(seed["block_sizes"][norm_idx], expected_norm)
@@ -4595,7 +4708,7 @@ class TestTritonReductionHeuristic(TestCase):
         # constructed spec (bare-spec, no active env — the allocator reads stored hints).
         from helion.autotuner.config_spec import BlockSizeSpec
 
-        H = TritonUserTiledReductionHeuristic
+        H = TritonUserTiledReductionHeuristicSM90
         size_hint = 4096  # next_pow2(size_hint) == 4096
 
         def spec_with(reduction_bid: int, norm_bid: int) -> ConfigSpec:

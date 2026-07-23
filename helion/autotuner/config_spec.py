@@ -1173,6 +1173,39 @@ class ConfigSpec:
     def _tcgen05_full_tile_direct_entry_seed_config(self) -> helion.Config | None:
         return self._cute_tcgen05_config.full_tile_direct_entry_seed_config()
 
+    def register_cute_tcgen05_mma_analysis(
+        self,
+        *,
+        m_block_id: int,
+        n_block_id: int,
+        k_block_id: int,
+        input_dtype: torch.dtype,
+        has_leading_passthrough: bool,
+        explicit_epi_tile_compatible: bool,
+    ) -> None:
+        self._cute_tcgen05_config.register_mma_analysis(
+            m_block_id=m_block_id,
+            n_block_id=n_block_id,
+            k_block_id=k_block_id,
+            input_dtype=input_dtype,
+            has_leading_passthrough=has_leading_passthrough,
+            explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        )
+
+    def _tcgen05_matmul_block_fragments(
+        self,
+    ) -> tuple[BlockSizeFragment, BlockSizeFragment, BlockSizeFragment] | None:
+        return self._cute_tcgen05_config._matmul_block_fragments()
+
+    def _tcgen05_matmul_seed_block_sizes(
+        self, *, bm: int, bn: int, bk: int
+    ) -> list[int] | None:
+        return self._cute_tcgen05_config._matmul_seed_block_sizes(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+
     def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
         self._cute_tcgen05_config.restrict_cluster_m_search(choices)
 
@@ -2598,6 +2631,17 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if value is None:
             return None
         normalized = super()._normalize(name, value)
+        # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
+        # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
+        # block size <= 1.  The autotuner search never proposes < 8 (its fragment
+        # ``low`` is 8), but the reduction seed's byte budget can collapse the chunk
+        # to 1 on a reduction co-resident with a wide feature.  Floor a stray 1 up to
+        # that same search floor of 8; for a small extent the ``>= size_hint`` rule
+        # below then collapses it to persistent ``None``, and 1 is the only
+        # power-of-two chunk that can hit this (so legal chunks 2, 4, 8, ... are
+        # left byte-identical).
+        if isinstance(normalized, int) and normalized < 2:
+            normalized = 8
         # A looped reduction whose chunk equals or exceeds the reduction
         # extent has only one iteration — it is semantically identical to a
         # persistent reduction, but the looped codegen path occasionally

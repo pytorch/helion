@@ -32,9 +32,11 @@ import torch
 from ...language import matmul_ops
 from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
+from .cute_epilogue import Tcgen05UnaryEpilogueChain
 from .cute_epilogue import _AuxiliaryTensorStep
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
+from .cute_fx_walk import reach_matmul_anchors
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -124,33 +126,6 @@ class Tcgen05AuxTensorDescriptor:
     store_value_node: torch.fx.Node
 
 
-def _store_value_pairs(
-    cg: GenerateAST,
-) -> list[tuple[torch.fx.Node, torch.fx.Node]]:
-    """Enumerate ``(store_node, value_node)`` pairs for every
-    ``memory_ops.store`` call across the live codegen graphs.
-
-    Pairs (rather than values alone) so each store's per-store
-    output tensor shape stays directly accessible: the chain
-    analyzer needs ``output_global_shape`` to validate rowvec
-    broadcast aux's global extent, and inferring it from
-    ``value_node.users`` after the fact returns ``None`` whenever
-    the value fans out to multiple stores — which silently
-    disables the broadcast classifier's global-extent check.
-
-    A ``store`` FX node has the shape
-    ``call_function(memory_ops.store, (tensor, index, value, extra_mask))``
-    (the ``store`` helper in :mod:`helion.language.memory_ops`).
-    ``args[2]`` is the value being stored — the entry point the
-    chain analyzer walks upstream from.
-    """
-    return [
-        pair
-        for graph_info in cg.codegen_graphs
-        for pair in _store_value_pairs_from_graph(graph_info.graph)
-    ]
-
-
 def _output_global_shape_from_store(
     store_node: torch.fx.Node,
 ) -> tuple[object, ...] | None:
@@ -165,6 +140,43 @@ def _output_global_shape_from_store(
     """
     tensor_val = _output_tensor_from_store_node(store_node)
     return tuple(tensor_val.shape) if tensor_val is not None else None
+
+
+def analyze_tcgen05_matmul_store_chains(
+    graphs: Sequence[GraphInfo],
+    matmul_fx_node: torch.fx.Node,
+) -> tuple[tuple[torch.fx.Node, Tcgen05UnaryEpilogueChain], ...] | None:
+    """Analyze every store that transitively consumes ``matmul_fx_node``.
+
+    Returns ``None`` when there is no consuming store or any reachable store is
+    outside the tcgen05 epilogue whitelist. Each successful entry pairs the
+    store node with the same chain representation used by store codegen.
+    """
+    inner_outputs = build_inner_outputs_index_from_graphs(graphs)
+    target_fx_nodes = {matmul_fx_node}
+    analyzed_stores: list[tuple[torch.fx.Node, Tcgen05UnaryEpilogueChain]] = []
+    for graph_info in graphs:
+        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph):
+            if matmul_fx_node not in reach_matmul_anchors(
+                store_value,
+                target_fx_nodes=target_fx_nodes,
+                inner_outputs_by_graph_id=inner_outputs,
+            ):
+                continue
+            analyzed = analyze_tcgen05_unary_epilogue_chain(
+                None,
+                store_value,
+                output_global_shape=_output_global_shape_from_store(store_node),
+                target_fx_nodes=target_fx_nodes,
+                inner_outputs_by_graph_id=inner_outputs,
+            )
+            if analyzed is None:
+                return None
+            chain, anchor = analyzed
+            if anchor is not matmul_fx_node:
+                return None
+            analyzed_stores.append((store_node, chain))
+    return tuple(analyzed_stores) if analyzed_stores else None
 
 
 def _step_host_tensor(
@@ -247,9 +259,8 @@ def discover_tcgen05_aux_tensor_descriptors(
     - The kernel has no store invocations (unusual but possible —
       a kernel that returns its output via a path the walker does
       not see).
-    - No store's chain reaches this matmul (pure matmul kernels
-      without an aux fusion; the chain analyzer rejects identity
-      stores and unary-only chains contribute zero descriptors).
+    - No store's chain reaches this matmul (pure matmul kernels and
+      unary-only chains contribute zero descriptors).
     - The chain analyzer rejects every store's chain (loud-failure
       shapes like 3-D collapse aux, unsupported broadcast,
       reductions). The store-codegen splice will surface the same
@@ -267,27 +278,17 @@ def discover_tcgen05_aux_tensor_descriptors(
     if matmul_fx_node not in cg.device_function.cute_state.matmul_fx_nodes:
         return ()
 
-    # Local import for ``CodegenState``: the natural top-level
-    # import would create a cycle (``inductor_lowering`` ->
-    # ``aten_lowering`` -> ``cute.cute_mma`` -> ``cute.aux_tensor``
-    # -> back). ``CodegenState`` is a ``NamedTuple`` whose
-    # ``dataclasses.field`` defaults are not honored by the tuple
-    # constructor, so every required field is provided
-    # positionally. Today the analyzer only reads ``codegen`` and
-    # ``device_function`` (via the ``codegen.device_function``
-    # property), so the empty dict/list defaults below are unused;
-    # supplying them explicitly keeps the construction robust
-    # against any future analyzer change that touches the optional
-    # state fields.
-    from ..inductor_lowering import CodegenState
-
-    stub_state = CodegenState(
-        codegen=cg, fx_node=None, env={}, proxy_args=[], ast_args=[]
+    analyzed_stores = analyze_tcgen05_matmul_store_chains(
+        cg.codegen_graphs, matmul_fx_node
     )
+    if analyzed_stores is None:
+        return ()
 
     descriptors: list[Tcgen05AuxTensorDescriptor] = []
     seen_values: set[torch.fx.Node] = set()
-    for store_node, store_value in _store_value_pairs(cg):
+    for store_node, chain in analyzed_stores:
+        store_value = store_node.args[2]
+        assert isinstance(store_value, torch.fx.Node)
         # Dedup: a value fed to multiple stores must contribute its
         # descriptors once. Walking the same chain N times would
         # emit N copies and the productive-body SMEM ring (keyed
@@ -295,16 +296,6 @@ def discover_tcgen05_aux_tensor_descriptors(
         if store_value in seen_values:
             continue
         seen_values.add(store_value)
-
-        output_global_shape = _output_global_shape_from_store(store_node)
-        analyzed = analyze_tcgen05_unary_epilogue_chain(
-            stub_state, store_value, output_global_shape=output_global_shape
-        )
-        if analyzed is None:
-            continue
-        chain, anchor = analyzed
-        if anchor is not matmul_fx_node:
-            continue
         for step in chain.auxiliary_tensor_steps:
             descriptors.append(_aux_descriptor_from_step(step, store_value))
     return tuple(descriptors)

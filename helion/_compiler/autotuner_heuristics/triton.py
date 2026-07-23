@@ -209,7 +209,13 @@ def _materialize_config(
         and allowed_pid_types
         and supported["pid_type"] not in allowed_pid_types
     ):
-        supported.pop("pid_type")
+        # Replace an illegal pid_type with the highest-preference legal one rather
+        # than popping it: a plain pop lets ``normalize`` refill the field with
+        # ``VALID_PID_TYPES[0]`` (== 'flat'), which re-introduces the disallowed value
+        # (e.g. under ``hl.barrier()`` / a data-dependent grid bound / force-persistent,
+        # where 'flat' is disallowed). ``allowed_pid_types`` is guaranteed non-empty and
+        # order-preserving, so ``[0]`` is a valid persistent choice when 'flat' is stripped.
+        supported["pid_type"] = allowed_pid_types[0]
     config_spec.normalize(supported, _fix_invalid=True)
     config = Config(**cast("dict[str, Any]", supported))
     config_spec._shrink_for_numel_constraints(config)
@@ -528,17 +534,29 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     ``ReductionKernelFact`` through ONE budget allocator (:meth:`size_reduction_tiles`); the
     subclasses differ ONLY in how they map the allocation onto knobs (EMISSION routing):
 
-    - **standard** (:class:`TritonStandardReductionHeuristic`): Helion rolls the rdim into a
+    - **standard** (:class:`TritonStandardReductionHeuristicSM90`): Helion rolls the rdim into a
       ``reduction_loops`` loop, so the primary reduction's size lands on that knob.
-    - **user-tiled** (:class:`TritonUserTiledReductionHeuristic`): the user hand-writes the
+    - **user-tiled** (:class:`TritonUserTiledReductionHeuristicSM90`): the user hand-writes the
       ``hl.tile`` loop, so each reduction axis is a ``block_sizes`` entry.
 
-    Not registered; only the subclasses are.
+    Each track has a sm90/H100 class (``*SM90``) and a sm100/B200 subclass (``*SM100``); the
+    conservative upstream fallback for unclaimed hardware lives in the standalone
+    :class:`TritonNarrowReductionHeuristic`. Every concrete class gates its own hardware in
+    ``is_eligible`` (via ``cls.HARDWARE_TARGETS``), so ``get_seed_config`` never declines for the
+    wrong GPU. Not registered; only the concrete subclasses are.
     """
 
     backend = "triton"
     # Widen the declared type so the sm100 subclass can retarget it (the base is sm90-only).
     HARDWARE_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", "sm90"),)
+    # Promote the reduction seed to the compiler default (autotune off) for every tuned track
+    # that derives from this base -- sm90/H100 AND sm100/B200. The narrow fallback
+    # (TritonNarrowReductionHeuristic) does NOT derive from this base, so it stays unpromoted.
+    # This is safe because the seed only emits valid configs: it materializes through
+    # ``_materialize_config`` (an illegal ``pid_type`` is repaired to a legal persistent type),
+    # ``ReductionLoopSpec._normalize`` floors a degenerate looped chunk of 1, and the reduction
+    # roller refuses to roll a scan-containing reduction (which would drop the scan's chunk carry).
+    promote_seed_to_default = True
 
     # ----- THE BUDGET (a register/byte capacity; everything else is a per-axis desire) -----
     # Per-program persistent byte ceiling: the group's resident working set — the sum over its live
@@ -1146,62 +1164,36 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         )
 
 
-class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
-    """standard (Helion-rolled rdim) inner-reduction seed: Helion rolls the reduction axis
-    into a ``reduction_loops`` loop from a single ``.sum(-1)``-style op — sum, long_sum,
-    rms_norm, layer_norm, softmax-row, cross_entropy. Triton analog of
+class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
+    """standard (Helion-rolled rdim) inner-reduction seed for sm90/H100: Helion rolls the
+    reduction axis into a ``reduction_loops`` loop from a single ``.sum(-1)``-style op — sum,
+    long_sum, rms_norm, layer_norm, softmax-row, cross_entropy. Triton analog of
     ``CuteReductionTileHeuristic`` (keeps its registry name), deepening the original
     one-row/persistent/``['last']`` seed with the num_warps ramp, persistent-vs-looped,
     and per-slot eviction.
 
     Gated by ``_triton_reduction_eligible`` (standard track) — broader than upstream
     ``is_canonical_row_reduction`` (also multi-axis rollable rows and raised-``autotuner_min``
-    large-M shapes). Off sm90 the H100-tuned levers are unvalidated, so it falls back to
-    ``_narrow_seed`` (pre-existing behavior preserved).
+    large-M shapes) — AND the sm90 hardware target. sm100 routes to
+    :class:`TritonStandardReductionHeuristicSM100`; unclaimed hardware routes to
+    :class:`TritonNarrowReductionHeuristic`.
     """
 
     name = "triton_reduction_tile"
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not matches_hardware(env, cls.HARDWARE_TARGETS):
+            return False
         if not _triton_reduction_eligible(env, device_ir):
             return False
         pd = _primary_descriptor_selected(env)
         return pd is not None and _is_standard_reduction(pd)
 
     @classmethod
-    def _narrow_seed(cls, env: CompileEnvironment) -> Config:
-        """The upstream conservative standard seed (one row/program, single persistent pass,
-        ``['last']`` eviction where supported). A verbatim port used off sm90 so non-sm90
-        behavior is unchanged.
-        """
-        spec = env.config_spec
-        seed: dict[str, Any] = {
-            "block_sizes": [1],
-            "reduction_loops": [None],
-        }
-        # Emit 'last' only where the backend supports it; backends that restrict
-        # eviction to ("",) keep the spec default so the seed stays valid.
-        eviction = spec.load_eviction_policies
-        if (
-            eviction.length
-            and isinstance(eviction.inner, EnumFragment)
-            and "last" in eviction.inner.choices
-        ):
-            seed["load_eviction_policies"] = ["last"] * eviction.length
-        return Config(**seed)
-
-    @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
-        if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            # sm100 has its own subclass (``TritonStandardReductionHeuristicSM100``); decline here so
-            # exactly one reduction seed fires on B200.
-            if matches_hardware(env, (("cuda", "sm100"),)):
-                return None
-            # Off any other target: keep the upstream conservative seed.
-            return cls._narrow_seed(env)
         spec = env.config_spec
         pd = _primary_descriptor_selected(env)
         if pd is None:
@@ -1272,13 +1264,17 @@ class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
             evict = cls._eviction_policies(env, "reread", pd.reread_eviction_index)
         if evict is not None:
             seed["load_eviction_policies"] = evict
-        return Config(**seed)
+        # Materialize through the shared guard so an emitted config value that is
+        # illegal for this kernel is repaired rather than shipped raw: a hardcoded
+        # ``pid_type='flat'`` is replaced with a legal persistent type when 'flat' is
+        # disallowed (barrier / data-dependent grid bound), matching the matmul seed path.
+        return _materialize_config(seed, config_spec=spec)
 
 
-class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
-    """user-tiled inner-reduction seed: fires when the user hand-writes the ``hl.tile`` loop
-    over the reduction axis (so the rdim is an ordinary ``block_sizes`` entry, e.g.
-    ``hl.tile(n, block_size=R_BLOCK)``), which the upstream gate rejects entirely.
+class TritonUserTiledReductionHeuristicSM90(_TritonReductionSeedBase):
+    """user-tiled inner-reduction seed for sm90/H100: fires when the user hand-writes the
+    ``hl.tile`` loop over the reduction axis (so the rdim is an ordinary ``block_sizes`` entry,
+    e.g. ``hl.tile(n, block_size=R_BLOCK)``), which the upstream gate rejects entirely.
 
     Every axis (the reduction r_block(s), the grid rows, the apply loops) is sized by the shared
     :meth:`size_reduction_tiles` ONE budget allocator — there are NO per-band branches. The kernel
@@ -1294,6 +1290,8 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not matches_hardware(env, cls.HARDWARE_TARGETS):
+            return False
         if not _triton_reduction_eligible(env, device_ir):
             return False
         pd = _primary_descriptor_selected(env)
@@ -1303,9 +1301,6 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
-        if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            # Off sm90: upstream never fired on user-tiled, so no prior seed to preserve. Decline.
-            return None
         spec = env.config_spec
         pd = _primary_descriptor_selected(env)
         if pd is None:
@@ -1335,7 +1330,10 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
             ev = cls._eviction_policies(env, "reread", pd.reread_eviction_index)
             if ev is not None:
                 seed["load_eviction_policies"] = ev
-        return Config(**seed)
+        # See the standard branch: materialize through the shared guard so an illegal
+        # ``pid_type='flat'`` (disallowed under a barrier / data-dependent bound) is
+        # repaired to a legal persistent type instead of shipping the raw seed.
+        return _materialize_config(seed, config_spec=spec)
 
 
 def _config_with_num_warps(cfg: Config, num_warps: int) -> Config:
@@ -1346,16 +1344,17 @@ def _config_with_num_warps(cfg: Config, num_warps: int) -> Config:
 
 
 # ============================ sm100 (B200) dedicated subclasses ============================ #
-# Re-target the sm90 reduction seeds at sm100 via a subclass that overrides only the hardware gate +
+# Re-target the sm90 reduction seeds at sm100 via a subclass that overrides only the hardware target +
 # B200 constants; the sm90/H100 emit is a separate class + gate, so it stays frozen.
 class _TritonReductionSeedSM100(_TritonReductionSeedBase):
     """sm100 (B200) constant/gate carrier for the two reduction seed tracks. Overrides the hardware
-    gate and re-tunes constants (as class attributes) only where a B200 measurement demands it. Not
-    registered; the two concrete subclasses below are.
+    target and re-tunes constants (as class attributes) only where a B200 measurement demands it. The
+    concrete subclasses inherit ``is_eligible`` from their sm90 track class, which gates on
+    ``cls.HARDWARE_TARGETS`` (sm100 here) — so hardware selection lives in ``is_eligible``, not in
+    this ``get_seed_config``. Not registered; the two concrete subclasses below are.
 
-    ``promote_seed_to_default`` is left at the base default (``False``) here: the sm100 reduction
-    seed is still contributed as an autotuner seed, but is NOT promoted to the compiler default until
-    a later change flips it on (together with the config-validity fixes that make promotion safe)."""
+    ``promote_seed_to_default`` is inherited from :class:`_TritonReductionSeedBase` (``True`` for
+    every tuned track, sm90 and sm100 alike)."""
 
     HARDWARE_TARGETS = (("cuda", "sm100"),)
     # --- B200 constant overrides (re-tuned during the climb; unset = direct port of H100) ---
@@ -1375,10 +1374,7 @@ class _TritonReductionSeedSM100(_TritonReductionSeedBase):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
-        # Fire the inherited rich seed ONLY on sm100; decline elsewhere so this promoted class never
-        # overrides the frozen sm90/H100 default.
-        if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            return None
+        # Build the inherited sm90-track seed (is_eligible already confirmed sm100), then re-tune.
         cfg = super().get_seed_config(env, device_ir)
         if cfg is None:
             return None
@@ -1425,23 +1421,73 @@ class _TritonReductionSeedSM100(_TritonReductionSeedBase):
 
 
 class TritonStandardReductionHeuristicSM100(
-    _TritonReductionSeedSM100, TritonStandardReductionHeuristic
+    _TritonReductionSeedSM100, TritonStandardReductionHeuristicSM90
 ):
     """standard (Helion-rolled rdim) inner-reduction seed for sm100/B200: the rich
-    :class:`TritonStandardReductionHeuristic` allocator with B200 constants from
+    :class:`TritonStandardReductionHeuristicSM90` allocator with B200 constants from
     :class:`_TritonReductionSeedSM100`."""
 
     name = "triton_reduction_tile_sm100"
 
 
 class TritonUserTiledReductionHeuristicSM100(
-    _TritonReductionSeedSM100, TritonUserTiledReductionHeuristic
+    _TritonReductionSeedSM100, TritonUserTiledReductionHeuristicSM90
 ):
     """user-tiled inner-reduction seed for sm100/B200: the rich
-    :class:`TritonUserTiledReductionHeuristic` allocator with B200 constants from
+    :class:`TritonUserTiledReductionHeuristicSM90` allocator with B200 constants from
     :class:`_TritonReductionSeedSM100`."""
 
     name = "triton_reduction_user_tile_sm100"
+
+
+# Hardware the tuned reduction seeds own; the narrow fallback yields to these targets.
+_TUNED_REDUCTION_TARGETS: tuple[HardwareTarget, ...] = (
+    ("cuda", "sm90"),
+    ("cuda", "sm100"),
+)
+
+
+class TritonNarrowReductionHeuristic(AutotunerHeuristic):
+    """Conservative upstream reduction fallback for hardware WITHOUT a tuned track (anything
+    other than sm90/sm100): one row/program, single persistent pass, ``['last']`` eviction where
+    supported. Fires only for a STANDARD (Helion-rolled) reduction — the user-tiled track had no
+    upstream seed, so it stays unclaimed on non-sm90/sm100. Not promoted (the un-tuned baseline
+    should not override the compiler default). This is the verbatim pre-sm100 behavior, now its own
+    class rather than an off-target branch inside the sm90 heuristic.
+    """
+
+    name = "triton_reduction_narrow"
+    backend = "triton"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        # Only where no tuned track owns the hardware.
+        if matches_hardware(env, _TUNED_REDUCTION_TARGETS):
+            return False
+        if not _triton_reduction_eligible(env, device_ir):
+            return False
+        pd = _primary_descriptor_selected(env)
+        return pd is not None and _is_standard_reduction(pd)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "reduction_loops": [None],
+        }
+        # Emit 'last' only where the backend supports it; backends that restrict
+        # eviction to ("",) keep the spec default so the seed stays valid.
+        eviction = spec.load_eviction_policies
+        if (
+            eviction.length
+            and isinstance(eviction.inner, EnumFragment)
+            and "last" in eviction.inner.choices
+        ):
+            seed["load_eviction_policies"] = ["last"] * eviction.length
+        return Config(**seed)
 
 
 class TritonMatmulReductionEpilogueHeuristic(AutotunerHeuristic):

@@ -47,6 +47,7 @@ from ..aten_lowering import view_lowering
 from ..aten_lowering import where_lowering
 from ..compile_environment import CompileEnvironment
 from .argreduce import codegen_cute_tile_argreduce
+from .cute_mma import codegen_cute_mma
 from .cute_mma import codegen_cute_mma_direct_mm
 from .indexing import CutePackedAffineLoad
 from .indexing import CuteShapeChainView
@@ -410,6 +411,10 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if out_dtype is not None
         else None
     )
+    if node.target in (torch.ops.aten.bmm.default, torch.ops.aten.bmm.dtype):
+        mma_result = codegen_cute_mma(ctx, node, with_acc=False)
+        if mma_result is not None:
+            return mma_result
     direct_mma_result = codegen_cute_mma_direct_mm(
         ctx,
         node,

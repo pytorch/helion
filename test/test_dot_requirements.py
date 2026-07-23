@@ -19,6 +19,7 @@ from helion._compiler.cute.strategies import Tcgen05WarpSpec
 from helion._compiler.cute.strategies import validate_tcgen05_strategy_invariants
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -374,9 +375,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec.normalize(valid_config, _fix_invalid=True)
         self.assertEqual(valid_config["tcgen05_cluster_m"], 2)
         self.assertEqual(valid_config["pid_type"], "persistent_interleaved")
-        # The FFI search projection claims the cluster_m=2 candidate and maps it
-        # onto the validated CtaGroup.TWO 256x256x128 envelope.
-        self.assertEqual(valid_config["block_sizes"][:3], [256, 256, 128])
+        # Ordinary cluster_m=2 candidates stay distinct from the FFI seed: M/N
+        # are projected onto the CtaGroup.TWO tile while a valid sampled K tile
+        # is preserved.
+        self.assertEqual(valid_config["block_sizes"][:3], [256, 256, 32])
+        self.assertIs(valid_config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], False)
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
 
@@ -439,10 +442,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
         self.assertEqual(search_fragments["tcgen05_cluster_m"].choices, (1, 2))
 
-        # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the FFI search
-        # projection claims any cluster_m=2 candidate and maps it onto the
-        # validated CtaGroup.TWO envelope: the full-tile 256x256x128 block,
-        # persistent_interleaved pid, and the FFI direct-entry seed L2 grouping.
+        # The ordinary cluster_m=2 search arm remains distinct from the FFI
+        # direct-entry seed. It projects M/N and the pid type onto the validated
+        # CtaGroup.TWO envelope while preserving a valid sampled K tile.
         config = {
             "block_sizes": [256, 256, 16],
             "l2_groupings": [1],
@@ -452,11 +454,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec.normalize(config, _fix_invalid=True)
         self.assertEqual(config["tcgen05_cluster_m"], 2)
         self.assertEqual(config["pid_type"], "persistent_interleaved")
-        self.assertEqual(config["block_sizes"][:3], [256, 256, 128])
-        self.assertEqual(config["l2_groupings"], [2])
+        self.assertEqual(config["block_sizes"][:3], [256, 256, 16])
+        self.assertEqual(config["l2_groupings"], [1])
+        self.assertIs(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], False)
 
-        # Regardless of the requested pid_type / bk / l2_grouping, an FFI-eligible
-        # cluster_m=2 candidate is projected onto the same validated envelope.
+        # Regardless of the requested pid_type / bk / l2_grouping, an explicit
+        # FFI request is projected onto the same validated direct-entry envelope.
         for override in (
             {"pid_type": "flat"},
             {"block_sizes": [128, 256, 16]},
@@ -470,6 +473,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     "l2_groupings": [1],
                     "pid_type": "persistent_blocked",
                     "tcgen05_cluster_m": 2,
+                    TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
                     **override,
                 }
                 spec.normalize(config, _fix_invalid=True)
@@ -477,6 +481,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 self.assertEqual(config["pid_type"], "persistent_interleaved")
                 self.assertEqual(config["block_sizes"][:3], [256, 256, 128])
                 self.assertEqual(config["l2_groupings"], [2])
+                self.assertIs(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_small_shape_wave_quantization_gate(self) -> None:
@@ -781,10 +786,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec.normalize(two_cta_config, _fix_invalid=True)
         self.assertEqual(two_cta_config["tcgen05_cluster_m"], 2)
         self.assertEqual(two_cta_config["pid_type"], "persistent_interleaved")
-        # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity); the FFI search
-        # projection maps the cluster_m=2 candidate onto the validated full-tile
-        # 256x256x128 envelope (bk widened from the requested 16).
-        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 128])
+        # The ordinary cluster_m=2 arm preserves its valid bk=16 sample instead
+        # of collapsing into the distinct bk=128 FFI direct-entry seed.
+        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 16])
+        self.assertIs(two_cta_config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], False)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_projection_falls_back_before_mutation(
@@ -1004,42 +1009,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_ab_stages_three_refused_for_multi_block_size_triple(
+    def test_cute_tcgen05_ab_stages_three_uses_analyzed_block_indices(
         self,
     ) -> None:
-        """Gate refuses ``ab=3`` when the spec has more than one (M,N,K) triple.
-
-        ``tcgen05_ab_stages`` is a global config knob across the whole
-        bound kernel, but the per-config search-time fixup
-        (``_fix_tcgen05_ab_stages_three_search_config``) only inspects
-        ``block_sizes[0:3]``. A multi-dot or multi-root kernel with
-        more than the single-matmul 3-block-size triple could otherwise
-        sit at ``ab=3`` for a later over-budget triple — that path
-        would survive the fixup and abort at ptxas mid-tuning. Verify
-        ``allow_tcgen05_ab_stages_three_search`` clears the recorded
-        constraints whenever the spec's block-size sequence is not the
-        validated 3-tuple.
-        """
+        """Extra config slots do not hide the analyzed M/N/K axes."""
         b200_budget_bytes = 227 * 1024 - 28 * 1024
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
 
-        # Sanity: the matmul-bound spec with a 3-block-size triple
-        # already admits the arm (this is the standard production path).
         self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
-
-        # Simulate a spec with more than the single-matmul 3-block-size
-        # triple (e.g. a multi-dot or multi-root kernel) and re-invoke
-        # the gate. The recorded constraints must be cleared so the
-        # search surface stays at ``ab_stages_max=2`` — otherwise a
-        # later over-budget triple would survive the per-config fixup
-        # (which inspects only ``block_sizes[0:3]``) and abort at ptxas.
-        # The gate's only check on ``block_sizes`` is its length, so
-        # re-running ``allow_tcgen05_ab_stages_three_search`` against
-        # a spec whose ``block_sizes`` reports a non-3 length is enough
-        # to validate the refusal.
         with patch.object(type(spec.block_sizes), "__len__", lambda self: 9):
-            self.assertEqual(len(spec.block_sizes), 9)
             with patch.object(
                 CuteTcgen05Config,
                 "per_cta_ab_smem_budget_bytes",
@@ -1049,9 +1028,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     dtype_bytes=2,
                     device=torch.device("cuda:0"),
                 )
-            self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+            self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
@@ -1683,6 +1662,25 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
 
     @onlyBackends(["cute"])
+    def test_cute_tcgen05_candidate_collection_ignores_ineligible_matmul(
+        self,
+    ) -> None:
+        args = (
+            torch.randn([256, 64], device=DEVICE, dtype=torch.float32),
+            torch.randn([64, 128], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            spec = _cute_two_matmuls_kernel.bind(args).config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        second_fact = spec.matmul_facts[1]
+        self.assertEqual(
+            spec._cute_tcgen05_config.matmul_block_ids,
+            (second_fact.m_block_id, second_fact.n_block_id, second_fact.k_block_id),
+        )
+
+    @onlyBackends(["cute"])
     def test_cute_tcgen05_multi_root_forced_persistent_raises_invalid_config(
         self,
     ) -> None:
@@ -1978,8 +1976,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         # cute_tcgen05_search_enabled gates the inclusion of the tcgen05
-        # optional fragments in _flat_fields(); enforce_dot_requirements
-        # set it during bind, so the narrowed search view should appear.
+        # optional fragments in _flat_fields(); structural DeviceIR analysis
+        # sets it during bind, so the narrowed search view should appear.
         self.assertTrue(spec.cute_tcgen05_search_enabled)
         flat_fields = spec._flat_fields()
         self.assertIn("tcgen05_num_epi_warps", flat_fields)

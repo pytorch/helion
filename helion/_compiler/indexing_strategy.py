@@ -57,6 +57,39 @@ class TileWithOffsetInfo(NamedTuple):
         )
 
 
+def subscript_tile_info(
+    env: CompileEnvironment, subscript: object
+) -> TileWithOffsetInfo | None:
+    """Return a subscript's tile axis and offset from its FX provenance."""
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    metadata = subscript.meta.get("tile_with_offset")
+    if isinstance(metadata, dict):
+        block_id = metadata.get("block_id")
+        offset = metadata.get("offset", 0)
+        block_size = metadata.get("block_size")
+        if isinstance(block_id, int) and isinstance(offset, (int, torch.SymInt)):
+            return TileWithOffsetInfo(block_id, offset, block_size)
+        return None
+    block_id = env.resolve_block_id(subscript.meta.get("val"))
+    if block_id is None:
+        return None
+    return TileWithOffsetInfo(block_id, 0)
+
+
+def exact_tile_block_ids(
+    env: CompileEnvironment, subscripts: Sequence[object]
+) -> tuple[int, ...] | None:
+    """Return ordered tile block IDs when every subscript has zero offset."""
+    block_ids: list[int] = []
+    for subscript in subscripts:
+        info = subscript_tile_info(env, subscript)
+        if info is None or not env.known_equal(info.offset, 0):
+            return None
+        block_ids.append(info.block_id)
+    return tuple(block_ids)
+
+
 def _get_padded_iota_original_length(
     state: CodegenState, index_position: int
 ) -> int | None:
