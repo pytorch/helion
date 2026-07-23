@@ -632,6 +632,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
 
+                self.env.restrict_pid_types_for_persistent(args)
+
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
                 self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                     self.env,
