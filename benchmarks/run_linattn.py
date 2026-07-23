@@ -24,10 +24,12 @@ import torch
 
 # (name, B, T, H, D); D is both the query/key and the value dim (D = DV).
 # The six production shapes from flash-linear-attention/benchmarks/ops/registry.
+# The full sweep times out CI, so we comment out three D=128 shapes and keep one
+# shape per head dim (64/128/256).
 SHAPES: list[tuple[str, int, int, int, int]] = [
-    ("B1_T8192_H96_D128", 1, 8192, 96, 128),
-    ("B2_T16384_H16_D128", 2, 16384, 16, 128),
-    ("B4_T2048_H16_D128", 4, 2048, 16, 128),
+    # ("B1_T8192_H96_D128", 1, 8192, 96, 128),
+    # ("B2_T16384_H16_D128", 2, 16384, 16, 128),
+    # ("B4_T2048_H16_D128", 4, 2048, 16, 128),
     ("B4_T4096_H64_D128", 4, 4096, 64, 128),
     ("B8_T2048_H32_D256", 8, 2048, 32, 256),
     ("B8_T1024_H8_D64", 8, 1024, 8, 64),
