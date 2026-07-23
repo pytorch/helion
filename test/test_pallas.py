@@ -3227,6 +3227,32 @@ class TestPallas(TestCase):
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
 
+    def test_scalar_row_ragged_col_store(self) -> None:
+        """A store with a scalar row index and a ragged-tile column on the
+        same tensor must not misalign the value slice with the tensor's dims.
+
+        ``sliced_value_for_store`` clamp-slices a ``TilePattern`` dim whose
+        last tile is narrower than ``block_size`` (here ``m=20`` -> a
+        remainder tile of 4 against ``block_size=8``). The literal ``0`` row
+        index is a scalar (``ArbitraryIndexPattern``): it consumes a tensor
+        dim but is squeezed out of the *value*'s shape, so it must not get a
+        slice entry of its own -- otherwise the clamp slice is built against
+        the wrong dimension of the (lower-rank) value and Pallas rejects it
+        with "Too many indices".
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_row_ragged_col_store(x: torch.Tensor) -> torch.Tensor:
+            _n, m = x.shape
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(m):
+                out[0, tile_m] = x[0, tile_m] * 2.0
+            return out
+
+        x = torch.randn(1, 20, device=DEVICE)
+        _, result = code_and_output(scalar_row_ragged_col_store, (x,), block_sizes=[8])
+        torch.testing.assert_close(result, x * 2.0)
+
     @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
     )

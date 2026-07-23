@@ -250,6 +250,9 @@ def sliced_value_for_store(
     writeback DMA clamps the extent instead (see ``_build_dma_slices``).
     """
     from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
 
     assert state.fx_node is not None
@@ -259,6 +262,15 @@ def sliced_value_for_store(
 
     if _tensor_routed_to_fori_scratch(state, tensor):
         return value
+
+    # Patterns that consume a tensor dim without it surviving into the stored
+    # value's shape (a scalar/offset index squeezes that dim) don't get a
+    # slice entry -- the value has no such dimension to slice.
+    squeezing_patterns = (
+        ArbitraryIndexPattern,
+        TileIndexWithOffsetPattern,
+        TileBeginWithOffsetPattern,
+    )
 
     env = CompileEnvironment.current()
     slices: list[str] = []
@@ -270,9 +282,13 @@ def sliced_value_for_store(
         if idx is None:
             continue
 
-        value_slice = ":"
         index_part = index_parts[index_part_idx]
         index_part_idx += 1
+        if isinstance(pattern, squeezing_patterns):
+            tensor_dim += 1
+            continue
+
+        value_slice = ":"
         if isinstance(pattern, TilePattern) and index_part == ":":
             block_size = env.block_sizes[pattern.block_id].from_config(state.config)
             dim_size = tensor.shape[tensor_dim]
