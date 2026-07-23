@@ -1462,9 +1462,7 @@ def generate_ast(
                 plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
                 for plan in codegen.cute_wrapper_plans
             )
-            if (
-                codegen.cute_uses_matmul or codegen.cute_wrapper_plans
-            ) and not shape_bake_safe_wrapper_only:
+            if codegen.cute_uses_matmul and not shape_bake_safe_wrapper_only:
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"

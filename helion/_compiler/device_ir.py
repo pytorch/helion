@@ -54,6 +54,7 @@ from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
+from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -3077,18 +3078,9 @@ def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
 
 
 def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
-    """Block-id a subscript expression INDEXES, from the index node's own provenance (tile/offset
-    meta, else its block-var SymInt). Reduction-AGNOSTIC (resolves a tile var regardless of the
-    block's ``reduction`` flag, unlike a shape-size resolve). ``None`` for a plain slice / scalar."""
-    if not isinstance(sub, torch.fx.Node):
-        return None
-    two = sub.meta.get("tile_with_offset")
-    if isinstance(two, dict) and two.get("block_id") is not None:
-        return two["block_id"]
-    val = sub.meta.get("val")
-    if val is not None:
-        return env.resolve_block_id(val)
-    return None
+    """Return the block axis indexed by a tile-provenance subscript."""
+    info = subscript_tile_info(env, sub)
+    return info.block_id if info is not None else None
 
 
 def _tile_rank(dims: tuple[int | None, ...]) -> int:
@@ -3656,6 +3648,70 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     requires_ws_overlap=flash_shape.requires_ws_overlap,
                     small_biased_candidate=flash_shape.small_biased_candidate,
                 )
+            else:
+                from ..language.matmul_ops import enable_cute_tcgen05_search
+                from ..language.matmul_ops import plan_cute_tcgen05_search
+                from .cute.cute_mma import analyze_cute_mma_node
+
+                # The same structural analyzer gates tcgen05 search and codegen
+                # for every matrix rank. This prevents transformed loads from
+                # receiving a tcgen05-only search space that codegen later rejects.
+                root_grid_block_ids = {
+                    tuple(block_ids) for block_ids in device_ir.grid_block_ids
+                }
+                search_candidates = []
+                for graph_info in device_ir.graphs:
+                    for node in graph_info.graph.nodes:
+                        candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                        if (
+                            candidate is None
+                            or candidate.requires_accumulator_seed
+                            or candidate.operands.output_block_ids
+                            not in root_grid_block_ids
+                        ):
+                            continue
+                        lhs = candidate.lhs.meta.get("val")
+                        rhs = candidate.rhs.meta.get("val")
+                        if not (
+                            isinstance(lhs, torch.Tensor)
+                            and isinstance(rhs, torch.Tensor)
+                        ):
+                            continue
+                        search_plan = plan_cute_tcgen05_search(
+                            lhs,
+                            rhs,
+                            has_leading_passthrough=(
+                                candidate.operands.has_leading_passthrough
+                            ),
+                        )
+                        if search_plan is None:
+                            continue
+                        search_candidates.append((candidate, lhs, search_plan))
+                analysis_keys = {
+                    (
+                        candidate.operands.output_block_ids,
+                        candidate.operands.k_block_id,
+                        candidate.operands.lhs.source_fake.dtype,
+                    )
+                    for candidate, _lhs, _plan in search_candidates
+                }
+                if len(analysis_keys) == 1:
+                    candidate, lhs, search_plan = search_candidates[0]
+                    enable_cute_tcgen05_search(
+                        lhs,
+                        plan=search_plan,
+                        m_block_id=candidate.operands.m_block_id,
+                        n_block_id=candidate.operands.n_block_id,
+                        k_block_id=candidate.operands.k_block_id,
+                        input_dtype=candidate.operands.lhs.source_fake.dtype,
+                        has_leading_passthrough=(
+                            candidate.operands.has_leading_passthrough
+                        ),
+                        explicit_epi_tile_compatible=all(
+                            item.explicit_epi_tile_compatible
+                            for item, _lhs, _plan in search_candidates
+                        ),
+                    )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05
