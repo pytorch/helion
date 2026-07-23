@@ -674,6 +674,20 @@ def _topk_pallas_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Te
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_rsqrt_uses_native_lax_op(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def rsqrt_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = torch.rsqrt(x[tile])
+            return out
+
+        x = torch.rand(8, 128, device=DEVICE, dtype=torch.float32) + 0.1
+        code, result = code_and_output(rsqrt_kernel, (x,), block_sizes=[8, 128])
+        torch.testing.assert_close(result, torch.rsqrt(x))
+        self.assertIn("lax.rsqrt", code)
+        self.assertNotIn("jnp.sqrt", code)
+
     def test_slice_addressing_classification(self) -> None:
         """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
         -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
