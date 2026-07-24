@@ -570,6 +570,12 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to compile failures."
             )
+        if self._autotune_metrics.num_worker_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_worker_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed in "
+                "isolated benchmark workers."
+            )
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")

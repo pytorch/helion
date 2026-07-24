@@ -34,6 +34,7 @@ from .benchmark_job import AccuracyCheckJob
 from .benchmark_job import AccuracyCheckResult
 from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
+from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
@@ -328,6 +329,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_baseline_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
+        self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
         # budget_exceeded_fn inherits the class-level _never_exceeded default
         # until BaseSearch._prepare installs the search's real hook.
 
@@ -835,8 +837,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
+                self._last_benchmark_failure_status = None
                 perf = self._benchmark_function(config, fn)
-                status = "ok" if math.isfinite(perf) else "error"
+                status = (
+                    "ok"
+                    if math.isfinite(perf)
+                    else self._last_benchmark_failure_status or "error"
+                )
                 recorded_perf = perf if math.isfinite(perf) else None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
@@ -1080,7 +1087,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
-            self._autotune_metrics.num_compile_failures += 1
+            self._last_benchmark_failure_status = (
+                "timeout" if isinstance(e, BenchmarkTimeout) else "error"
+            )
+            self._autotune_metrics.num_worker_failures += 1
             return inf
         except Exception as e:
             e.__traceback__ = None
@@ -1109,7 +1119,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
                 )
-                self._autotune_metrics.num_compile_failures += 1
+                self._last_benchmark_failure_status = (
+                    "timeout" if isinstance(e, BenchmarkTimeout) else "error"
+                )
+                self._autotune_metrics.num_worker_failures += 1
                 return inf
             except Exception as e:
                 e.__traceback__ = None

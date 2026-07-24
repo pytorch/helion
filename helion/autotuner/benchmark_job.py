@@ -16,6 +16,7 @@ from .benchmarking import synchronize_device
 from .kernel_args import load_trusted_kernel_args
 from .logger import capture_output
 from .precompile_future import _load_compiled_fn
+from .precompile_future import _unload_compiled_fn
 
 if TYPE_CHECKING:
     from .precompile_future import SerializedCompiledFunction
@@ -34,18 +35,21 @@ class BenchmarkJob:
         # diagnostics don't leak to the user's terminal.
         with capture_output():
             fn = _load_compiled_fn(self.fn_spec)
-            args = load_trusted_kernel_args(self.args_path)
-            bench = do_bench_generic if self.use_wall_clock else do_bench
-            # return_mode="median" guarantees a float return (not the tuple variant).
-            return cast(
-                "float",
-                bench(
-                    functools.partial(fn, *args),
-                    return_mode="median",
-                    warmup=self.warmup,
-                    rep=self.rep,
-                ),
-            )
+            try:
+                args = load_trusted_kernel_args(self.args_path)
+                bench = do_bench_generic if self.use_wall_clock else do_bench
+                # return_mode="median" guarantees a float return.
+                return cast(
+                    "float",
+                    bench(
+                        functools.partial(fn, *args),
+                        return_mode="median",
+                        warmup=self.warmup,
+                        rep=self.rep,
+                    ),
+                )
+            finally:
+                _unload_compiled_fn(fn)
 
 
 @functools.cache
@@ -71,10 +75,13 @@ class AccuracyCheckJob:
         # Keep compile/launch diagnostics out of the autotune progress stream.
         with capture_output():
             fn = _load_compiled_fn(self.fn_spec)
-            args = load_trusted_kernel_args(self.args_path)
-            baseline_output = _load_trusted_baseline_output(self.baseline_path)
-            output = fn(*args)
-            synchronize_device()
+            try:
+                args = load_trusted_kernel_args(self.args_path)
+                baseline_output = _load_trusted_baseline_output(self.baseline_path)
+                output = fn(*args)
+                synchronize_device()
+            finally:
+                _unload_compiled_fn(fn)
 
         try:
             assert_close(output, baseline_output, atol=self.atol, rtol=self.rtol)

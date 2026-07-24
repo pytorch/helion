@@ -6309,6 +6309,7 @@ class TestAutotuneBudget(TestCase):
         provider._autotune_metrics = SimpleNamespace(
             num_configs_tested=0,
             num_compile_failures=0,
+            num_worker_failures=0,
             num_accuracy_failures=0,
             num_generations=0,
             kernel_source="",
