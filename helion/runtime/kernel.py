@@ -568,6 +568,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         super().__init__()
         self.kernel = kernel
+        # Base specialization key from the REAL args (the same key bind() uses to
+        # distinguish BoundKernels).  Reused in compile_config as the PyCodeCache
+        # ``extra`` discriminator for backends that cache shape-specific module state
+        # (Backend.requires_shape_specialized_module).  Must be computed on the real
+        # args: fake_args turn scalar int/float/bool into SymInt/SymFloat/SymBool,
+        # which the specialization extractors reject.
+        self._base_spec_key = kernel._base_specialization_key(args)
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
@@ -846,8 +853,29 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
+            # static_shapes=True keys a distinct BoundKernel per input shape (see
+            # _tensor_key), but PyCodeCache keys compiled modules by SOURCE TEXT, so
+            # two shapes that emit byte-identical source (e.g. compact_worklist, whose
+            # token dim enters only via runtime offsets + a data-dependent loop) would
+            # share one module.  For backends whose generated module caches shape-
+            # specific state (Backend.requires_shape_specialized_module -- e.g. Pallas,
+            # whose output-meta descriptor / launcher cache / ds-pad decision /
+            # signature lock are all monomorphic) that shared module returns the first
+            # shape's cached output extent for both.  Fold the specialization key into
+            # the PyCodeCache key (via ``extra``, leaving the source untouched) so each
+            # specialization gets its own module.  Reusing the same key that
+            # distinguishes BoundKernels (``self._base_spec_key``, computed from the
+            # real args in __init__) guarantees distinct BoundKernel => distinct module
+            # and already covers shape/dtype/stride recursively through nested
+            # container args.
+            cache_extra = ""
+            if (
+                self.settings.static_shapes
+                and self.env.backend.requires_shape_specialized_module
+            ):
+                cache_extra = repr(self._base_spec_key)
             with measure("BoundKernel.PyCodeCache.load"):
-                module = PyCodeCache.load(triton_code)
+                module = PyCodeCache.load(triton_code, extra=cache_extra)
             self.env.backend.annotate_compiled_module(
                 module, triton_code, self.kernel.name
             )
