@@ -2568,37 +2568,44 @@ class TestCuteBackend(TestCase):
         )
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
-    def test_flash_attention_causal_fa4_split_loop_matches_sdpa(self) -> None:
+    def test_flash_attention_causal_fa4_descending_loops_match_sdpa(self) -> None:
         q, k, v = (
             torch.randn(1, 1, 512, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
         )
-        code, (out, _lse) = code_and_output(
-            cute_causal_attention,
-            (q, k, v),
-            block_sizes=[1, 128, 128],
-            cute_flash_topology="fa4",
-            cute_flash_causal_kv_order="descending",
-            cute_flash_causal_loop_split=True,
-            cute_flash_masked_e2e_schedule="16/4",
-            cute_flash_e2e_schedule="8/2",
-            cute_flash_e2e_offset=0,
-            cute_flash_e2e_offset0=1,
-            cute_flash_disc_pipe=4,
-            cute_flash_role_map="fa4",
-            cute_flash_epi_tma=True,
-            cute_flash_rescale_chunk_cols=16,
-            cute_flash_softmax_regs=200,
-        )
-        self.assertTrue(_flash_fired(code))
-        self.assertIn("fa4_disc_zero_store", code)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
             v,
             is_causal=True,
         )
-        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        for loop_split in (True, False):
+            with self.subTest(loop_split=loop_split):
+                code, (out, _lse) = code_and_output(
+                    cute_causal_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_topology="fa4",
+                    cute_flash_causal_kv_order="descending",
+                    cute_flash_causal_loop_split=loop_split,
+                    cute_flash_masked_e2e_schedule="16/4",
+                    cute_flash_e2e_schedule="8/2",
+                    cute_flash_e2e_offset=0,
+                    cute_flash_e2e_offset0=1,
+                    cute_flash_disc_pipe=4,
+                    cute_flash_role_map="fa4",
+                    cute_flash_epi_tma=True,
+                    cute_flash_rescale_chunk_cols=16,
+                    cute_flash_softmax_regs=200,
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertIn("fa4_disc_zero_store", code)
+                if loop_split:
+                    self.assertIn("for flash_kv_mask_iter in", code)
+                else:
+                    self.assertIn("for flash_kv_iter in", code)
+                    self.assertNotIn("flash_kv_mask_iter", code)
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
     def test_flash_attention_causal_single_warpgroup_matches_sdpa(self) -> None:
         q, k, v = (

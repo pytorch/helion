@@ -7676,6 +7676,7 @@ if warp_idx == 15:
                 softmax_not_first,
                 rowmax_block,
                 pass2_block,
+                zero_first_tile=is_causal and causal_desc_kv and stage == "0",
             )
             return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
