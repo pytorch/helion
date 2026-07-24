@@ -2784,11 +2784,12 @@ def helion_chunk_simple_gla(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert g is not None
     return chunked_linear_attn(
-        q * scale,
+        q,
         k,
         v,
         g,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
@@ -2808,11 +2809,12 @@ def helion_chunk_retention(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert g is not None
     return chunked_linear_attn(
-        q * scale,
+        q,
         k,
         v,
         g,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
