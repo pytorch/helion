@@ -295,15 +295,16 @@ class ConfigGeneration:
                     continue
             else:
                 value = config.config[key]
-            field = flat_fields[key]
             if is_sequence:
                 assert isinstance(value, list)
+                field = flat_fields[key]
                 assert isinstance(field, BlockIdSequence)
                 encoded_values = field._encode_flat_values(self.config_spec, value)
                 for idx, encoded_value in zip(indices, encoded_values, strict=True):
                     result[idx] = copy.deepcopy(encoded_value)
             else:
                 assert len(indices) == 1
+                field = self.flat_spec[indices[0]]
                 if isinstance(field, ListOf) and not isinstance(value, list):
                     value = [copy.deepcopy(value) for _ in range(field.length)]
                 result[indices[0]] = copy.deepcopy(value)
