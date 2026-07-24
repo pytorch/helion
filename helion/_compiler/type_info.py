@@ -446,11 +446,17 @@ class TensorType(TypeInfo):
                 rhs_rank = value.fake_value.ndim
                 # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
                 if rhs_rank != 0 and lhs_rank != rhs_rank:
-                    raise exc.RankMismatch(
-                        lhs_rank,
-                        rhs_rank,
-                        f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                    env = CompileEnvironment.current()
+                    can_squeeze = rhs_rank > lhs_rank and all(
+                        env.known_equal(value.fake_value.size(d), 1)
+                        for d in range(rhs_rank - lhs_rank)
                     )
+                    if not can_squeeze:
+                        raise exc.RankMismatch(
+                            lhs_rank,
+                            rhs_rank,
+                            f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                        )
             elif isinstance(value, (NumericType, LiteralType)):
                 # Allow scalar assignment to tensor (broadcasts to tensor shape)
                 pass
