@@ -5046,7 +5046,7 @@ class TestCuteBackend(TestCase):
             (HALF_DTYPE, 16, 16),
         )
         for dtype, block_m, block_n in cases:
-            with self.subTest(dtype=dtype, block_n=block_n):
+            with self.subTest(dtype=str(dtype), block_n=block_n):
                 args = (
                     torch.randn(2, block_m, 32, device=DEVICE, dtype=dtype),
                     torch.randn(2, 32, block_n, device=DEVICE, dtype=dtype),
