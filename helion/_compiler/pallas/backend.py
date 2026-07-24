@@ -128,6 +128,13 @@ class PallasBackend(Backend):
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         return False
 
+    @property
+    def requires_shape_specialized_module(self) -> bool:
+        # Pallas modules hold monomorphic, shape-specific cached state
+        # (output-meta descriptor, launcher cache, ds-pad decision, signature
+        # lock), so each static-shape specialization needs its own module.
+        return True
+
     def max_reduction_threads(self) -> int | None:
         return None
 
