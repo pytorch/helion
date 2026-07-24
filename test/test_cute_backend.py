@@ -1056,7 +1056,9 @@ def cute_rhs_batched_dot_bias_tcgen05(
         acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = hl.dot(w[tile_m, tile_k], y[tile_b, tile_k, tile_n], acc=acc)
-        out[tile_b, tile_m, tile_n] = (acc + bias[tile_n]).to(torch.bfloat16)
+        out[tile_b, tile_m, tile_n] = (acc + bias[tile_m].unsqueeze(-1)).to(
+            torch.bfloat16
+        )
     return out
 
 
@@ -5399,7 +5401,7 @@ class TestCuteBackend(TestCase):
                 [1, 128, 128, 64],
                 "persistent_interleaved",
                 torch.matmul(rhs_leading_args[0].float(), rhs_leading_args[1].float())
-                + rhs_leading_args[2].float(),
+                + rhs_leading_args[2].float()[None, :, None],
                 "'rhs_leading_passthrough': True",
             ),
         )

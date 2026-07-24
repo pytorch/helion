@@ -195,6 +195,7 @@ def aux_tensor_load_kind(
     carrier_tile_shape: tuple[object, ...] | None,
     carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None = None,
     carrier_global_shape: tuple[object, ...] | None = None,
+    explicit_rank1_data_axis: int | None = None,
 ) -> tuple[str, int | None] | None:
     """Classify ``node`` as a recognized auxiliary-tensor load kind, or
     return ``None`` when the load is not eligible for fusion.
@@ -217,9 +218,9 @@ def aux_tensor_load_kind(
       ``acc + bias[tile_m]`` is either a shape error (BM ≠ BN) or
       rowvec broadcast against the trailing axis (BM == BN). A
       user wanting M-axis (column-vector) broadcasting via a bare
-      rank-1 operand must write it explicitly (``bias[tile_m][:,
-      None]`` / ``.unsqueeze(-1)``); that is a separate, deferred
-      pattern. See :class:`Tcgen05UnaryEpilogueChain`
+      rank-1 operand must write it explicitly with ``.unsqueeze(-1)``;
+      the operand normalizer records that unambiguous direction. See
+      :class:`Tcgen05UnaryEpilogueChain`
       (``cute_epilogue.py``) for the splice-side broadcast-view
       contract.
     - ``("broadcast", 0)``: a rank-2 leading-axis broadcast aux
@@ -248,6 +249,11 @@ def aux_tensor_load_kind(
       still has the full ``(M, N)`` underlying shape; a genuine 2-D
       residual has a non-zero trailing stride and falls through to the
       exact matcher.
+
+    An explicit rank-1 ``unsqueeze`` is represented by
+    ``explicit_rank1_data_axis``. Axis 0 is a column vector and reuses the
+    ``("broadcast", 2)`` codegen; axis 1 is the explicit spelling of the
+    ordinary row-vector case.
 
     A rank-3 exact residual is accepted when its leading index is the carrier's
     leading passthrough tile. The classifier returns ``None`` for everything
@@ -370,6 +376,18 @@ def aux_tensor_load_kind(
     if len(carrier_tile_shape) != 2:
         return None
 
+    if explicit_rank1_data_axis is not None:
+        return _matches_rank1_broadcast(
+            aux_shape=aux_shape,
+            aux_tensor_shape=aux_tensor_shape,
+            aux_tensor_val=aux_tensor_val,
+            index_list=index_list,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+            data_axis=explicit_rank1_data_axis,
+        )
+
     colvec = _matches_colvec_broadcast(
         aux_shape=aux_shape,
         aux_tensor_shape=aux_tensor_shape,
@@ -434,10 +452,9 @@ def _matches_broadcast(
     aligns to the last dimension under PyTorch broadcasting rules,
     so ``acc + bias[tile_m]`` is not a column-vector broadcast — it
     is a shape error (BM ≠ BN) or trailing-axis broadcast (BM == BN).
-    Users wanting an explicit M-axis broadcast must write it
-    explicitly (``bias[tile_m][:, None]`` / ``.unsqueeze(-1)`` /
-    ``.expand(...)``); that is a separate pattern handler not yet
-    wired up.
+    Users wanting an M-axis broadcast must write it explicitly as
+    ``bias[tile_m].unsqueeze(-1)``; the operand normalizer supplies axis 0
+    to :func:`_matches_rank1_broadcast` for that form.
 
     The splice site emits ``cute.make_layout((m, n),
     stride=(0, 1))`` with stride 1 hard-coded on the data axis,
@@ -455,42 +472,54 @@ def _matches_broadcast(
     to be divisible by the tile extent passes the tile check yet
     reads OOB at runtime.
     """
-    if len(aux_tensor_shape) != 1 or len(aux_shape) != 1 or len(index_list) != 1:
-        return None
-    if carrier_tile_index_nodes is None:
-        # Broadcast classification is gated on knowing the carrier's
-        # tile-id symbols so we can pin which axis the load broadcasts
-        # along. Without that, the unpredicated splice could broadcast
-        # the wrong axis silently — bail to the loud-failure backstop.
-        return None
-    if len(carrier_tile_index_nodes) != 2:
+    return _matches_rank1_broadcast(
+        aux_shape=aux_shape,
+        aux_tensor_shape=aux_tensor_shape,
+        aux_tensor_val=aux_tensor_val,
+        index_list=index_list,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        carrier_global_shape=carrier_global_shape,
+        data_axis=1,
+    )
+
+
+def _matches_rank1_broadcast(
+    *,
+    aux_shape: tuple[object, ...],
+    aux_tensor_shape: tuple[object, ...],
+    aux_tensor_val: torch.Tensor,
+    index_list: Sequence[object],
+    carrier_tile_shape: tuple[object, ...],
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+    data_axis: int,
+) -> tuple[str, int] | None:
+    """Match a contiguous rank-1 load against one carrier data axis."""
+    if (
+        data_axis not in (0, 1)
+        or len(aux_tensor_shape) != 1
+        or len(aux_shape) != 1
+        or len(index_list) != 1
+        or carrier_tile_index_nodes is None
+        or len(carrier_tile_index_nodes) != 2
+        or aux_tensor_val.stride() != (1,)
+    ):
         return None
     load_idx = index_list[0]
-    if not isinstance(load_idx, torch.fx.Node):
+    if (
+        load_idx is not carrier_tile_index_nodes[data_axis]
+        or aux_shape[0] != carrier_tile_shape[data_axis]
+    ):
         return None
-    if aux_tensor_val.stride() != (1,):
+    if carrier_global_shape is not None and (
+        len(carrier_global_shape) != 2
+        or aux_tensor_shape[0] != carrier_global_shape[data_axis]
+    ):
         return None
-    aux_extent = aux_shape[0]
-    # Trailing-axis (rowvec) broadcast only — see docstring.
-    axis = 1
-    if load_idx is not carrier_tile_index_nodes[axis]:
-        return None
-    if aux_extent != carrier_tile_shape[axis]:
-        return None
-    if carrier_global_shape is not None:
-        if len(carrier_global_shape) != 2:
-            return None
-        # The underlying rank-1 aux tensor's *total* length must
-        # match the output's global axis size on the broadcast
-        # axis. The earlier ``aux_extent == carrier_tile_shape``
-        # check matches the per-load *tile* extent against the
-        # carrier's tile shape; without the global-size check, an
-        # aux smaller than the output axis whose length happens to
-        # be divisible by the tile extent could pass classification
-        # yet read OOB at runtime.
-        if aux_tensor_shape[0] != carrier_global_shape[axis]:
-            return None
-    return ("broadcast", axis)
+    # The existing column-vector path is identified by 2; row vectors retain
+    # their historical axis-1 representation.
+    return ("broadcast", 2 if data_axis == 0 else 1)
 
 
 def _matches_leading_broadcast(

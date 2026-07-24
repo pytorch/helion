@@ -22,11 +22,11 @@ expression for two cases:
 - Auxiliary-tensor binary ops: same shape as above, but one or more
   steps are ``add/sub/mul/div`` with the chain carrier as one
   operand and a ``helion.language.load(aux_tensor, [...])``
-  call as the other. Two aux load shapes are accepted: the
-  exact-shape rank-2 form (``residual[tile_m, tile_n]``) and the
-  rank-1 trailing-axis (rowvec) broadcast form (``bias[tile_n]``).
+  call as the other. Accepted shapes include exact-shape rank-2 loads,
+  rank-1 trailing-axis row vectors, and explicit rank-1 column vectors
+  spelled ``bias[tile_m].unsqueeze(-1)``.
   See :class:`_AuxiliaryTensorStep` for the canonical contract.
-  Forms outside these two — 3-D underlying tensors with a static
+  Other forms — 3-D underlying tensors with a static
   collapse, mismatched indices, leading-axis rank-1
   (``bias[tile_m]``), kwargs — are rejected to the loud-failure
   backstop.
@@ -120,7 +120,8 @@ class _AuxiliaryTensorStep:
     ``broadcast_axis`` is ``None`` when the aux tensor matches the
     carrier rank exactly (``residual[tile_m, tile_n]``), ``1`` for
     a trailing-axis (rowvec) broadcast aux load (``bias[tile_n]``
-    with shape ``(N,)``), or ``0`` for a leading-axis (row /
+    with shape ``(N,)``), ``2`` for an explicit column vector
+    (``bias[tile_m].unsqueeze(-1)``), or ``0`` for a leading-axis (row /
     M-axis) broadcast aux load spelled explicitly as a ``(1, N)``
     tensor indexed ``bias[tile_m, tile_n]``. A *bare* rank-1
     operand on the RHS (``acc + bias[tile_m]``) is still rejected
@@ -132,11 +133,10 @@ class _AuxiliaryTensorStep:
     M axis themselves, so row 0 broadcasts over every output row.
     The splice site
     (``memory_ops._codegen_cute_store_tcgen05_tile``) owns the
-    canonical broadcast-view contract — for both broadcast axes it
-    builds a 2-D logical view with stride 0 on the broadcast
-    (M) axis and stride 1 on the data (N) axis so the existing
-    ``partition_C → flat_divide → partition_D`` pipeline can run
-    unchanged. Mirrors Quack's ``RowVecLoad`` epilogue
+    canonical broadcast-view contract. Row vectors use stride ``(0, 1)``;
+    compact column vectors use stride ``(1, 0)``. Both feed the existing
+    ``partition_C → flat_divide → partition_D`` pipeline unchanged. The
+    row-vector form mirrors Quack's ``RowVecLoad`` epilogue
     (``quack/quack/epi_ops.py``).
     """
 
@@ -370,65 +370,80 @@ def _is_helion_load_node(node: torch.fx.Node) -> bool:
     return node.op == "call_function" and node.target is helion_load
 
 
-def _canonical_aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
-    """Return the underlying aux load plus its local-value template.
+@dataclasses.dataclass(frozen=True)
+class _AuxLoadOperand:
+    load_node: torch.fx.Node
+    value_template: str = "{aux}"
+    rank1_data_axis: int | None = None
 
-    Canonical unwrapping currently accepts raw aux loads and fp32 casts of
-    aux loads; other dtype casts stay outside the fused aux pattern.
+
+def _aux_load_operand(node: torch.fx.Node) -> _AuxLoadOperand | None:
+    """Normalize the accepted wrappers around one auxiliary load.
+
+    ``rank1_data_axis`` records the surviving axis after an explicit
+    rank-1 ``unsqueeze``. This distinguishes a real column-vector expression
+    from a bare rank-1 operand, whose broadcast direction follows PyTorch's
+    trailing-axis rule.
     """
     if _is_helion_load_node(node):
-        return node, "{aux}"
+        return _AuxLoadOperand(node)
+    if node.op != "call_function" or node.kwargs:
+        return None
+
     if (
-        node.op == "call_function"
-        and node.target is torch.ops.prims.convert_element_type.default
-        and not node.kwargs
+        node.target is torch.ops.prims.convert_element_type.default
         and len(node.args) == 2
         and node.args[1] is torch.float32
         and isinstance(node.args[0], torch.fx.Node)
     ):
-        inner = node.args[0]
-        if _is_helion_load_node(inner):
-            return inner, "({aux}).to(cutlass.Float32)"
-    return node, "{aux}"
+        inner = _aux_load_operand(node.args[0])
+        if inner is None:
+            return None
+        return dataclasses.replace(
+            inner, value_template=f"({inner.value_template}).to(cutlass.Float32)"
+        )
 
+    if (
+        node.target is torch.ops.aten.unsqueeze.default
+        and len(node.args) == 2
+        and isinstance(node.args[0], torch.fx.Node)
+        and isinstance(node.args[1], int)
+        and not isinstance(node.args[1], bool)
+    ):
+        inner = _aux_load_operand(node.args[0])
+        load_val = inner.load_node.meta.get("val") if inner is not None else None
+        dim = node.args[1] % 2
+        if (
+            inner is None
+            or inner.rank1_data_axis is not None
+            or not isinstance(load_val, torch.Tensor)
+            or load_val.ndim != 1
+            or node.args[1] not in (-2, -1, 0, 1)
+        ):
+            return None
+        return dataclasses.replace(inner, rank1_data_axis=1 - dim)
 
-def _aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
-    """Return ``(load_node, aux_template)`` for accepted aux operands.
-
-    ``aux_template`` is a ``{aux}``-keyed expression applied to the loaded
-    per-thread aux local before the outer binary op. This covers wrapped
-    residual terms such as ``0.5 * residual[tile_m, tile_n].to(torch.float32)``
-    without broadening the general chain model to arbitrary non-scalar binary
-    reuse.
-    """
-    load_node, aux_template = _canonical_aux_load_operand(node)
-    if load_node is not node:
-        return load_node, aux_template
-    if node.op != "call_function" or node.target is not torch.ops.aten.mul.Tensor:
-        return node, "{aux}"
-    if node.kwargs or len(node.args) < 2:
-        return node, "{aux}"
-    lhs = node.args[0]
-    rhs = node.args[1]
+    if node.target is not torch.ops.aten.mul.Tensor or len(node.args) < 2:
+        return None
+    lhs, rhs = node.args[:2]
     if isinstance(lhs, torch.fx.Node):
         scalar = _extract_scalar(rhs)
-        inner = lhs
+        inner_node = lhs
     elif isinstance(rhs, torch.fx.Node):
         scalar = _extract_scalar(lhs)
-        inner = rhs
+        inner_node = rhs
     else:
-        return node, "{aux}"
-    if scalar is None:
-        return node, "{aux}"
-    load_node, inner_template = _canonical_aux_load_operand(inner)
-    if load_node is inner and not _is_helion_load_node(load_node):
-        return node, "{aux}"
-    return load_node, f"(({inner_template}) * {scalar!r})"
+        return None
+    inner = _aux_load_operand(inner_node)
+    if scalar is None or inner is None:
+        return None
+    return dataclasses.replace(
+        inner, value_template=f"(({inner.value_template}) * {scalar!r})"
+    )
 
 
 def _is_aux_load_operand_node(node: torch.fx.Node) -> bool:
-    load_node, _ = _aux_load_operand(node)
-    return _is_helion_load_node(load_node)
+    return _aux_load_operand(node) is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -749,32 +764,36 @@ def _classify_binary(
         # tensor load; the other is the chain carrier. If both look
         # like aux loads or neither does, bail — the chain has no
         # unique carrier.
-        lhs_load, lhs_aux_template = _aux_load_operand(lhs)
-        rhs_load, rhs_aux_template = _aux_load_operand(rhs)
-        lhs_kind = aux_tensor_load_kind(
-            lhs_load,
-            carrier_tile_shape=carrier_tile_shape,
-            carrier_tile_index_nodes=carrier_tile_index_nodes,
-            carrier_global_shape=carrier_global_shape,
-        )
-        rhs_kind = aux_tensor_load_kind(
-            rhs_load,
-            carrier_tile_shape=carrier_tile_shape,
-            carrier_tile_index_nodes=carrier_tile_index_nodes,
-            carrier_global_shape=carrier_global_shape,
-        )
+        lhs_operand = _aux_load_operand(lhs)
+        rhs_operand = _aux_load_operand(rhs)
+
+        def load_kind(operand: _AuxLoadOperand | None) -> tuple[str, int | None] | None:
+            if operand is None:
+                return None
+            return aux_tensor_load_kind(
+                operand.load_node,
+                carrier_tile_shape=carrier_tile_shape,
+                carrier_tile_index_nodes=carrier_tile_index_nodes,
+                carrier_global_shape=carrier_global_shape,
+                explicit_rank1_data_axis=operand.rank1_data_axis,
+            )
+
+        lhs_kind = load_kind(lhs_operand)
+        rhs_kind = load_kind(rhs_operand)
         aux_load: torch.fx.Node
         carrier: torch.fx.Node
         forward_form: bool
         if lhs_kind is not None and rhs_kind is None:
-            aux_load = lhs_load
-            aux_template = lhs_aux_template
+            assert lhs_operand is not None
+            aux_load = lhs_operand.load_node
+            aux_template = lhs_operand.value_template
             carrier = rhs
             forward_form = False  # carrier is the right operand
             aux_kind = lhs_kind
         elif rhs_kind is not None and lhs_kind is None:
-            aux_load = rhs_load
-            aux_template = rhs_aux_template
+            assert rhs_operand is not None
+            aux_load = rhs_operand.load_node
+            aux_template = rhs_operand.value_template
             carrier = lhs
             forward_form = True  # carrier is the left operand
             aux_kind = rhs_kind
@@ -968,9 +987,8 @@ def analyze_tcgen05_unary_epilogue_chain(
     (``add`` / ``sub`` / ``mul`` / ``div`` against a compile-time
     Python literal), and auxiliary-tensor binary in two forms:
     exact-shape (``residual[tile_m, tile_n]``, rank-2 aux matching
-    the carrier tile shape) and rank-1 trailing-axis (rowvec)
-    broadcast (``bias[tile_n]``, where the single load index
-    symbol matches the carrier's trailing tile-id symbol). Other
+    the carrier tile shape), rank-1 trailing-axis rowvec broadcast,
+    and explicit rank-1 column-vector broadcast via ``unsqueeze``. Other
     shapes — 3-D collapsed loads, indices that are not exactly the
     carrier trailing tile-id symbol, leading-axis rank-1
     (``bias[tile_m]``), kwargs — are rejected so the loud-failure

@@ -1744,12 +1744,17 @@ def _codegen_cute_store_tcgen05_tile(
         # treats unreferenced tensors as captures, which doesn't work
         # for tensors only read inside a per-subtile loop body).
         df.placeholder_args.add(aux_tensor_name)
-        # Broadcast axes 0/1 build a stride-0 2-D view of a rank-1 tensor.
+        # Compact broadcast inputs build a logical 2-D view over their rank-1
+        # storage. Full-shape colvec views already carry stride (1, 0).
         # An exact rank-3 input uses a view of its selected leading coordinate.
-        # The colvec form (2) already carries an (M, N) stride-(1, 0) view.
+        compact_broadcast = (
+            aux_step.broadcast_axis is not None and aux_torch_tensor.ndim == 1
+        )
         aux_view2d = (
             df.new_var(f"tcgen05_aux_view2d_{aux_idx}")
-            if aux_step.broadcast_axis in (0, 1) or aux_torch_tensor.ndim == 3
+            if compact_broadcast
+            or aux_step.broadcast_axis == 0
+            or aux_torch_tensor.ndim == 3
             else None
         )
         aux_step_records.append(
@@ -2268,7 +2273,21 @@ def _codegen_cute_store_tcgen05_tile(
                 )
                 continue
 
-            if rec.broadcast_axis is None or rec.broadcast_axis == 2:
+            compact_colvec = rec.broadcast_axis == 2 and rec.aux_view2d is not None
+            if compact_colvec:
+                assert rec.aux_view2d is not None
+                # Explicit ``rank1.unsqueeze(-1)`` column vector. Reconstruct
+                # its logical (M, N) stride-(1, 0) view without requiring the
+                # caller to materialize an expanded host tensor.
+                lines.append(
+                    f"{rec.aux_view2d} = cute.make_tensor("
+                    f"{rec.aux_tensor_name}.iterator, "
+                    f"cute.make_layout(({m_size}, {n_size}), "
+                    f"stride=(1, 0)))"
+                )
+                source_for_local_tile = rec.aux_view2d
+                aux_tile_is_local = False
+            elif rec.broadcast_axis is None or rec.broadcast_axis == 2:
                 # Exact-shape aux (or the colvec form) uses the trailing matrix
                 # directly. For a rank-3 residual, first select the current
                 # leading-passthrough slice without changing its M/N strides.
