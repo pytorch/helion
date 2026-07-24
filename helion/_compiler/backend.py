@@ -2685,7 +2685,7 @@ def _kernel_specialized_mma_plan(
 ) -> _SpecializedMmaPlan | None:
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _choose_mma_impl
-    from .cute.cute_mma import _mma_tiles_are_static_full
+    from .cute.cute_mma import _mma_tile_coverage
     from .cute.cute_mma import analyze_cute_mma_node
     from .device_ir import ForLoopGraphInfo
     from .host_function import HostFunction
@@ -2725,9 +2725,9 @@ def _kernel_specialized_mma_plan(
                 continue
             if (
                 candidate.operands.has_leading_passthrough
-                and not _mma_tiles_are_static_full(
+                and not _mma_tile_coverage(
                     candidate.operands, bm=bm, bn=bn, bk=bk
-                )
+                ).is_full_or_k_tail
             ):
                 continue
             lhs_val = candidate.operands.lhs.source_fake

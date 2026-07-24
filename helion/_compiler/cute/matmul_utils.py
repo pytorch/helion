@@ -34,6 +34,50 @@ class DirectGroupedNLoadPlan:
     rhs_n_offset: int
 
 
+@dataclass(frozen=True)
+class CuteMmaTileCoverage:
+    """Static MMA tile coverage relevant to collective code generation."""
+
+    output_tiles_full: bool
+    k_tiles_full: bool
+    has_k_tail: bool
+
+    @property
+    def is_static_full(self) -> bool:
+        return self.output_tiles_full and self.k_tiles_full
+
+    @property
+    def is_k_tail_only(self) -> bool:
+        return self.output_tiles_full and self.has_k_tail
+
+    @property
+    def is_full_or_k_tail(self) -> bool:
+        return self.is_static_full or self.is_k_tail_only
+
+
+def classify_cute_mma_tile_coverage(
+    *, m: int, n: int, k: int, block_m: int, block_n: int, block_k: int
+) -> CuteMmaTileCoverage:
+    """Classify whether an MMA problem is full-tile or has only a K tail."""
+    k_tiles_full = k % block_k == 0
+    return CuteMmaTileCoverage(
+        output_tiles_full=m % block_m == 0 and n % block_n == 0,
+        k_tiles_full=k_tiles_full,
+        has_k_tail=k > block_k and not k_tiles_full,
+    )
+
+
+def largest_power_of_two_divisor_at_most(
+    extent: int, maximum: int, minimum: int
+) -> int | None:
+    """Return the largest power-of-two divisor in ``[minimum, maximum]``."""
+    if extent <= 0 or maximum <= 0 or minimum <= 0:
+        return None
+    maximum_power_of_two = 1 << (maximum.bit_length() - 1)
+    candidate = min(maximum_power_of_two, extent & -extent)
+    return candidate if candidate >= minimum else None
+
+
 def _cute_static_int_extent(size: object) -> int | None:
     if not isinstance(size, (int, torch.SymInt, sympy.Expr)):
         return None

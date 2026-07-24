@@ -11,7 +11,10 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
 from .._compiler.compile_environment import shape_env_var_hints
+from .._compiler.cute.matmul_utils import classify_cute_mma_tile_coverage
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
+from .._compiler.cute.matmul_utils import largest_power_of_two_divisor_at_most
+from .._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -383,7 +386,6 @@ def plan_cute_tcgen05_search(
             min_search_m = 64
         max_search_m = min(max_search_m, static_m & -static_m)
         max_search_n = min(max_search_n, static_n & -static_n)
-        max_search_k = min(max_search_k, static_k & -static_k)
         if max_search_m < min_search_m or max_search_n < 8 or max_search_k < mma_k:
             return None
     if static_m % max_search_m != 0 and static_n % max_search_n != 0:
@@ -436,21 +438,41 @@ def enable_cute_tcgen05_search(
     max_search_n = plan.max_search_n
     max_search_k = plan.max_search_k
     spec.cute_tcgen05_search_enabled = True
-    allow_full_tile_persistent_pid_types = (
-        static_m % max_search_m == 0
-        and static_n % max_search_n == 0
-        and static_k % max_search_k == 0
+    max_tile_coverage = classify_cute_mma_tile_coverage(
+        m=static_m,
+        n=static_n,
+        k=static_k,
+        block_m=max_search_m,
+        block_n=max_search_n,
+        block_k=max_search_k,
     )
+    persistent_block_m = largest_power_of_two_divisor_at_most(
+        static_m,
+        min(max_search_m, TCGEN05_ONE_CTA_MAX_BLOCK_M),
+        plan.min_search_m,
+    )
+    persistent_block_n = largest_power_of_two_divisor_at_most(static_n, max_search_n, 8)
+    allow_persistent_pid_types = False
+    if persistent_block_m is not None and persistent_block_n is not None:
+        persistent_tile_coverage = classify_cute_mma_tile_coverage(
+            m=static_m,
+            n=static_n,
+            k=static_k,
+            block_m=persistent_block_m,
+            block_n=persistent_block_n,
+            block_k=max_search_k,
+        )
+        allow_persistent_pid_types = persistent_tile_coverage.is_full_or_k_tail
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
     allow_full_tile_cluster_m2_search = (
-        allow_full_tile_persistent_pid_types
+        max_tile_coverage.is_static_full
         and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
         and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
         and static_k <= max_cluster_m2_search_k
     )
     allow_edge_cluster_m2_search = (
         not has_leading_passthrough
-        and not allow_full_tile_persistent_pid_types
+        and not max_tile_coverage.is_static_full
         and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
         and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
         and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -464,7 +486,7 @@ def enable_cute_tcgen05_search(
     allow_fp8_small_grid_cluster_m2_search = (
         not has_leading_passthrough
         and plan.is_fp8
-        and allow_full_tile_persistent_pid_types
+        and max_tile_coverage.is_static_full
         and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
         and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
         and static_k <= max_cluster_m2_search_k
@@ -492,7 +514,7 @@ def enable_cute_tcgen05_search(
                 allow_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
     spec.narrow_tcgen05_autotune_to_validated_configs(
-        allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
+        allow_persistent_pid_types=allow_persistent_pid_types,
         allow_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
         allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
