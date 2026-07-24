@@ -1549,6 +1549,35 @@ class TestWorklistNumerics(unittest.TestCase):
         "the resident-cache ordered KV path is validated on real TPU, not "
         "Pallas interpret mode"
     )
+    def test_grouped_fast_math_mask_elision_matches_eager(self):
+        H, D, block = 2, 16, 16
+        qo = _offsets([10, 23, 7, 40])
+        kvo = _offsets([16, 5, 0, 33])
+        lq, lkv = int(qo[-1]), int(kvo[-1])
+        torch.manual_seed(0)
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo)
+        kernel = helion.kernel(
+            _fully_jagged_kernel.fn,
+            backend="pallas",
+            static_shapes=True,
+            fast_math=True,
+        )
+
+        code, out = code_and_output(
+            kernel,
+            (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
+            **_worklist_config([block, block], loop_type="unroll", grouping=2),
+        )
+        self.assertEqual(code.count("lax.dot_general(scores"), 2)
+        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    @skipIfPallasInterpret(
+        "the resident-cache ordered KV path is validated on real TPU, not "
+        "Pallas interpret mode"
+    )
     def test_fully_jagged_long_kv_matches_eager(self):
         # Long, jagged KV (several kvblock trips, non-divisible final tiles per
         # sequence): the end-to-end numeric check for a jagged ordered reduction,
@@ -1830,6 +1859,17 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
             kvo,
         )
 
+    def _fast_math_resident_code(self, grouping: int) -> str:
+        kernel = helion.kernel(
+            _fully_jagged_kernel.fn,
+            backend="pallas",
+            static_shapes=True,
+            fast_math=True,
+        )
+        return kernel.bind(self._resident_args()).to_triton_code(
+            _worklist_config([8, 8], grouping=grouping)
+        )
+
     def test_resident_prep_zero_fill_load_mask_elided_from_reduction(self):
         # The prep-hoisted resident K load reads a zero-filled cache (the refill writes
         # tail_fill_value=0 once), so its per-tile fill-0 mask is redundant and dropped.
@@ -1852,12 +1892,42 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         self.assertRegex(body, rf"\b{src} = \w+_prep\[")
         self.assertNotRegex(body, rf"\b{src} = jnp\.where")
 
+    def test_fast_math_elides_zero_score_masks_for_both_groupings(self):
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                code = self._fast_math_resident_code(grouping)
+                score_masks = [
+                    line
+                    for line in code.splitlines()
+                    if "jnp.where" in line and ", scores" in line
+                ]
+                self.assertEqual(score_masks, [])
+                self.assertEqual(code.count("lax.dot_general(scores"), grouping)
+
+    def test_strict_math_keeps_zero_score_mask(self):
+        code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
+            _worklist_config([8, 8])
+        )
+        score_masks = [
+            line
+            for line in code.splitlines()
+            if "jnp.where" in line and ", scores" in line
+        ]
+        self.assertEqual(len(score_masks), 1)
+        self.assertNotIn("lax.dot_general(scores", code)
+
     def test_flash_resident_prep_keeps_softmax_neg_inf_mask(self):
         # Flash's fill-0 K/V load masks elide (prep cache zeroed), but the amax
         # reduction's softmax mask fills -inf (!= the cache's 0 tail) and is downstream
         # of the dot, so it is preserved.  Assert the score mask specifically: a
         # jnp.where whose fill is a -inf full (not merely the m_i init's -inf full).
-        code = _flash_prep_kernel.bind(self._resident_args()).to_triton_code(
+        kernel = helion.kernel(
+            _flash_prep_kernel.fn,
+            backend="pallas",
+            static_shapes=True,
+            fast_math=True,
+        )
+        code = kernel.bind(self._resident_args()).to_triton_code(
             _worklist_config([8, 8])
         )
         self.assertIn("_rc_prep_refill", code)  # prep cache installed
