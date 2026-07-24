@@ -2550,6 +2550,80 @@ class TestCuteBackend(TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_fa4_dense_64k_role_chain_seed_matches_sdpa(
+        self,
+    ) -> None:
+        q, k, v = (
+            torch.randn(1, 1, 65536, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+        )
+
+        self.assertIn("elif warp_idx == 13:", code)
+        self.assertIn("elif warp_idx == 14:", code)
+        self.assertIn("mbar_ptr=flash_pfor2_ptr + 0", code)
+        self.assertIn("fa4_store_o_smem_to_gmem", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_fa4_two_cta_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(2, 16, 1024, 128, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        for epi_tma in (True, False):
+            with self.subTest(epi_tma=epi_tma):
+                code, out = code_and_output(
+                    cute_dense_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_topology="fa4",
+                    cute_flash_persistent=True,
+                    cute_flash_use_2cta=True,
+                    cute_flash_epi_tma=epi_tma,
+                )
+
+                self.assertIn("cta_group=2", code)
+                self.assertIn("is_two_cta=True", code)
+                self.assertIn("smem_offset=-2048", code)
+                self.assertIn("flash_q_mma_tile0 * 2", code)
+                self.assertIn("'use_2cta_instrs': True", code)
+                self.assertIn(
+                    "flash_grid_dim = cutlass.Int32(cute.arch.cluster_dim()[0])",
+                    code,
+                )
+                self.assertIn(f"'epi_tma': {epi_tma}", code)
+                if epi_tma:
+                    self.assertIn("fa4_correction_epilogue_to_smem_scoped_2cta", code)
+                else:
+                    self.assertNotIn(
+                        "fa4_correction_epilogue_to_smem_scoped_2cta", code
+                    )
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_fa4_two_cta_clamps_pair_epilogue(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = resolve_flash_config(
+                128,
+                8,
+                {
+                    "cute_flash_topology": "fa4",
+                    "cute_flash_use_2cta": True,
+                    "cute_flash_epi_tma": False,
+                    "cute_flash_epi_stg": True,
+                    "cute_flash_epi_stg_gmem": "pair",
+                },
+            )
+
+        self.assertTrue(cfg.use_2cta_instrs)
+        self.assertTrue(cfg.epi_stg)
+        self.assertEqual(cfg.epi_stg_gmem, "stage")
+
     def test_flash_attention_clc_preserves_explicit_flattened_geometry(self) -> None:
         q, k, v = (
             torch.randn(2, 32, 8192, 64, dtype=torch.float16, device=DEVICE)
@@ -3986,6 +4060,30 @@ class TestCuteBackend(TestCase):
             self.assertEqual(resolve_flash_config(64, 1024).clc_stages, 2)
         self.assertEqual(cfg_64k.corr_tile_size, 16)
         self.assertEqual(cfg_64k.role_map, "fa4")
+        self.assertTrue(
+            _cute_flash._flash_role_chain_default(
+                hd=64,
+                num_kv=512,
+                is_causal=False,
+                role_map=cfg_64k.role_map,
+            )
+        )
+        self.assertFalse(
+            _cute_flash._flash_role_chain_default(
+                hd=64,
+                num_kv=1024,
+                is_causal=False,
+                role_map=cfg_128k.role_map,
+            )
+        )
+        self.assertFalse(
+            _cute_flash._flash_role_chain_default(
+                hd=64,
+                num_kv=512,
+                is_causal=True,
+                role_map=cfg_64k.role_map,
+            )
+        )
 
     def test_flash_attention_dense_hd64_epi_tma_seed_buckets(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
