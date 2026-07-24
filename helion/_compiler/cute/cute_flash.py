@@ -1866,14 +1866,33 @@ def resolve_flash_config(
     use_2cta_cfg = _cfg(FLASH_USE_2CTA_KEY)
     if use_2cta_cfg is not None:
         use_2cta_instrs = bool(use_2cta_cfg)
-    if topology != "fa4" or is_causal or num_kv % 4 != 0 or head_dim != 128:
+    dense_hd64_2cta = (
+        head_dim == 64 and 256 <= num_kv <= 1024 and dtype is torch.float16
+    )
+    if (
+        topology != "fa4"
+        or is_causal
+        or num_kv % 4 != 0
+        or (head_dim != 128 and not dense_hd64_2cta)
+    ):
         use_2cta_instrs = False
-    if use_2cta_instrs:
+    if use_2cta_instrs and head_dim == 128:
         precompute_qk_desc = False
         if epi_stg_gmem == "pair":
             # Pair destinations span both CTA rows; without a rank slice the two
             # CTAs alias the same output half.
             epi_stg_gmem = "stage"
+    if use_2cta_instrs and dense_hd64_2cta:
+        # This family was characterized as a unit: the TMA epilogue and Rep16
+        # split publication are required to beat the established one-CTA seed.
+        epi_tma = True
+        epi_stg = False
+        epi_stg_gmem = "stage"
+        p_store_repetition = 16
+        split_p_arrive = True
+        softmax_disc = False
+        s_load_repetition = 32
+        precompute_qk_desc = True
     use_cga2_local_default = (
         _flash_dense_hd64_seed_cga2_local(num_kv) if long_dense_hd64_fa4 else False
     )
@@ -2436,6 +2455,11 @@ def flash_attention_value_prior_weights(
             {
                 FLASH_S_STAGE_KEY: {2: 1.0},
                 FLASH_TOPOLOGY_KEY: {"fa4": 4.0, "ws_overlap": 1.0},
+                FLASH_USE_2CTA_KEY: (
+                    {True: 4.0, False: 2.0}
+                    if num_kv == 512 and dtype is torch.float16
+                    else {False: 1.0}
+                ),
                 FLASH_PERSISTENT_KEY: {True: 1.0},
                 FLASH_PERSISTENT_CTAS_PER_SM_KEY: {
                     persistent_ctas_per_sm: 4.0,
@@ -3925,7 +3949,18 @@ def flash_autotune_fragments(
         and head_dim == 128
         and num_kv % 4 == 0
     )
-    use_2cta_eligible = dense_hd128_fa4
+    dense_hd64_2cta_fa4 = (
+        topology_choices[0] == "fa4"
+        and not is_causal
+        and head_dim == 64
+        and 256 <= num_kv <= 1024
+        and num_kv % 4 == 0
+        and dtype is torch.float16
+        and not has_kv_tile_pruning
+        and not requires_ws_overlap
+        and not small_biased_candidate
+    )
+    use_2cta_eligible = dense_hd128_fa4 or dense_hd64_2cta_fa4
     use_2cta_choices = (
         _flash_choices_with_default(defaults.use_2cta_instrs, (False, True))
         if use_2cta_eligible
@@ -6158,6 +6193,7 @@ def emit_flash_fa4_device_body(
     )
     cta_group_size = 2 if use_2cta_instrs else 1
     mma_m = 256 if use_2cta_instrs else 128
+    dense_hd64_2cta = use_2cta_instrs and hd == 64
     pfor2_count = 2 * 128 if use_2cta_instrs else 128
     pfor_count = (
         pfor2_count
@@ -6166,8 +6202,9 @@ def emit_flash_fa4_device_body(
         if use_2cta_instrs
         else 2 * 128
     )
+    pfor_self_cta_rank = "None" if dense_hd64_2cta else "flash_mma_tile_coord_v"
     pfor_peer_arg = (
-        ", cutlass.Int32(0), flash_mma_tile_coord_v" if use_2cta_instrs else ""
+        f", cutlass.Int32(0), {pfor_self_cta_rank}" if use_2cta_instrs else ""
     )
     commit_group_arg = (
         ", flash_tcgen05_mcast_mask, cute_tcgen05_flash.CtaGroup.TWO"
@@ -6201,11 +6238,14 @@ def emit_flash_fa4_device_body(
     kv_loop_bound = "flash_num_active_kv" if is_causal else "_flash_num_kv_tiles"
     kv_loop_bound_minus_1 = f"{kv_loop_bound} - 1"
     epi_smem = cfg.epi_tma or cfg.epi_stg
-    role_chain_default = _flash_role_chain_default(
-        hd=hd, num_kv=num_kv, is_causal=is_causal, role_map=cfg.role_map
+    role_chain_default = (
+        _flash_role_chain_default(
+            hd=hd, num_kv=num_kv, is_causal=is_causal, role_map=cfg.role_map
+        )
+        or dense_hd64_2cta
     )
     role_chain = (
-        not use_2cta_instrs
+        (not use_2cta_instrs or dense_hd64_2cta)
         and not use_cga2_local_cta
         and not use_clc_scheduler
         and _flash_bool_env("HELION_CUTE_FLASH_ROLE_CHAIN", role_chain_default)
@@ -7918,7 +7958,12 @@ if warp_idx == 15:
                     io_dtype,
                 ]
             if use_2cta_instrs:
-                sp_pass2_args.extend(["cutlass.Int32(0)", "flash_mma_tile_coord_v"])
+                sp_pass2_args.extend(["cutlass.Int32(0)", pfor_self_cta_rank])
+                if dense_hd64_2cta and not mixed_p_store:
+                    # Eight packed pairs expose enough affine/exp ILP to hide the
+                    # dependency chain without the register pressure of a full
+                    # 32-value fragment. Level-schedule the two software-exp pairs.
+                    sp_pass2_args.extend(["True", "8", "2"])
             sp_exp_block = (
                 f"            flash_p_sum = _helion_flash_rt.{sp_pass2_name}("
                 + ", ".join(sp_pass2_args)
