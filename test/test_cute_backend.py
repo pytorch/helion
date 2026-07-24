@@ -22,6 +22,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
+from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime import _build_cute_schema_and_args
 from helion.runtime import _cute_cluster_shape
@@ -2465,6 +2466,36 @@ class TestCuteBackend(TestCase):
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_fa4_zero_threshold_publishes_computed_alpha(
+        self,
+    ) -> None:
+        q = torch.ones(1, 1, 256, 64, dtype=torch.float16, device=DEVICE)
+        k = torch.zeros_like(q)
+        k[:, :, 128:, :] = math.log(2.0) / 8.0
+        v = torch.zeros_like(q)
+        v[:, :, :128, :] = 1.0
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_softmax_disc=False,
+            cute_flash_exp2_impl="split",
+            cute_flash_rescale_threshold=0.0,
+        )
+
+        exp_call = code.index("flash_p_sum = _helion_flash_rt.fa4_sp_exp_convert_store")
+        alpha_compute = code.index("flash_alpha = cute.math.exp2(", exp_call)
+        rowsum_update = code.index(
+            "flash_row_sum = flash_row_sum * flash_alpha", alpha_compute
+        )
+        alpha_publish = code.index(" = flash_alpha", alpha_compute, rowsum_update)
+        self.assertLess(exp_call, alpha_compute)
+        self.assertLess(alpha_compute, alpha_publish)
+
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_fa4_fp16_rescale_threshold_stays_finite(self) -> None:
         q = torch.ones(1, 1, 256, 64, dtype=torch.float16, device=DEVICE)
         k = torch.zeros_like(q)
@@ -3886,6 +3917,33 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg.softmax_regs, 200)
         self.assertEqual(cfg.corr_regs, 64)
         self.assertEqual(cfg.other_regs, 48)
+
+    def test_flash_attention_fa4_register_budget_validation(self) -> None:
+        q, k, v = (
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bound = cute_dense_attention.bind((q, k, v))
+        self.assertTrue(bound.config_spec.cute_flash_search_enabled)
+
+        bad = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_softmax_regs=200,
+            cute_flash_corr_regs=80,
+            cute_flash_other_regs=40,
+        )
+        with self.assertRaisesRegex(InvalidConfig, "FA4 register budget exceeds 512"):
+            bound.config_spec.normalize(bad)
+
+        fixed = helion.Config.from_dict(bad.config)
+        bound.config_spec.normalize(fixed, _fix_invalid=True)
+        total = (
+            2 * fixed.config["cute_flash_softmax_regs"]
+            + fixed.config["cute_flash_corr_regs"]
+            + fixed.config["cute_flash_other_regs"]
+        )
+        self.assertLessEqual(total, 512)
 
     def test_flash_attention_dense_hd64_corr_reg_seed_buckets(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -7669,11 +7727,7 @@ class TestCuteConfigValuePriors(TestCase):
         with patch(
             "random.choices", side_effect=lambda values, weights, k: [values[0]]
         ):
-            population = [
-                gen.unflatten(flat).config for flat in gen.random_population_flat(4)
-            ]
-        self.assertEqual(len(population), 4)
-        biased_config = population[1]
+            biased_config = gen.unflatten(gen.biased_random_flat()).config
         self.assertEqual(biased_config[FLASH_TOPOLOGY_KEY], "fa4")
         self.assertEqual(biased_config[FLASH_E2E_SCHEDULE_KEY], "8/2")
         self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
@@ -7771,7 +7825,14 @@ class TestCuteConfigValuePriors(TestCase):
                 gen.unflatten(flat).config for flat in gen.random_population_flat(4)
             ]
         self.assertEqual(len(population), 4)
-        biased_config = population[1]
+        biased_config = next(
+            config
+            for config in population
+            if config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 1
+            and config[FLASH_CAUSAL_KV_ORDER_KEY] == "descending"
+            and config[FLASH_MASKED_E2E_SCHEDULE_KEY] == "16/4"
+            and config[FLASH_ROLE_MAP_KEY] == "helion"
+        )
         self.assertEqual(biased_config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 1)
         self.assertEqual(biased_config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
         self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")

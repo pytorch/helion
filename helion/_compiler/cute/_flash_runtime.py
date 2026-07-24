@@ -21,6 +21,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Float32
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
+import cutlass.utils.blackwell_helpers as sm100_utils_flash
 
 
 @functools.cache
@@ -1782,6 +1783,111 @@ def fa4_store_o_smem_to_gmem_whole(
             out[None, rest_m, None],
             tOgO_epi[None, rest_m, None],
         )
+
+
+def fa4_correction_epilogue_to_smem(
+    tiled_t2r: object,
+    tiled_r2s: object,
+    tOtO_corr_t2r: cute.Tensor,
+    tOsO_corr_r2s: cute.Tensor,
+    tOcO_corr_t2r: cute.Tensor,
+    inv_sum: object,
+    chunks: int,
+) -> None:
+    """FA4 correction epilogue: rescale O in TMEM and stage fp16 output in SMEM."""
+    for i in range(chunks):
+        reg_src = cast("cute.Tensor", tOcO_corr_t2r[None, 0, 0, i])
+        reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO_corr_t2r[None, 0, 0, i], reg)
+        reg.store(reg.load() * inv_sum)
+        cvt_copy(tiled_r2s, reg, tOsO_corr_r2s[None, 0, 0, i])
+
+
+def fa4_correction_epilogue_handoff_to_smem(
+    o_full_ptr_stage: object,
+    o_full_phase: object,
+    corr_epi_empty_ptr_stage: object,
+    corr_epi_empty_phase: object,
+    corr_epi_full_ptr_stage: object,
+    tiled_t2r: object,
+    tiled_r2s: object,
+    tOtO_corr_t2r: cute.Tensor,
+    tOsO_corr_r2s: cute.Tensor,
+    tOcO_corr_t2r: cute.Tensor,
+    inv_sum: object,
+    chunks: int,
+) -> None:
+    """Wait for O/epilogue handoff, stage final O in SMEM, then publish it."""
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    fa4_correction_epilogue_to_smem(
+        tiled_t2r,
+        tiled_r2s,
+        tOtO_corr_t2r,
+        tOsO_corr_r2s,
+        tOcO_corr_t2r,
+        inv_sum,
+        chunks,
+    )
+    cute.arch.fence_view_async_shared()
+    cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
+
+
+def fa4_correction_epilogue_handoff_to_smem_scoped(
+    o_full_ptr_stage: object,
+    o_full_phase: object,
+    corr_epi_empty_ptr_stage: object,
+    corr_epi_empty_phase: object,
+    corr_epi_full_ptr_stage: object,
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    inv_sum: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+) -> None:
+    """FA4 correction epilogue with copy-view lifetimes scoped after waits."""
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (128, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=False,
+    )
+    cO = cute.make_identity_tensor((128, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+    tOsO = flash_pvt_copy.partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    smem_atom = sm100_utils_flash.get_smem_store_op(
+        o_layout, o_dtype, cutlass.Float32, tiled_t2r
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
+        reg.store(reg.load() * inv_sum)
+        cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
+    cute.arch.fence_view_async_shared()
+    cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
 
 
 def _fa4_sp_exp_convert_store_impl(

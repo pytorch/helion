@@ -30,6 +30,7 @@ from .._compat import warps_to_threads
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
+from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
@@ -38,7 +39,9 @@ from .._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
 from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
 from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from .._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_offset0
@@ -1012,6 +1015,71 @@ class ConfigSpec:
                         f"{FLASH_E2E_SCHEDULE_KEY}={config[FLASH_E2E_SCHEDULE_KEY]!r}, "
                         f"got {e2e_offset!r}"
                     )
+        self._normalize_cute_flash_register_budget(
+            config,
+            fragments,
+            effective_topology,
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_flash_register_budget(
+        self,
+        config: dict[str, object],
+        fragments: Mapping[str, ConfigSpecFragment],
+        effective_topology: str,
+        *,
+        fix_invalid: bool,
+    ) -> None:
+        if effective_topology != "fa4":
+            return
+        softmax_regs = config.get(FLASH_SOFTMAX_REGS_KEY)
+        corr_regs = config.get(FLASH_CORR_REGS_KEY)
+        other_regs = config.get(FLASH_OTHER_REGS_KEY)
+        if (
+            type(softmax_regs) is not int
+            or type(corr_regs) is not int
+            or type(other_regs) is not int
+        ):
+            return
+        budget = 2 * softmax_regs + corr_regs + other_regs
+        if budget <= 512:
+            return
+        message = (
+            "FA4 register budget exceeds 512: "
+            f"2 * {FLASH_SOFTMAX_REGS_KEY} ({softmax_regs}) + "
+            f"{FLASH_CORR_REGS_KEY} ({corr_regs}) + "
+            f"{FLASH_OTHER_REGS_KEY} ({other_regs}) = {budget}"
+        )
+        if not fix_invalid:
+            raise InvalidConfig(message)
+
+        def _int_choices(key: str) -> tuple[int, ...]:
+            fragment = cast("EnumFragment", fragments[key])
+            return tuple(value for value in fragment.choices if type(value) is int)
+
+        current = (softmax_regs, corr_regs, other_regs)
+        best: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+        for softmax_candidate in _int_choices(FLASH_SOFTMAX_REGS_KEY):
+            for corr_candidate in _int_choices(FLASH_CORR_REGS_KEY):
+                for other_candidate in _int_choices(FLASH_OTHER_REGS_KEY):
+                    candidate = (softmax_candidate, corr_candidate, other_candidate)
+                    if 2 * softmax_candidate + corr_candidate + other_candidate > 512:
+                        continue
+                    score = (
+                        sum(a != b for a, b in zip(candidate, current, strict=True)),
+                        sum(
+                            abs(a - b) for a, b in zip(candidate, current, strict=True)
+                        ),
+                        -softmax_candidate,
+                    )
+                    if best is None or score < best[0]:
+                        best = (score, candidate)
+        if best is None:
+            raise InvalidConfig(message)
+        _score, (softmax_regs, corr_regs, other_regs) = best
+        config[FLASH_SOFTMAX_REGS_KEY] = softmax_regs
+        config[FLASH_CORR_REGS_KEY] = corr_regs
+        config[FLASH_OTHER_REGS_KEY] = other_regs
 
     def enable_cute_flash_search(
         self,
