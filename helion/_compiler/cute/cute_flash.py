@@ -2217,6 +2217,8 @@ def _flash_dense_hd64_seed_params(
         if num_kv == _FLASH_DENSE_HD64_VERY_LONG_MIN_KV:
             return 2, 0, 1, 1, True, 8.0, 8, True
         return 2, 0, 3, 1, True, 32.0, 8, True
+    if num_kv == 512:
+        return 2, 0, 0, 3, False, 8.0, 8, True
     if num_kv < 1024:
         return 2, 0, 0, 3, False, 8.0, 8, True
     if num_kv == 1024:
@@ -2252,11 +2254,11 @@ def _flash_dense_hd64_seed_s_load_rep(num_kv: int) -> int:
 
 
 def _flash_dense_hd64_seed_split_p_arrive(num_kv: int) -> bool:
-    return False
+    return num_kv == 512
 
 
 def _flash_dense_hd64_seed_precompute_qk_desc(num_kv: int) -> bool:
-    return False
+    return num_kv == 512
 
 
 def _flash_dense_hd64_seed_first_load_order(num_kv: int) -> int:
@@ -2265,7 +2267,7 @@ def _flash_dense_hd64_seed_first_load_order(num_kv: int) -> int:
     if num_kv < 512:
         return 0
     if num_kv == 512:
-        return 0
+        return 4
     if num_kv < 1024:
         return 0
     if num_kv == 1024:
@@ -2286,6 +2288,8 @@ def _flash_dense_hd64_seed_epi_stg(num_kv: int) -> bool:
 
 
 def _flash_dense_hd64_seed_corr_tile_size(num_kv: int) -> int:
+    if num_kv == 512:
+        return 16
     if num_kv > 2048:
         return 8
     return 8 if num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV else 16
@@ -2316,6 +2320,8 @@ def _flash_dense_hd64_seed_softmax_disc(num_kv: int) -> bool:
 
 
 def _flash_dense_hd64_seed_role_map(num_kv: int) -> str:
+    if num_kv == 512:
+        return "fa4"
     return "helion"
 
 
@@ -2330,7 +2336,7 @@ def _flash_dense_hd64_seed_softmax_regs(num_kv: int) -> int:
 
 
 def _flash_dense_hd64_seed_corr_regs(num_kv: int) -> int:
-    if num_kv >= 2048:
+    if num_kv == 512 or num_kv >= 2048:
         return 80
     if num_kv == _FLASH_DENSE_HD64_VERY_LONG_MIN_KV:
         return 64

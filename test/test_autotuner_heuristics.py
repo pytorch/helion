@@ -1522,7 +1522,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_DISC_PIPE_KEY], 4)
             self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
             self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
-            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertEqual(config[FLASH_PRECOMPUTE_QK_DESC_KEY], num_kv == 512)
             self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
             self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], 0)
             self.assertEqual(config[FLASH_KV_ORDER_KEY], "ascending")
@@ -1666,11 +1666,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 False,
                 1,
                 "descending",
-                8,
+                16,
                 False,
-                0,
+                4,
                 200,
-                72,
+                80,
                 32,
                 False,
                 False,
@@ -1717,9 +1717,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
             self.assertEqual(config[FLASH_SOFTMAX_DISC_KEY], softmax_disc)
             self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
+            self.assertEqual(config[FLASH_SPLIT_P_ARRIVE_KEY], num_kv == 512)
             self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
             self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
-            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertEqual(config[FLASH_PRECOMPUTE_QK_DESC_KEY], num_kv == 512)
             self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
             self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], first_load_order)
             self.assertEqual(config[FLASH_KV_ORDER_KEY], kv_order)

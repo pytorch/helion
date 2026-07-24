@@ -3949,11 +3949,12 @@ class TestCuteBackend(TestCase):
         with patch.dict(os.environ, {}, clear=True):
             cfg_32k = resolve_flash_config(64, 256)
             cfg_64k = resolve_flash_config(64, 512)
+            cfg_64k_bf16 = resolve_flash_config(64, 512, dtype=torch.bfloat16)
             cfg_128k = resolve_flash_config(64, 1024)
             cfg_256k = resolve_flash_config(64, 2048)
 
         self.assertEqual(cfg_32k.corr_regs, 64)
-        self.assertEqual(cfg_64k.corr_regs, 72)
+        self.assertEqual(cfg_64k.corr_regs, 80)
         self.assertEqual(cfg_128k.corr_regs, 72)
         self.assertEqual(cfg_256k.corr_regs, 80)
         self.assertEqual(cfg_32k.e2e_schedule, "8/2")
@@ -3961,10 +3962,16 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg_128k.e2e_schedule, "16/4")
         self.assertEqual(cfg_256k.e2e_schedule, "16/4")
         self.assertEqual(cfg_32k.first_load_order, 0)
-        self.assertEqual(cfg_64k.first_load_order, 0)
+        self.assertEqual(cfg_64k.first_load_order, 4)
         self.assertEqual(cfg_128k.first_load_order, 0)
         self.assertEqual(cfg_256k.first_load_order, 4)
+        self.assertFalse(cfg_32k.precompute_qk_desc)
+        self.assertTrue(cfg_64k.precompute_qk_desc)
+        self.assertFalse(cfg_128k.precompute_qk_desc)
+        self.assertFalse(cfg_256k.precompute_qk_desc)
         self.assertEqual(cfg_64k.rescale_threshold, 8.0)
+        self.assertEqual(cfg_64k_bf16.rescale_threshold, 8.0)
+        self.assertTrue(cfg_64k.split_p_arrive)
         self.assertTrue(cfg_128k.use_clc_scheduler)
         self.assertEqual(cfg_128k.clc_stages, 2)
         with patch.dict(
@@ -3973,6 +3980,8 @@ class TestCuteBackend(TestCase):
             clear=True,
         ):
             self.assertEqual(resolve_flash_config(64, 1024).clc_stages, 2)
+        self.assertEqual(cfg_64k.corr_tile_size, 16)
+        self.assertEqual(cfg_64k.role_map, "fa4")
 
     def test_flash_attention_dense_hd64_epi_tma_seed_buckets(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
