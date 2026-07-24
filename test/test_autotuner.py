@@ -3600,26 +3600,39 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(round_tripped.loop_orders, [[1, 0]])
 
-    def test_cute_tcgen05_search_surface_excludes_loop_orders(self) -> None:
-        """tcgen05 persistent scheduler relies on a fixed
-        ``pid_info[0]=M, pid_info[1]=N`` mapping (``cluster_m`` and
-        virtual-PID logic). Sampling ``loop_orders=[[1, 0]]`` for a
-        tcgen05 config would steer cluster logic onto the wrong axis.
-        The cute non-tcgen05 widening must not leak into the tcgen05
-        branch.
-        """
-        bound = _get_examples_matmul().bind(
-            (
-                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
-                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
-            )
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="tcgen05 requires CUDA capability >= 10.0"
+    )
+    def test_cute_tcgen05_search_surface_includes_loop_orders(self) -> None:
+        """tcgen05 autotuning can explore alternate output-tile orders."""
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
         )
+        bound = _get_examples_matmul().bind(args)
         # Confirm we are on the tcgen05 search branch.
         self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
         flat_keys = {
             key for key, _count, _is_sequence in bound.config_spec.flat_key_layout()
         }
-        self.assertNotIn("loop_orders", flat_keys)
+        self.assertIn("loop_orders", flat_keys)
+
+        gen = ConfigGeneration(bound.config_spec)
+        config = helion.Config(
+            block_sizes=[128, 128, 64],
+            loop_orders=[[1, 0]],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+        )
+        round_tripped = gen.unflatten(gen.flatten(config))
+        self.assertEqual(round_tripped.loop_orders, [[1, 0]])
+        code = bound.to_triton_code(round_tripped)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("StaticPersistentTileScheduler", code)
+
+        actual = bound.compile_config(round_tripped)(*args)
+        torch.testing.assert_close(actual, args[0] @ args[1], atol=0.125, rtol=0.02)
 
     def test_cute_flash_search_surface(self) -> None:
         """The flash-attention autotune surface (Tasks #25 + #28) appears only
