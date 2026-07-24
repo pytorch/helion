@@ -280,7 +280,7 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
-        # Set by the Pallas backend when worklist grouping is 1 and
+        # Set by the Pallas backend when worklist grouping is 1 or 2 and
         # detect_compact_worklist_plan succeeds; gates the compact-worklist
         # codegen path (see helion/_compiler/pallas/compact_worklist.py).
         self.compact_worklist_plan: CompactWorklistPlan | None = None

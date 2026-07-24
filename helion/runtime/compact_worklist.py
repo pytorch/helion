@@ -32,7 +32,7 @@ class CompactWorkMetadata(NamedTuple):
     """Scalar-prefetch metadata describing one compact worklist.
 
     Each of the array fields has the static shape ``[UPPER]``; entry ``i``
-    describes the ``i``-th compact tile (work item).  ``num_work`` is the
+    describes the ``i``-th compact tile group (work item).  ``num_work`` is the
     *traced* number of work items actually produced (``<= UPPER``); only the
     first ``num_work`` grid points execute, so the padded tail of every array is
     never indexed.
@@ -47,25 +47,24 @@ class CompactWorkMetadata(NamedTuple):
 
     owner_ids: Array  # int32[UPPER]   (per work item: which owner produced it)
     tile_starts: Array  # int32[UPPER] (absolute compact-tile start row)
-    tile_extents: Array  # int32[UPPER] (valid rows in the tile, in [1, block])
+    tile_extents: Array  # int32[UPPER] (valid rows in the tile group)
     range_start: Array | None  # int32[UPPER] | None  (ordered range begin)
     range_len: Array | None  # int32[UPPER] | None    (ordered range length, RAW)
     num_work: Array  # int32[]  TRACED scalar (never .item()-ed)
 
 
 def packed_upper_bound(total_compact: int, num_owners: int, block: int) -> int:
-    """Static megablocks bound on the number of compact tiles, PACKED ranges only.
+    """Static megablocks bound on the number of work items, PACKED ranges only.
 
-    Tight/safe **only when** owner ranges are packed/non-overlapping
-    (``sum(lengths) == total_compact``): then each owner wastes at most one
-    partial leading tile, so the worst case is ``cdiv(total_compact, block) +
-    num_owners - 1`` (tokamax: ``tiles_m + num_groups - 1``).  ``total_compact``
-    (e.g. ``total_q``) and ``num_owners`` (e.g. ``num_seq``) are static tensor
-    shapes, so this is a static Python int and no per-owner max length is needed.
+    Safe when owner ranges are packed/non-overlapping and ``total_compact`` is
+    at least ``sum(lengths)``. Equality gives the tight bound; a padded backing
+    tensor only makes it conservative. Each owner wastes at most one partial
+    leading block, so the worst case is ``cdiv(total_compact, block) +
+    num_owners - 1`` (tokamax: ``tiles_m + num_groups - 1``). Both inputs are
+    static shape data, so no event-size constant or per-owner maximum is needed.
 
     For general (possibly-overlapping) ranges this bound can UNDER-count
-    ``num_work``; the backend uses a conservative ``num_owners * cdiv(total,
-    block)`` instead (see ``backend._compact_worklist_upper``).
+    ``num_work``.
     """
     return -(-total_compact // block) + num_owners - 1
 
@@ -76,16 +75,17 @@ def flatten_worklist(
     block: int,
     UPPER: int,
     *,
+    grouping: int = 1,
     dep_base: Array | None = None,
     dep_len: Array | None = None,
 ) -> CompactWorkMetadata:
-    """Flatten a ragged ``owner x tile`` product into a padded compact worklist.
+    """Flatten a ragged ``owner x tile-group`` product into a padded worklist.
 
     ``base`` and ``length`` are ``int`` arrays of shape ``[P]`` (one entry per
     owner): ``base[p]`` is the absolute start row of owner ``p``'s compact slab
-    and ``length[p]`` its row count.  The owner is split into
-    ``cdiv(length[p], block)`` tiles; the flat list of all such tiles across all
-    owners is the worklist.
+    and ``length[p]`` its row count. The owner is split into base tiles of
+    ``block`` rows, then up to ``grouping`` consecutive base tiles from that
+    owner are combined into one work item.
 
     ``dep_base``/``dep_len`` (optional, ``[P]``) carry a per-owner ordered range
     (e.g. KV) that is gathered per work item and stored **raw** (never clamped).
@@ -101,9 +101,12 @@ def flatten_worklist(
     base = jnp.asarray(base, jnp.int32)
     length = jnp.asarray(length, jnp.int32)
     block_i = jnp.int32(block)
+    grouping_i = jnp.int32(grouping)
+    group_span = block_i * grouping_i
 
-    # Per-owner tile count -- parallel level, NOT clamped to a minimum of 1.
-    cnt = (length + block_i - 1) // block_i  # [P]
+    # Per-owner group count -- parallel level, NOT clamped to a minimum of 1.
+    logical_cnt = (length + block_i - 1) // block_i
+    cnt = (logical_cnt + grouping_i - 1) // grouping_i
     off = jnp.cumsum(cnt) - cnt  # exclusive scan: first work-item index per owner
     num_work = cnt.sum().astype(jnp.int32)  # TRACED scalar; never .item()-ed
 
@@ -114,17 +117,13 @@ def flatten_worklist(
     # total_repeat_length truncates the worklist and tiles are SILENTLY DROPPED.
     work = jnp.repeat(jnp.arange(p, dtype=jnp.int32), cnt, total_repeat_length=UPPER)
 
-    # tile_in[i] = index of this tile within its owner (0-based).
-    tile_in = jnp.arange(UPPER, dtype=jnp.int32) - off[work]
-    tile_starts = (base[work] + tile_in * block_i).astype(jnp.int32)
-    # Last tile of an owner is partial; clamp the extent to [.., block].  In the
-    # valid range [0, num_work) this is always in [1, block]; clip(min=0) is
-    # defensive for the padded tail (where length-tile_in*block can go negative),
-    # which the runtime grid never indexes but keeps the array non-negative.
-    tile_extents = jnp.clip(length[work] - tile_in * block_i, 0, block_i).astype(
+    # group_in[i] = index of this tile group within its owner (0-based).
+    group_in = jnp.arange(UPPER, dtype=jnp.int32) - off[work]
+    group_offset = group_in * group_span
+    tile_starts = (base[work] + group_offset).astype(jnp.int32)
+    tile_extents = jnp.clip(length[work] - group_offset, 0, group_span).astype(
         jnp.int32
     )
-
     range_start = None if dep_base is None else jnp.asarray(dep_base, jnp.int32)[work]
     range_len = None if dep_len is None else jnp.asarray(dep_len, jnp.int32)[work]
 
