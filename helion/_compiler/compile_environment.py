@@ -280,10 +280,9 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
-        # Set by the Pallas backend when config["pallas_loop_type"] ==
-        # "compact_worklist" and detect_compact_worklist_plan succeeds; gates the
-        # whole compact-worklist codegen path (see helion/_compiler/pallas/
-        # compact_worklist.py).
+        # Set by the Pallas backend when worklist grouping is 1 and
+        # detect_compact_worklist_plan succeeds; gates the compact-worklist
+        # codegen path (see helion/_compiler/pallas/compact_worklist.py).
         self.compact_worklist_plan: CompactWorklistPlan | None = None
         # Final resident-cache decision for this concrete config.  This includes
         # the cached physical window integer; runtime/codegen consumers must read

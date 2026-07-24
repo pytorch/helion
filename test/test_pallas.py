@@ -4663,9 +4663,9 @@ class TestPallas(TestCase):
         consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
         multiplicative load mask.
 
-        The deferral is an FX-graph pass, so it is independent of the pallas loop
-        type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
-        generic (non-attention) per-token jagged projection whose partial tiles
+        The deferral is an FX-graph pass, so it is independent of worklist
+        flattening -- asserted here for ordinary ``fori_loop`` and flattened
+        ``unroll`` on a generic per-token jagged projection whose partial tiles
         make the mask load-bearing.
         """
 
@@ -4695,13 +4695,14 @@ class TestPallas(TestCase):
             s, e = int(offsets[i]), int(offsets[i + 1])
             ref[s:e] = torch.bmm(x[s:e].transpose(0, 1), w).transpose(0, 1)
 
-        for loop_type in ("fori_loop", "compact_worklist"):
-            with self.subTest(loop_type=loop_type):
+        for loop_type, grouping in (("fori_loop", 0), ("unroll", 1)):
+            with self.subTest(loop_type=loop_type, grouping=grouping):
                 code, out = code_and_output(
                     jagged_proj,
                     (x, w, offsets),
                     block_sizes=[block],
                     pallas_loop_type=loop_type,
+                    pallas_worklist_grouping=grouping,
                 )
                 # x's masked load is raw (no eager ``* mask``), feeds a transpose,
                 # and the mask reappears as a post-transpose ``jnp.where``.
@@ -4710,11 +4711,11 @@ class TestPallas(TestCase):
                 self.assertRegex(producer, r"= x\[")
                 self.assertNotIn("* mask", producer)
                 self.assertIn("jnp.where", code)
-                # compact_worklist matches the eager reference on the partial
-                # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
+                # Worklist flattening matches the eager reference on the partial
+                # tiles. fori_loop miscompiles jagged tiles in pallas interpret
                 # (a pre-existing, unrelated issue), so it is not a sound numeric
                 # oracle here; for it we assert only the codegen above.
-                if loop_type == "compact_worklist":
+                if grouping == 1:
                     torch.testing.assert_close(
                         out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2
                     )

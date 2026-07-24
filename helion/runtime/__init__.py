@@ -358,9 +358,9 @@ def compact_ordered_physical_window(
     still get a legal ``pl.Element(block, padding=...)`` window instead of a
     zero-sized allocation.
 
-    Returns 0 when the budget cannot hold one ordered block.  Resident caching is
-    an automatic optimization, so the compiler treats that as "inactive" and
-    falls back to the streamed ordered loop.
+    Returns 0 when the budget cannot hold one ordered block. The selected loop
+    policy decides whether that is an invalid resident config or irrelevant to a
+    streamed config.
     """
     if not operands:
         return 0
