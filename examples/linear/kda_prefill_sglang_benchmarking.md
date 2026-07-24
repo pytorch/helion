@@ -63,6 +63,13 @@ activation/output:  bfloat16
 recurrent state:    float32
 ```
 
+SGLang's normal Kimi prefill/extend path concatenates each request's new tokens
+and always passes `query_start_loc` as `cu_seqlens`. The default hot-path
+specialization is therefore **packed varlen + forward substitution + FP32
+state**. Fixed-length input remains supported for direct callers and isolated
+microbenchmarks. Newton-Schulz is opt-in and can be combined with either input
+layout.
+
 The Helion public entry point has the same parameter order and defaults as
 SGLang's `chunk_kda`:
 
@@ -118,15 +125,19 @@ The production path launches six Helion-generated kernels:
 The important fusion is step 4. Keeping solve and recomputation separate was
 slower for every production sequence length tested.
 
-The selected single configuration is used for all observed sequence lengths
-and packed batch compositions. The performance-critical stages use:
+Each numerical path has one selected configuration for all observed sequence
+lengths. Fixed and packed state propagation also use separate configurations
+because they have materially different load patterns:
 
-| Stage | Blocks | Loop order | Warps | Stages | Indexing |
+| Stage/path | Blocks | Loop order | Warps | Stages | Indexing |
 |---|---|---|---:|---:|---|
-| matrices | 32 | `[2, 1, 0]` | 1 | 2 | pointer |
-| fused solve/recompute | 64, 32 | `[0, 1]` | 1 | 2 | pointer |
-| state | 16 | default | 4 | 3 | pointer |
-| output | 64 | `[2, 1, 0]` | 8 | 2 | pointer |
+| matrices, forward substitution | 32 | `[1, 2, 0]` | 1 | 2 | pointer |
+| matrices, Newton-Schulz | 32 | `[2, 1, 0]` | 1 | 2 | pointer |
+| solve/recompute, forward substitution | 64, 64 | `[0, 1]` | 1 | 3 | pointer |
+| solve/recompute, Newton-Schulz | 64, 64 | `[0, 1]` | 2 | 3 | pointer |
+| state, fixed length | 16 | default | 8 | 3 | pointer |
+| state, packed varlen | 16 | `[1, 2, 0]` | 4 | 3 | pointer |
+| output | 128 | `[1, 2, 0]` | 2 | 4 | pointer |
 
 All kernels use `static_shapes=False`. H, K, V, inner layouts, dtypes,
 fixed/varlen mode, and optional numerical modes remain specialized. Total
@@ -140,13 +151,25 @@ H/K/V.
 Multi-shape autotuning and focused sweeps used one geometric-mean objective,
 with production points at T=512 and T=8192 and validation at T=2048.
 
-- The best fused solve/recompute candidate used a V tile of 64, K tile of 32,
-  one warp, and two stages. Relative to the prior 64x64/four-warp version, its
-  stage latency ratios were 0.893, 0.463, and 0.498 at T=512/2048/8192.
-- State tile 16 with four warps was the best universal compromise: roughly
-  8-9% faster for packed varlen, 4.3% faster at fixed T=8192, and only 0.7%
-  slower at fixed T=512.
-- Matrix tuning selected block 32, one warp, and two stages.
+- The prologue now emits the cumulative gate, rounded Q/K operands, gated K,
+  and each chunk's final decay in one pass. This removes repeated exponentials
+  and avoids rereading the last gate in state propagation.
+- Forward substitution distributes the four independent 16x16 diagonal
+  inversions over the matrix CTAs. The solve consumes those pre-inverted
+  blocks. This was bitwise identical for the matrix, W, and U intermediates and
+  reduced full-pipeline latency by 13.5%, 12.3%, and 3.4% at
+  T=512/2048/8192 relative to doing the same inversions in the solve CTA.
+- Moving Newton-Schulz inversion into the matrix stage was neutral or slower,
+  so that path keeps inversion in the solve CTA. Three BF16 MMA-style
+  refinements match the CuTe DSL structure and outperform FP32 refinements
+  while remaining within the recurrent-reference tolerance.
+- Separate solve sweeps selected one warp for forward substitution and two for
+  Newton-Schulz. Both use 64x64 registered blocks and three pipeline stages.
+- Fixed state propagation benefits from eight warps: 11.320, 36.134, and
+  162.226 us at T=512/2048/8192, versus 11.552, 37.091, and 172.232 us with four
+  warps. Packed varlen instead prefers four warps and loop order `[1, 2, 0]`.
+- Matrix tuning selected block 32, one warp, and two stages, with distinct loop
+  orders for the two inverse paths.
 - Tensor descriptors were emitted for the contiguous normalization loads, but
   that variant was 3-4x slower. Gathered matrix/output addresses did not lower
   to descriptors. Pointer indexing is retained.
@@ -190,14 +213,20 @@ GPU:     NVIDIA GB200, SM100, 152 SMs
 SGLang's existing CuTe DSL prefill benchmark was extended in place to include
 Helion. With BF16, H=16, K=V=128, one fixed sequence, and CUDA-graph timing:
 
-| T | Triton (ms) | CuTe DSL (ms) | Helion (ms) | Triton/Helion |
-|---:|---:|---:|---:|---:|
-| 512 | 0.067 | 0.031 | 0.055 | 1.24x |
-| 2048 | 0.174 | 0.099 | 0.131 | 1.33x |
-| 8192 | 0.672 | 0.364 | 0.424 | 1.59x |
+| T | Triton (ms) | CuTe DSL (ms) | Helion forward-substitution (ms) | Triton/Helion | Helion Newton-Schulz (ms) | Triton/Helion-NS |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 0.067 | 0.031 | 0.042 | 1.62x | 0.039 | 1.74x |
+| 2048 | 0.176 | 0.099 | 0.107 | 1.64x | 0.103 | 1.68x |
+| 8192 | 0.674 | 0.363 | 0.379 | 1.78x | 0.367 | 1.82x |
 
-CuTe DSL remains faster on this fixed-shape GB200 microbenchmark. The relevant
-command is:
+The default forward-substitution path retains the Triton baseline's inverse
+operation order. Newton-Schulz is algebraically equivalent and passes the same
+recurrent-reference tolerances, but changes floating-point ordering. It is
+therefore opt-in through the ``newton_schulz=True`` keyword and is reported as a
+separate result rather than as a replacement for the default baseline.
+
+CuTe DSL remains faster on this fixed-shape GB200 microbenchmark. The default
+benchmark command is:
 
 ```bash
 cd /path/to/sglang
@@ -209,14 +238,17 @@ python benchmark/bench_linear_attention/bench_kda_prefill_cutedsl.py \
   --helion-root /path/to/helion-multi-autotune
 ```
 
+Add ``--helion-newton-schulz`` to select and clearly label the experimental
+Newton-Schulz specialization.
+
 A paired packed-varlen benchmark using raw gates, internal Q/K normalization,
 H=16, K=V=128, and ragged non-aligned lengths produced:
 
-| Total T | Triton (ms) | Helion (ms) | Triton/Helion |
-|---:|---:|---:|---:|
-| 512 | 0.067706 | 0.062355 | 1.086x |
-| 2048 | 0.155155 | 0.148765 | 1.043x |
-| 8192 | 0.534346 | 0.435134 | 1.228x |
+| Total T | Triton (ms) | Helion forward (ms) | Triton/Helion | Helion NS (ms) | Triton/Helion-NS |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 0.067957 | 0.052078 | 1.305x | 0.047767 | 1.423x |
+| 2048 | 0.157140 | 0.126784 | 1.239x | 0.122787 | 1.280x |
+| 8192 | 0.532932 | 0.438449 | 1.215x | 0.430456 | 1.238x |
 
 ### BF16 decode tuning
 
@@ -355,6 +387,35 @@ Results and logs from this machine are under:
 /home/eche/results/kda-prefill-ab-20260723
 ```
 
+### Path-isolated follow-up
+
+After tuning the forward-substitution and Newton-Schulz paths separately, a
+fresh TP=2 run kept FP32 state and Triton decode fixed. Each clean row is one
+100-request sample after a 20-request warmup:
+
+| Prefill path | Input tok/s | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | vs Triton |
+|---|---:|---:|---:|---:|---:|
+| Triton | 26,874.99 | 9.21 | 218.15 | 349.65 | baseline |
+| Helion forward substitution | 26,487.65 | 9.34 | 252.91 | 367.74 | -1.44% |
+| Helion Newton-Schulz | 25,926.43 | 9.55 | 237.83 | 402.78 | -3.53% |
+
+The first forward and first Newton measured samples each hit the same isolated
+1.7-second p99 TTFT scheduler stall. They are preserved as the non-`r2` files
+and excluded from the table. With only one clean serving sample per path, the
+small differences above are not robust enough to override the paired kernel
+measurements or the earlier multi-run serving result.
+
+All rows processed the same 247,525 input and 485 output tokens with no request
+errors. Forward substitution generated byte-identical text to Triton.
+Newton-Schulz preserved every output length but changed 90 of 100 generated
+texts, which is consistent with its intentionally different floating-point
+order. Both Helion servers emitted 12 generated-code events before readiness
+and none during measurement. The complete artifacts are under:
+
+```text
+/home/eche/results/kda-prefill-structural-20260724
+```
+
 ## End-to-end reproduction
 
 Set paths and offline mode:
@@ -389,11 +450,15 @@ python -m sglang.launch_server \
   2>&1 | tee "${RESULTS}/triton-server.log"
 ```
 
-For Helion, use the same command with:
+For the numerical-contract Helion path, use the same command with:
 
 ```bash
 export SGLANG_KDA_HELION_PREFILL=1
+unset HELION_KDA_PREFILL_NEWTON_SCHULZ
 ```
+
+Set `HELION_KDA_PREFILL_NEWTON_SCHULZ=1` in addition to the substitution flag
+to benchmark the separately tuned Newton-Schulz path.
 
 With only this flag, the hook in `scripts/kda_sglang_ab/sitecustomize.py`
 replaces only `kda_triton.chunk_kda`; decode and all other model kernels remain
@@ -435,15 +500,18 @@ cd "${HELION_ROOT}"
 pytest test/test_kda_prefill.py -x -vv -s
 ```
 
-The final run passed all four tests in 51.06 seconds. A wider direct packed test
+The final run passed all four tests in 36.01 seconds. A wider direct packed test
 at T=73, H=2, K=256, and V=80 had maximum output error `3.052e-5`, maximum
 intermediate-state error `1.707e-4`, finite outputs, and exact preservation of
-untouched state-pool rows.
+untouched state-pool rows. A Newton-Schulz packed-varlen safe-gate check at
+K=V=32 preserved the in-place and untouched-slot contracts with maximum output
+and state errors of `1.831e-4` and `7.321e-4`.
 
-SGLang's benchmark correctness mode also passed Helion and CuTe DSL against
-`fused_recurrent_kda` at T=128, 192, 256, 512, and 1024 with H=16 and K=V=128.
-Helion's largest output error was `7.32e-4`; its largest final-state error was
-`4.90e-3`.
+SGLang's benchmark correctness mode also passed both Helion paths and CuTe DSL
+against `fused_recurrent_kda` at T=128, 192, 256, 512, and 1024 with H=32 and
+K=V=128. Both Helion paths had maximum output error `4.88e-4`; the largest
+final-state errors were `4.39e-3` for forward substitution and `4.71e-3` for
+Newton-Schulz.
 
 ## Default-backend FP32/BF16 matrix
 
