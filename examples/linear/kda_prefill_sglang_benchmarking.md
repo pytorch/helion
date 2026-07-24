@@ -560,3 +560,35 @@ are saved under:
 ```text
 /home/eche/results/kda-default-matrix-20260724
 ```
+
+## ShareGPT FP32-state occupancy sweep
+
+A flag-free default baseline and the three Helion substitutions were measured
+with 128 fixed-seed ShareGPT prompts, 64 output tokens per prompt, FP32 state,
+TP=2, and concurrency 1/4/16/32/64/128. No linear-attention backend arguments
+were supplied; SGLang resolved the baseline to Triton decode and Triton prefill.
+Each cache-flushed cell processed 31,609 input and 8,192 output tokens with 128
+successful requests and no nonempty errors.
+
+| Configuration | C=1 | C=4 | C=16 | C=32 | C=64 | C=128 | Ratio geomean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Triton baseline | 848.3 | 2,427.6 | 7,206.0 | 12,780.0 | 19,239.6 | 30,858.0 | 1.0000x |
+| Helion decode | 876.7 | 2,535.2 | 7,339.8 | 12,992.4 | 19,886.1 | 30,915.2 | 1.0247x |
+| Helion prefill | 948.6 | 2,543.5 | 7,562.7 | 13,067.4 | 19,592.1 | 31,292.5 | 1.0445x |
+| Helion decode + prefill | 942.0 | 2,469.7 | 7,296.1 | 12,964.2 | 19,299.5 | 30,430.8 | 1.0233x |
+
+Values are total input-plus-output tokens per second. The geomean speedups were
+2.47% for decode, 4.45% for prefill, and 2.33% for both. Prefill-only reduced
+mean-TTFT geomean by 9.95%; at concurrency 1 it improved total throughput by
+11.82% and reduced mean TTFT from 156.1 to 117.7 ms. The combined row was not
+additive in this one-run sweep, so its small differences at higher occupancy
+should be treated as serving variance rather than a kernel interaction.
+
+The first baseline C=128 sample and a later baseline C=64 repeat each hit an
+isolated scheduler stall. Both are preserved; the table uses the clean original
+C=64 and clean repeated C=128. Full logs, JSONL files, per-cell percentages, and
+the outlier policy are under:
+
+```text
+/home/eche/results/kda-sharegpt-occupancy-fp32-20260724
+```
