@@ -760,6 +760,7 @@ class CuteBackend(Backend):
             for key, weights in flash_attention_value_prior_weights(
                 config_spec._cute_flash_head_dim or 0,
                 config_spec._cute_flash_num_kv,
+                dtype=config_spec._cute_flash_dtype,
                 is_causal=config_spec._cute_flash_is_causal,
                 has_kv_tile_pruning=config_spec._cute_flash_has_kv_tile_pruning,
                 requires_ws_overlap=config_spec._cute_flash_requires_ws_overlap,

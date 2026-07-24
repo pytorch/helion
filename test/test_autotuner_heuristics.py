@@ -1638,7 +1638,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 3,
                 1,
                 True,
-                32.0,
+                8.0,
                 8,
                 False,
                 1,
@@ -1760,7 +1760,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(very_long_config[FLASH_EPI_STG_KEY])
         self.assertEqual(very_long_config[FLASH_CORR_TILE_SIZE_KEY], 8)
         self.assertEqual(very_long_config.get(FLASH_ROLE_MAP_KEY, "helion"), "helion")
-        self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 32.0)
+        self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
         self.assertEqual(very_long_config[FLASH_RESCALE_CHUNK_COLS_KEY], 8)
         self.assertTrue(very_long_config[FLASH_PACKED_REDUCE_KEY])
         self.assertFalse(very_long_config[FLASH_LOCAL_TMA_PARTITION_KEY])
@@ -2021,6 +2021,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertNotIn(FLASH_E2E_OFFSET_KEY, seed.config)
         self.assertIn(seed, bound.config_spec.compiler_seed_configs)
         self.assertIsNone(bound.config_spec.compiler_default_config)
+
+        bf16_args = tuple(
+            torch.empty(1, 1, 49152, 64, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        )
+        bf16_bound = flash_attn.bind(bf16_args)
+        self.assertIs(bf16_bound.config_spec._cute_flash_dtype, torch.bfloat16)
+        bf16_seed = heuristic.get_seed_config(
+            bf16_bound.env, bf16_bound.host_function.device_ir
+        )
+        assert bf16_seed is not None
+        self.assertEqual(bf16_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 32.0)
 
         dense_2048_args = tuple(
             torch.empty(1, 1, 2048, 64, dtype=torch.float16, device=DEVICE)

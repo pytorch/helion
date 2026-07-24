@@ -2465,6 +2465,75 @@ class TestCuteBackend(TestCase):
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_fa4_fp16_rescale_threshold_stays_finite(self) -> None:
+        q = torch.ones(1, 1, 256, 64, dtype=torch.float16, device=DEVICE)
+        k = torch.zeros_like(q)
+        k[:, :, 128:, :] = 20.0 * math.log(2.0) / 8.0
+        v = torch.zeros_like(q)
+        v[:, :, :128, :] = 1.0
+        with patch.dict(
+            os.environ,
+            {"HELION_CUTE_FLASH_RESCALE_THRESHOLD": "32"},
+            clear=False,
+        ):
+            code, out = code_and_output(
+                cute_dense_attention,
+                (q, k, v),
+                block_sizes=[1, 128, 128],
+                cute_flash_topology="fa4",
+                cute_flash_kv_order="ascending",
+            )
+
+        self.assertIn("flash_acc_log >= -8.0", code)
+        self.assertTrue(torch.isfinite(out).all())
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_fa4_dense_128k_clc_seed_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(2, 32, 131072, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+        )
+
+        self.assertIn(
+            "flash_clc_pipeline = cutlass_pipeline_flash."
+            "PipelineClcFetchAsync.create("
+            "barrier_storage=storage.clc_mbar_ptr.data_ptr(), num_stages=2,",
+            code,
+        )
+        self.assertIn("problem_shape_ntile_mnl=(512, 32, 2)", code)
+        self.assertIn(
+            "flash_m_pair = cutlass.Int32(512 - 1) - "
+            "cutlass.Int32(flash_clc_work.tile_idx[0])",
+            code,
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_clc_preserves_explicit_flattened_geometry(self) -> None:
+        q, k, v = (
+            torch.randn(2, 32, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_persistent=True,
+            cute_flash_clc=True,
+            cute_flash_clc_heads_per_batch=64,
+        )
+
+        self.assertIn("problem_shape_ntile_mnl=(32, 64, 1)", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_bfloat16_fires_and_matches_sdpa(self) -> None:
         q, k, v = (
             torch.randn(2, 8, 256, 128, dtype=torch.bfloat16, device=DEVICE)
@@ -3615,6 +3684,21 @@ class TestCuteBackend(TestCase):
         )
         self.assertEqual(cfg.rescale_threshold, 4.0)
 
+        fp16_cfg = resolve_flash_config(
+            64,
+            2,
+            {"cute_flash_rescale_threshold": 32.0},
+            dtype=torch.float16,
+        )
+        bf16_cfg = resolve_flash_config(
+            64,
+            2,
+            {"cute_flash_rescale_threshold": 32.0},
+            dtype=torch.bfloat16,
+        )
+        self.assertEqual(fp16_cfg.rescale_threshold, 8.0)
+        self.assertEqual(bf16_cfg.rescale_threshold, 32.0)
+
         with patch.dict(
             os.environ,
             {
@@ -3822,6 +3906,15 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg_64k.first_load_order, 0)
         self.assertEqual(cfg_128k.first_load_order, 0)
         self.assertEqual(cfg_256k.first_load_order, 4)
+        self.assertEqual(cfg_64k.rescale_threshold, 8.0)
+        self.assertTrue(cfg_128k.use_clc_scheduler)
+        self.assertEqual(cfg_128k.clc_stages, 2)
+        with patch.dict(
+            os.environ,
+            {"HELION_CUTE_FLASH_CLC_STAGES": "1"},
+            clear=True,
+        ):
+            self.assertEqual(resolve_flash_config(64, 1024).clc_stages, 2)
 
     def test_flash_attention_dense_hd64_epi_tma_seed_buckets(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -7483,7 +7576,7 @@ class TestCuteConfigValuePriors(TestCase):
             FLASH_CLC_KEY: {False, True},
             FLASH_CLC_HEADS_PER_BATCH_KEY: {0, 32},
             FLASH_CLC_PDL_KEY: {False, True},
-            FLASH_CLC_STAGES_KEY: {1, 2, 3},
+            FLASH_CLC_STAGES_KEY: {2, 3},
             FLASH_LOCAL_TMA_PARTITION_KEY: {False, True},
             FLASH_TENSOR_4D_TMA_KEY: {False, True},
             FLASH_E2E_OFFSET_KEY: {0, 1, 2, 3},
@@ -7499,6 +7592,15 @@ class TestCuteConfigValuePriors(TestCase):
         self._assert_prior_choices(
             very_long_priors[FLASH_RESCALE_THRESHOLD_KEY],
             very_long_fragments[FLASH_RESCALE_THRESHOLD_KEY],
+            {8.0, 12.0},
+        )
+        bound.config_spec._cute_flash_num_kv = 384
+        bound.config_spec._cute_flash_dtype = torch.bfloat16
+        bf16_priors = CuteBackend().config_value_priors(bound.config_spec)
+        bf16_fragments = bound.config_spec._flat_fields()
+        self._assert_prior_choices(
+            bf16_priors[FLASH_RESCALE_THRESHOLD_KEY],
+            bf16_fragments[FLASH_RESCALE_THRESHOLD_KEY],
             {8.0, 16.0, 32.0},
         )
         for key, values in {

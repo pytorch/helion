@@ -3642,6 +3642,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 config_spec.enable_cute_flash_search(
                     head_dim=flash_shape.head_dim,
                     num_kv=flash_shape.num_kv,
+                    dtype=flash_shape.io_dtype,
                     block_size_targets=flash_shape.block_size_targets,
                     is_causal=flash_shape.is_causal,
                     has_kv_tile_pruning=flash_shape.has_kv_tile_pruning,

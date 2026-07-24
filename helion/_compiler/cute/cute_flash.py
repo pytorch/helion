@@ -1690,7 +1690,7 @@ def resolve_flash_config(
         8.0 if dtype in (torch.float16, torch.bfloat16) else 0.0
     )
     rescale_threshold_default = (
-        _flash_dense_hd64_seed_rescale_threshold(num_kv)
+        _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
         if long_dense_hd64_fa4 and dtype in (torch.float16, torch.bfloat16)
         else dtype_rescale_threshold_default
     )
@@ -1701,6 +1701,11 @@ def resolve_flash_config(
     if rescale_threshold_cfg is not None:
         rescale_threshold = float(rescale_threshold_cfg)  # type: ignore[arg-type]
     if not math.isfinite(rescale_threshold):
+        rescale_threshold = rescale_threshold_default
+    if rescale_threshold >= math.log2(torch.finfo(dtype).max):
+        # A pinned score can be up to exp2(threshold) before the fp32
+        # probabilities are cast to the I/O dtype. Reject stale/manual values
+        # that can overflow that cast; the shape default is always safe.
         rescale_threshold = rescale_threshold_default
     skip_rescale_stats_default = (
         _flash_dense_hd64_seed_skip_rescale_stats(num_kv)
@@ -1923,12 +1928,21 @@ def resolve_flash_config(
         clc_use_pdl = bool(clc_use_pdl_cfg)
     if not use_clc_scheduler:
         clc_use_pdl = False
-    clc_stages = int(os.environ.get("HELION_CUTE_FLASH_CLC_STAGES", "1"))
+    clc_stages = int(
+        os.environ.get(
+            "HELION_CUTE_FLASH_CLC_STAGES", "2" if use_clc_scheduler else "1"
+        )
+    )
     clc_stages_cfg = _cfg(FLASH_CLC_STAGES_KEY)
     if clc_stages_cfg is not None:
         clc_stages = int(clc_stages_cfg)  # type: ignore[arg-type]
-    if not use_clc_scheduler or clc_stages not in (1, 2, 3):
+    if not use_clc_scheduler:
         clc_stages = 1
+    elif clc_stages not in (2, 3):
+        # A one-stage CLC response pipeline can deadlock when several kernels
+        # contend for the GPU. Two stages is performance-neutral and keeps the
+        # producer from reusing the only response slot while roles retire it.
+        clc_stages = 2
     if (
         topology != "fa4"
         or not persistent
@@ -2172,6 +2186,17 @@ _FLASH_SEED_BLOCK_SIZE_TARGETS = (1, 128, 128)
 _FLASH_DENSE_HD64_MID_MIN_KV = 16
 _FLASH_DENSE_HD64_LONG_MIN_KV = 64
 _FLASH_DENSE_HD64_VERY_LONG_MIN_KV = 256
+_FLASH_RESCALE_THRESHOLD_VALUES = (0.0, 4.0, 8.0, 12.0, 16.0, 32.0)
+
+
+def _flash_safe_rescale_threshold_values(dtype: torch.dtype) -> tuple[float, ...]:
+    """Return thresholds whose largest pinned probability fits in ``dtype``."""
+    max_log2 = math.log2(torch.finfo(dtype).max)
+    return tuple(
+        threshold
+        for threshold in _FLASH_RESCALE_THRESHOLD_VALUES
+        if threshold < max_log2
+    )
 
 
 def _flash_dense_hd64_seed_params(
@@ -2203,10 +2228,13 @@ def _flash_dense_hd64_seed_params(
     return 3, 0, 0, 1, False, 8.0, 8, True
 
 
-def _flash_dense_hd64_seed_rescale_threshold(num_kv: int) -> float:
-    if num_kv == 2048:
-        return 32.0
-    return _flash_dense_hd64_seed_params(num_kv)[5]
+def _flash_dense_hd64_seed_rescale_threshold(
+    num_kv: int, dtype: torch.dtype = torch.float16
+) -> float:
+    threshold = 32.0 if num_kv == 2048 else _flash_dense_hd64_seed_params(num_kv)[5]
+    if threshold >= math.log2(torch.finfo(dtype).max):
+        return 8.0
+    return threshold
 
 
 def _flash_dense_hd64_seed_e2e_schedule(num_kv: int) -> str:
@@ -2329,6 +2357,7 @@ def flash_attention_value_prior_weights(
     head_dim: int,
     num_kv: int | None,
     *,
+    dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     has_kv_tile_pruning: bool = False,
     requires_ws_overlap: bool = False,
@@ -2357,7 +2386,10 @@ def flash_attention_value_prior_weights(
             rescale_chunk_cols,
             packed_reduce,
         ) = _flash_dense_hd64_seed_params(num_kv)
-        rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv)
+        rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
+        rescale_threshold_priors = (
+            (8.0, 16.0, 32.0) if dtype is torch.bfloat16 else (8.0, 12.0)
+        )
         p_store_rep = _flash_dense_hd64_seed_p_store_rep(num_kv)
         s_load_rep = _flash_dense_hd64_seed_s_load_rep(num_kv)
         split_p_arrive = _flash_dense_hd64_seed_split_p_arrive(num_kv)
@@ -2454,7 +2486,7 @@ def flash_attention_value_prior_weights(
                         rescale_threshold: 4.0,
                         **{
                             threshold: 3.0
-                            for threshold in (8.0, 16.0, 32.0)
+                            for threshold in rescale_threshold_priors
                             if threshold != rescale_threshold
                         },
                     }
@@ -2519,7 +2551,7 @@ def flash_attention_value_prior_weights(
                     **{heads: 2.0 for heads in (0, 32) if heads != clc_heads_per_batch},
                 },
                 FLASH_CLC_PDL_KEY: {False: 4.0, True: 1.0},
-                FLASH_CLC_STAGES_KEY: {1: 4.0, 2: 1.0, 3: 1.0},
+                FLASH_CLC_STAGES_KEY: {2: 4.0, 3: 1.0, 1: 1.0},
                 FLASH_LOCAL_TMA_PARTITION_KEY: {
                     local_tma_partition: 4.0,
                     not local_tma_partition: 1.0,
@@ -2681,6 +2713,7 @@ def _flash_seed_fragments(
     head_dim: int,
     num_kv: int,
     *,
+    dtype: torch.dtype,
     is_causal: bool,
     has_kv_tile_pruning: bool,
     requires_ws_overlap: bool,
@@ -2690,6 +2723,7 @@ def _flash_seed_fragments(
     return flash_autotune_fragments(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -2709,6 +2743,7 @@ def _flash_default_seed_config(
     head_dim: int,
     num_kv: int,
     *,
+    dtype: torch.dtype,
     is_causal: bool,
     has_kv_tile_pruning: bool,
     requires_ws_overlap: bool,
@@ -2725,6 +2760,7 @@ def _flash_default_seed_config(
     fragments = _flash_seed_fragments(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -2757,7 +2793,7 @@ def _flash_default_seed_config(
             rescale_chunk_cols,
             packed_reduce,
         ) = _flash_dense_hd64_seed_params(num_kv)
-        rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv)
+        rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
         family_values = {
             FLASH_S_STAGE_KEY: 2,
             FLASH_KV_STAGE_KEY: kv_stage,
@@ -2801,7 +2837,7 @@ def _flash_default_seed_config(
                 num_kv
             ),
             FLASH_CLC_PDL_KEY: False,
-            FLASH_CLC_STAGES_KEY: 1,
+            FLASH_CLC_STAGES_KEY: 2 if _flash_dense_hd64_seed_clc(num_kv) else 1,
             FLASH_LOCAL_TMA_PARTITION_KEY: _flash_dense_hd64_seed_local_tma_partition(
                 num_kv
             ),
@@ -2827,6 +2863,7 @@ def _flash_dense_sp_seed_config(
     head_dim: int,
     num_kv: int,
     *,
+    dtype: torch.dtype,
     is_causal: bool,
     has_kv_tile_pruning: bool,
     requires_ws_overlap: bool,
@@ -2852,6 +2889,7 @@ def _flash_dense_sp_seed_config(
     fragments = _flash_seed_fragments(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -2868,6 +2906,7 @@ def _flash_dense_sp_seed_config(
         rescale_chunk_cols,
         packed_reduce,
     ) = _flash_dense_hd64_seed_params(num_kv)
+    rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
     seed: dict[str, object] = {"block_sizes": block_sizes}
     family_values: dict[str, object] = {
         FLASH_TOPOLOGY_KEY: "fa4",
@@ -2919,6 +2958,7 @@ def _flash_causal_lpt_seed_config(
     head_dim: int,
     num_kv: int,
     *,
+    dtype: torch.dtype,
     is_causal: bool,
     has_kv_tile_pruning: bool,
     requires_ws_overlap: bool,
@@ -2939,6 +2979,7 @@ def _flash_causal_lpt_seed_config(
     fragments = _flash_seed_fragments(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -2981,6 +3022,7 @@ def _flash_causal_split_seed_config(
     head_dim: int,
     num_kv: int,
     *,
+    dtype: torch.dtype,
     is_causal: bool,
     has_kv_tile_pruning: bool,
     requires_ws_overlap: bool,
@@ -3001,6 +3043,7 @@ def _flash_causal_split_seed_config(
     fragments = _flash_seed_fragments(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -3050,6 +3093,7 @@ def flash_attention_seed_config(
     head_dim: int,
     num_kv: int | None,
     *,
+    dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     has_kv_tile_pruning: bool = False,
     requires_ws_overlap: bool = False,
@@ -3069,6 +3113,7 @@ def flash_attention_seed_config(
         return _flash_default_seed_config(
             head_dim,
             num_kv,
+            dtype=dtype,
             is_causal=is_causal,
             has_kv_tile_pruning=has_kv_tile_pruning,
             requires_ws_overlap=requires_ws_overlap,
@@ -3079,6 +3124,7 @@ def flash_attention_seed_config(
         return _flash_causal_lpt_seed_config(
             head_dim,
             num_kv,
+            dtype=dtype,
             is_causal=is_causal,
             has_kv_tile_pruning=has_kv_tile_pruning,
             requires_ws_overlap=requires_ws_overlap,
@@ -3089,6 +3135,7 @@ def flash_attention_seed_config(
         return _flash_dense_sp_seed_config(
             head_dim,
             num_kv,
+            dtype=dtype,
             is_causal=is_causal,
             has_kv_tile_pruning=has_kv_tile_pruning,
             requires_ws_overlap=requires_ws_overlap,
@@ -3099,6 +3146,7 @@ def flash_attention_seed_config(
         return _flash_causal_split_seed_config(
             head_dim,
             num_kv,
+            dtype=dtype,
             is_causal=is_causal,
             has_kv_tile_pruning=has_kv_tile_pruning,
             requires_ws_overlap=requires_ws_overlap,
@@ -3112,6 +3160,7 @@ def flash_attention_seed_configs(
     head_dim: int,
     num_kv: int | None,
     *,
+    dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     has_kv_tile_pruning: bool = False,
     requires_ws_overlap: bool = False,
@@ -3122,6 +3171,7 @@ def flash_attention_seed_configs(
     default_seed = flash_attention_seed_config(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -3133,6 +3183,7 @@ def flash_attention_seed_configs(
     causal_lpt_seed = flash_attention_seed_config(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -3145,6 +3196,7 @@ def flash_attention_seed_configs(
     causal_split_seed = flash_attention_seed_config(
         head_dim,
         num_kv,
+        dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
@@ -3161,6 +3213,7 @@ def flash_autotune_fragments(
     head_dim: int,
     num_kv: int,
     *,
+    dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     has_kv_tile_pruning: bool = False,
     requires_ws_overlap: bool = False,
@@ -3259,6 +3312,7 @@ def flash_autotune_fragments(
             if topology_config is not None
             else None
         ),
+        dtype=dtype,
         is_causal=is_causal,
         prefer_packed_reduce=has_kv_tile_pruning or requires_ws_overlap,
     )
@@ -3641,15 +3695,16 @@ def flash_autotune_fragments(
         e2e_offset0_choices = (defaults.e2e_offset0,)
         e2e_offset_search_choices = None
         e2e_offset0_search_choices = None
+    safe_rescale_thresholds = _flash_safe_rescale_threshold_values(dtype)
     if dense_hd64_fa4 or causal_hd64_seeded_fa4:
         rescale_threshold_choices = _flash_choices_with_default(
-            defaults.rescale_threshold, (0.0, 4.0, 8.0, 12.0, 16.0, 32.0)
+            defaults.rescale_threshold, safe_rescale_thresholds
         )
         rescale_threshold_search_defaults = (
             (32.0, 16.0, 8.0)
+            if very_long_dense_hd64_fa4 and dtype is torch.bfloat16
+            else (8.0, 12.0)
             if very_long_dense_hd64_fa4
-            else (8.0, 12.0, 32.0)
-            if dense_hd64_fa4 and num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
             else (8.0,)
         )
         rescale_threshold_search_choices: tuple[float, ...] | None = (
@@ -3692,7 +3747,7 @@ def flash_autotune_fragments(
             defaults.rescale_threshold,
             *(
                 threshold
-                for threshold in (0.0, 4.0, 8.0, 12.0, 16.0, 32.0)
+                for threshold in safe_rescale_thresholds
                 if threshold != defaults.rescale_threshold
             ),
         )
@@ -3929,7 +3984,7 @@ def flash_autotune_fragments(
     clc_stages_search_choices: tuple[int, ...] | None = (
         (defaults.clc_stages,)
         if use_clc_eligible and very_long_dense_hd64_fa4
-        else clc_stages_choices
+        else (2, 3)
         if use_clc_eligible
         else (1,)
     )
@@ -5826,7 +5881,10 @@ def _flash_fa4_wrap(
     if use_clc_scheduler:
         assert num_m_pairs is not None
         assert clc_heads_per_batch is not None and clc_heads_per_batch > 0
-        clc_m_pair_expr = "cutlass.Int32(flash_clc_work.tile_idx[0])"
+        clc_m_pair_expr = (
+            f"cutlass.Int32({num_m_pairs} - 1) - "
+            "cutlass.Int32(flash_clc_work.tile_idx[0])"
+        )
         advance = """        flash_clc_pipeline.consumer_wait(flash_clc_consumer_state)
         flash_clc_response_ptr = (
             flash_clc_response_base
@@ -8675,7 +8733,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     clc_heads_per_batch = cfg.clc_heads_per_batch
     if (
         cfg.use_clc_scheduler
-        and (clc_heads_per_batch <= 0 or clc_heads_per_batch == batch)
+        and clc_heads_per_batch <= 0
         and plan.tensor_4d_batch > 0
         and plan.tensor_4d_heads > 0
         and plan.tensor_4d_batch * plan.tensor_4d_heads == batch
