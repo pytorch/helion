@@ -14,6 +14,8 @@ from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
+from .cute_matmul_formula import CuteTcgen05FormulaFfiAltHeuristic
+from .cute_matmul_formula import CuteTcgen05FormulaMatmulHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200MatmulHeuristic
@@ -40,6 +42,12 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFlashAttentionCausalLptHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
+        # The formula heuristic subsumes the 3 cluster_m=2 producers above and is
+        # registered AFTER them so its promote_seed_to_default wins (last-promote-wins).
+        # The FFI alt-seed is a second ranked (non-promoting) config, benchmarked beside
+        # the promoted Bucket-A default for 16-bit compute.
+        CuteTcgen05FormulaMatmulHeuristic,
+        CuteTcgen05FormulaFfiAltHeuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
         CuteTileVecHeuristic,

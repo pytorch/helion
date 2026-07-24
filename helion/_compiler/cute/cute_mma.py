@@ -3283,10 +3283,24 @@ def _emit_mma_pipeline(
         # bias on the SIMT load path (no TMA), so the explicit
         # epilogue-tile family stays validated for the T2 envelope: the
         # store side still uses the same TMA-store + epi-tile shape as
-        # T1/T3/T4/T5. Exact-shape rank-2 aux tensors (broadcast_axis=
-        # None) and any other broadcast shape remain rejected here.
+        # T1/T3/T4/T5.
+        #
+        # Shape-5 (bias_residual_gelu) widens this to also admit a rank-2
+        # exact-shape residual aux (``broadcast_axis is None``, e.g.
+        # ``residual[tile_m, tile_n]``). Under the explicit-epi-tile /
+        # flat-role envelope ``c_input_warps == 0`` is enforced below, so the
+        # aux-TMA *productive* body never fires (its gate
+        # ``aux_tma_productive_body_gate_open`` requires ``c_input_warps > 0``):
+        # the residual is read by the epi warps through the direct SIMT
+        # exact-shape GMEM gather in ``_codegen_cute_store_tcgen05_tile`` (the
+        # same read path the DEFAULT-layout residual_add family already uses).
+        # That input-side gather is independent of the D-output TMA-store box
+        # the explicit epi-tile shape governs, so the store side is unchanged.
+        # Colvec (axis 2) and leading-axis (axis 0) broadcast aux remain
+        # rejected here -- only the rank-1 rowvec and rank-2 exact-shape forms
+        # are validated on this path.
         aux_descriptors_compatible_with_explicit_epi_tile = all(
-            d.broadcast_axis == 1 for d in aux_tensor_descriptors_value
+            d.broadcast_axis in (1, None) for d in aux_tensor_descriptors_value
         )
         # The explicit-epi-tile / flat-role store path is dtype-general for any
         # 16-bit operand: bf16 and fp16 produce the same epilogue tile
