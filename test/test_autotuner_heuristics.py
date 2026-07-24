@@ -2308,7 +2308,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
         # The clustered scheduler still assigns physical cluster M/N to work-tile
-        # coordinates 0/1. Autotuning repairs an alternate PID order to the
+        # coordinates 0/1. Autotuning repairs an alternate loop order to the
         # default; an explicit user config gets a clear validation error.
         clustered_alt_order = helion.Config.from_dict(default_cluster_m2_config.config)
         clustered_alt_order.config["loop_orders"] = [[1, 0]]
@@ -2316,15 +2316,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(clustered_alt_order.config["tcgen05_cluster_m"], 2)
         self.assertEqual(clustered_alt_order.loop_orders, [[0, 1]])
 
-        explicit_clustered_alt_order = helion.Config.from_dict(
-            default_cluster_m2_config.config
-        )
-        explicit_clustered_alt_order.config["loop_orders"] = [[1, 0]]
+        clustered_alt_order.config["loop_orders"] = [[1, 0]]
         with self.assertRaisesRegex(
             helion.exc.InvalidConfig,
-            "non-default loop_orders require tcgen05_cluster_m=1",
+            r"non-default loop_orders require tcgen05 cluster shape \(1, 1\)",
         ):
-            bound.config_spec.normalize(explicit_clustered_alt_order)
+            bound.config_spec.normalize(clustered_alt_order)
 
         # An explicit FFI request still projects onto the generalized seed.
         requested_ffi_config = helion.Config(

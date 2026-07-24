@@ -2685,30 +2685,23 @@ class CuteTcgen05Config:
     ) -> None:
         if not self.search_enabled:
             return
-        pid_type = config.get("pid_type")
-        cluster_m = config.get("tcgen05_cluster_m", 1)
-        cluster_n = config.get("tcgen05_cluster_n", 1)
-        loop_orders = config.get("loop_orders")
         default_loop_orders = [
             spec._fill_missing() for spec in self.config_spec.loop_orders
         ]
-        if (
-            isinstance(pid_type, str)
-            and pid_type.startswith("persistent")
-            and (cluster_m != 1 or cluster_n != 1)
-            and loop_orders
-            and loop_orders != default_loop_orders
-        ):
-            # The tcgen05 clustered scheduler applies the physical M/N cluster
-            # shape to work-tile coordinates 0/1. Alternate PID orders are safe
-            # for single-CTA scheduling, but clustered scheduling must become
-            # block-ID-aware before those coordinates can be reordered.
+        loop_orders = config.get("loop_orders", default_loop_orders)
+        cluster_shape = (
+            config.get("tcgen05_cluster_m", 1),
+            config.get("tcgen05_cluster_n", 1),
+        )
+        if cluster_shape != (1, 1) and loop_orders != default_loop_orders:
+            # The clustered scheduler binds physical M/N dimensions to work-tile
+            # coordinates 0/1. Reordering is safe for a single CTA, but clustered
+            # scheduling must become block-ID-aware before those coordinates move.
             if fix_invalid:
                 config["loop_orders"] = default_loop_orders
             else:
                 raise InvalidConfig(
-                    "non-default loop_orders require tcgen05_cluster_m=1 and "
-                    "tcgen05_cluster_n=1 for persistent tcgen05 kernels"
+                    "non-default loop_orders require tcgen05 cluster shape (1, 1)"
                 )
         pid_type_for_default = config.get("pid_type")
         strategy_validation_fragments = self.strategy_validation_fragments()

@@ -3618,8 +3618,7 @@ class TestCuteAutotuner(TestCase):
         self.assertIn("loop_orders", flat_keys)
 
         gen = ConfigGeneration(bound.config_spec)
-        config = bound.config_spec.default_config()
-        config.config.update(
+        config = helion.Config(
             block_sizes=[128, 128, 64],
             loop_orders=[[1, 0]],
             pid_type="persistent_interleaved",
