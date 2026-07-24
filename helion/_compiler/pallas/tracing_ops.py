@@ -9,6 +9,7 @@ the same eager timing as before.
 from __future__ import annotations
 
 import ast
+import contextlib
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -41,6 +42,7 @@ log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ...runtime.config import Config
@@ -125,6 +127,11 @@ def _(state: CodegenState) -> object:
             if pallas_loop_type == "emit_pipeline":
                 return _codegen_emit_pipeline(state)
             assert pallas_loop_type == "fori_loop"
+        if _is_compact_tile_loop(state):
+            plan = CompileEnvironment.current().compact_worklist_plan
+            assert plan is not None
+            if plan.grouping == 2:
+                return _codegen_grouped_compact_tile(state)
         return _codegen_fori_loop(state)
     if pallas_loop_type == "emit_pipeline":
         return _codegen_emit_pipeline(state)
@@ -149,6 +156,12 @@ def _(state: CodegenState) -> None:
                 _codegen_emit_pipeline(state)
                 return None
             assert pallas_loop_type == "fori_loop"
+        if _is_compact_tile_loop(state):
+            plan = CompileEnvironment.current().compact_worklist_plan
+            assert plan is not None
+            if plan.grouping == 2:
+                _codegen_grouped_compact_tile(state)
+                return None
         _codegen_fori_loop(state)
         return None
     if pallas_loop_type == "emit_pipeline":
@@ -230,6 +243,17 @@ def _prepare_resident_prep_lowerings(
     metadata_ref_for_field(plan, "range_len")
 
     graph_info = state.get_graph(state.proxy_arg(0))
+    cache_key = (
+        graph_info.graph_id,
+        decision.physical_window,
+        active_hoists,
+    )
+    common_statements = state.codegen.grouped_compact_common_statements
+    if common_statements is not None:
+        cached = state.codegen.grouped_resident_prep_lowering_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     load_nodes = {node.name: node for node in graph_info.graph.nodes}
     needed_hosts = {hoist.host_arg for hoist in active_hoists}
     resident_windows: dict[str, tuple[str, torch.Tensor]] = {}
@@ -291,6 +315,8 @@ def _prepare_resident_prep_lowerings(
         if fill is not None:
             load_tail_fills[lw.hoist.load_node_name] = fill
     elide_installed_prep_load_masks(graph_info.graph, load_tail_fills)
+    if common_statements is not None:
+        state.codegen.grouped_resident_prep_lowering_cache[cache_key] = lowerings
     return lowerings
 
 
@@ -554,6 +580,168 @@ def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
         _compact_axis_kind(state, i) == "ordered"
         for i in range(len(graph_info.block_ids))
     )
+
+
+def _is_compact_tile_loop(state: CodegenState) -> bool:
+    """True for the parallel compact-tile loop represented by the work item."""
+    from ..device_ir import ForLoopGraphInfo
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None:
+        return False
+    graph_info = state.get_graph(state.proxy_arg(0))
+    if not isinstance(graph_info, ForLoopGraphInfo):
+        return False
+    if graph_info.block_ids != [plan.compact_axis.block_id]:
+        return False
+    args = state.proxy_args[-1]
+    return isinstance(args, list) and not _loop_carried_indices(state, len(args))
+
+
+@contextlib.contextmanager
+def _compact_block_variant(state: CodegenState, factor: int) -> Iterator[None]:
+    """Temporarily codegen the compact loop with ``factor * base_block``."""
+    if factor == 1:
+        yield
+        return
+
+    from ...runtime.config import Config
+    from ..tile_dispatch import TileStrategyDispatch
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    assert plan is not None and factor == 2
+    block_id = plan.compact_axis.block_id
+    fn = state.device_function
+
+    block_sizes = [*fn.config.block_sizes]
+    block_index = env.config_spec.block_sizes.block_id_to_index(block_id)
+    block_sizes[block_index] *= factor
+    variant_config = Config.from_dict({**fn.config.config, "block_sizes": block_sizes})
+
+    original_config = fn.config
+    original_tile_strategy = fn.tile_strategy
+    original_block_cache = fn.block_size_var_cache
+    original_expr_cache = fn.expr_to_var_info
+
+    variant_block_cache = original_block_cache.copy()
+    variant_block_cache.pop((block_id,), None)
+    variant_expr_cache = {}
+    for expr, info in original_expr_cache.items():
+        block_mapping, _ = find_block_size_symbols(expr)
+        if block_id not in block_mapping.values():
+            variant_expr_cache[expr] = info
+
+    fn.config = variant_config
+    fn.block_size_var_cache = variant_block_cache
+    fn.expr_to_var_info = variant_expr_cache
+    try:
+        fn.tile_strategy = TileStrategyDispatch(fn, variant_config)
+        yield
+    finally:
+        fn.config = original_config
+        fn.tile_strategy = original_tile_strategy
+        fn.block_size_var_cache = original_block_cache
+        fn.expr_to_var_info = original_expr_cache
+
+
+def _compact_output_initializers(state: CodegenState) -> list[ast.stmt]:
+    """Zero the full max-sized output window before the one-tile body."""
+    from ..device_function import TensorArg
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    assert plan is not None and plan.grouping == 2
+    output_hosts = {
+        policy.arg_name
+        for policy in plan.tensor_policies
+        if policy.kind == "compact_exact_store"
+    }
+    statements: list[ast.stmt] = []
+    for arg in state.device_function.arguments:
+        if not isinstance(arg, TensorArg) or arg.host_str() not in output_hosts:
+            continue
+        indices = ", ".join(":" for _ in range(arg.fake_value.ndim))
+        statements.append(
+            statement_from_string(
+                f"{arg.name}[{indices}] = jnp.zeros_like({arg.name}[{indices}])"
+            )
+        )
+    assert len(statements) == len(output_hosts)
+    return statements
+
+
+def _codegen_grouped_compact_tile(state: CodegenState) -> None:
+    """Emit static base-block and double-block compact-body variants."""
+    from .compact_worklist import compact_ref_names
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    assert plan is not None and plan.grouping == 2
+    assert _is_compact_tile_loop(state)
+
+    codegen = state.codegen
+    common_statements: list[ast.AST] = []
+    branch_defs: list[ast.FunctionDef] = []
+    extent_ref = f"{compact_ref_names(plan)[1]}_ref"
+
+    counter_names = (
+        "atomic_op_index",
+        "device_load_index",
+        "device_load_cache_modifier_index",
+        "device_store_index",
+        "device_store_cache_modifier_index",
+        "device_memory_op_index",
+    )
+    initial_counters = {
+        name: getattr(state.device_function, name) for name in counter_names
+    }
+    final_counters: dict[str, int] | None = None
+    previous_common = codegen.grouped_compact_common_statements
+    assert previous_common is None
+    assert not codegen.grouped_resident_prep_lowering_cache
+    assert not codegen.grouped_resident_prep_refill_cache
+    assert not codegen.grouped_fori_dma_resource_cache
+    codegen.grouped_compact_common_statements = common_statements
+    try:
+        for factor in (1, 2):
+            for name, value in initial_counters.items():
+                setattr(state.device_function, name, value)
+            branch_body: list[ast.AST] = []
+            with (
+                codegen.set_statements(branch_body),
+                _compact_block_variant(state, factor),
+            ):
+                result = _codegen_fori_loop(state)
+            assert result is None
+            if factor == 1:
+                branch_body[:0] = _compact_output_initializers(state)
+                final_counters = {
+                    name: getattr(state.device_function, name) for name in counter_names
+                }
+
+            fn_name = state.device_function.new_var(f"_compact_group_{factor}")
+            comparison = "<=" if factor == 1 else ">"
+            fn_def = statement_from_string(
+                f"@pl.when({extent_ref}[_wid] {comparison} "
+                f"{env.compact_worklist_block})\n"
+                f"def {fn_name}():\n"
+                f"    pass"
+            )
+            assert isinstance(fn_def, ast.FunctionDef)
+            fn_def.body = cast("list[ast.stmt]", branch_body) or [ast.Pass()]
+            branch_defs.append(fn_def)
+    finally:
+        codegen.grouped_compact_common_statements = previous_common
+        codegen.grouped_resident_prep_lowering_cache.clear()
+        codegen.grouped_resident_prep_refill_cache.clear()
+        codegen.grouped_fori_dma_resource_cache.clear()
+        for name, value in (final_counters or initial_counters).items():
+            setattr(state.device_function, name, value)
+
+    for statement in common_statements:
+        state.add_statement(statement)
+    for fn_def in branch_defs:
+        state.add_statement(fn_def)
 
 
 def _compact_worklist_bounds(
@@ -2636,7 +2824,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     )
 
     # Compact worklist: the compact-tile aligned_load and exact_store tensors use
-    # per-tile pl.Element BlockSpecs, which Pallas double-buffers across the
+    # max-sized pl.Element BlockSpecs, which Pallas double-buffers across the
     # work-item grid.  Keep them OUT of the manual make_async_copy DMA path: with
     # a single straight-line compact tile there is no inner loop to overlap, so a
     # DMA start()/wait() would run fully serial (load -> wait -> compute -> store
@@ -2725,15 +2913,36 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         uses_load_prefetch = load_buffer_count == 2
         state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         hbm_name = state.device_function.tensor_arg(fake).name
-        vmem_name = state.device_function.register_scratch(
-            (load_buffer_count, *vmem_shape) if uses_load_prefetch else vmem_shape,
-            fake.dtype,
-            name_hint=hbm_name.replace("_hbm", "") + "_buf",
+        resource_key = (
+            graph_info.graph_id,
+            hbm_name,
+            direction,
+            vmem_shape,
+            load_buffer_count,
         )
-        sem_name = state.device_function.register_dma_semaphore(
-            name_hint=hbm_name.replace("_hbm", "") + "_sem",
-            shape=(load_buffer_count,) if uses_load_prefetch else (),
+        resource_cache = (
+            state.codegen.grouped_fori_dma_resource_cache
+            if state.codegen.grouped_compact_common_statements is not None
+            and _is_compact_ordered_inner_loop(state)
+            else None
         )
+        cached_resource = (
+            resource_cache.get(resource_key) if resource_cache is not None else None
+        )
+        if cached_resource is None:
+            vmem_name = state.device_function.register_scratch(
+                (load_buffer_count, *vmem_shape) if uses_load_prefetch else vmem_shape,
+                fake.dtype,
+                name_hint=hbm_name.replace("_hbm", "") + "_buf",
+            )
+            sem_name = state.device_function.register_dma_semaphore(
+                name_hint=hbm_name.replace("_hbm", "") + "_sem",
+                shape=(load_buffer_count,) if uses_load_prefetch else (),
+            )
+            if resource_cache is not None:
+                resource_cache[resource_key] = (vmem_name, sem_name)
+        else:
+            vmem_name, sem_name = cached_resource
         tensor_to_dma_scratch[hbm_name] = vmem_name
         tensor_to_sem[hbm_name] = sem_name
         if uses_load_prefetch:
@@ -2809,14 +3018,38 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     )
     if resident_prep_lowerings:
         assert len(grid_parts) == 1
-        num_ordered_tiles = state.device_function.new_var("_rc_num_ordered_tiles")
-        state.add_statement(
-            statement_from_string(f"{num_ordered_tiles} = {grid_parts[0]}")
+        refill_key = tuple(
+            (
+                lowering.hoist.graph_id,
+                lowering.hoist.prep_node_name,
+                lowering.cache_name,
+            )
+            for lowering in resident_prep_lowerings
         )
+        common_statements = state.codegen.grouped_compact_common_statements
+        num_ordered_tiles = (
+            state.codegen.grouped_resident_prep_refill_cache.get(refill_key)
+            if common_statements is not None
+            else None
+        )
+        if num_ordered_tiles is None:
+            num_ordered_tiles = state.device_function.new_var("_rc_num_ordered_tiles")
+            target = common_statements
+            with state.codegen.set_statements(target):
+                state.add_statement(
+                    statement_from_string(f"{num_ordered_tiles} = {grid_parts[0]}")
+                )
+                _emit_resident_prep_refill(
+                    state,
+                    block_ids,
+                    [num_ordered_tiles],
+                    resident_prep_lowerings,
+                )
+            if common_statements is not None:
+                state.codegen.grouped_resident_prep_refill_cache[refill_key] = (
+                    num_ordered_tiles
+                )
         grid_parts = [num_ordered_tiles]
-        _emit_resident_prep_refill(
-            state, block_ids, grid_parts, resident_prep_lowerings
-        )
 
     def _build_dma_slices(
         fake: torch.Tensor,
@@ -3080,20 +3313,14 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             ):
                 state.codegen.add_statement(statement)
 
-    # Compact-worklist outer tile: it IS the grid (exactly one tile per work
-    # item, since the builder guarantees extent <= BLOCK), so emit the body
+    # Compact-worklist outer tile: it IS the grid (exactly one static compact
+    # body per work item), so emit the body
     # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
     # would add control-flow overhead and block pipelining for the common
     # no-ordered-axis case). The ordered inner tile does not reach here: it lowers
     # separately through the loop type selected by the _for_loop Pallas dispatch.
-    plan = CompileEnvironment.current().compact_worklist_plan
-    is_compact_tile = (
-        plan is not None
-        and not carried  # the compact tile is parallel (no carried state)
-        and len(block_ids) == 1
-        and block_ids[0] == plan.compact_axis.block_id
-    )
-    if is_compact_tile:
+    if _is_compact_tile_loop(state):
+        assert not carried
         # No nonlocal declarations: the body runs at kernel scope (scratch refs
         # are kernel params, directly assignable -- nonlocal would be invalid).
         state.add_statement(statement_from_string(f"{loop_vars[0]} = 0"))

@@ -55,7 +55,9 @@ def _expr(src: str) -> ast.AST:
     return ast.parse(src, mode="eval").body
 
 
-def _python_flatten_reference(base, length, block, *, dep_base=None, dep_len=None):
+def _python_flatten_reference(
+    base, length, block, *, grouping=1, dep_base=None, dep_len=None
+):
     """Slow, obviously-correct Python reference for :func:`flatten_worklist`.
 
     Returns plain Python lists over the *valid* ``[0, num_work)`` range only
@@ -67,12 +69,14 @@ def _python_flatten_reference(base, length, block, *, dep_base=None, dep_len=Non
     range_start = []
     range_len = []
     for p in range(len(base)):
-        cnt = -(-int(length[p]) // block)  # cdiv, NOT clamped up
-        for t in range(cnt):
+        logical_count = -(-int(length[p]) // block)  # cdiv, NOT clamped up
+        for t in range(0, logical_count, grouping):
+            tile_count = min(grouping, logical_count - t)
             owner_ids.append(p)
             tile_starts.append(int(base[p]) + t * block)
-            tile_extents.append(min(block, int(length[p]) - t * block))
+            tile_extents.append(min(tile_count * block, int(length[p]) - t * block))
             if dep_base is not None:
+                assert dep_len is not None
                 range_start.append(int(dep_base[p]))
                 range_len.append(int(dep_len[p]))
     return {
@@ -90,7 +94,7 @@ def _python_flatten_reference(base, length, block, *, dep_base=None, dep_len=Non
 class TestWorklistBuilder(unittest.TestCase):
     """Unit tests for :func:`flatten_worklist`."""
 
-    def _check(self, lengths, block, *, dep_lengths=None):
+    def _check(self, lengths, block, *, grouping=1, dep_lengths=None):
         """Build with JAX and assert the valid range matches the reference."""
         lengths = list(lengths)
         # Owners are packed contiguously, so base = exclusive cumsum of lengths.
@@ -99,7 +103,7 @@ class TestWorklistBuilder(unittest.TestCase):
             base.append(base[-1] + L)
         total = sum(lengths)
         num_owners = len(lengths)
-        UPPER = packed_upper_bound(total, num_owners, block)
+        UPPER = packed_upper_bound(total, num_owners, block * grouping)
 
         dep_base = None
         if dep_lengths is not None:
@@ -113,13 +117,19 @@ class TestWorklistBuilder(unittest.TestCase):
             jnp.asarray(lengths, jnp.int32),
             block,
             UPPER,
+            grouping=grouping,
             dep_base=None if dep_base is None else jnp.asarray(dep_base, jnp.int32),
             dep_len=None
             if dep_lengths is None
             else jnp.asarray(dep_lengths, jnp.int32),
         )
         ref = _python_flatten_reference(
-            base, lengths, block, dep_base=dep_base, dep_len=dep_lengths
+            base,
+            lengths,
+            block,
+            grouping=grouping,
+            dep_base=dep_base,
+            dep_len=dep_lengths,
         )
 
         num_work = int(meta.num_work)
@@ -174,6 +184,26 @@ class TestWorklistBuilder(unittest.TestCase):
 
     def test_with_dep_range(self):
         self._check([300, 100, 256], block=128, dep_lengths=[512, 64, 200])
+
+    def test_grouping_two(self):
+        meta, num_work = self._check(
+            [0, 3, 8, 9, 16, 17, 24, 25],
+            block=8,
+            grouping=2,
+            dep_lengths=[1, 2, 3, 4, 5, 6, 7, 8],
+        )
+        self.assertEqual(
+            np.asarray(meta.owner_ids)[:num_work].tolist(),
+            [1, 2, 3, 4, 5, 5, 6, 6, 7, 7],
+        )
+        self.assertEqual(
+            np.asarray(meta.tile_starts)[:num_work].tolist(),
+            [0, 3, 11, 20, 36, 52, 53, 69, 77, 93],
+        )
+        self.assertEqual(
+            np.asarray(meta.tile_extents)[:num_work].tolist(),
+            [3, 8, 9, 16, 16, 1, 16, 8, 16, 9],
+        )
 
     def test_empty_dep_stored_raw(self):
         # An empty ordered range (kv_len == 0) must be stored RAW (not clamped
@@ -249,7 +279,7 @@ def _axis(kind, loop_var, block_id=0):
     )
 
 
-def _plan(*, ordered, owner_indexed):
+def _plan(*, ordered, owner_indexed, grouping=1):
     axes = [_axis("owner_grid", "seq", 0), _axis("compact_tile", "tile_q", 1)]
     if ordered:
         axes.append(_axis("ordered", "tile_kv", 2))
@@ -257,7 +287,10 @@ def _plan(*, ordered, owner_indexed):
     if owner_indexed:
         policies.append(TensorPolicy(arg_name="k", kind="owner_indexed"))
     return CompactWorklistPlan(
-        axes=tuple(axes), tensor_policies=tuple(policies), upper_bound_expr=""
+        axes=tuple(axes),
+        tensor_policies=tuple(policies),
+        upper_bound_expr="",
+        grouping=grouping,
     )
 
 
@@ -275,6 +308,11 @@ class TestMetadataArgNames(unittest.TestCase):
             (
                 "fully_jagged",
                 _plan(ordered=True, owner_indexed=False),
+                ["work_seq", "q_begin", "q_extent", "kv_begin", "kv_len"],
+            ),
+            (
+                "grouped",
+                _plan(ordered=True, owner_indexed=False, grouping=2),
                 ["work_seq", "q_begin", "q_extent", "kv_begin", "kv_len"],
             ),
         ]
@@ -562,12 +600,12 @@ def _offsets(lengths):
 
 
 def _worklist_config(
-    block_sizes: list[int], *, loop_type: str = "unroll"
+    block_sizes: list[int], *, loop_type: str = "unroll", grouping: int = 1
 ) -> helion.Config:
     return helion.Config(
         block_sizes=block_sizes,
         pallas_loop_type=loop_type,
-        pallas_worklist_grouping=1,
+        pallas_worklist_grouping=grouping,
     )
 
 
@@ -674,7 +712,7 @@ class TestDetectAndGating(unittest.TestCase):
         self.assertIsInstance(grouping_field, EnumFragment)
         choices = loop_type_field.choices
         self.assertEqual(choices, ("fori_loop", "emit_pipeline", "unroll"))
-        self.assertEqual(grouping_field.choices, (0, 1))
+        self.assertEqual(grouping_field.choices, (0, 1, 2))
         self.assertEqual(list(bk.env.config_spec.grid_block_ids), [0])
 
     def test_gating_absent_for_non_jagged(self):
@@ -1032,14 +1070,14 @@ class TestWorklistConfig(unittest.TestCase):
         kernel = self._kernel(fn, _worklist_config([16, 16]))
         args = (torch.randn(64, 64), torch.randn(64, 64))
         bound = kernel.bind(args)
-        with self.assertRaises(exc.InvalidConfig):
-            bound.ensure_config_exists(args)
-            bound.to_triton_code(bound._config)
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping), self.assertRaises(exc.InvalidConfig):
+                bound.to_triton_code(_worklist_config([16, 16], grouping=grouping))
 
     def test_invalid_worklist_grouping_raises(self):
         args = (torch.randn(64, 64), torch.randn(64, 64))
         bound = _add_kernel.bind(args)
-        for grouping in (True, 2):
+        for grouping in (True, -1, 3):
             with (
                 self.subTest(grouping=grouping),
                 self.assertRaisesRegex(
@@ -1111,6 +1149,51 @@ class TestWorklistLoopDispatch(unittest.TestCase):
         self.assertIn("lax.fori_loop", code)
         self.assertNotIn("pltpu.emit_pipeline(", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
+
+    def test_grouping_two_emits_static_compact_variants(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        args = (
+            torch.randn(lq, 4, 128),
+            torch.randn(4, 16, 4, 128),
+            torch.randn(4, 16, 4, 128),
+            qo,
+        )
+        code = _dense_kv_kernel.bind(args).to_triton_code(
+            _worklist_config([8], grouping=2)
+        )
+
+        self.assertIn("grouping=2", code)
+        self.assertIn("@pl.when(q_extent_ref[_wid] <= 8)", code)
+        self.assertIn("@pl.when(q_extent_ref[_wid] > 8)", code)
+        self.assertIn("_BLOCK_SIZE_1 = int(8)", code)
+        self.assertIn("_BLOCK_SIZE_2 = int(16)", code)
+        self.assertIn("q[pl.ds(0, _BLOCK_SIZE_1)", code)
+        self.assertIn("q[pl.ds(0, _BLOCK_SIZE_2)", code)
+        self.assertIn("out[:, :, :] = jnp.zeros_like(out[:, :, :])", code)
+        self.assertIn("_compact_block=16", code)
+        self.assertIn("_compact_num_scalar_prefetch=3", code)
+
+    def test_grouping_two_composes_with_loop_types(self):
+        for loop_type in ("unroll", "emit_pipeline", "fori_loop"):
+            with self.subTest(loop_type=loop_type):
+                code = _fully_jagged_kernel.bind(
+                    self._fully_jagged_args()
+                ).to_triton_code(
+                    _worklist_config([8, 8], loop_type=loop_type, grouping=2)
+                )
+                self.assertIn("@pl.when(q_extent_ref[_wid] <= 8)", code)
+                self.assertIn("@pl.when(q_extent_ref[_wid] > 8)", code)
+                if loop_type == "unroll":
+                    self.assertEqual(code.count("def _rc_prep_refill():"), 1)
+                    self.assertNotIn("k_prep_1", code)
+                elif loop_type == "emit_pipeline":
+                    self.assertEqual(code.count("pltpu.emit_pipeline("), 2)
+                    self.assertNotIn("_rc_prep_refill", code)
+                else:
+                    self.assertIn("pltpu.make_async_copy", code)
+                    self.assertNotIn("k_buf_1", code)
+                    self.assertNotIn("v_buf_1", code)
 
     def test_emit_pipeline_streams(self):
         code = _fully_jagged_kernel.bind(self._fully_jagged_args()).to_triton_code(
@@ -1282,9 +1365,17 @@ class TestConfigStateIsolation(unittest.TestCase):
             qo,
         )
         bound = kernel.bind(args)
-        # Worklist config first -> sets env.compact_worklist_plan.
+        # Grouping 2 first exercises the temporary doubled-block codegen state.
+        grouped = bound.to_triton_code(
+            _worklist_config([8], loop_type="fori_loop", grouping=2)
+        )
+        self.assertIn("@pl.when(q_extent_ref[_wid] <= 8)", grouped)
+        self.assertIn("_compact_block=16", grouped)
+        # A subsequent grouping-1 config must recover the original block and body.
         worklist = bound.to_triton_code(_worklist_config([8], loop_type="fori_loop"))
         self.assertIn("work_seq_ref", worklist)
+        self.assertNotIn("_compact_group_", worklist)
+        self.assertIn("_compact_block=8", worklist)
         # Then a fori config on the SAME bound kernel (same env): must be clean.
         fori = bound.to_triton_code(
             helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
@@ -1346,13 +1437,15 @@ class TestWorklistNumerics(unittest.TestCase):
         q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
         k = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
         v = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
-        _, out = code_and_output(
-            _dense_kv_kernel,
-            (q, k, v, qo.to(DEVICE)),
-            **_worklist_config([block]),
-        )
         ref = _eager_dense_kv(q.cpu(), k.cpu(), v.cpu(), qo)
-        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                _, out = code_and_output(
+                    _dense_kv_kernel,
+                    (q, k, v, qo.to(DEVICE)),
+                    **_worklist_config([block], grouping=grouping),
+                )
+                torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
     def test_dense_kv_empty_batch_zero_grid(self):
         # total_q == 0 => num_work == 0 => dynamic grid=(0,).  End-to-end guard
@@ -1386,12 +1479,21 @@ class TestWorklistNumerics(unittest.TestCase):
         k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
         v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
         ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo)
-        for loop_type in ("unroll", "fori_loop"):
-            with self.subTest(loop_type=loop_type):
+        configs = (
+            ("unroll", 1),
+            ("fori_loop", 1),
+            ("unroll", 2),
+            ("emit_pipeline", 2),
+            ("fori_loop", 2),
+        )
+        for loop_type, grouping in configs:
+            with self.subTest(loop_type=loop_type, grouping=grouping):
                 _, out = code_and_output(
                     _fully_jagged_kernel,
                     (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
-                    **_worklist_config([block, block], loop_type=loop_type),
+                    **_worklist_config(
+                        [block, block], loop_type=loop_type, grouping=grouping
+                    ),
                 )
                 torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
@@ -1452,7 +1554,7 @@ class TestWorklistJaxExport(unittest.TestCase):
         qod = jnp.asarray(qo.numpy())
         kernel = helion.kernel(
             _dense_kv_kernel.fn,
-            config=_worklist_config([block]),
+            config=_worklist_config([block], grouping=2),
             static_shapes=True,
             backend="pallas",
         )

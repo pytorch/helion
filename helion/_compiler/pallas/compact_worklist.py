@@ -114,6 +114,8 @@ class CompactWorklistPlan:
     # bound (NOT assumed to be base.shape[0] - 1, which only holds for the
     # offsets-array idiom).
     num_owners_expr: str = ""
+    # Number of consecutive compact base tiles combined into one work item.
+    grouping: int = 1
 
     @property
     def owner_axis(self) -> Axis:
@@ -708,6 +710,7 @@ def render_build_worklist(
             f"    dep_len = {ast.unparse(dep_len_resolved)}",
         ]
         dep_kwargs = ", dep_base=dep_base, dep_len=dep_len"
+    grouping_kwarg = "" if plan.grouping == 1 else f", grouping={plan.grouping}"
 
     # The owner-count expression (e.g. "offsets.shape[0] - 1" or "B") may
     # introduce additional free host names the builder must take as params.
@@ -724,7 +727,8 @@ def render_build_worklist(
         *dep_lines,
         (
             "    return flatten_worklist("
-            f"base, length, {block_expr}, {upper_expr}{dep_kwargs})"
+            f"base, length, {block_expr}, {upper_expr}"
+            f"{grouping_kwarg}{dep_kwargs})"
         ),
     ]
     return "\n".join(lines), offset_params

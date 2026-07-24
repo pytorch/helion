@@ -152,6 +152,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.resident_prep_lowering_stack: list[
             dict[tuple[int, str], ResidentPrepLowering]
         ] = []
+        # Grouping-2 worklists codegen the compact body twice, once per static
+        # compact block size. Shape-independent ordered-loop resources are shared
+        # across those mutually exclusive bodies.
+        self.grouped_compact_common_statements: list[ast.AST] | None = None
+        self.grouped_resident_prep_lowering_cache: dict[
+            tuple[object, ...], list[ResidentPrepLowering]
+        ] = {}
+        self.grouped_resident_prep_refill_cache: dict[tuple[object, ...], str] = {}
+        self.grouped_fori_dma_resource_cache: dict[
+            tuple[object, ...], tuple[str, str]
+        ] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
