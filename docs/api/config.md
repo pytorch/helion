@@ -103,6 +103,14 @@ Configs are typically discovered automatically through autotuning, but can also 
    - ``"persistent_blocked"``: Persistent kernels with blocked work distribution
    - ``"persistent_interleaved"``: Persistent kernels with interleaved distribution
 
+.. autoattribute:: Config.num_sm_multiplier
+
+   Controls persistent multi-occupancy. The physical launch grid is capped at
+   ``min(total logical program IDs, num SMs * num_sm_multiplier)`` so the
+   autotuner can select an overprovisioned multiplier without launching workers
+   that cannot own work. Device-dependent bounds retain the SM-derived grid
+   because their logical program count is unavailable to the host launcher.
+
 .. autoattribute:: Config.l2_groupings
 
    Controls reordering of program IDs to improve L2 cache locality.

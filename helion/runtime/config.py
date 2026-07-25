@@ -19,7 +19,7 @@ PidTypeLiteral = Literal[
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
-NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
+NumSmMultiplierLiteral = Literal[1, 2, 4, 8, 16, 32, 64, 128]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
 
@@ -83,8 +83,9 @@ class Config(Mapping[str, object]):
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
-            num_sm_multiplier: Multiplier for the number of SMs in persistent kernels (1, 2, 4, 8).
-                Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
+            num_sm_multiplier: Multiplier for the number of SMs in persistent kernels.
+                Controls multi-occupancy with a grid capped at the total logical
+                program count: min(total_pids, N * num_sms).
             maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
                 Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
                 to ensure multi-occupancy can be achieved.
