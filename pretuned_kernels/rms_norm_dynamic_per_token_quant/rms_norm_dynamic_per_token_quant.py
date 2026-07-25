@@ -179,6 +179,52 @@ def _rms_norm_dynamic_per_token_quant_vllm(
     )
 
 
+def _load_multi_shape_config() -> dict:
+    """Load the checked-in single multi-shape config for the current GPU.
+
+    Mirrors the per-shape heuristic's file selection: prefer the file matching
+    the running compute capability (``_multi_shape_config_cuda_sm<NN>.py``), then
+    fall back to the highest available capability <= the current one.
+    """
+    import glob
+    import importlib.util
+    import os
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    major, minor = torch.cuda.get_device_capability()
+    current = major * 10 + minor
+    candidates: dict[int, str] = {}
+    for path in glob.glob(os.path.join(here, "_multi_shape_config_cuda_sm*.py")):
+        match = re.search(r"_cuda_sm(\d+)\.py$", os.path.basename(path))
+        if match:
+            candidates[int(match.group(1))] = path
+    if not candidates:
+        raise FileNotFoundError(
+            "no _multi_shape_config_cuda_sm*.py found next to the kernel"
+        )
+    compatible = sorted(cc for cc in candidates if cc <= current)
+    chosen_cc = compatible[-1] if compatible else min(candidates)
+    spec = importlib.util.spec_from_file_location(
+        f"_multi_shape_config_sm{chosen_cc}", candidates[chosen_cc]
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.CONFIG
+
+
+def _single_config_kernel() -> object:
+    """Build a kernel pinned to the single multi-shape config (no autotuning)."""
+    config = helion.Config(**_load_multi_shape_config())
+    return helion.kernel(
+        rms_norm_dynamic_per_token_quant.fn,
+        config=config,
+        static_shapes=True,
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+
+
 def _baselines() -> list[tuple[str, object]]:
     """Baselines main() benchmarks against (torch always; vLLM when installed).
 
@@ -231,7 +277,14 @@ def correctness_check() -> None:
         )
 
 
-def main(verbose: bool = True) -> dict:
+def main(verbose: bool = True, single_config: bool = False) -> dict:
+    """Benchmark the Helion kernel across the shape sweep.
+
+    By default uses the per-shape AOT heuristic (a shape->config lookup table).
+    With ``single_config=True`` (``--single-config`` on the CLI), pins the one
+    checked-in multi-shape config for the current GPU and uses it for every
+    shape -- directly comparable numbers for the multi-shape autotune tradeoff.
+    """
     import os
     import sys
 
@@ -242,6 +295,13 @@ def main(verbose: bool = True) -> dict:
     shapes = _bench_shapes()
     epsilon = 1e-6
     baselines = _baselines()
+    kernel = (
+        _single_config_kernel() if single_config else rms_norm_dynamic_per_token_quant
+    )
+    if single_config and verbose:
+        print(
+            f"Using single multi-shape config: {helion.Config(**_load_multi_shape_config())}"
+        )
 
     def make_calls(shape: tuple[int, int]) -> tuple:
         hidden_size, num_tokens = shape
@@ -255,7 +315,7 @@ def main(verbose: bool = True) -> dict:
         scale_ref = torch.empty_like(scale)
 
         def helion_call() -> None:
-            rms_norm_dynamic_per_token_quant(result, x_in, weight, scale, epsilon)
+            kernel(result, x_in, weight, scale, epsilon)
 
         base_calls = [
             (
@@ -276,6 +336,16 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--single-config",
+        action="store_true",
+        help="Benchmark the single checked-in multi-shape config for every shape "
+        "instead of the per-shape AOT heuristic.",
+    )
+    cli_args = parser.parse_args()
     # Verify numerics across every benchmarked shape before timing.
     correctness_check()
-    main()
+    main(single_config=cli_args.single_config)
