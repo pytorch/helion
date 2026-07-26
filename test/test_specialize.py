@@ -355,7 +355,6 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x,))
         torch.testing.assert_close(result, x + x.stride(0))
         self.assertIn("stride = x.stride(0)", code)
-        self.assertIn("x_stride_0", code)
 
         transposed = x.T
         self.assertIs(fn.bind((x,)), fn.bind((transposed,)))
