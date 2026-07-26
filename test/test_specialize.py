@@ -340,6 +340,49 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         # Verify x_size_0 is NOT passed as an argument (it should be static)
         self.assertNotIn("x_size_0", code)
 
+    def test_unspecialized_stride_is_runtime_value(self):
+        """An unspecialized stride is not inlined from the example input."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            stride = x.stride(0)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + stride
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x + x.stride(0))
+        self.assertIn("stride = x.stride(0)", code)
+        self.assertIn("x_stride_0", code)
+
+        transposed = x.T
+        self.assertIs(fn.bind((x,)), fn.bind((transposed,)))
+        torch.testing.assert_close(fn(transposed), transposed + transposed.stride(0))
+
+    def test_unspecialized_stride_host_control_flow(self):
+        """Host control flow reads an unspecialized stride at runtime."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            if x.stride(0) == 1:
+                value = 1
+            else:
+                value = 2
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + value
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        transposed = x.T
+        code, result = code_and_output(fn, (x,))
+        self.assertIn("if x.stride(0) == 1:", code)
+        torch.testing.assert_close(result, x + 2)
+        self.assertIs(fn.bind((x,)), fn.bind((transposed,)))
+        torch.testing.assert_close(fn(transposed), transposed + 1)
+
     def test_specialize_stride_basic(self):
         """Test that hl.specialize works with tensor strides."""
 
@@ -467,7 +510,9 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                     fn.bind(contiguous_args),
                     fn.bind(transposed_args),
                 )
-                torch.testing.assert_close(fn(*contiguous_args), x + 1)
+                code, result = code_and_output(fn, contiguous_args)
+                self.assertNotIn("x_stride_1", code)
+                torch.testing.assert_close(result, x + 1)
                 torch.testing.assert_close(fn(*transposed_args), transposed + 64)
 
     def test_specialize_concrete_stride_dict(self):

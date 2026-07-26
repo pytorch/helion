@@ -90,23 +90,12 @@ def specialize(value: _T) -> _T:
 def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.compile_environment import _symint_free_symbols
-    from .._compiler.variable_origin import TensorStrideOrigin
 
     if origin.is_device():
         raise exc.SpecializeOnDevice
 
     proxy = value.proxy()
     env = CompileEnvironment.current()
-
-    def record_concrete_stride(type_info: TypeInfo) -> None:
-        stride_origin = type_info.origin
-        if isinstance(stride_origin, TensorStrideOrigin):
-            source = stride_origin.to_source()
-            assert isinstance(source, TensorPropertySource)
-            env.specialized_strides.add(source)
-
-    if not env.settings.static_shapes:
-        value.tree_map(record_concrete_stride)
 
     def handle_symint(symint: torch.SymInt) -> int:
         syms = _symint_free_symbols(symint)

@@ -801,12 +801,19 @@ class CompileEnvironment:
             self._symint_cache[key] = result
         return result
 
-    def input_symint(self, value: int, source: Source) -> torch.SymInt:
-        """Represent a concrete input property symbolically during propagation."""
+    def input_symint(self, value: int | torch.SymInt, source: Source) -> torch.SymInt:
+        """Represent an input property with an independent symbolic value.
+
+        FakeTensor may express a contiguous stride in terms of a size symbol.  A
+        dynamic kernel can be reused with a different layout, so exposing that
+        expression to user code would incorrectly couple the runtime stride to
+        the runtime size.
+        """
         result = self._input_symint_cache.get(source)
         if result is None:
+            hint = self.size_hint(value)
             expr = self.shape_env.create_symbol(
-                value,
+                hint,
                 source,
                 dynamic_dim=DimDynamic.DYNAMIC,
             )
@@ -814,7 +821,7 @@ class CompileEnvironment:
                 "torch.SymInt",
                 self.shape_env.create_symintnode(
                     expr,
-                    hint=value,
+                    hint=hint,
                     source=source,
                 ),
             )

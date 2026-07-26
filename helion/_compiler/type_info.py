@@ -579,7 +579,7 @@ class TensorAttributeType(TypeInfo):
                         dim += self.tensor.fake_value.ndim
                     stride_origin = TensorStrideOrigin(self.tensor.origin, dim)
                     if (
-                        isinstance(result, int)
+                        isinstance(result, (int, torch.SymInt))
                         and not CompileEnvironment.current().settings.static_shapes
                     ):
                         result = CompileEnvironment.current().input_symint(
@@ -598,7 +598,7 @@ class TensorAttributeType(TypeInfo):
                                 stride,
                                 TensorStrideOrigin(self.tensor.origin, dim).to_source(),
                             )
-                            if isinstance(stride, int)
+                            if isinstance(stride, (int, torch.SymInt))
                             and not CompileEnvironment.current().settings.static_shapes
                             else stride,
                             TensorStrideOrigin(self.tensor.origin, dim),
