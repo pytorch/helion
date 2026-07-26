@@ -6,7 +6,6 @@ from typing import NamedTuple
 from typing_extensions import TypeVar
 
 import torch
-from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 
@@ -69,10 +68,11 @@ class ProcessGroupName(ConstExpr):
 @_decorators.api(is_device_only=False)
 def specialize(value: _T) -> _T:
     """
-    Turn dynamic shapes into compile-time constants. Examples::
+    Turn dynamic tensor sizes or strides into compile-time constants. Examples::
 
            channels = hl.specialize(tensor.size(1))
            height, width = hl.specialize(tensor.shape[-2:])
+           row_stride = hl.specialize(tensor.stride(0))
 
     Args:
         value: The symbolic value or sequence of symbolic values to specialize on.
@@ -90,12 +90,23 @@ def specialize(value: _T) -> _T:
 def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.compile_environment import _symint_free_symbols
+    from .._compiler.variable_origin import TensorStrideOrigin
 
     if origin.is_device():
         raise exc.SpecializeOnDevice
 
     proxy = value.proxy()
     env = CompileEnvironment.current()
+
+    def record_concrete_stride(type_info: TypeInfo) -> None:
+        stride_origin = type_info.origin
+        if isinstance(stride_origin, TensorStrideOrigin):
+            source = stride_origin.to_source()
+            assert isinstance(source, TensorPropertySource)
+            env.specialized_strides.add(source)
+
+    if not env.settings.static_shapes:
+        value.tree_map(record_concrete_stride)
 
     def handle_symint(symint: torch.SymInt) -> int:
         syms = _symint_free_symbols(symint)
@@ -106,10 +117,9 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
                 if (
                     isinstance(source, TensorPropertySource)
                     and source.prop == TensorProperty.STRIDE
-                    and isinstance(source.base, LocalSource)
                     and source.idx is not None
                 ):
-                    env.specialized_strides.add((source.base.local_name, source.idx))
+                    env.specialized_strides.add(source)
         return symint.__int__()
 
     _convert_specializable(proxy, on_symint=handle_symint)
@@ -131,10 +141,9 @@ def _(value: _T) -> _T:
                 if (
                     isinstance(source, TensorPropertySource)
                     and source.prop == TensorProperty.STRIDE
-                    and isinstance(source.base, LocalSource)
                     and source.idx is not None
                 ):
-                    env.specialized_strides.add((source.base.local_name, source.idx))
+                    env.specialized_strides.add(source)
         return symint
 
     return _convert_specializable(value, on_symint=handle_symint)

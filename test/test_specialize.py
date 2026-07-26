@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 import unittest
 
@@ -16,6 +17,11 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
+
+
+@dataclasses.dataclass
+class TensorContainer:
+    x: torch.Tensor
 
 
 @onlyBackends(["triton", "cute"])
@@ -362,6 +368,159 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         self.assertIn("137", code)
         # Verify x_stride_0 is NOT passed as an argument (it should be inlined)
         self.assertNotIn("x_stride_0", code)
+
+    def test_specialize_concrete_stride(self):
+        """Concrete contiguous strides are inlined and guarded in the cache key."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            stride = hl.specialize(x.stride(-1))
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + stride
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x + 1)
+        self.assertNotIn("x_stride_1", code)
+
+        transposed = x.T
+        self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+        torch.testing.assert_close(fn(transposed), transposed + 64)
+
+    def test_specialize_concrete_stride_tuple(self):
+        """A tuple of concrete strides retains each dimension's cache guard."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            stride0, stride1 = hl.specialize(x.stride())
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + stride0 * 2 + stride1
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x + 129)
+        self.assertNotIn("x_stride_0", code)
+        self.assertNotIn("x_stride_1", code)
+
+        transposed = x.T
+        self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+        torch.testing.assert_close(fn(transposed), transposed + 66)
+
+    def test_specialize_concrete_stride_keyword_dim(self):
+        """The keyword spelling retains the tensor stride origin."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            stride = hl.specialize(x.stride(dim=-1))
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + stride
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        transposed = x.T
+        self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+        torch.testing.assert_close(fn(x), x + 1)
+        torch.testing.assert_close(fn(transposed), transposed + 64)
+
+    def test_specialize_concrete_stride_expression(self):
+        """Concrete stride dependencies survive host-side arithmetic."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            stride = hl.specialize(x.stride(-1) * 2)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + stride
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        transposed = x.T
+        self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+        torch.testing.assert_close(fn(x), x + 2)
+        torch.testing.assert_close(fn(transposed), transposed + 128)
+
+    def test_specialize_concrete_stride_container(self):
+        """Tensor paths through list and tuple arguments are guarded exactly."""
+
+        for container_type in (list, tuple):
+
+            @helion.kernel(static_shapes=False, autotune_effort="none")
+            def fn(xs: list[torch.Tensor]) -> torch.Tensor:
+                x = xs[0]
+                stride = hl.specialize(x.stride(-1))
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.size()):
+                    out[tile] = x[tile] + stride
+                return out
+
+            with self.subTest(container_type=container_type.__name__):
+                x = torch.randn([64, 64], device=DEVICE)
+                transposed = x.T
+                contiguous_args = (container_type([x]),)
+                transposed_args = (container_type([transposed]),)
+                self.assertIsNot(
+                    fn.bind(contiguous_args),
+                    fn.bind(transposed_args),
+                )
+                torch.testing.assert_close(fn(*contiguous_args), x + 1)
+                torch.testing.assert_close(fn(*transposed_args), transposed + 64)
+
+    def test_specialize_concrete_stride_dict(self):
+        """Mapping paths are replayable, and static kernels need no extra guard."""
+
+        for static_shapes in (False, True):
+
+            @helion.kernel(
+                static_shapes=static_shapes,
+                autotune_effort="none",
+            )
+            def fn(xs: dict[str, torch.Tensor]) -> torch.Tensor:
+                x = xs["x"]
+                stride = hl.specialize(x.stride(-1))
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.size()):
+                    out[tile] = x[tile] + stride
+                return out
+
+            with self.subTest(static_shapes=static_shapes):
+                x = torch.randn([64, 64], device=DEVICE)
+                transposed = x.T
+                contiguous_args = ({"x": x},)
+                transposed_args = ({"x": transposed},)
+                self.assertIsNot(
+                    fn.bind(contiguous_args),
+                    fn.bind(transposed_args),
+                )
+                torch.testing.assert_close(fn(*contiguous_args), x + 1)
+                torch.testing.assert_close(fn(*transposed_args), transposed + 64)
+
+    def test_specialize_concrete_stride_dataclass(self):
+        """Attribute-like container fields retain their input source path."""
+
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(xs: TensorContainer, device: torch.device) -> torch.Tensor:
+            x = xs.x
+            stride = hl.specialize(x.stride(-1))
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + stride
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        transposed = x.T
+        contiguous_args = (TensorContainer(x), x.device)
+        transposed_args = (TensorContainer(transposed), x.device)
+        self.assertIsNot(
+            fn.bind(contiguous_args),
+            fn.bind(transposed_args),
+        )
+        torch.testing.assert_close(fn(*contiguous_args), x + 1)
+        torch.testing.assert_close(fn(*transposed_args), transposed + 64)
 
     def test_specialize_stride_creates_different_variants(self):
         """Test that different stride patterns create different kernel variants."""

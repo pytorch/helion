@@ -1011,6 +1011,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if (
             not self.env.specialized_vars
+            and not self.env.specialized_strides
             and not self.env.tensor_descriptor_layout_guards
         ):
             return []
@@ -1029,7 +1030,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     ) -> Hashable:
                         result = _inner(args)
                         # Handle list of tensors: return tuple of sizes for all tensors
-                        if isinstance(result, list):
+                        if isinstance(result, (list, tuple)):
                             return tuple(
                                 cast("torch.Tensor", t).size(_index) for t in result
                             )
@@ -1045,7 +1046,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     ) -> Hashable:
                         result = _inner(args)
                         # Handle list of tensors: return tuple of strides for all tensors
-                        if isinstance(result, list):
+                        if isinstance(result, (list, tuple)):
                             return tuple(
                                 cast("torch.Tensor", t).stride(_index) for t in result
                             )
@@ -1054,16 +1055,21 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     return stride_extractor
                 raise exc.SpecializeArgType(v)
             if isinstance(v, GetItemSource):
-                if not isinstance(v.index, int) or v.index_is_slice:
+                if not isinstance(v.index, (int, str)) or v.index_is_slice:
                     raise exc.SpecializeArgType(v)
                 inner = make_extractor(v.base)
 
                 def getitem_extractor(
                     args: Sequence[object],
                     _inner: Callable[[Sequence[object]], Hashable] = inner,
-                    _index: int = v.index,
+                    _index: int | str = v.index,
                 ) -> Hashable:
-                    return cast("Sequence[object]", _inner(args))[_index]
+                    result = _inner(args)
+                    if isinstance(result, dict):
+                        return cast("Hashable", result[_index])
+                    if isinstance(_index, str):
+                        return cast("Hashable", getattr(result, _index))
+                    return cast("Sequence[Hashable]", result)[_index]
 
                 return getitem_extractor
             if isinstance(v, LocalSource):
@@ -1075,8 +1081,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
         extractors: list[Callable[[Sequence[object]], Hashable]] = []
+        extracted_strides: set[TensorPropertySource] = set()
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
+            extractors.append(make_extractor(source))
+            if (
+                isinstance(source, TensorPropertySource)
+                and source.prop == TensorProperty.STRIDE
+                and source.idx is not None
+            ):
+                extracted_strides.add(source)
+        for source in sorted(self.env.specialized_strides, key=repr):
+            if source in extracted_strides:
+                continue
             extractors.append(make_extractor(source))
         implicit_config = self._fixed_config_for_td_layout_guards()
         for source, guard in sorted(
