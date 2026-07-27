@@ -295,6 +295,28 @@ RCP_LN2 = 1.4426950408889634
 
 
 @helion.kernel()
+def chunk_cumsum_gc_helion(g: torch.Tensor) -> torch.Tensor:
+    """Per-chunk cumulative log-decay over the chunk (C) axis.
+        gc[i] = sum_{j <= i} g[j]        # [BHN, C, D], fp32
+    Computed as the tensor-core matmul gc = L @ g with L the [C, C]
+    lower-triangular ones matrix, instead of a strided scan over the C axis
+    (dim -2 of a [BH, N, C, D] tensor) whose steps stride by D. The bf16 g is
+    exactly representable in tf32, and the sum accumulates in fp32, so gc keeps
+    the same precision as an fp32 scan while reading g once through the MMA."""
+    BHN = g.size(0)
+    C = hl.specialize(g.size(1))
+    D = g.size(2)
+    gc = torch.empty([BHN, C, D], dtype=torch.float32, device=g.device)
+    for tile_bhn, tile_d in hl.tile([BHN, D]):
+        idx = hl.arange(C)
+        ltri = (idx[:, None] >= idx[None, :]).to(torch.float32)  # [C, C] incl. diag
+        L = ltri[None, :, :].broadcast_to([tile_bhn, C, C])
+        gt = g[tile_bhn, :, tile_d].to(torch.float32)  # [b, C, d]
+        gc[tile_bhn, :, tile_d] = hl.dot(L, gt)
+    return gc
+
+
+@helion.kernel()
 def chunk_fwd_h_diag_fused(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -981,10 +1003,12 @@ def chunk_bwd_o_kda_helion(
         Atb = Aqk[tile_bhn, :, :].transpose(-2, -1).to(hdt)
         dA = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
         for tile_v in hl.tile(V):
-            dob = (do[tile_bhn, :, tile_v].to(torch.float32) * scale).to(hdt)
+            dof32 = do[tile_bhn, :, tile_v].to(torch.float32)
+            dob = (dof32 * scale).to(hdt)
             vb = v_new[tile_bhn, :, tile_v].to(hdt)
             dA = dA + hl.dot(dob, vb.transpose(-2, -1))
-            dv_new[tile_bhn, :, tile_v] = hl.dot(Atb, dob)
+            # Aqk carries scale, so dv_new pairs it with the unscaled do.
+            dv_new[tile_bhn, :, tile_v] = hl.dot(Atb, dof32.to(hdt))
         dAqk[tile_bhn, :, :] = torch.where(incl, dA, 0.0)
 
         for tile_k in hl.tile(K):
@@ -1694,8 +1718,8 @@ def chunk_fwd_A_diag_anchored_helion(
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
 
-    A = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
-    Akk = torch.zeros([BHN, C, C], dtype=torch.float32, device=q.device)
+    A = torch.zeros([BHN, C, C], dtype=q.dtype, device=q.device)
+    Akk = torch.zeros([BHN, C, C], dtype=q.dtype, device=q.device)
 
     for tile_bhn in hl.tile(BHN, block_size=1):
         kt = k[tile_bhn, :, :].float()
@@ -2133,9 +2157,9 @@ def _helion_chunked_fwd_delta(
         decay_last = g_cs[:, :, -1]
         g_cs_flat = g_cs.reshape(BHN, C)
     elif diag_anchored:
-        g_cs = g.float().reshape(BH, N, C, D).cumsum(-2)
+        g_cs_flat = chunk_cumsum_gc_helion(g.reshape(BHN, C, D))
+        g_cs = g_cs_flat.reshape(BH, N, C, D)
         decay_last = g_cs[:, :, -1, :]
-        g_cs_flat = g_cs.reshape(BHN, C, D)
 
     a_use = a if a is not None else k
     qf = q.reshape(BHN, C, D)
@@ -2188,6 +2212,10 @@ def _helion_chunked_fwd_delta(
         o = chunk_fwd_o_helion(
             qf, kf, vnewf, g_cs_flat, hf, use_g=scalar_decay, scale=scale
         )
+
+    if diag_anchored:
+        # Attach cached data to h_all for the backward to use.
+        h_all._kda_bwd_cache = (g_cs_flat, Aqk, Akk)  # pyrefly: ignore
 
     final_state = None
     if return_final_state:
@@ -2558,11 +2586,6 @@ def _helion_chunked_bwd_kda(
     BH = B * H
     BHN = BH * N
 
-    # Cumulative per-chunk log-decay: the state kernels (fed gc4) and the WY /
-    # output / gram kernels (fed g_cs_flat) all expect the cumsum, not raw g.
-    gc4 = g.float().reshape(BH, N, C, D).cumsum(-2)
-    g_cs_flat = gc4.reshape(BHN, C, D)
-
     qf = q.reshape(BHN, C, D)
     kf = k.reshape(BHN, C, D)
     vf = v.reshape(BHN, C, DV)
@@ -2572,8 +2595,16 @@ def _helion_chunked_bwd_kda(
     Tinv = A_inv
     dof = grad_output.reshape(BHN, C, DV)
 
-    # Recompute the anchored grams (cheap; needed for dv_new/dAqk and dbeta/gram2).
-    Aqk, Akk = chunk_fwd_A_diag_anchored_helion(qf, kf, g_cs_flat, 1.0, build_kk=True)
+    # Reuse the forward's cached cumsum and anchored grams when available.
+    bwd_cache = getattr(h_all, "_kda_bwd_cache", None)
+    if bwd_cache is not None:
+        g_cs_flat, Aqk, Akk = bwd_cache
+    else:
+        g_cs_flat = chunk_cumsum_gc_helion(g.reshape(BHN, C, D))
+        Aqk, Akk = chunk_fwd_A_diag_anchored_helion(
+            qf, kf, g_cs_flat, scale, build_kk=True
+        )
+    gc4 = g_cs_flat.reshape(BH, N, C, D)
 
     # scale folds into the do load here; dh/dAqk/dv_new carry it downstream, so the
     # state kernels and gram2 (fed dAqk/dAkk) stay at 1.0 to avoid double-counting.
