@@ -1408,7 +1408,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(actual_quantized.float(), expected_quantized.float())
         torch.testing.assert_close(actual_scales, expected_scales)
 
-    @skipIfCute("Test validates frontend reshape constraints")
     @skipIfRefEager("Test validates compiler block-size constraints")
     def test_tile_reshape_additive_constraint(self):
         @helion.kernel(config=helion.Config(block_sizes=[2, 2]))
@@ -1431,7 +1430,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             bound.config_spec.normalize(helion.Config(block_sizes=[4, 4]))
         torch.testing.assert_close(bound(x), x)
 
-    @skipIfCute("Test validates frontend reshape constraints")
     @skipIfRefEager("Test validates compiler block-size constraints")
     def test_tile_reshape_modulo_constraint(self):
         @helion.kernel(config=helion.Config(block_sizes=[4, 128]))
@@ -1462,7 +1460,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             bound.config_spec.normalize(helion.Config(block_sizes=[4, 64]))
         torch.testing.assert_close(bound(x), x)
 
-    @skipIfCute("Test validates frontend reshape constraints")
     @skipIfRefEager("Test validates compiler block-size constraints")
     def test_tile_reshape_unsatisfiable_constraint(self):
         @helion.kernel
