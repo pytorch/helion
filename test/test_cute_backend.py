@@ -4855,7 +4855,12 @@ class TestCuteBackend(TestCase):
                 "tcgen05_cluster_m": 2,
             }
             bound.config_spec.normalize(projected, _fix_invalid=True)
-            self.assertEqual(projected["block_sizes"], [1, 256, 256, 64])
+            # Stage 2b made a generic DEFAULT-layout bn=128 cluster_m=2 tile
+            # searchable for the batched leading-passthrough family, so the
+            # sampled block_n=128 (index 2) now SURVIVES at 128 instead of
+            # snapping to the canonical 256. block_m (index 1) is still pinned
+            # to 256.
+            self.assertEqual(projected["block_sizes"], [1, 256, 128, 64])
             self.assertEqual(projected["pid_type"], "persistent_interleaved")
 
             def search_spec(m: int, n: int, k: int) -> ConfigSpec:
@@ -4910,8 +4915,19 @@ class TestCuteBackend(TestCase):
             "helion.language.matmul_ops._cuda_num_sms_or_zero",
             return_value=148,
         ):
-            self.assertEqual(cluster_choices(32), (1,))
-            self.assertEqual(cluster_choices(64), (1, 2))
+            # The wave-quant gate multiplies the per-batch output-cluster count
+            # by the batch (``leading_work_multiplier``); cluster_m=2 search is
+            # only admitted once that product clears ``num_sms // 4`` (= 37).
+            # Stage 2b made the batched leading-passthrough family search a
+            # bn=128 cluster_m=2 tile, so the count is taken at the narrow tile
+            # (256x128 -> 256//256 * 256//128 = 2 clusters per batch), moving the
+            # threshold to batch >= 19 (2 * 19 = 38 >= 37). A small batch that
+            # underfills stays cluster_m=1; a large batch enables cluster_m=2.
+            # If the batch factor were NOT counted the product would be a
+            # batch-independent 2 and cluster_m=2 would never enable -- so this
+            # boundary is what proves batch clusters are counted.
+            self.assertEqual(cluster_choices(16), (1,))
+            self.assertEqual(cluster_choices(32), (1, 2))
 
     def test_batched_direct_entry_seeds_match_epilogue_support(self) -> None:
         support = get_cute_mma_support()

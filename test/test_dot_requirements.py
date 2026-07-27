@@ -489,17 +489,24 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         is narrowed for shapes whose cluster_m=2 work-cluster count
         cannot saturate even a quarter-wave of cluster slots.
 
-        The gate measures ``(M / 256) * (N / 256)`` cluster_m=2 work
-        clusters and compares against ``num_sms // 4``. The threshold
-        was lowered from ``num_sms // 2`` (one full wave of 2-SM cluster
-        slots) because the generalized TVM-FFI direct entry has a much
-        lower launch/epilogue overhead and wins at ~64 work clusters
-        (0.86 of a wave on a 148-SM B200). With the SM count mocked to
-        B200's 148 the threshold is 37 cluster slots: 1024^3 sits at 16
-        clusters (< 37) and narrows to ``cluster_m=1`` only, while 2048^3
-        sits at 64 clusters (>= 37) and now KEEPS cluster_m=2 search
-        exposed. The 4096^3 G2 closure baseline (256 clusters) also keeps
-        cluster_m=2 search (covered by
+        Stage 2: the gate counts work clusters at the NARROWEST N tile
+        the full-tile cluster_m=2 search admits — ``(M / 256) * (N / 128)``
+        (block_n=128, a 256x128 output tile) rather than the 256x256
+        artifact ``(M / 256) * (N / 256)``. A block_n=128 cm2 tile produces
+        2x the clusters and fills the device where a 256x256 cm2 would
+        underfill, so counting at the tile the search can actually pick
+        keeps the gate honest for the bn=128 default-layout cm2 path (the
+        +8.3% 512x4096x4096 win). The comparison is against ``num_sms // 4``
+        (lowered from ``num_sms // 2`` because the generalized TVM-FFI
+        direct entry wins at ~0.86 of a wave). With the SM count mocked to
+        B200's 148 the threshold is 37 cluster slots: 1024^3 sits at 32
+        clusters ((1024/256)*(1024/128) = 4*8) < 37 and narrows to
+        ``cluster_m=1`` only, while 2048^3 sits at 128 clusters (>= 37) and
+        KEEPS cluster_m=2 search exposed. The 512x4096x4096 medium-M shape
+        now sits at 64 clusters ((512/256)*(4096/128) = 2*32) >= 37 and is
+        ADMITTED (it was suppressed under the old 256x256 count at 32
+        clusters) — the Stage-2 behavior change. The 4096^3 G2 closure
+        baseline (512 clusters) also keeps cluster_m=2 search (covered by
         ``test_cute_tcgen05_two_cta_enters_validated_search_space``).
 
         Mocking ``_cuda_num_sms_or_zero`` keeps the test hermetic:
@@ -519,10 +526,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        def bind_at(size: int):
+        def bind_at(size: int, n: int | None = None):
+            n = size if n is None else n
             args = (
                 torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
-                torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
+                torch.empty([size, n], device=DEVICE, dtype=HALF_DTYPE),
             )
             with (
                 patch_cute_mma_support(),
@@ -533,10 +541,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             ):
                 return cute_matmul_mma.bind(args).config_spec
 
-        # Suppressed: 1024^3 = 16 cluster slots < 148 // 4 = 37. cluster_m=2
-        # search is suppressed and the cluster_m2 seed / fixup machinery is
-        # disabled so the autotuner never spends budget on the cluster_m=2 seed
-        # for a shape where it has no productive lever.
+        # Suppressed: 1024^3 = (1024/256)*(1024/128) = 32 cluster slots < 148 // 4
+        # = 37 (counted at the narrow-N block_n=128 tile). cluster_m=2 search is
+        # suppressed and the cluster_m2 seed / fixup machinery is disabled so the
+        # autotuner never spends budget on the cluster_m=2 seed for a shape where
+        # it has no productive lever.
         suppressed_spec = bind_at(1024)
         self.assertEqual(suppressed_spec._tcgen05_cluster_m_search_choices, (1,))
         self.assertIsNone(suppressed_spec._tcgen05_cluster_m2_search_constraints)
@@ -551,15 +560,29 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertIn("persistent_interleaved", suppressed_spec.allowed_pid_types)
         self.assertIn("persistent_blocked", suppressed_spec.allowed_pid_types)
 
-        # Admitted (positive control for the lowered // 4 boundary): 2048^3 = 64
-        # cluster slots >= 37. cluster_m=2 search stays exposed, its constraints
-        # are recorded, and the cluster_m=2 seed heuristic is registered.
+        # Admitted (positive control for the lowered // 4 boundary): 2048^3 =
+        # (2048/256)*(2048/128) = 128 cluster slots >= 37. cluster_m=2 search
+        # stays exposed, its constraints are recorded, and the cluster_m=2 seed
+        # heuristic is registered.
         admitted_spec = bind_at(2048)
         self.assertEqual(admitted_spec._tcgen05_cluster_m_search_choices, (1, 2))
         self.assertIsNotNone(admitted_spec._tcgen05_cluster_m2_search_constraints)
         self.assertIn(
             CuteTcgen05ClusterM2Heuristic.name,
             admitted_spec.autotuner_heuristics,
+        )
+
+        # Stage 2 behavior change: the 512x4096x4096 medium-M shape sits at
+        # (512/256)*(4096/128) = 64 clusters counted at the narrow-N tile
+        # (>= 37, ADMITTED), where the old 256x256 count put it at
+        # (512/256)*(4096/256) = 32 (< 37, suppressed). This is the shape whose
+        # bn=128 cm2 + ab4 config runs +8.3% over the cm1 winner.
+        s2_spec = bind_at(512, n=4096)
+        self.assertEqual(s2_spec._tcgen05_cluster_m_search_choices, (1, 2))
+        self.assertIsNotNone(s2_spec._tcgen05_cluster_m2_search_constraints)
+        self.assertIn(
+            CuteTcgen05ClusterM2Heuristic.name,
+            s2_spec.autotuner_heuristics,
         )
 
     @onlyBackends(["cute"])
@@ -787,8 +810,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(two_cta_config["tcgen05_cluster_m"], 2)
         self.assertEqual(two_cta_config["pid_type"], "persistent_interleaved")
         # The ordinary cluster_m=2 arm preserves its valid bk=16 sample instead
-        # of collapsing into the distinct bk=128 FFI direct-entry seed.
-        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 16])
+        # of collapsing into the distinct bk=128 FFI direct-entry seed. The
+        # sub-128 sampled block_n rounds UP to the narrow 128 cm2 tile (the
+        # un-seeded [256,128,*] tile that only search can reach), not to 256.
+        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 128, 16])
         self.assertIs(two_cta_config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], False)
 
     @onlyBackends(["cute"])
@@ -904,12 +929,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
         # Cycle 97: ab=3 is BUDGET-AWARE-SEARCHABLE — the for_search cap is lifted
-        # to 3 wherever the SMEM-budget constraints were recorded (here: the mocked
-        # B200 budget), so the autotuner can SAMPLE ab=3 directly. A sampled ab=3
-        # that does not fit is then demoted by ``_fix_ab_stages_search_config`` (the
-        # over-budget cases below). The validation surface is independently 3 for
-        # explicit configs.
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+        # wherever the SMEM-budget constraints were recorded (here: the mocked
+        # B200 budget), so the autotuner can SAMPLE deeper AB directly. A sampled
+        # candidate that does not fit is then demoted by
+        # ``_fix_ab_stages_search_config`` (the over-budget cases below).
+        # Stage 2: the 16-bit for_search cap is 4 (not 3) so the DEFAULT-layout
+        # narrow-N (block_n=128) cluster_m=2 tile can search ab=4 — the
+        # ``[256,128,128] cm2 ab4`` config that runs +8.3% over the cm1 winner on
+        # 512x4096x4096 bf16 (196 608 B fits the 203 776 B budget). ab=4 at the
+        # canonical 256x256 tile overflows (262 144 B) and is demoted after
+        # shaping; the validation surface is independently 6 for explicit FFI /
+        # deep-AB configs.
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 4)
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the validation
         # surface admits the deeper FFI direct-entry stage tuples — up to ab=6
@@ -931,6 +962,36 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec.normalize(keep_config, _fix_invalid=True)
         self.assertEqual(keep_config["tcgen05_ab_stages"], 3)
         self.assertEqual(keep_config["tcgen05_cluster_m"], 2)
+
+        # Stage 2: the DEFAULT-layout narrow-N cluster_m=2 tile ([256,128,128])
+        # fits ab=4 in the B200 budget (196 608 bytes) and survives search
+        # normalization as [256,128,128] cm2 ab4 — the +8.3% config.
+        bn128_cm2_ab4 = {
+            "block_sizes": [256, 128, 128],
+            "l2_groupings": [2],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": 4,
+        }
+        spec.normalize(bn128_cm2_ab4, _fix_invalid=True)
+        self.assertEqual(bn128_cm2_ab4["block_sizes"], [256, 128, 128])
+        self.assertEqual(bn128_cm2_ab4["tcgen05_cluster_m"], 2)
+        self.assertEqual(bn128_cm2_ab4["tcgen05_ab_stages"], 4)
+
+        # A cluster_m=2 candidate whose sampled block_n snaps to the canonical
+        # 256 (the shaped [256,256,128] cm2 tile) overflows at ab=4
+        # (262 144 bytes) and must be demoted to the fitting ab=3.
+        canonical_cm2_ab4 = {
+            "block_sizes": [256, 256, 128],
+            "l2_groupings": [4],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": 4,
+        }
+        spec.normalize(canonical_cm2_ab4, _fix_invalid=True)
+        self.assertEqual(canonical_cm2_ab4["block_sizes"], [256, 256, 128])
+        self.assertEqual(canonical_cm2_ab4["tcgen05_cluster_m"], 2)
+        self.assertEqual(canonical_cm2_ab4["tcgen05_ab_stages"], 3)
 
         # ab=3 over-budget shapes get demoted to ab=2. The cute_dsl
         # ptxas failure is the loud backstop for explicit user configs
@@ -1030,7 +1091,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 )
             self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+            # Stage 2: 16-bit for_search AB cap is 4 (narrow-N cm2 ab4 searchable).
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 4)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
