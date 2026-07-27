@@ -15824,9 +15824,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         kernel = self._bias_residual_gelu_kernel()
         args = (
             torch.empty([640, 128], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 642], device=DEVICE, dtype=torch.bfloat16),
+            # Keep the row-vector extent unaligned while giving the matrix
+            # operands valid 16-byte-aligned padded TMA strides.
+            torch.empty([128, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
             torch.empty([642], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([640, 642], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([640, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
         )
 
         with patch_cute_mma_support():
