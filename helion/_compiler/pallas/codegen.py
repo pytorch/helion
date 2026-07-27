@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
+from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,17 +37,22 @@ def load_expr(
     device_fn.device_memory_op_index += 1
 
     assert state.fx_node is not None
-    patterns = state.fx_node.meta.get("indexing_patterns") or ()
+    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
     for pattern in patterns:
         if isinstance(pattern, IndirectGatherPattern):
             return emit_gather(state, pattern.plan, name)
 
-    idx_str, none_dims = index_str(state, subscript, tensor)
+    parts, none_dims = index_parts(state, subscript, tensor)
+    scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
+    if scalar_load is None:
+        result = expr_from_string(f"{name}[{', '.join(parts)}]")
+    else:
+        result = emit_vmem_scalar_load(tensor, name, parts, scalar_load)
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
-        result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
-    else:
-        result = expr_from_string(f"{name}[{idx_str}]")
+        result = expr_from_string(
+            "{result} * ({mask})", result=result, mask=expr_from_string(mask_expr)
+        )
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
