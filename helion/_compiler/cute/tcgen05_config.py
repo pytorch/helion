@@ -2078,39 +2078,110 @@ class CuteTcgen05Config:
             or config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) is not None
         )
 
-    @staticmethod
-    def _clear_target1_tvm_ffi_promotion_surface(config: dict[str, object]) -> None:
-        for key in list(config):
-            if key.startswith("tcgen05_") or key == "epilogue_subtile":
-                config.pop(key, None)
+    def _strip_target1_tvm_ffi_promotion_surface(
+        self, config: dict[str, object]
+    ) -> None:
+        """Repair a config AWAY from the FFI envelope, in place.
+
+        Turns off the FFI-only controls and returns the layout to DEFAULT,
+        leaving every other sampled key (tile, cluster, stage counts, swizzle,
+        pid_type, warp spec, indexing) untouched. The four layout keys move as
+        one unit because ``validate_tcgen05_strategy_invariants`` couples them:
+        ``explicit_epi_tile`` requires all three overrides set (and
+        ``d_store_box_n == epi_tile_n``), while any override set requires
+        ``explicit_epi_tile``. The result is an ordinary DEFAULT-layout
+        candidate whose epilogue tile is derived from bm/bn.
+        """
+        config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
+        config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
+        if (
+            config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+        ):
+            config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
+                Tcgen05LayoutStrategy.DEFAULT.value
+            )
+        for key in (
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
+            TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
+        ):
+            config[key] = None
+
+    # Keys that define the FFI direct-entry envelope: the six promotion-request
+    # controls plus the tile/cluster shape the ``flat_role`` codegen guard pins.
+    # Deliberately NOT every ``tcgen05_`` key in the seed -- derived fields such
+    # as ``tcgen05_persistence_model`` are still unset at this point in
+    # normalization (it is derived from ``pid_type`` later), so comparing them
+    # would make even the seed itself look incoherent.
+    _TARGET1_TVM_FFI_ENVELOPE_KEYS: tuple[str, ...] = (
+        TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
+        TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+        TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+        TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
+        TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
+        TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
+        "block_sizes",
+        "tcgen05_cluster_m",
+        "tcgen05_cluster_n",
+    )
+
+    def _is_coherent_target1_tvm_ffi_config(
+        self, config: dict[str, object], seed: Config
+    ) -> bool:
+        """True when *config* already carries the seed's full FFI envelope.
+
+        Such a config is already a valid direct-entry kernel, so there is
+        nothing to project: it is left exactly as sampled.
+        """
+        return all(
+            config.get(key) == seed.config[key]
+            for key in self._TARGET1_TVM_FFI_ENVELOPE_KEYS
+            if key in seed.config
+        )
 
     def _fix_target1_tvm_ffi_search_config(self, config: dict[str, object]) -> None:
-        # The generalized direct-entry seed projects FFI-requesting search
-        # candidates onto the validated CtaGroup.TWO envelope for ANY eligible
-        # shape (returns None for ineligible shapes, in which case the
-        # promotion surface is stripped back to the DEFAULT layout below).
-        seed = self.full_tile_direct_entry_seed_config()
+        # Three populations reach this gate, and they want different handling.
+        #
+        # (1) A config that ALREADY carries the complete, valid FFI envelope --
+        #     however it got here (sampled, seeded, user-written). It is a valid
+        #     direct-entry kernel as-is, so keep it untouched; projecting would
+        #     only overwrite keys outside the envelope that it legitimately
+        #     chose.
+        #
+        # (2) An EXPLICIT but PARTIAL ``tvm_ffi_launch=True`` -- a user config or
+        #     a cache entry that asks for FFI without the rest of the envelope.
+        #     The search never produces this: the flag is drawn False-only
+        #     (``EnumFragment((True, False), search_choices=(False,))`` in
+        #     ``optional_fragments``), so True is always deliberate. Project it
+        #     onto the validated envelope, exactly as before -- an explicit
+        #     request must not be silently downgraded, and a partial one cannot
+        #     compile on its own.
+        #
+        # (3) A SEARCH candidate that trips the gate through one of the five
+        #     OTHER keys in ``_target1_tvm_ffi_promotion_requested`` (flat-role,
+        #     ``explicit_epi_tile``, or the three epi-tile overrides). Those are
+        #     independent draws, so ~95% of candidates land here carrying a
+        #     partial envelope. Projecting each of them onto the seed collapsed
+        #     the population to a single config (measured: 293/300 candidates ->
+        #     1 distinct config, 0 of 30 keys varying), which is not a search --
+        #     and it was never needed for coverage, because the FFI envelope is
+        #     already in the population as an eligibility-gated seed
+        #     (``CuteTcgen05ClusterM2FfiHeuristic`` + the formula FFI-alt), which
+        #     ``_generate_best_available_population_flat`` also pins as a
+        #     finalist. These are repaired AWAY from FFI, keeping the ~20 other
+        #     keys the search chose (measured: 299/300 distinct).
         if not self._target1_tvm_ffi_promotion_requested(config):
             return
-        if seed is None:
-            config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
-            config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
-            if (
-                config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
-                == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
-            ):
-                config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
-                    Tcgen05LayoutStrategy.DEFAULT.value
-                )
-            for key in (
-                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
-                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
-                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
-            ):
-                config[key] = None
-            return
-        self._clear_target1_tvm_ffi_promotion_surface(config)
-        config.update(seed.config)
+        seed = self.full_tile_direct_entry_seed_config()
+        if seed is not None:
+            if self._is_coherent_target1_tvm_ffi_config(config, seed):
+                return
+            if config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
+                self._strip_target1_tvm_ffi_promotion_surface(config)
+                config.update(seed.config)
+                return
+        self._strip_target1_tvm_ffi_promotion_surface(config)
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._aux_tma_search_enabled():
@@ -2675,11 +2746,19 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        # The FFI repair runs FIRST, before the cluster_m=2 block shaping. It
+        # only rewrites the FFI-only controls + layout keys, so the shaping below
+        # then sees a settled layout: a repaired candidate is DEFAULT-layout and
+        # so its sampled bn<=128 can snap to the un-seeded [256,128,*] tile,
+        # instead of being forced to 256 by the ``layout == DEFAULT`` guard in
+        # ``_fix_cluster_m2_search_config`` reading a pre-repair
+        # ``explicit_epi_tile``. (When this ran after the shaping, every repaired
+        # candidate landed on the already-seeded 256x256 tile.)
+        self._fix_target1_tvm_ffi_search_config(config)
         self._fix_aux_edge_search_config(config)
         self._fix_cluster_m2_search_config(config)
         self._fix_cluster_m1_persistent_search_config(config)
         self._fix_ab_stages_three_search_config(config)
-        self._fix_target1_tvm_ffi_search_config(config)
         self._fix_aux_tma_full_tile_search_config(config)
         self._fix_with_scheduler_search_config(config)
         self._fix_aux_tma_search_config(config)
