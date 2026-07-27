@@ -1423,8 +1423,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 return int(str(raw[0])) if raw else 1
             return int(str(raw))
 
-        m_pid = self.pid_info[0]
-        n_pid = self.pid_info[1]
+        # M and N are the trailing two PID axes; any leading axes are
+        # passthrough (batch) that only offset memory (mirrors
+        # ``_specialized_mma_root_mn_block_ids``), so read M/N from the tail
+        # rather than positions 0/1. NOTE: the coord extraction below linearizes
+        # over M/N only. Batched *partial*-tile edge splitting would also need
+        # the leading passthrough factored out of the virtual pid; that is not a
+        # validated path (the multi-tile guard restricts batched 2-CTA to static
+        # full tiles, for which this predicate is true for every tile anyway).
+        m_pid = self.pid_info[-2]
+        n_pid = self.pid_info[-1]
         virtual_pid = self._tcgen05_linear_virtual_pid_expr(work_tile_var)
         num_pid_m = m_pid.num_pids_expr(is_device=True)
         l2_group = l2_grouping()

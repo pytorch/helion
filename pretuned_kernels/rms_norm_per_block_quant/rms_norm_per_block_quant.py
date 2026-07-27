@@ -16,7 +16,6 @@ from __future__ import annotations
 import torch
 
 import helion
-import helion.experimental
 import helion.language as hl
 
 # float8_e4m3fn numeric traits, used by the torch-native reference below. The
@@ -37,7 +36,7 @@ except ImportError:
     _HAS_VLLM = False
 
 
-@helion.experimental.aot_kernel(
+@helion.aot_kernel(
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def rms_norm_per_block_quant(

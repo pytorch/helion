@@ -408,6 +408,9 @@ class _Settings:
             False,
         )
     )
+    distributed: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED", False)
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_log_details: bool = dataclasses.field(
@@ -633,6 +636,12 @@ class Settings(_Settings):
         "autotune_force_persistent": (
             "If True, restrict pid_type choices to persistent kernels only during config selection. "
             "Set HELION_AUTOTUNE_FORCE_PERSISTENT=1 to force persistent kernel autotuning globally."
+        ),
+        "distributed": (
+            "Force distributed compilation behavior (persistent-only PID types, signal-pad SM "
+            "limits, and process-group resolution). Normally auto-detected from symmetric-memory "
+            "tensor arguments; set this for distributed kernels whose symmetric memory is not passed "
+            "as a detectable tensor. Set HELION_DISTRIBUTED=1 to force globally."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "

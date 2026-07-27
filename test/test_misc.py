@@ -1182,7 +1182,7 @@ class TestHelionTritonPrinter(TestCase):
         import sympy
         from torch.utils._sympy.functions import ToFloat
 
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.triton.printer import HelionTritonPrinter
 
         printer = HelionTritonPrinter()
 
@@ -1205,7 +1205,7 @@ class TestHelionTritonPrinter(TestCase):
         """Test that Float expressions are printed as raw literals."""
         import sympy
 
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.triton.printer import HelionTritonPrinter
 
         printer = HelionTritonPrinter()
 
@@ -1230,7 +1230,7 @@ class TestHelionTritonPrinter(TestCase):
         from torch.utils._sympy.functions import FloorDiv
 
         from helion._compiler.device_function import DeviceFunction
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.triton.printer import HelionTritonPrinter
 
         printer = HelionTritonPrinter()
 

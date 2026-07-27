@@ -345,7 +345,7 @@ class TestXCDRemapCodegen(TestCase):
         from pathlib import Path
         import tempfile
 
-        from helion.experimental.aot_compile import generate_standalone_file
+        from helion.autotuner.aot_compile import generate_standalone_file
 
         x, y = self._args()
         code, _ = code_and_output(
