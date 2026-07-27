@@ -16,19 +16,19 @@ The AOT workflow consists of four phases:
 
 Usage:
     # Run the full workflow using the AOT runner
-    python -m helion.experimental.aot_runner -- python examples/aot_example.py
+    python -m helion.autotuner.aot_runner -- python examples/aot_example.py
 
     # Run only specific kernels
-    python -m helion.experimental.aot_runner --kernel row_softmax -- python examples/aot_example.py
+    python -m helion.autotuner.aot_runner --kernel row_softmax -- python examples/aot_example.py
 
     # Or run individual phases manually:
     HELION_AOT_MODE=collect HELION_AOT_DATA_DIR=./aot_data python examples/aot_example.py
     HELION_AOT_MODE=measure HELION_AOT_DATA_DIR=./aot_data python examples/aot_example.py
 
-Using @helion.experimental.aot_kernel():
-    The simplest way to use AOT autotuning is with the @helion.experimental.aot_kernel() decorator:
+Using @helion.aot_kernel():
+    The simplest way to use AOT autotuning is with the @helion.aot_kernel() decorator:
 
-    @helion.experimental.aot_kernel()
+    @helion.aot_kernel()
     def my_kernel(...):
         ...
 
@@ -45,9 +45,9 @@ import os
 
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion.autotuner.benchmarking import do_bench_generic as do_bench
-import helion.experimental
 import helion.language as hl
 
 # ============================================================================
@@ -55,7 +55,7 @@ import helion.language as hl
 # ============================================================================
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def vector_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
     """Scale a vector by a constant."""
     n = x.size(0)
@@ -72,7 +72,7 @@ def vector_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
 # ============================================================================
 
 
-@helion.experimental.aot_kernel(static_shapes=False)
+@helion.aot_kernel(static_shapes=False)
 def row_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Row-wise softmax with explicit 2D tiling.
@@ -111,7 +111,7 @@ def row_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     """
     Column-wise sum reduction with 2D tiling.
@@ -144,7 +144,7 @@ def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 # ============================================================================
 
 
-@helion.experimental.aot_kernel(batched=[[0, None], None])
+@helion.aot_kernel(batched=[[0, None], None])
 def rms_norm_batched(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """RMS normalization with batch-aware heuristic.
 
@@ -194,7 +194,7 @@ def _rms_norm_oneshot_measure_inputs() -> list[tuple[torch.Tensor, float]]:
     ]
 
 
-@helion.experimental.aot_kernel(
+@helion.aot_kernel(
     batched=[[0, None], None],
     collect_fn=_rms_norm_oneshot_collect_inputs,
     measure_fn=_rms_norm_oneshot_measure_inputs,
@@ -242,7 +242,7 @@ def _matmul_key(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int, int, int]:
     return (m, n, k, a.element_size())
 
 
-@helion.experimental.aot_kernel(key=_matmul_key)
+@helion.aot_kernel(key=_matmul_key)
 def matmul_custom_key(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Matrix multiplication with custom key function for heuristic.
 
@@ -269,7 +269,7 @@ def matmul_custom_key(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def sum_aot(x: torch.Tensor) -> torch.Tensor:
     """
     Sums a 2D tensor along the last dimension.
@@ -516,9 +516,7 @@ def main() -> None:
         print()
     else:
         print(f"Running in AOT mode: {aot_mode}")
-        print(
-            "(Using @helion.experimental.aot_kernel() for automatic AOT configuration)"
-        )
+        print("(Using @helion.aot_kernel() for automatic AOT configuration)")
         print()
 
     benchmark_kernels(kernels)

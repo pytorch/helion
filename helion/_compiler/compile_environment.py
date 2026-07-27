@@ -25,7 +25,6 @@ from torch._inductor.codegen.wrapper import (
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
-import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
@@ -223,6 +222,7 @@ class CompileEnvironment:
         settings: Settings,
         *,
         index_dtype: torch.dtype | None = None,
+        is_distributed: bool = False,
     ) -> None:
         from ..autotuner.config_spec import ConfigSpec
 
@@ -312,14 +312,19 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
-        if settings.autotune_force_persistent or dist.is_initialized():
+        if settings.autotune_force_persistent or is_distributed:
             for pid_type in (
                 "flat",
                 "xyz",
             ):
                 self.config_spec.disallow_pid_type(pid_type)
 
-        if dist.is_initialized():
+        # CUDA symmetric-memory persistent-kernel sizing only. Guard on CUDA: the
+        # Pallas/TPU backend traces with a cpu-device torch tensor (the torch<->jax
+        # bridge), so under a multi-host (dist-initialized) serve this would call
+        # get_num_sm(cpu) -> "TODO: implement for other devices" and crash the
+        # kernel compile. _SymmetricMemory / SM-multiplier are irrelevant to Pallas.
+        if is_distributed and device.type == "cuda":
             from torch._C._distributed_c10d import _SymmetricMemory
 
             from .._dist_utils import max_num_blocks_for_symm_mem
@@ -622,6 +627,11 @@ class CompileEnvironment:
             source_expr = _symint_expr(source.value)
             if isinstance(source_expr, sympy.Symbol):
                 self.shape_env._constrain_unify(source.value, info.var)
+                # Match the block var's hint to the size it is now unified with,
+                # so both agree once the shared range is narrowed.
+                shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
+                    self.size_hint(source.value)
+                )
 
         from .host_function import HostFunction
         from .host_function import SymbolOrigin

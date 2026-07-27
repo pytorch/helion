@@ -15,7 +15,8 @@ fx_node — and is the loud-failure backstop. This module owns the
 expression for two cases:
 
 - Unary chains: ``matmul -> [whitelisted unary op]* ->
-  convert_element_type -> store``, where every op in the chain has
+  [convert_element_type] -> store``, where the terminal cast is omitted for
+  same-dtype stores and every op in the chain has
   exactly one tensor input (the prior tensor result) and zero or more
   compile-time scalar arguments.
 - Auxiliary-tensor binary ops: same shape as above, but one or more
@@ -435,8 +436,8 @@ class Tcgen05UnaryEpilogueChain:
     """A renderable whitelisted chain rooted at a tcgen05 matmul.
 
     ``steps`` is in *application order*: ``steps[0]`` is the op closest
-    to the matmul; ``steps[-1]`` is the op closest to the
-    ``convert_element_type`` cast at the store. A step is either a
+    to the matmul; ``steps[-1]`` is the op closest to the optional store cast.
+    A step is either a
     ``_UnaryStep`` (zero-arg unary or scalar binary) or an
     ``_AuxiliaryTensorStep`` (binary op with the chain carrier +
     a ``helion.language.load`` of an auxiliary GMEM tensor). The
@@ -503,17 +504,15 @@ class Tcgen05UnaryEpilogueChain:
         carries the per-thread auxiliary load value. Pure unary
         chains pass ``None``.
 
-        Identity epilogues do not reach this method: the analyzer in
-        :func:`analyze_tcgen05_unary_epilogue_chain` returns ``None``
-        for the no-step case so the splice site stays out of the
-        picture (the ``ast.Name`` fast path already handles identity
-        stores). Empty chains here would indicate a caller bug.
+        Identity epilogues do not reach this method: the analyzer returns an
+        empty chain for that case, and the splice site leaves it to the
+        existing ``ast.Name`` fast path. Empty chains here would indicate a
+        caller bug.
         """
         assert self.steps, (
             "render_prelude_and_expr is only valid for chains with at "
             "least one step; identity epilogues should never reach the "
-            "splice site (the analyzer returns None for them so the "
-            "ast.Name fast path handles them)"
+            "splice site (the ast.Name fast path handles them)"
         )
         aux_steps = self.auxiliary_tensor_steps
         if aux_steps:
@@ -954,12 +953,12 @@ def analyze_tcgen05_unary_epilogue_chain(
     """Classify ``value_node``'s producer chain as a whitelisted
     epilogue rooted at a tcgen05 matmul.
 
-    Expected shape: ``value_node`` is the user-side store value, which
-    Helion has wrapped in an implicit ``convert_element_type`` to the
-    store-target tensor's dtype. The chain we accept is, walking
-    upstream from ``value_node``:
+    ``value_node`` is the user-side store value. Helion normally wraps it in an
+    implicit ``convert_element_type`` to the store-target dtype, but elides that
+    no-op when the value already has the target dtype. The chain we accept is,
+    walking upstream from ``value_node``:
 
-        convert_element_type (the implicit cast) ->
+        [convert_element_type (the optional implicit cast)] ->
         [whitelisted op]* ->
         accumulator carrier (phi / getitem on for_loop output ->
         registered tcgen05 matmul fx_node).
@@ -987,9 +986,9 @@ def analyze_tcgen05_unary_epilogue_chain(
     pinned by ``test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch``.
 
     Returns ``(chain, matmul_anchor)`` on success — the rendered chain
-    excludes the trailing ``convert_element_type`` (the splice site
-    already emits ``.to(target_dtype)`` where ``target_dtype`` is the
-    store-target tensor's dtype), and the anchor is the unique
+    excludes the optional trailing ``convert_element_type`` (the splice site
+    emits ``.to(target_dtype)`` where ``target_dtype`` is the store-target
+    tensor's dtype), and the anchor is the unique
     tcgen05 matmul fx_node whose ``result_var`` the splice should
     target. Returns ``None`` if the chain is not in the whitelist or
     multiple matmul anchors are reachable along the carrier path
@@ -997,8 +996,8 @@ def analyze_tcgen05_unary_epilogue_chain(
     to the loud-failure ``BackendUnsupported`` raise on ``None`` so
     the diagnostic keeps firing for non-whitelisted shapes.
 
-    The chain may have ``steps == ()`` — i.e. ``out[tile] =
-    acc.to(x.dtype)`` — in which case the splice site emits the
+    The chain may have ``steps == ()`` — i.e. ``out[tile] = acc`` or
+    ``out[tile] = acc.to(x.dtype)`` — in which case the splice site emits the
     existing identity ``.to(target_dtype)`` line unchanged. The fast-
     path ``ast.Name``-matching code in ``store_codegen`` handles the
     identity case earlier; the empty-chain return from this function
@@ -1017,18 +1016,17 @@ def analyze_tcgen05_unary_epilogue_chain(
     if not target_fx_nodes:
         return None
 
+    chain_input: object = value_node
     if (
-        value_node.op != "call_function"
-        or value_node.target is not torch.ops.prims.convert_element_type.default
+        value_node.op == "call_function"
+        and value_node.target is torch.ops.prims.convert_element_type.default
     ):
-        return None
-    if value_node.kwargs:
-        # Defensive: ``prims.convert_element_type.default`` takes
-        # ``(input, dtype)`` positionally with no kwargs in the FX
-        # forms we trace; reject anything unexpected.
-        return None
-    cast_input = value_node.args[0] if value_node.args else None
-    if not isinstance(cast_input, torch.fx.Node):
+        if value_node.kwargs:
+            # ``convert_element_type`` takes ``(input, dtype)`` positionally in
+            # the FX forms we trace; reject anything unexpected.
+            return None
+        chain_input = value_node.args[0] if value_node.args else None
+    if not isinstance(chain_input, torch.fx.Node):
         return None
 
     if inner_outputs_by_graph_id is None:
@@ -1037,19 +1035,13 @@ def analyze_tcgen05_unary_epilogue_chain(
         inner_outputs_by_graph_id = build_inner_outputs_index(state)
 
     matmul_anchor = walk_carrier_to_tcgen05_matmul(
-        cast_input, target_fx_nodes, inner_outputs_by_graph_id
+        chain_input, target_fx_nodes, inner_outputs_by_graph_id
     )
     if matmul_anchor is not None:
-        # Identity epilogue (`out[tile] = acc.to(dtype)`). Return
-        # ``None`` so the splice site stays out of the picture — the
-        # ast.Name fast path in ``store_codegen`` already routes
-        # identity stores through ``_codegen_cute_store_tcgen05_tile``
-        # without an epilogue chain. Routing them through the splice
-        # would emit a no-op prelude + identical RHS, but the
-        # contract that identity stores never see an
-        # ``epilogue_chain`` keeps the no-chain code path
-        # byte-identical to the unary-only golden.
-        return None
+        # Preserve the distinction between a valid identity store and an
+        # unsupported chain. Store codegen leaves the empty-chain case to its
+        # existing ast.Name fast path, while preflight callers can admit it.
+        return Tcgen05UnaryEpilogueChain(steps=()), matmul_anchor
 
     # The chain carrier's expected tile shape and tile-id symbol
     # nodes, used to validate auxiliary-tensor loads. Read once at
@@ -1057,13 +1049,13 @@ def analyze_tcgen05_unary_epilogue_chain(
     # accepted op preserves shape (zero-arg unary, scalar-binary,
     # and exact-shape aux-binary all produce the same shape as
     # their input).
-    carrier_tile_shape = _carrier_tile_shape(cast_input)
-    carrier_tile_index_nodes = _carrier_tile_index_nodes(cast_input)
+    carrier_tile_shape = _carrier_tile_shape(chain_input)
+    carrier_tile_index_nodes = _carrier_tile_index_nodes(chain_input)
 
     steps: list[_UnaryStep | _AuxiliaryTensorStep] = []
-    cur: torch.fx.Node = cast_input
+    cur: torch.fx.Node = chain_input
     # Bound the walk so a pathological FX graph cannot loop forever.
-    # 32 unary ops between the matmul and the cast is an absurd upper
+    # 32 unary ops between the matmul and the store is an absurd upper
     # bound for any realistic activation chain.
     for _ in range(32):
         if cur.op != "call_function":

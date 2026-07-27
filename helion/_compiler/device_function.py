@@ -17,7 +17,6 @@ from typing import cast
 import sympy
 import torch
 from torch._dynamo.source import LocalSource
-from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .. import exc
@@ -1142,10 +1141,12 @@ class DeviceFunction:
         """
         return None
 
-    def register_dma_semaphore(self, name_hint: str = "sem") -> str:
+    def register_dma_semaphore(
+        self, name_hint: str = "sem", shape: tuple[int, ...] = ()
+    ) -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""
         return self.register_scratch(
-            (), None, name_hint=name_hint, scratch_type="dma_semaphore"
+            shape, None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
@@ -1207,98 +1208,3 @@ class DeviceFunction:
             return tls.functions[-1]
         except (AttributeError, IndexError):
             raise NoCurrentFunction from None
-
-
-class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that does the following:
-
-    - Avoids wrapping float literals in tl.full().
-     Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-     via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-     literal, letting downstream type promotion and casts handle dtype.
-
-    - Avoids triton_helpers.div_floor_integer(...) calls when both operands are
-      provably non-negative integers. TritonPrinter by default converts
-      floor(u1/2) to triton_helpers.div_floor_integer(...). We override this to
-      emit u1 // 2 only when the numerator is known to be non-negative and the
-      denominator is a positive integer, so that we keep helper calls for cases
-      that rely on floor semantics with mixed signs.
-    """
-
-    def _print_Float(self, expr: sympy.Expr) -> str:
-        return str(expr)
-
-    def _print_ToFloat(self, expr: sympy.Expr) -> str:
-        assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
-        # pyrefly: ignore [missing-attribute]
-        return f"{self._print(expr.args[0])} + 0.0"
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # Only use // operator when:
-        # 1. RHS is an integer constant
-        # 2. LHS is a constexpr argument (autotune parameter like block size)
-        # This ensures TMA descriptors get compile-time constants while preserving
-        if (
-            isinstance(rhs, sympy.Integer)
-            and getattr(lhs, "name", None) in DeviceFunction.current()._constexpr_args
-        ):
-            # pyrefly: ignore [missing-attribute]
-            lhs_str = self._print(lhs)
-            # pyrefly: ignore [missing-attribute]
-            rhs_str = self._print(rhs)
-            if not (lhs.is_Integer or lhs.is_Symbol):
-                lhs_str = f"({lhs_str})"
-            return f"{lhs_str} // {rhs_str}"
-        return super()._print_FloorDiv(expr)
-
-
-def texpr(expr: sympy.Expr) -> str:
-    return HelionTritonPrinter().doprint(expr)
-
-
-class HelionCutePrinter(HelionTritonPrinter):
-    """CuTe printer that avoids Triton runtime helpers in device expressions."""
-
-    def _print_basic_expr(self, expr: sympy.Basic) -> str:
-        return self.doprint(cast("sympy.Expr", expr))
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
-
-    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
-
-    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        lhs_printed = self._print_basic_expr(lhs)
-        rhs_printed = self._print_basic_expr(rhs)
-        return f"(({lhs_printed} + {rhs_printed} - 1) // {rhs_printed})"
-
-    def _print_PythonMod(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} % {self._print_basic_expr(rhs)})"
-
-
-def cute_texpr(expr: sympy.Expr) -> str:
-    return HelionCutePrinter().doprint(expr)
-
-
-class HelionPallasPrinter(HelionTritonPrinter):
-    """Pallas printer that emits plain Python operators instead of Triton runtime helpers."""
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} // {self._print(rhs)})"
-
-    def _print_PythonMod(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} % {self._print(rhs)})"
-
-
-def pallas_texpr(expr: sympy.Expr) -> str:
-    return HelionPallasPrinter().doprint(expr)

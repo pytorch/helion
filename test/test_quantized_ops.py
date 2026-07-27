@@ -129,6 +129,40 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
         self.assertIn("=f,=f,h", code)
         self.assertIn("tl.inline_asm_elementwise", code)
 
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="FP4 conversion instructions require Blackwell"
+    )
+    def test_load_float4_e2m1fn_x16_to_float16(self):
+        @helion.kernel(autotune_effort="none")
+        def fp4_to_f16_lanes(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                (offsets.size(0), 16),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            for tile in hl.tile(offsets.size(0), block_size=4):
+                lanes = hl.load_float4_e2m1fn_x16_to_float16(
+                    x,
+                    offsets[tile],
+                    extra_mask=tile.index < offsets.size(0),
+                )
+                for i in hl.static_range(16):
+                    out[tile, i] = lanes[i]
+            return out
+
+        raw = torch.arange(16, dtype=torch.uint8, device=DEVICE) * 17
+        offsets = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(fp4_to_f16_lanes, (raw, offsets))
+
+        raw_i32 = raw.view(2, 8).to(torch.int32)
+        nibbles = torch.stack((raw_i32 & 0xF, (raw_i32 >> 4) & 0xF), dim=-1)
+        expected = _dequant_e2m1(nibbles.reshape(2, 16)).to(torch.float16)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("tl.pointer_type(tl.uint64)", code)
+        self.assertIn("[fp4_qword_", code)
+        self.assertIn("=h,=h", code)
+
 
 if __name__ == "__main__":
     unittest.main()

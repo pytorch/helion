@@ -405,7 +405,7 @@ class HelionKernelVariable(VariableTracker):
             else None,
         )
         result = _call_function_and_unflatten_output(
-            tx,
+            cast("Any", tx),
             helion_kernel_wrapper_mutation,
             (),
             hop_kwargs,

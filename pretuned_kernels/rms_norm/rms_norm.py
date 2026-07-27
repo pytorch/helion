@@ -5,11 +5,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-import helion.experimental
+import helion
 import helion.language as hl
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
