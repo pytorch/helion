@@ -22,7 +22,6 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
@@ -1358,7 +1357,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out2, x2)
 
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
-    @skipIfCute("CuTe does not support this reshape/reduction layout")
     @skipIfRefEager("Test validates compiler block-size constraints")
     def test_tile_reshape_for_grouped_quantization(self):
         group_size = 128
@@ -1407,6 +1405,27 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(actual_quantized.float(), expected_quantized.float())
         torch.testing.assert_close(actual_scales, expected_scales)
+
+    @onlyBackends(["cute"])
+    def test_tile_reshape_cute_split_factor_below_minimum(self):
+        @helion.kernel
+        def invalid_split(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            tile_size_n = hl.register_block_size(256, n)
+            for tile_m, tile_n in hl.tile([m, n], block_size=[None, tile_size_n]):
+                block = x[tile_m, tile_n]
+                block_m, block_n = block.shape
+                grouped = block.reshape(block_m, block_n // 128, 128)
+                out[tile_m, tile_n] = grouped.reshape(block_m, block_n)
+            return out
+
+        x = torch.randn(4, 256, device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "No power-of-two block size assignment satisfies reshape constraint",
+        ):
+            invalid_split.bind((x,))
 
     @skipIfRefEager("Test validates compiler block-size constraints")
     def test_tile_reshape_additive_constraint(self):
