@@ -441,24 +441,25 @@ def chunk_fwd_wy_delta_helion(
     for tile_bhn in hl.tile(BHN, block_size=1):
         beta_i = beta[tile_bhn, :].to(torch.float32)  # [1, C]
 
-        kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
-        for tile_d in hl.tile(D):
-            kt = k[tile_bhn, :, tile_d]
-            kk = hl.dot(kt, kt.transpose(-2, -1), acc=kk)
         idx = hl.arange(C)
         strict_lower = idx[:, None] > idx[None, :]
         if diag_anchored:
             # The anchored k-gram Akk already carries the per-channel decay and
-            # the strict-lower mask (kk above is unused on this path).
+            # the strict-lower mask; the in-kernel k @ k gram is compiled out.
             A = -(beta_i[:, :, None] * Akk[tile_bhn, :, :])  # pyrefly: ignore[unsupported-operation]
-        elif scalar_decay:
-            decay = g_cs[tile_bhn, :].to(  # pyrefly: ignore[unsupported-operation]
-                torch.float32
-            )  # [1, C]
-            L = torch.exp2((decay[:, :, None] - decay[:, None, :]) * RCP_LN2)
-            A = torch.where(strict_lower, -(beta_i[:, :, None] * kk * L), 0.0)
         else:
-            A = torch.where(strict_lower, -(beta_i[:, :, None] * kk), 0.0)
+            kk = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
+            for tile_kk in hl.tile(D):
+                kt_kk = k[tile_bhn, :, tile_kk]
+                kk = hl.dot(kt_kk, kt_kk.transpose(-2, -1), acc=kk)
+            if scalar_decay:
+                decay = g_cs[tile_bhn, :].to(  # pyrefly: ignore[unsupported-operation]
+                    torch.float32
+                )  # [1, C]
+                L = torch.exp2((decay[:, :, None] - decay[:, None, :]) * RCP_LN2)
+                A = torch.where(strict_lower, -(beta_i[:, :, None] * kk * L), 0.0)
+            else:
+                A = torch.where(strict_lower, -(beta_i[:, :, None] * kk), 0.0)
 
         eye = (idx[:, None] == idx[None, :]).to(torch.float32)
         eye = eye[None, :, :].broadcast_to([tile_bhn, C, C])  # pyrefly: ignore[no-matching-overload]
