@@ -55,6 +55,21 @@ class CuteMmaTileCoverage:
         return self.is_static_full or self.is_k_tail_only
 
 
+def cute_tma_tensor_is_aligned(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor satisfies TMA's 16-byte alignment contract."""
+    itemsize = tensor.dtype.itemsize
+    storage_offset = _cute_static_int_extent(tensor.storage_offset())
+    if storage_offset is None or storage_offset * itemsize % 16 != 0:
+        return False
+    for tensor_stride in tensor.stride():
+        stride = _cute_static_int_extent(tensor_stride)
+        if stride is None or stride <= 0:
+            return False
+        if stride != 1 and stride * itemsize % 16 != 0:
+            return False
+    return True
+
+
 def classify_cute_mma_tile_coverage(
     *, m: int, n: int, k: int, block_m: int, block_n: int, block_k: int
 ) -> CuteMmaTileCoverage:

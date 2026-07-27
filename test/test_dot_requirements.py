@@ -11,6 +11,7 @@ import helion
 from helion import _compat
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.cute.matmul_utils import classify_cute_mma_tile_coverage
+from helion._compiler.cute.matmul_utils import cute_tma_tensor_is_aligned
 from helion._compiler.cute.matmul_utils import largest_power_of_two_divisor_at_most
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
@@ -246,6 +247,15 @@ def _bind_cute_strategy_kernel():
 
 @onlyBackends(["triton", "cute"])
 class TestDotRequirements(RefEagerTestDisabled, TestCase):
+    def test_cute_tma_tensor_alignment(self) -> None:
+        self.assertTrue(cute_tma_tensor_is_aligned(torch.empty(128, 24)))
+        self.assertFalse(cute_tma_tensor_is_aligned(torch.empty(128, 17)))
+        self.assertTrue(cute_tma_tensor_is_aligned(torch.empty(128, 24).T))
+        self.assertFalse(cute_tma_tensor_is_aligned(torch.empty(128, 17).T))
+
+        offset = torch.empty(128 * 24 + 1)[1:].view(128, 24)
+        self.assertFalse(cute_tma_tensor_is_aligned(offset))
+
     def test_cute_mma_tile_coverage_classification(self) -> None:
         self.assertEqual(largest_power_of_two_divisor_at_most(128, 96, 8), 64)
 
@@ -296,6 +306,22 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(normalized.pid_type, "persistent_interleaved")
         self.assertEqual(flat, gen.flatten(normalized))
         gen.encode_config(flat)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_unaligned_tma_stride_disables_persistent_search(
+        self,
+    ) -> None:
+        args = (
+            torch.empty([256, 17], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([17, 256], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        _cute_strategy_matmul_kernel.reset()
+        with patch_cute_mma_support():
+            bound = _cute_strategy_matmul_kernel.bind(args)
+
+        self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+        self.assertNotIn("persistent_blocked", bound.config_spec.allowed_pid_types)
+        self.assertNotIn("persistent_interleaved", bound.config_spec.allowed_pid_types)
 
     @patch.object(_compat, "_min_dot_size", lambda *args: (2, 8, 16))
     def test_hl_dot_sets_min_size(self) -> None:

@@ -49,6 +49,7 @@ from .layout import MatmulExecutionPlan
 from .matmul_utils import CuteMmaTileCoverage
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .matmul_utils import classify_cute_mma_tile_coverage
+from .matmul_utils import cute_tma_tensor_is_aligned
 from .mma_support import get_cute_mma_support
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import Tcgen05PersistenceModel
@@ -2161,8 +2162,14 @@ def _emit_mma_pipeline(
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
     # layout Helion emits expects the standard row-major A. Only B's major
     # mode is made layout-aware here.
-    tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
-    tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
+    tcgen05_use_tma_a = (
+        _dtype_tma_ok and _lhs_major == "row" and cute_tma_tensor_is_aligned(lhs_fake)
+    )
+    tcgen05_use_tma_b = (
+        _dtype_tma_ok
+        and _rhs_major in ("row", "col")
+        and cute_tma_tensor_is_aligned(rhs_fake)
+    )
     # B is K-major when its (K, N) storage is K-contiguous (column-major),
     # i.e. stride[0] == 1 -> _rhs_major == "col".
     tcgen05_b_k_major = _rhs_major == "col"
@@ -2444,7 +2451,8 @@ def _emit_mma_pipeline(
         and tcgen05_k_tail_only
     )
     # Keep role-local producer and consumer state aligned by treating the
-    # partial K tile as a normal TMA stage; bounded TMA tensors zero-fill it.
+    # partial K tile as a normal TMA stage. The operand-level TMA gate above
+    # ensures bounded TMA tensors can safely zero-fill the tail.
     tcgen05_preserve_tma_for_one_cta_k_tail = (
         tcgen05_one_cta_k_tail
         and tcgen05_use_tma_pipeline

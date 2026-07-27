@@ -3652,6 +3652,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 from ..language.matmul_ops import enable_cute_tcgen05_search
                 from ..language.matmul_ops import plan_cute_tcgen05_search
                 from .cute.cute_mma import analyze_cute_mma_node
+                from .cute.matmul_utils import cute_tma_tensor_is_aligned
 
                 # The same structural analyzer gates tcgen05 search and codegen
                 # for every matrix rank. This prevents transformed loads from
@@ -3710,6 +3711,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         explicit_epi_tile_compatible=all(
                             item.explicit_epi_tile_compatible
                             for item, _lhs, _plan in search_candidates
+                        ),
+                        tma_operands_aligned=all(
+                            cute_tma_tensor_is_aligned(operand.source_fake)
+                            for item, _lhs, _plan in search_candidates
+                            for operand in (item.operands.lhs, item.operands.rhs)
                         ),
                     )
         config_spec.raise_grid_block_minimums()

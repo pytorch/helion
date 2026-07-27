@@ -419,6 +419,7 @@ def enable_cute_tcgen05_search(
     input_dtype: torch.dtype,
     has_leading_passthrough: bool,
     explicit_epi_tile_compatible: bool,
+    tma_operands_aligned: bool,
 ) -> None:
     """Apply one preflighted tcgen05 search plan to the shared config."""
     env = CompileEnvironment.current()
@@ -462,16 +463,20 @@ def enable_cute_tcgen05_search(
             block_n=persistent_block_n,
             block_k=max_search_k,
         )
-        allow_persistent_pid_types = persistent_tile_coverage.is_full_or_k_tail
+        allow_persistent_pid_types = (
+            tma_operands_aligned and persistent_tile_coverage.is_full_or_k_tail
+        )
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
     allow_full_tile_cluster_m2_search = (
-        max_tile_coverage.is_static_full
+        tma_operands_aligned
+        and max_tile_coverage.is_static_full
         and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
         and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
         and static_k <= max_cluster_m2_search_k
     )
     allow_edge_cluster_m2_search = (
-        not has_leading_passthrough
+        tma_operands_aligned
+        and not has_leading_passthrough
         and not max_tile_coverage.is_static_full
         and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
         and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
@@ -484,7 +489,8 @@ def enable_cute_tcgen05_search(
         and static_k % max_search_k != 0
     )
     allow_fp8_small_grid_cluster_m2_search = (
-        not has_leading_passthrough
+        tma_operands_aligned
+        and not has_leading_passthrough
         and plan.is_fp8
         and max_tile_coverage.is_static_full
         and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
