@@ -20,6 +20,7 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
 import helion.language as hl
@@ -118,6 +119,14 @@ def cute_relu(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
         out[tile] = torch.relu(x[tile])
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_cast_fp8(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile].to(torch.float8_e4m3fn)
     return out
 
 
@@ -4172,6 +4181,37 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_relu, args)
         (x,) = args
         torch.testing.assert_close(out, torch.relu(x))
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_pointwise_cast_fp8(self) -> None:
+        x = torch.linspace(-10, 10, 32, device=DEVICE)
+        code, out = code_and_output(
+            cute_cast_fp8,
+            (x,),
+            block_size=32,
+            num_threads=[32],
+        )
+        self.assertEqual(out.dtype, torch.float8_e4m3fn)
+        torch.testing.assert_close(
+            out.float(),
+            x.to(torch.float8_e4m3fn).float(),
+        )
+        self.assertIn("_cute_float32_to_fp8e4m3fn", code)
+        self.assertIn("_cute_fp8e4m3fn_to_storage", code)
+
+        x_bf16 = x.to(torch.bfloat16)
+        bf16_code, bf16_out = code_and_output(
+            cute_cast_fp8,
+            (x_bf16,),
+            block_size=32,
+            num_threads=[32],
+        )
+        self.assertEqual(bf16_out.dtype, torch.float8_e4m3fn)
+        torch.testing.assert_close(
+            bf16_out.float(),
+            x_bf16.to(torch.float8_e4m3fn).float(),
+        )
+        self.assertIn("_cute_float32_to_fp8e4m3fn(cutlass.Float32(load))", bf16_code)
 
     def test_pointwise_sin(self) -> None:
         args = (torch.randn(65, 23, device=DEVICE, dtype=torch.float32),)

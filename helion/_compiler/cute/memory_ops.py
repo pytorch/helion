@@ -156,8 +156,13 @@ def _cute_scalar_storage_dtype(dtype: torch.dtype) -> str:
 
 
 def _cute_scalar_store_expr(
-    tensor_name: str, index_exprs: list[str], value: str
+    tensor_name: str,
+    index_exprs: list[str],
+    value: str,
+    dtype: torch.dtype,
 ) -> str:
+    if dtype is torch.float8_e4m3fn:
+        value = f"_cute_fp8e4m3fn_to_storage({value})"
     if "None" in index_exprs:
         return f"{tensor_name}.__setitem__({_cute_index_tuple(index_exprs)}, {value})"
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
@@ -427,6 +432,7 @@ def _codegen_cute_store_stack_load(
             tensor_name,
             target_indices,
             f"({stack_ptr_expr}).load()",
+            tensor.dtype,
         )
         mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
         if mask_expr is None:
@@ -487,7 +493,9 @@ def _codegen_cute_store_stack_load(
         value=value,
     )
     store_expr = expr_from_string(
-        _cute_scalar_store_expr(tensor_name, rewritten_index_exprs, "{value}"),
+        _cute_scalar_store_expr(
+            tensor_name, rewritten_index_exprs, "{value}", tensor.dtype
+        ),
         value=value,
     )
     mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
@@ -755,7 +763,9 @@ def _codegen_cute_affine_reshape_store(
     )
     col_index = f"{index_dtype}({n_global})"
     tensor_name = state.device_function.tensor_arg(tensor).name
-    store_expr = _cute_scalar_store_expr(tensor_name, [row_index, col_index], value_var)
+    store_expr = _cute_scalar_store_expr(
+        tensor_name, [row_index, col_index], value_var, tensor.dtype
+    )
 
     store_stmt: ast.stmt = create(ast.Expr, value=expr_from_string(store_expr))
     mask_parts = [
@@ -1353,7 +1363,7 @@ def _codegen_cute_store_expand_broadcast_tile(
         value=value,
     )
     store_expr = expr_from_string(
-        _cute_scalar_store_expr(tensor_name, index_exprs, "{value}"),
+        _cute_scalar_store_expr(tensor_name, index_exprs, "{value}", tensor.dtype),
         value=value,
     )
 
@@ -1713,7 +1723,9 @@ def _(state: CodegenState) -> ast.AST:
     if isinstance(topk_lane_expr, str) and isinstance(topk_k, int):
         index_exprs[-1] = topk_lane_expr
     store_uses_pointer = "None" not in index_exprs
-    store_expr = _cute_scalar_store_expr(tensor_name, index_exprs, "{value}")
+    store_expr = _cute_scalar_store_expr(
+        tensor_name, index_exprs, "{value}", tensor.dtype
+    )
     assign_expr = expr_from_string(store_expr, value=value)
 
     mask_expr = _cute_combined_mask(state, subscript, extra_mask, tensor=tensor)

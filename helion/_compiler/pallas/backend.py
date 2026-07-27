@@ -198,7 +198,12 @@ class PallasBackend(Backend):
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"pl.program_id({dim})"
 
-    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+    def cast_expr(
+        self,
+        expr_str: str,
+        dtype_str: str,
+        source_dtype_str: str | None = None,
+    ) -> str:
         return f"lax.convert_element_type({expr_str}, {dtype_str})"
 
     @property
@@ -240,7 +245,12 @@ class PallasBackend(Backend):
 
         return PallasKernelOverrides()
 
-    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+    def cast_ast(
+        self,
+        x: ast.AST,
+        target_dtype: torch.dtype,
+        source_dtype: torch.dtype | None = None,
+    ) -> ast.AST:
         return expr_from_string(
             f"lax.convert_element_type({{x}}, {self.dtype_str(target_dtype)})", x=x
         )

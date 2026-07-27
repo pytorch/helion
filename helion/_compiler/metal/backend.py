@@ -103,7 +103,12 @@ class MetalBackend(Backend):
     def inline_constexpr(self, name: str, value: str) -> str:
         return f"{name} = {value}"
 
-    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+    def cast_expr(
+        self,
+        expr_str: str,
+        dtype_str: str,
+        source_dtype_str: str | None = None,
+    ) -> str:
         return f"static_cast<{dtype_str}>({expr_str})"
 
     def lane_index_expr(
