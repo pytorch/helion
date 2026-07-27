@@ -2089,8 +2089,8 @@ def _helion_chunked_fwd(
         return o.reshape(B, H, T, DV), h_all, final_state
 
     # Diagonal decay path.
-    gc4 = g.reshape(BH, N, C, D).float().cumsum(-2)
-    gc = gc4.reshape(BHN, C, D)
+    gc = chunk_cumsum_gc_helion(g.reshape(BHN, C, D))
+    gc4 = gc.reshape(BH, N, C, D)
 
     k_4d = k.reshape(BH, N, C, D)
     v_4d = v.reshape(BH, N, C, DV)
