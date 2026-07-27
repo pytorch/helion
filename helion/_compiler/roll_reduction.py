@@ -25,6 +25,7 @@ from ..language.matmul_ops import dot_scaled as hl_dot_scaled
 from ..language.memory_ops import load
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
+from ..language.scan_ops import _associative_scan
 from ..language.view_ops import join as hl_join
 from ..language.view_ops import split as hl_split
 from .aten_lowering import aten_lowering_dispatch
@@ -102,6 +103,16 @@ class ReductionRoller:
             # TODO(jansel): support rolling user-defined reductions
             raise NotImplementedError(
                 "hl._reduce operations are not compatible with reduction rolling"
+            )
+
+        if node.target is _associative_scan:
+            # It appears associative scans are not rollable: a scan needs the
+            # running prefix from all prior elements, but the scan codegen assumes
+            # the whole scan dimension is one tile (there is no cross-tile prefix
+            # carry). Rolling re-runs the scan per chunk with no carry, silently
+            # dropping the cross-chunk prefix. Refuse to roll -> stay persistent.
+            raise NotImplementedError(
+                "hl.associative_scan operations are not compatible with reduction rolling"
             )
 
         if is_for_loop_target(node.target) or node.target is _if:
