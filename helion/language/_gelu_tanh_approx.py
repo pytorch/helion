@@ -84,10 +84,24 @@ GELU_ERF_INV_SQRT2: float = 0.7071067811865476
 # inputs to fp32 around ``cute.math.tanh`` automatically, so the
 # absence of an explicit cast is intentional and safe for both call
 # sites.
+#
+# ``fastmath=True`` lowers ``cute.math.tanh`` to the single hardware
+# ``tanh.approx.f32`` MUFU instruction instead of the accurate,
+# multi-instruction software polynomial the default (``fastmath=False``)
+# emits. In a fused tcgen05 GEMM+GELU epilogue the accurate tanh is a
+# throughput bottleneck: its extra MUFU/ALU ops do not overlap the UMMA
+# and expose ~14% of runtime on a 2048x4096x4096 bf16 GEMM (a plain-matmul
+# and a fused-ReLU epilogue both tie the reference at ~1.0x, but the
+# accurate-tanh GELU stalled at ~0.87x). The approximation matches the
+# reference CuTe kernel (quack ``gemm_act`` uses the same
+# ``tanh.approx.f32`` for its GELU) and stays within bf16 rounding of the
+# exact ``F.gelu`` oracle (max abs diff ~0.016 on that shape), so it is
+# the correct lowering for the tanh-approximation GELU the user opted into
+# via ``approximate="tanh"``.
 _GELU_TANH_APPROX_EXPR_CUTE = (
     f"(0.5 * ({{inner}}) * (1.0 + cute.math.tanh(({{inner}}) *"
     f" ({GELU_TANH_APPROX_KAPPA!r} + {GELU_TANH_APPROX_LAMBDA!r}"
-    f" * ({{inner}}) * ({{inner}})))))"
+    f" * ({{inner}}) * ({{inner}})), fastmath=True)))"
 )
 # Exact erf GELU uses a helper so fp32 TensorSSA carriers, including
 # tcgen05 epilogue fragments, can use packed f32x2 mul/fma around the

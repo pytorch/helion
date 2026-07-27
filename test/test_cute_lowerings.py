@@ -1024,12 +1024,22 @@ class TestCuteLowerings(unittest.TestCase):
 
         with patch_cute_mma_support():
             bound = cute_matmul_mma_codegen_only.bind(args)
-            # Keep the narrowed cluster_m=1 search. Explicit flat
-            # cluster_m=2 configs are rejected until G3 runtime ownership is
-            # validated, and this auto-path test only needs to pin tcgen05.
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.env.config_spec.restrict_tcgen05_cluster_m_search((1,))
-            config = bound.config_spec.default_config()
+            # Pin the cluster_m=1 flat auto-path config explicitly (matching the
+            # sibling test_tcgen05_default_store_arrives_with_exec_warp). This test
+            # validates the cluster_m=1 tcgen05 MMA codegen markers, so it must not
+            # depend on ``default_config()`` — the promote-to-default formula heuristic
+            # (CuteTcgen05FormulaMatmulHeuristic) now owns the default and legitimately
+            # emits a cluster_m=2 config for this shape.
+            config = helion.Config(
+                block_sizes=[128, 32, 16],
+                l2_groupings=[4],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=4,
+                pid_type="flat",
+            )
             code = bound.to_triton_code(config)
 
         self.assertEqual(config.config["block_sizes"][2], 16)

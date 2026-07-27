@@ -1325,26 +1325,34 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
         ]
-        # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds.
-        # Callers decide whether both are expected in the supplied population;
-        # every cluster_m=2 seed must still match the common tile envelope.
+        # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds, and
+        # the promote-to-default formula heuristic additionally emits a deep-AB
+        # compute seed on a different bk (e.g. [256,256,64] ab=6 alongside the
+        # canonical bk=128 tile). Assert the expected-envelope seed is PRESENT
+        # among the cluster_m=2 seeds (the property under test -- that tile is
+        # seeded rather than mutation-discovered) rather than requiring every
+        # cluster_m=2 seed to be it.
         self.assertGreaterEqual(len(seeded), 1)
-        for seed in seeded:
-            self.assertEqual(
-                seed["block_sizes"][:3],
-                [
-                    TCGEN05_TWO_CTA_BLOCK_M,
-                    TCGEN05_TWO_CTA_BLOCK_N,
-                    expected_block_k,
-                ],
-            )
-            self.assertEqual(
-                seed["indexing"],
-                ["tensor_descriptor"] * expected_indexing_length,
-            )
-            self.assertEqual(seed["pid_type"], "persistent_interleaved")
-            self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
-        return seeded[0]
+        matching = [
+            seed
+            for seed in seeded
+            if seed["block_sizes"][:3]
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                expected_block_k,
+            ]
+            and seed["indexing"] == ["tensor_descriptor"] * expected_indexing_length
+            and seed["pid_type"] == "persistent_interleaved"
+            and seed["tcgen05_num_epi_warps"] == 4
+        ]
+        self.assertGreaterEqual(
+            len(matching),
+            1,
+            f"expected cluster_m=2 seed [256,256,{expected_block_k}] not found among "
+            f"{[s['block_sizes'] for s in seeded]}",
+        )
+        return matching[0]
 
     def _assert_cute_tcgen05_edge_k_tail_seed_overrides(
         self,

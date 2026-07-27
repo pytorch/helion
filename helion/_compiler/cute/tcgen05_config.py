@@ -1547,28 +1547,38 @@ class CuteTcgen05Config:
         #     the 16-bit hard cap (6) AND the SMEM budget, so the real ab6/bk128
         #     overflow (294912 B) is still rejected -> clamped to what fits. The
         #     canonical 256x256 cm2 tile only fits ab<=3, so a snapped ab4 there
-        #     is clamped back to 3 here. cluster_m=1 keeps the strict ab<=3 cap
-        #     (its reachable bf16 tiles overflow beyond ab3), and EXPLICIT_EPI_TILE
-        #     / FFI configs are handled by the direct-entry tuple branch above.
+        #     is clamped back to 3 here. EXPLICIT_EPI_TILE / FFI configs are
+        #     handled by the direct-entry tuple branch above.
         #     The batched leading-passthrough family is admitted too: per-CTA AB
         #     SMEM is batch-invariant (``tcgen05_ab_smem_bytes_per_cta`` takes only
         #     bm/bn/bk/dtype/stages/cluster_m, and the leading axis is squeezed to
         #     block size 1 in codegen), so a batched ``[*,256,128,128]`` cm2 tile
         #     fits ab=4 identically and ``max_ab_stages_that_fit`` still enforces
         #     the real per-CTA cap.
+        #
+        #     PR-5 (formula seed) extension: 16-bit ``cluster_m=1`` DEFAULT layout
+        #     gets the SAME SMEM-clamped admission. The formula's decode regime
+        #     emits a narrow cm1 tile ([64,32,256] bf16 ab4 = 196608 B, the R3 #8
+        #     decode answer key) that fits the budget and is dtype-general in the
+        #     role_local_monolithic codegen (fp8 cm1 already runs deep ab>3 through
+        #     it). The earlier cm1 ab<=3 restriction was about SMEM OVERFLOW, which
+        #     ``max_ab_stages_that_fit`` already enforces: a cm1 256^2 bf16 tile
+        #     per-stage is 65536 B (bk64) / 131072 B (bk128), so fit_max clamps it
+        #     to 3 / 1 respectively -- the overflow is still rejected. Only the
+        #     fitting decode tile is admitted at ab4.
         constraints = self.ab_stages_search_constraints
         is_fp8 = constraints is not None and constraints.dtype_bytes == 1
         layout = config.get(
             TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
             Tcgen05LayoutStrategy.DEFAULT.value,
         )
-        is_16bit_default_cm2 = (
+        is_16bit_default = (
             constraints is not None
             and constraints.dtype_bytes == 2
-            and config.get("tcgen05_cluster_m") == 2
+            and config.get("tcgen05_cluster_m") in (1, 2)
             and layout == Tcgen05LayoutStrategy.DEFAULT.value
         )
-        if is_fp8 or is_16bit_default_cm2:
+        if is_fp8 or is_16bit_default:
             config_view = self._matmul_config_view(config)
             cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
             if config_view is not None:
