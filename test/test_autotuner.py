@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextlib import nullcontext
+import copy
 import csv
 import logging
 import math
@@ -1415,6 +1416,81 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         for _ in range(50):
             result = gen.differential_mutation(base, a, b, c, crossover_rate=0.9)
             self.assertEqual(result[warp_idx], base[warp_idx])
+
+    def test_population_member_canonicalizes_overridden_flat_values(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        gen = ConfigGeneration(spec, overrides={"num_warps": 8})
+        raw_flat = gen.default_flat()
+        original_flat = copy.deepcopy(raw_flat)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_gen = gen
+
+        member = search.make_unbenchmarked(raw_flat)
+
+        self.assertIsNotNone(member)
+        assert member is not None
+        self.assertEqual(raw_flat, original_flat)
+        self.assertIsNot(member.flat_values, raw_flat)
+        self.assertEqual(member.config.num_warps, 8)
+        self.assertEqual(member.flat_values[gen.num_warps_index], 8)
+        self.assertEqual(member.flat_values, gen.flatten(member.config))
+        gen.encode_config(member.flat_values)
+
+        [(seed_flat, seed_config)] = gen.user_seed_flat_config_pairs(
+            [helion.Config(num_warps=4)]
+        )
+        self.assertEqual(seed_config.num_warps, 8)
+        self.assertEqual(seed_flat, gen.flatten(seed_config))
+
+    def test_scalar_list_override_has_encodable_flat_values(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        gen = ConfigGeneration(spec, overrides={"indexing": "pointer"})
+
+        flat, config = gen.canonicalize_flat(gen.default_flat())
+
+        indexing_indices, is_sequence = gen._key_to_flat_indices["indexing"]
+        self.assertFalse(is_sequence)
+        self.assertEqual(len(indexing_indices), 1)
+        self.assertEqual(flat[indexing_indices[0]], ["pointer"] * spec.indexing.length)
+        self.assertEqual(flat, gen.flatten(config))
+        gen.encode_config(flat)
+
+    def test_population_adopts_config_filter_replacement(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        search = PatternSearch(bound_kernel, args, initial_population=1)
+        member = search.make_unbenchmarked(search.config_gen.default_flat())
+        assert member is not None
+        replacement = helion.Config.from_dict({**member.config.config, "num_warps": 8})
+        result = SimpleNamespace(
+            config=replacement,
+            perf=float("inf"),
+            fn=lambda: None,
+            status="error",
+            compile_time=None,
+        )
+
+        with patch.object(search, "benchmark_batch", return_value=[result]):
+            search.benchmark_population([member])
+
+        self.assertIs(member.config, replacement)
+        self.assertEqual(member.flat_values, search.config_gen.flatten(replacement))
+        self.assertEqual(
+            member.flat_values[search.config_gen.num_warps_index],
+            8,
+        )
+        search.config_gen.encode_config(member.flat_values)
 
     def test_lfbo_pattern_search_skips_overridden_indices(self):
         """LFBOPatternSearch._generate_neighbors skips overridden indices."""
