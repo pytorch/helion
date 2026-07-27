@@ -2150,6 +2150,63 @@ class TestPallas(TestCase):
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
+    @skipIfPallasInterpret(
+        "device-sync semantics need a real TPU; CPU-interpret executes synchronously"
+    )
+    def test_device_sync_waits_for_compiled_output(self) -> None:
+        """``torch.accelerator.synchronize()`` must block on a ``torch.compile`` op.
+
+        Regression guard for torch_tpu#2402: when the device-wide sync returns
+        before a compiled graph finishes, the wall-clock benchmark measures a
+        ``torch.compile`` baseline as ~0ms and its deferred work is charged to
+        the next candidate's timing window (the flash_attention dashboard
+        inflation investigated in the benchmarking fix).
+
+        Non-flaky by construction: instead of an absolute time bound, it compares
+        the device-wide sync against a per-output wait on the *same* heavy
+        compiled op. If the sync materializes the op the two are comparable; if
+        it returns early the ratio collapses (~600x gap observed), so the 0.5x
+        threshold has a large margin.
+        """
+        import time
+
+        import torch.nn.functional as F
+
+        from helion.autotuner.benchmarking import synchronize_device
+
+        q, k, v = (
+            torch.randn(8, 32, 8192, 256, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        compiled = torch.compile(F.scaled_dot_product_attention)
+        for _ in range(5):  # warm up / trigger compilation
+            compiled(q, k, v)
+        synchronize_device()
+
+        def best_ms(stop: Callable[[object], None]) -> float:
+            best = math.inf
+            for _ in range(3):
+                synchronize_device()  # drain before timing
+                start = time.perf_counter()
+                out = compiled(q, k, v)
+                stop(out)
+                best = min(best, (time.perf_counter() - start) * 1000)
+            return best
+
+        from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
+            synchronize as tpu_sync,
+        )
+
+        device_sync_ms = best_ms(lambda out: synchronize_device())
+        per_output_ms = best_ms(lambda out: tpu_sync(out, wait=True))
+        self.assertGreater(
+            device_sync_ms,
+            0.5 * per_output_ms,
+            f"torch.accelerator.synchronize() returned before the compiled op "
+            f"finished (device_sync={device_sync_ms:.2f}ms vs "
+            f"per_output_wait={per_output_ms:.2f}ms) — torch_tpu#2402",
+        )
+
     def test_pallas_matmul_dot_general_lowering_fires_on_no_tiling(self) -> None:
         """No-tiling 2-input matmul emits ``lax.dot_general``, not ``pl.pallas_call``.
 
