@@ -15,6 +15,7 @@ from . import ast_extension
 from .host_function import HostFunction
 from .host_function import KernelDefinition
 from .tensor_utils import patch_tensor_factories
+from .tile_shape_constraints import TileShapeConstraintMode
 
 if TYPE_CHECKING:
     import types
@@ -172,6 +173,7 @@ class KernelCompiler:
             # suppress_guards() prevents this by skipping guard
             # installation (including replacements) in evaluate_expr.
             HostFunction._suppress_guards_if_profiler_enabled(self.env),
+            TileShapeConstraintMode(),
             torch.device(self.env.device),
         ):
             yield
