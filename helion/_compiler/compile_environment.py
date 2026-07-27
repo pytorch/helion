@@ -223,6 +223,7 @@ class CompileEnvironment:
         settings: Settings,
         *,
         index_dtype: torch.dtype | None = None,
+        is_distributed: bool = False,
     ) -> None:
         from ..autotuner.config_spec import ConfigSpec
 

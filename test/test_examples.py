@@ -2830,6 +2830,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         # restored after the test.
         from examples.linear import linear_attention_engine as engine
 
+        # Free cached GPU memory after each test so xdist workers
+        # sharing one GPU don't OOM.
+        if torch.cuda.is_available():
+            self.addCleanup(torch.cuda.empty_cache)
+
         for kernel in vars(engine).values():
             if isinstance(kernel, helion.Kernel):
                 original_effort = kernel.settings.autotune_effort

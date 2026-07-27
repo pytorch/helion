@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import contextlib
 from datetime import timedelta
+import io
 import os
 import unittest
+from unittest.mock import patch
+import warnings
 
 import torch
 from torch import Tensor
@@ -13,18 +16,22 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
+from torch.testing._internal.common_utils import TestCase as CommonTestCase
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.common_utils import run_tests
 
 import helion
 from helion._dist_utils import all_gather_object
+from helion._dist_utils import kernel_uses_symm_mem
 from helion._dist_utils import sync_object
 from helion._dist_utils import sync_seed
+from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion.autotuner import search_algorithms
 from helion.autotuner.effort_profile import _PROFILES
@@ -35,6 +42,11 @@ from helion.autotuner.effort_profile import RandomSearchConfig
 import helion.language as hl
 
 autotuner_names = ["fixed", *search_algorithms]
+
+# torch.distributed._symmetric_memory.is_symm_mem_tensor exists only on newer
+# PyTorch. The symm-mem-based gating degrades to conservative behavior without it,
+# so the tests that assert the fine-grained gating require the API.
+_HAS_SYMM_MEM_DETECT = hasattr(symm_mem, "is_symm_mem_tensor")
 
 
 def custom_get_timeout(test_id: str) -> int:
@@ -573,6 +585,162 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         expected = ref_fn(a_local, b_local, tp_group)
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestDistributedGating(CommonTestCase):
+    """Issue #3024: single-process checks that distributed gating keys off
+    symmetric-memory usage, not torch.distributed.is_initialized()."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._owns_pg = not dist.is_initialized()
+        if self._owns_pg:
+            dist.init_process_group(
+                backend="gloo", world_size=1, rank=0, store=dist.HashStore()
+            )
+
+    def tearDown(self) -> None:
+        if self._owns_pg and dist.is_initialized():
+            dist.destroy_process_group()
+        super().tearDown()
+
+    @staticmethod
+    def _make_add() -> object:
+        @helion.kernel(autotune_effort="none")
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        return add
+
+    def _bind_add(self):
+        x = torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16)
+        stderr = io.StringIO()
+        with (
+            warnings.catch_warnings(record=True) as caught,
+            contextlib.redirect_stderr(stderr),
+        ):
+            warnings.simplefilter("always")
+            bound = self._make_add().bind((x, y))
+        return bound, stderr.getvalue(), caught
+
+    @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
+    def test_non_distributed_kernel_not_constrained(self) -> None:
+        x = torch.randn(4, device=DEVICE)
+        self.assertFalse(kernel_uses_symm_mem((x, x)))
+        bound, stderr, caught = self._bind_add()
+        spec = bound.env.config_spec
+        self.assertIn("flat", spec.allowed_pid_types)
+        self.assertEqual(spec.max_num_sm_multiplier, 128)
+        self.assertIsNone(bound.env.process_group_name)
+        self.assertNotIn("ProcessGroupNameNotFound", stderr)
+        self.assertFalse(any("max_num_sm" in str(w.message) for w in caught))
+
+    @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
+    @skipIfRefEager("process-group resolution only happens in compiled mode")
+    def test_symm_mem_kernel_still_distributed(self) -> None:
+        with patch.object(symm_mem, "is_symm_mem_tensor", return_value=True):
+            self.assertTrue(kernel_uses_symm_mem(([torch.randn(4, device=DEVICE)],)))
+            with (
+                patch(
+                    "helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000
+                ),
+                patch("helion.runtime.get_num_sm", return_value=200),
+            ):
+                bound, stderr, _ = self._bind_add()
+        spec = bound.env.config_spec
+        self.assertNotIn("flat", spec.allowed_pid_types)
+        self.assertNotIn("xyz", spec.allowed_pid_types)
+        self.assertLess(spec.max_num_sm_multiplier, 128)
+        self.assertIsNotNone(bound.env.process_group_name)
+        self.assertIn("ProcessGroupNameNotFound", stderr)
+
+    @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
+    @skipIfRefEager("process-group resolution only happens in compiled mode")
+    def test_symm_mem_call_does_not_alias_cached_kernel(self) -> None:
+        # Same kernel object and identical shapes: a symmetric-memory call must
+        # not reuse the non-distributed kernel cached from an ordinary call, and
+        # the ordinary key must still resolve back to it. See issue #3024.
+        @helion.kernel(autotune_effort="none")
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16)
+
+        bound_normal = add.bind((x, y))
+        self.assertIn("flat", bound_normal.env.config_spec.allowed_pid_types)
+
+        with (
+            patch.object(symm_mem, "is_symm_mem_tensor", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            patch("helion.runtime.get_num_sm", return_value=200),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            bound_symm = add.bind((x, y))
+            symm_fast_key = add._fast_dispatch_key((x, y))
+
+        self.assertIsNot(bound_normal, bound_symm)
+        self.assertNotIn("flat", bound_symm.env.config_spec.allowed_pid_types)
+        # the fast-dispatch key carries the distributed bit too
+        self.assertNotEqual(add._fast_dispatch_key((x, y)), symm_fast_key)
+        # the ordinary key still resolves back to the original compiled kernel
+        self.assertIs(bound_normal, add.bind((x, y)))
+
+    @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
+    @skipIfRefEager("process-group resolution only happens in compiled mode")
+    def test_explicit_distributed_flag(self) -> None:
+        @helion.kernel(autotune_effort="none", distributed=True)
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16)
+        self.assertFalse(kernel_uses_symm_mem((x, y)))
+        with (
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            patch("helion.runtime.get_num_sm", return_value=200),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            bound = add.bind((x, y))
+        spec = bound.env.config_spec
+        self.assertNotIn("flat", spec.allowed_pid_types)
+        self.assertLess(spec.max_num_sm_multiplier, 128)
+        self.assertIsNotNone(bound.env.process_group_name)
+
+    def test_distributed_flag_without_process_group(self) -> None:
+        if not self._owns_pg:
+            self.skipTest("needs exclusive control of the process group")
+        if dist.is_initialized():
+            dist.destroy_process_group()  # we created it; next test's setUp re-inits
+
+        @helion.kernel(autotune_effort="none", distributed=True)
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.bfloat16)
+        bound = add.bind((x, x))  # must not raise
+        self.assertIn("flat", bound.env.config_spec.allowed_pid_types)
+        self.assertIsNone(bound.env.process_group_name)
+
+    def test_coordination_helpers_tolerate_none_pg(self) -> None:
+        self.assertEqual(all_gather_object("x", process_group_name=None), ["x"])
+        self.assertEqual(sync_object("x", process_group_name=None), "x")
+        with sync_seed(process_group_name=None):
+            pass
 
 
 if __name__ == "__main__":

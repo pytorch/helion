@@ -671,9 +671,34 @@ def _topk_pallas_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Te
     return out_v, out_i
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def _constant_pad_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
+    """F.pad -> aten.constant_pad_nd -> jnp.pad on the pallas backend (pad the
+    lane dim, mirroring the spec-decode sampler's in-kernel output padding)."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols + 128], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(rows):
+        out[tile, :] = torch.nn.functional.pad(x[tile, :], (0, 128), value=0.0)
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_rsqrt_uses_native_lax_op(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def rsqrt_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = torch.rsqrt(x[tile])
+            return out
+
+        x = torch.rand(8, 128, device=DEVICE, dtype=torch.float32) + 0.1
+        code, result = code_and_output(rsqrt_kernel, (x,), block_sizes=[8, 128])
+        torch.testing.assert_close(result, torch.rsqrt(x))
+        self.assertIn("lax.rsqrt", code)
+        self.assertNotIn("jnp.sqrt", code)
+
     def test_slice_addressing_classification(self) -> None:
         """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
         -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
@@ -914,6 +939,47 @@ class TestPallas(TestCase):
             / x.shape[0]
         )
         self.assertGreaterEqual(recall, 0.99)
+
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
+    def test_topk_bf16_vocab_reduction(self) -> None:
+        """bf16 input: the (rows, vocab) reduction buffer stays bf16 (halves the
+        scoped VMEM) while each num_bins slice upcasts to f32 for the compare, so
+        the top-1 value and a high recall survive."""
+        torch.manual_seed(0)
+        xf = torch.randn(64, 4096, device=DEVICE, dtype=torch.float32)
+        x = xf.to(torch.bfloat16)
+        _, (vals, idx) = code_and_output(
+            _topk_pallas_kernel, (x, _TOPK_TEST_K), block_sizes=[8]
+        )
+        # top-1 value matches the true max (index may differ under bf16 ties)
+        torch.testing.assert_close(
+            vals[:, 0].float().cpu(),
+            xf.max(dim=-1).values.cpu(),
+            rtol=0.03,
+            atol=0.05,
+        )
+        ref_i = torch.topk(xf, _TOPK_TEST_K, dim=-1, largest=True)[1].cpu()
+        idx_c = idx.cpu()
+        ref_sets = [set(r.tolist()) for r in ref_i]
+        recall = (
+            sum(
+                len(set(idx_c[r].tolist()) & ref_sets[r]) / _TOPK_TEST_K
+                for r in range(xf.shape[0])
+            )
+            / xf.shape[0]
+        )
+        self.assertGreater(recall, 0.9)
+
+    def test_constant_pad_nd_lowering(self) -> None:
+        """F.pad lowers to aten.constant_pad_nd -> jnp.pad on the pallas backend."""
+        torch.manual_seed(0)
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            _constant_pad_pallas_kernel, (x,), block_sizes=[8]
+        )
+        self.assertIn("jnp.pad", code)
+        expected = torch.nn.functional.pad(x, (0, 128), value=0.0)
+        torch.testing.assert_close(result, expected)
 
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
@@ -4658,6 +4724,11 @@ class TestPallas(TestCase):
         self.assertNotIn(torch.ops.aten.view.default, _RELAYOUT_TARGETS)
         self.assertNotIn(torch.ops.aten.reshape.default, _RELAYOUT_TARGETS)
 
+    @skipIfPallasInterpret(
+        "JAX interpret mode does not support pl.Element block specs "
+        "(compact_worklist subtest); a failed interpret launch poisons "
+        "later tests, so skip rather than xfail"
+    )
     def test_transpose_dot_defers_pallas_load_mask(self) -> None:
         """A masked load consumed via ``transpose`` -> dot defers its mask to the
         consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
