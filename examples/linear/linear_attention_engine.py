@@ -402,6 +402,7 @@ def chunk_fwd_wy_delta_helion(
     beta: torch.Tensor,
     g_cs: torch.Tensor | None = None,
     Akk: torch.Tensor | None = None,
+    k_state_out: torch.Tensor | None = None,
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -424,6 +425,9 @@ def chunk_fwd_wy_delta_helion(
         mask); the w-key rides per-channel exp(gc):
             A = -beta * Akk
             w = T @ (beta * exp(gc) * k);  u = T @ (beta * v)
+        This path also writes the serial state pass's key operand, which shares
+        the k read and the per-channel gc:
+            k_state_out = k * exp(gc[C-1] - gc)     # [C, D]
     """
     BHN = k.size(0)
     C = hl.specialize(k.size(1))
@@ -472,12 +476,17 @@ def chunk_fwd_wy_delta_helion(
         A_inv[tile_bhn, :, :] = T
 
         for tile_d in hl.tile(D):
-            kt = k[tile_bhn, :, tile_d].to(torch.float32) * beta_i[:, :, None]
+            raw_k = k[tile_bhn, :, tile_d].to(torch.float32)
+            kt = raw_k * beta_i[:, :, None]
             if scalar_decay:
                 kt = kt * torch.exp2(decay * RCP_LN2)[:, :, None]  # pyrefly: ignore[unbound-name]
             elif diag_anchored:
                 gc_d = g_cs[tile_bhn, :, tile_d].to(torch.float32)  # pyrefly: ignore[unsupported-operation]
                 kt = kt * torch.exp2(gc_d * RCP_LN2)
+                gc_last = g_cs[tile_bhn, C - 1, tile_d].to(torch.float32)  # pyrefly: ignore[unsupported-operation]
+                k_state_out[tile_bhn, :, tile_d] = (  # pyrefly: ignore[unsupported-operation]
+                    raw_k * torch.exp2((gc_last[:, None, :] - gc_d) * RCP_LN2)
+                ).to(k.dtype)
             w[tile_bhn, :, tile_d] = hl.dot(T, kt).to(w.dtype)
         for tile_dv in hl.tile(DV):
             vt = v[tile_bhn, :, tile_dv].to(torch.float32) * beta_i[:, :, None]
@@ -496,6 +505,7 @@ def chunk_fwd_h_delta_helion(
     decay_last: torch.Tensor | None = None,
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    k_pre_scaled: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Serial state pass for the delta rule. Walk i = 0 -> N-1 carrying the state
     S; h_all[i] is the state entering chunk i. The chunk walk is serial; DV is
@@ -514,6 +524,8 @@ def chunk_fwd_h_delta_helion(
         per-channel over D and the key rides the per-channel anchored decay:
             S = exp(gc_last)[:, None] * S
                 + (k[i] * exp(gc_last[None, :] - gc[i])).T @ v_new[i]
+        With k_pre_scaled=True the key arrives with exp(gc_last - gc) already
+        applied, so this serial walk only decays the carry.
     """
     BH = k.size(0)
     N = k.size(1)
@@ -547,15 +559,16 @@ def chunk_fwd_h_delta_helion(
                 )
                 h_orig = h_orig * torch.exp2(dl * RCP_LN2)
             elif diag_anchored:
-                gc_i = g_cs[  # pyrefly: ignore[unsupported-operation]
-                    idx, i_t, :, :
-                ].float()  # [C, D]
                 gl = decay_last[  # pyrefly: ignore[unsupported-operation]
                     idx, i_t, :
                 ].float()  # [D]
-                k_i = (k_i.float() * torch.exp2((gl[None, :] - gc_i) * RCP_LN2)).to(
-                    k_i.dtype
-                )
+                if not k_pre_scaled:
+                    gc_i = g_cs[  # pyrefly: ignore[unsupported-operation]
+                        idx, i_t, :, :
+                    ].float()  # [C, D]
+                    k_i = (k_i.float() * torch.exp2((gl[None, :] - gc_i) * RCP_LN2)).to(
+                        k_i.dtype
+                    )
                 h_orig = h_orig * torch.exp2(gl * RCP_LN2)[:, None]
             h_acc = hl.dot(k_i.transpose(-2, -1), vnew_i.to(k_i.dtype), acc=h_orig)
 
@@ -2177,22 +2190,27 @@ def _helion_chunked_fwd_delta(
             qf, kf, g_cs_flat, scale, build_kk=True
         )
 
+    # The anchored key the serial state pass consumes shares the WY transform's
+    # k read and per-channel decay, so the WY kernel emits it.
+    k_state_flat = torch.empty_like(kf) if diag_anchored else None
     w, u, A_inv = chunk_fwd_wy_delta_helion(
         af,
         vf,
         bf,
         g_cs_flat,
         Akk,
+        k_state_flat,
         scalar_decay=scalar_decay,
         diag_anchored=diag_anchored,
     )
 
     k4 = k.reshape(BH, N, C, D)
+    k_state4 = k_state_flat.reshape(BH, N, C, D) if k_state_flat is not None else k4
     w4 = w.reshape(BH, N, C, D)
     u4 = u.reshape(BH, N, C, DV)
     state = _init_state(initial_state, BH, D, DV, q).to(k.dtype)
     h_all, v_new_all = chunk_fwd_h_delta_helion(
-        k4,
+        k_state4,
         w4,
         u4,
         state,
@@ -2200,6 +2218,7 @@ def _helion_chunked_fwd_delta(
         decay_last,
         scalar_decay=scalar_decay,
         diag_anchored=diag_anchored,
+        k_pre_scaled=diag_anchored,
     )
 
     hf = h_all.reshape(BHN, D, DV)
