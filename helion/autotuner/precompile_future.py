@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import hashlib
 import inspect
 import multiprocessing as mp
 from multiprocessing import connection
@@ -158,7 +159,43 @@ def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
         raise RuntimeError(
             f"Unable to locate compiled kernel '{fn_spec.function_name}' in generated module"
         )
+    _reattach_cute_source_hash(module, fn_spec)
     return fn
+
+
+def _reattach_cute_source_hash(
+    module: types.ModuleType, fn_spec: SerializedCompiledFunction
+) -> None:
+    """Re-attach the CuTe disk-cache source hash lost by the fresh-module exec.
+
+    The parent sets ``_helion_<name>._helion_cute_source_hash`` in
+    ``CuteBackend.annotate_compiled_module`` (only reachable from
+    ``BoundKernel.compile_config``); the on-disk DSL cache key derives from it
+    (``_cute_disk_cache_key``).  Loading the kernel here re-``exec``s the source
+    into a fresh module without that step, so every worker launcher would get
+    ``cache_key=None`` and unconditionally cold-compile -- even for a config the
+    worker already compiled and persisted moments earlier (e.g. the
+    higher-accuracy rebench pass).  Recomputing the same ``sha256(source)`` and
+    reattaching it lets the worker's launchers hit the on-disk cache, so a
+    repeat compile of the same config becomes a warm reload instead of a full
+    cutlass-DSL recompile.  No-op for non-CuTe kernels (attribute simply unused).
+    """
+    # Same source hash for every ``_helion_*`` object, mirroring the parent
+    # ``CuteBackend.annotate_compiled_module``. The scan fallback is safe: a wrong
+    # stamp only misses the cache (cold recompile), never a false hit.
+    source_hash = hashlib.sha256(fn_spec.source_code.encode("utf-8")).hexdigest()
+    kernel_obj = getattr(module, f"_helion_{fn_spec.function_name}", None)
+    candidates = [kernel_obj] if kernel_obj is not None else []
+    if not candidates:
+        candidates = [
+            v
+            for k, v in vars(module).items()
+            if k.startswith("_helion_") and callable(v)
+        ]
+    for obj in candidates:
+        with contextlib.suppress(AttributeError, TypeError):
+            # pyrefly: ignore [missing-attribute]
+            obj._helion_cute_source_hash = source_hash
 
 
 def _run_kernel_in_subprocess_spawn(

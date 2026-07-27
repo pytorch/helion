@@ -32,6 +32,8 @@ from .accuracy import assert_close as _assert_close
 from .accuracy import is_fp8_dtype
 from .benchmark_job import AccuracyCheckJob
 from .benchmark_job import AccuracyCheckResult
+from .benchmark_job import BenchmarkAndAccuracyJob
+from .benchmark_job import BenchmarkAndAccuracyResult
 from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkWorker
@@ -1073,66 +1075,35 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         we classified and handled, or ``None`` if the subprocess path cannot
         handle this config and the caller should fall back to in-process.
         """
+        # Fused path: time + accuracy-check in ONE worker job so the config is
+        # compiled once, not once per job. Only when the accuracy check would
+        # otherwise run as its own worker job (subprocess on, check on, no custom
+        # baseline fn / mutated args) and a baseline was written.
+        if (
+            self.settings.autotune_fused_accuracy_check
+            and self._subprocess_accuracy_check_enabled()
+            and self._precompile_baseline_path is not None
+        ):
+            fused = self._run_fused_benchmark_accuracy_job(config, fn, warmup=1, rep=50)
+            if fused is not None:
+                return fused
+            # None => the fused job could not handle this config (e.g. serialize
+            # failed); fall through to the legacy two-job / in-process path.
+
         try:
             latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
             if latency is None:
                 return None
-        except BenchmarkSubprocessError as e:
-            # Timeout or unexpected worker exit; skip config and continue.
-            self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
-            self._autotune_metrics.num_compile_failures += 1
-            return inf
         except Exception as e:
-            e.__traceback__ = None
-            if match_unrecoverable_runtime_error(e):
-                # Worker is already killed; parent CUDA is unaffected.
-                # Skip this config and continue the search.
-                decorator = self.kernel.format_kernel_decorator(config, self.settings)
-                self.log.warning(
-                    f"Skipping config that triggered an unrecoverable runtime "
-                    f"error in the benchmark subprocess: "
-                    f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
-                )
-                self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-                self._autotune_metrics.num_compile_failures += 1
-                return inf
-            self.log.debug(
-                f"Benchmark subprocess raised for {config!r}: {type(e).__name__}: {e}"
-            )
-            self._autotune_metrics.num_compile_failures += 1
-            return inf
+            return self._handle_subprocess_job_error(config, e, phase="benchmark")
 
         if self.settings.autotune_accuracy_check:
             try:
                 accuracy_result = self._run_subprocess_accuracy_check_job(fn)
-            except BenchmarkSubprocessError as e:
-                self.log.warning(
-                    f"Accuracy check subprocess failed for {config!r}: {e}"
-                )
-                self._autotune_metrics.num_compile_failures += 1
-                return inf
             except Exception as e:
-                e.__traceback__ = None
-                if match_unrecoverable_runtime_error(e):
-                    # Worker is already killed; parent CUDA is unaffected.
-                    # Skip this config and continue the search.
-                    decorator = self.kernel.format_kernel_decorator(
-                        config, self.settings
-                    )
-                    self.log.warning(
-                        f"Skipping config that triggered an unrecoverable runtime "
-                        f"error in the accuracy check subprocess: "
-                        f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
-                    )
-                    self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-                    self._autotune_metrics.num_compile_failures += 1
-                    return inf
-                self.log.debug(
-                    f"Accuracy check subprocess raised for {config!r}: "
-                    f"{type(e).__name__}: {e}"
+                return self._handle_subprocess_job_error(
+                    config, e, phase="accuracy check"
                 )
-                self._autotune_metrics.num_compile_failures += 1
-                return inf
 
             if accuracy_result is not None:
                 if not accuracy_result.ok:
@@ -1179,6 +1150,102 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self._clear_jit_fast_path_caches(fn)
 
         return float(latency)
+
+    def _handle_subprocess_job_error(
+        self, config: Config, e: Exception, *, phase: str
+    ) -> float:
+        """Classify a subprocess benchmark/accuracy worker failure.
+
+        Shared by the benchmark, accuracy-check, and fused-job dispatch paths,
+        which all react to a worker failure identically: log, count it as a
+        compile failure, and return ``inf`` so the search skips the config and
+        continues. ``phase`` is the human-readable step name for the log
+        message (e.g. ``"benchmark"`` or ``"accuracy check"``). The parent CUDA
+        context is unaffected in every case here -- a timeout/exit killed the
+        worker, and an unrecoverable runtime error was raised *inside* the
+        worker -- so this never re-raises (unlike the in-process fallback).
+        """
+        self._autotune_metrics.num_compile_failures += 1
+        if isinstance(e, BenchmarkSubprocessError):
+            # Timeout or unexpected worker exit; skip config and continue.
+            self.log.warning(
+                f"{phase.capitalize()} subprocess failed for {config!r}: {e}"
+            )
+            return inf
+        e.__traceback__ = None
+        if match_unrecoverable_runtime_error(e):
+            # Worker is already killed; parent CUDA is unaffected.
+            # Skip this config and continue the search.
+            decorator = self.kernel.format_kernel_decorator(config, self.settings)
+            self.log.warning(
+                f"Skipping config that triggered an unrecoverable runtime "
+                f"error in the {phase} subprocess: "
+                f"{type(e).__qualname__}: {e}\n  Config: {decorator}"
+            )
+            self.kernel.maybe_log_repro(self.log.warning, self.args, config)
+            return inf
+        self.log.debug(
+            f"{phase.capitalize()} subprocess raised for {config!r}: "
+            f"{type(e).__name__}: {e}"
+        )
+        return inf
+
+    def _run_fused_benchmark_accuracy_job(
+        self,
+        config: Config,
+        fn: CompiledConfig,
+        *,
+        warmup: int,
+        rep: int,
+    ) -> float | None:
+        """Time ``fn`` and accuracy-check it in a single worker job.
+
+        Returns the measured latency (ms) on success, ``inf`` for a failure we
+        classified and handled (skip config, continue search), or ``None`` if
+        the fused job cannot handle this config (serialize failed) and the
+        caller should fall back to the legacy path.
+        """
+        if self._precompile_args_path is None or self._precompile_baseline_path is None:
+            return None
+        try:
+            fn_spec = _serialize_compiled_fn(fn)
+        except RuntimeError:
+            return None
+
+        if self._benchmark_worker is None:
+            self._benchmark_worker = BenchmarkWorker(device=None)
+
+        job = BenchmarkAndAccuracyJob(
+            fn_spec=fn_spec,
+            args_path=self._precompile_args_path,
+            baseline_path=self._precompile_baseline_path,
+            atol=self._effective_atol,
+            rtol=self._effective_rtol,
+            warmup=warmup,
+            rep=rep,
+            use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
+        )
+        try:
+            result = cast(
+                "BenchmarkAndAccuracyResult",
+                self._benchmark_worker.run(
+                    job, timeout=float(self.settings.autotune_benchmark_timeout)
+                ),
+            )
+        except Exception as e:
+            return self._handle_subprocess_job_error(config, e, phase="benchmark")
+
+        accuracy_result = result.accuracy
+        if accuracy_result is not None and not accuracy_result.ok:
+            if not self.settings.autotune_ignore_errors:
+                self.log.warning(
+                    f"Skipping config with accuracy mismatch: {config!r}\n"
+                    f"{accuracy_result.message}\n"
+                    "Use HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
+                )
+            self._autotune_metrics.num_accuracy_failures += 1
+            return inf
+        return float(result.latency)
 
     def _run_subprocess_accuracy_check_job(
         self, fn: CompiledConfig

@@ -619,6 +619,10 @@ def do_bench_generic(
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
     n_repeat = max(1, int(rep / estimate_ms))
+    # NOTE: the CuTe first-call cost (cold compile OR warm disk reload via
+    # _reattach_cute_source_hash) MUST be absorbed by this warmup and never leak into
+    # the timed `perfs` below — otherwise the disk-cache reattach could bias config
+    # selection at a generation-boundary re-benchmark. Keep warmup before the timed loop.
     # Warm-up
     for _ in range(n_warmup):
         fn()

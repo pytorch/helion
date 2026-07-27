@@ -32,6 +32,7 @@ from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
 from helion.autotuner.benchmark_job import AccuracyCheckResult
+from helion.autotuner.benchmark_job import BenchmarkAndAccuracyJob
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
@@ -220,6 +221,102 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("Output leaf type mismatch", result.message)
+
+    def test_fused_job_loads_fn_once_and_returns_latency_and_accuracy(self) -> None:
+        # The fused job must load (and therefore compile) the fn exactly once,
+        # reusing it for both the timed benchmark and the accuracy check.
+        fn = _ReturnValue(torch.tensor([1.0]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            torch.save((), args_path)
+            torch.save(torch.tensor([1.0]), baseline_path)
+
+            with (
+                patch(
+                    "helion.autotuner.benchmark_job._load_compiled_fn",
+                    return_value=fn,
+                ) as load_fn,
+                patch(
+                    "helion.autotuner.benchmark_job.do_bench",
+                    return_value=2.5,
+                ),
+            ):
+                result = BenchmarkAndAccuracyJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                )()
+
+        self.assertEqual(result.latency, 2.5)
+        self.assertIsNotNone(result.accuracy)
+        self.assertTrue(result.accuracy.ok)
+        # The whole point of the fix: one load == one compile for both steps.
+        load_fn.assert_called_once()
+
+    def test_fused_job_reports_accuracy_mismatch_with_latency(self) -> None:
+        fn = _ReturnValue(torch.tensor([2.0]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            torch.save((), args_path)
+            torch.save(torch.tensor([1.0]), baseline_path)
+
+            with (
+                patch(
+                    "helion.autotuner.benchmark_job._load_compiled_fn",
+                    return_value=fn,
+                ),
+                patch(
+                    "helion.autotuner.benchmark_job.do_bench",
+                    return_value=3.0,
+                ),
+            ):
+                result = BenchmarkAndAccuracyJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                )()
+
+        # A timing is still produced, but the accuracy check flags the mismatch.
+        self.assertEqual(result.latency, 3.0)
+        self.assertIsNotNone(result.accuracy)
+        self.assertFalse(result.accuracy.ok)
+
+    def test_fused_job_times_only_when_no_baseline(self) -> None:
+        fn = _ReturnValue(torch.tensor([1.0]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((), args_path)
+
+            with (
+                patch(
+                    "helion.autotuner.benchmark_job._load_compiled_fn",
+                    return_value=fn,
+                ) as load_fn,
+                patch(
+                    "helion.autotuner.benchmark_job.do_bench",
+                    return_value=4.0,
+                ),
+            ):
+                result = BenchmarkAndAccuracyJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=None,
+                    atol=0.0,
+                    rtol=0.0,
+                )()
+
+        self.assertEqual(result.latency, 4.0)
+        self.assertIsNone(result.accuracy)
+        load_fn.assert_called_once()
 
     def test_subprocess_accuracy_check_uses_benchmark_timeout(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
