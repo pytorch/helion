@@ -299,11 +299,12 @@ def chunk_fwd_h_diag_fused(
     k: torch.Tensor,
     v: torch.Tensor,
     g_last: torch.Tensor,
-    h0: torch.Tensor,
+    h0: torch.Tensor | None,
     gc: torch.Tensor | None = None,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    has_h0: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     """Fused state accumulation over N chunks.
 
@@ -336,7 +337,10 @@ def chunk_fwd_h_diag_fused(
 
     for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
         idx = tile_bh.id
-        h_acc = h0[idx, tile_d, tile_dv].float()
+        if has_h0:
+            h_acc = h0[idx, tile_d, tile_dv].float()
+        else:
+            h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
 
         for i_t in hl.grid(N):
             h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
@@ -1999,9 +2003,10 @@ def _helion_chunked_fwd(
 
         k_4d = k.reshape(BH, N, C, D)
         v_flat = v.reshape(BH, N, C, DV)
-        state = _init_state(initial_state, BH, D, DV, q)
+        has_h0 = initial_state is not None
+        state = _init_state(initial_state, BH, D, DV, q) if has_h0 else None
         h_all = chunk_fwd_h_diag_fused(
-            k_4d, v_flat, g_last, state, gc=g_cs, scalar_decay=True
+            k_4d, v_flat, g_last, state, gc=g_cs, scalar_decay=True, has_h0=has_h0
         )
 
         # Output kernel: pass raw q, k with g_cs for decay; scale folds in here.
