@@ -497,6 +497,7 @@ class TestSettingsEnv(TestCase):
         # max_blocks=10000, 200 SMs -> 10000 // 200 = 50 -> floor pow2 = 32
         settings = helion.Settings()
         with (
+            patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
             patch("helion.runtime.get_num_sm", return_value=200),
         ):
@@ -510,6 +511,7 @@ class TestSettingsEnv(TestCase):
         # without crashing on `1 << -1`.
         settings = helion.Settings()
         with (
+            patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=144),
             patch("helion.runtime.get_num_sm", return_value=148),
         ):
