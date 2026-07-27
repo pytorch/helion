@@ -1994,8 +1994,7 @@ def _helion_chunked_fwd(
 
     if scalar_decay:
         # Scalar decay path.
-        gc = g.float().reshape(BH, N, C)
-        g_cs = gc.cumsum(-1)  # [BH, N, C]
+        g_cs = g.reshape(BH, N, C).cumsum(-1, dtype=torch.float32)  # [BH, N, C]
         g_last = g_cs[:, :, -1]  # [BH, N]
 
         k_4d = k.reshape(BH, N, C, D)
@@ -2273,8 +2272,7 @@ def _helion_chunked_bwd(
         if bwd_cache is not None:
             g_cs, g_last_scalar, g_last_4d = bwd_cache
         else:
-            gc = g.float().reshape(BH, N, C)
-            g_cs = gc.cumsum(-1)
+            g_cs = g.reshape(BH, N, C).cumsum(-1, dtype=torch.float32)
             g_last_scalar = g_cs[:, :, -1]
             g_last_4d = g_last_scalar.unsqueeze(-1).expand(-1, -1, D)
 
