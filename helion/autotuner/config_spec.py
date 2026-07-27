@@ -53,7 +53,7 @@ from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
 from .._compiler.cute.tcgen05_config import CuteTcgen05Config
-from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from .._compiler.cute.tcgen05_config import Tcgen05AbStagesSearchConstraints
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..exc import InvalidConfig
@@ -1133,16 +1133,16 @@ class ConfigSpec:
         self._cute_tcgen05_config.cluster_m2_search_constraints = value
 
     @property
-    def _tcgen05_ab_stages_three_search_constraints(
+    def _tcgen05_ab_stages_search_constraints(
         self,
-    ) -> Tcgen05AbStagesThreeSearchConstraints | None:
-        return self._cute_tcgen05_config.ab_stages_three_search_constraints
+    ) -> Tcgen05AbStagesSearchConstraints | None:
+        return self._cute_tcgen05_config.ab_stages_search_constraints
 
-    @_tcgen05_ab_stages_three_search_constraints.setter
-    def _tcgen05_ab_stages_three_search_constraints(
-        self, value: Tcgen05AbStagesThreeSearchConstraints | None
+    @_tcgen05_ab_stages_search_constraints.setter
+    def _tcgen05_ab_stages_search_constraints(
+        self, value: Tcgen05AbStagesSearchConstraints | None
     ) -> None:
-        self._cute_tcgen05_config.ab_stages_three_search_constraints = value
+        self._cute_tcgen05_config.ab_stages_search_constraints = value
 
     @property
     def _tcgen05_num_epi_warps_search_choices(self) -> tuple[int, ...] | None:
@@ -1253,13 +1253,13 @@ class ConfigSpec:
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         self._cute_tcgen05_config._fix_cluster_m2_search_config(config)
 
-    def allow_tcgen05_ab_stages_three_search(
+    def allow_tcgen05_ab_stages_search(
         self,
         *,
         dtype_bytes: int,
         device: torch.device,
     ) -> None:
-        self._cute_tcgen05_config.allow_ab_stages_three_search(
+        self._cute_tcgen05_config.allow_ab_stages_search(
             dtype_bytes=dtype_bytes,
             device=device,
         )
@@ -1268,7 +1268,7 @@ class ConfigSpec:
     def _cute_per_cta_ab_smem_budget_bytes(device: torch.device) -> int:
         return CuteTcgen05Config.per_cta_ab_smem_budget_bytes(device)
 
-    def _tcgen05_ab_stages_three_fits(
+    def _tcgen05_ab_stages_fits(
         self,
         *,
         bm: int,
@@ -1276,7 +1276,7 @@ class ConfigSpec:
         bk: int,
         cluster_m: int,
     ) -> bool:
-        return self._cute_tcgen05_config.ab_stages_three_fits(
+        return self._cute_tcgen05_config.ab_stages_fits(
             bm=bm,
             bn=bn,
             bk=bk,
@@ -1314,8 +1314,8 @@ class ConfigSpec:
         cluster_m2_static_k: int | None = None,
         allow_cluster_m2_edge_k_tail_family: bool = False,
         allow_cluster_m2_fp8_small_grid: bool = False,
-        ab_stages_three_dtype_bytes: int | None = None,
-        ab_stages_three_device: torch.device | None = None,
+        ab_stages_dtype_bytes: int | None = None,
+        ab_stages_device: torch.device | None = None,
     ) -> None:
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
             allow_persistent_pid_types=allow_persistent_pid_types,
@@ -1323,8 +1323,8 @@ class ConfigSpec:
             cluster_m2_static_k=cluster_m2_static_k,
             allow_cluster_m2_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
             allow_cluster_m2_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
-            ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
-            ab_stages_three_device=ab_stages_three_device,
+            ab_stages_dtype_bytes=ab_stages_dtype_bytes,
+            ab_stages_device=ab_stages_device,
         )
 
     def supports_config_key(self, key: str) -> bool:
