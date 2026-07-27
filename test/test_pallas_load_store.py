@@ -628,7 +628,9 @@ class TestPallasVmemScalarLoad(TestCase):
         expected = (source.float().sum(-1) + source[:, -1].float()).to(DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @parametrize("dtype", [torch.bfloat16, torch.float32, torch.int32])
+    @parametrize(
+        "dtype", [torch.bfloat16, torch.float32, torch.int32, torch.float8_e4m3fn]
+    )
     def test_runtime_lane_index(self, dtype: torch.dtype) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def column_load(x: torch.Tensor) -> torch.Tensor:

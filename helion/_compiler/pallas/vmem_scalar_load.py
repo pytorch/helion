@@ -31,8 +31,13 @@ if TYPE_CHECKING:
 class VmemScalarLoad:
     """Runtime scalar indices on the minor dims of a VMEM-resident tensor.
 
-    ``static_indices[dim]`` holds the normalized literal index for ``dim``,
-    or ``None`` when the index is only known at runtime.
+    Attributes:
+        scalar_dims: Minor dims (non-negative) that are scalar-indexed.
+        extents: Extent of each scalar dim in the kernel's resident VMEM
+            window (tensor dim size capped by the configured block size).
+        static_indices: Normalized literal index for each scalar dim, or
+            ``None`` when the index is only known at runtime.
+        patterns: Per-dim indexing pattern, one entry per tensor dim.
     """
 
     scalar_dims: list[int]
@@ -41,7 +46,8 @@ class VmemScalarLoad:
     patterns: tuple[object, ...]
 
     def has_runtime_index(self, dim: int) -> bool:
-        """Whether ``dim`` is scalar-indexed by a value only known at runtime."""
+        """Whether ``dim`` (may be negative) has a runtime-only scalar index."""
+        dim %= len(self.patterns)
         return dim in self.static_indices and self.static_indices[dim] is None
 
 
@@ -53,7 +59,7 @@ def _is_scalar_index_pattern(pattern: object) -> bool:
 
 
 def _is_32bit(dtype: torch.dtype) -> bool:
-    return dtype.itemsize == 4 and dtype != torch.bool
+    return dtype.itemsize == 4
 
 
 def _resident_extent(state: CodegenState, tensor: torch.Tensor, dim: int) -> int:
@@ -141,10 +147,9 @@ def _sublane_load_applies(tensor: torch.Tensor, load: VmemScalarLoad) -> bool:
     """32-bit dtypes can put a runtime sublane index in the ref subscript."""
     if not _is_32bit(tensor.dtype):
         return False
-    sublane, lane = tensor.ndim - 2, tensor.ndim - 1
     # TODO(tcombes): when both indices are runtime values, compose the sublane
     # load with a lane roll instead of rolling both axes.
-    return load.has_runtime_index(sublane) and not load.has_runtime_index(lane)
+    return load.has_runtime_index(-2) and not load.has_runtime_index(-1)
 
 
 def _sublane_load_expr(
