@@ -234,6 +234,7 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
+        self._is_distributed = is_distributed
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
         self._backend.validate_environment()
@@ -340,9 +341,10 @@ class CompileEnvironment:
         if self.settings.autotune_force_persistent or not dist.is_initialized():
             return
 
-        if not self.has_barrier:
-            # A barrier already forces the restriction; only otherwise pay for the
-            # per-arg symm-mem scan (a collective on some torch builds).
+        if not self.has_barrier and not self._is_distributed:
+            # A barrier or an explicit distributed declaration already forces the
+            # restriction; only otherwise pay for the per-arg symm-mem scan (a
+            # collective on some torch builds).
             from .._dist_utils import is_symm_mem_tensor
 
             if not any(
