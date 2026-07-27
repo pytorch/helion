@@ -13,6 +13,8 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
@@ -997,6 +999,34 @@ class TestReductions(RefEagerTestBase, TestCase):
         inv_rms_y = torch.rsqrt(torch.mean(y_f * y_f, dim=-1) + 1e-5)
         expected_y = (y_f * inv_rms_y[:, None] * w2.float()).half()
         torch.testing.assert_close(out_y, expected_y, rtol=1e-2, atol=1e-2)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager(
+        "promoted-seed reduction_loops is only materialized in compiled mode"
+    )
+    @skipIfTileIR("TileIR reduction tiling differs")
+    @skipIfCute("reduction seed is Triton-only; CuTe uses its own reduction tiling")
+    def test_mid_axis_reduce_wide_feature_default_config(self) -> None:
+        """Regression: a reduction over a small middle axis co-resident with a wide
+        feature ([M, R, N].sum(1), R small, N large) run with the promoted default (no
+        explicit config) must produce a VALID reduction_loops and match the reference.
+        The byte-budget reduction seed used to collapse the rolled chunk to
+        ``reduction_loops=[1]``, which ``LoopedReductionStrategy`` rejects (block_size >
+        1); the ``ReductionLoopSpec._normalize`` floor now repairs it. Shapes are kept
+        small so the persistent tile fits a small GPU under parallel test execution."""
+
+        @helion.kernel(autotune_effort="none")
+        def mid_axis_reduce(x: torch.Tensor) -> torch.Tensor:
+            m, _r, n = x.shape
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :, :].to(torch.float32).sum(1)
+            return out
+
+        x = torch.randn([8, 4, 2048], device=DEVICE, dtype=torch.float32)
+        expected = x.sum(1)
+        _code, out = code_and_output(mid_axis_reduce, (x,))
+        torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

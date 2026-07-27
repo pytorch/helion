@@ -12,11 +12,10 @@ import math
 import torch
 
 import helion
-import helion.experimental
 import helion.language as hl
 
 
-@helion.experimental.aot_kernel(
+@helion.aot_kernel(
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def scaled_mm(

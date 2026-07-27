@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-import ast
-from typing import TYPE_CHECKING
 from typing import Sequence
 from typing import overload
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .. import exc
-from .._compiler.ast_extension import create
-from .._compiler.ast_extension import expr_from_string
 from . import _decorators
-
-if TYPE_CHECKING:
-    from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["inline_asm_elementwise"]
 
@@ -146,138 +138,3 @@ def _(
     # Type assertion: dtypes[0] is guaranteed to be torch.dtype due to validation above
     assert isinstance(dtypes[0], torch.dtype)
     return torch.empty(broadcast_shape, dtype=dtypes[0], device=env.device)
-
-
-@_decorators.codegen(inline_asm_elementwise, "triton")
-def _(state: CodegenState) -> ast.AST | list[ast.AST]:
-    # Get arguments
-    asm_str = state.proxy_arg(0)
-    constraints_str = state.proxy_arg(1)
-    dtype = state.proxy_arg(3)
-    is_pure = state.proxy_arg(4)
-    pack = state.proxy_arg(5)
-
-    # Convert the list of tensor args to AST
-    # We need to create a proper list AST with the tensor elements
-    raw_args = state.ast_args[2]
-    if isinstance(raw_args, list):
-        # Create AST List node with the tensor elements
-        args_ast = create(ast.List, elts=raw_args, ctx=ast.Load())
-    else:
-        # If it's not a list, wrap it in a list (shouldn't normally happen)
-        args_ast = raw_args
-
-    # Convert dtype to Triton type string(s)
-    if isinstance(dtype, (tuple, list)):
-        dtype_strs = [triton_type(dt) for dt in dtype if isinstance(dt, torch.dtype)]
-        dtype_arg = f"({', '.join(dtype_strs)})"  # Use tuple syntax for multiple dtypes
-        has_multiple_outputs = True
-    else:
-        dtype_arg = (
-            triton_type(dtype) if isinstance(dtype, torch.dtype) else "tl.float32"
-        )
-        has_multiple_outputs = False
-
-    # Create the call to tl.inline_asm_elementwise
-    inline_asm_call = create(
-        ast.Call,
-        func=expr_from_string("tl.inline_asm_elementwise"),
-        args=[
-            create(ast.Constant, value=asm_str),
-            create(ast.Constant, value=constraints_str),
-            args_ast,
-            expr_from_string(dtype_arg),
-            create(ast.Constant, value=is_pure),
-            create(ast.Constant, value=pack),
-        ],
-        keywords=[],
-    )
-
-    # Handle multiple outputs by creating getitem expressions
-    if has_multiple_outputs:
-        assert isinstance(dtype, (tuple, list))  # Type guard for len()
-        num_outputs = len(dtype)
-        return [
-            expr_from_string(
-                f"{{inline_asm_result}}[{i}]", inline_asm_result=inline_asm_call
-            )
-            for i in range(num_outputs)
-        ]
-
-    return inline_asm_call
-
-
-@_decorators.codegen(inline_asm_elementwise, "cute")
-def _(state: CodegenState) -> ast.AST | list[ast.AST]:
-    asm_str = state.proxy_arg(0)
-    constraints_str = state.proxy_arg(1)
-    dtype = state.proxy_arg(3)
-    is_pure = state.proxy_arg(4)
-    pack = state.proxy_arg(5)
-
-    if pack != 1:
-        raise exc.BackendUnsupported(
-            "cute",
-            "hl.inline_asm_elementwise with pack != 1",
-        )
-
-    raw_args = state.ast_args[2]
-    if isinstance(raw_args, list):
-        args_ast = create(ast.Tuple, elts=raw_args, ctx=ast.Load())
-    elif isinstance(raw_args, tuple):
-        args_ast = create(ast.Tuple, elts=list(raw_args), ctx=ast.Load())
-    else:
-        args_ast = create(ast.Tuple, elts=[raw_args], ctx=ast.Load())
-
-    from .._compiler.compile_environment import CompileEnvironment
-
-    backend = CompileEnvironment.current().backend
-    if isinstance(dtype, (tuple, list)):
-        dtype_arg = create(
-            ast.Tuple,
-            elts=[
-                expr_from_string(backend.dtype_str(dt))
-                for dt in dtype
-                if isinstance(dt, torch.dtype)
-            ],
-            ctx=ast.Load(),
-        )
-        has_multiple_outputs = True
-    else:
-        dtype_arg = expr_from_string(
-            backend.dtype_str(dtype)
-            if isinstance(dtype, torch.dtype)
-            else "cutlass.Float32"
-        )
-        has_multiple_outputs = False
-
-    inline_asm_call = create(
-        ast.Call,
-        func=expr_from_string("_cute_inline_asm_elementwise"),
-        args=[args_ast],
-        keywords=[
-            create(ast.keyword, arg="asm", value=create(ast.Constant, value=asm_str)),
-            create(
-                ast.keyword,
-                arg="constraints",
-                value=create(ast.Constant, value=constraints_str),
-            ),
-            create(ast.keyword, arg="dtype", value=dtype_arg),
-            create(
-                ast.keyword,
-                arg="is_pure",
-                value=create(ast.Constant, value=is_pure),
-            ),
-        ],
-    )
-
-    if has_multiple_outputs:
-        assert isinstance(dtype, (tuple, list))
-        inline_asm_result = state.codegen.lift(
-            inline_asm_call, dce=True, prefix="inline_asm_result"
-        )
-        return [
-            expr_from_string(f"{inline_asm_result.id}[{i}]") for i in range(len(dtype))
-        ]
-
-    return inline_asm_call

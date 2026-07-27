@@ -37,6 +37,7 @@ import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
+FIXED_BLOCK_SIZE = 16
 
 
 @helion.kernel
@@ -272,6 +273,29 @@ class TestLoops(RefEagerTestBase, TestCase):
             args,
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
+
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_fixed_block_unroll_and_pipeline(self):
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bhn = x.size(0)
+            c = x.size(1)
+            for tile_bhn in hl.tile(bhn, block_size=1):
+                for tile_c in hl.tile(c, block_size=FIXED_BLOCK_SIZE):
+                    x_block = x[tile_bhn, tile_c].float()
+                    out[tile_bhn, tile_c] = x_block
+            return out
+
+        args = (torch.randn((1, 64), device=DEVICE, dtype=HALF_DTYPE),)
+        _, result = code_and_output(
+            fn,
+            args,
+            range_num_stages=[0, 2],
+            range_unroll_factors=[0, 2],
+        )
+        torch.testing.assert_close(result, args[0])
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
