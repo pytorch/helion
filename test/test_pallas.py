@@ -2217,8 +2217,8 @@ class TestPallas(TestCase):
         """
         from unittest.mock import patch
 
-        from helion import runtime as helion_runtime
         from helion.runtime.config import Config
+        from helion.runtime.pallas import launcher as pallas_launcher
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def _matmul_dot_general_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -2246,9 +2246,9 @@ class TestPallas(TestCase):
         no_tiling_cfg = Config(block_sizes=[256, 256, 256])
 
         with patch.object(
-            helion_runtime,
+            pallas_launcher,
             "_build_matmul_dot_general_jit_fn",
-            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+            wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
         ) as build_spy:
             compiled_fn = bound.compile_config(no_tiling_cfg)
             result_no_tiling = compiled_fn(x, y)
@@ -2266,9 +2266,9 @@ class TestPallas(TestCase):
         bound_ref = _matmul_dot_general_pin.bind((x, y))
         tiled_cfg = Config(block_sizes=[128, 128, 128])
         with patch.object(
-            helion_runtime,
+            pallas_launcher,
             "_build_matmul_dot_general_jit_fn",
-            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+            wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
         ) as build_spy_tiled:
             compiled_ref = bound_ref.compile_config(tiled_cfg)
             result_tiled = compiled_ref(x, y)
@@ -2293,7 +2293,7 @@ class TestPallas(TestCase):
         import jax
         import jax.numpy as jnp
 
-        from helion import runtime as helion_runtime
+        from helion.runtime.pallas import launcher as pallas_launcher
 
         spec: dict[str, object] = {
             "lhs_tensor_arg_index": 0,
@@ -2305,7 +2305,7 @@ class TestPallas(TestCase):
             patch.object(jax, "jit", lambda fn: fn),
             patch.object(jax.lax, "dot_general", wraps=jax.lax.dot_general) as dot_spy,
         ):
-            fn = helion_runtime._build_matmul_dot_general_jit_fn(spec)
+            fn = pallas_launcher._build_matmul_dot_general_jit_fn(spec)
             result = cast(
                 "Any",
                 fn(

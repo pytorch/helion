@@ -182,8 +182,9 @@ def _codegen_resident_cache(state: CodegenState) -> object:
     Optional prep-cache descriptors are handled inside ``_codegen_fori_loop``.
 
     Ranges longer than ``C`` are NOT handled in-kernel: the torch launcher raises
-    (``runtime._compact_raise_if_range_exceeds_window``), while JAX export keeps
-    this as a caller precondition. There is no in-kernel streamed ``else``.
+    (``runtime.pallas.launcher._compact_raise_if_range_exceeds_window``), while
+    JAX export keeps this as a caller precondition. There is no in-kernel streamed
+    ``else``.
     """
     decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
     assert decision is not None and decision.active
