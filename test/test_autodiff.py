@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfNotTriton
+from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -1156,6 +1157,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_shape=(64, 1),
         )
 
+    @skipIfRocm("backward autotuning times out on ROCm")
     def test_backward_autotune(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
