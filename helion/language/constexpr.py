@@ -97,7 +97,7 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     proxy = value.proxy()
     env = CompileEnvironment.current()
 
-    def handle_symint(symint: torch.SymInt) -> int:
+    def handle_symint(symint: torch.SymInt) -> int | torch.SymInt:
         syms = _symint_free_symbols(symint)
         env.specialized_vars.update(syms)
         # Track stride specializations
@@ -110,6 +110,8 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
                     and source.idx is not None
                 ):
                     env.specialized_strides.add((source.base.local_name, source.idx))
+        if env.preserve_specializations:
+            return symint
         return symint.__int__()
 
     _convert_specializable(proxy, on_symint=handle_symint)
@@ -142,6 +144,10 @@ def _(value: _T) -> _T:
 
 @_decorators.codegen(specialize, "common")
 def _(state: CodegenState) -> ast.AST:
+    from .._compiler.compile_environment import CompileEnvironment
+
+    if CompileEnvironment.current().preserve_specializations:
+        return state.ast_arg(0)
     specialized = _convert_specializable(state.proxy_arg(0))
     return expr_from_string(repr(specialized))
 

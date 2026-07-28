@@ -4,6 +4,7 @@ import math
 import unittest
 
 import torch
+from torch._inductor.codecache import PyCodeCache
 
 import helion
 from helion._testing import DEVICE
@@ -16,6 +17,34 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
+
+
+@onlyBackends(["triton"])
+class TestExportSpecialize(RefEagerTestBase, TestCase):
+    def test_export_preserves_specializations_as_constexpr(self):
+        @helion.kernel(static_shapes=False)
+        def specialized_add(x: torch.Tensor) -> torch.Tensor:
+            n = hl.specialize(x.size(1))
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([x.size(0), n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + n
+            return out
+
+        x = torch.randn([4, 16], device=DEVICE)
+        config = helion.Config(block_sizes=[1, 4])
+        default_code = specialized_add.bind((x,)).to_code(config)
+        bound = specialized_add.bind((x,), preserve_specializations=True)
+        exported_code = bound.to_code(config)
+
+        self.assertNotIn("n: tl.constexpr", default_code)
+        self.assertIn("n: tl.constexpr", exported_code)
+        self.assertIn("x.size(1)", exported_code)
+
+        module = PyCodeCache.load(exported_code)
+        for shape in ([4, 16], [7, 32]):
+            value = torch.randn(shape, device=DEVICE)
+            result = module.specialized_add(value)
+            torch.testing.assert_close(result, value + shape[1])
 
 
 @onlyBackends(["triton", "cute"])

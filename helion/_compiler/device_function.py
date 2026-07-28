@@ -261,6 +261,7 @@ class DeviceFunction:
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
         self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
+        self._specialized_expr_args: dict[sympy.Expr, ConstExprArg] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
@@ -582,6 +583,8 @@ class DeviceFunction:
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
+        if env.preserve_specializations and expr.free_symbols & env.specialized_vars:
+            return self.specialized_expr_arg(expr, origin.origin).name
         if isinstance(origin.origin, TensorSizeOrigin):
             assert origin.fake_value is not None
             arg = self.tensor_size(
@@ -731,6 +734,16 @@ class DeviceFunction:
             self.arguments.append(arg)
             self._expr_args[sym] = arg
         return self._expr_args[sym]
+
+    def specialized_expr_arg(self, sym: sympy.Expr, origin: Origin) -> ConstExprArg:
+        if sym not in self._specialized_expr_args:
+            arg = ConstExprArg(
+                name=self.new_var(origin.suggest_var_name()),
+                _host_str=origin.host_str(),
+            )
+            self.arguments.append(arg)
+            self._specialized_expr_args[sym] = arg
+        return self._specialized_expr_args[sym]
 
     def constexpr_arg(self, name: str, value: object | None = None) -> bool:
         """Create a constexpr argument, returns True if created, False if already exists."""
