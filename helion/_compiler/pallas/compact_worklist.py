@@ -430,7 +430,7 @@ def build_resident_cache_admission(
     candidates, account for their scratch footprint, choose the one physical
     resident window, and drop optional prep when it cannot fit.
     """
-    from ...runtime import compact_ordered_physical_window
+    from ...runtime.pallas.launcher import compact_ordered_physical_window
 
     resident_operands = _tensor_footprints(
         host_args,

@@ -40,8 +40,8 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from . import _BlockSpecInfo
     from .kernel import Kernel
+    from .pallas.launcher import _BlockSpecInfo
 
 
 _TORCH_TO_JNP_DTYPE: dict[torch.dtype, object] | None = None
@@ -294,11 +294,11 @@ def default_pallas_jax_launcher(
     output(s) as ``_JaxExportTensor`` so the Helion wrapper's trailing
     reshape/view operations stay traceable.
     """
-    from . import _pallas_apply_ds_padding
-    from . import _pallas_compile_jit_fn
-    from . import _pallas_output_only_descriptors
-    from . import _pallas_padded_output_dims_by_arg
-    from . import _pallas_slice_to_orig
+    from .pallas.launcher import _pallas_apply_ds_padding
+    from .pallas.launcher import _pallas_compile_jit_fn
+    from .pallas.launcher import _pallas_output_only_descriptors
+    from .pallas.launcher import _pallas_padded_output_dims_by_arg
+    from .pallas.launcher import _pallas_slice_to_orig
     from .settings import is_pallas_interpret
 
     interpret = (
@@ -334,14 +334,14 @@ def default_pallas_jax_launcher(
     if compact_build_worklist is not None:
         # Resident caching: on this JAX-export/jit path the resident
         # window IS applied, but the host overflow guard
-        # (runtime._compact_raise_if_range_exceeds_window) is NOT run here -- the
+        # (runtime.pallas.launcher._compact_raise_if_range_exceeds_window) is NOT run here -- the
         # offsets are jit tracers, so a per-source reduction length exceeding the
         # window size C cannot be checked at trace time.  Contract: the caller
         # must ensure every ordered (reduction) range <= C (VMEM-derived,
         # thousands of tokens; the torch/eager launcher does enforce this).
         # Sizing C from a caller-provided max bound would make the window
         # overflow-proof by construction.
-        from . import _pallas_compile_compact_jit_fn
+        from .pallas.launcher import _pallas_compile_compact_jit_fn
 
         result = _pallas_compile_compact_jit_fn(
             pallas_kernel,

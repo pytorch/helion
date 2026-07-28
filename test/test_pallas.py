@@ -2217,8 +2217,8 @@ class TestPallas(TestCase):
         """
         from unittest.mock import patch
 
-        from helion import runtime as helion_runtime
         from helion.runtime.config import Config
+        from helion.runtime.pallas import launcher as helion_runtime
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def _matmul_dot_general_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -2293,7 +2293,7 @@ class TestPallas(TestCase):
         import jax
         import jax.numpy as jnp
 
-        from helion import runtime as helion_runtime
+        from helion.runtime.pallas import launcher as helion_runtime
 
         spec: dict[str, object] = {
             "lhs_tensor_arg_index": 0,
