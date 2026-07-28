@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
+from typing import cast
 import unittest
 
 import sympy
 
+from helion._compiler.backend import TileIRBackend
 from helion._compiler.backend import TritonBackend
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.compile_environment import FixedBlockSizeSource
+from helion._compiler.compile_environment import ReductionLoopBlockSizeSource
 from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.autotuner.config_spec import TensorNumelConstraint
 
 
@@ -31,8 +38,6 @@ def _make_constraint(
 
 def _check_numel_constraints(gen: ConfigGeneration, flat_config: list[object]) -> bool:
     """Return True if all tensor numel constraints are satisfied."""
-    from typing import cast
-
     for constraint in gen.config_spec.tensor_numel_constraints:
         args = [
             cast("int", flat_config[gen.block_size_indices[i]])
@@ -280,26 +285,182 @@ class TestShrinkConfig(unittest.TestCase):
             )
 
 
-class TestMixedSymbolExtraction(unittest.TestCase):
-    """Constraints with non-block-size free symbols must be skipped."""
+class TestNumelConstraintExtraction(unittest.TestCase):
+    """Extract constraints while preserving only config-time symbols."""
+
+    @staticmethod
+    def _mock_env(
+        backend: TritonBackend | None = None,
+    ) -> CompileEnvironment:
+        env = object.__new__(CompileEnvironment)
+        env._backend = backend or TritonBackend()
+        env.shape_env = SimpleNamespace(replace=lambda expr: expr)
+        env.specialized_vars = set()
+        env.config_spec = ConfigSpec(backend=env._backend)
+        return env
+
+    def test_config_invariant_reduction_extents_are_substituted(self) -> None:
+        """Persistent-only reductions contribute to the per-tile tensor numel."""
+        b0, b1, r0, r1, r2 = sympy.symbols("b0 b1 r0 r1 r2")
+        env = self._mock_env()
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=128))
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
+        env.config_spec.reduction_loops.append(
+            ReductionLoopSpec(block_id=2, size_hint=4)
+        )
+        env.block_sizes = [
+            SimpleNamespace(symbol=lambda: b0, block_id=0),
+            SimpleNamespace(symbol=lambda: b1, block_id=1),
+            SimpleNamespace(
+                symbol=lambda: r0,
+                block_id=2,
+                size=4,
+                block_size_source=ReductionLoopBlockSizeSource(0),
+            ),
+            SimpleNamespace(
+                symbol=lambda: r1,
+                block_id=3,
+                size=32,
+                block_size_source=ReductionLoopBlockSizeSource(1),
+            ),
+            SimpleNamespace(
+                symbol=lambda: r2,
+                block_id=4,
+                size=128,
+                block_size_source=ReductionLoopBlockSizeSource(2),
+            ),
+        ]
+        env.kernel_tensor_sizes = [(b0, r0, r1, b1, r2)]
+
+        env._extract_tensor_numel_constraints()
+
+        self.assertEqual(len(env.config_spec.tensor_numel_constraints), 1)
+        constraint = env.config_spec.tensor_numel_constraints[0]
+        self.assertEqual(constraint.block_indices, (0, 1))
+        self.assertTrue(constraint.check_fn(8, 8))
+        self.assertFalse(constraint.check_fn(16, 8))
+        gen = ConfigGeneration(env.config_spec)
+        flat = gen.default_flat()
+        config_block_indices, _ = gen._key_to_flat_indices["block_sizes"]
+        self.assertEqual([flat[i] for i in config_block_indices], [8, 8])
+
+    def test_tileir_substitutes_persistent_reduction_extent(self) -> None:
+        block, reduction = sympy.symbols("u0 r0")
+        env = self._mock_env(TileIRBackend())
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=128))
+        env.config_spec.reduction_loops.append(
+            ReductionLoopSpec(block_id=1, size_hint=5)
+        )
+        env.block_sizes = [
+            SimpleNamespace(symbol=lambda: block, block_id=0),
+            SimpleNamespace(
+                symbol=lambda: reduction,
+                block_id=1,
+                size=5,
+                block_size_source=ReductionLoopBlockSizeSource(0),
+            ),
+        ]
+        env.kernel_tensor_sizes = [(block, reduction)]
+
+        env._extract_tensor_numel_constraints()
+
+        self.assertEqual(len(env.config_spec.tensor_numel_constraints), 1)
+        constraint = env.config_spec.tensor_numel_constraints[0]
+        self.assertEqual(constraint.expr_str, "8*u0 <= 1048576")
+        self.assertTrue(constraint.check_fn(131072))
+        self.assertFalse(constraint.check_fn(262144))
+
+    def test_rollable_reduction_skips_constraint(self) -> None:
+        """A genuinely configurable reduction cannot use a block-only check."""
+        b0, b1, r0 = sympy.symbols("b0 b1 r0")
+        env = self._mock_env()
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=128))
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=128))
+        env.config_spec.reduction_loops.append(
+            ReductionLoopSpec(block_id=2, size_hint=16384)
+        )
+        env.block_sizes = [
+            SimpleNamespace(symbol=lambda: b0, block_id=0),
+            SimpleNamespace(symbol=lambda: b1, block_id=1),
+            SimpleNamespace(
+                symbol=lambda: r0,
+                block_id=2,
+                size=16384,
+                block_size_source=ReductionLoopBlockSizeSource(0),
+            ),
+        ]
+        env.kernel_tensor_sizes = [(b0, b1, r0)]
+
+        env._extract_tensor_numel_constraints()
+
+        self.assertEqual(env.config_spec.tensor_numel_constraints, [])
+
+    def test_reused_reduction_symbol_preserves_tunable_origin(self) -> None:
+        """A reduction alias must not overwrite its tunable tile symbol."""
+        block = sympy.Symbol("block")
+        env = self._mock_env()
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=128))
+        env.block_sizes = [
+            SimpleNamespace(symbol=lambda: block, block_id=0),
+            SimpleNamespace(
+                symbol=lambda: block,
+                block_id=1,
+                size=16384,
+                block_size_source=ReductionLoopBlockSizeSource(0),
+            ),
+        ]
+        env.kernel_tensor_sizes = [(block, sympy.Integer(16384))]
+
+        env._extract_tensor_numel_constraints()
+
+        self.assertEqual(len(env.config_spec.tensor_numel_constraints), 1)
+        constraint = env.config_spec.tensor_numel_constraints[0]
+        self.assertEqual(constraint.block_indices, (0,))
+        self.assertTrue(constraint.check_fn(64))
+        self.assertFalse(constraint.check_fn(128))
+
+    def test_fixed_block_extent_is_substituted(self) -> None:
+        block, fixed = sympy.symbols("block fixed")
+        env = self._mock_env()
+        env.config_spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=128))
+        env.block_sizes = [
+            SimpleNamespace(symbol=lambda: block, block_id=0),
+            SimpleNamespace(
+                symbol=lambda: fixed,
+                block_id=1,
+                size=128,
+                block_size_source=FixedBlockSizeSource(128),
+            ),
+        ]
+        env.kernel_tensor_sizes = [(block, fixed, sympy.Integer(128))]
+
+        env._extract_tensor_numel_constraints()
+
+        self.assertEqual(len(env.config_spec.tensor_numel_constraints), 1)
+        constraint = env.config_spec.tensor_numel_constraints[0]
+        self.assertTrue(constraint.check_fn(64))
+        self.assertFalse(constraint.check_fn(128))
 
     def test_mixed_symbol_shape_skipped(self) -> None:
         """A tensor shape like block_size_0 * runtime_dim should not produce
-        a constraint, because lambdify cannot substitute runtime_dim."""
-        from types import SimpleNamespace
-
-        from helion._compiler.compile_environment import CompileEnvironment
-
+        a constraint because it cannot be evaluated during config generation."""
         b0 = sympy.Symbol("u0", integer=True)
         runtime_dim = sympy.Symbol("u8", integer=True)
 
         # Minimal mock of CompileEnvironment for _extract_tensor_numel_constraints
         env = object.__new__(CompileEnvironment)
-        env._backend = SimpleNamespace(max_tensor_numel=TRITON_MAX_TENSOR_NUMEL)
+        env._backend = SimpleNamespace(
+            name="triton",
+            codegen_name="triton",
+            max_tensor_numel=TRITON_MAX_TENSOR_NUMEL,
+        )
+        env.shape_env = SimpleNamespace(replace=lambda expr: expr)
+        env.specialized_vars = set()
         env.block_sizes = [SimpleNamespace(symbol=lambda: b0, block_id=0)]
         env.config_spec = SimpleNamespace(
             block_sizes=SimpleNamespace(
                 block_id_to_index=lambda bid: bid,
+                valid_block_ids=lambda: [0],
             ),
             tensor_numel_constraints=[],
         )
@@ -324,10 +485,6 @@ class TestBackendMaxTensorNumel(unittest.TestCase):
     def test_backend_with_no_cap_extracts_no_constraints(self) -> None:
         """When backend.max_tensor_numel is None, _extract_tensor_numel_constraints
         emits no constraints regardless of how large the tile would be."""
-        from types import SimpleNamespace
-
-        from helion._compiler.compile_environment import CompileEnvironment
-
         b0 = sympy.Symbol("u0", integer=True)
         env = object.__new__(CompileEnvironment)
         env._backend = SimpleNamespace(max_tensor_numel=None)
