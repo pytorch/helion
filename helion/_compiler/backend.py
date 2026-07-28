@@ -703,6 +703,17 @@ class Backend(abc.ABC):
         """
         ...
 
+    def embedded_helper_source(self, body: str) -> str:
+        """Source of in-kernel runtime helpers to inline into the generated module.
+
+        Backends that call a helion-defined helper from inside the generated
+        kernel can return its source here (instead of importing it) so the output
+        is self-contained -- which lets the precompiler produce a helion-free
+        standalone. Only helpers actually referenced in ``body`` should be
+        emitted. Injected between the imports and the kernel body. Default: none.
+        """
+        return ""
+
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 

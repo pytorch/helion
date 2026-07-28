@@ -900,6 +900,13 @@ class TestPallas(TestCase):
         # (1) the lowering emits the divide-and-filter helper, not jax.lax.top_k
         self.assertIn("_helion_divide_filter_topk", code)
         self.assertNotIn("lax.top_k", code)
+        # (1b) the helper source is embedded (no helion import) so the kernel is
+        # self-contained / precompilable, and the embed doesn't corrupt the module.
+        self.assertIn("def divide_filter_topk(", code)
+        self.assertIn("_helion_divide_filter_topk = divide_filter_topk", code)
+        self.assertNotIn("from helion._compiler.pallas.topk_impl import", code)
+        self.assertNotIn("import helion", code)
+        ast.parse(code)
         # (2) correctness vs the exact top-k
         ref_v, ref_i = torch.topk(x, _TOPK_TEST_K, dim=-1, largest=True)
         idx_c = idx.cpu()

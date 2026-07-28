@@ -843,6 +843,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ast.fix_missing_locations(body_root)
                 imports = "\n".join(import_lines)
                 body = unparse(body_root, output_origin_lines=output_origin_lines)
+                # Inline any in-kernel runtime helpers (e.g. Pallas topk /
+                # compact-worklist) so the generated module is self-contained.
+                embedded = self.env.backend.embedded_helper_source(body)
+                if embedded:
+                    body = f"{embedded}\n\n\n{body}"
                 if imports:
                     return f"from __future__ import annotations\n\n{imports}\n\n{body}"
                 return f"from __future__ import annotations\n\n{body}"

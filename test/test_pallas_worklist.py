@@ -749,7 +749,10 @@ class TestWorklistRender(unittest.TestCase):
         src, offset_params = render_build_worklist(
             plan, block_expr=str(self.BLOCK), upper_expr=str(upper)
         )
-        namespace: dict = {}
+        # The rendered builder now calls a module-level ``flatten_worklist``
+        # (provided by the backend's embedded-helper inlining in real generated
+        # modules) rather than importing it inline, so supply it here.
+        namespace: dict = {"flatten_worklist": flatten_worklist}
         exec(compile(src, "<build_worklist>", "exec"), namespace)
         builder = namespace["_build_worklist"]
         return src, offset_params, builder(*offset_arrays)
@@ -881,7 +884,10 @@ class TestBuilderDistinctTensors(unittest.TestCase):
         self.assertEqual(offset_params, ["lo", "hi"])
         self.assertIn("jnp.arange(lo.shape[0]", src)
 
-        namespace: dict = {}
+        # The rendered builder now calls a module-level ``flatten_worklist``
+        # (supplied by the backend's embedded-helper inlining in real modules)
+        # rather than importing it inline, so provide it here.
+        namespace: dict = {"flatten_worklist": flatten_worklist}
         exec(compile(src, "<bw>", "exec"), namespace)
         meta = namespace["_build_worklist"](
             jnp.asarray(lo.numpy()), jnp.asarray(hi.numpy())
@@ -1064,6 +1070,13 @@ class TestWorklistConfig(unittest.TestCase):
         # builder kwargs; there is no separate launcher name.
         self.assertIn("_compact_build_worklist=_build_worklist", code)
         self.assertIn("def _build_worklist(", code)
+        # ``flatten_worklist`` is embedded at module scope (no Helion import),
+        # so the generated module is self-contained for precompilation rather
+        # than importing the runtime helper inside ``_build_worklist``.
+        self.assertIn("def flatten_worklist(", code)
+        self.assertNotIn("from helion.runtime.compact_worklist import", code)
+        # The embedded helper source must not corrupt the generated module.
+        ast.parse(code)
         # Offsets arg index is non-empty (q_offsets feeds the builder).
         self.assertRegex(code, r"_compact_offset_arg_indices=\[\d")
         self.assertIn("_compact_num_scalar_prefetch=3", code)
