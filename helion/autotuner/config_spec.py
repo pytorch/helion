@@ -2153,15 +2153,9 @@ class ConfigSpec:
                 )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
-                # Universal pid emission honors ``loop_orders`` (the
-                # launch grid swaps which tile axis is outer), and the
-                # better order is shape-dependent. Expose only on the
-                # non-tcgen05 branch — the tcgen05 persistent
-                # scheduler relies on a fixed
-                # ``pid_info[0]=M, pid_info[1]=N`` mapping for
-                # ``cluster_m`` / virtual-PID logic, so sampling
-                # ``loop_orders=[[1, 0]]`` there would steer cluster
-                # logic onto the wrong axis.
+                # Universal pid emission honors ``loop_orders`` and the
+                # better order is shape-dependent. tcgen05 exposes the same
+                # field from CuteTcgen05Config.flat_fields().
                 if (
                     self.supports_config_key("loop_orders")
                     and len(self.loop_orders) > 0

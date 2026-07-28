@@ -2685,6 +2685,24 @@ class CuteTcgen05Config:
     ) -> None:
         if not self.search_enabled:
             return
+        default_loop_orders = [
+            spec._fill_missing() for spec in self.config_spec.loop_orders
+        ]
+        loop_orders = config.get("loop_orders", default_loop_orders)
+        cluster_shape = (
+            config.get("tcgen05_cluster_m", 1),
+            config.get("tcgen05_cluster_n", 1),
+        )
+        if cluster_shape != (1, 1) and loop_orders != default_loop_orders:
+            # The clustered scheduler binds physical M/N dimensions to work-tile
+            # coordinates 0/1. Reordering is safe for a single CTA, but clustered
+            # scheduling must become block-ID-aware before those coordinates move.
+            if fix_invalid:
+                config["loop_orders"] = default_loop_orders
+            else:
+                raise InvalidConfig(
+                    "non-default loop_orders require tcgen05 cluster shape (1, 1)"
+                )
         pid_type_for_default = config.get("pid_type")
         strategy_validation_fragments = self.strategy_validation_fragments()
         for key, fragment in strategy_validation_fragments.items():
@@ -2742,6 +2760,11 @@ class CuteTcgen05Config:
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "l2_groupings": self.config_spec.l2_groupings,
         }
+        if (
+            self.config_spec.supports_config_key("loop_orders")
+            and len(self.config_spec.loop_orders) > 0
+        ):
+            fields["loop_orders"] = self.config_spec.loop_orders
         fields.update(self.optional_fragments(for_search=True))
         fields.update(self.strategy_autotune_fragments())
         fields.update(self.aux_load_mode_autotune_fragments())
