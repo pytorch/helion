@@ -539,9 +539,10 @@ kernel for a concrete set of sample inputs and writes a standalone `.py`
 file that runs with **only `torch` + the backend DSL** (`triton`; `jax`
 for the Pallas backend) — no `helion` import at runtime.
 
-This differs from {py:func}`helion.aot_kernel` (heuristic *pre-tuning*),
-which still runs the full Helion compile stack at call time. A precompiled
-file is self-contained: import it and call the exported entrypoint.
+This differs from {py:func}`helion.pretuned_kernel` (heuristic *pre-tuning*;
+formerly `helion.aot_kernel`, still available as an alias), which runs the full
+Helion compile stack at call time. A precompiled file is self-contained: import
+it and call the exported entrypoint.
 
 ```python
 import torch
@@ -588,15 +589,27 @@ out = add(x, y)
 - `output_path` — where to write the standalone file.
 - `entrypoint_name` — name of the exported function (defaults to the
   kernel's own name).
-- `jax_fn` — Pallas only; export a `jax.Array` entrypoint instead of a
-  torch-tensor one.
+- `jax_fn` — Pallas only; export a `jax.Array` entrypoint that runs the kernel
+  via the real `pl.kernel` compile core with **`jax` as the only dependency** (no
+  `torch`, no `helion`), instead of the default torch-tensor entrypoint. Supports
+  the common case (plain block specs, including multi-dim tile loops that lower to
+  a flat grid); kernels using advanced Pallas features (scratch/VMEM, SMEM, HBM
+  pass-through, in-place aliasing, compact-worklist, matmul `dot_general`) raise a
+  clear `NotImplementedError`.
 
-How it works: the generated code's only Helion dependency is the backend
-launcher (`helion/runtime/triton/launcher.py` or
-`helion/runtime/pallas/launcher.py`). Those modules are deliberately
-dependency-free (torch + the backend DSL only), so `precompile` inlines
-the launcher verbatim, drops the `from helion.runtime import ...` line, and
-emits the entrypoint — leaving a file with zero `helion` imports.
+How it works: for the torch-tensor entrypoint (Triton, and Pallas/TorchTPU), the
+generated code's only Helion dependency is the backend launcher
+(`helion/runtime/triton/launcher.py` or `helion/runtime/pallas/launcher.py`).
+Those modules are deliberately dependency-free (torch + the backend DSL only), so
+`precompile` inlines the launcher verbatim, drops the `from helion.runtime
+import ...` line, and emits the entrypoint — leaving a file with zero `helion`
+imports. In-kernel Pallas helpers (the `aten.topk` lowering and the
+compact-worklist builder) are pure-`jax` and get their source embedded into the
+generated module, so kernels using them precompile too. For `jax_fn=True`,
+`precompile` instead captures the launch metadata and inlines the jax-only slice
+of the Pallas launcher, so the standalone drives the exact same `pl.kernel`
+compile core (via the shared `_pallas_jax_call`) as the in-process jax_fn path —
+depending only on `jax`.
 
 ## Ahead-of-Time (AOT) Heuristic Tuning
 
@@ -628,8 +641,8 @@ ship pretuned heuristic files that demonstrate this end-to-end.
 
 ### Quick start: decorate a kernel for AOT
 
-Use {py:func}`helion.aot_kernel` instead of
-{py:func}`helion.kernel`.  The decorator wires the kernel into an
+Use {py:func}`helion.pretuned_kernel` (formerly `helion.aot_kernel`, kept as an
+alias) instead of {py:func}`helion.kernel`.  The decorator wires the kernel into an
 {py:class}`~helion.autotuner.aot_cache.AOTAutotuneCache`, which is what
 loads the generated heuristic at runtime:
 
@@ -639,7 +652,7 @@ import helion
 import helion.language as hl
 
 
-@helion.aot_kernel()
+@helion.pretuned_kernel()
 def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
@@ -810,7 +823,7 @@ target.
    actual hardware you are targeting — not the laptop you happen to
    be editing on.
 
-2. **Confirm the kernel uses `@helion.aot_kernel(...)`**
+2. **Confirm the kernel uses `@helion.pretuned_kernel(...)`**
    (see *Quick start* above).
 
 3. **Run the AOT workflow.**  Point the runner at any benchmark script
