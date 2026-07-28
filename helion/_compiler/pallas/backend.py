@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import enum
+import inspect
 import math
 from typing import TYPE_CHECKING
 from typing import Any
@@ -33,6 +34,35 @@ if TYPE_CHECKING:
     from .compact_worklist import CompactWorklistPlan
 
     InductorOpOverrides = OpsHandler[Any]
+
+
+def _embed_source(source: str) -> str:
+    """Return a module's source ready to inline: its module docstring and
+    ``from __future__`` lines stripped (leading comments -- e.g. an SPDX header --
+    and everything else preserved), so the docstring prose can't leak into the
+    generated code and the mid-module ``from __future__`` (a SyntaxError) is gone.
+
+    The docstring span is located via ``ast`` (not a quote scan) so a docstring
+    whose prose contains a triple-quote can't corrupt the output, and a module
+    that opens with code rather than a docstring is handled correctly.
+    """
+    lines = source.split("\n")
+    doc_lines: set[int] = set()
+    tree = ast.parse(source)
+    if (
+        tree.body
+        and isinstance(first := tree.body[0], ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        # ast line numbers are 1-based; end_lineno is the closing-quote line.
+        doc_lines = set(range(first.lineno - 1, (first.end_lineno or first.lineno)))
+    kept = [
+        line
+        for idx, line in enumerate(lines)
+        if idx not in doc_lines and not line.strip().startswith("from __future__")
+    ]
+    return "\n".join(kept).strip("\n")
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
@@ -169,8 +199,32 @@ class PallasBackend(Backend):
             "lax": "import jax.lax as lax",
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
-            "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
         }
+
+    def embedded_helper_source(self, body: str) -> str:
+        """Inline the in-kernel Pallas helpers referenced by ``body``.
+
+        ``divide_filter_topk`` (aten.topk lowering) and ``flatten_worklist``
+        (compact-worklist builder) are pure-``jax`` helpers the generated kernel
+        calls. Embedding their source -- instead of importing them from helion --
+        makes the generated module self-contained (so it precompiles to a
+        helion-free standalone) and applies to regular kernels too.
+        """
+        blocks: list[str] = []
+        if "_helion_divide_filter_topk" in body:
+            from . import topk_impl
+
+            blocks.extend(
+                [
+                    _embed_source(inspect.getsource(topk_impl)),
+                    "_helion_divide_filter_topk = divide_filter_topk",
+                ]
+            )
+        if "flatten_worklist" in body:
+            from ...runtime import compact_worklist
+
+            blocks.append(_embed_source(inspect.getsource(compact_worklist)))
+        return "\n\n\n".join(blocks)
 
     # Config keys that Pallas actually uses.  Everything else
     # (pid_type, num_warps, num_stages, maxnreg, indexing, etc.)
