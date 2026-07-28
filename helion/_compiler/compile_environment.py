@@ -1065,18 +1065,19 @@ class CompileEnvironment:
         self,
         input_shape: typing.Sequence[int | torch.SymInt],
         output_shape: typing.Sequence[int | torch.SymInt],
-    ) -> None:
+    ) -> list[int | torch.SymInt]:
         """Record reshape guards involving direct tunable block-size symbols."""
+        rewritten_shape = list(output_shape)
         if any(isinstance(dim, int) and dim == -1 for dim in output_shape):
             # PyTorch already handles inferred dimensions. Supporting them here
             # requires normalizing -1 to an exact symbolic quotient first.
-            return
+            return rewritten_shape
 
         input_numel = sympy.prod(_to_sympy(dim) for dim in input_shape)
         output_numel = sympy.prod(_to_sympy(dim) for dim in output_shape)
         constraint_expr = sympy.simplify(sympy.Eq(input_numel, output_numel))
         if constraint_expr is sympy.true or constraint_expr is sympy.false:
-            return
+            return rewritten_shape
 
         from ..autotuner.config_spec import BlockSizeConstraint
 
@@ -1084,7 +1085,7 @@ class CompileEnvironment:
         config_block_ids = set(self.config_spec.block_sizes.valid_block_ids())
         for symbol in constraint_expr.free_symbols:
             if not isinstance(symbol, sympy.Symbol):
-                return
+                return rewritten_shape
             block_id = self.get_block_id(symbol)
             # Accept only direct tunable symbols so this path does not need
             # block-size alias substitution or canonicalization.
@@ -1093,7 +1094,7 @@ class CompileEnvironment:
                 or block_id not in config_block_ids
                 or self.block_sizes[block_id].symbol() != symbol
             ):
-                return
+                return rewritten_shape
             block_ids.add(block_id)
         ordered_block_ids = tuple(sorted(block_ids))
         symbols = [
@@ -1114,6 +1115,42 @@ class CompileEnvironment:
         if not constraint_exists:
             constraints.append(constraint)
 
+        # CuTe maps a tile dimension to one thread axis. For a trailing split,
+        # restrict the tile to one complete group so the inner dimension can
+        # retain the original block's symbolic provenance. Add this before the
+        # assignment search so incompatible minima or earlier guards fail
+        # instead of silently using a layout CuTe cannot represent correctly.
+        split_block_id: int | None = None
+        split_constraint: BlockSizeConstraint | None = None
+        if (
+            self.backend_name == "cute"
+            and len(output_shape) == len(input_shape) + 1
+            and all(
+                itertools.starmap(
+                    self.known_equal,
+                    zip(input_shape[:-1], output_shape[:-2], strict=True),
+                )
+            )
+            and isinstance(output_shape[-1], int)
+            and output_shape[-1] >= 2
+        ):
+            split_block_id = self.get_block_id(input_shape[-1])
+            if split_block_id is not None:
+                factor = output_shape[-1]
+                symbol = self.block_sizes[split_block_id].symbol()
+                fixed_expr = sympy.Eq(symbol, factor)
+                split_constraint = BlockSizeConstraint(
+                    check_fn=_make_numel_check([symbol], fixed_expr),
+                    block_ids=(split_block_id,),
+                    expr_str=str(fixed_expr),
+                )
+                if not any(
+                    existing.block_ids == split_constraint.block_ids
+                    and existing.expr_str == split_constraint.expr_str
+                    for existing in constraints
+                ):
+                    constraints.append(split_constraint)
+
         assignment = self._find_block_constraint_assignment(
             constraints,
             preferred=shape_env_var_hints(self.shape_env),
@@ -1126,6 +1163,12 @@ class CompileEnvironment:
 
         if not constraint_exists:
             self.config_spec.block_size_constraints.append(constraint)
+        if split_constraint is not None and not any(
+            existing.block_ids == split_constraint.block_ids
+            and existing.expr_str == split_constraint.expr_str
+            for existing in self.config_spec.block_size_constraints
+        ):
+            self.config_spec.block_size_constraints.append(split_constraint)
 
         hints = shape_env_var_hints(self.shape_env)
         for block_id, value in assignment.items():
@@ -1134,6 +1177,11 @@ class CompileEnvironment:
             self.config_spec.block_sizes.block_id_lookup(
                 block_id
             ).autotuner_default = value
+
+        if split_block_id is not None:
+            rewritten_shape[-1] = self.block_sizes[split_block_id].var
+
+        return rewritten_shape
 
     def _find_block_constraint_assignment(
         self,

@@ -31,8 +31,9 @@ class TileShapeConstraintMode(TorchDispatchMode):
             tensor, shape = args[:2]
             if isinstance(tensor, torch.Tensor) and isinstance(shape, (list, tuple)):
                 if all(isinstance(dim, (int, torch.SymInt)) for dim in shape):
-                    CompileEnvironment.current().prepare_tile_reshape(
+                    shape = CompileEnvironment.current().prepare_tile_reshape(
                         tensor.shape,
                         shape,
                     )
+                    args = (tensor, shape, *args[2:])
         return func(*args, **(kwargs or {}))
