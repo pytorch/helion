@@ -1,13 +1,14 @@
 """
-AOT Kernel Decorator
-====================
+Pretuned Kernel Decorator
+=========================
 
-Provides a simplified decorator for creating kernels with AOT (Ahead-of-Time)
-autotuning support. This decorator automatically configures the kernel for
-heuristic-based config selection.
+Provides a simplified decorator (``helion.pretuned_kernel``, formerly
+``helion.aot_kernel``) for creating kernels with AOT (Ahead-of-Time) autotuning
+support. This decorator automatically configures the kernel for heuristic-based
+config selection.
 
 Usage:
-    @helion.aot_kernel()
+    @helion.pretuned_kernel()
     def my_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         ...
 
@@ -338,7 +339,7 @@ class _AOTKernelDecorator:
 
 
 @overload
-def aot_kernel(
+def pretuned_kernel(
     fn: Callable[..., _R],
     *,
     config: ConfigLike | None = None,
@@ -351,7 +352,7 @@ def aot_kernel(
 
 
 @overload
-def aot_kernel(
+def pretuned_kernel(
     fn: None = None,
     *,
     config: ConfigLike | None = None,
@@ -363,7 +364,7 @@ def aot_kernel(
 ) -> _AOTKernelDecorator: ...
 
 
-def aot_kernel(
+def pretuned_kernel(
     fn: Callable[..., _R] | None = None,
     *,
     config: ConfigLike | None = None,
@@ -420,7 +421,7 @@ def aot_kernel(
         Kernel: A Kernel object configured for AOT autotuning.
 
     Example:
-        @helion.aot_kernel()
+        @helion.pretuned_kernel()
         def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             m, k = a.shape
             _, n = b.shape
@@ -436,7 +437,7 @@ def aot_kernel(
         result = matmul(x, y)
 
         # Example with batched dimension:
-        @helion.aot_kernel(batched=[[0, None], None])
+        @helion.pretuned_kernel(batched=[[0, None], None])
         def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
             # x has shape (batch, hidden), first dim is batched
             ...
@@ -450,7 +451,7 @@ def aot_kernel(
             return [(torch.randn(1024, size, device="cuda"), 1e-5)
                     for size in range(128, 4096, 128)]
 
-        @helion.aot_kernel(
+        @helion.pretuned_kernel(
             batched=[[0, None], None],
             collect_fn=my_collect_inputs,
             measure_fn=my_measure_inputs,
@@ -473,11 +474,11 @@ def aot_kernel(
     user_key: KeyFunction | None = cast("KeyFunction | None", settings.pop("key", None))
 
     if fn is None:
-        # Called as @aot_kernel() - return a decorator
+        # Called as @pretuned_kernel() - return a decorator
         return cast(
             "_AOTKernelDecorator",
             functools.partial(
-                aot_kernel,
+                pretuned_kernel,
                 config=config,
                 configs=configs,
                 batched=batched,
@@ -515,3 +516,10 @@ def aot_kernel(
     k._aot_user_key = user_key  # type: ignore[attr-defined]
 
     return k
+
+
+# Deprecated alias: ``aot_kernel`` was renamed to ``pretuned_kernel`` to make
+# clear it is ahead-of-time pre-*tuning* (heuristic config selection), as opposed
+# to :func:`helion.precompile` pre-*compilation*. Kept as a backward-compatible
+# alias so existing ``helion.aot_kernel`` callers keep working unchanged.
+aot_kernel = pretuned_kernel

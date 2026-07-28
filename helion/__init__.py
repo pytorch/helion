@@ -10,6 +10,7 @@ from ._utils import cdiv
 from ._utils import next_power_of_2
 from .autotuner import aot_kernel
 from .autotuner import from_cache
+from .autotuner import pretuned_kernel
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import PrecompilationInput
@@ -36,6 +37,7 @@ __all__ = [
     "language",
     "next_power_of_2",
     "precompile",
+    "pretuned_kernel",
     "runtime",
 ]
 

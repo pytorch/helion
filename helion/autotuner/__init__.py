@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from .aot_cache import AOTAutotuneCache as AOTAutotuneCache
 from .aot_kernel import aot_kernel as aot_kernel
+from .aot_kernel import pretuned_kernel as pretuned_kernel
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
