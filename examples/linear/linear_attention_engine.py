@@ -1430,8 +1430,8 @@ def chunk_bwd_dqk_helion(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g_cs: torch.Tensor,
-    g_last: torch.Tensor,
+    g_cs: torch.Tensor | None,
+    g_last: torch.Tensor | None,
     h: torch.Tensor,
     do: torch.Tensor,
     dh: torch.Tensor,
@@ -1622,7 +1622,7 @@ def chunk_bwd_dv_helion(
     q: torch.Tensor,
     k: torch.Tensor,
     k_state: torch.Tensor,
-    g_cs: torch.Tensor,
+    g_cs: torch.Tensor | None,
     do: torch.Tensor,
     dh: torch.Tensor,
     g_last: torch.Tensor | None = None,
@@ -2026,8 +2026,11 @@ def _helion_chunked_fwd(
         # No-decay path: the in-kernel decay ops are skipped and compiled out via use_g=False.
         k_state_4d = k.reshape(BH, N, C, D)
         v_flat = v.reshape(BH, N, C, DV)
-        state = _init_state(initial_state, BH, D, DV, q)
-        h_all = chunk_fwd_h_diag_fused(k_state_4d, v_flat, None, state, use_g=False)
+        has_h0 = initial_state is not None
+        state = _init_state(initial_state, BH, D, DV, q) if has_h0 else None
+        h_all = chunk_fwd_h_diag_fused(
+            k_state_4d, v_flat, None, state, use_g=False, has_h0=has_h0
+        )
 
         qf = q.reshape(BHN, C, D)
         kf = k.reshape(BHN, C, D)
@@ -2306,8 +2309,6 @@ def _helion_chunked_bwd(
             q_4d, do_flat, None, dstate, use_g=False, scale=scale
         )
 
-        g_csf2 = q.new_zeros(BHN, C, dtype=torch.float32)
-        g_lastf2 = q.new_zeros(BHN, dtype=torch.float32)
         dhf2 = dh_all.reshape(BHN, D, DV)
         qb = q.reshape(BHN, C, D)
         kb = k.reshape(BHN, C, D)
@@ -2316,10 +2317,10 @@ def _helion_chunked_bwd(
         hb = h_all.reshape(BHN, D, DV)
 
         dq_raw, dk_raw = chunk_bwd_dqk_helion(
-            qb, kb, vb, g_csf2, g_lastf2, hb, dob, dhf2, use_g=False, scale=scale
+            qb, kb, vb, None, None, hb, dob, dhf2, use_g=False, scale=scale
         )
         dv_raw = chunk_bwd_dv_helion(
-            qb, kb, kb, g_csf2, dob, dhf2, use_g=False, scale=scale
+            qb, kb, kb, None, dob, dhf2, use_g=False, scale=scale
         )
 
         return (
