@@ -16,7 +16,8 @@ from typing import cast
 
 import sympy
 import torch
-from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch.fx.graph import _Namespace
 
 from .. import exc
@@ -794,10 +795,11 @@ class DeviceFunction:
         v = fake_value.stride(dim)
         env = CompileEnvironment.current()
         # Check if this stride was explicitly specialized
-        source = env.input_sources.get(fake_value)
+        source = env.tensor_input_source(fake_value)
         if (
-            isinstance(source, LocalSource)
-            and (source.local_name, dim) in env.specialized_strides
+            source is not None
+            and TensorPropertySource(source, TensorProperty.STRIDE, dim)
+            in env.specialized_strides
         ):
             return StaticShape(int(v))
         if isinstance(v, int):
