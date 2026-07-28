@@ -46,7 +46,10 @@ from .device_state import CuteTcgen05MatmulPlan
 from .device_state import CuteTcgen05StoreValue
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
+from .matmul_utils import CuteMmaTileCoverage
 from .matmul_utils import analyze_direct_grouped_n_loads
+from .matmul_utils import classify_cute_mma_tile_coverage
+from .matmul_utils import cute_tma_tensor_is_aligned
 from .mma_support import get_cute_mma_support
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import Tcgen05PersistenceModel
@@ -561,14 +564,16 @@ class _MmaOutputStoreAnalysis:
     explicit_epi_tile_compatible: bool
 
 
-def _mma_tiles_are_static_full(
+def _mma_tile_coverage(
     analysis: _MmaOperandAnalysis, *, bm: int, bn: int, bk: int
-) -> bool:
-    """Whether the analyzed matrix extents are divisible by their tile sizes."""
-    return (
-        int(analysis.lhs.matrix_rows) % bm == 0
-        and int(analysis.rhs.matrix_cols) % bn == 0
-        and int(analysis.lhs.matrix_cols) % bk == 0
+) -> CuteMmaTileCoverage:
+    return classify_cute_mma_tile_coverage(
+        m=int(analysis.lhs.matrix_rows),
+        n=int(analysis.rhs.matrix_cols),
+        k=int(analysis.lhs.matrix_cols),
+        block_m=bm,
+        block_n=bn,
+        block_k=bk,
     )
 
 
@@ -1254,9 +1259,8 @@ def prepare_cute_collective_lane_loop_suppression(
             != "tcgen05"
         ):
             continue
-        if analysis.has_leading_passthrough and not _mma_tiles_are_static_full(
-            analysis, bm=bm, bn=bn, bk=bk
-        ):
+        coverage = _mma_tile_coverage(analysis, bm=bm, bn=bn, bk=bk)
+        if analysis.has_leading_passthrough and not coverage.is_full_or_k_tail:
             continue
         if (
             len(lhs_load.users) != 1
@@ -2158,8 +2162,14 @@ def _emit_mma_pipeline(
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
     # layout Helion emits expects the standard row-major A. Only B's major
     # mode is made layout-aware here.
-    tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
-    tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
+    tcgen05_use_tma_a = (
+        _dtype_tma_ok and _lhs_major == "row" and cute_tma_tensor_is_aligned(lhs_fake)
+    )
+    tcgen05_use_tma_b = (
+        _dtype_tma_ok
+        and _rhs_major in ("row", "col")
+        and cute_tma_tensor_is_aligned(rhs_fake)
+    )
     # B is K-major when its (K, N) storage is K-contiguous (column-major),
     # i.e. stride[0] == 1 -> _rhs_major == "col".
     tcgen05_b_k_major = _rhs_major == "col"
@@ -2304,10 +2314,8 @@ def _emit_mma_pipeline(
         config=df.config,
         input_device=lhs_fake.device,
     )
-    mma_tiles_are_static_full = _mma_tiles_are_static_full(
-        analysis, bm=bm, bn=bn, bk=bk
-    )
-    if analysis.has_leading_passthrough and not mma_tiles_are_static_full:
+    tile_coverage = _mma_tile_coverage(analysis, bm=bm, bn=bn, bk=bk)
+    if analysis.has_leading_passthrough and not tile_coverage.is_full_or_k_tail:
         return None
     # A leading-passthrough collective absorbs its serialized K loop. Other
     # non-root lane loops must already have been suppressed by MMA planning;
@@ -2369,10 +2377,27 @@ def _emit_mma_pipeline(
             "tcgen05 matmul with a leading passthrough axis does not support "
             "tcgen05_cluster_n != 1",
         )
-    tcgen05_static_output_tiles = m_size % bm == 0 and n_size % bn == 0
-    tcgen05_static_full_tiles = mma_tiles_are_static_full
-    tcgen05_has_k_tail = k_total_size > bk and k_total_size % bk != 0
-    tcgen05_k_tail_only = tcgen05_static_output_tiles and tcgen05_has_k_tail
+    tcgen05_static_output_tiles = tile_coverage.output_tiles_full
+    tcgen05_static_full_tiles = tile_coverage.is_static_full
+    tcgen05_has_k_tail = tile_coverage.has_k_tail
+    tcgen05_k_tail_only = tile_coverage.is_k_tail_only
+    tcgen05_one_cta_k_tail = (
+        mma_impl == "tcgen05"
+        and tcgen05_k_tail_only
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n_requested == 1
+    )
+    if (
+        analysis.has_leading_passthrough
+        and mma_impl == "tcgen05"
+        and tcgen05_k_tail_only
+        and not tcgen05_one_cta_k_tail
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 matmul with a leading passthrough K tail requires "
+            "tcgen05_cluster_m=1 and tcgen05_cluster_n=1",
+        )
     tcgen05_double_edge_output = m_size % bm != 0 and n_size % bn != 0
     tcgen05_double_edge_tma = (
         mma_impl == "tcgen05"
@@ -2425,6 +2450,14 @@ def _emit_mma_pipeline(
         and tcgen05_requested_two_cta
         and tcgen05_k_tail_only
     )
+    # Keep role-local producer and consumer state aligned by treating the
+    # partial K tile as a normal TMA stage. The operand-level TMA gate above
+    # ensures bounded TMA tensors can safely zero-fill the tail.
+    tcgen05_preserve_tma_for_one_cta_k_tail = (
+        tcgen05_one_cta_k_tail
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+    )
     tcgen05_m_edge_only = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
@@ -2452,6 +2485,7 @@ def _emit_mma_pipeline(
         and not tcgen05_static_full_tiles
         and not tcgen05_mixed_tma_scalar_fallback
         and not tcgen05_preserve_tma_for_two_cta_k_tail
+        and not tcgen05_preserve_tma_for_one_cta_k_tail
         and not tcgen05_m_edge_only
         and not tcgen05_n_edge_only
         and not tcgen05_double_edge_tma
@@ -2523,7 +2557,7 @@ def _emit_mma_pipeline(
         tcgen05_preserve_tma_for_two_cta_k_tail
         and tcgen05_is_two_cta
         and tcgen05_cluster_n == 1
-    )
+    ) or tcgen05_preserve_tma_for_one_cta_k_tail
     # Mirror the K-tail role-local guard so later cluster demotion or
     # cluster_n enablement cannot silently admit unvalidated edge ownership.
     tcgen05_role_local_m_edge_tma = (

@@ -13,6 +13,7 @@ from ...autotuner.config_fragment import EnumFragment
 from ...autotuner.config_fragment import IntegerFragment
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from .matmul_utils import largest_power_of_two_divisor_at_most
 from .strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
@@ -284,6 +285,20 @@ class CuteTcgen05Config:
         if max(indices) >= len(block_sizes):
             return None
         return block_sizes, m_index, n_index, k_index
+
+    def _matmul_static_extents(self) -> tuple[int, int, int] | None:
+        if self.matmul_block_ids is None:
+            return None
+        for fact in self.config_spec.matmul_facts:
+            if (
+                (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+                == self.matmul_block_ids
+                and fact.static_m is not None
+                and fact.static_n is not None
+                and fact.static_k is not None
+            ):
+                return fact.static_m, fact.static_n, fact.static_k
+        return None
 
     def _matmul_block_fragments(
         self,
@@ -1854,7 +1869,7 @@ class CuteTcgen05Config:
         config_view = self._matmul_config_view(config)
         if config_view is None:
             return
-        block_sizes, m_index, _, _ = config_view
+        block_sizes, m_index, n_index, _ = config_view
         constraints = self.cluster_m2_search_constraints
         if constraints is not None and constraints.allow_edge_k_tail_family:
             # persistent_interleaved stays in the flat enum so cluster_m=2
@@ -1862,9 +1877,33 @@ class CuteTcgen05Config:
             # same surface must use the validated flat edge fallback.
             config["pid_type"] = "flat"
             return
-        bm = block_sizes[m_index]
-        if isinstance(bm, int) and not isinstance(bm, bool):
-            block_sizes[m_index] = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+        static_extents = self._matmul_static_extents()
+        fragments = self._matmul_block_fragments()
+        if static_extents is None or fragments is None:
+            return
+        static_m, static_n, _ = static_extents
+        bm_fragment, bn_fragment, _ = fragments
+        for block_index, static_size, minimum, maximum in (
+            (
+                m_index,
+                static_m,
+                bm_fragment.low,
+                TCGEN05_ONE_CTA_MAX_BLOCK_M,
+            ),
+            (n_index, static_n, bn_fragment.low, bn_fragment.high),
+        ):
+            block_size = block_sizes[block_index]
+            if not isinstance(block_size, int) or isinstance(block_size, bool):
+                continue
+            divisor = largest_power_of_two_divisor_at_most(
+                static_size,
+                min(block_size, maximum),
+                minimum,
+            )
+            if divisor is None:
+                config["pid_type"] = "flat"
+                return
+            block_sizes[block_index] = divisor
 
     def restrict_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
         assert choices, "tcgen05_num_epi_warps search must allow at least one value"

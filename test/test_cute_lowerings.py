@@ -8367,13 +8367,7 @@ class TestCuteLowerings(unittest.TestCase):
         torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
 
     def test_tcgen05_persistent_partial_multi_tile_runtime_guard(self) -> None:
-        """Partial legacy persistent + tcgen05 still raises ``RuntimeError``.
-
-        Static full tiles use role-local persistent loops and have multi-tile
-        coverage. Partial K/M/N shapes stay on the legacy shared TMA fallback
-        path, which still launch-fails for multi-tile shapes; keep the
-        host-side guard for that non-role-local path.
-        """
+        """An unaligned TMA operand stays on the guarded persistent path."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -8394,9 +8388,9 @@ class TestCuteLowerings(unittest.TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        # K=17 is not a static full tile for bk=16, so role-local extraction
-        # stays disabled. M/N are 2x2 tiles, so the legacy multi-tile guard
-        # must fire before the CUDA launch.
+        # The contiguous lhs has a 34-byte row stride, which cannot be encoded
+        # safely by TMA. M/N are 2x2 tiles, so the legacy multi-tile guard must
+        # fire before the CUDA launch.
         args = (
             torch.randn(256, 17, device=DEVICE, dtype=torch.float16),
             torch.randn(17, 256, device=DEVICE, dtype=torch.float16),
@@ -8417,6 +8411,56 @@ class TestCuteLowerings(unittest.TestCase):
                 "supports runtime execution only",
             ):
                 bound(*args)
+
+    def test_tcgen05_persistent_aligned_k_tail_multi_tile_correctness(self) -> None:
+        """A 16-byte-aligned K-tail uses role-local persistent loops."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_aligned_k_tail(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(256, 24, device=DEVICE, dtype=torch.float16),
+            torch.randn(24, 256, device=DEVICE, dtype=torch.float16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_aligned_k_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 16],
+                pid_type="persistent_blocked",
+            )
+            bound.set_config(cfg)
+            code = bound.to_triton_code(cfg)
+            self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
+            for role in range(3):
+                self.assertIn(
+                    f"while tcgen05_role_local_{role}_work_tile.is_valid_tile",
+                    code,
+                )
+            out = bound(*args)
+
+        torch.testing.assert_close(
+            out,
+            args[0] @ args[1],
+            atol=2e-1,
+            rtol=1e-2,
+        )
 
     def test_tcgen05_persistent_cluster_m2_multi_tile_runtime_guard(self) -> None:
         """CtaGroup.ONE cluster_m=2 fallback remains guarded."""
@@ -15780,9 +15824,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         kernel = self._bias_residual_gelu_kernel()
         args = (
             torch.empty([640, 128], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 642], device=DEVICE, dtype=torch.bfloat16),
+            # Keep the row-vector extent unaligned while giving the matrix
+            # operands valid 16-byte-aligned padded TMA strides.
+            torch.empty([128, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
             torch.empty([642], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([640, 642], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([640, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
         )
 
         with patch_cute_mma_support():

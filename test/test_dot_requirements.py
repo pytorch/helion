@@ -10,6 +10,9 @@ import torch
 import helion
 from helion import _compat
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.cute.matmul_utils import classify_cute_mma_tile_coverage
+from helion._compiler.cute.matmul_utils import cute_tma_tensor_is_aligned
+from helion._compiler.cute.matmul_utils import largest_power_of_two_divisor_at_most
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
@@ -244,6 +247,82 @@ def _bind_cute_strategy_kernel():
 
 @onlyBackends(["triton", "cute"])
 class TestDotRequirements(RefEagerTestDisabled, TestCase):
+    def test_cute_tma_tensor_alignment(self) -> None:
+        self.assertTrue(cute_tma_tensor_is_aligned(torch.empty(128, 24)))
+        self.assertFalse(cute_tma_tensor_is_aligned(torch.empty(128, 17)))
+        self.assertTrue(cute_tma_tensor_is_aligned(torch.empty(128, 24).T))
+        self.assertFalse(cute_tma_tensor_is_aligned(torch.empty(128, 17).T))
+
+        offset = torch.empty(128 * 24 + 1)[1:].view(128, 24)
+        self.assertFalse(cute_tma_tensor_is_aligned(offset))
+
+    def test_cute_mma_tile_coverage_classification(self) -> None:
+        self.assertEqual(largest_power_of_two_divisor_at_most(128, 96, 8), 64)
+
+        full = classify_cute_mma_tile_coverage(
+            m=128, n=128, k=128, block_m=128, block_n=128, block_k=64
+        )
+        self.assertTrue(full.is_static_full)
+        self.assertTrue(full.is_full_or_k_tail)
+
+        k_tail = classify_cute_mma_tile_coverage(
+            m=128, n=128, k=104, block_m=128, block_n=128, block_k=64
+        )
+        self.assertTrue(k_tail.is_k_tail_only)
+        self.assertTrue(k_tail.is_full_or_k_tail)
+
+        single_partial_k = classify_cute_mma_tile_coverage(
+            m=128, n=128, k=40, block_m=128, block_n=128, block_k=64
+        )
+        self.assertFalse(single_partial_k.is_full_or_k_tail)
+
+        output_edge = classify_cute_mma_tile_coverage(
+            m=130, n=128, k=104, block_m=128, block_n=128, block_k=64
+        )
+        self.assertFalse(output_edge.is_full_or_k_tail)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_k_tail_reaches_smaller_persistent_tile(self) -> None:
+        args = (
+            torch.empty([192, 104], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([104, 128], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        _cute_strategy_matmul_kernel.reset()
+        with patch_cute_mma_support():
+            bound = _cute_strategy_matmul_kernel.bind(args)
+        spec = bound.config_spec
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+
+        gen = ConfigGeneration(spec)
+        sampled = helion.Config(
+            block_sizes=[128, 128, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+        )
+        flat, normalized = gen.canonicalize_flat(gen.flatten(sampled))
+
+        self.assertEqual(normalized.block_sizes[:3], [64, 128, 64])
+        self.assertEqual(normalized.pid_type, "persistent_interleaved")
+        self.assertEqual(flat, gen.flatten(normalized))
+        gen.encode_config(flat)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_unaligned_tma_stride_disables_persistent_search(
+        self,
+    ) -> None:
+        args = (
+            torch.empty([256, 17], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([17, 256], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        _cute_strategy_matmul_kernel.reset()
+        with patch_cute_mma_support():
+            bound = _cute_strategy_matmul_kernel.bind(args)
+
+        self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+        self.assertNotIn("persistent_blocked", bound.config_spec.allowed_pid_types)
+        self.assertNotIn("persistent_interleaved", bound.config_spec.allowed_pid_types)
+
     @patch.object(_compat, "_min_dot_size", lambda *args: (2, 8, 16))
     def test_hl_dot_sets_min_size(self) -> None:
         @helion.kernel
@@ -1462,8 +1541,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     def test_cute_tcgen05_partial_tile_search_keeps_persistent_pid_types_out(
         self,
     ) -> None:
-        """Autotune excludes persistent pid types when the search can sample
-        block sizes that produce partial tiles."""
+        """Autotune excludes persistence when no full output tile is reachable."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1479,7 +1557,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         args = (
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([64, 192], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([64, 193], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
             bound = cute_matmul_mma.bind(args)

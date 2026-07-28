@@ -130,7 +130,7 @@ def _detect_specialized_mma_loop(
     from ..host_function import HostFunction
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _mma_active_n_threads
-    from .cute_mma import _mma_tiles_are_static_full
+    from .cute_mma import _mma_tile_coverage
     from .cute_mma import _tcgen05_root_m_threads
     from .cute_mma import analyze_cute_mma_node
 
@@ -209,7 +209,7 @@ def _detect_specialized_mma_loop(
         candidate
         for candidate in candidates
         if not candidate.operands.has_leading_passthrough
-        or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
+        or _mma_tile_coverage(candidate.operands, bm=bm, bn=bn, bk=bk).is_full_or_k_tail
     ]
     if not candidates:
         return False
