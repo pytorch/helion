@@ -223,6 +223,7 @@ class CompileEnvironment:
         *,
         index_dtype: torch.dtype | None = None,
         is_distributed: bool = False,
+        preserve_specializations: bool = False,
     ) -> None:
         from ..autotuner.config_spec import ConfigSpec
 
@@ -230,6 +231,7 @@ class CompileEnvironment:
         # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
+        self.preserve_specializations = preserve_specializations
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
@@ -349,6 +351,8 @@ class CompileEnvironment:
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
+        if self.preserve_specializations:
+            return expr
         if subs := {
             s: sympy.Integer(shape_env_size_hint(self.shape_env, s))
             for s in expr.free_symbols & self.specialized_vars

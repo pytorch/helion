@@ -345,12 +345,20 @@ class Kernel(Generic[_R]):
             key.append(self._key_fn(*args))
         return tuple(key)
 
-    def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
+    def bind(
+        self,
+        args: tuple[object, ...],
+        *,
+        preserve_specializations: bool = False,
+    ) -> BoundKernel[_R]:
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
 
         Args:
             args: The arguments to bind to the Kernel.
+            preserve_specializations: Preserve values passed to ``hl.specialize``
+                as runtime-provided backend constexpr arguments. This is intended
+                for exporting code that can be reused across input shapes.
 
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
@@ -363,6 +371,19 @@ class Kernel(Generic[_R]):
                 raise TypeError(
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
+            if preserve_specializations:
+                normalized_args = self.normalize_args(*args)
+                if len(normalized_args) != len(args):
+                    return self.bind(
+                        normalized_args,
+                        preserve_specializations=True,
+                    )
+                return BoundKernel(
+                    self,
+                    args,
+                    preserve_specializations=True,
+                )
+
             signature = self._base_specialization_key(args)
             cache_key = self._get_bound_kernel_cache_key(args, signature)
             bound_kernel = (
@@ -584,6 +605,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self,
         kernel: Kernel[_R],
         args: tuple[object, ...],
+        *,
+        preserve_specializations: bool = False,
     ) -> None:
         """
         Initialize a BoundKernel object.
@@ -621,6 +644,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self.kernel.settings,
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
             is_distributed=is_distributed,
+            preserve_specializations=preserve_specializations,
         )
 
         if is_ref_mode_enabled(self.kernel.settings):

@@ -4,6 +4,9 @@ import math
 import unittest
 
 import torch
+from torch._inductor.codecache import PyCodeCache
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._testing import DEVICE
@@ -16,13 +19,70 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+_SPECIALIZATION_MODES = (False, True) if _get_backend() == "triton" else (False,)
+
+
+@onlyBackends(["triton"])
+class TestExportSpecialize(RefEagerTestBase, TestCase):
+    def test_export_preserves_specializations_as_constexpr(self):
+        @helion.kernel(static_shapes=False)
+        def specialized_add(x: torch.Tensor) -> torch.Tensor:
+            n = hl.specialize(x.size(1))
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([x.size(0), n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + n
+            return out
+
+        x = torch.randn([4, 16], device=DEVICE)
+        config = helion.Config(block_sizes=[1, 4])
+        default_code = specialized_add.bind((x,)).to_code(config)
+        bound = specialized_add.bind((x,), preserve_specializations=True)
+        exported_code = bound.to_code(config)
+
+        self.assertNotIn("n: tl.constexpr", default_code)
+        self.assertIn("n: tl.constexpr", exported_code)
+        self.assertIn("x.size(1)", exported_code)
+
+        module = PyCodeCache.load(exported_code)
+        for shape in ([4, 16], [7, 32]):
+            value = torch.randn(shape, device=DEVICE)
+            result = module.specialized_add(value)
+            torch.testing.assert_close(result, value + shape[1])
 
 
 @onlyBackends(["triton", "cute"])
 class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
-    def test_sqrt_does_not_specialize(self):
+    def assert_bind_cache_behavior(
+        self,
+        fn: helion.Kernel[torch.Tensor],
+        x: torch.Tensor,
+        preserve_specializations: bool,
+    ) -> None:
+        bound = fn.bind(
+            (x,),
+            preserve_specializations=preserve_specializations,
+        )
+        rebound = fn.bind(
+            (torch.zeros_like(x),),
+            preserve_specializations=preserve_specializations,
+        )
+        self.assertTrueIfInNormalMode(
+            (bound is rebound) == (not preserve_specializations)
+        )
+        self.assertTrueIfInNormalMode(
+            bound
+            is not fn.bind(
+                (torch.zeros_like(x[:, 1:]),),
+                preserve_specializations=preserve_specializations,
+            )
+        )
+
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_sqrt_does_not_specialize(self, preserve_specializations: bool) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -34,10 +94,17 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([512, 512], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_sizes=[32, 1], flatten_loop=True)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_sizes=[32, 1],
+            flatten_loop=True,
+        )
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
 
-    def test_specialize_host(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_specialize_host(self, preserve_specializations: bool) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -50,11 +117,17 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_sizes=[32, 32])
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_sizes=[32, 32],
+        )
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
 
     @skipIfRefEager("Ref eager mode won't raise ShapeSpecializingAllocation error")
-    def test_dynamic_size_block_errors(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_dynamic_size_block_errors(self, preserve_specializations: bool) -> None:
         @helion.kernel(static_shapes=False)
         def fn(
             x: torch.Tensor,
@@ -68,9 +141,17 @@ class TestSpecialize(RefEagerTestBase, TestCase):
 
         x = torch.randn([512, 512], device=DEVICE)
         with self.assertRaises(ShapeSpecializingAllocation):
-            code_and_output(fn, (x,), block_size=16)
+            code_and_output(
+                fn,
+                (x,),
+                preserve_specializations=preserve_specializations,
+                block_size=16,
+            )
 
-    def test_dynamic_size_block_specialize(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_dynamic_size_block_specialize(
+        self, preserve_specializations: bool
+    ) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -84,11 +165,27 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([512, 512], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_size=32,
+        )
         torch.testing.assert_close(result, x + 1)
-        self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
+        self.assertEqual(
+            len(
+                fn.bind(
+                    (x,),
+                    preserve_specializations=preserve_specializations,
+                ).config_spec.reduction_loops
+            ),
+            0,
+        )
 
-    def test_dynamic_size_block_non_power_of_two(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_dynamic_size_block_non_power_of_two(
+        self, preserve_specializations: bool
+    ) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -102,17 +199,28 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_size=32,
+        )
         torch.testing.assert_close(result, x + 1)
         self.assertTrueIfInNormalMode(
-            len(fn.bind((x,)).config_spec.reduction_loops) == 0
+            len(
+                fn.bind(
+                    (x,),
+                    preserve_specializations=preserve_specializations,
+                ).config_spec.reduction_loops
+            )
+            == 0
         )
-        self.assertTrueIfInNormalMode(fn.bind((x,)) is fn.bind((torch.zeros_like(x),)))
-        self.assertTrueIfInNormalMode(
-            fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
-        )
+        self.assert_bind_cache_behavior(fn, x, preserve_specializations)
 
-    def test_dynamic_size_block_non_power_of_two_outplace(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_dynamic_size_block_non_power_of_two_outplace(
+        self, preserve_specializations: bool
+    ) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -126,17 +234,28 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_size=32,
+        )
         torch.testing.assert_close(result, x + 1)
         self.assertTrueIfInNormalMode(
-            len(fn.bind((x,)).config_spec.reduction_loops) == 0
+            len(
+                fn.bind(
+                    (x,),
+                    preserve_specializations=preserve_specializations,
+                ).config_spec.reduction_loops
+            )
+            == 0
         )
-        self.assertTrueIfInNormalMode(fn.bind((x,)) is fn.bind((torch.zeros_like(x),)))
-        self.assertTrueIfInNormalMode(
-            fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
-        )
+        self.assert_bind_cache_behavior(fn, x, preserve_specializations)
 
-    def test_dynamic_size_block_non_power_of_two_swap_order(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_dynamic_size_block_non_power_of_two_swap_order(
+        self, preserve_specializations: bool
+    ) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -150,17 +269,28 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_size=32,
+        )
         torch.testing.assert_close(result, x + 1)
         self.assertTrueIfInNormalMode(
-            len(fn.bind((x,)).config_spec.reduction_loops) == 0
+            len(
+                fn.bind(
+                    (x,),
+                    preserve_specializations=preserve_specializations,
+                ).config_spec.reduction_loops
+            )
+            == 0
         )
-        self.assertTrueIfInNormalMode(fn.bind((x,)) is fn.bind((torch.zeros_like(x),)))
-        self.assertTrueIfInNormalMode(
-            fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
-        )
+        self.assert_bind_cache_behavior(fn, x, preserve_specializations)
 
-    def test_dynamic_size_block_non_power_of_two_double_acc(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_dynamic_size_block_non_power_of_two_double_acc(
+        self, preserve_specializations: bool
+    ) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -176,17 +306,28 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_size=32,
+        )
         torch.testing.assert_close(result, x + 2)
         self.assertTrueIfInNormalMode(
-            len(fn.bind((x,)).config_spec.reduction_loops) == 0
+            len(
+                fn.bind(
+                    (x,),
+                    preserve_specializations=preserve_specializations,
+                ).config_spec.reduction_loops
+            )
+            == 0
         )
-        self.assertTrueIfInNormalMode(fn.bind((x,)) is fn.bind((torch.zeros_like(x),)))
-        self.assertTrueIfInNormalMode(
-            fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
-        )
+        self.assert_bind_cache_behavior(fn, x, preserve_specializations)
 
-    def test_dynamic_size_block_non_power_of_two_matmul(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_dynamic_size_block_non_power_of_two_matmul(
+        self, preserve_specializations: bool
+    ) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -211,17 +352,28 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_size=32,
+        )
         torch.testing.assert_close(result, x + 2)
         self.assertTrueIfInNormalMode(
-            len(fn.bind((x,)).config_spec.reduction_loops) == 0
+            len(
+                fn.bind(
+                    (x,),
+                    preserve_specializations=preserve_specializations,
+                ).config_spec.reduction_loops
+            )
+            == 0
         )
-        self.assertTrueIfInNormalMode(fn.bind((x,)) is fn.bind((torch.zeros_like(x),)))
-        self.assertTrueIfInNormalMode(
-            fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
-        )
+        self.assert_bind_cache_behavior(fn, x, preserve_specializations)
 
-    def test_tensor_factory_specialize_non_power_of_2(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_tensor_factory_specialize_non_power_of_2(
+        self, preserve_specializations: bool
+    ) -> None:
         def _test_with_factory(factory_fn, test_host=True):
             @helion.kernel()
             def reduce_kernel(
@@ -251,7 +403,11 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                 return grad_weight.sum(0).to(x.dtype)
 
             x = torch.randn([128, 56], device=DEVICE, dtype=torch.float32)
-            code, result = code_and_output(reduce_kernel, (x, factory_fn, test_host))
+            code, result = code_and_output(
+                reduce_kernel,
+                (x, factory_fn, test_host),
+                preserve_specializations=preserve_specializations,
+            )
             reference = x.sum(0)
             torch.testing.assert_close(result, reference, rtol=1e-3, atol=1e-3)
 
@@ -279,7 +435,8 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         _test_with_factory(lambda x, s, **kw: hl.zeros([s], **kw), test_host=False)
         _test_with_factory(lambda x, s, **kw: hl.full([s], 1.0, **kw), test_host=False)
 
-    def test_specialize_reduce(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_specialize_reduce(self, preserve_specializations: bool) -> None:
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -291,13 +448,25 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+            block_size=32,
+        )
         torch.testing.assert_close(result, x.sum(-1))
         self.assertTrueIfInNormalMode(
-            len(fn.bind((x,)).config_spec.reduction_loops) == 1
+            len(
+                fn.bind(
+                    (x,),
+                    preserve_specializations=preserve_specializations,
+                ).config_spec.reduction_loops
+            )
+            == 1
         )
 
-    def test_specialize_tuple_element(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_specialize_tuple_element(self, preserve_specializations: bool) -> None:
         """Test that hl.specialize works correctly with tuple elements."""
 
         @helion.kernel(config=helion.Config(block_sizes=[32]))
@@ -305,19 +474,27 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             out = x.new_empty(x.shape)
             val = hl.specialize(bitshift[0])
             for x_tile in hl.tile([x.shape[0]]):
-                # compute_val equivalent: 1 << (32 - val)
-                out[x_tile] = x[x_tile] + (1 << (32 - val))
+                out[x_tile] = x[x_tile] + val * 4096
             return out
 
         x = torch.ones(64, dtype=torch.int32, device=DEVICE)
-        code, result = code_and_output(foo, (x, (16, 16)))
-        # 1 << (32-16) = 1 << 16 = 65536
+        code, result = code_and_output(
+            foo,
+            (x, (16, 16)),
+            preserve_specializations=preserve_specializations,
+        )
+        # 16 * 4096 = 65536
         expected = x + 65536
         torch.testing.assert_close(result, expected)
-        # Verify that 65536 appears in the generated code as a constant
-        self.assertIn("65536", code)
+        if preserve_specializations:
+            self.assertIn("val: tl.constexpr", code)
+        else:
+            self.assertIn("65536", code)
 
-    def test_specialize_size_becomes_static(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_specialize_size_becomes_static(
+        self, preserve_specializations: bool
+    ) -> None:
         """Test that hl.specialize on a size makes it NOT passed to the triton kernel."""
 
         @helion.kernel(static_shapes=False)
@@ -329,12 +506,19 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([137], device=DEVICE)  # Use prime to avoid alignment
-        code, result = code_and_output(fn, (x,))
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+        )
         torch.testing.assert_close(result, x + 1)
-        # Verify x_size_0 is NOT passed as an argument (it should be static)
-        self.assertNotIn("x_size_0", code)
+        if preserve_specializations:
+            self.assertIn("n: tl.constexpr", code)
+        else:
+            self.assertNotIn("x_size_0", code)
 
-    def test_specialize_stride_basic(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_specialize_stride_basic(self, preserve_specializations: bool) -> None:
         """Test that hl.specialize works with tensor strides."""
 
         @helion.kernel(static_shapes=False, autotune_effort="none")
@@ -356,14 +540,23 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         storage = torch.randn(storage_size, device=DEVICE)
         x = torch.as_strided(storage, size, (stride0, stride1))
 
-        code, result = code_and_output(fn, (x,))
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+        )
         torch.testing.assert_close(result, x + x.stride(0))
-        # Verify the unique stride value 137 is inlined as a constant
-        self.assertIn("137", code)
-        # Verify x_stride_0 is NOT passed as an argument (it should be inlined)
-        self.assertNotIn("x_stride_0", code)
+        if preserve_specializations:
+            self.assertIn("x_stride_0: tl.constexpr", code)
+            self.assertIn("x.stride(0)", code)
+        else:
+            self.assertIn("137", code)
+            self.assertNotIn("x_stride_0", code)
 
-    def test_specialize_stride_creates_different_variants(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_specialize_stride_creates_different_variants(
+        self, preserve_specializations: bool
+    ) -> None:
         """Test that different stride patterns create different kernel variants."""
 
         @helion.kernel(static_shapes=False, autotune_effort="none")
@@ -390,19 +583,34 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         x_b = torch.as_strided(storage_b, size, (stride0_b, 1))
 
         # These should create different bound kernels due to different strides
-        bound1 = fn.bind((x_a,))
-        bound2 = fn.bind((x_b,))
+        bound1 = fn.bind(
+            (x_a,),
+            preserve_specializations=preserve_specializations,
+        )
+        bound2 = fn.bind(
+            (x_b,),
+            preserve_specializations=preserve_specializations,
+        )
 
         # Verify different variants are used
         self.assertTrueIfInNormalMode(bound1 is not bound2)
 
         # Verify correctness
-        result1 = fn(x_a)
-        result2 = fn(x_b)
+        _, result1 = code_and_output(
+            fn,
+            (x_a,),
+            preserve_specializations=preserve_specializations,
+        )
+        _, result2 = code_and_output(
+            fn,
+            (x_b,),
+            preserve_specializations=preserve_specializations,
+        )
         torch.testing.assert_close(result1, x_a + stride0_a)
         torch.testing.assert_close(result2, x_b + stride0_b)
 
-    def test_specialize_stride_tuple(self):
+    @parametrize("preserve_specializations", _SPECIALIZATION_MODES)
+    def test_specialize_stride_tuple(self, preserve_specializations: bool) -> None:
         """Test that hl.specialize works with tuple of strides."""
 
         @helion.kernel(static_shapes=False, autotune_effort="none")
@@ -423,15 +631,26 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         storage = torch.randn(storage_size, device=DEVICE)
         x = torch.as_strided(storage, size, (stride0, stride1))
 
-        code, result = code_and_output(fn, (x,))
+        code, result = code_and_output(
+            fn,
+            (x,),
+            preserve_specializations=preserve_specializations,
+        )
         expected = x + stride0 + stride1
         torch.testing.assert_close(result, expected)
-        # Verify both unique stride values appear in the generated code
-        self.assertIn("311", code)
-        self.assertIn("131", code)
-        # Verify both x_stride_0 and x_stride_1 are NOT passed as arguments (they should be inlined)
-        self.assertNotIn("x_stride_0", code)
-        self.assertNotIn("x_stride_1", code)
+        if preserve_specializations:
+            self.assertIn("x_stride_0: tl.constexpr", code)
+            self.assertIn("x_stride_1: tl.constexpr", code)
+            self.assertIn("x.stride(0)", code)
+            self.assertIn("x.stride(1)", code)
+        else:
+            self.assertIn("311", code)
+            self.assertIn("131", code)
+            self.assertNotIn("x_stride_0", code)
+            self.assertNotIn("x_stride_1", code)
+
+
+instantiate_parametrized_tests(TestSpecialize)
 
 
 @onlyBackends(["triton", "cute"])
