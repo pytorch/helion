@@ -20,7 +20,6 @@ import torch.distributed as dist
 
 from .._compat import _regs_per_block
 from .._compat import device_num_sm
-from .._compat import get_num_xcd
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -60,6 +59,7 @@ from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraint
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..exc import InvalidConfig
+from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
