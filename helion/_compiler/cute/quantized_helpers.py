@@ -4,14 +4,28 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from cutlass import Float8E4M3FN
 from cutlass import Float32
 from cutlass import Int8
 from cutlass import Int16
+from cutlass._mlir.dialects import arith
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 if TYPE_CHECKING:
     from cutlass._mlir import ir
+
+
+def _as_ir_value(
+    value: object,
+    *,
+    loc: ir.Location | None,
+    ip: ir.InsertionPoint | None,
+) -> ir.Value:
+    raw_value = getattr(value, "value", None)
+    if hasattr(raw_value, "type"):
+        return cast("Any", raw_value)
+    return cast("Any", value).ir_value(loc=loc, ip=ip)
 
 
 def _as_i16(
@@ -20,11 +34,7 @@ def _as_i16(
     loc: ir.Location | None,
     ip: ir.InsertionPoint | None,
 ) -> ir.Value:
-    raw_value = getattr(value, "value", None)
-    if hasattr(raw_value, "type"):
-        ir_value = cast("Any", raw_value)
-    else:
-        ir_value = cast("Any", value).ir_value(loc=loc, ip=ip)
+    ir_value = _as_ir_value(value, loc=loc, ip=ip)
     ir_type = str(cast("Any", ir_value).type)
     if ir_type == "i8":
         return llvm.zext(Int16.mlir_type, ir_value, loc=loc, ip=ip)
@@ -34,6 +44,56 @@ def _as_i16(
     if ir_type == "i16":
         return ir_value
     raise TypeError(f"unsupported quantized scalar type: {ir_type}")
+
+
+@dsl_user_op
+def float32_to_fp8e4m3fn(
+    value: Any,  # noqa: ANN401
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> Float8E4M3FN:
+    """Narrow a scalar through PTX's packed E4M3 conversion instruction."""
+    if isinstance(value, Float8E4M3FN):
+        return value
+
+    value_f32 = Float32(value).ir_value(loc=loc, ip=ip)
+    packed = llvm.inline_asm(
+        Int16.mlir_type,
+        [value_f32],
+        """
+        {
+          .reg .f32 zero;
+          mov.f32 zero, 0f00000000;
+          cvt.rn.satfinite.e4m3x2.f32 $0, zero, $1;
+        }
+        """,
+        "=h,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    low_byte = arith.trunci(Int8.mlir_type, packed, loc=loc, ip=ip)
+    return Float8E4M3FN(llvm.bitcast(Float8E4M3FN.mlir_type, low_byte, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def fp8e4m3fn_to_storage(
+    value: object,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> Int8:
+    """Return the raw storage byte for a scalar E4M3 register value."""
+    ir_value = _as_ir_value(value, loc=loc, ip=ip)
+    ir_type = str(cast("Any", ir_value).type)
+    if ir_type == "i8":
+        return Int8(ir_value)
+    if ir_type.startswith("f8"):
+        return Int8(llvm.bitcast(Int8.mlir_type, ir_value, loc=loc, ip=ip))
+    raise TypeError(f"unsupported fp8 storage value type: {ir_type}")
 
 
 @dsl_user_op

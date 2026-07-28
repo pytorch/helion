@@ -1358,7 +1358,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out2, x2)
 
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
-    @skipIfCute("CuTe does not support scalar float32 to float8 conversion")
+    @skipIfCute("CuTe does not support this reshape/reduction layout")
     @skipIfRefEager("Test validates compiler block-size constraints")
     def test_tile_reshape_for_grouped_quantization(self):
         group_size = 128

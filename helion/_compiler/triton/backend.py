@@ -234,7 +234,12 @@ class TritonBackend(Backend):
 
         return triton_acc_type(dtype)
 
-    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+    def cast_expr(
+        self,
+        expr_str: str,
+        dtype_str: str,
+        source_dtype_str: str | None = None,
+    ) -> str:
         return f"tl.cast({expr_str}, {dtype_str})"
 
     def arange_expr(

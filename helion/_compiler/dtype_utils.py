@@ -4,19 +4,20 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     import ast
 
 
-def cast_ast(x: ast.AST, dtype: torch.dtype) -> ast.AST:
+def cast_ast(
+    x: ast.AST,
+    dtype: torch.dtype,
+    source_dtype: torch.dtype | None = None,
+) -> ast.AST:
     """Return an AST that casts expression `x` to the backend dtype string."""
     env = CompileEnvironment.current()
-    dtype_str = env.backend.dtype_str(dtype)
-    cast_str = env.backend.cast_expr("{x}", dtype_str)
-    return expr_from_string(cast_str, x=x)
+    return env.backend.cast_ast(x, dtype, source_dtype)
 
 
 def promote_and_cast_pair(
@@ -32,6 +33,6 @@ def promote_and_cast_pair(
     """
 
     common = torch.promote_types(lhs_dtype, rhs_dtype)
-    lhs_out = lhs if lhs_dtype == common else cast_ast(lhs, common)
-    rhs_out = rhs if rhs_dtype == common else cast_ast(rhs, common)
+    lhs_out = lhs if lhs_dtype == common else cast_ast(lhs, common, lhs_dtype)
+    rhs_out = rhs if rhs_dtype == common else cast_ast(rhs, common, rhs_dtype)
     return lhs_out, rhs_out, common

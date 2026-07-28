@@ -1038,7 +1038,9 @@ class CuteBackend(Backend):
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
+            "_cute_fp8e4m3fn_to_storage": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_storage as _cute_fp8e4m3fn_to_storage",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
+            "_cute_float32_to_fp8e4m3fn": "from helion._compiler.cute.quantized_helpers import float32_to_fp8e4m3fn as _cute_float32_to_fp8e4m3fn",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
@@ -1072,10 +1074,34 @@ class CuteBackend(Backend):
 
         return HelionCuteDSLOpOverrides()
 
-    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+    def cast_expr(
+        self,
+        expr_str: str,
+        dtype_str: str,
+        source_dtype_str: str | None = None,
+    ) -> str:
+        fp8_dtype = "cutlass.Float8E4M3FN"
+        if (
+            dtype_str == fp8_dtype
+            and source_dtype_str is not None
+            and source_dtype_str not in ("cutlass.Float32", fp8_dtype)
+        ):
+            expr_str = self.cast_expr(
+                expr_str,
+                "cutlass.Float32",
+                source_dtype_str,
+            )
+            source_dtype_str = "cutlass.Float32"
+        if source_dtype_str == "cutlass.Float32" and dtype_str == fp8_dtype:
+            return f"_cute_float32_to_fp8e4m3fn({expr_str})"
         return f"{dtype_str}({expr_str})"
 
-    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+    def cast_ast(
+        self,
+        x: ast.AST,
+        target_dtype: torch.dtype,
+        source_dtype: torch.dtype | None = None,
+    ) -> ast.AST:
         from ..device_function import DeviceFunction
         from ..device_function import NoCurrentFunction
 
@@ -1090,7 +1116,7 @@ class CuteBackend(Backend):
                     is not None
                 ):
                     return x
-        return super().cast_ast(x, target_dtype)
+        return super().cast_ast(x, target_dtype, source_dtype)
 
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
         # ``sem_arg`` is a TensorArg that arrives as a ``cute.Tensor``; its

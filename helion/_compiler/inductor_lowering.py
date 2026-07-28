@@ -1072,9 +1072,14 @@ class GenerateASTFromInductor(DefaultHandler):
         self.cg = cg
         self.input_name_lookup = input_name_lookup
 
-    def _cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+    def _cast_ast(
+        self,
+        x: ast.AST,
+        target_dtype: torch.dtype,
+        source_dtype: torch.dtype | None = None,
+    ) -> ast.AST:
         backend = CompileEnvironment.current().backend
-        return backend.cast_ast(x, target_dtype)
+        return backend.cast_ast(x, target_dtype, source_dtype)
 
     def _to_ast(self, x: object) -> ast.AST:
         if isinstance(x, ast.AST):
@@ -1094,7 +1099,12 @@ class GenerateASTFromInductor(DefaultHandler):
             return val.dtype
         return None
 
-    def _create_cast_expr(self, x: object, target_dtype: torch.dtype) -> ast.AST:
+    def _create_cast_expr(
+        self,
+        x: object,
+        target_dtype: torch.dtype,
+        source_dtype: torch.dtype | None = None,
+    ) -> ast.AST:
         """Create a backend cast expression from AST or string input.
 
         Args:
@@ -1105,7 +1115,7 @@ class GenerateASTFromInductor(DefaultHandler):
             AST expression for the cast operation
         """
         x_ast = self._to_ast(x)
-        return self._cast_ast(x_ast, target_dtype)
+        return self._cast_ast(x_ast, target_dtype, source_dtype)
 
     def _maybe_cast_to_expected_dtype(self, expr: ast.AST) -> ast.AST:
         """Cast expression to expected dtype if needed.
@@ -1156,7 +1166,7 @@ class GenerateASTFromInductor(DefaultHandler):
                 x=self._to_ast(x),
             )
             return self._lift(cast_expr)
-        cast_expr = self._create_cast_expr(x, dtype)
+        cast_expr = self._create_cast_expr(x, dtype, src_dtype)
         return self._lift(cast_expr)
 
     def sigmoid(self, x: object) -> str:  # type: ignore[override]

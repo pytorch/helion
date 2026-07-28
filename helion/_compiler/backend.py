@@ -211,7 +211,12 @@ class Backend(abc.ABC):
     def cdiv_expr(self, numel: str, block_size: str, *, is_device: bool) -> str:
         return f"(({numel}) + ({block_size}) - 1) // ({block_size})"
 
-    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+    def cast_expr(
+        self,
+        expr_str: str,
+        dtype_str: str,
+        source_dtype_str: str | None = None,
+    ) -> str:
         """Generate a backend-specific type cast expression."""
         raise exc.BackendUnsupported(self.name, "cast")
 
@@ -638,9 +643,18 @@ class Backend(abc.ABC):
     def inductor_op_overrides(self) -> InductorOpOverrides:
         raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
 
-    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+    def cast_ast(
+        self,
+        x: ast.AST,
+        target_dtype: torch.dtype,
+        source_dtype: torch.dtype | None = None,
+    ) -> ast.AST:
         return expr_from_string(
-            self.cast_expr("{x}", self.dtype_str(target_dtype)),
+            self.cast_expr(
+                "{x}",
+                self.dtype_str(target_dtype),
+                self.dtype_str(source_dtype) if source_dtype is not None else None,
+            ),
             x=x,
         )
 
