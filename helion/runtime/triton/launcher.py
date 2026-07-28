@@ -1,4 +1,4 @@
-"""Runtime launch helpers for the Triton backend.
+"""Helion-dependency-free runtime launch helpers for the Triton backend.
 
 This module holds the small set of runtime symbols that Helion's *generated*
 Triton code depends on at execution time:
@@ -8,11 +8,14 @@ Triton code depends on at execution time:
 * :func:`set_triton_allocator` -- installs the scratch allocator used by TMA /
   tensor-descriptor kernels (device-function prefix statement).
 
-Keeping these in a single dedicated module (rather than scattered through
-``helion.runtime``) lets the ahead-of-time precompiler bulk-export exactly this
-file into a standalone kernel. It is intended to depend only on ``torch`` and
-``triton`` (that guarantee is enforced in a follow-up change; today it still
-reaches back into a couple of ``helion`` helpers).
+It depends only on ``torch`` and ``triton`` -- no other ``helion`` module -- so
+the ahead-of-time precompiler can bulk-export this file verbatim into a
+standalone kernel with zero Helion runtime dependency.
+
+Helion-specific behavior that is only meaningful in-process (translating
+Triton's opaque shape errors into :class:`helion.exc.ShapeMismatch`, and the
+CPU/TPU cases of :func:`get_num_sm`) lives in thin wrappers in
+:mod:`helion.runtime`, not here.
 """
 
 from __future__ import annotations
@@ -21,12 +24,13 @@ import contextvars
 
 import torch
 
-from ... import exc
-from ..._utils import triton_is_available
-from ..settings import is_pallas_interpret as _module_is_pallas_interpret
-
-if triton_is_available():
+try:
     import triton
+except ImportError:
+    triton = None  # type: ignore[assignment]
+
+
+if triton is not None:
 
     def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
         # Dynamically get device from Triton backend
@@ -50,6 +54,7 @@ if triton_is_available():
         # if allocator isn't NullAllocator, we assume it is set by the user
         if isinstance(existing, NullAllocator):
             set_allocator(_alloc_fn)
+
 else:
 
     def set_triton_allocator() -> None:  # type: ignore[misc]
@@ -58,10 +63,11 @@ else:
 
 def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     """
-    Get the number of streaming multiprocessors (SMs) for the specified device.
+    Get the number of streaming multiprocessors (SMs) for the specified GPU.
 
     Args:
-        device: Device to query.
+        device: Device to query. Must be a GPU device (``cuda``/``xpu``/``mps``/
+            ``mtia``); CPU/TPU handling lives in :func:`helion.runtime.get_num_sm`.
         reserved_sms: Number of SMs to keep free for other work (e.g., communication
             kernels). Defaults to 0 meaning all device SMs are available to Helion.
 
@@ -70,13 +76,6 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         for any reserved SMs. Always at least 1.
     """
     available_sms: int
-    if device.type == "cpu":
-        if not _module_is_pallas_interpret():
-            raise AssertionError("TODO: implement for other devices")
-        return 1
-    if device.type == "tpu":
-        return 1
-
     assert device.type in [
         "cuda",
         "xpu",
@@ -135,13 +134,7 @@ def default_launcher(
     }
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
-    try:
-        return triton_kernel.run(  # type: ignore[union-attr]
-            *args,
-            **run_kwargs,
-        )
-    except Exception as error:
-        message = str(error)
-        if "Cannot make_shape_compatible: incompatible dimensions" in message:
-            raise exc.ShapeMismatch("kernel operands", message) from error
-        raise
+    return triton_kernel.run(  # type: ignore[union-attr]
+        *args,
+        **run_kwargs,
+    )
