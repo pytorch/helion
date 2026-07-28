@@ -5,16 +5,16 @@ generated Pallas code invokes) plus the shared block-spec / compile / caching
 helpers it and the pure-JAX export path (`helion.runtime.pallas_jax_export`)
 build on.
 
-Isolated here (out of the catch-all `helion.runtime`) so the ahead-of-time
-precompiler can bulk-export it. Making it depend only on torch + jax is a
-follow-up; today it still reaches into a couple of `helion` helpers
-(`settings`, `_compiler.backend`).
+Depends only on ``torch`` and ``jax`` -- no other ``helion`` module -- so the
+ahead-of-time precompiler can bulk-export this file verbatim into a standalone
+kernel with zero Helion runtime dependency.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
@@ -22,13 +22,33 @@ from typing import cast
 
 import torch
 
-from ..settings import is_pallas_interpret as _module_is_pallas_interpret
-
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
 
     import jax
+
+
+# Dtypes Mosaic/Pallas cannot lower. Kept here (rather than imported from the
+# compiler) so the launcher stays dependency-free; the compiler applies the same
+# check at codegen time.
+_PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
+
+
+def _pallas_interpret_enabled() -> bool:
+    """Whether Pallas interpret mode (CPU, no TPU) is on, per the
+    ``HELION_PALLAS_INTERPRET`` env var.
+
+    Dependency-free stand-in for ``helion.runtime.settings.is_pallas_interpret``
+    at the launcher's call sites: the launcher runs at kernel-execution time,
+    where no ``CompileEnvironment`` is active, so ``is_pallas_interpret`` already
+    reduces to this env-var read (``Settings.pallas_interpret`` itself defaults
+    from the same variable).
+    """
+    value = os.environ.get("HELION_PALLAS_INTERPRET")
+    if value is None or (value := value.strip()) == "":
+        return False
+    return value.lower() in ("1", "true", "yes", "on", "y", "t")
 
 
 def _pallas_make_block_spec(
@@ -103,8 +123,13 @@ def _pallas_make_block_spec(
 _CACHED_VMEM_LIMIT_BYTES: int | None = None
 
 
-def _get_vmem_limit_bytes(pltpu: object) -> int:
-    """Safely retrieves the TPU VMEM capacity without crashing on hardware locks."""
+def _get_vmem_limit_bytes(pltpu: object, interpret: bool) -> int:
+    """Safely retrieves the TPU VMEM capacity without crashing on hardware locks.
+
+    ``interpret`` picks the synthetic CPU TPU-info budget over a real-TPU query.
+    Callers pass the compile-time ``settings.pallas_interpret`` (compiler) or the
+    runtime env-var value (launcher), so this helper stays dependency-free.
+    """
     global _CACHED_VMEM_LIMIT_BYTES
     if _CACHED_VMEM_LIMIT_BYTES is not None:
         return _CACHED_VMEM_LIMIT_BYTES
@@ -112,9 +137,7 @@ def _get_vmem_limit_bytes(pltpu: object) -> int:
     # In interpret mode there is no real TPU; query the synthetic TPU info
     # registered by ``_ensure_cpu_tpu_info`` so the budget matches what real
     # TPU 7X reports rather than falling back to the conservative 16MB default.
-    from ..settings import is_pallas_interpret
-
-    if is_pallas_interpret():
+    if interpret:
         try:
             from jax._src.pallas.mosaic.tpu_info import registry
 
@@ -567,8 +590,6 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
 
 def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
     """Raise if any tensor arg uses a dtype unsupported on TPU."""
-    from ..._compiler.backend import _PALLAS_UNSUPPORTED_DTYPES
-
     for a in args:
         if isinstance(a, torch.Tensor) and a.dtype in _PALLAS_UNSUPPORTED_DTYPES:
             raise TypeError(
@@ -1404,7 +1425,7 @@ def _pallas_check_vmem_or_raise(
         output_indices,
         pallas_aliases,
     )
-    vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+    vmem_limit_bytes = _get_vmem_limit_bytes(pltpu, _pallas_interpret_enabled())
     if estimated_vmem > vmem_limit_bytes:
         raise RuntimeError(
             f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
@@ -1760,7 +1781,7 @@ def _pallas_install_launcher_cache(
     interpret = (
         _pallas_interpret
         if _pallas_interpret is not None
-        else _module_is_pallas_interpret()
+        else _pallas_interpret_enabled()
     )
     if interpret:
         _ensure_cpu_tpu_info()
@@ -2293,9 +2314,12 @@ def _pallas_compile_compact_jit_fn(
                 # already-sized allocation; do not use it to choose C.  A
                 # streamed compact_worklist kernel keeps the platform default.
                 vmem_limit_bytes=(
-                    max(_get_vmem_limit_bytes(pltpu), 128 * 1024 * 1024)
+                    max(
+                        _get_vmem_limit_bytes(pltpu, _pallas_interpret_enabled()),
+                        128 * 1024 * 1024,
+                    )
                     if ordered_aligned_arg_indices
-                    else _get_vmem_limit_bytes(pltpu)
+                    else _get_vmem_limit_bytes(pltpu, _pallas_interpret_enabled())
                 ),
             ),
             interpret=interpret,
@@ -2353,7 +2377,7 @@ def _pallas_install_compact_launcher_cache(
     interpret = (
         _pallas_interpret
         if _pallas_interpret is not None
-        else _module_is_pallas_interpret()
+        else _pallas_interpret_enabled()
     )
     if interpret:
         _ensure_cpu_tpu_info()
