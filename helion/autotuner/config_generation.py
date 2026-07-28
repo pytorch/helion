@@ -301,12 +301,20 @@ class ConfigGeneration:
                 assert isinstance(field, BlockIdSequence)
                 encoded_values = field._encode_flat_values(self.config_spec, value)
                 for idx, encoded_value in zip(indices, encoded_values, strict=True):
-                    result[idx] = encoded_value
+                    result[idx] = copy.deepcopy(encoded_value)
             else:
                 assert len(indices) == 1
-                result[indices[0]] = value
+                field = self.flat_spec[indices[0]]
+                if isinstance(field, ListOf) and not isinstance(value, list):
+                    value = [copy.deepcopy(value) for _ in range(field.length)]
+                result[indices[0]] = copy.deepcopy(value)
         self._repair_cute_num_threads(result)
         return result
+
+    def canonicalize_flat(self, flat_values: FlatConfig) -> tuple[FlatConfig, Config]:
+        """Normalize a flat config and return an owned matching flat/config pair."""
+        config = self.unflatten(copy.deepcopy(flat_values))
+        return self.flatten(config), config
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
@@ -438,8 +446,7 @@ class ConfigGeneration:
         seen: set[Config] = set()
         for i, config in enumerate(self.config_spec.compiler_seed_configs):
             try:
-                flat = self.flatten(config)
-                normalized = self.unflatten(flat)
+                flat, normalized = self.canonicalize_flat(self.flatten(config))
             except (
                 InvalidConfig,
                 ValueError,
@@ -466,8 +473,7 @@ class ConfigGeneration:
         seen: set[Config] = set()
         for i, config in enumerate(user_seed_configs):
             try:
-                flat = self.flatten(config)
-                normalized = self.unflatten(flat)
+                flat, normalized = self.canonicalize_flat(self.flatten(config))
             except (
                 InvalidConfig,
                 ValueError,

@@ -103,20 +103,12 @@ class PallasBackend(Backend):
     def map_dot_precision(precision: DotPrecision) -> str:
         """Map Helion dot precision to Pallas-specific precision string.
 
-        Pallas/TPU has limited support for different precisions, often
-        falling back to the highest available precision.
+        Pallas/TPU does not support Triton-style TF32/IEEE controls. On the
+        current TPU stack, JAX ``high``/``highest`` fp32 dot precision is less
+        compatible with PyTorch eager references than JAX default precision, so
+        all Helion aliases intentionally lower to the Pallas default.
         """
-        pallas_precision_by_dot_precision = {
-            "default": "default",
-            # "high" is mapped to "highest" because Pallas/Mosaic doesn't yet
-            # support it on TPU.
-            "high": "highest",
-            "highest": "highest",
-            "tf32": "highest",
-            "tf32x3": "highest",
-            "ieee": "highest",
-        }
-        return pallas_precision_by_dot_precision.get(precision, "default")
+        return "default"
 
     @property
     def max_tensor_numel(self) -> int | None:
@@ -1098,7 +1090,10 @@ class PallasBackend(Backend):
             for s in device_fn._scratch_args
         ]
         if scratch_shapes:
-            launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+            from ..host_function import HostFunction
+
+            scratch_shapes_str = HostFunction.current().literal_expr(scratch_shapes)
+            launcher_args.append(f"_scratch_shapes={scratch_shapes_str}")
 
         # Identify which launcher arg positions correspond to pipeline-body
         # tensors (need HBM refs); all others get proper BlockSpecs.

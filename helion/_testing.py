@@ -464,6 +464,13 @@ def float32_matmul_precision(precision: str) -> Generator[None, None, None]:
         torch.set_float32_matmul_precision(original_precision)
 
 
+def get_test_float32_matmul_precision() -> str:
+    """Return the PyTorch fp32 matmul precision used for test references."""
+    if _get_backend() == "pallas" and not is_pallas_interpret():
+        return "medium"
+    return "high"
+
+
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
     """Skip test when backend is not Triton (e.g. cute, pallas)."""
     return skipIfFn(lambda: _get_backend() != "triton", reason)
@@ -1134,37 +1141,27 @@ def _as_tensors(result: object) -> list[torch.Tensor]:
 
 
 def _with_tf32_precision(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-    """Run a test helper with TF32 enabled, restoring prior precision settings."""
+    """Run a test helper with backend-aligned fp32 matmul precision."""
 
     @functools.wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        orig_matmul_fp32_precision: str | None = None
         orig_cudnn_fp32_precision: str | None = None
-        orig_float32_matmul_precision: str | None = None
+        orig_float32_matmul_precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision(get_test_float32_matmul_precision())
         try:
             cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
-            orig_matmul_fp32_precision = cast(
-                "str", torch.backends.cuda.matmul.fp32_precision
-            )
             orig_cudnn_fp32_precision = cast("str", cudnn_conv.fp32_precision)
-            torch.backends.cuda.matmul.fp32_precision = "tf32"
             cudnn_conv.fp32_precision = "tf32"
         except AttributeError:  # No cudnn available
-            orig_float32_matmul_precision = torch.get_float32_matmul_precision()
-            torch.set_float32_matmul_precision("high")  # older deprecated API
+            pass
 
         try:
             return fn(*args, **kwargs)
         finally:
-            if (
-                orig_matmul_fp32_precision is not None
-                and orig_cudnn_fp32_precision is not None
-            ):
+            torch.set_float32_matmul_precision(orig_float32_matmul_precision)
+            if orig_cudnn_fp32_precision is not None:
                 cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
-                torch.backends.cuda.matmul.fp32_precision = orig_matmul_fp32_precision
                 cudnn_conv.fp32_precision = orig_cudnn_fp32_precision
-            elif orig_float32_matmul_precision is not None:
-                torch.set_float32_matmul_precision(orig_float32_matmul_precision)
 
     return wrapper
 
@@ -1179,6 +1176,7 @@ def run_example(
     rtol: float = 1e-2,
     atol: float = 1e-1,
     max_mismatch_pct: float | None = None,
+    max_mismatched_abs_diff: float | None = None,
     bwd: bool = False,
     trace_path: str | None = None,
     process_group_name: str | None = None,
@@ -1199,6 +1197,8 @@ def run_example(
         atol: Absolute tolerance for correctness check (default: 1e-1)
         max_mismatch_pct: If set, use assert_close_with_mismatch_tolerance with this mismatch
             fraction tolerance instead of strict assert_close (default: None)
+        max_mismatched_abs_diff: If set with max_mismatch_pct, bound the largest
+            absolute difference among mismatched elements.
         bwd: Whether to also test backward pass (default: False)
         trace_path: if not None, do profiling and save trace to this path
     """
@@ -1232,6 +1232,7 @@ def run_example(
                         atol=atol,
                         rtol=rtol,
                         max_mismatch_pct=max_mismatch_pct,
+                        max_mismatched_abs_diff=max_mismatched_abs_diff,
                     )
                 else:
                     torch.testing.assert_close(
@@ -1396,6 +1397,8 @@ def _assert_example_result_close(
     skip_accuracy: bool,
     atol: float,
     rtol: float,
+    max_mismatch_pct: float | None = None,
+    max_mismatched_abs_diff: float | None = None,
     cos_sim: CosSimilarity | tuple[int, float] | None = None,
 ) -> None:
     if skip_accuracy:
@@ -1422,12 +1425,22 @@ def _assert_example_result_close(
                 f"Cosine similarity {sim.mean().item()} is less than {min_sim}"
             )
 
-        torch.testing.assert_close(
-            got_f32,
-            exp_f32,
-            atol=atol,
-            rtol=rtol,
-        )
+        if max_mismatch_pct is not None:
+            assert_close_with_mismatch_tolerance(
+                got_f32,
+                exp_f32,
+                atol=atol,
+                rtol=rtol,
+                max_mismatch_pct=max_mismatch_pct,
+                max_mismatched_abs_diff=max_mismatched_abs_diff,
+            )
+        else:
+            torch.testing.assert_close(
+                got_f32,
+                exp_f32,
+                atol=atol,
+                rtol=rtol,
+            )
 
     tree_map(assert_close_fn, result, expected)
 
@@ -1453,6 +1466,8 @@ def check_example(
     static_shapes: bool | None = None,
     atol: float = 1e-1,
     rtol: float = 1e-2,
+    max_mismatch_pct: float | None = None,
+    max_mismatched_abs_diff: float | None = None,
     emit_code: bool = True,
     cos_sim: CosSimilarity | tuple[int, float] | None = None,
     **kwargs: object,
@@ -1479,6 +1494,8 @@ def check_example(
         skip_accuracy=skip_accuracy,
         atol=atol,
         rtol=rtol,
+        max_mismatch_pct=max_mismatch_pct,
+        max_mismatched_abs_diff=max_mismatched_abs_diff,
         cos_sim=cos_sim,
     )
     return code
@@ -1845,6 +1862,7 @@ def assert_close_with_mismatch_tolerance(
     atol: float = 1e-4,
     rtol: float = 1e-4,
     max_mismatch_pct: float = 0.01,
+    max_mismatched_abs_diff: float | None = None,
     max_abs_diff: float | None = None,
     max_rel_diff: float | None = None,
 ) -> None:
@@ -1857,6 +1875,8 @@ def assert_close_with_mismatch_tolerance(
 
     - *max_mismatch_pct*: maximum allowed fraction of mismatched elements
       (default 1%).  Always checked.
+    - *max_mismatched_abs_diff*: if not None, the greatest absolute
+      difference among mismatched elements must not exceed this value.
     - *max_abs_diff*: if not None, the greatest absolute difference across
       all elements must not exceed this value.
     - *max_rel_diff*: if not None, the greatest relative difference
@@ -1874,6 +1894,7 @@ def assert_close_with_mismatch_tolerance(
             autotune_baseline_accuracy_check_fn=partial(
                 assert_close_with_mismatch_tolerance,
                 max_mismatch_pct=0.05,
+                max_mismatched_abs_diff=1.0,
                 max_abs_diff=10.0,
                 max_rel_diff=15.0,
             ),
@@ -1894,13 +1915,22 @@ def assert_close_with_mismatch_tolerance(
 
     # Use the same mismatch definition as torch.testing.assert_close:
     # an element is mismatched when |actual - expected| > atol + rtol * |expected|
-    mismatched = (abs_diff > atol + rtol * expected.abs()).sum().item()
+    mismatch_mask = abs_diff > atol + rtol * expected.abs()
+    mismatched = mismatch_mask.sum().item()
     mismatch_pct = mismatched / total if total > 0 else 0.0
 
     if mismatch_pct > max_mismatch_pct:
         raise AssertionError(
             f"Too many mismatches: {mismatch_pct:.4%} > {max_mismatch_pct:.4%}"
         )
+
+    if max_mismatched_abs_diff is not None and mismatched:
+        worst_mismatched_abs = abs_diff[mismatch_mask].max().item()
+        if worst_mismatched_abs > max_mismatched_abs_diff:
+            raise AssertionError(
+                "Mismatched absolute diff too large: "
+                f"{worst_mismatched_abs} > {max_mismatched_abs_diff}"
+            )
 
     if max_abs_diff is not None:
         worst_abs = abs_diff.max().item()
