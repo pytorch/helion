@@ -530,6 +530,74 @@ runtime.  The Triton kernels could then be compiled down into PTX/cubins
 to further remove Python from the critical path, but details on this
 are beyond the scope of this document.
 
+## Precompilation: exporting standalone, Helion-free kernels
+
+Some teams want to *ship* a Helion-generated kernel without taking Helion
+as a runtime dependency (e.g. vLLM, TPU inference stacks that would rather
+check in the generated kernel). `helion.precompile` compiles a
+kernel for a concrete set of sample inputs and writes a standalone `.py`
+file that runs with **only `torch` + the backend DSL** (`triton`; `jax`
+for the Pallas backend) — no `helion` import at runtime.
+
+This differs from {py:func}`helion.aot_kernel` (heuristic *pre-tuning*),
+which still runs the full Helion compile stack at call time. A precompiled
+file is self-contained: import it and call the exported entrypoint.
+
+```python
+import torch
+import helion
+import helion.language as hl
+
+
+@helion.kernel(config=helion.Config(block_sizes=[128, 128]))
+def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+if __name__ == "__main__":
+    x = torch.randn(1024, 1024, device="cuda")
+    y = torch.randn(1024, 1024, device="cuda")
+    helion.precompile(
+        helion.PrecompilationInput(
+            kernel=add,
+            sample_inputs=(x, y),
+            output_path="add_precompiled.py",
+        )
+    )
+```
+
+The generated `add_precompiled.py` exports `def add(x, y): ...` and can be
+imported and called directly — no Helion required:
+
+```python
+from add_precompiled import add  # only torch + triton needed
+out = add(x, y)
+```
+
+`PrecompilationInput` fields:
+
+- `kernel` — the `@helion.kernel` to export. Its `Settings` and `Config`
+  behave exactly as in a normal call: an explicit `config=`/`configs=` is
+  used as-is; otherwise the autotuner picks a config for `sample_inputs`.
+- `sample_inputs` — the concrete arguments to compile for. With
+  `static_shapes=True` (the default) the exported kernel is specialized to
+  these exact shapes/strides.
+- `output_path` — where to write the standalone file.
+- `entrypoint_name` — name of the exported function (defaults to the
+  kernel's own name).
+- `jax_fn` — Pallas only; export a `jax.Array` entrypoint instead of a
+  torch-tensor one.
+
+How it works: the generated code's only Helion dependency is the backend
+launcher (`helion/runtime/triton/launcher.py` or
+`helion/runtime/pallas/launcher.py`). Those modules are deliberately
+dependency-free (torch + the backend DSL only), so `precompile` inlines
+the launcher verbatim, drops the `from helion.runtime import ...` line, and
+emits the entrypoint — leaving a file with zero `helion` imports.
+
 ## Ahead-of-Time (AOT) Heuristic Tuning
 
 Helion's standard autotuning runs at the first call to a kernel and tunes
