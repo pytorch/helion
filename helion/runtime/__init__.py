@@ -26,6 +26,9 @@ from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
+from .precompile import PrecompilationInput as PrecompilationInput
+from .precompile import PrecompilationResult as PrecompilationResult
+from .precompile import precompile as precompile
 from .settings import is_pallas_interpret as _module_is_pallas_interpret
 from .triton.launcher import default_launcher as _triton_default_launcher
 from .triton.launcher import get_num_sm as _triton_get_num_sm

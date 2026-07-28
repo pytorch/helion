@@ -12,14 +12,19 @@ from .autotuner import aot_kernel
 from .autotuner import from_cache
 from .runtime import Config
 from .runtime import Kernel
+from .runtime import PrecompilationInput
+from .runtime import PrecompilationResult
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
+from .runtime import precompile
 from .runtime.settings import RefMode
 from .runtime.settings import Settings
 
 __all__ = [
     "Config",
     "Kernel",
+    "PrecompilationInput",
+    "PrecompilationResult",
     "RefMode",
     "Settings",
     "aot_kernel",
@@ -30,6 +35,7 @@ __all__ = [
     "kernel",
     "language",
     "next_power_of_2",
+    "precompile",
     "runtime",
 ]
 
