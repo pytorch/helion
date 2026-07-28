@@ -1087,9 +1087,14 @@ def _run_bound_kernel(
 def code_and_output(
     fn: Kernel[_R],
     args: tuple[object, ...],
+    *,
+    preserve_specializations: bool = False,
     **kwargs: object,
 ) -> tuple[str, _R]:
-    bound = fn.bind(args)
+    bound = fn.bind(
+        args,
+        preserve_specializations=preserve_specializations,
+    )
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
             # pyrefly: ignore [bad-argument-type]
@@ -1464,7 +1469,7 @@ def check_example(
         code, result = code_and_output(
             kernel_fn,
             args,
-            **kwargs,
+            **kwargs,  # pyrefly: ignore [bad-argument-type]
         )
     else:
         code = ""

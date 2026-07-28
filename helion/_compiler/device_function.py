@@ -269,6 +269,9 @@ class DeviceFunction:
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
+        self._specialized_tensor_stride_args: dict[
+            tuple[torch.Tensor, int], ConstExprArg
+        ] = {}
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
@@ -812,6 +815,17 @@ class DeviceFunction:
             isinstance(source, LocalSource)
             and (source.local_name, dim) in env.specialized_strides
         ):
+            if env.preserve_specializations:
+                key = (fake_value, dim)
+                if key not in self._specialized_tensor_stride_args:
+                    tensor_arg = self.tensor_arg(fake_value)
+                    arg = ConstExprArg(
+                        name=f"{tensor_arg.name}_stride_{dim}",
+                        _host_str=f"{tensor_arg.host_str()}.stride({dim})",
+                    )
+                    self.arguments.append(arg)
+                    self._specialized_tensor_stride_args[key] = arg
+                return self._specialized_tensor_stride_args[key]
             return StaticShape(int(v))
         if isinstance(v, int):
             if env.settings.static_shapes:
