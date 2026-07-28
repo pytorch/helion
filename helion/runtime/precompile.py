@@ -150,6 +150,10 @@ def _backend_precompiler(backend: str) -> BackendPrecompiler:
         from .triton.precompile import TritonPrecompiler
 
         return TritonPrecompiler()
+    if backend == "pallas":
+        from .pallas.precompile import PallasPrecompiler
+
+        return PallasPrecompiler()
     raise NotImplementedError(
         f"helion.precompile does not yet support the {backend!r} backend"
     )

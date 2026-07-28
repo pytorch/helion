@@ -14,6 +14,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessPallas
 import helion.language as hl
 
 
@@ -245,6 +246,113 @@ class TestPrecompile(TestCase):
             # Shapes other than the (128, 128) sample it was precompiled with.
             for shape in ((128, 128), (256, 64), (64, 256)):
                 _run_standalone_without_helion(str(out_path), "add_dynamic", shape)
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[8]), static_shapes=False, backend="pallas"
+)
+def pallas_rows_times_two(x: torch.Tensor) -> torch.Tensor:
+    """static_shapes=False Pallas (torch-tensor) kernel: the standalone must run at
+    any leading dim -- it inlines the real host wrapper, which derives the grid +
+    output shape from the runtime input rather than the precompiled sample shape."""
+    n, _d = x.shape
+    out = torch.empty_like(x)
+    for tile in hl.tile(n):
+        out[tile, :] = x[tile, :] * 2.0
+    return out
+
+
+def _import_standalone(path: str, name: str) -> object:
+    """Import a generated standalone module.
+
+    The module is registered in ``sys.modules`` before ``exec_module`` so that
+    any inlined ``@dataclass`` (e.g. in the Pallas launcher) can resolve
+    ``cls.__module__`` during class creation -- exactly what the normal import
+    machinery does for a real ``import``.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return mod
+
+
+@skipUnlessPallas("precompile Pallas test requires the Pallas backend / TPU")
+@skipIfRefEager("precompile compiles real kernels; not meaningful in ref-eager")
+class TestPrecompilePallas(TestCase):
+    def test_pallas_standalone_runs(self) -> None:
+        x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "pallas_add_standalone.py"
+            res = helion.precompile(
+                helion.PrecompilationInput(
+                    kernel=pallas_add,
+                    sample_inputs=(x, y),
+                    output_path=str(out_path),
+                )
+            )
+            source = out_path.read_text()
+            self.assertEqual(res.entrypoint_name, "pallas_add")
+            # No runtime dependency on helion; the dependency-free Pallas launcher
+            # is inlined instead.
+            self.assertNotIn("import helion", source)
+            self.assertNotIn("from helion", source)
+            self.assertIn("def default_pallas_launcher(", source)
+            self.assertIn("_default_pallas_launcher = default_pallas_launcher", source)
+            self.assertIn("def pallas_add(", source)
+            # Import the standalone (no helion needed at import) and run on TPU.
+            name = "pallas_add_standalone_test"
+            mod = _import_standalone(str(out_path), name)
+            try:
+                out = mod.pallas_add(x, y)
+                torch.testing.assert_close(out, x + y)
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_dynamic_shapes_run_at_other_shapes(self) -> None:
+        """A static_shapes=False Pallas (torch-tensor) kernel precompiled at one
+        sample shape runs correctly at OTHER shapes: the standalone inlines the
+        real host wrapper, which derives the grid + output shape from the runtime
+        input rather than freezing the precompiled sample shape."""
+        d = 128
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "pallas_rt2.py"
+            helion.precompile(
+                helion.PrecompilationInput(
+                    kernel=pallas_rows_times_two,
+                    sample_inputs=(
+                        torch.zeros(512, d, device=DEVICE, dtype=torch.float32),
+                    ),
+                    output_path=str(out_path),
+                )
+            )
+            name = "pallas_rt2_test"
+            mod = _import_standalone(str(out_path), name)
+            try:
+                # Shapes other than the T=512 sample it was precompiled with.
+                for t in (512, 128, 256):
+                    x = torch.randn(t, d, device=DEVICE, dtype=torch.float32)
+                    out = mod.pallas_rows_times_two(x)
+                    self.assertEqual(tuple(out.shape), (t, d))
+                    torch.testing.assert_close(out, x * 2.0)
+            finally:
+                sys.modules.pop(name, None)
 
 
 if __name__ == "__main__":
