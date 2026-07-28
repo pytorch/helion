@@ -114,6 +114,7 @@ jobs:
         with:
           path: |
             ~/.cache/uv
+            ~/.triton
             ~/.venv
           key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
@@ -151,7 +152,19 @@ jobs:
       - name: Install Triton from source
         if: matrix.triton-pin != ''
         run: |
-          set -x
+          set -euxo pipefail
+
+          retry () {
+            local attempt
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              if [ "$attempt" -eq 3 ]; then
+                return 1
+              fi
+              sleep $((attempt * 30))
+            done
+          }
+
           source .venv/bin/activate
           apt-get update
           apt-get install -y git clang-20 clang++-20 zlib1g-dev
@@ -170,6 +183,13 @@ jobs:
           # require CUDA headers that are not present on Intel XPU runners.
           if [ "${{ matrix.alias }}" == "xpu" ]; then
             export TRITON_BUILD_PROTON=OFF
+          fi
+          # TileIR's 1.3 GB LLVM download has a fixed timeout and no retries.
+          if [ "${{ matrix.backend }}" == "tileir" ]; then
+            retry python python/build_helpers.py write_thirdparty_cmake_vars \
+              --triton-cache-path "$HOME/.triton" \
+              --output /tmp/triton-third-party-vars.cmake \
+              --packages llvm json
           fi
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
