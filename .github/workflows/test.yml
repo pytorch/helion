@@ -116,7 +116,7 @@ jobs:
             ~/.cache/uv
             ~/.triton
             ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ matrix.triton-pin }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       # TPU installs its (pinned) torch via the install-pytorch-for-torchtpu composite
       # action below; every other runtime installs torch here.
