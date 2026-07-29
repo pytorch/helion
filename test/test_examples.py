@@ -1865,7 +1865,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         result = mod.nvfp4_w4a4_matmul(A_packed, W_packed, act_scale, weight_scale)
         expected = mod.reference_nvfp4_w4a4_matmul(
-              A_packed, W_packed, act_scale, weight_scale
+            A_packed, W_packed, act_scale, weight_scale
         )
         torch.testing.assert_close(
             result,
