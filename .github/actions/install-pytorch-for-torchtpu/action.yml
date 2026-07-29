@@ -13,4 +13,4 @@ runs:
         source .venv/bin/activate
         # The latest PyTorch nightly known to build against the pinned torch_tpu
         # commit (.github/ci_commit_pins/torch_tpu.txt). Bump the two together.
-        uv pip install -U --pre "torch==2.14.0.dev20260707" --index-url https://download.pytorch.org/whl/nightly/cpu
+        uv pip install -U --pre "torch==2.14.0.dev20260726" --index-url https://download.pytorch.org/whl/nightly/cpu

@@ -16,7 +16,7 @@ runs:
           --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
           --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
           --pre \
-          'jax==0.10.2' 'jaxlib==0.10.2' 'libtpu==0.0.43' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
+          'jax==0.11.0' 'jaxlib==0.11.0' 'libtpu==0.0.44.1' 'tpu-info==0.14.2' 'jaxtyping' 'frozendict' 'immutabledict'
         # Install Bazel
         if ! command -v bazel &> /dev/null; then
           sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
