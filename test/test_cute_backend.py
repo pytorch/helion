@@ -2624,6 +2624,36 @@ class TestCuteBackend(TestCase):
         self.assertTrue(cfg.epi_stg)
         self.assertEqual(cfg.epi_stg_gmem, "stage")
 
+    def test_flash_attention_fa4_dense_hd64_two_cta_matches_sdpa(self) -> None:
+        for seq_len in (32768, 65536, 131072):
+            with self.subTest(seq_len=seq_len):
+                q, k, v = (
+                    torch.randn(1, 1, seq_len, 64, dtype=torch.float16, device=DEVICE)
+                    for _ in range(3)
+                )
+                code, out = code_and_output(
+                    cute_dense_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_topology="fa4",
+                    cute_flash_persistent=True,
+                    cute_flash_use_2cta=True,
+                    cute_flash_epi_tma=True,
+                )
+
+                self.assertIn("cta_group=2", code)
+                self.assertIn("is_two_cta=True", code)
+                self.assertIn("elif warp_idx < 4:", code)
+                self.assertIn("mbarrier_init(flash_pfor_ptr + flash_st, 512)", code)
+                self.assertIn("mbarrier_init(flash_pfor2_ptr + flash_st, 256)", code)
+                self.assertIn("fa4_correction_epilogue_to_smem_scoped_2cta", code)
+                self.assertIn("'use_2cta_instrs': True", code)
+                self.assertIn("gemm_ptx_precomputed_qk_static", code)
+                self.assertIn(", True, 8, 2)", code)
+
+                expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_clc_preserves_explicit_flattened_geometry(self) -> None:
         q, k, v = (
             torch.randn(2, 32, 8192, 64, dtype=torch.float16, device=DEVICE)
@@ -4100,6 +4130,76 @@ class TestCuteBackend(TestCase):
         self.assertFalse(cfg_128k.epi_stg)
         self.assertFalse(cfg_256k.epi_tma)
         self.assertTrue(cfg_256k.epi_stg)
+
+    def test_flash_attention_dense_hd64_two_cta_eligibility(self) -> None:
+        force_two_cta = {
+            "cute_flash_topology": "fa4",
+            "cute_flash_use_2cta": True,
+            "cute_flash_precompute_qk_desc": True,
+            "cute_flash_epi_tma": False,
+            "cute_flash_epi_stg": True,
+            "cute_flash_epi_stg_gmem": "pair",
+            "cute_flash_p_store_rep": 32,
+            "cute_flash_s_load_rep": 16,
+            "cute_flash_softmax_disc": True,
+            "cute_flash_split_p_arrive": False,
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            dense_64k = resolve_flash_config(64, 512, force_two_cta)
+            dense_32k = resolve_flash_config(64, 256, force_two_cta)
+            dense_128k = resolve_flash_config(64, 1024, force_two_cta)
+            dense_unaligned = resolve_flash_config(64, 258, force_two_cta)
+            dense_256k = resolve_flash_config(64, 2048, force_two_cta)
+            dense_bf16 = resolve_flash_config(
+                64, 512, force_two_cta, dtype=torch.bfloat16
+            )
+            causal = resolve_flash_config(64, 512, force_two_cta, is_causal=True)
+            dense_hd128 = resolve_flash_config(128, 512, force_two_cta)
+
+        self.assertTrue(dense_64k.use_2cta_instrs)
+        self.assertTrue(dense_64k.precompute_qk_desc)
+        self.assertTrue(dense_64k.epi_tma)
+        self.assertFalse(dense_64k.epi_stg)
+        self.assertEqual(dense_64k.epi_stg_gmem, "stage")
+        self.assertEqual(dense_64k.p_store_repetition, 16)
+        self.assertEqual(dense_64k.s_load_repetition, 32)
+        self.assertFalse(dense_64k.softmax_disc)
+        self.assertTrue(dense_64k.split_p_arrive)
+        self.assertTrue(dense_32k.use_2cta_instrs)
+        self.assertTrue(dense_128k.use_2cta_instrs)
+        self.assertFalse(dense_unaligned.use_2cta_instrs)
+        self.assertFalse(dense_256k.use_2cta_instrs)
+        self.assertFalse(dense_bf16.use_2cta_instrs)
+        self.assertFalse(causal.use_2cta_instrs)
+        self.assertTrue(dense_hd128.use_2cta_instrs)
+        self.assertFalse(dense_hd128.precompute_qk_desc)
+
+        fragments = _cute_flash.flash_autotune_fragments(64, 512)
+        two_cta = fragments[_cute_flash.FLASH_USE_2CTA_KEY]
+        epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
+        self.assertEqual(set(two_cta.search_choices or ()), {False, True})
+        self.assertEqual(epi_tma.search_choices, (False,))
+
+        eligible_32k = _cute_flash.flash_autotune_fragments(64, 256)
+        self.assertEqual(
+            set(eligible_32k[_cute_flash.FLASH_USE_2CTA_KEY].search_choices or ()),
+            {False, True},
+        )
+        eligible_128k = _cute_flash.flash_autotune_fragments(64, 1024)
+        self.assertEqual(
+            set(eligible_128k[_cute_flash.FLASH_USE_2CTA_KEY].search_choices or ()),
+            {False, True},
+        )
+        ineligible_unaligned = _cute_flash.flash_autotune_fragments(64, 258)
+        self.assertEqual(
+            ineligible_unaligned[_cute_flash.FLASH_USE_2CTA_KEY].search_choices,
+            (False,),
+        )
+        ineligible = _cute_flash.flash_autotune_fragments(64, 2048)
+        self.assertEqual(
+            ineligible[_cute_flash.FLASH_USE_2CTA_KEY].search_choices,
+            (False,),
+        )
 
     def test_flash_attention_fa4_persistent_config_overrides_env(self) -> None:
         with patch.dict(os.environ, {"HELION_CUTE_FLASH_PERSISTENT": "1"}, clear=True):
