@@ -44,7 +44,6 @@ from ...language.memory_ops import store
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
-from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
 
 if TYPE_CHECKING:
@@ -1392,49 +1391,43 @@ def _codegen_cute_store_expand_broadcast_tile(
     return ast.Constant(value=None)
 
 
-def _try_splice_tcgen05_unary_epilogue(
+def _try_codegen_tcgen05_epilogue_plan(
     state: CodegenState,
     tensor: object,
     subscript: list[object] | tuple[object, ...],
     ast_subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
-    value_node: torch.fx.Node | None,
 ) -> ast.AST | None:
-    """Splice attempt for ``out[tile] = chain(acc)[.to(x.dtype)]``.
-
-    Returns the splice-completion sentinel (``ast.Constant(value=None)``)
-    on a successful splice (the caller should return it directly), and
-    ``None`` if the splice did not fire — the caller should continue to
-    the loud-failure backstop or the SIMT fallback.
-
-    Splice is attempted only when the kernel has a tcgen05-registered
-    matmul fx_node (``cute_state.matmul_fx_nodes`` non-empty), the
-    store value has a backing FX node, the store target is a 2-D
-    ``torch.Tensor``, and the chain analyzer accepts the value chain
-    (returning ``(chain, anchor)`` for a non-empty chain rooted at
-    a tcgen05 matmul). Chains the whitelist rejects (broadcast aux
-    loads, reductions, kwarg-bearing binaries, etc.) leave the
-    analyzer returning ``None`` and the splice does not fire — the
-    loud-failure backstop then catches them.
-    """
     cute_state = state.device_function.cute_state
-    if not cute_state.matmul_fx_nodes:
+    planned = cute_state.tcgen05_epilogue_store_plan(state.fx_node)
+    if planned is None or not isinstance(tensor, torch.Tensor):
         return None
-    if value_node is None:
-        return None
-    if not isinstance(tensor, torch.Tensor):
-        return None
-    analyzed = analyze_tcgen05_unary_epilogue_chain(
-        state, value_node, output_global_shape=tuple(tensor.shape)
+    plan, store_plan = planned
+    value_node = (
+        state.fx_node.args[2]
+        if state.fx_node is not None and len(state.fx_node.args) > 2
+        else None
     )
-    if analyzed is None:
-        return None
-    chain, anchor = analyzed
-    if not chain.steps:
-        return None
-    anchor_result_var = cute_state.matmul_fx_node_result_vars.get(anchor)
+    from ..inductor_lowering import is_deferred_epilogue_value
+
+    received_deferred = is_deferred_epilogue_value(state.ast_args[2])
+    expected_deferred = cute_state.is_deferred_tcgen05_epilogue_node(
+        store_plan.value_node
+    )
+    if (
+        value_node is not store_plan.value_node
+        or received_deferred != expected_deferred
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "committed tcgen05 epilogue store did not receive its exact planned "
+            "source value state",
+        )
+    anchor_result_var = cute_state.matmul_fx_node_result_vars.get(plan.anchor)
     if anchor_result_var is None:
-        return None
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 epilogue store ran before its MMA result was registered"
+        )
     rewritten_stmt = _codegen_cute_store_tcgen05_tile(
         state,
         tensor,
@@ -1442,10 +1435,13 @@ def _try_splice_tcgen05_unary_epilogue(
         ast_subscript,
         extra_mask,
         anchor_result_var,
-        epilogue_chain=chain,
+        epilogue_store_plan=store_plan,
     )
     if rewritten_stmt is None:
-        return None
+        raise exc.BackendUnsupported(
+            "cute",
+            "committed tcgen05 epilogue store could not use its planned store path",
+        )
     stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
     for stmt in stmts:
         state.add_statement(stmt)
@@ -1459,9 +1455,15 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(subscript, (list, tuple))
     ast_subscript = state.ast_args[1]
     assert isinstance(ast_subscript, (list, tuple))
-    raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    planned_store = _try_codegen_tcgen05_epilogue_plan(
+        state, tensor, subscript, ast_subscript, extra_mask
+    )
+    if planned_store is not None:
+        return planned_store
+
+    raw_value = state.ast_args[2]
     value_node = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         maybe_value_node = state.fx_node.args[2]
@@ -1627,19 +1629,6 @@ def _(state: CodegenState) -> ast.AST:
                 state.add_statement(stmt)
             return ast.Constant(value=None)
 
-    # Try to splice a whitelisted chain epilogue
-    # (`out[tile] = chain(acc)[.to(x.dtype)]`) into the role-local
-    # tcgen05 epilogue's per-thread T2R loop. Implementation in
-    # ``_try_splice_tcgen05_unary_epilogue``. Chains the whitelist
-    # rejects (broadcast aux loads, reductions, etc.) leave the
-    # splice off and fall through to the loud-failure backstop
-    # below.
-    spliced = _try_splice_tcgen05_unary_epilogue(
-        state, tensor, subscript, ast_subscript, extra_mask, value_node
-    )
-    if spliced is not None:
-        return spliced
-
     # Loud-failure backstop for fused-epilogue stores that follow a
     # tcgen05 matmul. The tcgen05 grid-emission path (in `program_id.py`)
     # does not bind the per-block-id `indices_<n>` / `mask_<n>` variable
@@ -1660,28 +1649,10 @@ def _(state: CodegenState) -> ast.AST:
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 MMA path does not yet emit per-block-id indices "
-            "and masks for non-whitelisted fused epilogues that follow "
-            "the MMA. The store target's value chain depends on a "
-            "tcgen05 matmul result through ops the chain analyzer "
-            "rejects (e.g. aux tensors with a 3-D underlying shape "
-            "and a static collapse like `aux3d[tile_m, tile_n, 0]`, "
-            "loads whose index expression is not exactly the "
-            "carrier tile-id symbol, non-scalar binary ops, "
-            "`aten.add.Tensor` with `alpha=k`, or an intermediate "
-            "`.to(d_inter)` cast where `d_inter` differs from the "
-            "store-target dtype). Identity stores "
-            "(`out[tile] = acc.to(x.dtype)`), whitelisted unary chains "
-            "(relu/tanh/exp/log/sqrt/abs/neg + scalar add/sub/mul/div "
-            "on the accumulator carrier), exact-shape 2-D "
-            "auxiliary-tensor binary ops (`acc + residual[tile_m, "
-            "tile_n]`), and rank-1 trailing-axis (rowvec) broadcast "
-            "aux loads (`acc + bias[tile_n]`) all work via the "
-            "fused-epilogue splice path. The leading-axis rank-1 "
-            "form (`acc + bias[tile_m]`) is rejected because a bare "
-            "rank-1 RHS aligns to the trailing axis under PyTorch "
-            "broadcasting; an explicit colvec broadcast must be "
-            "written with `bias[tile_m][:, None]` / "
-            "`.unsqueeze(-1)`.",
+            "and masks for an unplanned fused epilogue that follows "
+            "the MMA. Generic tcgen05 epilogues must be finalized before "
+            "root graph lowering; reaching this fallback indicates that "
+            "the live plan and MMA cutover disagreed.",
         )
 
     tensor_name = state.device_function.tensor_arg(tensor).name
@@ -2107,29 +2078,44 @@ def _(state: CodegenState) -> object:
         return expr_from_string(index_var)
 
     cute_state = state.device_function.cute_state
-    if cute_state.suppress_root_lane_loops or (
-        state.fx_node is not None
-        and cute_state.is_collective_handled_load(state.fx_node.name)
+    if not cute_state.rematerializing_scalar_load and (
+        cute_state.suppress_root_lane_loops
+        or (
+            state.fx_node is not None
+            and cute_state.is_collective_handled_load(state.fx_node.name)
+        )
     ):
         zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
 
-    packed_affine_lhs = _maybe_codegen_cute_packed_affine_lhs_load(
-        state, tensor, subscript, extra_mask
+    packed_affine_lhs = (
+        None
+        if cute_state.rematerializing_scalar_load
+        else _maybe_codegen_cute_packed_affine_lhs_load(
+            state, tensor, subscript, extra_mask
+        )
     )
     if packed_affine_lhs is not None:
         return packed_affine_lhs
 
-    packed_rhs_load = _maybe_codegen_cute_packed_rhs_load(
-        state, tensor, subscript, extra_mask
+    packed_rhs_load = (
+        None
+        if cute_state.rematerializing_scalar_load
+        else _maybe_codegen_cute_packed_rhs_load(state, tensor, subscript, extra_mask)
     )
     if packed_rhs_load is not None:
         return packed_rhs_load
 
-    if _is_cute_affine_range_load_for_store(state, subscript, ast_subscript):
+    if (
+        not cute_state.rematerializing_scalar_load
+        and _is_cute_affine_range_load_for_store(state, subscript, ast_subscript)
+    ):
         zero = _cute_scalar_storage_dtype(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
-    if _is_cute_strided_slice_load_for_store(state, tensor, subscript):
+    if (
+        not cute_state.rematerializing_scalar_load
+        and _is_cute_strided_slice_load_for_store(state, tensor, subscript)
+    ):
         zero = _cute_scalar_storage_dtype(tensor.dtype)
         return expr_from_string(f"{zero}(0)")
 
@@ -2149,7 +2135,11 @@ def _(state: CodegenState) -> object:
         tensor=tensor,
         include_tensor_index_masks=False,
     )
-    vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
+    vec_ctx = (
+        None
+        if cute_state.rematerializing_scalar_load
+        else _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
+    )
     if vec_ctx is not None:
         vec_width, vec_block_id, vec_mode = vec_ctx
         from ..reduction_strategy import LoopedReductionStrategy

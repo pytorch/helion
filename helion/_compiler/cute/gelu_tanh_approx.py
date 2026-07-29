@@ -23,18 +23,16 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
 
 
-@_decorators.codegen(_gelu_tanh_approx, "cute")
+@_decorators.codegen(_gelu_tanh_approx, "cute", pure_fragment=True)
 def _(state: CodegenState) -> ast.AST:
-    # Same lift-to-single-local rationale as the triton path: see the
-    # module docstring and :class:`Tcgen05UnaryEpilogueChain`
-    # (``cute_epilogue.py``).
+    # Lift once so repeated polynomial references share a single local.
     input_ast = state.codegen.lift(
         state.ast_arg(0), dce=True, prefix="gelu_tanh_approx_in"
     )
     return expr_from_string(epilogue_unary_step_template().format(inner=input_ast.id))
 
 
-@_decorators.codegen(_gelu_erf, "cute")
+@_decorators.codegen(_gelu_erf, "cute", pure_fragment=True)
 def _(state: CodegenState) -> ast.AST:
     input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
     return expr_from_string(

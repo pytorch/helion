@@ -74,6 +74,8 @@ class APIFunc(Protocol):
         _type_function: A callable that determines the return type of this function
             during type propagation phase.
         _codegen: Mapping of backend names to callables that generate device code.
+        _pure_fragment_codegen: Backend names whose codegen is safe to invoke on a
+            register fragment with explicit AST operands.
         _fake_fn: A callable that provides a "fake" implementation used during
             tracing and compilation.
         _prepare_args: A callable that preprocesses the arguments before they're
@@ -91,6 +93,7 @@ class APIFunc(Protocol):
     _cache_type: bool
     _type_function: Callable[..., TypeInfo] | None
     _codegen: CodegenDict
+    _pure_fragment_codegen: set[str]
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
@@ -208,6 +211,7 @@ def api(
         api._cache_type = cache_type
         api._type_function = None
         api._codegen = CodegenDict()
+        api._pure_fragment_codegen = set()
         api._fake_fn = None
         api._get_masked_value = None
         api._to_device_ir = None
@@ -277,6 +281,8 @@ def prepare_args(
 def codegen(
     original_fn: Callable[..., object],
     backend: str,
+    *,
+    pure_fragment: bool = False,
 ) -> _NoReturnDecorator[object]:
     def _impl(codegen_fn: Callable[[CodegenState], object]) -> Callable[..., Never]:
         assert is_api_func(original_fn), (
@@ -286,6 +292,8 @@ def codegen(
             f"codegen already registered for backend {backend!r}"
         )
         original_fn._codegen[backend] = codegen_fn
+        if pure_fragment:
+            original_fn._pure_fragment_codegen.add(backend)
         return _no_call
 
     # pyrefly: ignore [bad-return]

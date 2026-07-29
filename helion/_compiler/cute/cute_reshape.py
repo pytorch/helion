@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import math
+import operator
 from typing import TYPE_CHECKING
+from typing import Callable
+from typing import TypeVar
 from typing import cast
 
 import sympy
@@ -21,6 +25,7 @@ import torch
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ...language import view_ops
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -34,6 +39,9 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
 
 CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
+
+_Coordinate = int | str
+_ResolvedCoordinate = TypeVar("_ResolvedCoordinate")
 
 
 def _env_arg(ctx: LoweringContext, node: Node) -> object:
@@ -471,6 +479,298 @@ def _expand_source_coords(
         else:
             return None
     return source_coords
+
+
+def logical_coords_from_flat(
+    flat_index: _Coordinate, shape: list[int]
+) -> tuple[_Coordinate, ...]:
+    if isinstance(flat_index, int):
+        return tuple(
+            (flat_index // math.prod(shape[dim + 1 :])) % extent
+            for dim, extent in enumerate(shape)
+        )
+    return tuple(_coords_from_flat_index(flat_index, shape))
+
+
+def logical_flat_from_coords(
+    coords: tuple[_Coordinate, ...] | list[_Coordinate], shape: list[int]
+) -> _Coordinate:
+    if all(isinstance(coord, int) for coord in coords):
+        return sum(
+            cast("int", coord) * math.prod(shape[dim + 1 :])
+            for dim, coord in enumerate(coords)
+        )
+    rendered = [
+        str(coord) if isinstance(coord, str) else f"cutlass.Int32({coord})"
+        for coord in coords
+    ]
+    return _flat_index_from_coords(rendered, shape)
+
+
+def broadcast_logical_flat_index(
+    flat_index: _Coordinate,
+    *,
+    output_shape: list[int],
+    source_shape: list[int],
+) -> _Coordinate | None:
+    output_coords = logical_coords_from_flat(flat_index, output_shape)
+    rank_delta = len(output_shape) - len(source_shape)
+    if rank_delta < 0:
+        return None
+    source_coords: list[_Coordinate] = []
+    for dim, source_extent in enumerate(source_shape):
+        output_dim = dim + rank_delta
+        if source_extent == 1:
+            source_coords.append(0)
+        elif source_extent == output_shape[output_dim]:
+            source_coords.append(output_coords[output_dim])
+        else:
+            return None
+    return logical_flat_from_coords(source_coords, source_shape)
+
+
+def resolve_cute_logical_coordinate(
+    node: Node,
+    flat_index: _Coordinate,
+    *,
+    config: Config,
+    leaf: Callable[[Node, _Coordinate, int | None], _ResolvedCoordinate],
+    select: Callable[
+        [_Coordinate, tuple[_ResolvedCoordinate, ...]], _ResolvedCoordinate
+    ],
+    projection: int | None = None,
+) -> _ResolvedCoordinate:
+    """Route one logical coordinate through CuTe view operations.
+
+    This is deliberately independent of thread-layout materialization. The FX
+    graph remains the semantic graph; callers provide terminal and selection
+    behavior for static validation or fragment rendering.
+    """
+    env = CompileEnvironment.current()
+    value = node.meta.get("val")
+    if projection is None:
+        if not isinstance(value, torch.Tensor):
+            return leaf(node, flat_index, projection)
+        output_shape = _get_tile_shape(value, env, config)
+    else:
+        output_shape = None
+
+    target = node.target
+    if target in (
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.view.default,
+    ):
+        source = node.args[0] if node.args else None
+        if not isinstance(source, Node) or output_shape is None:
+            return leaf(node, flat_index, projection)
+        source_value = source.meta.get("val")
+        if not isinstance(source_value, torch.Tensor):
+            return leaf(node, flat_index, projection)
+        source_shape = _get_tile_shape(source_value, env, config)
+        if math.prod(source_shape) != math.prod(output_shape):
+            return leaf(node, flat_index, projection)
+        return resolve_cute_logical_coordinate(
+            source,
+            flat_index,
+            config=config,
+            leaf=leaf,
+            select=select,
+        )
+
+    def recurse(source: Node, coords: list[_Coordinate]) -> _ResolvedCoordinate:
+        source_value = source.meta.get("val")
+        if not isinstance(source_value, torch.Tensor):
+            return leaf(node, flat_index, projection)
+        source_shape = _get_tile_shape(source_value, env, config)
+        return resolve_cute_logical_coordinate(
+            source,
+            logical_flat_from_coords(coords, source_shape),
+            config=config,
+            leaf=leaf,
+            select=select,
+        )
+
+    if target in (
+        torch.ops.aten.permute.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.t.default,
+    ):
+        source = node.args[0] if node.args else None
+        if not isinstance(source, Node) or output_shape is None:
+            return leaf(node, flat_index, projection)
+        if target is torch.ops.aten.permute.default:
+            dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dims")
+            if not isinstance(dims, (list, tuple)) or not all(
+                isinstance(dim, int) for dim in dims
+            ):
+                return leaf(node, flat_index, projection)
+            permutation = [cast("int", dim) for dim in dims]
+        elif target is torch.ops.aten.transpose.int:
+            dim0 = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim0")
+            dim1 = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim1")
+            if not isinstance(dim0, int) or not isinstance(dim1, int):
+                return leaf(node, flat_index, projection)
+            permutation = list(range(len(output_shape)))
+            permutation[dim0], permutation[dim1] = (
+                permutation[dim1],
+                permutation[dim0],
+            )
+        else:
+            if len(output_shape) != 2:
+                return leaf(node, flat_index, projection)
+            permutation = [1, 0]
+        coords = logical_coords_from_flat(flat_index, output_shape)
+        return recurse(
+            source, [coords[permutation.index(dim)] for dim in range(len(coords))]
+        )
+
+    if target is torch.ops.aten.expand.default:
+        source = node.args[0] if node.args else None
+        source_value = source.meta.get("val") if isinstance(source, Node) else None
+        if (
+            not isinstance(source, Node)
+            or not isinstance(source_value, torch.Tensor)
+            or output_shape is None
+        ):
+            return leaf(node, flat_index, projection)
+        source_shape = _get_tile_shape(source_value, env, config)
+        source_flat = broadcast_logical_flat_index(
+            flat_index, output_shape=output_shape, source_shape=source_shape
+        )
+        if source_flat is None:
+            return leaf(node, flat_index, projection)
+        return resolve_cute_logical_coordinate(
+            source,
+            source_flat,
+            config=config,
+            leaf=leaf,
+            select=select,
+        )
+
+    if target is torch.ops.aten.unsqueeze.default:
+        source = node.args[0] if node.args else None
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        if (
+            not isinstance(source, Node)
+            or not isinstance(dim, int)
+            or output_shape is None
+        ):
+            return leaf(node, flat_index, projection)
+        coords = list(logical_coords_from_flat(flat_index, output_shape))
+        dim %= len(coords)
+        return recurse(source, coords[:dim] + coords[dim + 1 :])
+
+    if target is torch.ops.aten.squeeze.dim:
+        source = node.args[0] if node.args else None
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+        source_value = source.meta.get("val") if isinstance(source, Node) else None
+        if (
+            not isinstance(source, Node)
+            or not isinstance(source_value, torch.Tensor)
+            or not isinstance(dim, int)
+            or output_shape is None
+        ):
+            return leaf(node, flat_index, projection)
+        source_shape = _get_tile_shape(source_value, env, config)
+        dim %= len(source_shape)
+        coords = list(logical_coords_from_flat(flat_index, output_shape))
+        if source_shape == output_shape:
+            source_coords = coords
+        elif source_shape[dim] == 1 and len(source_shape) == len(output_shape) + 1:
+            source_coords = [*coords[:dim], 0, *coords[dim:]]
+        else:
+            return leaf(node, flat_index, projection)
+        return recurse(source, source_coords)
+
+    if target is view_ops.subscript:
+        source = node.args[0] if node.args else None
+        indices = node.args[1] if len(node.args) > 1 else None
+        if (
+            not isinstance(source, Node)
+            or not isinstance(indices, (list, tuple))
+            or output_shape is None
+        ):
+            return leaf(node, flat_index, projection)
+        output_coords = iter(logical_coords_from_flat(flat_index, output_shape))
+        source_coords: list[_Coordinate] = []
+        for index in indices:
+            coord = next(output_coords)
+            if index is None:
+                if isinstance(coord, int) and coord != 0:
+                    return leaf(node, flat_index, projection)
+            elif isinstance(index, slice) and index == slice(None):
+                source_coords.append(coord)
+            else:
+                return leaf(node, flat_index, projection)
+        return recurse(source, source_coords)
+
+    if target is operator.getitem:
+        base = node.args[0] if node.args else None
+        index = node.args[1] if len(node.args) > 1 else None
+        if (
+            isinstance(base, Node)
+            and base.target is view_ops.split
+            and isinstance(index, int)
+        ):
+            return resolve_cute_logical_coordinate(
+                base,
+                flat_index,
+                config=config,
+                leaf=leaf,
+                select=select,
+                projection=index,
+            )
+
+    if target is view_ops.split:
+        source = node.args[0] if node.args else None
+        values = node.meta.get("val")
+        if (
+            not isinstance(source, Node)
+            or projection not in (0, 1)
+            or not isinstance(values, (tuple, list))
+            or not isinstance(values[projection], torch.Tensor)
+        ):
+            return leaf(node, flat_index, projection)
+        projected_shape = _get_tile_shape(values[projection], env, config)
+        coords = list(logical_coords_from_flat(flat_index, projected_shape))
+        return recurse(source, [*coords, projection])
+
+    if target is view_ops.join:
+        if output_shape is None:
+            return leaf(node, flat_index, projection)
+        coords = list(logical_coords_from_flat(flat_index, output_shape))
+        selector = coords[-1]
+        logical_shape = output_shape[:-1]
+        choices: list[_ResolvedCoordinate] = []
+        for source in node.args[:2]:
+            if not isinstance(source, Node):
+                return leaf(node, flat_index, projection)
+            source_value = source.meta.get("val")
+            if not isinstance(source_value, torch.Tensor):
+                return leaf(node, flat_index, projection)
+            source_shape = _get_tile_shape(source_value, env, config)
+            source_flat = broadcast_logical_flat_index(
+                logical_flat_from_coords(coords[:-1], logical_shape),
+                output_shape=logical_shape,
+                source_shape=source_shape,
+            )
+            if source_flat is None:
+                return leaf(node, flat_index, projection)
+            choices.append(
+                resolve_cute_logical_coordinate(
+                    source,
+                    source_flat,
+                    config=config,
+                    leaf=leaf,
+                    select=select,
+                )
+            )
+        if isinstance(selector, int):
+            return choices[selector]
+        return select(selector, tuple(choices))
+
+    return leaf(node, flat_index, projection)
 
 
 def _stack_choice_expr(
