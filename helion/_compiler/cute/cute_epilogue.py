@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
+    from .cute_reshape import _Coordinate
 
 
 class Tcgen05EpilogueLoadScope(enum.Enum):
@@ -552,7 +553,7 @@ def _coordinate_requests(
         return memo[key]
 
     def leaf(
-        current: Node, current_flat: int | str, current_projection: int | None
+        current: Node, current_flat: _Coordinate, current_projection: int | None
     ) -> frozenset[_Request]:
         if not isinstance(current_flat, int):
             raise _UnsupportedEpilogue
@@ -623,9 +624,11 @@ def _coordinate_requests(
                 output_coords = iter(
                     logical_coords_from_flat(current_flat, output_shape)
                 )
-                source_coords: list[int | str] = []
+                source_coords: list[int] = []
                 for index in indices:
                     coord = next(output_coords)
+                    if not isinstance(coord, int):
+                        raise _UnsupportedEpilogue
                     if index is None:
                         if coord != 0:
                             raise _UnsupportedEpilogue

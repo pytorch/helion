@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
+from fractions import Fraction
+import functools
+import itertools
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import TypeVar
 from typing import cast
@@ -33,6 +38,8 @@ from .indexing import CuteShapeChainView
 from .indexing import is_cute_shape_chain_target
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..aten_lowering import LoweringContext
     from ..compile_environment import Config
     from ..generate_ast import GenerateAST
@@ -40,7 +47,259 @@ if TYPE_CHECKING:
 
 CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
 
-_Coordinate = int | str
+
+@dataclasses.dataclass(frozen=True)
+class CuteLogicalCoordinate:
+    """Rendered logical coordinate with an exact symbolic identity."""
+
+    expression: str
+    semantic: Any
+    bounds: tuple[tuple[Any, int, int], ...] = ()
+    symbol_expressions: tuple[tuple[Any, str], ...] = ()
+
+
+def _semantic_interval(
+    expression: Any,  # noqa: ANN401 - SymPy's operator stubs are incomplete.
+    bounds: dict[Any, tuple[int, int]],
+) -> tuple[Any, Any] | None:
+    if expression.is_number and expression.is_real:
+        return expression, expression
+    if isinstance(expression, sympy.Symbol):
+        symbol_interval = bounds.get(expression)
+        if symbol_interval is None:
+            return None
+        return sympy.Integer(symbol_interval[0]), sympy.Integer(symbol_interval[1])
+    if expression.is_Add:
+        intervals = [_semantic_interval(arg, bounds) for arg in expression.args]
+        if any(interval is None for interval in intervals):
+            return None
+        present = cast("list[tuple[Any, Any]]", intervals)
+        return sum((interval[0] for interval in present), start=sympy.Integer(0)), sum(
+            (interval[1] for interval in present), start=sympy.Integer(0)
+        )
+    if expression.is_Mul:
+        product_interval: tuple[Any, Any] = (
+            sympy.Integer(1),
+            sympy.Integer(1),
+        )
+        for arg in expression.args:
+            arg_interval = _semantic_interval(arg, bounds)
+            if arg_interval is None:
+                return None
+            products = tuple(
+                left * right for left in product_interval for right in arg_interval
+            )
+            product_interval = (min(products), max(products))
+        return product_interval
+    if expression.func is sympy.floor:
+        floor_interval = _semantic_interval(expression.args[0], bounds)
+        if floor_interval is None:
+            return None
+        return sympy.floor(floor_interval[0]), sympy.floor(floor_interval[1])
+    if expression.func is sympy.Mod:
+        modulus = expression.args[1]
+        if not modulus.is_Integer or modulus <= 0:
+            return None
+        mod_interval = _semantic_interval(expression.args[0], bounds)
+        if (
+            mod_interval is not None
+            and mod_interval[0] >= 0
+            and mod_interval[1] < modulus
+        ):
+            return mod_interval
+        return sympy.Integer(0), modulus - 1
+    return None
+
+
+def _simplify_coordinate_semantic(
+    expression: Any,  # noqa: ANN401 - SymPy's operator stubs are incomplete.
+    coordinate_bounds: tuple[tuple[Any, int, int], ...],
+) -> Any:  # noqa: ANN401
+    # This only keeps emitted expressions compact. Exact pair membership uses
+    # bounded_logical_coordinate_choices and never depends on this fixed point.
+    bounds = {symbol: (lower, upper) for symbol, lower, upper in coordinate_bounds}
+
+    def simplify_node(node: Any) -> Any:  # noqa: ANN401
+        if not node.args:
+            return node
+        rebuilt = node.func(*(simplify_node(arg) for arg in node.args))
+        rebuilt = sympy.simplify(rebuilt)
+        if rebuilt.func is sympy.floor:
+            interval = _semantic_interval(rebuilt.args[0], bounds)
+            if interval is not None:
+                lower = sympy.floor(interval[0])
+                upper = sympy.floor(interval[1])
+                if lower == upper:
+                    return lower
+        if rebuilt.func is sympy.Mod:
+            modulus = rebuilt.args[1]
+            interval = _semantic_interval(rebuilt.args[0], bounds)
+            if (
+                interval is not None
+                and modulus.is_Integer
+                and modulus > 0
+                and interval[0] >= 0
+                and interval[1] < modulus
+            ):
+                return rebuilt.args[0]
+        return rebuilt
+
+    previous = expression
+    for _ in range(4):
+        current = simplify_node(previous)
+        if current == previous:
+            return current
+        previous = current
+    return previous
+
+
+def _merge_coordinate_bounds(
+    coordinates: list[CuteLogicalCoordinate],
+) -> tuple[tuple[Any, int, int], ...]:
+    merged: dict[Any, tuple[int, int]] = {}
+    for coordinate in coordinates:
+        for symbol, lower, upper in coordinate.bounds:
+            prior = merged.setdefault(symbol, (lower, upper))
+            if prior != (lower, upper):
+                raise ValueError(f"conflicting bounds for logical coordinate {symbol}")
+    return tuple(
+        (symbol, *merged[symbol])
+        for symbol in sorted(merged, key=lambda value: value.sort_key())
+    )
+
+
+def _evaluate_bounded_coordinate(
+    expression: Any,  # noqa: ANN401 - SymPy's operator stubs are incomplete.
+    values: dict[Any, int],
+) -> int | Fraction:
+    if isinstance(expression, sympy.Rational):
+        return Fraction(int(expression.p), int(expression.q))
+    if isinstance(expression, sympy.Symbol):
+        try:
+            return values[expression]
+        except KeyError as exc:
+            raise ValueError(
+                f"missing bound for logical coordinate {expression}"
+            ) from exc
+    if expression.is_Add:
+        return sum(
+            (_evaluate_bounded_coordinate(arg, values) for arg in expression.args),
+            start=Fraction(0),
+        )
+    if expression.is_Mul:
+        result = Fraction(1)
+        for arg in expression.args:
+            result *= _evaluate_bounded_coordinate(arg, values)
+        return result
+    if expression.func is sympy.floor:
+        return math.floor(_evaluate_bounded_coordinate(expression.args[0], values))
+    if expression.func is sympy.Mod:
+        lhs = _evaluate_bounded_coordinate(expression.args[0], values)
+        rhs = _evaluate_bounded_coordinate(expression.args[1], values)
+        if lhs.denominator != 1 or rhs.denominator != 1 or rhs <= 0:
+            raise ValueError(f"invalid bounded coordinate modulo {expression}")
+        return lhs.numerator % rhs.numerator
+    raise ValueError(f"unsupported bounded coordinate expression {expression}")
+
+
+@functools.lru_cache(maxsize=256)
+def _bounded_semantic_choices(
+    target: tuple[Any, ...],
+    choices: tuple[tuple[Any, ...], ...],
+    bounds: tuple[tuple[Any, int, int], ...],
+) -> frozenset[int]:
+    structural = tuple(
+        index for index, choice in enumerate(choices) if target == choice
+    )
+    if len(structural) == 1:
+        return frozenset(structural)
+
+    symbols = tuple(symbol for symbol, _lower, _upper in bounds)
+    selected: set[int] = set()
+    assignments = itertools.product(
+        *(range(lower, upper + 1) for _symbol, lower, upper in bounds)
+    )
+    for assignment in assignments:
+        values = dict(zip(symbols, assignment, strict=True))
+        target_value = tuple(
+            _evaluate_bounded_coordinate(expression, values) for expression in target
+        )
+        matches = tuple(
+            index
+            for index, choice in enumerate(choices)
+            if target_value
+            == tuple(
+                _evaluate_bounded_coordinate(expression, values)
+                for expression in choice
+            )
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "logical coordinate is outside or ambiguous within its proven choices"
+            )
+        selected.add(matches[0])
+    return frozenset(selected)
+
+
+def bounded_logical_coordinate_choices(
+    target: tuple[CuteLogicalCoordinate, ...],
+    choices: tuple[tuple[CuteLogicalCoordinate, ...], ...],
+) -> frozenset[int]:
+    """Return the exact finite set selected from semantically disjoint choices."""
+    if not choices or any(len(choice) != len(target) for choice in choices):
+        raise ValueError("logical coordinate choices must have one matching rank")
+    coordinates = [
+        *target,
+        *(coordinate for choice in choices for coordinate in choice),
+    ]
+    return _bounded_semantic_choices(
+        tuple(coordinate.semantic for coordinate in target),
+        tuple(
+            tuple(coordinate.semantic for coordinate in choice) for choice in choices
+        ),
+        _merge_coordinate_bounds(coordinates),
+    )
+
+
+def _merge_coordinate_symbol_expressions(
+    coordinates: list[CuteLogicalCoordinate],
+) -> tuple[tuple[Any, str], ...]:
+    merged: dict[Any, str] = {}
+    for coordinate in coordinates:
+        for symbol, expression in coordinate.symbol_expressions:
+            prior = merged.setdefault(symbol, expression)
+            if prior != expression:
+                raise ValueError(
+                    f"conflicting renderings for logical coordinate {symbol}"
+                )
+    return tuple(
+        (symbol, merged[symbol])
+        for symbol in sorted(merged, key=lambda value: value.sort_key())
+    )
+
+
+def _render_coordinate_semantic(
+    semantic: Any,  # noqa: ANN401 - SymPy's operator stubs are incomplete.
+    symbol_expressions: tuple[tuple[Any, str], ...],
+    fallback: str,
+) -> str:
+    if not symbol_expressions:
+        return fallback
+    if any(
+        not (
+            isinstance(node, (sympy.Integer, sympy.Symbol))
+            or node.is_Add
+            or node.is_Mul
+        )
+        for node in sympy.preorder_traversal(semantic)
+    ):
+        return fallback
+    from .printer import cute_texpr
+
+    return cute_texpr(semantic, dict(symbol_expressions))
+
+
+_Coordinate = int | str | CuteLogicalCoordinate
 _ResolvedCoordinate = TypeVar("_ResolvedCoordinate")
 
 
@@ -489,19 +748,80 @@ def logical_coords_from_flat(
             (flat_index // math.prod(shape[dim + 1 :])) % extent
             for dim, extent in enumerate(shape)
         )
+    if isinstance(flat_index, CuteLogicalCoordinate):
+        expressions = _coords_from_flat_index(flat_index.expression, shape)
+        coordinates: list[CuteLogicalCoordinate] = []
+        for dim, (expression, extent) in enumerate(
+            zip(expressions, shape, strict=True)
+        ):
+            semantic = _simplify_coordinate_semantic(
+                sympy.floor(flat_index.semantic / math.prod(shape[dim + 1 :])) % extent,
+                flat_index.bounds,
+            )
+            coordinates.append(
+                CuteLogicalCoordinate(
+                    _render_coordinate_semantic(
+                        semantic, flat_index.symbol_expressions, expression
+                    ),
+                    semantic,
+                    flat_index.bounds,
+                    flat_index.symbol_expressions,
+                )
+            )
+        return tuple(coordinates)
     return tuple(_coords_from_flat_index(flat_index, shape))
 
 
 def logical_flat_from_coords(
-    coords: tuple[_Coordinate, ...] | list[_Coordinate], shape: list[int]
+    coords: Sequence[_Coordinate], shape: list[int]
 ) -> _Coordinate:
     if all(isinstance(coord, int) for coord in coords):
         return sum(
             cast("int", coord) * math.prod(shape[dim + 1 :])
             for dim, coord in enumerate(coords)
         )
+    if any(isinstance(coord, CuteLogicalCoordinate) for coord in coords) and not any(
+        isinstance(coord, str) for coord in coords
+    ):
+        typed_coords = [
+            coord
+            if isinstance(coord, CuteLogicalCoordinate)
+            else CuteLogicalCoordinate(
+                f"cutlass.Int32({cast('int', coord)})", sympy.Integer(coord)
+            )
+            for coord in coords
+        ]
+        bounds = _merge_coordinate_bounds(typed_coords)
+        symbol_expressions = _merge_coordinate_symbol_expressions(typed_coords)
+        semantic = _simplify_coordinate_semantic(
+            sum(
+                (
+                    coord.semantic * math.prod(shape[dim + 1 :])
+                    for dim, coord in enumerate(typed_coords)
+                ),
+                start=sympy.Integer(0),
+            ),
+            bounds,
+        )
+        fallback = _flat_index_from_coords(
+            [coord.expression for coord in typed_coords], shape
+        )
+        return CuteLogicalCoordinate(
+            _render_coordinate_semantic(
+                semantic,
+                symbol_expressions,
+                fallback,
+            ),
+            semantic,
+            bounds,
+            symbol_expressions,
+        )
     rendered = [
-        str(coord) if isinstance(coord, str) else f"cutlass.Int32({coord})"
+        coord.expression
+        if isinstance(coord, CuteLogicalCoordinate)
+        else str(coord)
+        if isinstance(coord, str)
+        else f"cutlass.Int32({coord})"
         for coord in coords
     ]
     return _flat_index_from_coords(rendered, shape)
@@ -513,6 +833,8 @@ def broadcast_logical_flat_index(
     output_shape: list[int],
     source_shape: list[int],
 ) -> _Coordinate | None:
+    if output_shape == source_shape:
+        return flat_index
     output_coords = logical_coords_from_flat(flat_index, output_shape)
     rank_delta = len(output_shape) - len(source_shape)
     if rank_delta < 0:

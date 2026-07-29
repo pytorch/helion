@@ -71,9 +71,13 @@ from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
+from helion._compiler.cute.cute_reshape import CuteLogicalCoordinate
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
+from helion._compiler.cute.cute_reshape import bounded_logical_coordinate_choices
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
+from helion._compiler.cute.cute_reshape import logical_coords_from_flat
+from helion._compiler.cute.cute_reshape import logical_flat_from_coords
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.indexing import CutePackedAffineLoad
 from helion._compiler.cute.indexing import CutePackedTerms
@@ -843,9 +847,19 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
             _generic_epilogue_config([128, 128, 32]),
         )
         self.assertIn("cute.gemm", code)
-        self.assertIn("tcgen05_epi_scan", code)
+        self.assertIn("tcgen05_epi_partner_index", code)
+        self.assertNotIn("tcgen05_epi_scan", code)
+        self.assertIn("cute.size(tcgen05_tRS_rAcc.shape) % 2 == 0", code)
         self.assertNotIn("split_smem", code)
         self.assertNotIn("reshape_smem", code)
+
+    def test_generic_pair_transform_rejects_unproven_t2r_fragment(self) -> None:
+        x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        config = _generic_epilogue_config([128, 128, 32])
+        bound = _generic_pair_swap_epilogue.bind((x.T, x))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+            bound.to_triton_code(config)
 
     def test_generic_pair_transform_runtime(self) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -921,8 +935,11 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
                     _generic_epilogue_config([1, 128, head_dim, 32]),
                 )
                 self.assertIn("cute.gemm", code)
-                self.assertIn("tcgen05_epi_scan", code)
+                self.assertIn("tcgen05_epi_partner_index", code)
+                self.assertNotIn("tcgen05_epi_scan", code)
                 self.assertIn("tcgen05_epi_load", code)
+                self.assertEqual(code.count(" = (table.iterator +"), 2)
+                self.assertEqual(code.count(" = (bias.iterator +"), 2)
                 self.assertNotIn("split_smem", code)
                 self.assertNotIn("permute_smem", code)
                 self.assertLess(len(code), 100_000)
@@ -961,6 +978,73 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
                 torch.testing.assert_close(
                     actual, expected.to(dtype), atol=1.0, rtol=2e-2
                 )
+
+
+class TestCuteLogicalCoordinates(unittest.TestCase):
+    def test_bounded_pair_relation_survives_shape_roundtrips(self) -> None:
+        pair_m = sympy.Symbol("pair_m", integer=True, nonnegative=True)
+        pair_n = sympy.Symbol("pair_n", integer=True, nonnegative=True)
+        bounds = ((pair_m, 0, 127), (pair_n, 0, 63))
+        expressions = ((pair_m, "pair_m"), (pair_n, "pair_n"))
+        pair_n_twice = sympy.Mul(sympy.Integer(2), pair_n)
+        current = (
+            CuteLogicalCoordinate("pair_m", pair_m, bounds, expressions),
+            CuteLogicalCoordinate("2 * pair_n", pair_n_twice, bounds, expressions),
+        )
+        partner = (
+            current[0],
+            CuteLogicalCoordinate(
+                "2 * pair_n + 1",
+                sympy.Add(pair_n_twice, sympy.Integer(1)),
+                bounds,
+                expressions,
+            ),
+        )
+        flat = logical_flat_from_coords(current, [128, 128])
+        for shape in ([128, 64, 2], [64, 2, 128], [2, 128, 64], [128, 128]):
+            flat = logical_flat_from_coords(
+                logical_coords_from_flat(flat, shape), shape
+            )
+        target = logical_coords_from_flat(flat, [128, 128])
+        self.assertTrue(
+            all(isinstance(coord, CuteLogicalCoordinate) for coord in target)
+        )
+        self.assertEqual(
+            bounded_logical_coordinate_choices(
+                cast("tuple[CuteLogicalCoordinate, ...]", target),
+                (current, partner),
+            ),
+            frozenset({0}),
+        )
+
+    def test_bounded_pair_relation_can_select_both_slots(self) -> None:
+        pair_n = sympy.Symbol("pair_n", integer=True, nonnegative=True)
+        bounds = ((pair_n, 0, 63),)
+        expressions = ((pair_n, "pair_n"),)
+        pair_n_twice = sympy.Mul(sympy.Integer(2), pair_n)
+        current = (
+            CuteLogicalCoordinate("2 * pair_n", pair_n_twice, bounds, expressions),
+        )
+        partner = (
+            CuteLogicalCoordinate(
+                "2 * pair_n + 1",
+                sympy.Add(pair_n_twice, sympy.Integer(1)),
+                bounds,
+                expressions,
+            ),
+        )
+        target = (
+            CuteLogicalCoordinate(
+                "2 * pair_n + pair_n % 2",
+                sympy.Add(pair_n_twice, sympy.Mod(pair_n, 2)),
+                bounds,
+                expressions,
+            ),
+        )
+        self.assertEqual(
+            bounded_logical_coordinate_choices(target, (current, partner)),
+            frozenset({0, 1}),
+        )
 
 
 @onlyBackends(["cute"])

@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import Any
 
+import sympy
 import torch
 from torch._inductor.virtualized import V
 from torch.fx.node import Node
@@ -16,10 +18,12 @@ from ...language import tile_index
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from .cute_epilogue import Tcgen05PairTraversal
 from .cute_epilogue import _fragment_elementwise_inputs
-from .cute_reshape import _coords_from_flat_index
+from .cute_reshape import CuteLogicalCoordinate
 from .cute_reshape import _flat_index_from_coords
 from .cute_reshape import _get_tile_shape
+from .cute_reshape import bounded_logical_coordinate_choices
 from .cute_reshape import broadcast_logical_flat_index
 from .cute_reshape import logical_coords_from_flat
 from .cute_reshape import logical_flat_from_coords
@@ -34,6 +38,56 @@ if TYPE_CHECKING:
 class FragmentEpilogueCode:
     prelude: str
     expression: str
+
+
+_FragmentCoordinate = int | str | CuteLogicalCoordinate
+
+
+@dataclasses.dataclass(frozen=True)
+class _TerminalKey:
+    kind: str
+    node: Node
+    coordinates: tuple[object, ...]
+    predicate: Node | None
+    dtype: torch.dtype | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _PairSlot:
+    index_name: str
+    partner_index_name: str
+    coordinates: tuple[CuteLogicalCoordinate, CuteLogicalCoordinate]
+    partner_coordinates: tuple[CuteLogicalCoordinate, CuteLogicalCoordinate]
+
+
+def _coordinate_expression(value: _FragmentCoordinate) -> str:
+    if isinstance(value, CuteLogicalCoordinate):
+        return value.expression
+    if isinstance(value, int):
+        return str(value)
+    return value
+
+
+def _coordinate_semantic(
+    value: _FragmentCoordinate,
+) -> Any | None:  # noqa: ANN401 - SymPy's operator stubs are incomplete.
+    if isinstance(value, CuteLogicalCoordinate):
+        return value.semantic
+    if isinstance(value, int):
+        return sympy.Integer(value)
+    return None
+
+
+def _proven_coordinate_choices(
+    target: tuple[CuteLogicalCoordinate, ...],
+    choices: tuple[tuple[CuteLogicalCoordinate, ...], ...],
+) -> frozenset[int]:
+    try:
+        return bounded_logical_coordinate_choices(target, choices)
+    except ValueError as exc:
+        raise AssertionError(
+            "rendered coordinate contradicts the planned pair-local proof"
+        ) from exc
 
 
 def _shape(state: CodegenState, node: Node) -> list[int]:
@@ -177,15 +231,19 @@ class _ScalarEvaluator:
         carrier_name: str,
         coordinate_name: str,
         body_indent: str,
+        pair_slot: _PairSlot | None = None,
+        terminal_cache: dict[_TerminalKey, ast.AST] | None = None,
     ) -> None:
         self.state = state
         self.carrier_name = carrier_name
         self.coordinate_name = coordinate_name
         self.body_indent = body_indent
+        self.pair_slot = pair_slot
+        self.terminal_cache = terminal_cache
         self.output_block_ids = store.output_block_ids
         self.boundaries = set(store.boundary_nodes)
-        self.memo: dict[tuple[Node, str, int | None], ast.AST] = {}
-        self.index_memo: dict[str, str] = {}
+        self.memo: dict[tuple[Node, _FragmentCoordinate, int | None], ast.AST] = {}
+        self.index_memo: dict[_FragmentCoordinate, _FragmentCoordinate] = {}
         self.lines: list[str] = []
 
     def _bind(self, prefix: str, expression: ast.AST) -> ast.AST:
@@ -198,15 +256,28 @@ class _ScalarEvaluator:
         )
         return expr_from_string(name)
 
-    def _index(self, expression: str) -> str:
+    def _index(self, expression: _FragmentCoordinate) -> _FragmentCoordinate:
         if expression in self.index_memo:
             return self.index_memo[expression]
         name = self.state.device_function.new_var("tcgen05_epi_flat")
-        self.lines.append(f"{self.body_indent}{name} = cutlass.Int32({expression})\n")
-        self.index_memo[expression] = name
-        return name
+        self.lines.append(
+            f"{self.body_indent}{name} = "
+            f"cutlass.Int32({_coordinate_expression(expression)})\n"
+        )
+        result: _FragmentCoordinate = name
+        if isinstance(expression, CuteLogicalCoordinate):
+            result = CuteLogicalCoordinate(
+                name,
+                expression.semantic,
+                expression.bounds,
+                expression.symbol_expressions,
+            )
+        self.index_memo[expression] = result
+        return result
 
-    def _broadcast_flat(self, output: Node, source: Node, flat: str) -> str:
+    def _broadcast_flat(
+        self, output: Node, source: Node, flat: _FragmentCoordinate
+    ) -> _FragmentCoordinate:
         source_flat = broadcast_logical_flat_index(
             flat,
             output_shape=_shape(self.state, output),
@@ -214,18 +285,113 @@ class _ScalarEvaluator:
         )
         if source_flat is None:
             raise RuntimeError(f"unsupported fragment broadcast into {output.name}")
-        return self._index(str(source_flat))
+        return self._index(source_flat)
 
-    def _boundary(self, node: Node, flat: str) -> ast.AST:
-        coords = _coords_from_flat_index(flat, _shape(self.state, node))
+    def _cached_terminal(self, key: _TerminalKey | None) -> ast.AST | None:
+        if key is None or self.terminal_cache is None:
+            return None
+        return self.terminal_cache.get(key)
+
+    def _remember_terminal(self, key: _TerminalKey | None, value: ast.AST) -> ast.AST:
+        if key is not None and self.terminal_cache is not None:
+            self.terminal_cache.setdefault(key, value)
+        return value
+
+    @staticmethod
+    def _terminal_dtype(node: Node) -> torch.dtype | None:
+        value = node.meta.get("val")
+        return value.dtype if isinstance(value, torch.Tensor) else None
+
+    def _boundary(self, node: Node, flat: _FragmentCoordinate) -> ast.AST:
+        coords = logical_coords_from_flat(flat, _shape(self.state, node))
         if len(coords) == 2:
             target_m, target_n = coords
         elif len(coords) == 3:
             target_h, target_m, target_n = coords
-            if target_h != "cutlass.Int32(0)":
-                raise RuntimeError("tcgen05 fragment cannot cross a leading tile")
+            if isinstance(target_h, CuteLogicalCoordinate):
+                leading_choices = _proven_coordinate_choices(
+                    (target_h,),
+                    (
+                        (
+                            dataclasses.replace(
+                                target_h,
+                                expression="cutlass.Int32(0)",
+                                semantic=sympy.Integer(0),
+                            ),
+                        ),
+                    ),
+                )
+                if leading_choices != frozenset({0}):
+                    raise RuntimeError("tcgen05 fragment cannot cross a leading tile")
+            else:
+                target_h_semantic = _coordinate_semantic(target_h)
+                if (
+                    target_h_semantic is not None
+                    and sympy.simplify(target_h_semantic) != 0
+                ) or (
+                    target_h_semantic is None
+                    and _coordinate_expression(target_h) != "cutlass.Int32(0)"
+                ):
+                    raise RuntimeError("tcgen05 fragment cannot cross a leading tile")
         else:
             raise RuntimeError("tcgen05 fragment boundary must be rank 2 or 3")
+        semantic_coords = tuple(_coordinate_semantic(coord) for coord in coords)
+        terminal_key = (
+            _TerminalKey(
+                "boundary",
+                node,
+                tuple(semantic_coords),
+                None,
+                self._terminal_dtype(node),
+            )
+            if all(coord is not None for coord in semantic_coords)
+            else None
+        )
+        if (cached := self._cached_terminal(terminal_key)) is not None:
+            return cached
+        if self.pair_slot is not None:
+            if not isinstance(target_m, CuteLogicalCoordinate) or not isinstance(
+                target_n, CuteLogicalCoordinate
+            ):
+                raise RuntimeError("pair-local boundary lost typed coordinates")
+            target = (target_m, target_n)
+            pair_choices = _proven_coordinate_choices(
+                target,
+                (
+                    self.pair_slot.coordinates,
+                    self.pair_slot.partner_coordinates,
+                ),
+            )
+            if pair_choices == frozenset({0}):
+                index = self.pair_slot.index_name
+                value = expr_from_string(f"{self.carrier_name}[{index}]")
+            elif pair_choices == frozenset({1}):
+                index = self.pair_slot.partner_index_name
+                value = expr_from_string(f"{self.carrier_name}[{index}]")
+            elif pair_choices == frozenset({0, 1}):
+                is_current = " and ".join(
+                    f"({_coordinate_expression(target_coordinate)}) == "
+                    f"({_coordinate_expression(current_coordinate)})"
+                    for target_coordinate, current_coordinate in zip(
+                        target, self.pair_slot.coordinates, strict=True
+                    )
+                )
+                value = expr_from_string(
+                    f"{self.carrier_name}[{self.pair_slot.index_name}] if "
+                    f"({is_current}) else "
+                    f"{self.carrier_name}[{self.pair_slot.partner_index_name}]"
+                )
+            else:
+                raise RuntimeError(
+                    "pair-local boundary has an invalid bounded choice relation"
+                )
+            return self._remember_terminal(
+                terminal_key,
+                self._bind(
+                    "tcgen05_epi_acc_scalar",
+                    value,
+                ),
+            )
         result = self.state.device_function.new_var("tcgen05_epi_acc_scalar")
         matches = self.state.device_function.new_var("tcgen05_epi_matches")
         scan = self.state.device_function.new_var("tcgen05_epi_scan")
@@ -239,8 +405,9 @@ class _ScalarEvaluator:
                 f"{indent}for {scan} in range(cute.size({self.carrier_name}.shape)):\n",
                 f"{indent}    {coord} = {self.coordinate_name}[{scan}]\n",
                 (
-                    f"{indent}    {is_match} = {coord}[0] == {target_m} and "
-                    f"{coord}[1] == {target_n}\n"
+                    f"{indent}    {is_match} = {coord}[0] == "
+                    f"{_coordinate_expression(target_m)} and "
+                    f"{coord}[1] == {_coordinate_expression(target_n)}\n"
                 ),
                 (
                     f"{indent}    {result} = {self.carrier_name}[{scan}] if "
@@ -253,18 +420,37 @@ class _ScalarEvaluator:
                 ),
             ]
         )
-        return expr_from_string(result)
+        return self._remember_terminal(terminal_key, expr_from_string(result))
 
-    def _tile_index(self, node: Node, flat: str) -> ast.AST:
+    def _tile_index(self, node: Node, flat: _FragmentCoordinate) -> ast.AST:
         from ...language.memory_ops import _cute_tile_begin_expr
 
         size_node = node.args[0] if node.args else None
         size = size_node.meta.get("val") if isinstance(size_node, Node) else size_node
         base = _cute_tile_begin_expr(self.state, size)
-        coord = _coords_from_flat_index(flat, _shape(self.state, node))[0]
-        return expr_from_string(f"cutlass.Int32({base}) + cutlass.Int32({coord})")
+        coord = logical_coords_from_flat(flat, _shape(self.state, node))[0]
+        semantic = _coordinate_semantic(coord)
+        terminal_key = (
+            _TerminalKey(
+                "tile_index",
+                node,
+                (semantic,),
+                None,
+                self._terminal_dtype(node),
+            )
+            if semantic is not None
+            else None
+        )
+        if (cached := self._cached_terminal(terminal_key)) is not None:
+            return cached
+        result = expr_from_string(
+            f"cutlass.Int32({base}) + cutlass.Int32({_coordinate_expression(coord)})"
+        )
+        if terminal_key is not None and self.terminal_cache is not None:
+            result = self._bind("tcgen05_epi_tile_index", result)
+        return self._remember_terminal(terminal_key, result)
 
-    def _host_load(self, node: Node, flat: str) -> ast.AST:
+    def _host_load(self, node: Node, flat: _FragmentCoordinate) -> ast.AST:
         from .matmul_utils import cute_rematerialize_scalar_load
 
         source_node = node.args[0] if node.args else None
@@ -279,6 +465,21 @@ class _ScalarEvaluator:
             raise RuntimeError(f"fragment load {node.name} has no tensor metadata")
         output_shape = _shape(self.state, node)
         output_coords = logical_coords_from_flat(flat, output_shape)
+        flat_semantic = _coordinate_semantic(flat)
+        extra_mask = node.args[2] if len(node.args) > 2 else None
+        terminal_key = (
+            _TerminalKey(
+                "load",
+                node,
+                (flat_semantic,),
+                extra_mask if isinstance(extra_mask, Node) else None,
+                output_value.dtype,
+            )
+            if flat_semantic is not None
+            else None
+        )
+        if (cached := self._cached_terminal(terminal_key)) is not None:
+            return cached
         advanced = [
             index
             for index in indices
@@ -287,6 +488,7 @@ class _ScalarEvaluator:
         ]
         index_overrides: dict[int, str] = {}
         env_overrides: dict[Node, ast.AST] = {}
+        advanced_indices: list[tuple[Node, _FragmentCoordinate]] = []
         if advanced:
             if not all(isinstance(index, Node) for index in indices):
                 raise RuntimeError(
@@ -294,8 +496,16 @@ class _ScalarEvaluator:
                 )
             for index in indices:
                 assert isinstance(index, Node)
-                index_flat = self._broadcast_flat(node, index, flat)
-                env_overrides[index] = self.evaluate(index, index_flat)
+                index_flat = broadcast_logical_flat_index(
+                    flat,
+                    output_shape=output_shape,
+                    source_shape=_shape(self.state, index),
+                )
+                if index_flat is None:
+                    raise RuntimeError(
+                        f"unsupported fragment broadcast into {node.name}"
+                    )
+                advanced_indices.append((index, index_flat))
         else:
             from ...language.memory_ops import _cute_tile_begin_expr
 
@@ -341,7 +551,8 @@ class _ScalarEvaluator:
                             else output_dim
                         )
                         index_overrides[block_id] = (
-                            f"({base}) + ({output_coords[coord_dim]})"
+                            f"({base}) + "
+                            f"({_coordinate_expression(output_coords[coord_dim])})"
                         )
                         output_dim += 1
                     elif not isinstance(value, int):
@@ -355,11 +566,14 @@ class _ScalarEvaluator:
                         )
                     base = _cute_tile_begin_expr(self.state, output_size)
                     index_overrides[block_id] = (
-                        f"({base}) + ({output_coords[output_dim]})"
+                        f"({base}) + "
+                        f"({_coordinate_expression(output_coords[output_dim])})"
                     )
                     output_dim += 1
                 elif not isinstance(index, int):
                     raise RuntimeError(f"unsupported fragment load index {index!r}")
+        for index, index_flat in advanced_indices:
+            env_overrides[index] = self.evaluate(index, self._index(index_flat))
         rematerialized = cute_rematerialize_scalar_load(
             self.state,
             node,
@@ -370,18 +584,25 @@ class _ScalarEvaluator:
             raise RuntimeError(f"failed to rematerialize fragment load {node.name}")
         statements, expression = rematerialized
         self.lines.append(_render_ast_statements(statements, self.body_indent))
-        return self._bind("tcgen05_epi_load", expression)
+        return self._remember_terminal(
+            terminal_key, self._bind("tcgen05_epi_load", expression)
+        )
 
-    def evaluate(self, node: Node, flat: str, projection: int | None = None) -> ast.AST:
+    def evaluate(
+        self,
+        node: Node,
+        flat: _FragmentCoordinate,
+        projection: int | None = None,
+    ) -> ast.AST:
         key = (node, flat, projection)
         if key in self.memo:
             return self.memo[key]
 
         def leaf(
-            current: Node, current_flat: int | str, current_projection: int | None
+            current: Node,
+            current_flat: _FragmentCoordinate,
+            current_projection: int | None,
         ) -> ast.AST:
-            if not isinstance(current_flat, str):
-                current_flat = str(current_flat)
             if current in self.boundaries:
                 return self._boundary(current, current_flat)
             if current.target is memory_ops.load:
@@ -402,7 +623,7 @@ class _ScalarEvaluator:
                             current_flat, _shape(self.state, current)
                         )
                     )
-                    source_coords: list[int | str] = []
+                    source_coords: list[_FragmentCoordinate] = []
                     for index in indices:
                         coord = next(output_coords)
                         if index is None:
@@ -416,7 +637,7 @@ class _ScalarEvaluator:
                     source_flat = logical_flat_from_coords(
                         source_coords, _shape(self.state, source)
                     )
-                    return self.evaluate(source, self._index(str(source_flat)))
+                    return self.evaluate(source, self._index(source_flat))
                 raise RuntimeError(f"malformed fragment load {current.name}")
             if current.target is tile_index:
                 return self._tile_index(current, current_flat)
@@ -439,14 +660,22 @@ class _ScalarEvaluator:
             self.lines.append(_render_ast_statements(statements, self.body_indent))
             return self._bind("tcgen05_epi_value", expression)
 
-        def select(selector: int | str, choices: tuple[ast.AST, ...]) -> ast.AST:
-            if not isinstance(selector, str) or len(choices) != 2:
+        def select(
+            selector: _FragmentCoordinate, choices: tuple[ast.AST, ...]
+        ) -> ast.AST:
+            if len(choices) != 2:
                 raise RuntimeError("invalid fragment coordinate selection")
+            semantic = _coordinate_semantic(selector)
+            if semantic is not None and semantic.is_Integer:
+                selected = int(semantic)
+                if selected not in (0, 1):
+                    raise RuntimeError("fragment coordinate selected an invalid input")
+                return choices[selected]
             return self._bind(
                 "tcgen05_epi_join",
                 expr_from_string(
                     "({left} if ({selector}) == cutlass.Int32(0) else {right})",
-                    selector=expr_from_string(selector),
+                    selector=expr_from_string(_coordinate_expression(selector)),
                     left=choices[0],
                     right=choices[1],
                 ),
@@ -464,7 +693,7 @@ class _ScalarEvaluator:
         return result
 
 
-def _scalar_fragment(
+def _scanned_scalar_fragment(
     state: CodegenState,
     store: Tcgen05EpilogueStorePlan,
     *,
@@ -473,10 +702,6 @@ def _scalar_fragment(
     target_dtype: str,
     indent: str,
 ) -> FragmentEpilogueCode:
-    if store.required_pair_width is not None and (
-        store.pair_local is None or store.pair_local.width != store.required_pair_width
-    ):
-        raise RuntimeError("scalar fragment reached rendering without pair-local proof")
     df = state.device_function
     output = df.new_var("tcgen05_epi_output")
     index = df.new_var("tcgen05_epi_index")
@@ -504,6 +729,158 @@ def _scalar_fragment(
         f"{body_indent}{output}[{index}] = {ast.unparse(value)}\n"
     )
     return FragmentEpilogueCode(prelude, f"{output}.load()")
+
+
+def _pair_scalar_fragment(
+    state: CodegenState,
+    store: Tcgen05EpilogueStorePlan,
+    *,
+    carrier_name: str,
+    coordinate_name: str,
+    target_dtype: str,
+    indent: str,
+) -> FragmentEpilogueCode:
+    capability = store.pair_local
+    if (
+        capability is None
+        or capability.width != 2
+        or capability.traversal is not Tcgen05PairTraversal.CONTIGUOUS_EVEN_ODD_N_R2S
+    ):
+        raise RuntimeError("pair fragment requires contiguous even/odd R2S traversal")
+    df = state.device_function
+    output = df.new_var("tcgen05_epi_output")
+    index = df.new_var("tcgen05_epi_index")
+    partner_index = df.new_var("tcgen05_epi_partner_index")
+    coord = df.new_var("tcgen05_epi_coord")
+    body_indent = indent + "    "
+    output_shape = _shape(state, store.value_node)
+    if len(output_shape) not in (2, 3):
+        raise RuntimeError("tcgen05 pair fragment output must be rank 2 or 3")
+    if len(output_shape) == 3 and output_shape[0] != 1:
+        raise RuntimeError("tcgen05 pair fragment requires one leading tile")
+    matrix_shape = output_shape[-2:]
+    if matrix_shape[-1] % capability.width:
+        raise RuntimeError("tcgen05 pair fragment requires complete register pairs")
+
+    pair_m: Any = sympy.Symbol("tcgen05_pair_m", integer=True, nonnegative=True)
+    pair_n: Any = sympy.Symbol("tcgen05_pair_n", integer=True, nonnegative=True)
+    pair_bounds = (
+        (pair_m, 0, matrix_shape[0] - 1),
+        (pair_n, 0, matrix_shape[1] // capability.width - 1),
+    )
+    pair_symbol_expressions = (
+        (pair_m, f"{coord}[0]"),
+        (pair_n, f"{coord}[1] // cutlass.Int32({capability.width})"),
+    )
+    current_coordinates = (
+        CuteLogicalCoordinate(
+            f"{coord}[0]", pair_m, pair_bounds, pair_symbol_expressions
+        ),
+        CuteLogicalCoordinate(
+            f"{coord}[1]",
+            capability.width * pair_n,
+            pair_bounds,
+            pair_symbol_expressions,
+        ),
+    )
+    partner_coordinates = (
+        CuteLogicalCoordinate(
+            f"{coord}[0]", pair_m, pair_bounds, pair_symbol_expressions
+        ),
+        CuteLogicalCoordinate(
+            f"{coord}[1] + cutlass.Int32(1)",
+            capability.width * pair_n + 1,
+            pair_bounds,
+            pair_symbol_expressions,
+        ),
+    )
+    current_flat = logical_flat_from_coords(current_coordinates, matrix_shape)
+    partner_flat = logical_flat_from_coords(partner_coordinates, matrix_shape)
+    if not isinstance(current_flat, CuteLogicalCoordinate) or not isinstance(
+        partner_flat, CuteLogicalCoordinate
+    ):
+        raise RuntimeError("pair fragment lost typed coordinate provenance")
+
+    terminal_cache: dict[_TerminalKey, ast.AST] = {}
+    evaluator = _ScalarEvaluator(
+        state,
+        store,
+        carrier_name=carrier_name,
+        coordinate_name=coordinate_name,
+        body_indent=body_indent,
+        pair_slot=_PairSlot(
+            index,
+            partner_index,
+            current_coordinates,
+            partner_coordinates,
+        ),
+        terminal_cache=terminal_cache,
+    )
+    partner_evaluator = _ScalarEvaluator(
+        state,
+        store,
+        carrier_name=carrier_name,
+        coordinate_name=coordinate_name,
+        body_indent=body_indent,
+        pair_slot=_PairSlot(
+            partner_index,
+            index,
+            partner_coordinates,
+            current_coordinates,
+        ),
+        terminal_cache=terminal_cache,
+    )
+    value = evaluator.evaluate(store.value_node, evaluator._index(current_flat))
+    partner_value = partner_evaluator.evaluate(
+        store.value_node, partner_evaluator._index(partner_flat)
+    )
+    prelude = (
+        f"{indent}assert cute.size({carrier_name}.shape) % "
+        f'{capability.width} == 0, "tcgen05 pair carrier must be complete"\n'
+        f"{indent}{output} = cute.make_rmem_tensor("
+        f"cute.make_layout({carrier_name}.shape), {target_dtype})\n"
+        f"{indent}for {index} in range(0, cute.size({carrier_name}.shape), "
+        f"{capability.width}):\n"
+        f"{body_indent}{partner_index} = {index} + 1\n"
+        f"{body_indent}{coord} = {coordinate_name}[{index}]\n"
+        f"{''.join(evaluator.lines)}"
+        f"{body_indent}{output}[{index}] = {ast.unparse(value)}\n"
+        f"{''.join(partner_evaluator.lines)}"
+        f"{body_indent}{output}[{partner_index}] = {ast.unparse(partner_value)}\n"
+    )
+    return FragmentEpilogueCode(prelude, f"{output}.load()")
+
+
+def _scalar_fragment(
+    state: CodegenState,
+    store: Tcgen05EpilogueStorePlan,
+    *,
+    carrier_name: str,
+    coordinate_name: str,
+    target_dtype: str,
+    indent: str,
+) -> FragmentEpilogueCode:
+    if store.required_pair_width is not None and (
+        store.pair_local is None or store.pair_local.width != store.required_pair_width
+    ):
+        raise RuntimeError("scalar fragment reached rendering without pair-local proof")
+    if store.pair_local is not None:
+        return _pair_scalar_fragment(
+            state,
+            store,
+            carrier_name=carrier_name,
+            coordinate_name=coordinate_name,
+            target_dtype=target_dtype,
+            indent=indent,
+        )
+    return _scanned_scalar_fragment(
+        state,
+        store,
+        carrier_name=carrier_name,
+        coordinate_name=coordinate_name,
+        target_dtype=target_dtype,
+        indent=indent,
+    )
 
 
 def render_fragment_epilogue(
