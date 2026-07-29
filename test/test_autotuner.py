@@ -4023,8 +4023,10 @@ class TestCuteAutotuner(TestCase):
         self.assertEqual(manual_config[FLASH_RESCALE_CHUNK_COLS_KEY], 64)
         manual_corr_config = dict(attn_bound.config_spec.default_config().config)
         manual_corr_config[FLASH_CORR_REGS_KEY] = 72
+        manual_corr_config[FLASH_OTHER_REGS_KEY] = 40
         attn_bound.config_spec.normalize(manual_corr_config)
         self.assertEqual(manual_corr_config[FLASH_CORR_REGS_KEY], 72)
+        self.assertEqual(manual_corr_config[FLASH_OTHER_REGS_KEY], 40)
         manual_bad_corr_config = dict(attn_bound.config_spec.default_config().config)
         manual_bad_corr_config[FLASH_CORR_REGS_KEY] = 96
         with self.assertRaises(exc.InvalidConfig):
@@ -4863,9 +4865,11 @@ class TestCuteAutotuner(TestCase):
         long_manual_corr = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_corr_regs=72,
+            cute_flash_other_regs=40,
         )
         long_bound.config_spec.normalize(long_manual_corr)
         self.assertEqual(long_manual_corr.config[FLASH_CORR_REGS_KEY], 72)
+        self.assertEqual(long_manual_corr.config[FLASH_OTHER_REGS_KEY], 40)
         long_manual_inf_threshold = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_rescale_threshold=math.inf,
@@ -6555,8 +6559,57 @@ class TestConfigValuePriors(TestCase):
         ):
             # 1 default + 10 random fill slots (seeds suppressed above).
             gen.random_population_flat(11)
-        self.assertEqual(biased.call_count, 5)
-        self.assertEqual(uniform.call_count, 5)
+        # Duplicate or invalid draws are retried, but attempts continue to
+        # alternate between biased and uniform sampling.
+        self.assertGreaterEqual(biased.call_count + uniform.call_count, 10)
+        self.assertLessEqual(abs(biased.call_count - uniform.call_count), 1)
+
+    def test_population_fill_pads_after_unique_configs_exhausted(self) -> None:
+        gen, _ = self._add_config_gen()
+        default_flat = gen.default_flat()
+        normalized = gen.unflatten(default_flat)
+        gen.config_spec.cute_flash_search_enabled = True
+        with (
+            patch.object(gen, "default_flat", return_value=default_flat),
+            patch.object(gen, "user_seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "biased_random_flat", return_value=default_flat),
+            patch.object(gen, "random_flat", return_value=default_flat),
+            patch.object(gen, "unflatten", return_value=normalized),
+            patch.object(gen, "flatten", return_value=default_flat),
+        ):
+            population = gen.random_population_flat(6)
+        self.assertEqual(population, [default_flat] * 6)
+
+    def test_flash_population_stores_normalized_flat_configs(self) -> None:
+        gen, _ = self._add_config_gen()
+        default_flat = gen.default_flat()
+        normalized = gen.unflatten(default_flat)
+        gen.config_spec.cute_flash_search_enabled = True
+        canonical_flat = [*default_flat]
+        with (
+            patch.object(gen, "default_flat", return_value=default_flat),
+            patch.object(gen, "user_seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "unflatten", return_value=normalized),
+            patch.object(gen, "flatten", return_value=canonical_flat) as flatten,
+        ):
+            population = gen.random_population_flat(1)
+        self.assertEqual(population, [canonical_flat])
+        flatten.assert_called_once_with(normalized)
+
+    def test_non_flash_population_propagates_generation_failure(self) -> None:
+        gen, _ = self._add_config_gen()
+        gen.config_spec.cute_flash_search_enabled = False
+        with (
+            patch.object(
+                gen,
+                "random_population_flat",
+                side_effect=exc.InvalidConfig("invalid default"),
+            ),
+            self.assertRaisesRegex(exc.InvalidConfig, "invalid default"),
+        ):
+            gen.random_population(1)
 
 
 if __name__ == "__main__":

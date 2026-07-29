@@ -4420,12 +4420,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # Future heuristics may add more compiler seeds; this test only
         # requires the CuTe cluster-m2 seed to be present.
         self.assertGreaterEqual(len(acf_configs), 2)
-        self.assertEqual(
+        acf_seed_configs = [
+            config
+            for config in acf_configs
+            if config.config["advanced_controls_file"] == "/tmp/helion-test.acf"
+        ]
+        self.assertGreaterEqual(len(acf_seed_configs), 1)
+        self.assertLessEqual(
             {config.config["advanced_controls_file"] for config in acf_configs},
-            {"/tmp/helion-test.acf"},
+            {"", "/tmp/helion-test.acf"},
         )
         self._assert_cute_tcgen05_cluster_m2_seeded(
-            acf_configs,
+            acf_seed_configs,
             expected_block_k=128,
             expected_indexing_length=3,
         )

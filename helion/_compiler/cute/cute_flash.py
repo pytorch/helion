@@ -6460,6 +6460,25 @@ tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(
     _flash_tma_v, 0, cute.make_layout(1),
     cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3)){setup_gmem_slice}"""
     )
+    fa4_stat_handoff = (
+        cfg.exp2_impl == "split"
+        and not is_causal
+        and hd == 64
+        and not has_lse
+        and not score_plan.modifiers
+        and _flash_bool_env("HELION_CUTE_FLASH_FA4_STAT_HANDOFF", True)
+    )
+    scale_layout = (
+        f"cute.make_layout(({q_stage} * 128))"
+        if fa4_stat_handoff
+        else f"cute.make_layout(({s_corr_stage}, {q_stage}, 128))"
+    )
+
+    def _scale_slot_expr(index: str, stage: str) -> str:
+        if fa4_stat_handoff:
+            return f"flash_scale_t[{stage} * 128 + flash_local_tidx]"
+        return f"flash_scale_t[{index}, {stage}, flash_local_tidx]"
+
     setup = f"""
 tidx, _, _ = cute.arch.thread_idx()
 warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -6473,8 +6492,7 @@ storage = smem.allocate(_flash_storage_cls)
 sQ = storage.sQ.get_tensor(_flash_qsl.outer, swizzle=_flash_qsl.inner)
 sK = storage.sK.get_tensor(_flash_ksl.outer, swizzle=_flash_ksl.inner)
 sV = cute.make_tensor(cute.recast_ptr(sK.iterator, _flash_vsl.inner), _flash_vsl.outer)
-flash_scale_t = storage.sScale.get_tensor(
-    cute.make_layout(({s_corr_stage}, {q_stage}, 128)))
+flash_scale_t = storage.sScale.get_tensor({scale_layout})
 
 # Raw mbarrier init -> fence -> CTA sync, before the pipelines.
 flash_s_full_ptr = storage.s_full_mbar.data_ptr()
@@ -6530,17 +6548,15 @@ flash_kv_prod, flash_kv_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(
 
 flash_qkt = _flash_qk_mma.get_slice(flash_mma_tile_coord_v)
 flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
-tSrQ = flash_qkt.make_fragment_A(sQ)
-tSrK = flash_qkt.make_fragment_B(sK)
-tOrV = flash_pvt.make_fragment_B(sV)
-flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, 128))
-tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
-flash_pv_acc_shape = flash_pvt.partition_shape_C(({mma_m}, {hd}))
-tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
 {setup_tma_partitions}
     """
 
-    tmem_base_setup = f"""    flash_tmem.wait_for_alloc()
+    tmem_fragment_setup = f"""    flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, 128))
+    tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
+    flash_pv_acc_shape = flash_pvt.partition_shape_C(({mma_m}, {hd}))
+    tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
+"""
+    tmem_base_setup = f"""{tmem_fragment_setup}    flash_tmem.wait_for_alloc()
     flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
     tStS0_full = cute.make_tensor(flash_tmem_ptr, tStS.layout)
     tStS1_full = cute.make_tensor(flash_tmem_ptr + 128, tStS.layout)
@@ -6550,11 +6566,29 @@ tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
 """
     tmem_mma_setup = (
         tmem_base_setup
-        + f"""    tP = cute.make_tensor(tStS0.iterator, _flash_ptl.outer)
+        + f"""    tSrQ = flash_qkt.make_fragment_A(sQ)
+    tSrK = flash_qkt.make_fragment_B(sK)
+    tOrV = flash_pvt.make_fragment_B(sV)
+    tP = cute.make_tensor(tStS0.iterator, _flash_ptl.outer)
     tOrP0 = flash_pvt.make_fragment_A(tP)
     tOrP1 = cute.make_tensor(tOrP0.iterator + {p1_step}, tOrP0.layout)
 """
     )
+    score_store_needed = (
+        cfg.softmax_disc
+        and not _flash_fa4_runtime_disc_score_plan_supported(score_plan)
+    )
+    score_store_setup = ""
+    if score_store_needed:
+        score_store_setup = """    flash_score_st_atom = cute.make_copy_atom(
+        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+    flash_tiled_score_st0 = cute_tcgen05_flash.make_tmem_copy(flash_score_st_atom, tStS0)
+    flash_tiled_score_st1 = cute_tcgen05_flash.make_tmem_copy(flash_score_st_atom, tStS1)
+    flash_thr_score_st0 = flash_tiled_score_st0.get_slice(flash_local_tidx)
+    flash_thr_score_st1 = flash_tiled_score_st1.get_slice(flash_local_tidx)
+    tScoreSTtS0 = flash_thr_score_st0.partition_D(tStS0)
+    tScoreSTtS1 = flash_thr_score_st1.partition_D(tStS1)
+"""
     tmem_softmax_setup = (
         tmem_base_setup
         + f"""    cS = cute.make_identity_tensor((128, 128))
@@ -6568,14 +6602,7 @@ tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
     tLDtS0 = flash_thr_ld0.partition_S(tStS0)
     tLDtS1 = flash_thr_ld1.partition_S(tStS1)
     tLDcS = flash_thr_ld0.partition_D(tScS)
-    flash_score_st_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
-    flash_tiled_score_st0 = cute_tcgen05_flash.make_tmem_copy(flash_score_st_atom, tStS0)
-    flash_tiled_score_st1 = cute_tcgen05_flash.make_tmem_copy(flash_score_st_atom, tStS1)
-    flash_thr_score_st0 = flash_tiled_score_st0.get_slice(flash_local_tidx)
-    flash_thr_score_st1 = flash_tiled_score_st1.get_slice(flash_local_tidx)
-    tScoreSTtS0 = flash_thr_score_st0.partition_D(tStS0)
-    tScoreSTtS1 = flash_thr_score_st1.partition_D(tStS1)
+{score_store_setup.rstrip()}
 
     # Staged-P store atom repetition is autotuned. Rep16 preserves the original
     # 4-chunk FA4 granularity; Rep32 halves the P r2t chunk count on hd64.
@@ -6628,6 +6655,16 @@ tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
     def _tmem_softmax_setup_stage(stage: str) -> str:
         ptr_expr = "flash_tmem_ptr" if stage == "0" else "flash_tmem_ptr + 128"
         p_store_iter = p0_store_iter if stage == "0" else p1_store_iter
+        stage_score_store_setup = ""
+        if score_store_needed:
+            stage_score_store_setup = f"""    flash_score_st_atom = cute.make_copy_atom(
+        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+    flash_tiled_score_st{stage} = cute_tcgen05_flash.make_tmem_copy(
+        flash_score_st_atom, tStS{stage})
+    flash_thr_score_st{stage} = flash_tiled_score_st{stage}.get_slice(
+        flash_local_tidx)
+    tScoreSTtS{stage} = flash_thr_score_st{stage}.partition_D(tStS{stage})
+"""
         coord_setup = (
             "    tLDcS = flash_thr_ld0.partition_D(tScS)\n"
             if stage == "0"
@@ -6640,6 +6677,8 @@ tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
         )
         return f"""    flash_tmem.wait_for_alloc()
     flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
+    flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, 128))
+    tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
     tStS{stage} = cute.make_tensor({ptr_expr}, tStS.layout)
     cS = cute.make_identity_tensor((128, 128))
     tScS = flash_qkt.partition_C(cS)
@@ -6650,13 +6689,7 @@ tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
     flash_thr_ld{stage} = flash_tiled_ld{stage}.get_slice(flash_local_tidx)
     tLDtS{stage} = flash_thr_ld{stage}.partition_S(tStS{stage})
 {coord_setup.rstrip()}
-    flash_score_st_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
-    flash_tiled_score_st{stage} = cute_tcgen05_flash.make_tmem_copy(
-        flash_score_st_atom, tStS{stage})
-    flash_thr_score_st{stage} = flash_tiled_score_st{stage}.get_slice(
-        flash_local_tidx)
-    tScoreSTtS{stage} = flash_thr_score_st{stage}.partition_D(tStS{stage})
+{stage_score_store_setup.rstrip()}
 
     # Staged-P store atom repetition is autotuned. Rep16 preserves the original
     # 4-chunk FA4 granularity; Rep32 halves the P r2t chunk count on hd64.
@@ -6754,6 +6787,9 @@ sO = storage.sO.get_tensor(_flash_osl.outer, swizzle=_flash_osl.inner)
 """
         if epi_smem
         else ""
+    )
+    scoped_corr_epi_smem = epi_smem and _flash_bool_env(
+        "HELION_CUTE_FLASH_SCOPED_CORR_EPI", True
     )
     epi_tma_setup = (
         f"""
@@ -6893,6 +6929,7 @@ if warp_idx == 15:
         epi_prelude = "decode"
     elif cfg.epi_stg:
         epi_head = f"""    cute.arch.setmaxregister_decrease({cfg.other_regs})
+{textwrap.indent(epi_stg_setup.strip(), "    ") if cfg.epi_stg else ""}
     flash_corr_epi_full_phase = cutlass.Int32(0)
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive(flash_corr_epi_empty_ptr + 0)
@@ -7559,7 +7596,13 @@ if warp_idx == 15:
         def _corr_publish_alpha(indent: str) -> str:
             if cfg.skip_rescale_stats:
                 return ""
-            publish_alpha_store = f"{indent}flash_scale_t[{corr_prod_index}, {stage}, flash_local_tidx] = flash_alpha\n"
+            publish_alpha_store = (
+                f"{indent}{_scale_slot_expr(corr_prod_index, stage)} = flash_alpha\n"
+            )
+            if fa4_stat_handoff:
+                return f"""{publish_alpha_store.rstrip()}
+{indent}cute.arch.barrier_arrive(
+{indent}    barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)"""
             publish_alpha_advance = corr_prod_advance.replace("\n", f"\n{indent}")
             return f"""{indent}_helion_flash_rt.mbar_spin_wait(
 {indent}    {corr_empty_ptr} + {corr_prod_index}, flash_s_corr_prod_phase)
@@ -7570,9 +7613,15 @@ if warp_idx == 15:
 
         corr_publish_alpha = _corr_publish_alpha("                ")
         corr_rowsum_advance = corr_prod_advance.replace("\n", "\n        ")
-        corr_publish_rowsum = f"""        _helion_flash_rt.mbar_spin_wait(
+        if fa4_stat_handoff:
+            corr_publish_rowsum = f"""        {_scale_slot_expr(corr_prod_index, stage)} = flash_row_sum
+        cute.arch.barrier_arrive(
+            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+{lse_store}"""
+        else:
+            corr_publish_rowsum = f"""        _helion_flash_rt.mbar_spin_wait(
             {corr_empty_ptr} + {corr_prod_index}, flash_s_corr_prod_phase)
-        flash_scale_t[{corr_prod_index}, {stage}, flash_local_tidx] = flash_row_sum
+        {_scale_slot_expr(corr_prod_index, stage)} = flash_row_sum
         cute.arch.barrier_arrive(
             barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
 {lse_store}
@@ -7833,6 +7882,13 @@ if warp_idx == 15:
         if not sp_corr_publish_alpha and not cfg.skip_rescale_stats:
             sp_corr_publish_alpha = f"""            if {softmax_not_first}:
 {corr_publish_alpha}"""
+        fa4_publish_alpha_before_exp = fa4_stat_handoff and cfg.rescale_threshold > 0.0
+        sp_alpha_publish_pre = (
+            sp_corr_publish_alpha if fa4_publish_alpha_before_exp else ""
+        )
+        sp_alpha_publish_post = (
+            "" if fa4_publish_alpha_before_exp else sp_corr_publish_alpha
+        )
         return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
         for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{
@@ -7851,9 +7907,10 @@ if warp_idx == 15:
             if flash_row_max == -cutlass.Float32.inf:
                 flash_row_max_safe = cutlass.Float32(0.0)
 {_sp_alpha_pre}
+{sp_alpha_publish_pre}
 {sp_exp_block}
 {_sp_alpha_post}
-{sp_corr_publish_alpha}
+{sp_alpha_publish_post}
             flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
 {sp_p_store_block}
 {final_corr_publish_rowsum}"""
@@ -7897,18 +7954,28 @@ if warp_idx == 15:
         if use_2cta_instrs
         else "    cute.arch.mbarrier_arrive(flash_tmem_dealloc_ptr)"
     )
+    softmax0_inner = _softmax_inner(
+        "0",
+        "flash_tiled_ld0",
+        "tLDtS0",
+        "flash_tiled_st0",
+        "tSTtS0",
+        "flash_tiled_score_st0",
+        "tScoreSTtS0",
+    )
+    softmax1_inner = _softmax_inner(
+        "1",
+        "flash_tiled_ld1",
+        "tLDtS1",
+        "flash_tiled_st1",
+        "tSTtS1",
+        "flash_tiled_score_st1",
+        "tScoreSTtS1",
+    )
     softmax0_block = _flash_fa4_wrap(
         "if warp_idx < 4:",
         softmax0_head,
-        _softmax_inner(
-            "0",
-            "flash_tiled_ld0",
-            "tLDtS0",
-            "flash_tiled_st0",
-            "tSTtS0",
-            "flash_tiled_score_st0",
-            "tScoreSTtS0",
-        ),
+        softmax0_inner,
         persistent,
         prelude=softmax_prelude,
         tail=tmem_dealloc_arrive,
@@ -7924,15 +7991,7 @@ if warp_idx == 15:
     softmax1_block = _flash_fa4_wrap(
         "if (warp_idx >= 4) & (warp_idx < 8):",
         softmax1_head,
-        _softmax_inner(
-            "1",
-            "flash_tiled_ld1",
-            "tLDtS1",
-            "flash_tiled_st1",
-            "tSTtS1",
-            "flash_tiled_score_st1",
-            "tScoreSTtS1",
-        ),
+        softmax1_inner,
         persistent,
         prelude=softmax_prelude,
         tail=tmem_dealloc_arrive,
@@ -7957,17 +8016,22 @@ if warp_idx == 15:
     _helion_flash_rt.mbarrier_arrive(flash_pfor_ptr + 0{pfor_peer_arg})
     _helion_flash_rt.mbarrier_arrive(flash_pfor_ptr + 1{pfor_peer_arg})"""
     )
-    corr_head = f"""    cute.arch.setmaxregister_decrease({cfg.corr_regs})
-{tmem_base_setup.rstrip()}
-{corr_epi_smem_setup.rstrip()}
-    flash_o_full_phase = cutlass.Int32(0)
-    flash_s_corr_cons_index = cutlass.Int32(0)
-    flash_s_corr_cons_phase = cutlass.Int32(0)
-    flash_corr_epi_empty_phase = cutlass.Int32(0){corr_pfor_prearrive}
+    corr_stat_empty_init = (
+        ""
+        if fa4_stat_handoff
+        else """
     cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)
     cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 1)
     cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)
     cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 1)"""
+    )
+    corr_head = f"""    cute.arch.setmaxregister_decrease({cfg.corr_regs})
+{tmem_base_setup.rstrip()}
+{"" if scoped_corr_epi_smem else corr_epi_smem_setup.rstrip()}
+    flash_o_full_phase = cutlass.Int32(0)
+    flash_s_corr_cons_index = cutlass.Int32(0)
+    flash_s_corr_cons_phase = cutlass.Int32(0)
+    flash_corr_epi_empty_phase = cutlass.Int32(0){corr_pfor_prearrive}{corr_stat_empty_init}"""
     if not epi_smem:
         corr_head += f"""
     flash_gO_corr = cute.flat_divide(_flash_mOt, cute.select((128, {hd}, 128), mode=[0, 1]))
@@ -7988,7 +8052,12 @@ if warp_idx == 15:
 
     def _corr_epi(stage: str, mtile: str) -> str:
         corr_cons_index = "0" if not is_causal else "flash_s_corr_cons_index"
-        scale_expr = f"flash_scale_t[{corr_cons_index}, {stage}, flash_local_tidx]"
+        scale_expr = _scale_slot_expr(corr_cons_index, stage)
+        stat_empty_arrive = (
+            ""
+            if fa4_stat_handoff
+            else f"        cute.arch.mbarrier_arrive(flash_s{stage}_corr_empty_ptr + {corr_cons_index})\n"
+        )
         if not epi_smem:
             # Committed path: per-thread t2r (Ld32x32 Rep16) -> rescale -> cast ->
             # STG.E.128 straight to gmem (coord->linear address division per thread =
@@ -7996,7 +8065,7 @@ if warp_idx == 15:
             return f"""        cute.arch.barrier(
             barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
         flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
-        cute.arch.mbarrier_arrive(flash_s{stage}_corr_empty_ptr + {corr_cons_index})
+{stat_empty_arrive}\
         _helion_flash_rt.mbar_spin_wait(flash_o_full_ptr + {stage}, flash_o_full_phase)
         tOgO_mma{stage} = {corr_gmem_o_index.format(mtile=mtile)}
         gO_epi{stage} = cute.zipped_divide(tOgO_mma{stage}, flash_epi_tiler{stage})
@@ -8014,52 +8083,70 @@ if warp_idx == 15:
         # {stage} of the 2-staged _flash_osl) via the SMEM-STORE atom matched to
         # the t2r tiled copy. A dedicated epilogue warp then drains sO either by
         # TMA-O or by vector STG.
+        if scoped_corr_epi_smem:
+            return f"""        cute.arch.barrier(
+            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+        flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
+{stat_empty_arrive}\
+        _helion_flash_rt.fa4_correction_epilogue_handoff_to_smem_scoped(
+            flash_o_full_ptr + {stage}, flash_o_full_phase,
+            flash_corr_epi_empty_ptr + {stage}, flash_corr_epi_empty_phase,
+            flash_corr_epi_full_ptr + {stage},
+            flash_pvt, tOtO{stage}, sO[None, None, {stage}], flash_local_tidx,
+            flash_inv_sum{stage}, {hd}, {cfg.corr_tile_size}, {io_dtype})
+"""
         return f"""        cute.arch.barrier(
             barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
         flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
-        cute.arch.mbarrier_arrive(flash_s{stage}_corr_empty_ptr + {corr_cons_index})
-        _helion_flash_rt.mbar_spin_wait(flash_o_full_ptr + {stage}, flash_o_full_phase)
-        _helion_flash_rt.mbar_spin_wait(
-            flash_corr_epi_empty_ptr + {stage}, flash_corr_epi_empty_phase)
-        for flash_i in cutlass.range_constexpr(flash_o_corr_chunks):
-            flash_oreg{stage} = cute.make_rmem_tensor(tOcO_corr_t2r[None, 0, 0, flash_i].shape, cutlass.Float32)
-            cute.copy(flash_o_tiled_t2r, tOtO{stage}_corr_t2r[None, 0, 0, flash_i], flash_oreg{stage})
-            flash_oreg{stage}.store(flash_oreg{stage}.load() * flash_inv_sum{stage})
-            _helion_flash_rt.cvt_copy(flash_o_tiled_r2s, flash_oreg{stage}, tOsO{stage}_corr_r2s[None, 0, 0, flash_i])
-        cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(flash_corr_epi_full_ptr + {stage})"""
+{stat_empty_arrive}\
+        _helion_flash_rt.fa4_correction_epilogue_handoff_to_smem(
+            flash_o_full_ptr + {stage}, flash_o_full_phase,
+            flash_corr_epi_empty_ptr + {stage}, flash_corr_epi_empty_phase,
+            flash_corr_epi_full_ptr + {stage},
+            flash_o_tiled_t2r, flash_o_tiled_r2s,
+            tOtO{stage}_corr_t2r, tOsO{stage}_corr_r2s, tOcO_corr_t2r,
+            flash_inv_sum{stage}, flash_o_corr_chunks)
+"""
 
     corr_epi_empty_toggle = (
         "        flash_corr_epi_empty_phase ^= 1" if epi_smem else ""
     )
     corr_cons_index = "0" if not is_causal else "flash_s_corr_cons_index"
     corr_empty0_early = (
-        "            cute.arch.mbarrier_arrive("
-        f"flash_s0_corr_empty_ptr + {corr_cons_index})"
-        if not is_causal
-        else ""
+        ""
+        if fa4_stat_handoff
+        else (
+            "            cute.arch.mbarrier_arrive("
+            f"flash_s0_corr_empty_ptr + {corr_cons_index})"
+            if not is_causal
+            else ""
+        )
     )
     corr_empty1_early = (
-        "            cute.arch.mbarrier_arrive("
-        f"flash_s1_corr_empty_ptr + {corr_cons_index})"
-        if not is_causal
-        else ""
+        ""
+        if fa4_stat_handoff
+        else (
+            "            cute.arch.mbarrier_arrive("
+            f"flash_s1_corr_empty_ptr + {corr_cons_index})"
+            if not is_causal
+            else ""
+        )
     )
     corr_empty0_late = (
         ""
-        if not is_causal
+        if fa4_stat_handoff or not is_causal
         else "            cute.arch.mbarrier_arrive("
         "flash_s0_corr_empty_ptr + flash_s_corr_cons_index)"
     )
     corr_empty1_late = (
         ""
-        if not is_causal
+        if fa4_stat_handoff or not is_causal
         else "            cute.arch.mbarrier_arrive("
         "flash_s1_corr_empty_ptr + flash_s_corr_cons_index)"
     )
     corr_stage0 = f"""            cute.arch.barrier(
                 barrier_id=3 + warp_idx % 4, number_of_threads=64)
-            flash_a0 = flash_scale_t[{corr_cons_index}, 0, flash_local_tidx]
+            flash_a0 = {_scale_slot_expr(corr_cons_index, "0")}
 {corr_empty0_early}
             flash_need_rescale0 = cute.arch.vote_ballot_sync(flash_a0 < 1.0) != 0
             if flash_need_rescale0:
@@ -8070,7 +8157,7 @@ if warp_idx == 15:
 {corr_empty0_late}"""
     corr_stage1 = f"""            cute.arch.barrier(
                 barrier_id=7 + warp_idx % 4, number_of_threads=64)
-            flash_a1 = flash_scale_t[{corr_cons_index}, 1, flash_local_tidx]
+            flash_a1 = {_scale_slot_expr(corr_cons_index, "1")}
 {corr_empty1_early}
             flash_need_rescale1 = cute.arch.vote_ballot_sync(flash_a1 < 1.0) != 0
             if flash_need_rescale1:
@@ -8105,12 +8192,17 @@ if warp_idx == 15:
         if flash_s_corr_cons_index == 0:
             flash_s_corr_cons_phase ^= 1
         flash_o_full_phase ^= 1"""
+    corr_prelude = (
+        "none"
+        if epi_smem and not is_causal and not has_lse and not score_plan.modifiers
+        else "decode"
+    )
     corr_block = _flash_fa4_wrap(
         "if (warp_idx >= 8) & (warp_idx < 12):",
         corr_head,
         corr_inner,
         persistent,
-        prelude="decode",
+        prelude=corr_prelude,
         tail=tmem_dealloc_arrive,
         total_tiles=total_tiles,
         num_m_pairs=num_m_pairs,
@@ -8126,7 +8218,6 @@ if warp_idx == 15:
         setup
         + epi_smem_setup
         + ("" if local_epi_tma_setup else epi_tma_setup)
-        + epi_stg_setup
         + empty_block
         + load_block
         + mma_block
