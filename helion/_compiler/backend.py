@@ -518,6 +518,24 @@ class Backend(abc.ABC):
         """
         return None
 
+    def generated_source_hash(self, compiled_fn: object) -> str | None:
+        """Return the exact generated-source hash attached to ``compiled_fn``.
+
+        Backends may return ``None`` when generated-source identity is not
+        available. The autotuner uses a non-``None`` value only for
+        backend-scoped effective-code deduplication.
+        """
+        return None
+
+    def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
+        """Whether the autotuner may merge source-identical candidates.
+
+        This is disabled by default because source identity is not necessarily
+        sufficient to establish benchmark equivalence for every backend and
+        search domain.
+        """
+        return False
+
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         """Classify an exception that occurred during autotuning.
 

@@ -52,6 +52,8 @@ _AGGREGATED_METRIC_FIELDS = (
     "num_compile_failures",
     "num_worker_failures",
     "num_accuracy_failures",
+    "num_unique_sources",
+    "num_source_deduplications",
     "num_generations",
 )
 

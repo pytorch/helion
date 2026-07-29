@@ -1026,6 +1026,18 @@ class CuteBackend(Backend):
                 source.encode("utf-8")
             ).hexdigest()
 
+    def generated_source_hash(self, compiled_fn: object) -> str | None:
+        fn_globals = getattr(compiled_fn, "__globals__", None)
+        fn_name = getattr(compiled_fn, "__name__", None)
+        if not isinstance(fn_globals, dict) or not isinstance(fn_name, str):
+            return None
+        cute_kernel = fn_globals.get(f"_helion_{fn_name}")
+        source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+        return source_hash if isinstance(source_hash, str) else None
+
+    def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
+        return config_spec.cute_flash_search_enabled
+
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or
         # launch are expected when an invalid config is tried; treat them as

@@ -343,7 +343,9 @@ class BenchmarkResult(NamedTuple):
     config: Config
     fn: Callable[..., object]
     perf: float
-    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
+    status: Literal[
+        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "deduplicated"
+    ]
     compile_time: float | None
 
 
@@ -485,6 +487,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
+        self._effective_source_hashes: set[str] = set()
+        self._effective_source_results: dict[str, BenchmarkResult] = {}
         # budget_exceeded_fn inherits the class-level _never_exceeded default
         # until BaseSearch._prepare installs the search's real hook.
 
@@ -750,6 +754,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_args_path = None
         self._precompile_baseline_path = None
         self._precompile_result_counter = count()
+        self._effective_source_hashes.clear()
+        self._effective_source_results.clear()
         # Drop the baseline tensors (GPU memory) so refcount frees them
         # the moment the provider loses its last external reference.
         self._baseline_output = None
@@ -766,6 +772,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         custom_bench = backend.get_do_bench()
         return backend.name == "cute" and custom_bench is do_bench_generic
+
+    def _effective_source_dedup_enabled(self) -> bool:
+        """Whether this provider may collapse source-identical candidates.
+
+        Rank-specialized distributed code can produce a different source
+        partition on each rank. Keeping every rank's benchmark loop identical
+        is more important than deduplicating those uncommon searches.
+        """
+        return (
+            self.config_spec.backend.should_deduplicate_generated_sources(
+                self.config_spec
+            )
+            and not dist.is_initialized()
+        )
 
     def _subprocess_benchmark_enabled(self) -> bool:
         """Subprocess benchmark path is opt-in and skipped for distributed /
@@ -906,6 +926,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         compiled: dict[int, Callable[..., object]] = {}
         futures: list[PrecompileFuture] | None = None
 
+        # Initialize results before source deduplication so source aliases and
+        # unhandled budget-tail entries can be filled positionally.
+        results: list[BenchmarkResult] = [
+            BenchmarkResult(
+                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
+            )
+            for c in all_configs
+        ]
+
         # Compilation phase
         for i, config in enumerate(all_configs):
             if self._budget_exceeded_synced():
@@ -927,6 +956,52 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"{self.kernel.format_kernel_decorator(config, self.settings)}",
                     exc_info=True,
                 )
+
+        source_hashes: dict[int, str] = {}
+        aliases_by_representative: dict[int, list[int]] = {}
+        deduplicated_indices: set[int] = set()
+        unique_compiled: dict[int, Callable[..., object]] = {}
+        representative_by_hash: dict[str, int] = {}
+        deduplicate_sources = self._effective_source_dedup_enabled()
+        backend = self.config_spec.backend if deduplicate_sources else None
+        seen_sources = self._effective_source_hashes
+        cached_source_results = self._effective_source_results
+
+        for index, fn in compiled.items():
+            source_hash = (
+                backend.generated_source_hash(fn)
+                if deduplicate_sources and backend is not None
+                else None
+            )
+            if source_hash is None:
+                unique_compiled[index] = fn
+                continue
+            source_hashes[index] = source_hash
+            if source_hash not in seen_sources:
+                seen_sources.add(source_hash)
+                self._autotune_metrics.num_unique_sources += 1
+            cached_result = cached_source_results.get(source_hash)
+            if cached_result is not None:
+                results[index] = BenchmarkResult(
+                    config=all_configs[index],
+                    fn=cached_result.fn,
+                    perf=cached_result.perf,
+                    status="deduplicated",
+                    compile_time=None,
+                )
+                deduplicated_indices.add(index)
+                self._autotune_metrics.num_source_deduplications += 1
+                continue
+            representative = representative_by_hash.get(source_hash)
+            if representative is not None:
+                aliases_by_representative.setdefault(representative, []).append(index)
+                deduplicated_indices.add(index)
+                self._autotune_metrics.num_source_deduplications += 1
+                continue
+            representative_by_hash[source_hash] = index
+            unique_compiled[index] = fn
+
+        compiled = unique_compiled
         fns = list(compiled.values())
         valid_indices = list(compiled.keys())
         configs = [all_configs[i] for i in valid_indices]
@@ -955,14 +1030,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         else:
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
-
-        # Initialize results with defaults
-        results: list[BenchmarkResult] = [
-            BenchmarkResult(
-                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
-            )
-            for c in all_configs
-        ]
 
         # Benchmark loop with progress reporting
         iterator = iter_with_progress(
@@ -1001,6 +1068,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config_id=config_id,
                         config=config,
+                        source_hash=source_hashes.get(valid_indices[index]),
                     )
                 )
             if all(
@@ -1036,6 +1104,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     status=status,
                     compile_time=compile_time,
                 )
+            representative_index = valid_indices[index]
+            representative_result = results[representative_index]
+            source_hash = source_hashes.get(representative_index)
+            if (
+                source_hash is not None
+                and representative_result.status == "ok"
+                and math.isfinite(representative_result.perf)
+            ):
+                cached_source_results[source_hash] = representative_result
+            for alias_index in aliases_by_representative.get(representative_index, ()):
+                results[alias_index] = BenchmarkResult(
+                    config=all_configs[alias_index],
+                    fn=representative_result.fn,
+                    perf=representative_result.perf,
+                    status=(
+                        "deduplicated"
+                        if math.isfinite(representative_result.perf)
+                        else representative_result.status
+                    ),
+                    compile_time=None,
+                )
             if config_id is not None:
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
@@ -1045,6 +1134,32 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config_id=config_id,
                         config=config,
+                        source_hash=source_hash,
+                    )
+                )
+
+        for index in deduplicated_indices:
+            result = results[index]
+            config = all_configs[index]
+            source_hash = source_hashes[index]
+            if result.status == "deduplicated":
+                self.log.debug(
+                    lambda config=config, source_hash=source_hash: (
+                        f"Reusing effective generated source {source_hash} "
+                        f"for {config!r}"
+                    )
+                )
+            config_id = self.log.register_config(config)
+            if config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status=result.status,
+                        perf_ms=result.perf if math.isfinite(result.perf) else None,
+                        compile_time=None,
+                        config_id=config_id,
+                        config=config,
+                        source_hash=source_hash,
                     )
                 )
         return results
