@@ -209,11 +209,6 @@ _HEURISTIC_PURPOSES: Mapping[str, str] = {
         "skinny GEMM (one operand dim >> the other): tile the long dims and "
         "use a deep K tile"
     ),
-    "triton_split_join_rotate": (
-        "split/join rotate kernel (rope): each program loads a large untiled "
-        "inner slab, so keep every block_size at 1 (larger outer tiles waste "
-        "work and overflow Triton's block-numel cap)"
-    ),
     "triton_reduction_tile": (
         "canonical row reduction (softmax/rms_norm/cross_entropy): one row per "
         "program with a single persistent pass over the reduction axis "

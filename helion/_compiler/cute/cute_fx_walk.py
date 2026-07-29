@@ -118,12 +118,54 @@ def _resolve_for_loop_getitem(
     return inner_outs[idx]
 
 
+def reach_matmul_anchors(
+    value_node: torch.fx.Node,
+    *,
+    target_fx_nodes: set[torch.fx.Node],
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]],
+) -> set[torch.fx.Node]:
+    """Return target matmul nodes transitively reached by ``value_node``."""
+    if not target_fx_nodes:
+        return set()
+
+    from ...language import _tracing_ops
+
+    found: set[torch.fx.Node] = set()
+    visited: set[torch.fx.Node] = set()
+    stack: list[torch.fx.Node] = [value_node]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if cur in target_fx_nodes:
+            found.add(cur)
+            continue
+        # `getitem(_for_loop_node, idx)` is the subgraph hop into the
+        # body's output[idx]. Descend only into the matching inner output.
+        if cur.op == "call_function" and cur.target is operator.getitem:
+            base = cur.args[0] if cur.args else None
+            if (
+                isinstance(base, torch.fx.Node)
+                and base.op == "call_function"
+                and _tracing_ops.is_for_loop_target(base.target)
+            ):
+                inner_out = _resolve_for_loop_getitem(cur, inner_outputs_by_graph_id)
+                if inner_out is not None and inner_out not in visited:
+                    stack.append(inner_out)
+                continue
+        for arg in cur.all_input_nodes:
+            if arg not in visited:
+                stack.append(arg)
+    return found
+
+
 def reach_tcgen05_matmul_anchors(
     state: CodegenState, value_node: torch.fx.Node
 ) -> set[torch.fx.Node]:
-    """Return the set of registered tcgen05 matmul fx_nodes that
-    ``value_node``'s FX graph transitively depends on. Empty set means
-    no tcgen05 matmul is reachable.
+    """Return registered tcgen05 matmuls reached by ``value_node``.
+
+    Empty means no registered tcgen05 matmul is reachable.
 
     The walk descends through every input node (``all_input_nodes``)
     except for the ``getitem(_for_loop, idx)`` subgraph-hop branch,
@@ -140,45 +182,11 @@ def reach_tcgen05_matmul_anchors(
     :func:`walk_carrier_to_tcgen05_matmul` walker because it needs
     to commit to a single carrier path.
     """
-    df = state.device_function
-    target_fx_nodes = df.cute_state.matmul_fx_nodes
-    if not target_fx_nodes:
-        return set()
-
-    inner_outputs_by_graph_id = build_inner_outputs_index(state)
-
-    from ...language import _tracing_ops
-
-    found: set[torch.fx.Node] = set()
-    visited: set[torch.fx.Node] = set()
-    stack: list[torch.fx.Node] = [value_node]
-    while stack:
-        cur = stack.pop()
-        if cur in visited:
-            continue
-        visited.add(cur)
-        if cur in target_fx_nodes:
-            found.add(cur)
-            continue
-        # `getitem(_for_loop_node, idx)` is the subgraph hop into the
-        # body's output[idx]. Descend only into the matching inner
-        # output and skip the generic ``all_input_nodes`` fan-out so we
-        # don't re-enter every body output via the loop-arg tuple.
-        if cur.op == "call_function" and cur.target is operator.getitem:
-            base = cur.args[0] if cur.args else None
-            if (
-                isinstance(base, torch.fx.Node)
-                and base.op == "call_function"
-                and _tracing_ops.is_for_loop_target(base.target)
-            ):
-                inner_out = _resolve_for_loop_getitem(cur, inner_outputs_by_graph_id)
-                if inner_out is not None and inner_out not in visited:
-                    stack.append(inner_out)
-                continue
-        for arg in cur.all_input_nodes:
-            if arg not in visited:
-                stack.append(arg)
-    return found
+    return reach_matmul_anchors(
+        value_node,
+        target_fx_nodes=state.device_function.cute_state.matmul_fx_nodes,
+        inner_outputs_by_graph_id=build_inner_outputs_index(state),
+    )
 
 
 def aux_tensor_load_kind(
@@ -241,11 +249,11 @@ def aux_tensor_load_kind(
       residual has a non-zero trailing stride and falls through to the
       exact matcher.
 
-    The classifier returns ``None`` for everything else: 3-D
-    underlying tensors with a static collapse
-    (``aux3d[tile_m, tile_n, 0]``), broadcast variants whose index
-    is not the exact carrier tile-id symbol (e.g. ``bias[tile_n + 1]``),
-    rank mismatches, kwargs, non-default ``extra_mask`` /
+    A rank-3 exact residual is accepted when its leading index is the carrier's
+    leading passthrough tile. The classifier returns ``None`` for everything
+    else: 3-D tensors with a different/static leading index, broadcast variants
+    whose index is not the exact carrier tile-id symbol (for example,
+    ``bias[tile_n + 1]``), rank mismatches, kwargs, non-default ``extra_mask`` /
     ``eviction_policy`` positions, rank-1 indexed by the carrier's
     leading-axis tile id (``bias[tile_m]`` — see above), or rank-2
     aux whose underlying shape neither equals the carrier global
@@ -302,6 +310,44 @@ def aux_tensor_load_kind(
         return None
     aux_tensor_shape = tuple(aux_tensor_val.shape)
 
+    # Collective MMA treats every axis before the trailing matrix pair as a
+    # block-size-1 passthrough. Normalize that carrier here, where auxiliary
+    # load rank and index provenance are still available. A matching rank-3
+    # residual must use the exact same leading tile index; shared rank-1/2
+    # auxiliaries simply broadcast across the passthrough axis.
+    if carrier_tile_shape is not None and len(carrier_tile_shape) > 2:
+        leading_rank = len(carrier_tile_shape) - 2
+        if leading_rank != 1:
+            return None
+        if carrier_tile_index_nodes is None or len(carrier_tile_index_nodes) != 3:
+            return None
+        aux_has_leading_axis = any(
+            len(value) > 2 for value in (aux_shape, aux_tensor_shape, index_list)
+        )
+        if aux_has_leading_axis:
+            if not (
+                len(aux_shape) == 3
+                and len(aux_tensor_shape) == 3
+                and len(index_list) == 3
+                and index_list[0] is carrier_tile_index_nodes[0]
+                and aux_shape[0] == carrier_tile_shape[0]
+            ):
+                return None
+            if carrier_global_shape is not None and (
+                len(carrier_global_shape) != 3
+                or aux_tensor_shape[0] != carrier_global_shape[0]
+            ):
+                return None
+            aux_shape = aux_shape[1:]
+            aux_tensor_shape = aux_tensor_shape[1:]
+            index_list = index_list[1:]
+        carrier_tile_shape = carrier_tile_shape[1:]
+        carrier_tile_index_nodes = carrier_tile_index_nodes[1:]
+        if carrier_global_shape is not None:
+            if len(carrier_global_shape) != 3:
+                return None
+            carrier_global_shape = carrier_global_shape[1:]
+
     # Defensive default when the caller cannot supply the carrier's
     # tile shape (e.g., chain entry point with unrecoverable meta).
     # Without the carrier shape we cannot disambiguate the broadcast
@@ -320,8 +366,7 @@ def aux_tensor_load_kind(
             return ("exact", None)
         return None
 
-    # The cute backend only produces rank-2 matmul carriers today.
-    # Higher-rank carriers fall through to the loud-failure backstop.
+    # The normalized collective MMA carrier is always the trailing (M, N) tile.
     if len(carrier_tile_shape) != 2:
         return None
 

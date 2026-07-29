@@ -21,7 +21,6 @@ from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
-    from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
@@ -486,6 +485,101 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         return Config(**seed)
 
 
+class CuteFlashAttentionHeuristic(AutotunerHeuristic):
+    """Seed ``block_sizes=[1, 128, 128]`` for detected fp16 flash-attention.
+
+    When ``HELION_CUTE_FLASH`` is on (the default), a dense online-softmax
+    attention kernel at [tile_b=1, tile_m=128, tile_n=128], fp16, head_dim in
+    {64, 128} lowers to the fused tcgen05 flash path
+    (``cute_flash.codegen_attention_flash``) -- orders of magnitude faster than
+    the scalar fallback. The flash detector fires at EXACTLY 128x128 tiles, so
+    unless that config is in the autotuner population the fast path is never
+    measured. This seed puts it in generation 0; the search still owns every
+    other knob and benchmarks the seed against the rest, dropping it if the
+    accuracy/compile check ever fails.
+    """
+
+    name = "cute_flash_attention"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_flash_search_enabled
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        if not spec.cute_flash_search_enabled:
+            return None
+        from ..cute.cute_flash import flash_attention_seed_config
+
+        assert spec._cute_flash_head_dim is not None
+        return flash_attention_seed_config(
+            spec._cute_flash_head_dim,
+            spec._cute_flash_num_kv,
+            dtype=spec._cute_flash_dtype,
+            is_causal=spec._cute_flash_is_causal,
+            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
+            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
+            small_biased_candidate=spec._cute_flash_small_biased_candidate,
+            block_size_targets=spec._cute_flash_block_size_target_list(),
+        )
+
+
+class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
+    """Seed best-known causal hd64 LPT swizzle points for large-token rows."""
+
+    name = "cute_flash_attention_causal_lpt"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ..cute.cute_flash import flash_attention_seed_config
+
+        spec = env.config_spec
+        if not spec.cute_flash_search_enabled or spec._cute_flash_head_dim is None:
+            return False
+        return (
+            flash_attention_seed_config(
+                spec._cute_flash_head_dim,
+                spec._cute_flash_num_kv,
+                dtype=spec._cute_flash_dtype,
+                is_causal=spec._cute_flash_is_causal,
+                has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
+                small_biased_candidate=spec._cute_flash_small_biased_candidate,
+                block_size_targets=spec._cute_flash_block_size_target_list(),
+                seed_kind="causal_lpt",
+            )
+            is not None
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+
+        from ..cute.cute_flash import flash_attention_seed_config
+
+        spec = env.config_spec
+        assert spec._cute_flash_head_dim is not None
+        return flash_attention_seed_config(
+            spec._cute_flash_head_dim,
+            spec._cute_flash_num_kv,
+            dtype=spec._cute_flash_dtype,
+            is_causal=spec._cute_flash_is_causal,
+            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
+            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
+            small_biased_candidate=spec._cute_flash_small_biased_candidate,
+            block_size_targets=spec._cute_flash_block_size_target_list(),
+            seed_kind="causal_lpt",
+        )
+
+
 class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     name = "cute_tcgen05_cluster_m2"
     backend = "cute"
@@ -498,11 +592,10 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             return False
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in spec.allowed_pid_types:
             return False
-        if len(spec.block_sizes) != 3:
+        fragments = spec._tcgen05_matmul_block_fragments()
+        if fragments is None:
             return False
-
-        bm_fragment = cast("BlockSizeFragment", spec.block_sizes[0]._fragment(spec))
-        bn_fragment = cast("BlockSizeFragment", spec.block_sizes[1]._fragment(spec))
+        bm_fragment, bn_fragment, _ = fragments
         edge_k_tail_family = constraints.allow_edge_k_tail_family
         m_tile_reachable = (
             bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
@@ -569,12 +662,15 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         # rediscover num_warps/num_stages/staging from a partial seed.
         # ``tcgen05_strategy`` (ROLE_LOCAL_MONOLITHIC) is the default, so it is
         # left implicit; the search still owns every one of these knobs.
+        block_sizes = spec._tcgen05_matmul_seed_block_sizes(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=bk,
+        )
+        if block_sizes is None:
+            return None
         seed: dict[str, Any] = {
-            "block_sizes": [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                bk,
-            ],
+            "block_sizes": block_sizes,
             "num_warps": 8,
             "num_stages": 4,
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
@@ -620,9 +716,10 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     def _select_bk(env: CompileEnvironment) -> int | None:
         spec = env.config_spec
         constraints = spec._tcgen05_cluster_m2_search_constraints
-        if constraints is None or len(spec.block_sizes) != 3:
+        fragments = spec._tcgen05_matmul_block_fragments()
+        if constraints is None or fragments is None:
             return None
-        bk_fragment = cast("BlockSizeFragment", spec.block_sizes[2]._fragment(spec))
+        bk_fragment = fragments[2]
         if constraints.allow_edge_k_tail_family:
             if (
                 bk_fragment.low
@@ -645,10 +742,10 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     @staticmethod
     def _small_grid_tile_reachable(spec: ConfigSpec) -> bool:
         """True when the fp8 small-grid 2-CTA tile (bm=128/bn=128) is in range."""
-        if len(spec.block_sizes) != 3:
+        fragments = spec._tcgen05_matmul_block_fragments()
+        if fragments is None:
             return False
-        bm_fragment = cast("BlockSizeFragment", spec.block_sizes[0]._fragment(spec))
-        bn_fragment = cast("BlockSizeFragment", spec.block_sizes[1]._fragment(spec))
+        bm_fragment, bn_fragment, _ = fragments
         return (
             bm_fragment.low
             <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
@@ -661,10 +758,10 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     @staticmethod
     def _full_tile_reachable(spec: ConfigSpec) -> bool:
         """True when the bm=256/bn=256 full-tile cluster_m=2 tile is in range."""
-        if len(spec.block_sizes) != 3:
+        fragments = spec._tcgen05_matmul_block_fragments()
+        if fragments is None:
             return False
-        bm_fragment = cast("BlockSizeFragment", spec.block_sizes[0]._fragment(spec))
-        bn_fragment = cast("BlockSizeFragment", spec.block_sizes[1]._fragment(spec))
+        bm_fragment, bn_fragment, _ = fragments
         return (
             bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
             and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
@@ -721,12 +818,15 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         the search falls back to shallower samples, so seeding the max is safe.
         """
         spec = env.config_spec
+        block_sizes = spec._tcgen05_matmul_seed_block_sizes(
+            bm=TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N,
+            bk=bk,
+        )
+        if block_sizes is None:
+            raise AssertionError("fp8 small-grid seed requested without matmul axes")
         seed: dict[str, Any] = {
-            "block_sizes": [
-                TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M,
-                TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N,
-                bk,
-            ],
+            "block_sizes": block_sizes,
             "num_warps": 8,
             "num_stages": 4,
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,

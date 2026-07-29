@@ -17,20 +17,13 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion.autotuner._metadata.ir_features import _has_networkx_node_link
 from helion.autotuner.base_search import _warn_dataset_without_log
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuneLogSink
 from helion.autotuner.metrics import KernelMetadata
 import helion.language as hl
-
-# Acceptance suite for the opt-in cost-model telemetry. Most tests are device-free
-# and run on every backend lane; the end-to-end autotune -> .meta.jsonl test
-# (TestAutotuneDatasetE2E) is gated to the triton lanes (NVIDIA/AMD/XPU/TileIR),
-# the only backend whose autotune-e2e works. The per-config <base>.csv joins to the
-# per-run <base>.meta.jsonl via the
-# content-addressed config_id; the dataset sidecar is written only when collection
-# is enabled.
 
 _LEAN_CSV_HEADER = [
     "run_id",
@@ -43,8 +36,6 @@ _LEAN_CSV_HEADER = [
     "config",
 ]
 
-# Keys of one on-disk .meta.jsonl record: the KernelMetadata identity plus the
-# run's config_id -> config map.
 _SIDECAR_KEYS = {
     "run_id",
     "kernel_name",
@@ -53,13 +44,16 @@ _SIDECAR_KEYS = {
     "dtypes",
     "hardware",
     "settings",
+    "ir_graph",
     "configs",
 }
+
+# Mirrors the extractor gate: missing networkx should degrade to None, not fail E2E.
+_HAS_NETWORKX = _has_networkx_node_link()
 
 
 @helion.kernel(config=helion.Config(block_sizes=[16]))
 def _add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """A kernel that adds two tensors."""
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = x[tile] + y[tile]
@@ -79,7 +73,6 @@ def _metadata() -> KernelMetadata:
 
 class TestAutotuneLogDetailsSetting(TestCase):
     def test_autotune_log_details_opt_in(self) -> None:
-        """``autotune_log_details`` is off by default and enabled via the env flag."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HELION_AUTOTUNE_LOG_DETAILS", None)
             self.assertFalse(helion.Settings().autotune_log_details)
@@ -87,24 +80,18 @@ class TestAutotuneLogDetailsSetting(TestCase):
             self.assertTrue(helion.Settings().autotune_log_details)
 
     def test_autotune_log_details_without_log_warns(self) -> None:
-        """The opt-in flag with no log path warns once per logger and writes
-        nothing. Tested at ``_warn_dataset_without_log`` -- the unit that owns the
-        behavior (autotune() reaches it via an ``elif`` when ``autotune_log`` is
-        unset) -- so the check stays independent of the autotune flow. The
-        ``@functools.cache`` de-dup is what makes it fire once per logger."""
         _warn_dataset_without_log.cache_clear()
         self.addCleanup(_warn_dataset_without_log.cache_clear)
 
         log = Mock()
         _warn_dataset_without_log(log)
-        _warn_dataset_without_log(log)  # same logger -> cached, no second warning
+        _warn_dataset_without_log(log)
         log.warning.assert_called_once_with(
             "HELION_AUTOTUNE_LOG_DETAILS is set but HELION_AUTOTUNE_LOG is not; no "
             "autotune dataset will be collected. Set HELION_AUTOTUNE_LOG to a base "
             "path to enable collection."
         )
 
-        # A distinct logger is a distinct cache key -> the warning fires again.
         other_log = Mock()
         _warn_dataset_without_log(other_log)
         other_log.warning.assert_called_once()
@@ -112,10 +99,6 @@ class TestAutotuneLogDetailsSetting(TestCase):
 
 class TestCodegenSettings(TestCase):
     def test_codegen_settings_pinned_and_valid(self) -> None:
-        """Guard the run_id codegen set against drift: pin the exact contents (a new
-        codegen-affecting setting must be added here consciously) and confirm every
-        name is a real Settings field (catches typos / renames in settings.py).
-        Note: this cannot detect a new codegen setting that not added to the list."""
         from helion.autotuner.metrics import _CODEGEN_SETTINGS
 
         self.assertEqual(
@@ -133,7 +116,7 @@ class TestCodegenSettings(TestCase):
                 "triton_do_not_specialize",
             ),
         )
-        # Sorted -> stable run_id wire format across edits.
+        # run_id wire format is order-sensitive.
         self.assertEqual(_CODEGEN_SETTINGS, tuple(sorted(_CODEGEN_SETTINGS)))
         settings_keys = helion.Settings().to_dict()
         for name in _CODEGEN_SETTINGS:
@@ -142,13 +125,9 @@ class TestCodegenSettings(TestCase):
 
 class TestRunId(TestCase):
     def test_run_id_changes_with_codegen_settings(self) -> None:
-        """The core guarantee of the codegen signature: flipping ANY codegen
-        setting changes run_id, so two runs whose generated code can differ never
-        collide. Exercised with each setting's real value type."""
         from helion.autotuner.metrics import _CODEGEN_SETTINGS
 
-        # Type-accurate (base, changed) value per codegen setting. A new entry in
-        # _CODEGEN_SETTINGS without a pair here raises KeyError (keeps this in sync).
+        # A new _CODEGEN_SETTINGS entry without a pair here raises KeyError.
         pairs: dict[str, tuple[object, object]] = {
             "allow_warp_specialize": (True, False),
             "backend": ("triton", "cute"),
@@ -182,11 +161,6 @@ class TestRunId(TestCase):
 
 class TestAutotuneLogSink(TestCase):
     def test_dataset_logged_when_enabled(self) -> None:
-        """Device-free schema check (runs on every backend lane): driving the sink
-        with collection enabled writes the lean CSV header and one .meta.jsonl
-        record, and a CSV row joins to its full config via config_id and to its run
-        via run_id. The flag -> autotune -> file path is covered by
-        TestAutotuneDatasetE2E on triton/GPU lanes."""
         config = helion.Config(block_sizes=[32], num_warps=4)
         with tempfile.TemporaryDirectory() as tmp:
             with AutotuneLogSink(
@@ -219,19 +193,15 @@ class TestAutotuneLogSink(TestCase):
         def cell(name: str) -> str:
             return data[0][header.index(name)]
 
-        # The full config is written inline (compat with existing CSV consumers).
         self.assertTrue(cell("config"))
         self.assertIn("32", cell("config"))
 
-        # One sidecar record with exactly the lean keys, including the configs map.
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
-        # The CSV row joins to its config via config_id ...
         stored = sidecar["configs"][cell("config_id")]
         cfg = helion.Config.from_json(json.dumps(stored))
         self.assertEqual(cfg.block_sizes, [32])
-        # ... and to its run via run_id.
         self.assertEqual(cell("run_id"), sidecar["run_id"])
 
 
@@ -239,16 +209,6 @@ class TestAutotuneLogSink(TestCase):
 class TestAutotuneDatasetE2E(TestCase):
     @skipIfRefEager("Autotuning not supported in ref eager mode")
     def test_autotune_writes_dataset_sidecar(self) -> None:
-        """End-to-end: with ``HELION_AUTOTUNE_LOG_DETAILS=1`` a non-restricted
-        autotune writes the ``.meta.jsonl`` sidecar, and a CSV ``config_id``/
-        ``run_id`` resolve in a record. Gated to triton -- the only backend whose
-        autotune-e2e path works here (covering NVIDIA/AMD, the Intel XPU
-        triton lane, and TileIR). cute and pallas (TPU) are excluded and metal is
-        excluded too. The sidecar *schema* is backend-agnostic and is still
-        checked on every lane (metal/pallas/XPU/CPU-interpret included) by the
-        device-free ``TestAutotuneLogSink.test_dataset_logged_when_enabled``."""
-        # block_sizes is backend-agnostic; num_warps is triton-only, so omit it to
-        # keep these configs valid on the cute lane too.
         configs = [
             helion.Config(block_sizes=[32]),
             helion.Config(block_sizes=[64]),
@@ -266,7 +226,7 @@ class TestAutotuneDatasetE2E(TestCase):
             },
         ):
 
-            @helion.kernel()  # unpinned -> a real (non-restricted) search
+            @helion.kernel()
             def add(a, b):
                 out = torch.empty_like(a)
                 for tile in hl.tile(out.size()):
@@ -282,13 +242,11 @@ class TestAutotuneDatasetE2E(TestCase):
             search = FiniteSearch(bound_kernel, args, configs=configs)
             search.autotune()
 
-        # Flag on + non-restricted -> dataset sidecar written alongside the CSV.
         csv_path = base_path.with_suffix(".csv")
         meta_path = base_path.with_suffix(".meta.jsonl")
         self.assertTrue(csv_path.exists())
         self.assertTrue(meta_path.exists())
 
-        # Union the per-run configs maps and run_ids from the sidecar records.
         configs_by_id: dict[str, object] = {}
         run_ids: set[str] = set()
         meta_lines = [
@@ -300,9 +258,16 @@ class TestAutotuneDatasetE2E(TestCase):
             self.assertIn("kernel_source", record)
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
+            if _HAS_NETWORKX:
+                ir = record["ir_graph"]
+                self.assertIsNotNone(ir)
+                self.assertTrue(ir["nodes"])
+                self.assertIn("edges", ir)
+                self.assertTrue(ir["directed"])
+            else:
+                self.assertIsNone(record["ir_graph"])
         self.assertGreater(len(configs_by_id), 0)
 
-        # A CSV row joins to a stored config via config_id and to its run via run_id.
         rows = list(csv.reader(csv_path.read_text().splitlines()))
         header, data = rows[0], rows[1:]
         self.assertGreater(len(data), 0)
@@ -311,6 +276,28 @@ class TestAutotuneDatasetE2E(TestCase):
         self.assertIn(data[0][header.index("run_id")], run_ids)
         decoded_config = helion.Config.from_json(json.dumps(configs_by_id[config_id]))
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
+
+
+class TestIrGraphDegradation(TestCase):
+    def test_ir_graph_none_without_device_ir(self) -> None:
+        meta = KernelMetadata(kernel_name="k", kernel_source="src")
+        record = meta.to_dict()
+        self.assertIn("ir_graph", record)
+        self.assertIsNone(record["ir_graph"])
+
+    def test_run_id_excludes_device_ir(self) -> None:
+        fields = {
+            "kernel_name": "k",
+            "kernel_source": "src",
+            "input_shapes": "[s0]",
+            "dtypes": "torch.float32",
+            "hardware": "H100",
+            "settings": {},
+        }
+        self.assertEqual(
+            KernelMetadata(**fields).run_id,
+            KernelMetadata(**fields, _device_ir=object()).run_id,
+        )
 
 
 if __name__ == "__main__":

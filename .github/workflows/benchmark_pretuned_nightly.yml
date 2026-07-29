@@ -1,0 +1,35 @@
+name: Benchmark Pretuned Nightly
+
+# Cron entry point for the pretuned-kernel benchmark suite. Mirrors
+# Benchmark Nightly: it dispatches Benchmark Pretuned Dispatch via
+# createWorkflowDispatch so the dispatched run's actor is github-actions[bot]
+# (which build_pretuned_dashboard_data.py treats as the nightly trend).
+# Offset from Benchmark Nightly (8 AM UTC) to avoid GPU runner contention.
+
+on:
+  schedule:
+    - cron: '0 10 * * *'  # 2 AM PST (10 AM UTC)
+  workflow_dispatch:
+
+jobs:
+  dispatch-pretuned-benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch benchmark_pretuned_dispatch workflow
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'benchmark_pretuned_dispatch.yml',
+              ref: 'main',
+              inputs: {
+                run_h100: 'true',
+                run_b200: 'true'
+              }
+            })

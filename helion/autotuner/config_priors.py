@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Container
 import random
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -13,17 +14,22 @@ if TYPE_CHECKING:
 # such as ``indexing`` or ``block_sizes``) and returns a biased value, or
 # ``None`` to fall back to the fragment's uniform ``random()``.
 #
-# Returned values must be representable by the fragment (e.g. a member of an
-# ``EnumFragment``'s ``choices``, or within an integer fragment's range);
+# Returned values must be representable by the fragment and, for enum fragments
+# with narrowed ``search_choices``, part of the active search surface.
 # :func:`weighted_choice` enforces this, so a backend can list aspirational
-# values without worrying about which a given kernel actually exposes.
+# values without worrying about which a given kernel actually searches.
 ValuePrior = Callable[["ConfigSpecFragment", int], object]
 
 
 def _fragment_accepts(fragment: ConfigSpecFragment, value: object) -> bool:
     """Best-effort check that ``value`` lies in this fragment's value space."""
-    choices = getattr(fragment, "choices", None)
-    if choices is not None:
+    active_choices = getattr(fragment, "_active_choices", None)
+    choices = (
+        active_choices()
+        if callable(active_choices)
+        else getattr(fragment, "choices", None)
+    )
+    if isinstance(choices, Container):
         return value in choices
     low = getattr(fragment, "low", None)
     high = getattr(fragment, "high", None)

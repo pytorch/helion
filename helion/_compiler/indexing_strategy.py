@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import dataclasses
+import logging
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import NamedTuple
@@ -13,6 +14,7 @@ from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
 
 from .. import exc
+from .._compat import fp8_block_ptr_padding_broken
 from .._compat import get_tensor_descriptor_fn_name
 from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
@@ -38,6 +40,9 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
+log = logging.getLogger(__name__)
+
+
 class TileWithOffsetInfo(NamedTuple):
     block_id: int
     offset: int | torch.SymInt
@@ -50,6 +55,39 @@ class TileWithOffsetInfo(NamedTuple):
             if self.block_size is not None
             else env.block_sizes[env.canonical_block_id(self.block_id)].var
         )
+
+
+def subscript_tile_info(
+    env: CompileEnvironment, subscript: object
+) -> TileWithOffsetInfo | None:
+    """Return a subscript's tile axis and offset from its FX provenance."""
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    metadata = subscript.meta.get("tile_with_offset")
+    if isinstance(metadata, dict):
+        block_id = metadata.get("block_id")
+        offset = metadata.get("offset", 0)
+        block_size = metadata.get("block_size")
+        if isinstance(block_id, int) and isinstance(offset, (int, torch.SymInt)):
+            return TileWithOffsetInfo(block_id, offset, block_size)
+        return None
+    block_id = env.resolve_block_id(subscript.meta.get("val"))
+    if block_id is None:
+        return None
+    return TileWithOffsetInfo(block_id, 0)
+
+
+def exact_tile_block_ids(
+    env: CompileEnvironment, subscripts: Sequence[object]
+) -> tuple[int, ...] | None:
+    """Return ordered tile block IDs when every subscript has zero offset."""
+    block_ids: list[int] = []
+    for subscript in subscripts:
+        info = subscript_tile_info(env, subscript)
+        if info is None or not env.known_equal(info.offset, 0):
+            return None
+        block_ids.append(info.block_id)
+    return tuple(block_ids)
 
 
 def _get_padded_iota_original_length(
@@ -208,6 +246,7 @@ class IndexingStrategy:
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         raise NotImplementedError
 
@@ -635,6 +674,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
@@ -707,11 +747,17 @@ class PointerIndexingStrategy(IndexingStrategy):
             broadcast = backend.broadcast_to_expr("{offset}", shape_str)
             offset_expr = expr_from_string(broadcast, offset=offset_expr)
 
+        extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+        store_placeholders: dict[str, ast.AST] = {
+            "value": value,
+            "offset": offset_expr,
+            "mask": indexing.mask_expr,
+        }
+        if cache_modifier is not None:
+            store_placeholders["cm"] = cache_modifier
         return expr_from_string(
-            f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
-            value=value,
-            offset=offset_expr,
-            mask=indexing.mask_expr,
+            f"tl.store({name} + {{offset}}, {{value}}, {{mask}}{extra})",
+            **store_placeholders,
         )
 
     def codegen_atomic(
@@ -746,7 +792,27 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         eviction_policy: ast.AST | None,
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
+        # Triton's python-only block-pointer rewrite (triton-lang/triton#9668,
+        # in the triton 3.8 series) lowers a block-pointer load with
+        # padding_option='zero' to a masked load whose `other` is the integer
+        # literal 0, which Triton cannot cast to FP8 (triton-lang/triton#10751).
+        # Fall back to pointer indexing, which uses other=0.0 for FP8. Gated on the
+        # affected Triton version so the fallback drops once upstream is fixed.
+        fp8_block_ptr_unsupported = (
+            fake_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and fp8_block_ptr_padding_broken()
+        )
+        if (
+            not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript)
+            or fp8_block_ptr_unsupported
+        ):
+            log.debug(
+                "block_ptr indexing requested but unsupported for this load (%s); "
+                "falling back to pointer indexing",
+                "FP8 block-pointer padding broken on this Triton version"
+                if fp8_block_ptr_unsupported
+                else "unsupported access pattern",
+            )
             return PointerIndexingStrategy().codegen_load(
                 state,
                 fake_tensor,
@@ -790,20 +856,27 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if extra_mask is not None or not BlockedSubscriptIndexing.is_supported(
             state, fake_tensor, subscript
         ):
             return PointerIndexingStrategy().codegen_store(
-                state, fake_tensor, subscript, value, extra_mask
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
+        extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+        placeholders: dict[str, ast.AST] = {
+            "block_ptr": indexing.make_block_ptr(state),
+            "value": store_value,
+        }
+        if cache_modifier is not None:
+            placeholders["cm"] = cache_modifier
         return expr_from_string(
-            f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)})",
-            block_ptr=indexing.make_block_ptr(state),
-            value=store_value,
+            f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)}{extra})",
+            **placeholders,
         )
 
 
@@ -863,7 +936,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if fake_tensor.ndim == 2 and block_size < threshold:
                     return False
 
-            if isinstance(dim_size, int) and block_size > dim_size:
+            # CUDA TMA descriptors require boxDim <= tensorDim in every
+            # dimension (see PR #2555). For a statically-known size we compare
+            # directly; for a symbolic/dynamic dimension (e.g. an unspecialized
+            # matmul M) we compare against the size hint, which is the
+            # dimension's extent while the autotuner benchmarks. Matmul
+            # block-size overshoot can raise a block above a small dynamic dim,
+            # which would otherwise build an invalid descriptor and crash with a
+            # misaligned-address error.
+            dim_extent = (
+                dim_size if isinstance(dim_size, int) else env.size_hint(dim_size)
+            )
+            if block_size > dim_extent:
                 return False
 
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
@@ -999,12 +1083,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if extra_mask is not None or not self.is_supported(
             state, fake_tensor, subscript
         ):
             return PointerIndexingStrategy().codegen_store(
-                state, fake_tensor, subscript, value, extra_mask
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
@@ -1209,6 +1294,7 @@ class StackIndexingStrategy:
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
@@ -1228,12 +1314,18 @@ class StackIndexingStrategy:
         )
 
         dtype = triton_type(tensor_like.dtype)
+        extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+        placeholders: dict[str, ast.AST] = {
+            "base": dev_ptrs_ast,
+            "value": value,
+            "offset": indexing.index_expr,
+            "mask": mask_expr,
+        }
+        if cache_modifier is not None:
+            placeholders["cm"] = cache_modifier
         return expr_from_string(
-            f"tl.store({{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{value}}, {{mask}})",
-            base=dev_ptrs_ast,
-            value=value,
-            offset=indexing.index_expr,
-            mask=mask_expr,
+            f"tl.store({{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{value}}, {{mask}}{extra})",
+            **placeholders,
         )
 
 
@@ -1507,7 +1599,9 @@ class SubscriptIndexing(NamedTuple):
             if k is None:
                 output_idx += 1
             elif isinstance(k, int):
-                index_values.append(repr(k))
+                if k < 0:
+                    k += fake_value.size(len(index_values))
+                index_values.append(state.device_function.literal_expr(k))
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, n)
             ) is not None:
@@ -1915,7 +2009,9 @@ class BlockedSubscriptIndexing:
             if k is None:
                 pass  # handled by reshaped_size
             elif isinstance(k, int):
-                res.offsets.append(repr(k))
+                if k < 0:
+                    k += fake_value.size(len(res.offsets))
+                res.offsets.append(state.device_function.literal_expr(k))
                 res.block_shape.append(1)
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, n)

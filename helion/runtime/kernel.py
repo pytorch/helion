@@ -54,6 +54,8 @@ from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
+from .._dist_utils import kernel_declares_process_group
+from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
@@ -186,12 +188,20 @@ class Kernel(Generic[_R]):
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
+        # Whether the kernel declares distributed intent via an hl.ProcessGroupName
+        # argument. Computed once so the per-call is_distributed check stays cheap
+        # on the dispatch hot path (avoids re-running inspect.signature). See #3024.
+        self._declares_process_group: bool = kernel_declares_process_group(fn)
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
             Config(**config) if isinstance(config, dict) else config
             for config in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
+        # Fast dispatch cache: maps a cheap, fine-grained argument key (exact
+        # dtype/shape/stride/device per tensor) directly to a BoundKernel,
+        # skipping the full specialization-key machinery on repeat calls.
+        self._dispatch_cache: dict[Hashable, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
@@ -273,6 +283,68 @@ class Kernel(Generic[_R]):
         extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
         return BoundKernelInMemoryCacheKey(signature, extra_results)
 
+    def _compute_is_distributed(self, args: Sequence[object]) -> bool:
+        """Whether this call should compile as a distributed kernel.
+
+        True when the arguments carry symmetric-memory tensors, or the author
+        declared distributed intent (``settings.distributed`` or an
+        ``hl.ProcessGroupName`` argument) inside an initialized process group.
+        This is folded into the specialization key so a symmetric-memory call
+        and an identically-shaped ordinary call never share a compiled kernel.
+        See GitHub issue #3024.
+        """
+        return kernel_uses_symm_mem(tuple(args)) or (
+            dist.is_initialized()
+            and (self.settings.distributed or self._declares_process_group)
+        )
+
+    def _fast_dispatch_key(self, args: tuple[object, ...]) -> Hashable | None:
+        """
+        Build a cheap dispatch key for the fast-path cache in ``__call__``.
+
+        The key records exact per-argument metadata (dtype/shape/stride/device
+        for tensors, type and value for scalars), which is strictly finer than
+        the full specialization key: any two argument lists that produce
+        different full keys also produce different fast keys.  That makes it
+        safe to map a fast key directly to the BoundKernel that a full
+        ``bind()`` resolved for the same arguments.
+
+        Returns None when an argument type is not handled (tensor subclasses,
+        containers, ...), or when there is no tensor argument to pin down the
+        device; callers must then take the regular ``bind()`` path.
+        """
+        key: list[Hashable] = []
+        has_tensor = False
+        for a in args:
+            t = type(a)
+            if t is torch.Tensor or t is torch.nn.Parameter:
+                tensor = cast("torch.Tensor", a)
+                has_tensor = True
+                si = getattr(tensor, "_dynamo_static_indices", None)
+                key.append(
+                    (
+                        tensor.dtype,
+                        tensor.shape,
+                        tensor.stride(),
+                        tensor.device,
+                        None if si is None else frozenset(si),
+                    )
+                )
+            elif t is int or t is float or t is bool or t is str:
+                key.append((t, a))
+            elif a is None:
+                key.append(None)
+            elif t is torch.dtype or t is torch.device:
+                key.append(a)
+            else:
+                return None
+        if not has_tensor:
+            return None
+        key.append(self._compute_is_distributed(args))
+        if self._key_fn is not None:
+            key.append(self._key_fn(*args))
+        return tuple(key)
+
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
@@ -327,9 +399,16 @@ class Kernel(Generic[_R]):
             else:
                 result.append(self._specialization_key(value))
         device_type, device_capability = _device_specialization_key(args)
+        is_distributed = self._compute_is_distributed(args)
         if self._key_fn is not None:
-            return (*result, device_type, device_capability, self._key_fn(*args))
-        return (*result, device_type, device_capability)
+            return (
+                *result,
+                device_type,
+                device_capability,
+                is_distributed,
+                self._key_fn(*args),
+            )
+        return (*result, device_type, device_capability, is_distributed)
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -440,6 +519,17 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
+        elif self._dispatch_cache:
+            # Fast path: repeat call with argument metadata seen before. The
+            # cache is only populated by calls that already took the slow
+            # path below, so hitting it cannot skip autotuning/compilation.
+            # (The cache stays empty under TPU compile capture, so this
+            # cannot bypass auto_capture_call below.)
+            fast_key = self._fast_dispatch_key(args)
+            if fast_key is not None:
+                bound = self._dispatch_cache.get(fast_key)
+                if bound is not None and bound._run is not None:
+                    return bound._run(*args)
         if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
             # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
             # not ready when kernel.py first loads during ``import helion``.
@@ -449,7 +539,14 @@ class Kernel(Generic[_R]):
             result = auto_capture_call(self, args)
             if result is not RUN_NORMAL:
                 return cast("_R", result)
-        return self.bind(args)(*args)
+            return self.bind(args)(*args)
+        bound = self.bind(args)
+        result = bound(*args)
+        if bound._run is not None:
+            fast_key = self._fast_dispatch_key(args)
+            if fast_key is not None:
+                self._dispatch_cache[fast_key] = bound
+        return result
 
     def reset(self) -> None:
         """
@@ -457,6 +554,7 @@ class Kernel(Generic[_R]):
         recompile and re-autotune.
         """
         self._bound_kernels.clear()
+        self._dispatch_cache.clear()
 
     @property
     def jax_fn(self) -> Callable[..., Any]:
@@ -499,6 +597,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         super().__init__()
         self.kernel = kernel
+        # Base specialization key from the REAL args (the same key bind() uses to
+        # distinguish BoundKernels).  Reused in compile_config as the PyCodeCache
+        # ``extra`` discriminator for backends that cache shape-specific module state
+        # (Backend.requires_shape_specialized_module).  Must be computed on the real
+        # args: fake_args turn scalar int/float/bool into SymInt/SymFloat/SymBool,
+        # which the specialization extractors reject.
+        self._base_spec_key = kernel._base_specialization_key(args)
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
@@ -506,10 +611,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._backward_compiled: (
             tuple[Kernel[object], str, BoundKernel[object]] | None
         ) = None
+        # Distributed detection lives on Kernel so the same value feeds both the
+        # specialization cache key and CompileEnvironment gating; that keeps a
+        # symmetric-memory call from ever aliasing a non-distributed compiled
+        # kernel of the same shape. See GitHub issue #3024.
+        is_distributed = self.kernel._compute_is_distributed(args)
         self._env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
+            is_distributed=is_distributed,
         )
 
         if is_ref_mode_enabled(self.kernel.settings):
@@ -518,7 +629,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return
 
         with self.env:
-            self._env.process_group_name = _find_process_group_name(kernel.fn, args)
+            self._env.process_group_name = _find_process_group_name(
+                kernel.fn, args, is_distributed
+            )
 
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
@@ -777,8 +890,29 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
+            # static_shapes=True keys a distinct BoundKernel per input shape (see
+            # _tensor_key), but PyCodeCache keys compiled modules by SOURCE TEXT, so
+            # two shapes that emit byte-identical source (e.g. compact_worklist, whose
+            # token dim enters only via runtime offsets + a data-dependent loop) would
+            # share one module.  For backends whose generated module caches shape-
+            # specific state (Backend.requires_shape_specialized_module -- e.g. Pallas,
+            # whose output-meta descriptor / launcher cache / ds-pad decision /
+            # signature lock are all monomorphic) that shared module returns the first
+            # shape's cached output extent for both.  Fold the specialization key into
+            # the PyCodeCache key (via ``extra``, leaving the source untouched) so each
+            # specialization gets its own module.  Reusing the same key that
+            # distinguishes BoundKernels (``self._base_spec_key``, computed from the
+            # real args in __init__) guarantees distinct BoundKernel => distinct module
+            # and already covers shape/dtype/stride recursively through nested
+            # container args.
+            cache_extra = ""
+            if (
+                self.settings.static_shapes
+                and self.env.backend.requires_shape_specialized_module
+            ):
+                cache_extra = repr(self._base_spec_key)
             with measure("BoundKernel.PyCodeCache.load"):
-                module = PyCodeCache.load(triton_code)
+                module = PyCodeCache.load(triton_code, extra=cache_extra)
             self.env.backend.annotate_compiled_module(
                 module, triton_code, self.kernel.name
             )
@@ -914,6 +1048,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if (
             not self.env.specialized_vars
+            and not self.env.specialized_strides
             and not self.env.tensor_descriptor_layout_guards
         ):
             return []
@@ -932,7 +1067,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     ) -> Hashable:
                         result = _inner(args)
                         # Handle list of tensors: return tuple of sizes for all tensors
-                        if isinstance(result, list):
+                        if isinstance(result, (list, tuple)):
                             return tuple(
                                 cast("torch.Tensor", t).size(_index) for t in result
                             )
@@ -948,7 +1083,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     ) -> Hashable:
                         result = _inner(args)
                         # Handle list of tensors: return tuple of strides for all tensors
-                        if isinstance(result, list):
+                        if isinstance(result, (list, tuple)):
                             return tuple(
                                 cast("torch.Tensor", t).stride(_index) for t in result
                             )
@@ -957,16 +1092,21 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     return stride_extractor
                 raise exc.SpecializeArgType(v)
             if isinstance(v, GetItemSource):
-                if not isinstance(v.index, int) or v.index_is_slice:
+                if not isinstance(v.index, (int, str)) or v.index_is_slice:
                     raise exc.SpecializeArgType(v)
                 inner = make_extractor(v.base)
 
                 def getitem_extractor(
                     args: Sequence[object],
                     _inner: Callable[[Sequence[object]], Hashable] = inner,
-                    _index: int = v.index,
+                    _index: int | str = v.index,
                 ) -> Hashable:
-                    return cast("Sequence[object]", _inner(args))[_index]
+                    result = _inner(args)
+                    if isinstance(result, dict):
+                        return cast("Hashable", result[_index])
+                    if isinstance(_index, str):
+                        return cast("Hashable", getattr(result, _index))
+                    return cast("Sequence[Hashable]", result)[_index]
 
                 return getitem_extractor
             if isinstance(v, LocalSource):
@@ -978,8 +1118,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
         extractors: list[Callable[[Sequence[object]], Hashable]] = []
+        extracted_strides: set[TensorPropertySource] = set()
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
+            extractors.append(make_extractor(source))
+            if (
+                isinstance(source, TensorPropertySource)
+                and source.prop == TensorProperty.STRIDE
+                and source.idx is not None
+            ):
+                extracted_strides.add(source)
+        for source in sorted(self.env.specialized_strides, key=repr):
+            if source in extracted_strides:
+                continue
             extractors.append(make_extractor(source))
         implicit_config = self._fixed_config_for_td_layout_guards()
         for source, guard in sorted(

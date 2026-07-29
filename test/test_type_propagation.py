@@ -120,6 +120,34 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         output = type_propagation_report(use_device_properties, x)
         self.assertExpectedJournal(output)
 
+    def test_symbolic_comparison_preserves_expression(self):
+        """A comparison/`and` on symbolic block sizes must propagate the real
+        relation (e.g. ``block_m < 64``), not a fresh unbacked bool that discards
+        the operands. Preserving the expression keeps the block-size dependency
+        so the condition stays resolvable per-config at codegen."""
+
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            block_m = hl.register_block_size(m)
+            block_n = hl.register_block_size(n)
+            cmp = block_m < 64  # noqa: F841
+            both = block_m < 64 and block_n >= 64  # noqa: F841
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n], block_size=[block_m, block_n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n]
+            return out
+
+        output = type_propagation_report(fn, torch.ones([128, 128], device=DEVICE))
+        # The comparison and the `and` propagate as real relationals over the
+        # block-size symbols, e.g. `SymBoolType(u0 < 64)` and a conjunction that
+        # still mentions `>= 64`. Before the fix they became opaque unbacked
+        # bools like `SymBoolType(Eq(u2, 1))` that dropped the operands.
+        self.assertIn("SymBoolType(", output)
+        self.assertIn("< 64)", output)
+        self.assertIn(">= 64", output)
+        self.assertNotRegex(output, r"SymBoolType\(Eq\(u\d+, 1\)\)")
+
     @skipIfXPU("CUDA-only")
     def test_cuda_device_properties_unsupported_attribute(self):
         @helion.kernel

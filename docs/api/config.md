@@ -107,6 +107,15 @@ Configs are typically discovered automatically through autotuning, but can also 
 
    Controls reordering of program IDs to improve L2 cache locality.
 
+.. autoattribute:: Config.xcd_remap
+
+   AMD CDNA only. Remaps program IDs into contiguous per-XCD regions to improve
+   L2 locality on multi-XCD GPUs (MI300/MI350). Supported for ``pid_type``
+   ``"flat"`` (remap the program id), ``"persistent_blocked"`` (remap the
+   worker's block assignment), and ``"persistent_interleaved"`` (remap each
+   virtual pid); composes with ``l2_groupings``. Best for tiled-reuse kernels
+   (matmul, MoE, attention); not for simple rowwise streaming kernels.
+
 .. autoattribute:: Config.indexing
 
    Memory indexing strategy for load and store operations. Can be specified as:

@@ -339,8 +339,8 @@ def _get_dot_precision() -> DotPrecision:
                 "high": "high",
                 "highest": "highest",
                 "bfloat16": "default",
-                "tensorfloat32": "high",
-                "float32": "highest",
+                "tensorfloat32": "default",
+                "float32": "default",
             },
         )
 
@@ -407,6 +407,9 @@ class _Settings:
             "HELION_AUTOTUNE_FORCE_PERSISTENT",
             False,
         )
+    )
+    distributed: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED", False)
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
@@ -617,7 +620,7 @@ class Settings(_Settings):
             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
-        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, can be 'default', 'high', 'highest' (mapped to JAX precision). Unified mappings exist so that any value can be used on any backend.",
+        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
         "fast_math": (
             "If True, enable fast math approximations (Helion-level and Inductor-level). "
             "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
@@ -633,6 +636,12 @@ class Settings(_Settings):
         "autotune_force_persistent": (
             "If True, restrict pid_type choices to persistent kernels only during config selection. "
             "Set HELION_AUTOTUNE_FORCE_PERSISTENT=1 to force persistent kernel autotuning globally."
+        ),
+        "distributed": (
+            "Force distributed compilation behavior (persistent-only PID types, signal-pad SM "
+            "limits, and process-group resolution). Normally auto-detected from symmetric-memory "
+            "tensor arguments; set this for distributed kernels whose symmetric memory is not passed "
+            "as a detectable tensor. Set HELION_DISTRIBUTED=1 to force globally."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "

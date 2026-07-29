@@ -4,6 +4,7 @@ import collections
 import contextlib
 import dataclasses
 import inspect
+import linecache
 import multiprocessing as mp
 from multiprocessing import connection
 import os
@@ -25,6 +26,7 @@ import uuid
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import synchronize_device
 from .kernel_args import load_trusted_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
@@ -99,6 +101,7 @@ class SerializedCompiledFunction:
     source_code: str
     filename: str | None
     module_name: str | None
+    source_hash: str | None = None
 
 
 @dataclasses.dataclass
@@ -134,11 +137,19 @@ def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
                 source_code = inspect.getsource(module)
     if source_code is None:
         raise RuntimeError("Unable to capture source for compiled kernel")
+    source_hash: str | None = None
+    fn_globals = getattr(fn, "__globals__", None)
+    if isinstance(fn_globals, dict):
+        kernel = fn_globals.get(f"_helion_{fn.__name__}")
+        value = getattr(kernel, "_helion_cute_source_hash", None)
+        if isinstance(value, str):
+            source_hash = value
     return SerializedCompiledFunction(
         function_name=fn.__name__,
         source_code=source_code,
         filename=filename,
         module_name=module_name,
+        source_hash=source_hash,
     )
 
 
@@ -149,16 +160,58 @@ def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
     module.__loader__ = None
     module.__package__ = None
     sys.modules[module_name] = module
-    exec(
-        compile(fn_spec.source_code, module.__file__, "exec"),
-        module.__dict__,
-    )
-    fn = getattr(module, fn_spec.function_name, None)
-    if fn is None:
-        raise RuntimeError(
-            f"Unable to locate compiled kernel '{fn_spec.function_name}' in generated module"
+    try:
+        exec(
+            compile(fn_spec.source_code, module.__file__, "exec"),
+            module.__dict__,
         )
-    return fn
+        fn = getattr(module, fn_spec.function_name, None)
+        if fn is None:
+            raise RuntimeError(
+                f"Unable to locate compiled kernel '{fn_spec.function_name}' "
+                "in generated module"
+            )
+        cute_kernel = module.__dict__.get(f"_helion_{fn_spec.function_name}")
+        if cute_kernel is not None and fn_spec.source_hash is not None:
+            # Backend annotation is runtime metadata and is not present in the
+            # generated source. Carry the parent's exact value because
+            # PyCodeCache treats strip-equivalent source as one file key.
+            with contextlib.suppress(AttributeError, TypeError):
+                cute_kernel._helion_cute_source_hash = fn_spec.source_hash
+        return fn
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+
+
+def _unload_compiled_fn(fn: CompiledConfig) -> None:
+    """Release caches and the temporary module created by ``_load_compiled_fn``."""
+    clear_jit_fast_path_caches(fn)
+    module_name = getattr(fn, "__module__", "")
+    if module_name.startswith("_helion_autotune_subprocess_"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            cute_kernel = module.__dict__.get(f"_helion_{fn.__name__}")
+            if cute_kernel is not None:
+                launchers = getattr(
+                    cute_kernel, "_helion_cute_compiled_launchers", None
+                )
+                if isinstance(launchers, dict):
+                    for launcher in launchers.values():
+                        jit_func = getattr(launcher, "_jit_func", None)
+                        wrapped = getattr(jit_func, "__wrapped__", jit_func)
+                        code = getattr(wrapped, "__code__", None)
+                        filename = getattr(code, "co_filename", "")
+                        if filename.startswith("<helion_cute_launcher:"):
+                            linecache.cache.pop(filename, None)
+                for cache_name in (
+                    "_helion_cute_compiled_launchers",
+                    "_helion_cute_launch_arg_cache",
+                ):
+                    cache = getattr(cute_kernel, cache_name, None)
+                    if isinstance(cache, dict):
+                        cache.clear()
+        sys.modules.pop(module_name, None)
 
 
 def _run_kernel_in_subprocess_spawn(
@@ -173,10 +226,11 @@ def _run_kernel_in_subprocess_spawn(
         fn = _load_compiled_fn(fn_spec)
         args = load_trusted_kernel_args(args_path)
         assert isinstance(args, (tuple, list))
-        synchronize_device(None)
+        synchronize_device()
         with capture_output() as _cap:
-            result = fn(*args)
-        synchronize_device(result)
+            # Keep asynchronous device buffers alive until execution completes.
+            _output = fn(*args)
+        synchronize_device()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1

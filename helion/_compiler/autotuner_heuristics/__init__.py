@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from .common import dedupe_configs
+from .cute import CuteFlashAttentionCausalLptHeuristic
+from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
@@ -15,10 +17,14 @@ from .cute import CuteTileVecWarpReduceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200MatmulHeuristic
+from .triton import TritonMatmulReductionEpilogueHeuristic
+from .triton import TritonNarrowReductionHeuristic
+from .triton import TritonPointwiseSeedHeuristic
 from .triton import TritonSkinnyGemmHeuristic
-from .triton import TritonSplitJoinRotateHeuristic
-from .triton import TritonStandardReductionHeuristic
-from .triton import TritonUserTiledReductionHeuristic
+from .triton import TritonStandardReductionHeuristicSM90
+from .triton import TritonStandardReductionHeuristicSM100
+from .triton import TritonUserTiledReductionHeuristicSM90
+from .triton import TritonUserTiledReductionHeuristicSM100
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -30,6 +36,8 @@ if TYPE_CHECKING:
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
         CuteFp8GemmSkinnyMHeuristic,
+        CuteFlashAttentionHeuristic,
+        CuteFlashAttentionCausalLptHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteReductionTileHeuristic,
@@ -41,9 +49,13 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "triton": (
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
-        TritonSplitJoinRotateHeuristic,
-        TritonStandardReductionHeuristic,
-        TritonUserTiledReductionHeuristic,
+        TritonMatmulReductionEpilogueHeuristic,
+        TritonStandardReductionHeuristicSM90,
+        TritonStandardReductionHeuristicSM100,
+        TritonUserTiledReductionHeuristicSM90,
+        TritonUserTiledReductionHeuristicSM100,
+        TritonNarrowReductionHeuristic,
+        TritonPointwiseSeedHeuristic,
     ),
     "pallas": (
         PallasMatmulNoTilingSeedHeuristic,
@@ -85,7 +97,7 @@ def compiler_seed_configs(
         if config is None:
             continue
         configs.append(config)
-        if heuristic.promote_seed_to_default:
+        if heuristic.should_promote(env):
             env.config_spec.compiler_default_config = config
         env.config_spec.autotuner_heuristics.append(heuristic.name)
     return dedupe_configs(configs)

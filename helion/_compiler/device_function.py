@@ -16,8 +16,8 @@ from typing import cast
 
 import sympy
 import torch
-from torch._dynamo.source import LocalSource
-from torch._inductor.codegen.triton import TritonPrinter
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch.fx.graph import _Namespace
 
 from .. import exc
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
@@ -217,7 +218,7 @@ class ScratchArg:
     """
 
     name: str
-    shape: tuple[int, ...]
+    shape: tuple[int | torch.SymInt, ...]
     dtype: torch.dtype | None  # None for semaphores
     scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
 
@@ -323,6 +324,7 @@ class DeviceFunction:
         self.device_load_index = 0
         self.device_load_cache_modifier_index = 0
         self.device_store_index = 0
+        self.device_store_cache_modifier_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.epilogue_subtile_store_indices: dict[str, int] = {}
@@ -347,8 +349,10 @@ class DeviceFunction:
         # the emit_pipeline codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.
         self.carry_tiles: dict[int, CarryBoundaryTile] = {}
-        # row block_id -> carry scratch var name (allocated lazily at the store).
-        self.carry_scratch: dict[int, str] = {}
+        # CarryScratchKey(row block_id, output name) -> carry scratch var name.
+        # One scratch per output buffer (a tile may feed several stores),
+        # allocated at the store.
+        self.carry_scratch: dict[CarryScratchKey, str] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -451,6 +455,49 @@ class DeviceFunction:
         """Resolve a block_id to its concrete size for the current config."""
         env = CompileEnvironment.current()
         return env.block_sizes[block_id].from_config(self.config)
+
+    def evaluate_constexpr_condition(self, test: object) -> bool | None:
+        """Resolve a control-flow test to a concrete bool for the current config.
+
+        Block sizes are symbolic during the (single) frontend pass but become
+        concrete integers per-config at codegen time.  A branch condition that
+        depends only on block sizes (and other constants) is therefore a
+        compile-time constant here, even though it could not be folded earlier.
+        Substituting the config's block sizes lets us decide the branch and emit
+        only the live side, which is what makes shape-divergent branches legal.
+
+        Returns the concrete bool, or ``None`` if the test is not a compile-time
+        constant for this config (e.g. it depends on a runtime value).
+        """
+        if isinstance(test, (bool, int)):
+            return bool(test)
+        if not isinstance(test, torch.SymBool):
+            return None
+        # NB: a boolean expression (And/Or/Relational) is a sympy.Basic but not a
+        # sympy.Expr, so we classify its free symbols directly rather than via
+        # find_block_size_symbols (which only handles sympy.Expr).
+        expr = test._sympy_()
+        if not isinstance(expr, sympy.Basic):
+            return None
+        env = CompileEnvironment.current()
+        hf = HostFunction.current()
+        subs: dict[sympy.Basic, sympy.Basic] = {}
+        for symbol in expr.free_symbols:
+            origin_info = hf.expr_to_origin.get(symbol)
+            if origin_info is None or not isinstance(
+                origin_info.origin, BlockSizeOrigin
+            ):
+                return None
+            value = env.block_sizes[origin_info.origin.block_id].from_config(
+                self.config
+            )
+            if not isinstance(value, int):
+                return None
+            subs[symbol] = sympy.Integer(value)
+        resolved = expr.xreplace(subs)
+        if resolved.free_symbols:
+            return None
+        return bool(resolved)
 
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
@@ -748,10 +795,11 @@ class DeviceFunction:
         v = fake_value.stride(dim)
         env = CompileEnvironment.current()
         # Check if this stride was explicitly specialized
-        source = env.input_sources.get(fake_value)
+        source = env.tensor_input_source(fake_value)
         if (
-            isinstance(source, LocalSource)
-            and (source.local_name, dim) in env.specialized_strides
+            source is not None
+            and TensorPropertySource(source, TensorProperty.STRIDE, dim)
+            in env.specialized_strides
         ):
             return StaticShape(int(v))
         if isinstance(v, int):
@@ -1074,7 +1122,7 @@ class DeviceFunction:
 
     def register_scratch(
         self,
-        shape: tuple[int, ...],
+        shape: tuple[int | torch.SymInt, ...],
         dtype: torch.dtype | None,
         name_hint: str = "scratch",
         scratch_type: str = "vmem",
@@ -1095,10 +1143,12 @@ class DeviceFunction:
         """
         return None
 
-    def register_dma_semaphore(self, name_hint: str = "sem") -> str:
+    def register_dma_semaphore(
+        self, name_hint: str = "sem", shape: tuple[int, ...] = ()
+    ) -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""
         return self.register_scratch(
-            (), None, name_hint=name_hint, scratch_type="dma_semaphore"
+            shape, None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
@@ -1160,98 +1210,3 @@ class DeviceFunction:
             return tls.functions[-1]
         except (AttributeError, IndexError):
             raise NoCurrentFunction from None
-
-
-class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that does the following:
-
-    - Avoids wrapping float literals in tl.full().
-     Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-     via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-     literal, letting downstream type promotion and casts handle dtype.
-
-    - Avoids triton_helpers.div_floor_integer(...) calls when both operands are
-      provably non-negative integers. TritonPrinter by default converts
-      floor(u1/2) to triton_helpers.div_floor_integer(...). We override this to
-      emit u1 // 2 only when the numerator is known to be non-negative and the
-      denominator is a positive integer, so that we keep helper calls for cases
-      that rely on floor semantics with mixed signs.
-    """
-
-    def _print_Float(self, expr: sympy.Expr) -> str:
-        return str(expr)
-
-    def _print_ToFloat(self, expr: sympy.Expr) -> str:
-        assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
-        # pyrefly: ignore [missing-attribute]
-        return f"{self._print(expr.args[0])} + 0.0"
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # Only use // operator when:
-        # 1. RHS is an integer constant
-        # 2. LHS is a constexpr argument (autotune parameter like block size)
-        # This ensures TMA descriptors get compile-time constants while preserving
-        if (
-            isinstance(rhs, sympy.Integer)
-            and getattr(lhs, "name", None) in DeviceFunction.current()._constexpr_args
-        ):
-            # pyrefly: ignore [missing-attribute]
-            lhs_str = self._print(lhs)
-            # pyrefly: ignore [missing-attribute]
-            rhs_str = self._print(rhs)
-            if not (lhs.is_Integer or lhs.is_Symbol):
-                lhs_str = f"({lhs_str})"
-            return f"{lhs_str} // {rhs_str}"
-        return super()._print_FloorDiv(expr)
-
-
-def texpr(expr: sympy.Expr) -> str:
-    return HelionTritonPrinter().doprint(expr)
-
-
-class HelionCutePrinter(HelionTritonPrinter):
-    """CuTe printer that avoids Triton runtime helpers in device expressions."""
-
-    def _print_basic_expr(self, expr: sympy.Basic) -> str:
-        return self.doprint(cast("sympy.Expr", expr))
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
-
-    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
-
-    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        lhs_printed = self._print_basic_expr(lhs)
-        rhs_printed = self._print_basic_expr(rhs)
-        return f"(({lhs_printed} + {rhs_printed} - 1) // {rhs_printed})"
-
-    def _print_PythonMod(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} % {self._print_basic_expr(rhs)})"
-
-
-def cute_texpr(expr: sympy.Expr) -> str:
-    return HelionCutePrinter().doprint(expr)
-
-
-class HelionPallasPrinter(HelionTritonPrinter):
-    """Pallas printer that emits plain Python operators instead of Triton runtime helpers."""
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} // {self._print(rhs)})"
-
-    def _print_PythonMod(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} % {self._print(rhs)})"
-
-
-def pallas_texpr(expr: sympy.Expr) -> str:
-    return HelionPallasPrinter().doprint(expr)

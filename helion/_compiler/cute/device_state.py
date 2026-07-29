@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from ..tile_strategy import DeviceLoopState
+    from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05StoreValue:
     lifecycle_context: Tcgen05LifecycleContext
+    output_block_ids: tuple[int, ...]
     pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
     bm: int = 0
     bn: int = 0
@@ -141,11 +143,15 @@ class CuteTcgen05MatmulPlan:
     def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
         """Aux descriptors staged by the C-input warp.
 
-        Exact-shape MxN aux tensors use the SMEM-ring producer. Broadcast
-        row-vector aux tensors stay on the direct per-thread load path so
-        they do not allocate a full-tile ring for a one-dimensional input.
+        Exact-shape rank-2 MxN aux tensors use the SMEM-ring producer.
+        Broadcast row vectors and leading-passthrough rank-3 residuals stay on
+        the direct per-thread load path; the producer scheduler is 2-D only.
         """
-        return tuple(d for d in self.aux_tensor_descriptors if d.broadcast_axis is None)
+        return tuple(
+            d
+            for d in self.aux_tensor_descriptors
+            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+        )
 
     @property
     def is_clc_persistent(self) -> bool:
@@ -331,6 +337,16 @@ class CuteDeviceFunctionState:
         # masking for that axis (the serial loop already covers exactly [0, C)).
         # Empty except while re-materializing such an operand load.
         self.matmul_operand_index_override: dict[int, str] = {}
+        # Set by the backend's flash-attention detector when the fused
+        # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
+        # tile_n device-loop block ids. The dedicated flash codegen emits the
+        # whole device body and host launch, mirroring
+        # ``.notes/spikes/fa_tcgen05_spike.py``.
+        self.attention_flash_block_ids: list[int] | None = None
+        self.attention_flash_score_plan: AttentionScorePlan | None = None
+        # Launch block thread count for the flash path: 128 (single-warpgroup
+        # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
+        self.attention_flash_threads: int = 128
 
     def register_tcgen05_store_value(
         self, name: str, value: CuteTcgen05StoreValue

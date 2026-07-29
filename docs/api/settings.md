@@ -94,11 +94,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Supported values depend on the backend:
    - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``
-   - Pallas (TPU): ``"default"`` (forces JAX default, typically bfloat16), ``"high"``, ``"highest"`` (float32 emulation).
+   - Pallas (TPU): ``"default"``, ``"high"``, ``"highest"`` and portable Triton aliases are accepted.
 
-   However, unified mappings exist so you can use any value on any backend. They map to the closest equivalent of equal or higher precision:
+   However, unified mappings exist so you can use any value on any backend:
    - On Triton: ``"default"`` maps to ``"tf32"``, ``"high"`` maps to ``"tf32x3"``, and ``"highest"`` maps to ``"ieee"``.
-   - On Pallas: ``"tf32"``, ``"tf32x3"`` and ``"ieee"`` all map to ``"highest"``.
+   - On Pallas/TPU: all values currently emit JAX default precision. JAX ``"high"``/``"highest"`` fp32 dot precision is not used because it is less compatible with PyTorch eager references on the supported TPU stack.
 
 .. autoattribute:: Settings.static_shapes
 
@@ -150,7 +150,8 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_log_details
 
-   Opt-in to the cost-model dataset sidecar. When enabled (``HELION_AUTOTUNE_LOG_DETAILS=1``) and ``autotune_log`` is set, Helion appends one JSON record per run to ``<autotune_log>.meta.jsonl``: the kernel identity (``run_id``, name, source, shapes, dtypes, hardware), the full ``helion.settings`` (JSON-safe via ``json.dumps(default=str)``, so ``torch.dtype``/callables become strings), and a ``configs`` map from ``config_id`` to the config tested.
+   Opt-in to the cost-model dataset sidecar. When enabled (``HELION_AUTOTUNE_LOG_DETAILS=1``) and ``autotune_log`` is set, Helion appends one JSON record per run to ``<autotune_log>.meta.jsonl``: the kernel identity (``run_id``, name, source, shapes, dtypes, hardware), the full ``helion.settings`` (JSON-safe via ``json.dumps(default=str)``, so ``torch.dtype``/callables become strings), an ``ir_graph`` (see below), and a ``configs`` map from ``config_id`` to the config tested.
+   ``ir_graph`` is a config-independent, node-link dump of the kernel's device IR (the per-tile computation lowered to the Triton kernel body), captured once per run. Load it with ``networkx.node_link_graph(record["ir_graph"], edges="edges")`` (requires ``networkx>=3.4``). It is ``null`` when the device IR is unavailable or extraction fails. Block dimensions stay symbolic in the dump; recover concrete tile sizes by joining with each config's ``block_sizes``. Because the device IR is a function of ``run_id``'s inputs, every record sharing a ``run_id`` carries an identical ``ir_graph``.
    Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
    Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
 
@@ -315,7 +316,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). This variable does not apply to the Pallas backend. |
-| ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Sets default matmul precision for Pallas dot products (JAX values: ``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). This variable does not apply to the Triton backend. |
+| ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Accepts JAX matmul precision values for Pallas dot products (``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). On TPU these values emit Pallas default precision. This variable does not apply to the Triton backend. |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |

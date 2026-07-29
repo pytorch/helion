@@ -7,6 +7,7 @@ import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import cast
 import unittest
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
@@ -287,6 +288,49 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(m):
         for tile_n in hl.tile(n):
             out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_inner_loop_newaxis_add(x: torch.Tensor) -> torch.Tensor:
+    """Inner-loop load whose logical result has a leading newaxis."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[None, tile_m, tile_n].squeeze(0) + 1
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_direct_jagged_sum(
+    x: torch.Tensor, row_lengths: torch.Tensor
+) -> torch.Tensor:
+    """Dense backing tensor read directly through an ``hl.jagged_tile``."""
+    b, _max_k, d = x.size()
+    out = torch.empty([b, d], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        lengths = row_lengths[tile_b]
+        acc = hl.zeros([tile_b, d], dtype=x.dtype)
+        for tile_k in hl.jagged_tile(lengths):
+            acc = acc + x[tile_b, tile_k, :].sum(dim=1)
+        out[tile_b, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_direct_jagged_exp_sum(
+    x: torch.Tensor, row_lengths: torch.Tensor
+) -> torch.Tensor:
+    """Exercise a downstream jagged ``_mask_to`` after a nonlinear op."""
+    b, _max_k, d = x.size()
+    out = torch.empty([b, d], dtype=torch.float32, device=x.device)
+    for tile_b in hl.tile(b):
+        lengths = row_lengths[tile_b]
+        acc = hl.zeros([tile_b, d], dtype=torch.float32)
+        for tile_k in hl.jagged_tile(lengths):
+            acc += torch.exp(x[tile_b, tile_k, :].float()).sum(dim=1)
+        out[tile_b, :] = acc
     return out
 
 
@@ -609,14 +653,58 @@ def kernel_tile_begin_plus_offset_is_elementwise(
     return out
 
 
+# Module-level (Helion reads it as a constant, not a closure) so torch.topk's k
+# is static; the pallas backend lowers aten.topk to a tallax-style
+# divide-and-filter (see test_topk_divide_and_filter_lowering).
+_TOPK_TEST_K = 32
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _topk_pallas_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    b, _v = x.shape
+    k = hl.specialize(k)  # static top-k width (num_bins is computed at trace time)
+    out_v = torch.empty([b, k], dtype=x.dtype, device=x.device)
+    out_i = torch.empty([b, k], dtype=torch.int32, device=x.device)
+    for tile_b in hl.tile(b):
+        vals, idx = torch.topk(x[tile_b, :], k, dim=-1, largest=True)
+        out_v[tile_b, :] = vals
+        out_i[tile_b, :] = idx.to(torch.int32)
+    return out_v, out_i
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _constant_pad_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
+    """F.pad -> aten.constant_pad_nd -> jnp.pad on the pallas backend (pad the
+    lane dim, mirroring the spec-decode sampler's in-kernel output padding)."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols + 128], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(rows):
+        out[tile, :] = torch.nn.functional.pad(x[tile, :], (0, 128), value=0.0)
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_rsqrt_uses_native_lax_op(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def rsqrt_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = torch.rsqrt(x[tile])
+            return out
+
+        x = torch.rand(8, 128, device=DEVICE, dtype=torch.float32) + 0.1
+        code, result = code_and_output(rsqrt_kernel, (x,), block_sizes=[8, 128])
+        torch.testing.assert_close(result, torch.rsqrt(x))
+        self.assertIn("lax.rsqrt", code)
+        self.assertNotIn("jnp.sqrt", code)
+
     def test_slice_addressing_classification(self) -> None:
         """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
         -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
-        from helion._compiler.backend import SliceAddressing as SA
-        from helion._compiler.backend import _slice_addressing as classify
+        from helion._compiler.pallas.backend import SliceAddressing as SA
+        from helion._compiler.pallas.backend import _slice_addressing as classify
 
         f32_2d = torch.empty(16, 128, dtype=torch.float32)
         bf16_2d = torch.empty(16, 128, dtype=torch.bfloat16)
@@ -798,6 +886,102 @@ class TestPallas(TestCase):
         expected = torch.nn.functional.silu(a) * b
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
+    def test_topk_divide_and_filter_lowering(self) -> None:
+        """aten.topk lowers to a tallax-style divide-and-filter (Mosaic has no
+        jax.lax.top_k): the generated code calls the helper, the top-1 is exact,
+        values come out descending, and recall vs the exact top-k is high
+        (approximate, like tallax's approx_max_k)."""
+        torch.manual_seed(0)
+        x = torch.randn(64, 4096, device=DEVICE, dtype=torch.float32)
+        code, (vals, idx) = code_and_output(
+            _topk_pallas_kernel, (x, _TOPK_TEST_K), block_sizes=[8]
+        )
+        # (1) the lowering emits the divide-and-filter helper, not jax.lax.top_k
+        self.assertIn("_helion_divide_filter_topk", code)
+        self.assertNotIn("lax.top_k", code)
+        # (2) correctness vs the exact top-k
+        ref_v, ref_i = torch.topk(x, _TOPK_TEST_K, dim=-1, largest=True)
+        idx_c = idx.cpu()
+        vals_c = vals.cpu()
+        # top-1 is exact (required so a greedy argmax is unaffected)
+        self.assertTrue(torch.equal(idx_c[:, 0], ref_i.cpu()[:, 0].to(torch.int32)))
+        # values come out descending
+        self.assertTrue(bool((vals_c[:, :-1] - vals_c[:, 1:] >= -1e-4).all()))
+        # recall vs the true top-k is high (approximate path, like tallax)
+        ref_sets = [set(r.tolist()) for r in ref_i.cpu()]
+        recall = (
+            sum(
+                len(set(idx_c[r].tolist()) & ref_sets[r]) / _TOPK_TEST_K
+                for r in range(x.shape[0])
+            )
+            / x.shape[0]
+        )
+        self.assertGreater(recall, 0.9)
+
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
+    def test_topk_recall_target_default_099(self) -> None:
+        """Regression guard for the divide-and-filter default recall_target=0.99.
+        At k=64, V=32768 the approximate top-k must recall >=99% of the true
+        top-k; with the previous default (0.95) recall is only ~0.98 and this
+        FAILS. High recall matters when the top-k feeds an exact threshold (e.g. a
+        top-p nucleus, or a rejection sampler's target-prob normalization)."""
+        torch.manual_seed(0)
+        x = torch.randn(128, 32768, device=DEVICE, dtype=torch.float32)
+        _, (_vals, idx) = code_and_output(_topk_pallas_kernel, (x, 64), block_sizes=[8])
+        ref_i = torch.topk(x, 64, dim=-1, largest=True)[1].cpu()
+        idx_c = idx.cpu()
+        ref_sets = [set(r.tolist()) for r in ref_i]
+        recall = (
+            sum(
+                len(set(idx_c[r].tolist()) & ref_sets[r]) / 64
+                for r in range(x.shape[0])
+            )
+            / x.shape[0]
+        )
+        self.assertGreaterEqual(recall, 0.99)
+
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
+    def test_topk_bf16_vocab_reduction(self) -> None:
+        """bf16 input: the (rows, vocab) reduction buffer stays bf16 (halves the
+        scoped VMEM) while each num_bins slice upcasts to f32 for the compare, so
+        the top-1 value and a high recall survive."""
+        torch.manual_seed(0)
+        xf = torch.randn(64, 4096, device=DEVICE, dtype=torch.float32)
+        x = xf.to(torch.bfloat16)
+        _, (vals, idx) = code_and_output(
+            _topk_pallas_kernel, (x, _TOPK_TEST_K), block_sizes=[8]
+        )
+        # top-1 value matches the true max (index may differ under bf16 ties)
+        torch.testing.assert_close(
+            vals[:, 0].float().cpu(),
+            xf.max(dim=-1).values.cpu(),
+            rtol=0.03,
+            atol=0.05,
+        )
+        ref_i = torch.topk(xf, _TOPK_TEST_K, dim=-1, largest=True)[1].cpu()
+        idx_c = idx.cpu()
+        ref_sets = [set(r.tolist()) for r in ref_i]
+        recall = (
+            sum(
+                len(set(idx_c[r].tolist()) & ref_sets[r]) / _TOPK_TEST_K
+                for r in range(xf.shape[0])
+            )
+            / xf.shape[0]
+        )
+        self.assertGreater(recall, 0.9)
+
+    def test_constant_pad_nd_lowering(self) -> None:
+        """F.pad lowers to aten.constant_pad_nd -> jnp.pad on the pallas backend."""
+        torch.manual_seed(0)
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            _constant_pad_pallas_kernel, (x,), block_sizes=[8]
+        )
+        self.assertIn("jnp.pad", code)
+        expected = torch.nn.functional.pad(x, (0, 128), value=0.0)
+        torch.testing.assert_close(result, expected)
+
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
 
@@ -859,6 +1043,125 @@ class TestPallas(TestCase):
         self.assertIn("[:64, :]", code)
         self.assertNotIn("[:64, :32]", code)
         torch.testing.assert_close(result, torch.ones_like(x))
+
+    @skipIfPallasInterpret(
+        "data-dependent writeback clamp emits a dynamic-size DMA slice "
+        "(pl.ds with a traced size) that JAX interpret mode cannot discharge"
+    )
+    def test_fori_loop_ragged_sub_block_store(self) -> None:
+        """fori_loop store from a data-dependent ``hl.tile(start, end)`` whose
+        per-sequence extent is smaller than the block, with several sequences
+        packed into one output (the ragged/paged-attention decode shape).
+
+        Regression test for two coupled issues in the fori_loop store path:
+
+        * ``sliced_value_for_store`` clamped the value to ``out.shape[0]`` (the
+          whole token dim) on the block-sized VMEM scratch store, so when total
+          tokens < block the in-body store raised
+          ``Invalid shape for `swap``` (block-sized ref vs sliced value).
+        * the writeback DMA copied a full block from each sequence's
+          data-dependent begin, overrunning into adjacent sequences' rows; the
+          fix clamps the writeback to the per-tile extent.
+
+        The store dim is the *leading* (outer) dim of a 3D tensor, matching the
+        ``[tokens, heads, head_dim]`` layout where clamping is alignment-legal.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_add1(x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+            n_seq = cu_seqlens.size(0) - 1
+            out = torch.empty_like(x)
+            for s in hl.grid(n_seq):
+                start = cu_seqlens[s]
+                end = cu_seqlens[s + 1]
+                for tile in hl.tile(start, end):
+                    out[tile, :, :] = x[tile, :, :] + 1.0
+            return out
+
+        # Sequence lengths 1, 7, 4, 13 -> total 25 < block 32, so every tile is
+        # a sub-block partial that exercises the scratch-store + writeback clamp.
+        cu = torch.tensor([0, 1, 8, 12, 25], dtype=torch.int32, device=DEVICE)
+        total = int(cu[-1].item())
+        x = torch.randn(total, 8, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            ragged_add1,
+            (x, cu),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_last_two_dim_ragged_store_rejected(self) -> None:
+        """A ragged (data-dependent) store whose tiled dim is one of the last two
+        (lane/sublane) dims is rejected with a clear error.
+
+        Mosaic tile alignment forbids a dynamic-size clamp on the last two dims,
+        so such a store would fall back to a full-block writeback from the
+        data-dependent begin and silently overrun adjacent rows. Rather than
+        emit that, codegen raises; the user should move the ragged dimension
+        to a leading position, e.g. ``[tokens, heads, head_dim]``.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        # 2D tensor -> dim 0 is len(shape)-2 (a last-two dim), and the tile bounds
+        # are loaded at runtime (data-dependent), so the store is rejected.
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    @unittest.expectedFailure  # nested-scratch resolution bug; see _find_dma_scratch_loop TODO
+    def test_fori_loop_nested_same_tensor_scratch_miscompiles(self) -> None:
+        """Nested fori_loops that scratch-route the same tensor miscompile.
+
+        ``out`` is DMA-routed by both the outer ``tile_m`` loop (full row) and
+        the inner ``tile_n`` loop (column slice).  The inner RMW's load/store
+        bind to the *first* matching scratch (the outer loop's) via
+        ``_find_dma_scratch_loop``, while its DMA uses the inner loop's scratch,
+        so each inner iteration adds to the whole-row buffer -- producing a wrong
+        result (x + 5 instead of x + 3) with no error.  xpasses once scratch
+        resolution picks the innermost (current) loop instead of first-match.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_same_output(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for _ in hl.grid(1):
+                for tile_m in hl.tile(m):
+                    out[tile_m, :] = x[tile_m, :] + 1.0
+                    for tile_n in hl.tile(n):
+                        out[tile_m, tile_n] = out[tile_m, tile_n] + 2.0
+            return out
+
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        _, out = code_and_output(
+            nested_same_output,
+            (x,),
+            block_sizes=[128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(out, x + 3.0)
 
     def test_add_does_not_donate_inputs(self) -> None:
         """Verify that read-only inputs are not donated by the kernel.
@@ -1301,11 +1604,10 @@ class TestPallas(TestCase):
             torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
         # The launcher stores its grid-keyed cache on the inner device-kernel
-        # object (``_pallas_cache`` / ``_pallas_pipeline_cache`` /
-        # ``_pallas_fori_cache``, depending on which launcher the config
-        # selects), reachable via the compiled function's module globals.  A
-        # populated cache means repeat calls took the fast-path branch.
-        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        # object as ``_pallas_cache``, reachable via the compiled function's
+        # module globals.  A populated cache means repeat calls took the
+        # fast-path branch.
+        cache_attrs = ("_pallas_cache",)
         cached = [
             value
             for value in compiled_fn.__globals__.values()
@@ -1372,12 +1674,10 @@ class TestPallas(TestCase):
         # Confirm the direct-call snapshot was actually built (slot 5 of the
         # launcher cache), so the equality above exercised the direct path and
         # is not a trivial slow-path-vs-slow-path comparison.
-        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
         caches = [
-            getattr(value, a)
+            value._pallas_cache
             for value in compiled_fn.__globals__.values()
-            for a in cache_attrs
-            if getattr(value, a, None) is not None
+            if getattr(value, "_pallas_cache", None) is not None
         ]
         self.assertTrue(
             caches and caches[0][5] is not None,
@@ -1429,7 +1729,7 @@ class TestPallas(TestCase):
             )
 
         # Slot 5 of the launcher cache holds the _DirectCallKernel snapshot.
-        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        cache_attrs = ("_pallas_cache",)
         caches = [
             getattr(value, a)
             for value in compiled_fn.__globals__.values()
@@ -1851,6 +2151,63 @@ class TestPallas(TestCase):
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
+    @skipIfPallasInterpret(
+        "device-sync semantics need a real TPU; CPU-interpret executes synchronously"
+    )
+    def test_device_sync_waits_for_compiled_output(self) -> None:
+        """``torch.accelerator.synchronize()`` must block on a ``torch.compile`` op.
+
+        Regression guard for torch_tpu#2402: when the device-wide sync returns
+        before a compiled graph finishes, the wall-clock benchmark measures a
+        ``torch.compile`` baseline as ~0ms and its deferred work is charged to
+        the next candidate's timing window (the flash_attention dashboard
+        inflation investigated in the benchmarking fix).
+
+        Non-flaky by construction: instead of an absolute time bound, it compares
+        the device-wide sync against a per-output wait on the *same* heavy
+        compiled op. If the sync materializes the op the two are comparable; if
+        it returns early the ratio collapses (~600x gap observed), so the 0.5x
+        threshold has a large margin.
+        """
+        import time
+
+        import torch.nn.functional as F
+
+        from helion.autotuner.benchmarking import synchronize_device
+
+        q, k, v = (
+            torch.randn(8, 32, 8192, 256, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        compiled = torch.compile(F.scaled_dot_product_attention)
+        for _ in range(5):  # warm up / trigger compilation
+            compiled(q, k, v)
+        synchronize_device()
+
+        def best_ms(stop: Callable[[object], None]) -> float:
+            best = math.inf
+            for _ in range(3):
+                synchronize_device()  # drain before timing
+                start = time.perf_counter()
+                out = compiled(q, k, v)
+                stop(out)
+                best = min(best, (time.perf_counter() - start) * 1000)
+            return best
+
+        from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
+            synchronize as tpu_sync,
+        )
+
+        device_sync_ms = best_ms(lambda out: synchronize_device())
+        per_output_ms = best_ms(lambda out: tpu_sync(out, wait=True))
+        self.assertGreater(
+            device_sync_ms,
+            0.5 * per_output_ms,
+            f"torch.accelerator.synchronize() returned before the compiled op "
+            f"finished (device_sync={device_sync_ms:.2f}ms vs "
+            f"per_output_wait={per_output_ms:.2f}ms) — torch_tpu#2402",
+        )
+
     def test_pallas_matmul_dot_general_lowering_fires_on_no_tiling(self) -> None:
         """No-tiling 2-input matmul emits ``lax.dot_general``, not ``pl.pallas_call``.
 
@@ -1929,6 +2286,37 @@ class TestPallas(TestCase):
             f"dot_general output diverged from pallas_call by {max_abs_diff}",
         )
 
+    def test_pallas_matmul_dot_general_lowering_pins_default_precision(self) -> None:
+        """The no-tiling dot-general shortcut must not inherit JAX global precision."""
+        from unittest.mock import patch
+
+        import jax
+        import jax.numpy as jnp
+
+        from helion import runtime as helion_runtime
+
+        spec: dict[str, object] = {
+            "lhs_tensor_arg_index": 0,
+            "rhs_tensor_arg_index": 1,
+            "out_dtype": "jnp.float32",
+            "f32_accumulator": False,
+        }
+        with (
+            patch.object(jax, "jit", lambda fn: fn),
+            patch.object(jax.lax, "dot_general", wraps=jax.lax.dot_general) as dot_spy,
+        ):
+            fn = helion_runtime._build_matmul_dot_general_jit_fn(spec)
+            result = cast(
+                "Any",
+                fn(
+                    jnp.ones((2, 3), dtype=jnp.float32),
+                    jnp.ones((3, 4), dtype=jnp.float32),
+                ),
+            )
+
+        self.assertEqual(result.shape, (2, 4))
+        self.assertEqual(dot_spy.call_args.kwargs["precision"], "default")
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
@@ -1944,16 +2332,18 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    def test_bmm_fori_loop_non_divisible_k(self) -> None:
-        """Test fori_loop bmm where BLOCK_K=256 doesn't evenly divide K=384."""
+    def test_bmm_fori_loop_buffered_non_divisible_k(self) -> None:
+        """Buffered fori_loop BMM handles a partial final K tile."""
         a = torch.randn(4, 128, 384, device=DEVICE, dtype=torch.bfloat16)
         b = torch.randn(4, 384, 128, device=DEVICE, dtype=torch.bfloat16)
-        _code, result = code_and_output(
+        code, result = code_and_output(
             pallas_bmm,
             (a, b),
             block_sizes=[4, 128, 128, 256],
             pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2, 2],
         )
+        self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 2)
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
@@ -2025,6 +2415,207 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
+
+    def _assert_load_buffer_count_noop(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[object, ...],
+        block_sizes: list[int],
+        buffer_counts: list[int],
+    ) -> str:
+        bound = kernel.bind(args)
+        baseline = bound.to_code(
+            helion.Config(block_sizes=block_sizes, pallas_loop_type="fori_loop")
+        )
+        preferred = bound.to_code(
+            helion.Config(
+                block_sizes=block_sizes,
+                pallas_loop_type="fori_loop",
+                pallas_load_buffer_count=buffer_counts,
+            )
+        )
+        self.assertEqual(preferred, baseline)
+        return preferred
+
+    def test_fori_loop_tensor_load_buffering_codegen(self) -> None:
+        """A selected tensor is primed and prefetched on its existing DMA route."""
+        args = (
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+        )
+        depth_one_code = self._assert_load_buffer_count_noop(
+            pallas_inner_loop_add, args, [8, 128], [1, 1]
+        )
+        self.assertNotIn("_prime_fori_loads", depth_one_code)
+        self.assertNotIn("_prefetch_fori_loads", depth_one_code)
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2, 1],
+        )
+
+        self.assertIn("def _prime_fori_loads", code)
+        self.assertIn("def _prefetch_fori_loads", code)
+        self.assertIn("((2, 8, 128), 'jnp.float32', 'vmem')", code)
+        self.assertIn("((2,), None, 'dma_semaphore')", code)
+        self.assertRegex(code, r"\.at\[\(_j(?:_\d+)? \+ 1\) % 2\]")
+        self.assertRegex(code, r"\.at\[_j(?:_\d+)? % 2\]")
+
+        # The prime starts stage zero before entering the loop and deliberately
+        # does not wait. The body starts the next stage before any current-stage
+        # wait, then waits for both the ordinary depth-one load and selected load
+        # before consuming the selected stage.
+        prime_start = code.index("def _prime_fori_loads")
+        fori_call = code.index("jax.lax.fori_loop", prime_start)
+        prime = code[prime_start:fori_call]
+        self.assertIn(".start()", prime)
+        self.assertNotIn(".wait()", prime)
+
+        module = ast.parse(code)
+        body = next(
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("_fori_body_0")
+        )
+        statements = [ast.unparse(statement) for statement in body.body]
+        prefetch = next(
+            i
+            for i, statement in enumerate(body.body)
+            if isinstance(statement, ast.FunctionDef)
+            and statement.name.startswith("_prefetch_fori_loads")
+        )
+        compute = next(
+            i
+            for i, text in enumerate(statements)
+            if "% 2" in text and "_buf" in text and "make_async_copy" not in text
+        )
+        waits = [i for i, text in enumerate(statements) if ".wait()" in text]
+        self.assertLess(prefetch, min(waits))
+        self.assertGreaterEqual(sum(i < compute for i in waits), 2)
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_repeated_loads_share_buffer(self) -> None:
+        """Repeated loads of one input reuse its tensor-keyed DMA route."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def load_twice(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + x[tile_m, tile_n]
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            load_twice,
+            (x,),
+            block_sizes=[8, 128],
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2],
+        )
+        self.assertIn("((2, 8, 128), 'jnp.float32', 'vmem')", code)
+        self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 1)
+        self.assertRegex(code, r"x_buf\.at\[_j(?:_\d+)? % 2\]")
+        self.assertNotRegex(code, r"x_buf_\d+")
+        torch.testing.assert_close(result, x + x)
+
+    def test_pallas_load_with_newaxis(self) -> None:
+        """Newaxis normalization preserves fori and emit_pipeline indexing."""
+        x = torch.randn(64, 256, device=DEVICE, dtype=torch.float32)
+        cases = (("fori_loop", [2]), ("emit_pipeline", None))
+        for loop_type, buffer_counts in cases:
+            with self.subTest(loop_type=loop_type):
+                code, result = code_and_output(
+                    pallas_inner_loop_newaxis_add,
+                    (x,),
+                    block_sizes=[8, 128],
+                    pallas_loop_type=loop_type,
+                    pallas_load_buffer_count=buffer_counts,
+                )
+                marker = (
+                    "((2, 8, 128), 'jnp.float32', 'vmem')"
+                    if buffer_counts
+                    else "pltpu.emit_pipeline"
+                )
+                self.assertIn(marker, code)
+                torch.testing.assert_close(result, x + 1)
+
+    def test_fori_loop_load_buffering_falls_back_for_stored_input(self) -> None:
+        """A requested count of two is ignored for mutable storage."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_inplace_add(x: torch.Tensor, y: torch.Tensor) -> None:
+            m, n = x.size()
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    x[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        self._assert_load_buffer_count_noop(nested_inplace_add, args, [8, 128], [2, 1])
+
+    def test_fori_loop_load_buffering_falls_back_for_atomic_input(self) -> None:
+        """Atomic use of selected storage also keeps the ordinary route."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def load_then_atomic_add(x: torch.Tensor) -> None:
+            m, n = x.size()
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    value = x[tile_m, tile_n]
+                    hl.atomic_add(x, [tile_m, tile_n], value)
+
+        source = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code = self._assert_load_buffer_count_noop(
+            load_then_atomic_add, (source,), [8, 128], [2]
+        )
+        self.assertNotIn("_prime_fori_loads", code)
+        self.assertNotIn("_prefetch_fori_loads", code)
+
+    def test_fori_loop_direct_jagged_tile(self) -> None:
+        """Staged jagged loads handle eager and downstream nonlinear masks."""
+        lengths = torch.tensor([0, 1, 9, 16], dtype=torch.int32, device=DEVICE)
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+        cases = (
+            ("load", pallas_direct_jagged_sum, lambda values: values),
+            ("nonlinear", pallas_direct_jagged_exp_sum, torch.exp),
+        )
+        load_code = ""
+        for name, kernel, transform in cases:
+            with self.subTest(mask=name):
+                expected = torch.stack(
+                    [
+                        (
+                            transform(x[row, : int(lengths[row].item()), :]).sum(dim=0)
+                            if int(lengths[row].item()) > 0
+                            else torch.zeros_like(x[row, 0, :])
+                        )
+                        for row in range(4)
+                    ]
+                )
+                code, result = code_and_output(
+                    kernel,
+                    (x, lengths),
+                    block_sizes=[2, 8],
+                    pallas_loop_type="fori_loop",
+                    pallas_load_buffer_count=[2, 1],
+                )
+                torch.testing.assert_close(result, expected)
+                self.assertIn("def _prime_fori_loads", code)
+                if name == "load":
+                    load_code = code
+
+        self.assertIn("((2, 4, 8, 128), 'jnp.float32', 'vmem')", load_code)
+        self.assertIn("((2,), None, 'dma_semaphore')", load_code)
+        self.assertIn("pltpu.make_async_copy(x.at", load_code)
+        self.assertNotIn("one_hot", load_code)
+        self.assertRegex(load_code, r"mask_\d+\.astype\(jnp\.float32\)\[:, :, None\]")
 
     @xfailIfPallasInterpret(
         "dynamic pl.ds / pl.BoundedSlice BlockSpecs are not supported by JAX's "
@@ -2119,10 +2710,6 @@ class TestPallas(TestCase):
         compiled under ``pallas_loop_type='fori_loop'``."""
         self._check_scalar_lookup_in_pipeline("fori_loop")
 
-    @xfailIfPallasInterpret(
-        "pl.program_id captured into emit_pipeline body is not supported in "
-        "JAX interpret mode (program_id_p.bind asserts during trace)"
-    )
     def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
         """Grid (``tile_m``) → non-grid device loop (``tile_n``) wrapping
         an inner emit_pipeline (``tile_k``) whose body reads
@@ -2174,17 +2761,17 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     def test_two_pass_reduction_fori_loop(self) -> None:
-        """Two inner reduction loops over the same dim compile and run under
-        ``pallas_loop_type='fori_loop'``.
-        """
-        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
-        _code, result = code_and_output(
+        """One tensor count applies to each separately admitted fori route."""
+        x = torch.randn(256, 384, device=DEVICE, dtype=torch.float32)
+        expected = x - x.mean(dim=-1, keepdim=True)
+        code, result = code_and_output(
             pallas_two_pass_reduction,
             (x,),
             block_sizes=[128, 128, 128],
             pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2],
         )
-        expected = x - x.mean(dim=-1, keepdim=True)
+        self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 2)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     @xfailIfPallas("Pipeline + scalar access codegen not yet supported")
@@ -2202,7 +2789,7 @@ class TestPallas(TestCase):
             pallas_loop_type="emit_pipeline",
         )
         self.assertIn("pltpu.emit_pipeline", code)
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, expected)
 
     def test_invalid_pallas_loop_type_raises(self) -> None:
@@ -2241,6 +2828,69 @@ class TestPallas(TestCase):
         # but are instead taking over tensor returned by torch_tpu JaxCallable
         self.assertIn("torch.empty_like(q_view, device='meta')", _code)
         self.assertIn("out = _launcher(", _code)
+
+    def test_attention_reshape_merge_scratch_size(self) -> None:
+        """Reshape-merged tiled dims size loop-carried scratch by block product.
+
+        A ``reshape([-1, d])`` that merges several tiled dims gives a leading
+        size that is a *product* of block-size symbols. The scratch must resolve
+        to that product (here m_block=64), not the symbol's size hint (the full
+        2*2*64=262144 extent) which would over-size the buffer and crash.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def attn_merge(
+            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+        ) -> torch.Tensor:
+            bq, hq, m, n = (
+                q_in.size(0),
+                q_in.size(1),
+                q_in.size(2),
+                k_in.size(2),
+            )
+            d = hl.specialize(q_in.size(3))
+            out = torch.empty_like(q_in)
+            scale = (1.0 / math.sqrt(d)) * 1.44269504
+            for tb, th, tm in hl.tile([bq, hq, m]):
+                qt = q_in[tb, th, tm, :].reshape([-1, d])
+                m_i = hl.full([qt.size(0)], float("-inf"), dtype=torch.float32)
+                l_i = hl.full([qt.size(0)], 1.0, dtype=torch.float32)
+                acc = hl.zeros([qt.size(0), d], dtype=torch.float32)
+                for tn in hl.tile(n):
+                    kt = k_in[tb, th, tn, :].reshape([-1, d])
+                    qk = hl.dot(qt * scale, kt.transpose(0, 1), out_dtype=torch.float32)
+                    m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                    p = torch.exp2(qk - m_ij[:, None])
+                    l_i = l_i * torch.exp2(m_i - m_ij) + torch.sum(p, -1)
+                    acc = acc * torch.exp2(m_i - m_ij)[:, None]
+                    vt = v_in[tb, th, tn, :].reshape([-1, d])
+                    acc = torch.addmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                out[tb, th, tm, :] = (
+                    (acc / l_i[:, None]).to(out.dtype).reshape([1, 1, -1, d])
+                )
+            return out
+
+        query = torch.randn(2, 2, 64, 32, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(2, 2, 64, 32, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(2, 2, 64, 32, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            attn_merge,
+            (query, key, val),
+            block_sizes=[1, 1, 64, 32],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn(
+            "_scratch_shapes=["
+            "((64,), 'jnp.float32', 'vmem'), "
+            "((64,), 'jnp.float32', 'vmem'), "
+            "((64, 32), 'jnp.float32', 'vmem')]",
+            code,
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
     def test_hl_zeros_outer_arithmetic_emit_pipeline(self) -> None:
         """``hl.zeros`` results must support arithmetic at outer (non-inner-loop) scope.
@@ -2308,36 +2958,40 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
     def test_attention_fori_loop_correctness(self) -> None:
-        """Test fori_loop attention with loop-carried state and pre-broadcast."""
+        """Fori attention buffers K/V while loop-invariant Q remains unchanged."""
         query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         key = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         val = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
         args = (query, key, val)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
         code, result = code_and_output(
             pallas_attention,
             args,
             block_sizes=[4, 128, 128],
             pallas_loop_type="fori_loop",
             pallas_pre_broadcast=True,
+            pallas_load_buffer_count=[2, 2, 2],
         )
         self.assertIn("jax.lax.fori_loop", code)
         self.assertIn("pltpu.make_async_copy", code)
-        # m_i and l_i last dim 128 is the pre-broadcast trailing dim;
-        # acc last dim 128 is head_dim; extra entries are DMA buffers/semaphores
+        self.assertIn("def _prime_fori_loads", code)
+        # The first three entries are pre-broadcast loop-carried state. K and V
+        # then receive two VMEM stages and two semaphore slots each.
         self.assertIn(
             "_scratch_shapes=["
             "((4, 128, 128), 'jnp.float32', 'vmem'), "
             "((4, 128, 128), 'jnp.float32', 'vmem'), "
             "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((), None, 'dma_semaphore'), "
-            "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((), None, 'dma_semaphore')]",
+            "((2, 4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2,), None, 'dma_semaphore'), "
+            "((2, 4, 128, 128), 'jnp.float32', 'vmem'), "
+            "((2,), None, 'dma_semaphore')]",
             code,
         )
-        ref = torch.nn.functional.scaled_dot_product_attention(
-            query.float().cpu(), key.float().cpu(), val.float().cpu()
-        ).to(device=DEVICE)
+        self.assertIn("_hbm_arg_indices=[1, 2]", code)
+        self.assertNotIn("q_view_buf", code)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
     def test_attention_emit_pipeline_correctness_head_dim_256(self) -> None:
@@ -2656,12 +3310,16 @@ class TestPallas(TestCase):
         ``NameError: name 'indices_2' is not defined`` at trace time.
         """
         x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
-        _code, result = code_and_output(
+        code, result = code_and_output(
             pallas_chunked_add,
             (x,),
             block_sizes=[128],
             pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2],
         )
+        self.assertIn("def _prime_fori_loads", code)
+        self.assertIn("((2, 256, 128), 'jnp.float32', 'vmem')", code)
+        self.assertIn("((2,), None, 'dma_semaphore')", code)
         torch.testing.assert_close(result, x + 1.0)
 
     def test_mixed_scalar_and_slice_access(self) -> None:
@@ -2693,6 +3351,35 @@ class TestPallas(TestCase):
         self.assertNotIn("_smem_arg_indices", code)
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
+
+    @skipIfPallasInterpret("slicing error in JAX interpret mode")
+    def test_scalar_row_ragged_col_store(self) -> None:
+        """A store with a scalar row index and a ragged-tile column on the
+        same tensor must not misalign the value slice with the tensor's dims.
+
+        ``sliced_value_for_store`` clamp-slices a ``TilePattern`` dim whose
+        last tile is narrower than ``block_size`` (here ``m=20`` -> a
+        remainder tile of 108 against ``block_size=128``). The literal ``0`` row
+        index is a scalar (``ArbitraryIndexPattern``): it consumes a tensor
+        dim but is squeezed out of the *value*'s shape, so it must not get a
+        slice entry of its own -- otherwise the clamp slice is built against
+        the wrong dimension of the (lower-rank) value and Pallas rejects it
+        with "Too many indices".
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_row_ragged_col_store(x: torch.Tensor) -> torch.Tensor:
+            _n, m = x.shape
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(m):
+                out[0, tile_m] = x[0, tile_m] * 2.0
+            return out
+
+        x = torch.randn(1, 20, device=DEVICE)
+        _, result = code_and_output(
+            scalar_row_ragged_col_store, (x,), block_sizes=[128]
+        )
+        torch.testing.assert_close(result, x * 2.0)
 
     @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
@@ -2805,7 +3492,6 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallasTpu("Pallas TPU not correctly handling tile index with offset")
     def test_tensor_access_tile_index_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -3018,7 +3704,7 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_fori_loop_multidim_partial_tile(self) -> None:
-        """Test fori_loop with a 2D inner loop and a partial tail tile."""
+        """A nested partial tile primes the inner axis inside the outer loop."""
         args = (
             torch.randn(4, 70, 130, device=DEVICE, dtype=torch.float32),
             torch.randn(4, 70, 130, device=DEVICE, dtype=torch.float32),
@@ -3028,30 +3714,65 @@ class TestPallas(TestCase):
             args,
             block_sizes=[1, 8, 128],
             pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2, 1],
         )
-        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
         torch.testing.assert_close(result, args[0] + args[1])
+
+        module = ast.parse(code)
+        outer_body = next(
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("_fori_body_0")
+            and any(
+                isinstance(statement, ast.FunctionDef)
+                and statement.name.startswith("_fori_body_1")
+                for statement in node.body
+            )
+        )
+        statements = [ast.unparse(statement) for statement in outer_body.body]
+        inner_body = next(
+            i for i, text in enumerate(statements) if "_fori_body_1" in text
+        )
+        num_iterations = next(
+            i for i, text in enumerate(statements) if text.startswith("_num_iterations")
+        )
+        prime = next(
+            i for i, text in enumerate(statements) if "def _prime_fori_loads" in text
+        )
+        inner_call = next(
+            i
+            for i, text in enumerate(statements)
+            if text.startswith("jax.lax.fori_loop")
+        )
+        self.assertLess(inner_body, num_iterations)
+        self.assertLess(num_iterations, prime)
+        self.assertLess(prime, inner_call)
+        self.assertIn("_j0", statements[prime])
 
     def test_fori_loop_no_dma_unaligned_inner_block(self) -> None:
         """fori_loop with inner block violating DMA alignment (last dim % 128 != 0).
 
-        Exercises the non-DMA fallback: instead of pltpu.make_async_copy,
-        codegen should emit pl.ds() slicing into the outer BlockSpec refs.
+        A requested count of two is a no-op on the existing non-DMA fallback.
         """
         args = (
             torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
             torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+        )
+        baseline = self._assert_load_buffer_count_noop(
+            pallas_inner_loop_add, args, [8, 64], [2, 1]
         )
         code, result = code_and_output(
             pallas_inner_loop_add,
             args,
             block_sizes=[8, 64],
             pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2, 1],
         )
+        self.assertEqual(code, baseline)
         self.assertIn("jax.lax.fori_loop", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
-        # Block size 64 < 128 alignment — hint should NOT be applied
         self.assertNotIn("pl.multiple_of(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
@@ -3087,24 +3808,49 @@ class TestPallas(TestCase):
             pallas_loop_type="fori_loop",
         )
         self.assertNotIn("pltpu.make_async_copy", code)
-        self.assertNotIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(
             result, x.sum(dim=0, keepdim=True), rtol=1e-3, atol=1e-3
         )
 
     def test_pallas_loop_prefixed_row_slab_streams(self) -> None:
-        x = torch.randn(2, 48, 4, 128, device=DEVICE, dtype=torch.float32)
-        offsets = torch.tensor([0, 11, 37], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(3, 48, 4, 128, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 0, 11, 37], device=DEVICE, dtype=torch.int32)
         code, result = code_and_output(
             pallas_owner_prefixed_row_slab_sum,
             (x, offsets),
             block_sizes=[8],
             pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2, 1],
         )
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.make_async_copy(x.at", code)
+        self.assertIn("def _prime_fori_loads", code)
+        self.assertIn("def _prefetch_fori_loads", code)
+        self.assertIn("((2, 1, 8, 4, 128), 'jnp.float32', 'vmem')", code)
+        self.assertIn("((2,), None, 'dma_semaphore')", code)
+        num_iterations = [
+            node.value
+            for node in ast.walk(ast.parse(code))
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id.startswith("_num_iterations")
+        ]
+        self.assertEqual(len(num_iterations), 1)
+        trip_count = ast.unparse(num_iterations[0])
+        self.assertIn("end", trip_count)
+        self.assertIn("start", trip_count)
+        self.assertIn("_BLOCK_SIZE", trip_count)
+        self.assertNotIn("amax", trip_count)
         ref = torch.stack(
-            [x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0) for g in range(2)]
+            [
+                (
+                    x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0)
+                    if int(offsets[g + 1]) > int(offsets[g])
+                    else torch.zeros_like(x[g, 0])
+                )
+                for g in range(3)
+            ]
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
@@ -3114,7 +3860,7 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("pl.BoundedSlice", code)
         self.assertIn("pipeline_mode=pl.Buffered", code)
-        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertIn("_hbm_arg_indices=[1]", code)
         self.assertNotIn("pltpu.make_async_copy", code)
 
         offsets = torch.tensor([3, 29], device=DEVICE, dtype=torch.int32)
@@ -3124,7 +3870,7 @@ class TestPallas(TestCase):
             block_sizes=[8],
             pallas_loop_type="fori_loop",
         )
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.make_async_copy(x.at", code)
         torch.testing.assert_close(
             result,
@@ -3140,7 +3886,7 @@ class TestPallas(TestCase):
         self.assertIn("pl.BlockSpec((1, pl.BoundedSlice", code)
         self.assertIn("lambda _j: (1, pl.ds(start + _j * _BLOCK_SIZE_1", code)
         self.assertIn("pipeline_mode=pl.Buffered", code)
-        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertIn("_hbm_arg_indices=[1]", code)
         self.assertNotIn("pltpu.make_async_copy", code)
 
     def test_tile_id_per_block_accumulator(self) -> None:
@@ -3264,14 +4010,19 @@ class TestPallas(TestCase):
             ("fori_loop", "jax.lax.fori_loop"),
         ):
             with self.subTest(pallas_loop_type=loop_type):
+                buffer_counts = [2] if loop_type == "fori_loop" else None
                 code, result = code_and_output(
                     fn,
                     (x,),
                     block_sizes=[32, 128, 128],
                     pallas_loop_type=loop_type,
+                    pallas_load_buffer_count=buffer_counts,
                 )
                 self.assertIn(loop_marker, code)
-                self.assertNotIn("_pipeline_arg_indices=[0", code)
+                self.assertNotIn("_hbm_arg_indices=[0", code)
+                if buffer_counts:
+                    self.assertNotIn("_prime_fori_loads", code)
+                    self.assertNotIn("_prefetch_fori_loads", code)
                 torch.testing.assert_close(result, expected)
 
     def test_no_pipeline_outer_summary_read(self) -> None:
@@ -3314,11 +4065,11 @@ class TestPallas(TestCase):
         # T (arg index 0) must NOT be pipelined — its outer-scope load
         # would otherwise hit HBM after the BlockSpec is replaced.
         self.assertIn("pltpu.emit_pipeline", code)
-        self.assertNotIn("_pipeline_arg_indices=[0", code)
+        self.assertNotIn("_hbm_arg_indices=[0", code)
         torch.testing.assert_close(result, T * x, rtol=1e-3, atol=1e-3)
 
     def test_fori_loop_per_tensor_dma_mixed(self) -> None:
-        """A fori_loop body can mix DMA-aligned and DMA-unaligned tensors.
+        """Buffering an eligible tensor does not affect an ineligible peer.
 
         Aligned tensors take ``pltpu.make_async_copy`` scratch buffers; the
         unaligned tensor stays in its outer BlockSpec VMEM ref and is read
@@ -3331,10 +4082,13 @@ class TestPallas(TestCase):
             (x, r),
             block_sizes=[8],
             pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2, 2],
         )
         self.assertIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("def _prime_fori_loads", code)
+        self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 1)
+        self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
 
     def test_pipeline_begin_aligned_skips_pad(self) -> None:
@@ -4088,14 +4842,19 @@ class TestPallas(TestCase):
         self.assertNotIn(torch.ops.aten.view.default, _RELAYOUT_TARGETS)
         self.assertNotIn(torch.ops.aten.reshape.default, _RELAYOUT_TARGETS)
 
+    @skipIfPallasInterpret(
+        "JAX interpret mode does not support pl.Element block specs "
+        "(compact_worklist subtest); a failed interpret launch poisons "
+        "later tests, so skip rather than xfail"
+    )
     def test_transpose_dot_defers_pallas_load_mask(self) -> None:
         """A masked load consumed via ``transpose`` -> dot defers its mask to the
         consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
         multiplicative load mask.
 
-        The deferral is an FX-graph pass, so it is independent of the pallas loop
-        type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
-        generic (non-attention) per-token jagged projection whose partial tiles
+        The deferral is an FX-graph pass, so it is independent of worklist
+        flattening -- asserted here for ordinary ``fori_loop`` and flattened
+        ``unroll`` on a generic per-token jagged projection whose partial tiles
         make the mask load-bearing.
         """
 
@@ -4125,13 +4884,14 @@ class TestPallas(TestCase):
             s, e = int(offsets[i]), int(offsets[i + 1])
             ref[s:e] = torch.bmm(x[s:e].transpose(0, 1), w).transpose(0, 1)
 
-        for loop_type in ("fori_loop", "compact_worklist"):
-            with self.subTest(loop_type=loop_type):
+        for loop_type, grouping in (("fori_loop", 0), ("unroll", 1)):
+            with self.subTest(loop_type=loop_type, grouping=grouping):
                 code, out = code_and_output(
                     jagged_proj,
                     (x, w, offsets),
                     block_sizes=[block],
                     pallas_loop_type=loop_type,
+                    pallas_worklist_grouping=grouping,
                 )
                 # x's masked load is raw (no eager ``* mask``), feeds a transpose,
                 # and the mask reappears as a post-transpose ``jnp.where``.
@@ -4140,11 +4900,11 @@ class TestPallas(TestCase):
                 self.assertRegex(producer, r"= x\[")
                 self.assertNotIn("* mask", producer)
                 self.assertIn("jnp.where", code)
-                # compact_worklist matches the eager reference on the partial
-                # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
+                # Worklist flattening matches the eager reference on the partial
+                # tiles. fori_loop miscompiles jagged tiles in pallas interpret
                 # (a pre-existing, unrelated issue), so it is not a sound numeric
                 # oracle here; for it we assert only the codegen above.
-                if loop_type == "compact_worklist":
+                if grouping == 1:
                     torch.testing.assert_close(
                         out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2
                     )
@@ -4183,7 +4943,11 @@ class TestPallas(TestCase):
         )
 
         # Eager mask retained on the direct dot input; nothing to defer past.
-        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+        self.assertRegex(
+            code,
+            r"(y\[[^\n]*\][^\n]*\*\s*mask_\d+\.astype|"
+            r"mask_\d+\.astype[^\n]*\*[^\n]*y\[)",
+        )
         self.assertNotRegex(code, r"jnp\.transpose\(")
 
         s, e = 0, 50
@@ -4442,7 +5206,6 @@ class TestPallas(TestCase):
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_boundary_mask_with_squeezed_leading_dims(self) -> None:
         """Boundary mask generation succeeds when leading dimensions are squeezed."""
 
@@ -4464,9 +5227,7 @@ class TestPallas(TestCase):
             high_rank_kernel, (x,), pallas_loop_type="fori_loop"
         )
 
-        ref = torch.zeros_like(x)
-        ref[:, :, 16:, :] = x[:, :, 16:, :]
-        torch.testing.assert_close(result, ref)
+        torch.testing.assert_close(result[:, :, 16:, :], x[:, :, 16:, :])
 
     def test_pallas_0d_tensor_arg(self) -> None:
         """0D tensor arguments shouldn't cause positional argument shift in block specs."""
@@ -4724,6 +5485,11 @@ class TestPallasIndirectGather(TestCase):
 instantiate_parametrized_tests(TestPallasIndirectGather)
 
 
+# Module-level so Helion lifts it into a host-wrapper torch.tensor([...]) kernel
+# arg (see test_jax_fn_lifted_constant).
+_JAXFN_LIFTED_CONST = 0.5
+
+
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasJaxFn(TestCase):
     """End-to-end tests for the ``Kernel.jax_fn`` pure-JAX export path.
@@ -4780,6 +5546,31 @@ class TestPallasJaxFn(TestCase):
         ref_c = ref_a + ref_b
         ref = float(jnp.sum(ref_c) + jnp.mean(ref_c) * 0.5)
         self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_lifted_constant(self) -> None:
+        """jax_fn handles a Python float constant that Helion lifts into a
+        host-wrapper ``torch.tensor([...])`` kernel arg (regression: the launcher
+        assumed every tensor arg was a ``_JaxExportTensor`` -> AttributeError
+        ``_jax_arr``)."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def thresh_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                v = x[tile]
+                out[tile] = torch.where(v > _JAXFN_LIFTED_CONST, v, 0.0)
+            return out
+
+        f = jax.jit(thresh_kernel.jax_fn)
+        a = (jnp.arange(128 * 128, dtype=jnp.float32) / (128 * 128)).reshape(128, 128)
+        result = jax.block_until_ready(f(a))
+        ref = jnp.where(a > _JAXFN_LIFTED_CONST, a, 0.0)
+        self.assertTrue(bool(jnp.allclose(result, ref, atol=1e-5)))
 
     def test_jax_fn_unroll(self) -> None:
         """jax_fn drives an unroll kernel inside ``jax.jit``."""
@@ -4914,7 +5705,7 @@ class TestPallasPrinter(TestCase):
         from torch.utils._sympy.functions import FloorDiv
         from torch.utils._sympy.functions import PythonMod
 
-        from helion._compiler.device_function import pallas_texpr
+        from helion._compiler.pallas.printer import pallas_texpr
 
         x, y = sympy.symbols("x y")
         self.assertEqual(pallas_texpr(PythonMod(x, y)), "(x % y)")

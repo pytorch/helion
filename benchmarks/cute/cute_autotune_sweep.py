@@ -18,7 +18,7 @@ Usage::
     python benchmarks/cute/cute_autotune_sweep.py \\
         --output cute_sweep.jsonl
 
-    # Run the smaller non-fp32 coverage list with a longer budget:
+    # Run the smaller non-fp32 coverage list with an explicit shorter budget:
     python benchmarks/cute/cute_autotune_sweep.py \\
         --list-name nonfp32 \\
         --output cute_sweep_nonfp32.jsonl \\
@@ -1074,15 +1074,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=900.0,
+        default=4500.0,
         help=(
-            "Per-test wall-clock timeout in seconds (default: 900). The "
-            "matmul-shaped autotune paths can run >10 min per node on "
-            "B200 when many candidates compile cleanly — for an "
-            "exhaustive sweep that disambiguates 'budget-bound' from "
-            "'real hang' on the matmul-shaped paths, pass "
-            "``--timeout 1800``. The active matmul target sweep in "
-            "``cute_plan.md`` uses its own 3600 s target budget."
+            "Per-test wall-clock timeout in seconds (default: 4500). The "
+            "matmul-shaped and attention-shaped autotune paths can run well "
+            "past 15-20 minutes on B200 when many candidates compile cleanly. "
+            "The default leaves headroom around the active 3600 s autotune "
+            "budget so a budget-bound search is not misclassified as a "
+            "subprocess timeout."
         ),
     )
     parser.add_argument(

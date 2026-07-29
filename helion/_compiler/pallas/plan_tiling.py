@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from ... import exc
+
 if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
@@ -214,6 +216,21 @@ def _analyze_subscript_patterns(
     return patterns
 
 
+def _is_supported_slice(idx: slice) -> bool:
+    """Contiguous slices with static (int/SymInt) or open bounds."""
+    if idx.step is not None and idx.step != 1:
+        return False
+    for bound in (idx.start, idx.stop):
+        if bound is None:
+            continue
+        if isinstance(bound, int) and bound >= 0:
+            continue
+        if isinstance(bound, torch.SymInt):
+            continue
+        return False
+    return True
+
+
 def _detect_indexing_pattern(
     idx: object,
     tensor: torch.Tensor,
@@ -261,10 +278,8 @@ def _detect_indexing_pattern(
         return ArbitraryIndexPattern(idx)
 
     if isinstance(idx, slice):
-        if idx != slice(None):
-            raise AssertionError(
-                f"Arbitrary slice expr {slice} not supported in Pallas backend yet"
-            )
+        if not _is_supported_slice(idx):
+            raise exc.BackendUnsupported("pallas", f"slice expr {idx!r}")
         return ArbitrarySlicePattern(idx)
 
     if isinstance(idx, (int, torch.SymInt)):
@@ -314,7 +329,7 @@ def _update_tiling_decision(
 
     elif isinstance(pattern, ArbitrarySlicePattern):
         if pattern.slice != slice(None):
-            # fow now we only support the `[:]` slice pattern
+            # bounded slice: fixed subrange of the dim, must stay untiled
             _disallow_tiling()
 
     elif isinstance(pattern, (ArbitraryIndexPattern, TensorIndexPattern)):

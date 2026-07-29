@@ -2,6 +2,8 @@
 *.a
 *.bak
 benchmarks/tritonbench
+benchmarks/flash-attention
+cutlass
 *.bzl
 .build-wheels
 .cache

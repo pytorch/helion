@@ -13,8 +13,12 @@ _FP8_DTYPES = {
 }
 
 
-def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
-    """Like torch.testing.assert_close but handles fp8 and uses chunked comparison for large tensors."""
+def is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _FP8_DTYPES
+
+
+def assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
+    """Like torch.testing.assert_close, with fp8 and large tensor handling."""
 
     def convert(t: torch.Tensor) -> torch.Tensor:
         return t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t
@@ -33,16 +37,27 @@ def _assert_close(actual: object, expected: object, atol: float, rtol: float) ->
             f"  expected: {expected_spec} ({len(expected_flat)} leaves)"
         )
 
-    for a, e in zip(actual_flat, expected_flat, strict=True):
-        if isinstance(a, torch.Tensor):
-            _chunked_assert_close(a, e, atol=atol, rtol=rtol)
-        elif isinstance(a, str):
-            if not isinstance(e, str):
-                raise AssertionError(f"Type mismatch {a} vs {e}")
-            if a != e:
-                raise AssertionError(f"string mismatch {a} vs {e}")
+    for actual_leaf, expected_leaf in zip(actual_flat, expected_flat, strict=True):
+        if isinstance(actual_leaf, torch.Tensor):
+            if not isinstance(expected_leaf, torch.Tensor):
+                raise AssertionError(
+                    "Output leaf type mismatch during autotuner accuracy check: "
+                    f"actual is Tensor, expected is {type(expected_leaf).__name__}"
+                )
+            _chunked_assert_close(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
+        elif isinstance(actual_leaf, str):
+            if not isinstance(expected_leaf, str):
+                raise AssertionError(f"Type mismatch {actual_leaf} vs {expected_leaf}")
+            if actual_leaf != expected_leaf:
+                raise AssertionError(
+                    f"string mismatch {actual_leaf} vs {expected_leaf}"
+                )
         else:
-            torch.testing.assert_close(a, e, atol=atol, rtol=rtol)
+            torch.testing.assert_close(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
+
+
+def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
+    assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 def _chunked_assert_close(
@@ -50,20 +65,20 @@ def _chunked_assert_close(
     expected: torch.Tensor,
     atol: float,
     rtol: float,
-    chunk_size: int = 2**22,  # ~4M elements per chunk
+    chunk_size: int = 2**22,
 ) -> None:
-    """Memory-efficient assert_close for large tensors.
-
-    Processes the comparison in chunks to avoid allocating multiple
-    full-size temporary tensors.  Uses torch.testing.assert_close on
-    each chunk so error messages retain full detail.
-    """
+    """Memory-efficient assert_close for large tensors."""
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"Tensor shape mismatch during autotuner accuracy check: "
+            f"{tuple(actual.shape)} != {tuple(expected.shape)}"
+        )
     if actual.numel() <= chunk_size:
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
         return
-    a_flat = actual.reshape(-1)
-    e_flat = expected.reshape(-1)
-    for i in range(0, a_flat.numel(), chunk_size):
-        a_chunk = a_flat[i : i + chunk_size]
-        e_chunk = e_flat[i : i + chunk_size]
-        torch.testing.assert_close(a_chunk, e_chunk, atol=atol, rtol=rtol)
+    actual_flat = actual.reshape(-1)
+    expected_flat = expected.reshape(-1)
+    for start in range(0, actual_flat.numel(), chunk_size):
+        actual_chunk = actual_flat[start : start + chunk_size]
+        expected_chunk = expected_flat[start : start + chunk_size]
+        torch.testing.assert_close(actual_chunk, expected_chunk, atol=atol, rtol=rtol)

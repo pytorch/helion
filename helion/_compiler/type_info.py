@@ -39,6 +39,7 @@ from .variable_origin import GetItemOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -64,6 +65,18 @@ class TypeInfo:
 
     @classmethod
     def from_example(cls, value: object, origin: Origin) -> TypeInfo:
+        from ..language.constexpr import ConstExpr
+
+        if isinstance(value, ConstExpr):
+            # hl.constexpr(...) used inside a kernel body marks its argument as a
+            # compile-time constant.  It is transparent to control flow and
+            # arithmetic, so represent it by its wrapped value's type.  Without
+            # this, ConstExpr (a NamedTuple, incl. subclasses like
+            # ProcessGroupName) becomes a ClassType whose truth_value() is
+            # bool(element_types) -- always True, since the wrapper always has its
+            # single 'value' field -- so an `if hl.constexpr(cond):` ignores cond
+            # and always takes the body.
+            return cls.from_example(value.value, origin)
         if isinstance(value, torch.Tensor):
             # TODO(jansel): need to wrap this in a fake tensor
             # TODO(jansel): tensor subclass support
@@ -543,17 +556,57 @@ class TensorAttributeType(TypeInfo):
         attr = self.attr()
         if attr in {"dim", "ndimension"} and not (args or kwargs):
             return TypeInfo.from_example(self.tensor.fake_value.ndim, origin)
-        if attr in {"shape", "size", "stride"} and not kwargs:
+        stride_dim_kwarg = attr == "stride" and not args and set(kwargs) == {"dim"}
+        if (attr in {"shape", "size", "stride"} and not kwargs) or stride_dim_kwarg:
             fn = getattr(self.tensor.fake_value, attr)
             try:
-                return TypeInfo.from_example(
-                    fn(*[x.as_literal() for x in args]),
-                    origin,
-                )
+                literal_args = [x.as_literal() for x in args]
+                literal_kwargs = {
+                    key: value.as_literal() for key, value in kwargs.items()
+                }
+                result = fn(*literal_args, **literal_kwargs)
             except NotImplementedError:
                 raise exc.TypeInferenceError(
                     f"Tensor.{attr}() args must be literals"
                 ) from None
+            if attr == "stride":
+                if literal_args or literal_kwargs:
+                    dim = cast(
+                        "int",
+                        literal_args[0] if literal_args else literal_kwargs["dim"],
+                    )
+                    if dim < 0:
+                        dim += self.tensor.fake_value.ndim
+                    stride_origin = TensorStrideOrigin(self.tensor.origin, dim)
+                    if (
+                        isinstance(result, (int, torch.SymInt))
+                        and not CompileEnvironment.current().settings.static_shapes
+                    ):
+                        result = CompileEnvironment.current().input_symint(
+                            result,
+                            stride_origin.to_source(),
+                        )
+                    return TypeInfo.from_example(
+                        result,
+                        stride_origin,
+                    )
+                return SequenceType(
+                    origin,
+                    tuple(
+                        TypeInfo.from_example(
+                            CompileEnvironment.current().input_symint(
+                                stride,
+                                TensorStrideOrigin(self.tensor.origin, dim).to_source(),
+                            )
+                            if isinstance(stride, (int, torch.SymInt))
+                            and not CompileEnvironment.current().settings.static_shapes
+                            else stride,
+                            TensorStrideOrigin(self.tensor.origin, dim),
+                        )
+                        for dim, stride in enumerate(cast("tuple[int, ...]", result))
+                    ),
+                )
+            return TypeInfo.from_example(result, origin)
         if attr == "item" and not (args or kwargs):
             if origin.is_device():
                 raise exc.NotAllowedOnDevice("Tensor.item()")

@@ -410,6 +410,11 @@ result3 = rms_norm_fwd(torch.randn([2048, 2048], device="cuda"), weight_2048)  #
 Use `hl.specialize()` when a dimension is performance-critical and you want
 it specialized regardless of how the kernel is called.
 
+Tensor strides can be specialized in the same way, for example
+`row_stride = hl.specialize(x.stride(0))`. The stride is inlined in generated
+code and included in the kernel cache key, so inputs with different layouts
+compile separate variants.
+
 ### `torch._dynamo.mark_static()` - External Specialization
 
 Use `torch._dynamo.mark_static()` **before** calling the kernel to specialize
@@ -555,18 +560,18 @@ ship pretuned heuristic files that demonstrate this end-to-end.
 
 ### Quick start: decorate a kernel for AOT
 
-Use {py:func}`helion.experimental.aot_kernel` instead of
+Use {py:func}`helion.aot_kernel` instead of
 {py:func}`helion.kernel`.  The decorator wires the kernel into an
 {py:class}`~helion.autotuner.aot_cache.AOTAutotuneCache`, which is what
 loads the generated heuristic at runtime:
 
 ```python
 import torch
-import helion.experimental
+import helion
 import helion.language as hl
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
@@ -593,7 +598,7 @@ The decorator accepts a few extras:
 
 See [`examples/aot_example.py`](https://github.com/pytorch/helion/blob/main/examples/aot_example.py)
 for runnable demonstrations of each option, and
-[`helion/experimental/aot_kernel.py`](https://github.com/pytorch/helion/blob/main/helion/experimental/aot_kernel.py)
+[`helion/autotuner/aot_kernel.py`](https://github.com/pytorch/helion/blob/main/helion/autotuner/aot_kernel.py)
 for the full decorator reference.
 
 ### Offline workflow: collect → measure → evaluate
@@ -602,7 +607,7 @@ The AOT runner orchestrates a three-phase workflow over a benchmark
 script that exercises the kernel across the shapes you care about:
 
 ```bash
-python -m helion.experimental.aot_runner -- python my_benchmark.py
+python -m helion.autotuner.aot_runner -- python my_benchmark.py
 ```
 
 `my_benchmark.py` is *your* script — it imports the kernel and calls it
@@ -624,7 +629,7 @@ times with different `HELION_AOT_MODE` settings:
    companion list of configs is the output of subset selection from
    the measure phase.
 
-Useful runner flags (run `python -m helion.experimental.aot_runner --help`
+Useful runner flags (run `python -m helion.autotuner.aot_runner --help`
 for the full list):
 
 - `--kernel <name>` — restrict the workflow to specific kernels.
@@ -737,7 +742,7 @@ target.
    actual hardware you are targeting — not the laptop you happen to
    be editing on.
 
-2. **Confirm the kernel uses `@helion.experimental.aot_kernel(...)`**
+2. **Confirm the kernel uses `@helion.aot_kernel(...)`**
    (see *Quick start* above).
 
 3. **Run the AOT workflow.**  Point the runner at any benchmark script
@@ -745,10 +750,10 @@ target.
 
    ```bash
    # Tutorial example: tune layer_norm on the current GPU.
-   python -m helion.experimental.aot_runner -- python pretuned_kernels/layer_norm/layer_norm.py
+   python -m helion.autotuner.aot_runner -- python pretuned_kernels/layer_norm/layer_norm.py
 
    # User-authored kernel: same pattern.
-   python -m helion.experimental.aot_runner -- python my_benchmark.py
+   python -m helion.autotuner.aot_runner -- python my_benchmark.py
    ```
 
    The three phases run back-to-back.  Plan for a long wall-clock —

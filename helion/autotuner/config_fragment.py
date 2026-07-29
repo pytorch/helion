@@ -6,6 +6,7 @@ import math
 import random
 from typing import TYPE_CHECKING
 from typing import Iterable
+from typing import TypeAlias
 from typing import TypeGuard
 from typing import cast
 
@@ -15,6 +16,9 @@ if TYPE_CHECKING:
     from typing import Callable
 
     from . import ConfigSpec
+
+
+FragmentFingerprint: TypeAlias = tuple[str | int, ...]
 
 
 def integer_power_of_two(n: object) -> TypeGuard[int]:
@@ -92,7 +96,7 @@ class ConfigSpecFragment:
         """
         return (1, False)
 
-    def fingerprint(self) -> tuple[int, ...]:
+    def fingerprint(self) -> FragmentFingerprint:
         """Return structural metadata for this fragment used in ConfigSpec fingerprinting."""
         return ()
 
@@ -250,28 +254,62 @@ class IntegerFragment(BaseIntegerFragment):
 @dataclasses.dataclass
 class EnumFragment(ConfigSpecFragment):
     choices: tuple[object, ...]
+    search_choices: tuple[object, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.search_choices is None:
+            return
+        if not self.search_choices:
+            raise ValueError("search_choices must not be empty")
+        invalid = [
+            choice for choice in self.search_choices if choice not in self.choices
+        ]
+        if invalid:
+            raise ValueError(
+                f"search_choices must be a subset of choices, got {invalid!r}"
+            )
+
+    def _active_choices(self) -> tuple[object, ...]:
+        return self.choices if self.search_choices is None else self.search_choices
 
     def default(self) -> object:
         return self.choices[0]
 
     def random(self) -> object:
-        return random.choice(self.choices)
+        return random.choice(self._active_choices())
 
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if current not in self.choices:
             raise ValueError(f"{current!r} not a valid choice")
-        return [choice for choice in self.choices if choice != current]
+        return [choice for choice in self._active_choices() if choice != current]
 
     def differential_mutation(self, a: object, b: object, c: object) -> object:
+        active_choices = self._active_choices()
         if b == c:
+            if a not in active_choices:
+                return self.random()
             return a
-        choices = [b, c]
+        choices = [choice for choice in (b, c) if choice in active_choices]
+        if not choices:
+            return self.random()
         if a in choices:
             choices.remove(a)
+        if not choices:
+            return self.random()
         return random.choice(choices)
 
     def dim(self) -> int:
         return len(self.choices)
+
+    def fingerprint(self) -> FragmentFingerprint:
+        if self.search_choices is None:
+            return ("enum", *(repr(choice) for choice in self.choices))
+        return (
+            "enum",
+            *(repr(choice) for choice in self.choices),
+            "search",
+            *(repr(choice) for choice in self.search_choices),
+        )
 
     def encode(self, value: object) -> list[float]:
         """Encode enum values as their index."""
@@ -422,8 +460,8 @@ class ListOf(ConfigSpecFragment):
             for i in range(self.length)
         ]
 
-    def fingerprint(self) -> tuple[int, ...]:
-        return (self.length,)
+    def fingerprint(self) -> FragmentFingerprint:
+        return (self.length, *self.inner.fingerprint())
 
     def dim(self) -> int:
         return self.length * self.inner.dim()

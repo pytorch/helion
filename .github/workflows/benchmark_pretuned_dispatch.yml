@@ -1,0 +1,84 @@
+name: Benchmark Pretuned Dispatch
+
+# On-demand benchmark of every kernel under pretuned_kernels/ against its
+# checked-in heuristic. Mirrors Benchmark Dispatch but for the pretuned-kernel
+# suite: it fans out to GPU runners via benchmark_pretuned.yml and then triggers
+# the docs deploy, which rebuilds the dashboard's Pretuned tab from the uploaded
+# artifacts. The nightly cron lives in benchmark_pretuned_nightly.yml, which
+# dispatches this workflow with run_h100/run_b200 set.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_h100:
+        description: 'Run pretuned benchmarks on H100'
+        required: false
+        type: boolean
+        default: true
+      run_b200:
+        description: 'Run pretuned benchmarks on B200'
+        required: false
+        type: boolean
+        default: true
+      kernels:
+        description: 'Comma-separated list of kernels to run (empty = all)'
+        required: false
+        type: string
+        default: ""
+      env_vars:
+        description: 'Environment variables for the benchmark runner'
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  run-h100:
+    if: ${{ github.event.inputs.run_h100 == 'true' }}
+    uses: ./.github/workflows/benchmark_pretuned.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: mt-l-x86iamx-22-225-h100
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: h100
+      kernels: ${{ github.event.inputs.kernels || '' }}
+      env-vars: ${{ github.event.inputs.env_vars || '' }}
+
+  run-b200:
+    if: ${{ github.event.inputs.run_b200 == 'true' }}
+    uses: ./.github/workflows/benchmark_pretuned.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.dgx.b200
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: b200
+      kernels: ${{ github.event.inputs.kernels || '' }}
+      env-vars: ${{ github.event.inputs.env_vars || '' }}
+
+  trigger-docs-deploy:
+    if: always()
+    needs: [run-h100, run-b200]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger docs deploy
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docs-deploy.yml',
+              ref: 'main'
+            })

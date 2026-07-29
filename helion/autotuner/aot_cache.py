@@ -38,10 +38,10 @@ from typing import Literal
 import torch
 
 from .._hardware import get_hardware_info
-from ..experimental.aot_kernel import _flatten_key_value
-from ..experimental.aot_kernel import extract_key_features
-from ..experimental.aot_kernel import extract_shape_features
 from ..runtime.config import Config
+from .aot_kernel import _flatten_key_value
+from .aot_kernel import extract_key_features
+from .aot_kernel import extract_shape_features
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
@@ -243,6 +243,10 @@ def compute_tensor_hash(tensor: torch.Tensor) -> str:
     # Convert dtypes not supported by numpy (e.g., bfloat16)
     if tensor.dtype == torch.bfloat16:
         tensor = tensor.to(torch.float32)
+    # fp8 (and other sub-byte-named) dtypes have no numpy equivalent; hash the
+    # raw bytes by viewing as uint8 (fp8_e4m3fn / fp8_e5m2 are 1 byte each).
+    elif tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        tensor = tensor.view(torch.uint8)
     return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:8]
 
 
@@ -548,7 +552,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 print(
                     f"[AOT] Warning: No heuristic found for '{kernel_name}'. "
                     f"Using default config. "
-                    f"Use `python -m helion.experimental.aot_runner` to generate tuned configs.",
+                    f"Use `python -m helion.autotuner.aot_runner` to generate tuned configs.",
                     file=sys.stderr,
                 )
         return self.autotuner.config_spec.default_config()
@@ -841,7 +845,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 )
 
         # -- emit standalone file -------------------------------------------
-        from ..experimental.aot_compile import generate_standalone_file
+        from .aot_compile import generate_standalone_file
 
         out_path = generate_standalone_file(
             kernel_name=kernel_name,

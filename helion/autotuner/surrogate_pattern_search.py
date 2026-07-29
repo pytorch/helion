@@ -162,6 +162,7 @@ class LFBOPatternSearch(PatternSearch):
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
     ) -> dict[str, object]:
+        from ..runtime.settings import _env_get_int
         from ..runtime.settings import _get_initial_population_strategy
 
         assert profile.lfbo_pattern_search is not None
@@ -175,6 +176,7 @@ class LFBOPatternSearch(PatternSearch):
             "max_generations": profile.lfbo_pattern_search.max_generations,
             "initial_population_strategy": strategy,
             "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
+            "num_neighbors_cap": _env_get_int("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS", -1),
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
 
@@ -484,7 +486,7 @@ class LFBOPatternSearch(PatternSearch):
                 # Fit model
                 self._fit_surrogate()
 
-        # Finishing phase + (TPU-only) final-pick re-rank.
+        # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
         return self._finalize()
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
@@ -693,6 +695,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
             FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
             remainder with random configs when best_available_pad_random is True.
             Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
+        num_neighbors_cap: Maximum number of neighbors to explore per generation.
+            -1 means no cap. Set HELION_CAP_AUTOTUNE_NUM_NEIGHBORS=N to override.
     """
 
     def __init__(
@@ -712,6 +716,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
         best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
+        num_neighbors_cap: int = -1,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
@@ -731,6 +736,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             similarity_penalty=similarity_penalty,
             initial_population_strategy=initial_population_strategy,
             best_available_pad_random=best_available_pad_random,
+            num_neighbors_cap=num_neighbors_cap,
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
@@ -862,4 +868,4 @@ class LFBOTreeSearch(LFBOPatternSearch):
             if current_flat != base_list:
                 all_results.append(list(current_flat))
 
-        return all_results
+        return self.shrink_neighbors(all_results)

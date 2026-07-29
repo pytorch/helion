@@ -207,7 +207,7 @@ class PatternSearch(PopulationBasedSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-        # Finishing phase + (TPU-only) final-pick re-rank.
+        # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
         return self._finalize()
 
     def _pattern_search_from(

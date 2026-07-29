@@ -280,11 +280,25 @@ def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> No
     _PATCHED_ROPE_OPERATOR_CLASSES.add(Operator)
 
 
-def patch_gdn_tritonbench_accuracy(operator_name: str, Operator: type[Any]) -> None:
+def patch_gdn_tritonbench(operator_name: str, Operator: type[Any]) -> None:
     if operator_name != "gdn_fwd_h":
         return
     if Operator in _PATCHED_GDN_OPERATOR_CLASSES:
         return
+
+    original_get_shape_iter = Operator.get_shape_iter
+    limit_mi350_inputs = torch.version.hip is not None and "gfx950" in (
+        get_device_name() or ""
+    )
+
+    def get_shape_iter(self: object) -> Iterator[object]:
+        for input_id, shape in enumerate(original_get_shape_iter(self)):
+            # ROCm 7.1 segfaults when the MI350 benchmark advances to input 2.
+            # Keep the two inputs that completed successfully while preserving
+            # the full input set on other GPUs.
+            if limit_mi350_inputs and input_id >= 2:
+                break
+            yield shape
 
     def accuracy(
         self: object,
@@ -305,6 +319,7 @@ def patch_gdn_tritonbench_accuracy(operator_name: str, Operator: type[Any]) -> N
             return torch.allclose(output, baseline_output, rtol=0.5, atol=2.0)
         return torch.allclose(output, baseline_output, rtol=0.1, atol=0.3)
 
+    Operator.get_shape_iter = get_shape_iter
     Operator.accuracy = accuracy
     _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
 
@@ -399,6 +414,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.rope.operator",
         "examples.rope",
         "rope_tritonbench",
+        {
+            "num_inputs": 5,  # rope autotune takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "rope-bwd": (
         "tritonbench.operators.rope.operator",
@@ -517,7 +535,8 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.welford",
         "welford",
         {
-            "num_inputs": 6,  # welford takes long time on Benchmark CI, so use fewer inputs instead.
+            # Welford autotuning takes ~15+ minutes per shape on MI350.
+            "num_inputs": 3,
         },
     ),
     "gather_gemv": (
@@ -1472,7 +1491,7 @@ def run_kernel_variants(
         Operator = operator_module.Operator
         patch_rope_tritonbench_inputs(operator_name, Operator)
         patch_mamba2_tritonbench_inputs(operator_name, Operator)
-        patch_gdn_tritonbench_accuracy(operator_name, Operator)
+        patch_gdn_tritonbench(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
@@ -1573,7 +1592,17 @@ def run_kernel_variants(
                         nonlocal first_call
                         if first_call:
                             first_call = False
-                            torch.cuda.synchronize()
+                            # Flush previously-queued work before the
+                            # compile-time counter starts (a pre-call counter
+                            # flush, not a result sync -- hence
+                            # accelerator.synchronize here, not the autotuner's
+                            # tensor-level synchronize_device). Bare
+                            # torch.cuda.synchronize() raised "Torch not compiled
+                            # with CUDA enabled" on TPU (torch_tpu builds against
+                            # CPU torch), failing every helion impl under
+                            # --measure-compile-time.
+                            if torch.accelerator.is_available():
+                                torch.accelerator.synchronize()
                             reset_compile_time()
                             try:
                                 result = original()
@@ -1846,6 +1875,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
         "Time (s)",
         "Configs",
         "Compile Fail",
+        "Worker Fail",
         "Accuracy Fail",
         "Generations",
         "Best Perf (ms)",
@@ -1856,6 +1886,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
     total_time = 0.0
     total_configs = 0
     total_compile_failures = 0
+    total_worker_failures = 0
     total_accuracy_failures = 0
     total_generations = 0
     total_configs_per_second = 0.0
@@ -1867,6 +1898,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
         total_time += m.autotune_time
         total_configs += m.num_configs_tested
         total_compile_failures += m.num_compile_failures
+        total_worker_failures += m.num_worker_failures
         total_accuracy_failures += m.num_accuracy_failures
         total_generations += m.num_generations
         total_configs_per_second += cps
@@ -1878,6 +1910,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
                 f"{m.autotune_time:.2f}",
                 m.num_configs_tested,
                 m.num_compile_failures,
+                m.num_worker_failures,
                 m.num_accuracy_failures,
                 m.num_generations,
                 f"{m.best_perf_ms:.4f}",
@@ -1893,6 +1926,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
                 f"{total_time / n:.2f}",
                 f"{total_configs / n:.1f}",
                 f"{total_compile_failures / n:.1f}",
+                f"{total_worker_failures / n:.1f}",
                 f"{total_accuracy_failures / n:.1f}",
                 f"{total_generations / n:.1f}",
                 "",
@@ -1904,6 +1938,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
                 f"{total_time:.2f}",
                 total_configs,
                 total_compile_failures,
+                total_worker_failures,
                 total_accuracy_failures,
                 total_generations,
                 "",
@@ -2073,6 +2108,38 @@ def main() -> None:
         assert args.kernel, (
             "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
         )
+
+        # On TPU only a subset of implementations run: Helion (Pallas), the
+        # eager (torch/aten) baseline, and torch.compile. Triton/CUDA-specific
+        # kernels (triton_*, liger_*, mamba_ssm, flash-linear-attention,
+        # cutlass/quack, ...) do not run on TPU. When --device tpu is requested,
+        # filter to the runnable families so Benchmark CI doesn't select impls
+        # that would crash. This is a positive allowlist of TPU-capable
+        # execution modes -- new GPU-only backends are excluded by default;
+        # extend the tuple only when a genuinely new TPU-runnable execution mode
+        # is added.
+        tpu = "tpu" in {
+            tritonbench_args[i + 1]
+            for i, tok in enumerate(tritonbench_args)
+            if tok == "--device" and i + 1 < len(tritonbench_args)
+        } or any(tok == "--device=tpu" for tok in tritonbench_args)
+        tpu_runnable_prefixes = (
+            "helion",  # Pallas
+            "torch",  # torch eager (torch_*) + torch.compile (torch_compile_*)
+            "aten",  # aten eager baseline
+            "naive",  # naive eager baseline (e.g. naive_softmax)
+            "eager",  # eager_* baseline
+            "sdpa",  # torch SDPA baseline
+            "pt2",  # torch.compile (pt2_*)
+            "compile",  # torch.compile variant
+            # The entries below are full impl-name prefixes (not execution-mode
+            # families) for baselines/refs that don't start with a mode token.
+            "llama_rms",  # rms_norm eager baseline
+            "cross_entropy_loss",  # cross_entropy eager baseline
+            "preprocessed_eager",  # int4_gemm eager baseline
+            "preprocessed_torch",  # int4_gemm torch.compile ref (NOT _triton)
+        )
+
         # List implementations for specified kernels to be run on Benchmark CI
         kernel_names = [k.strip() for k in args.kernel.split(",")]
         for kernel in kernel_names:
@@ -2094,8 +2161,32 @@ def main() -> None:
                     impl_name = metric_key[: -len("-speedup")]
                     implementations.append(impl_name)
 
+            if tpu:
+                implementations = [
+                    impl
+                    for impl in implementations
+                    if impl.startswith(tpu_runnable_prefixes)
+                ]
+                # A GPU-only baseline (e.g. fp8_attention's triton baseline)
+                # cannot anchor a TPU run; skip the kernel rather than emit an
+                # impl set that would crash.
+                if baseline_impl and not baseline_impl.startswith(
+                    tpu_runnable_prefixes
+                ):
+                    print(
+                        f"Warning: {kernel} baseline '{baseline_impl}' does not run "
+                        f"on TPU; skipping.",
+                        file=sys.stderr,
+                    )
+                    continue
+
             implementations = sorted(implementations)
-            assert implementations, f"No implementations found for kernel: {kernel}"
+            if not implementations:
+                msg = f"No implementations found for kernel: {kernel}"
+                if tpu:
+                    print(f"Warning: {msg} on TPU, skipping...", file=sys.stderr)
+                    continue
+                raise AssertionError(msg)
             print(
                 f"{kernel}: impls={','.join(implementations)} baseline={baseline_impl}"
             )

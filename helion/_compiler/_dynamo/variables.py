@@ -28,7 +28,7 @@ from helion.runtime.kernel import Kernel
 _SYM_SCALAR_TYPES = (torch.SymInt, torch.SymFloat)
 
 if TYPE_CHECKING:
-    from torch._dynamo.symbolic_convert import InstructionTranslator
+    from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
@@ -326,7 +326,7 @@ class HelionKernelVariable(VariableTracker):
 
     def call_function(
         self,
-        tx: InstructionTranslator,
+        tx: InstructionTranslatorBase,
         args: Sequence[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
@@ -379,7 +379,7 @@ class HelionKernelVariable(VariableTracker):
         hop_kwargs = {
             "kernel_idx": self._kernel_idx,
             "constant_args": constant_args,
-            "tensor_args": ConstDictVariable(tensor_args, dict).as_proxy(),
+            "tensor_args": ConstDictVariable(tensor_args).as_proxy(),
             "output_spec": output_spec,
         }
 
@@ -405,7 +405,7 @@ class HelionKernelVariable(VariableTracker):
             else None,
         )
         result = _call_function_and_unflatten_output(
-            tx,
+            cast("Any", tx),
             helion_kernel_wrapper_mutation,
             (),
             hop_kwargs,

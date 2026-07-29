@@ -18,6 +18,7 @@ PidTypeLiteral = Literal[
 ]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
+StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
@@ -41,8 +42,10 @@ class Config(Mapping[str, object]):
         range_multi_buffers: list[bool | None] | None = None,
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
+        pallas_load_buffer_count: list[int] | None = None,
         load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
+        store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -52,6 +55,7 @@ class Config(Mapping[str, object]):
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
+        xcd_remap: bool | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -70,8 +74,12 @@ class Config(Mapping[str, object]):
             range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
             range_flattens: Controls flatten parameter for tl.range calls.
             static_ranges: Whether to use tl.static_range instead tl.range.
+            pallas_load_buffer_count: Pallas-only load buffer count (1 or 2) for
+                each input tensor. Tensors without an existing DMA route use the
+                ordinary path.
             load_eviction_policies: Eviction policies for load operations ("", "first", "last").
             load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
+            store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -93,6 +101,10 @@ class Config(Mapping[str, object]):
             advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
             epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
                 the N dimension. None = disabled (default), valid values are 2 or 4.
+            xcd_remap: AMD CDNA only. Remap program IDs into contiguous per-XCD regions to
+                improve L2 locality on multi-XCD GPUs (MI300/MI350). Supported for pid_type
+                "flat", "persistent_blocked", and "persistent_interleaved"; composes with
+                ``l2_groupings``.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -109,8 +121,10 @@ class Config(Mapping[str, object]):
             "range_multi_buffers": range_multi_buffers,
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
+            "pallas_load_buffer_count": pallas_load_buffer_count,
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
+            "store_cache_modifiers": store_cache_modifiers,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -120,6 +134,7 @@ class Config(Mapping[str, object]):
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
+            "xcd_remap": xcd_remap,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -263,6 +278,10 @@ class Config(Mapping[str, object]):
         return cast("PidTypeLiteral", self.config.get("pid_type", "flat"))
 
     @property
+    def xcd_remap(self) -> bool:
+        return cast("bool", self.config.get("xcd_remap", False))
+
+    @property
     def num_sm_multiplier(self) -> int:
         from ..autotuner.config_spec import DEFAULT_NUM_SM_MULTIPLIER
 
@@ -305,6 +324,10 @@ class Config(Mapping[str, object]):
         return cast("list[bool]", self.config.get("static_ranges", []))
 
     @property
+    def pallas_load_buffer_count(self) -> list[int]:
+        return cast("list[int]", self.config.get("pallas_load_buffer_count", []))
+
+    @property
     def load_eviction_policies(self) -> list[EvictionPolicyLiteral]:
         return cast(
             "list[EvictionPolicyLiteral]", self.config.get("load_eviction_policies", [])
@@ -315,6 +338,13 @@ class Config(Mapping[str, object]):
         return cast(
             "list[LoadCacheModifierLiteral]",
             self.config.get("load_cache_modifiers", []),
+        )
+
+    @property
+    def store_cache_modifiers(self) -> list[StoreCacheModifierLiteral]:
+        return cast(
+            "list[StoreCacheModifierLiteral]",
+            self.config.get("store_cache_modifiers", []),
         )
 
     @property

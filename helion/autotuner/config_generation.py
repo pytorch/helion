@@ -301,12 +301,20 @@ class ConfigGeneration:
                 assert isinstance(field, BlockIdSequence)
                 encoded_values = field._encode_flat_values(self.config_spec, value)
                 for idx, encoded_value in zip(indices, encoded_values, strict=True):
-                    result[idx] = encoded_value
+                    result[idx] = copy.deepcopy(encoded_value)
             else:
                 assert len(indices) == 1
-                result[indices[0]] = value
+                field = self.flat_spec[indices[0]]
+                if isinstance(field, ListOf) and not isinstance(value, list):
+                    value = [copy.deepcopy(value) for _ in range(field.length)]
+                result[indices[0]] = copy.deepcopy(value)
         self._repair_cute_num_threads(result)
         return result
+
+    def canonicalize_flat(self, flat_values: FlatConfig) -> tuple[FlatConfig, Config]:
+        """Normalize a flat config and return an owned matching flat/config pair."""
+        config = self.unflatten(copy.deepcopy(flat_values))
+        return self.flatten(config), config
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
@@ -438,8 +446,7 @@ class ConfigGeneration:
         seen: set[Config] = set()
         for i, config in enumerate(self.config_spec.compiler_seed_configs):
             try:
-                flat = self.flatten(config)
-                normalized = self.unflatten(flat)
+                flat, normalized = self.canonicalize_flat(self.flatten(config))
             except (
                 InvalidConfig,
                 ValueError,
@@ -466,8 +473,7 @@ class ConfigGeneration:
         seen: set[Config] = set()
         for i, config in enumerate(user_seed_configs):
             try:
-                flat = self.flatten(config)
-                normalized = self.unflatten(flat)
+                flat, normalized = self.canonicalize_flat(self.flatten(config))
             except (
                 InvalidConfig,
                 ValueError,
@@ -571,25 +577,70 @@ class ConfigGeneration:
         if n <= 0:
             return [self.default_flat()]
         default_flat = self.default_flat()
-        result = [default_flat]
 
-        # Initial population order is default -> user seed configs -> compiler seeds
-        # -> random.  This preserves user seed priority without dropping built-in
-        # backend/compiler seeds from ConfigSpec.compiler_seed_configs.
-        for flat, _config in self.user_seed_flat_config_pairs(
-            user_seed_configs, log_func
-        ):
-            if any(flat == existing for existing in result):
-                continue
-            result.append(flat)
-            if len(result) >= n:
+        if not self.config_spec.cute_flash_search_enabled:
+            result = [default_flat]
+            for flat, _config in self.user_seed_flat_config_pairs(
+                user_seed_configs, log_func
+            ):
+                if any(flat == existing for existing in result):
+                    continue
+                result.append(flat)
+                if len(result) >= n:
+                    return result[:n]
+            for flat, _config in self.seed_flat_config_pairs(log_func):
+                if any(flat == existing for existing in result):
+                    continue
+                result.append(flat)
+                if len(result) >= n:
+                    return result[:n]
+            priors_present = bool(self._config_value_priors)
+            for j in range(n - len(result)):
+                result.append(
+                    self.biased_random_flat()
+                    if priors_present and j % 2 == 0
+                    else self.random_flat()
+                )
+            return result
+
+        result: list[FlatConfig] = []
+        seen: set[Config] = set()
+        default_first = not self.config_spec.cute_flash_search_enabled
+
+        def append_valid(config: Config) -> bool:
+            if config in seen:
+                return False
+            seen.add(config)
+            result.append(self.flatten(config))
+            return len(result) >= n
+
+        def append_if_valid(flat: FlatConfig) -> bool:
+            try:
+                config = self.unflatten(flat)
+            except InvalidConfig:
+                return False
+            return append_valid(config)
+
+        if default_first:
+            if append_if_valid(default_flat):
                 return result[:n]
 
-        for flat, _config in self.seed_flat_config_pairs(log_func):
-            if any(flat == existing for existing in result):
-                continue
-            result.append(flat)
-            if len(result) >= n:
+        # Initial population order is normally default -> user seed configs ->
+        # compiler seeds -> random.  Flash attention has backend-shaped compiler
+        # seeds that are materially better anchors than the raw fragment default,
+        # so try those seeds before the default when that search surface is active.
+        for _flat, config in self.user_seed_flat_config_pairs(
+            user_seed_configs, log_func
+        ):
+            if append_valid(config):
+                return result[:n]
+
+        for _flat, config in self.seed_flat_config_pairs(log_func):
+            if append_valid(config):
+                return result[:n]
+
+        if not default_first:
+            if append_if_valid(default_flat):
                 return result[:n]
 
         # Fill the remainder with random configs. When the backend supplies
@@ -598,11 +649,45 @@ class ConfigGeneration:
         # search keeps full coverage; with no priors every fill is uniform,
         # leaving the historical behavior unchanged.
         priors_present = bool(self._config_value_priors)
-        for j in range(n - len(result)):
+        invalid = 0
+        duplicate = 0
+        attempts = 0
+        max_attempts = max(64, (n - len(result)) * 64)
+        while len(result) < n and attempts < max_attempts:
+            j = attempts
+            attempts += 1
             if priors_present and j % 2 == 0:
-                result.append(self.biased_random_flat())
+                flat = self.biased_random_flat()
             else:
-                result.append(self.random_flat())
+                flat = self.random_flat()
+            try:
+                config = self.unflatten(flat)
+            except InvalidConfig:
+                invalid += 1
+                continue
+            if config in seen:
+                duplicate += 1
+                continue
+            seen.add(config)
+            result.append(self.flatten(config))
+        if len(result) < n and log_func is not None:
+            log_func(
+                "Generated only "
+                f"{len(result)}/{n} valid initial population configs "
+                f"after {attempts} random attempts "
+                f"({invalid} invalid, {duplicate} duplicate); "
+                "padding with duplicate valid configs."
+            )
+        if len(result) < n:
+            if not result:
+                raise InvalidConfig(
+                    "failed to generate any valid initial population configs"
+                )
+            pad_from = [copy.deepcopy(flat) for flat in result]
+            pad_idx = 0
+            while len(result) < n:
+                result.append(copy.deepcopy(pad_from[pad_idx % len(pad_from)]))
+                pad_idx += 1
         return result
 
     def random_population(
@@ -614,9 +699,18 @@ class ConfigGeneration:
     ) -> list[Config]:
         result: list[Config] = []
         attempts = 0
-        for flat in self.random_population_flat(
-            n, user_seed_configs=user_seed_configs, log_func=log_func
-        ):
+        if not self.config_spec.cute_flash_search_enabled:
+            flat_population = self.random_population_flat(
+                n, user_seed_configs=user_seed_configs, log_func=log_func
+            )
+        else:
+            try:
+                flat_population = self.random_population_flat(
+                    n, user_seed_configs=user_seed_configs, log_func=log_func
+                )
+            except InvalidConfig:
+                flat_population = []
+        for flat in flat_population:
             try:
                 result.append(self.unflatten(flat))
             except InvalidConfig:

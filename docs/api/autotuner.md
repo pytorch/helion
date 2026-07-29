@@ -4,6 +4,16 @@ The `helion.autotuner` module provides automatic optimization of kernel configur
 
 Autotuning effort can be adjusted via :attr:`helion.Settings.autotune_effort`, which configures how much each algorithm explores (``"none"`` disables autotuning, ``"quick"`` runs a smaller search, ``"full"`` uses the full search budget). Users may still override individual autotuning parameters if they need finer control.
 
+```{note}
+**Guard your entry script with `if __name__ == "__main__":`.** By default Helion
+benchmarks (and may precompile) candidate configs in a *spawned* subprocess,
+which re-imports your entry module. If the top-level kernel call is not under an
+`if __name__ == "__main__":` guard, the worker re-runs it on import and
+autotuning aborts with `NoConfigFound` (often with `failed to send job to
+worker`). Either add the guard, or set `HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0`
+to benchmark in-process.
+```
+
 ```{eval-rst}
 .. currentmodule:: helion.autotuner
 
@@ -70,10 +80,13 @@ across multiple refinement rounds.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HELION_LLM_PROVIDER` | | LLM provider: `anthropic` or `openai` |
+| `HELION_LLM_PROVIDER` | | LLM provider: `anthropic`, `openai`, `bedrock`, or `vertex` |
 | `HELION_LLM_MODEL` | | Model name (e.g. `claude-opus-4-7`, `gpt-4o`) |
-| `HELION_LLM_API_KEY` | | API key (falls back to `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) |
+| `HELION_LLM_API_KEY` | | API key (falls back to `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`). Optional for `vertex`/`bedrock`, which authenticate by client identity. |
 | `HELION_LLM_API_BASE` | | Custom API base URL |
+| `HELION_LLM_VERTEX_PROJECT` | | Cloud project id for the `vertex` provider (falls back to `ANTHROPIC_VERTEX_PROJECT_ID`) |
+| `HELION_LLM_VERTEX_LOCATION` | `global` | Vertex AI location for the `vertex` provider (falls back to `CLOUD_ML_REGION`) |
+| `HELION_LLM_EXTRA_HEADERS` | | Extra HTTP headers as a JSON object or newline-separated `Header: value` lines (for gateways that require custom routing/identity headers) |
 | `HELION_LLM_COMPILE_TIMEOUT_S` | `15` | Compile timeout (seconds) for LLM-proposed configs |
 | `HELION_LLM_CA_BUNDLE` | | Custom CA bundle path (for corporate proxies that do TLS inspection) |
 | `HELION_LLM_CLIENT_CERT` | | Client certificate path (for proxies requiring mutual TLS) |
@@ -81,6 +94,26 @@ across multiple refinement rounds.
 
 The proxy/TLS variables are only needed in corporate environments where a proxy intercepts
 HTTPS traffic. Most users connecting directly to the LLM API can ignore them.
+
+The `vertex` provider talks to Anthropic models hosted on Google
+[Vertex AI](https://docs.anthropic.com/en/api/claude-on-vertex-ai) (the publisher
+`rawPredict` endpoint). It is the analog of `bedrock`: the model is named in the
+URL and authentication is by client identity (a bearer token via
+`HELION_LLM_API_KEY`, and/or mTLS via the client-cert variables), so it also
+works behind an API-compatible gateway. The endpoint, project, and location each
+fall back to the standard Anthropic-on-Vertex SDK variables
+(`ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION`)
+when the helion-specific knob is unset, so an environment already configured for
+Anthropic-on-Vertex needs only `HELION_LLM_PROVIDER=vertex` and a model. Example:
+
+```bash
+export HELION_AUTOTUNER=LLMGuidedSearch
+export HELION_LLM_PROVIDER=vertex
+export HELION_LLM_MODEL=claude-sonnet-4-5
+export HELION_LLM_API_BASE=https://<your-vertex-endpoint>/v1
+export HELION_LLM_VERTEX_PROJECT=<your-project>
+export HELION_LLM_VERTEX_LOCATION=us-east5  # optional, default: global
+```
 
 ### LLM-Seeded Search (Hybrid)
 

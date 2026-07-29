@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from typing import Iterable
 
     from torch._inductor.ir import MultiOutput
-    from torch._inductor.scheduler import SchedulerNode
+    from torch._inductor.scheduler import BaseSchedulerNode
 
     from ..inductor_lowering import CodegenState
     from helion.runtime.kernel import BoundKernel
@@ -405,7 +405,7 @@ class HelionTemplateBuffer(TemplateBuffer):
 
     def has_aliasing_or_mutation_for_prologue_fusion(
         self,
-        scheduler_node: SchedulerNode,
+        scheduler_node: object,
     ) -> bool:
         """Return the Inductor fusion-blocking alias/mutation state.
 
@@ -416,8 +416,12 @@ class HelionTemplateBuffer(TemplateBuffer):
         MutationOutputs remain in the scheduler graph for dependencies and
         memory planning.
         """
+        # cast (type-checker only) to the fuller scheduler-node interface the body
+        # needs; no runtime isinstance, so structurally-compatible nodes (real
+        # Inductor nodes and test fakes) all work.
+        node = cast("BaseSchedulerNode", scheduler_node)
         mutation_names: set[str] = set()
-        for output in scheduler_node.get_outputs():
+        for output in node.get_outputs():
             if output.get_aliases():
                 return True
 
@@ -687,6 +691,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         subscript: list[object],
         value: ast.expr,
         extra_mask: ast.expr | None,
+        cache_modifier: ast.expr | None,
         codegen_store: Callable[..., ast.expr],
     ) -> ast.expr:
         """Emit per-epilogue index definitions + ``<STORE_OUTPUT_{i}>`` placeholder.
@@ -719,7 +724,9 @@ class HelionTemplateBuffer(TemplateBuffer):
         param_name = state.device_function.tensor_arg(tensor).name
         epilogue_idx = self._fusion_metadata.epilogue_idx_by_param.get(param_name)
         if epilogue_idx is None:
-            return codegen_store(state, tensor, [*subscript], value, extra_mask)
+            return codegen_store(
+                state, tensor, [*subscript], value, extra_mask, cache_modifier
+            )
 
         kernel_val_name = f"_kernel_val_{epilogue_idx}"
 
@@ -790,7 +797,12 @@ class HelionTemplateBuffer(TemplateBuffer):
             state.add_statement(
                 ast.Expr(
                     value=codegen_store(
-                        state, tensor, [*subscript], store_val, extra_mask
+                        state,
+                        tensor,
+                        [*subscript],
+                        store_val,
+                        extra_mask,
+                        cache_modifier,
                     )
                 )
             )

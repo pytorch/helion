@@ -50,6 +50,13 @@ import helion.language as hl
 @helion.kernel(
     # Static shapes provides a speedup for attention.
     static_shapes=True,
+    # Use the manual matmul+softmax reference as autotune's correctness anchor.
+    # Otherwise `_compute_baseline` compiles Helion's default config, which OOMs
+    # VMEM on TPU at large shapes (V is left as a VMEM ref because of the
+    # outer-scope epilogue read, forcing a full-tensor BlockSpec). Wrap in a
+    # lambda so the `ref_xsa` name is looked up at call time (it's defined
+    # further down the file).
+    autotune_baseline_fn=lambda q, k, v, eps=1e-6: ref_xsa(q, k, v, eps),
 )
 def xsa_kernel(
     q_in: torch.Tensor,
