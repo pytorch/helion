@@ -4007,9 +4007,7 @@ class TestCuteAutotuner(TestCase):
         )
         rescale_threshold_choices = flash_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices
         self.assertEqual(rescale_threshold_choices[0], 8.0)
-        self.assertEqual(
-            set(rescale_threshold_choices), {0.0, 4.0, 8.0, 12.0, 16.0, 32.0}
-        )
+        self.assertEqual(set(rescale_threshold_choices), {0.0, 4.0, 8.0, 12.0})
         rescale_chunk_cols_choices = flash_fragments[
             FLASH_RESCALE_CHUNK_COLS_KEY
         ].choices
@@ -4157,7 +4155,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_ws_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+            {0.0, 4.0, 8.0, 12.0},
         )
         self.assertEqual(
             set(long_ws_fragments[FLASH_PACKED_REDUCE_KEY].choices), {False, True}
@@ -4358,7 +4356,14 @@ class TestCuteAutotuner(TestCase):
         very_long_dense_fragments = flash_autotune_fragments(64, 256, is_causal=False)
         self.assertEqual(
             very_long_dense_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
-            (8.0, 32.0, 16.0),
+            (8.0, 12.0),
+        )
+        very_long_bf16_fragments = flash_autotune_fragments(
+            64, 384, dtype=torch.bfloat16, is_causal=False
+        )
+        self.assertEqual(
+            very_long_bf16_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (32.0, 16.0, 8.0),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_PERSISTENT_CTAS_PER_SM_KEY].search_choices,
@@ -4509,7 +4514,7 @@ class TestCuteAutotuner(TestCase):
         }
         very_long_dense_search_choices_by_num_kv = {
             256: {
-                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (40,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
                 FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
@@ -4525,7 +4530,7 @@ class TestCuteAutotuner(TestCase):
                 FLASH_KV_STAGE_KEY: (2, 3),
             },
             384: {
-                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (32,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
                 FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
@@ -4541,7 +4546,7 @@ class TestCuteAutotuner(TestCase):
                 FLASH_KV_STAGE_KEY: (2, 3),
             },
             512: {
-                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (32,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
                 FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
@@ -4558,7 +4563,7 @@ class TestCuteAutotuner(TestCase):
                 FLASH_KV_STAGE_KEY: (2, 3),
             },
             1024: {
-                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (40,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
                 FLASH_E2E_SCHEDULE_KEY: ("16/4", "8/2"),
@@ -4576,9 +4581,10 @@ class TestCuteAutotuner(TestCase):
                 FLASH_KV_STAGE_KEY: (2, 3),
                 FLASH_CLC_KEY: (True,),
                 FLASH_CLC_HEADS_PER_BATCH_KEY: (32,),
+                FLASH_CLC_STAGES_KEY: (2,),
             },
             2048: {
-                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_CORR_TILE_SIZE_KEY: (8, 16),
                 FLASH_SOFTMAX_REGS_KEY: (192, 200),
                 FLASH_ROLE_MAP_KEY: ("helion", "fa4"),
@@ -4704,7 +4710,7 @@ class TestCuteAutotuner(TestCase):
             long_dense_fragments[FLASH_CLC_PDL_KEY].search_choices, (False, True)
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices, (1, 2, 3)
+            long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices, (2, 3)
         )
         self.assertEqual(
             long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
@@ -4787,7 +4793,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+            {0.0, 4.0, 8.0, 12.0},
         )
         long_odd_fragments = flash_autotune_fragments(64, 65, is_causal=False)
         self.assertEqual(
@@ -4802,7 +4808,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+            {0.0, 4.0, 8.0, 12.0},
         )
         valid_wide_offset = helion.Config(
             block_sizes=[1, 128, 128],

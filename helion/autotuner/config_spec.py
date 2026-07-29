@@ -640,6 +640,7 @@ class ConfigSpec:
         self.cute_flash_search_enabled: bool = False
         self._cute_flash_head_dim: int | None = None
         self._cute_flash_num_kv: int | None = None
+        self._cute_flash_dtype: torch.dtype = torch.float16
         self._cute_flash_is_causal: bool = False
         self._cute_flash_has_kv_tile_pruning: bool = False
         self._cute_flash_requires_ws_overlap: bool = False
@@ -837,6 +838,7 @@ class ConfigSpec:
         fragments = flash_autotune_fragments(
             self._cute_flash_head_dim,
             self._cute_flash_num_kv,
+            dtype=self._cute_flash_dtype,
             is_causal=self._cute_flash_is_causal,
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
@@ -1016,6 +1018,7 @@ class ConfigSpec:
         *,
         head_dim: int,
         num_kv: int,
+        dtype: torch.dtype = torch.float16,
         block_size_targets: Mapping[int, int],
         is_causal: bool = False,
         has_kv_tile_pruning: bool = False,
@@ -1025,6 +1028,7 @@ class ConfigSpec:
         self.cute_flash_search_enabled = True
         self._cute_flash_head_dim = head_dim
         self._cute_flash_num_kv = num_kv
+        self._cute_flash_dtype = dtype
         self._cute_flash_is_causal = is_causal
         self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
         self._cute_flash_requires_ws_overlap = requires_ws_overlap
@@ -1238,6 +1242,7 @@ class ConfigSpec:
                 flash_attention_seed_configs(
                     self._cute_flash_head_dim,
                     self._cute_flash_num_kv,
+                    dtype=self._cute_flash_dtype,
                     is_causal=self._cute_flash_is_causal,
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
@@ -2140,6 +2145,7 @@ class ConfigSpec:
                     flash_autotune_fragments(
                         self._cute_flash_head_dim,
                         self._cute_flash_num_kv,
+                        dtype=self._cute_flash_dtype,
                         is_causal=self._cute_flash_is_causal,
                         has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                         requires_ws_overlap=self._cute_flash_requires_ws_overlap,
