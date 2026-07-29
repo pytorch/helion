@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import linecache
 import math
 import multiprocessing as mp
 from multiprocessing.connection import Connection
@@ -11,8 +12,10 @@ from pathlib import Path
 import pickle
 import random
 import signal
+import sys
 import tempfile
 import time
+from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -28,6 +31,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
@@ -39,9 +43,14 @@ from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
 from helion.autotuner.kernel_args import load_trusted_kernel_args
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
+from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _run_kernel_in_subprocess_spawn
+from helion.autotuner.precompile_future import _serialize_compiled_fn
+from helion.autotuner.precompile_future import _unload_compiled_fn
 from helion.autotuner.random_search import RandomSearch
+from helion.runtime import _create_cute_wrapper
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 
@@ -95,6 +104,110 @@ class _ReturnValue:
 
 
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
+    @skipUnlessCuteAvailable("_create_cute_wrapper requires the CuTe DSL")
+    def test_cute_wrapper_failure_does_not_leak_linecache(self) -> None:
+        launcher_filenames_before = {
+            filename
+            for filename in linecache.cache
+            if filename.startswith("<helion_cute_launcher:")
+        }
+
+        with (
+            patch("builtins.exec", side_effect=RuntimeError("decoration failed")),
+            self.assertRaisesRegex(RuntimeError, "decoration failed"),
+        ):
+            _create_cute_wrapper(object(), (), (32, 1, 1))
+
+        launcher_filenames_after = {
+            filename
+            for filename in linecache.cache
+            if filename.startswith("<helion_cute_launcher:")
+        }
+        self.assertEqual(launcher_filenames_after, launcher_filenames_before)
+
+    def test_compiled_fn_restores_cute_source_hash_and_unloads(self) -> None:
+        launcher_filename = "<helion_cute_launcher:test>"
+        source = (
+            "class Kernel:\n"
+            "    pass\n"
+            f"exec(compile('def launcher():\\n    pass\\n', {launcher_filename!r}, 'exec'))\n"
+            "class Launcher:\n"
+            "    pass\n"
+            "compiled_launcher = Launcher()\n"
+            "compiled_launcher._jit_func = launcher\n"
+            "_helion_call = Kernel()\n"
+            "_helion_call._helion_cute_compiled_launchers = "
+            "{'compiled': compiled_launcher}\n"
+            "_helion_call._helion_cute_launch_arg_cache = {'args': object()}\n"
+            "def call():\n"
+            "    return _helion_call._helion_cute_source_hash\n"
+        )
+        expected_hash = "parent-source-hash"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "compiled_module.py"
+            path.write_text(source)
+            source_module = ModuleType("_test_compiled_module")
+            source_module.__file__ = str(path)
+            sys.modules[source_module.__name__] = source_module
+            try:
+                exec(compile(source, str(path), "exec"), source_module.__dict__)
+                source_module._helion_call._helion_cute_source_hash = expected_hash
+                fn_spec = _serialize_compiled_fn(source_module.call)
+            finally:
+                sys.modules.pop(source_module.__name__, None)
+
+        fn = _load_compiled_fn(fn_spec)
+        module_name = fn.__module__
+        loaded_module = sys.modules[module_name]
+        cute_kernel = loaded_module._helion_call
+        self.assertEqual(fn_spec.source_hash, expected_hash)
+        self.assertEqual(fn(), expected_hash)
+        self.assertIn(module_name, sys.modules)
+        linecache.cache[launcher_filename] = (0, None, [], launcher_filename)
+
+        _unload_compiled_fn(fn)
+        self.assertNotIn(module_name, sys.modules)
+        self.assertEqual(cute_kernel._helion_cute_compiled_launchers, {})
+        self.assertEqual(cute_kernel._helion_cute_launch_arg_cache, {})
+        self.assertNotIn(launcher_filename, linecache.cache)
+
+    def test_compiled_fn_unload_clears_triton_fast_path_cache(self) -> None:
+        source = (
+            "class Kernel:\n"
+            "    def __init__(self):\n"
+            "        self.cleared = False\n"
+            "    def clear_fast_path_caches(self):\n"
+            "        self.cleared = True\n"
+            "_helion_call = Kernel()\n"
+            "def call():\n"
+            "    pass\n"
+        )
+        fn_spec = SerializedCompiledFunction("call", source, None, None)
+        fn = _load_compiled_fn(fn_spec)
+        kernel = fn.__globals__["_helion_call"]
+
+        _unload_compiled_fn(fn)
+
+        self.assertTrue(kernel.cleared)
+
+    def test_compiled_fn_load_failure_does_not_leak_module(self) -> None:
+        module_prefix = "_helion_autotune_subprocess_"
+        modules_before = {
+            name for name in sys.modules if name.startswith(module_prefix)
+        }
+        fn_spec = SerializedCompiledFunction(
+            function_name="call",
+            source_code="raise RuntimeError('load failed')\n",
+            filename=None,
+            module_name=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "load failed"):
+            _load_compiled_fn(fn_spec)
+
+        modules_after = {name for name in sys.modules if name.startswith(module_prefix)}
+        self.assertEqual(modules_after, modules_before)
+
     def test_benchmark_job_can_use_wall_clock_bench(self) -> None:
         fn = _ReturnValue(torch.empty(()))
 
@@ -124,6 +237,32 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         load_args.assert_called_once_with("/tmp/args.pt")
         event_bench.assert_not_called()
         wall_clock_bench.assert_called_once()
+
+    def test_benchmark_job_unloads_module_after_failure(self) -> None:
+        fn = _ReturnValue(torch.empty(()))
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=(),
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.do_bench",
+                side_effect=RuntimeError("benchmark failed"),
+            ),
+            patch("helion.autotuner.benchmark_job._unload_compiled_fn") as unload_fn,
+            self.assertRaisesRegex(RuntimeError, "benchmark failed"),
+        ):
+            BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+            )()
+
+        unload_fn.assert_called_once_with(fn)
 
     def test_accuracy_check_job_passes(self) -> None:
         fn = _ReturnValue(torch.tensor([1.0]))
@@ -246,6 +385,44 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider._benchmark_worker.run.assert_called_once()
         _, kwargs = provider._benchmark_worker.run.call_args
         self.assertEqual(kwargs["timeout"], 17.0)
+
+    def test_benchmark_timeout_has_worker_metric_and_status(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=BenchmarkTimeout("timed out"),
+        ):
+            result = provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(result, math.inf)
+        self.assertEqual(provider._last_benchmark_failure_status, "timeout")
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
+
+    def test_benchmark_worker_death_has_error_status(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=BenchmarkWorkerDied("worker exited"),
+        ):
+            result = provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(result, math.inf)
+        self.assertEqual(provider._last_benchmark_failure_status, "error")
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
 
     def test_subprocess_accuracy_check_skips_mutated_args(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
@@ -571,7 +748,8 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             call_count[0] += 1
             if call_count[0] % 3 == 0:
                 call_count[1] += 1
-                self._autotune_metrics.num_compile_failures += 1
+                self._last_benchmark_failure_status = "timeout"
+                self._autotune_metrics.num_worker_failures += 1
                 return math.inf
             return original(self, config, fn)
 
@@ -593,10 +771,12 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             "_benchmark_function_subprocess",
             maybe_fail,
         ):
-            RandomSearch(bound_kernel, args, 20).autotune()
+            search = RandomSearch(bound_kernel, args, 20)
+            search.autotune()
 
         self.assertGreaterEqual(call_count[0], 6)
         self.assertGreaterEqual(call_count[1], 2)
+        self.assertEqual(search._autotune_metrics.num_worker_failures, call_count[1])
 
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:

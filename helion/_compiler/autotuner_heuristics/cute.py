@@ -519,6 +519,7 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
         return flash_attention_seed_config(
             spec._cute_flash_head_dim,
             spec._cute_flash_num_kv,
+            dtype=spec._cute_flash_dtype,
             is_causal=spec._cute_flash_is_causal,
             has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
@@ -544,6 +545,7 @@ class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
             flash_attention_seed_config(
                 spec._cute_flash_head_dim,
                 spec._cute_flash_num_kv,
+                dtype=spec._cute_flash_dtype,
                 is_causal=spec._cute_flash_is_causal,
                 has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
                 requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
@@ -568,6 +570,7 @@ class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
         return flash_attention_seed_config(
             spec._cute_flash_head_dim,
             spec._cute_flash_num_kv,
+            dtype=spec._cute_flash_dtype,
             is_causal=spec._cute_flash_is_causal,
             has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=spec._cute_flash_requires_ws_overlap,

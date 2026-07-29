@@ -1875,6 +1875,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
         "Time (s)",
         "Configs",
         "Compile Fail",
+        "Worker Fail",
         "Accuracy Fail",
         "Generations",
         "Best Perf (ms)",
@@ -1885,6 +1886,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
     total_time = 0.0
     total_configs = 0
     total_compile_failures = 0
+    total_worker_failures = 0
     total_accuracy_failures = 0
     total_generations = 0
     total_configs_per_second = 0.0
@@ -1896,6 +1898,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
         total_time += m.autotune_time
         total_configs += m.num_configs_tested
         total_compile_failures += m.num_compile_failures
+        total_worker_failures += m.num_worker_failures
         total_accuracy_failures += m.num_accuracy_failures
         total_generations += m.num_generations
         total_configs_per_second += cps
@@ -1907,6 +1910,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
                 f"{m.autotune_time:.2f}",
                 m.num_configs_tested,
                 m.num_compile_failures,
+                m.num_worker_failures,
                 m.num_accuracy_failures,
                 m.num_generations,
                 f"{m.best_perf_ms:.4f}",
@@ -1922,6 +1926,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
                 f"{total_time / n:.2f}",
                 f"{total_configs / n:.1f}",
                 f"{total_compile_failures / n:.1f}",
+                f"{total_worker_failures / n:.1f}",
                 f"{total_accuracy_failures / n:.1f}",
                 f"{total_generations / n:.1f}",
                 "",
@@ -1933,6 +1938,7 @@ def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
                 f"{total_time:.2f}",
                 total_configs,
                 total_compile_failures,
+                total_worker_failures,
                 total_accuracy_failures,
                 total_generations,
                 "",

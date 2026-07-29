@@ -152,6 +152,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.resident_prep_lowering_stack: list[
             dict[tuple[int, str], ResidentPrepLowering]
         ] = []
+        # Grouping-2 worklists codegen the compact body twice, once per static
+        # compact block size. Shape-independent ordered-loop resources are shared
+        # across those mutually exclusive bodies.
+        self.grouped_compact_common_statements: list[ast.AST] | None = None
+        self.grouped_resident_prep_lowering_cache: dict[
+            tuple[object, ...], list[ResidentPrepLowering]
+        ] = {}
+        self.grouped_resident_prep_refill_cache: dict[tuple[object, ...], str] = {}
+        self.grouped_fori_dma_resource_cache: dict[
+            tuple[object, ...], tuple[str, str]
+        ] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -1338,10 +1349,8 @@ if __name__ == "__main__":
     """)
 
 
-def _maybe_emit_compact_worklist_builder(codegen: GenerateAST, config: Config) -> None:
+def _maybe_emit_compact_worklist_builder(codegen: GenerateAST) -> None:
     """Emit the module-level jnp ``_build_worklist`` for a compact-worklist kernel."""
-    if config.get("pallas_loop_type") != "compact_worklist":
-        return
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     if plan is None:
@@ -1387,7 +1396,7 @@ def generate_ast(
             # Emit the worklist builder + record its offset params BEFORE the host
             # body is visited (the launcher call -- which reads the offset params
             # via build_launcher_args -- is generated during that visit).
-            _maybe_emit_compact_worklist_builder(codegen, config)
+            _maybe_emit_compact_worklist_builder(codegen)
 
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
