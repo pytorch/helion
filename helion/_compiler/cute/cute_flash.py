@@ -1870,6 +1870,10 @@ def resolve_flash_config(
         use_2cta_instrs = False
     if use_2cta_instrs:
         precompute_qk_desc = False
+        if epi_stg_gmem == "pair":
+            # Pair destinations span both CTA rows; without a rank slice the two
+            # CTAs alias the same output half.
+            epi_stg_gmem = "stage"
     use_cga2_local_default = (
         _flash_dense_hd64_seed_cga2_local(num_kv) if long_dense_hd64_fa4 else False
     )
@@ -2323,6 +2327,12 @@ def _flash_dense_hd64_seed_role_map(num_kv: int) -> str:
     if num_kv == 512:
         return "fa4"
     return "helion"
+
+
+def _flash_role_chain_default(
+    *, hd: int, num_kv: int, is_causal: bool, role_map: str
+) -> bool:
+    return not is_causal and hd == 64 and num_kv == 512 and role_map == "fa4"
 
 
 def _flash_dense_hd64_seed_cga2_local(num_kv: int) -> bool:
@@ -6191,11 +6201,14 @@ def emit_flash_fa4_device_body(
     kv_loop_bound = "flash_num_active_kv" if is_causal else "_flash_num_kv_tiles"
     kv_loop_bound_minus_1 = f"{kv_loop_bound} - 1"
     epi_smem = cfg.epi_tma or cfg.epi_stg
+    role_chain_default = _flash_role_chain_default(
+        hd=hd, num_kv=num_kv, is_causal=is_causal, role_map=cfg.role_map
+    )
     role_chain = (
         not use_2cta_instrs
         and not use_cga2_local_cta
         and not use_clc_scheduler
-        and _flash_bool_env("HELION_CUTE_FLASH_ROLE_CHAIN", False)
+        and _flash_bool_env("HELION_CUTE_FLASH_ROLE_CHAIN", role_chain_default)
     )
     storage_extra_args = f", {epi_smem!s}, {use_clc_scheduler!s}, {cfg.clc_stages}"
     prefetch_epi_tma = (
@@ -6756,9 +6769,9 @@ sO = storage.sO.get_tensor(_flash_osl.outer, swizzle=_flash_osl.inner)
     flash_o_layout_enum = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
     flash_o_epi_subtile = (128, flash_o_corr_tile)
     flash_o_tmem_atom = sm100_utils_flash.get_tmem_load_op(
-        (128, {hd}), flash_o_layout_enum, {io_dtype}, cutlass.Float32,
-        flash_o_epi_subtile, use_2cta_instrs=False)
-    flash_o_cO = cute.make_identity_tensor((128, {hd}))
+        ({mma_m}, {hd}), flash_o_layout_enum, {io_dtype}, cutlass.Float32,
+        flash_o_epi_subtile, use_2cta_instrs={use_2cta_instrs!s})
+    flash_o_cO = cute.make_identity_tensor(({mma_m}, {hd}))
     tOcO_corr = flash_pvt.partition_C(flash_o_cO)
     tOtO0_corr_i = cute.logical_divide(
         tOtO0, cute.make_layout((128, flash_o_corr_tile)))
@@ -6779,8 +6792,8 @@ sO = storage.sO.get_tensor(_flash_osl.outer, swizzle=_flash_osl.inner)
         tOtO0_corr_i[(None, None), None])
     tOtO1_corr_t2r = flash_o_thr_t2r.partition_S(
         tOtO1_corr_i[(None, None), None])
-    tOsO0_corr = flash_pvt.partition_C(sO[None, None, 0])
-    tOsO1_corr = flash_pvt.partition_C(sO[None, None, 1])
+    tOsO0_corr = flash_pvt.get_slice(0).partition_C(sO[None, None, 0])
+    tOsO1_corr = flash_pvt.get_slice(0).partition_C(sO[None, None, 1])
     tOsO0_corr_i = cute.logical_divide(
         tOsO0_corr, cute.make_layout((128, flash_o_corr_tile)))
     tOsO1_corr_i = cute.logical_divide(
@@ -6894,17 +6907,21 @@ if warp_idx == 15:
             tensor_4d_heads=tensor_4d_heads,
             recompute_tile_coords=cfg.recompute_tile_coords,
         )
+    # The rank-sliced PV partitions add the CTA rank themselves. Start their
+    # output coordinates at the rank-zero tile to avoid applying the rank twice.
+    output_m_tile0 = "flash_q_mma_tile0 * 2" if use_2cta_instrs else "flash_m_tile0"
+    output_m_tile1 = "flash_q_mma_tile1 * 2" if use_2cta_instrs else "flash_m_tile1"
     if use_tensor_4d_tma:
-        epi_tma_gmem0 = "tOgO_tma[None, flash_m_tile0, 0, flash_head, flash_batch]"
-        epi_tma_gmem1 = "tOgO_tma[None, flash_m_tile1, 0, flash_head, flash_batch]"
+        epi_tma_gmem0 = f"tOgO_tma[None, {output_m_tile0}, 0, flash_head, flash_batch]"
+        epi_tma_gmem1 = f"tOgO_tma[None, {output_m_tile1}, 0, flash_head, flash_batch]"
         epi_stg_mO_cur = "_flash_mOt[None, None, flash_head, flash_batch]"
         corr_gmem_o_index = (
             "flash_pvt.partition_C(flash_gO_corr)"
             "[None, None, None, {mtile}, 0, flash_head, flash_batch]"
         )
     else:
-        epi_tma_gmem0 = "tOgO_tma[None, flash_m_tile0, 0, flash_bh]"
-        epi_tma_gmem1 = "tOgO_tma[None, flash_m_tile1, 0, flash_bh]"
+        epi_tma_gmem0 = f"tOgO_tma[None, {output_m_tile0}, 0, flash_bh]"
+        epi_tma_gmem1 = f"tOgO_tma[None, {output_m_tile1}, 0, flash_bh]"
         epi_stg_mO_cur = "_flash_mOt[None, None, flash_bh]"
         corr_gmem_o_index = (
             "flash_pvt.partition_C(flash_gO_corr)"
@@ -7126,7 +7143,10 @@ if warp_idx == 15:
         )
 
     if cfg.mma_ptx:
-        q_stage_stride = mma_m * hd // 8
+        # Each CTA owns 128 Q rows even when a CtaGroup.TWO MMA spans 256 rows.
+        # SMEM descriptors use 16-byte units, so derive the stage stride from
+        # the per-CTA tile rather than the cluster-wide MMA M extent.
+        q_stage_stride = (mma_m // cta_group_size) * hd // 8
         if cfg.precompute_qk_desc:
             qk_desc_head = """
     flash_q_smem_base = _helion_flash_ptx.smem_desc_base_from_tensor(
@@ -7401,12 +7421,16 @@ if warp_idx == 15:
     mma_tmem_teardown = """    flash_tmem.relinquish_alloc_permit()
     flash_tmem_user_bar.arrive_and_wait()
     flash_tmem.free(flash_tmem_ptr)"""
+    mma_role_inner = mma_inner
+    if use_2cta_instrs:
+        # Both allocator warps must allocate and free the paired TMEM block. Only
+        # the leader CTA issues the CtaGroup.TWO MMA instructions.
+        mma_role_inner = f"""        if flash_is_leader_cta:
+{textwrap.indent(mma_inner, "    ")}"""
     mma_block = _flash_fa4_wrap(
-        f"{role_next} (warp_idx == 12) & flash_is_leader_cta:"
-        if use_2cta_instrs
-        else f"{role_next} warp_idx == 12:",
+        f"{role_next} warp_idx == 12:",
         mma_head,
-        mma_inner,
+        mma_role_inner,
         persistent,
         prelude="none",
         tail=mma_tmem_teardown,
@@ -8102,6 +8126,16 @@ if warp_idx == 15:
     split_corr_epi_handoff = scoped_corr_epi_smem and _flash_bool_env(
         "HELION_CUTE_FLASH_SPLIT_CORR_EPILOGUE_HANDOFF", True
     )
+    scoped_corr_epi_fn = (
+        "fa4_correction_epilogue_to_smem_scoped_2cta"
+        if use_2cta_instrs
+        else "fa4_correction_epilogue_to_smem_scoped"
+    )
+    scoped_corr_epi_handoff_fn = (
+        "fa4_correction_epilogue_handoff_to_smem_scoped_2cta"
+        if use_2cta_instrs
+        else "fa4_correction_epilogue_handoff_to_smem_scoped"
+    )
 
     def _corr_epi(stage: str, mtile: str) -> str:
         corr_cons_index = "0" if not is_causal else "flash_s_corr_cons_index"
@@ -8144,7 +8178,7 @@ if warp_idx == 15:
 {stat_empty_arrive}\
         {_corr_wait_o_ready(stage)}
         {_corr_wait_epi_empty(stage)}
-        _helion_flash_rt.fa4_correction_epilogue_to_smem_scoped(
+        _helion_flash_rt.{scoped_corr_epi_fn}(
             flash_pvt, tOtO{stage}, sO[None, None, {stage}], flash_local_tidx,
             flash_inv_sum{stage}, {hd}, {cfg.corr_tile_size}, {io_dtype})
         cute.arch.fence_view_async_shared()
@@ -8154,7 +8188,7 @@ if warp_idx == 15:
             barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
         flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
 {stat_empty_arrive}\
-        _helion_flash_rt.fa4_correction_epilogue_handoff_to_smem_scoped(
+        _helion_flash_rt.{scoped_corr_epi_handoff_fn}(
             flash_o_full_ptr + {stage}, flash_o_full_phase,
             flash_corr_epi_empty_ptr + {stage}, flash_corr_epi_empty_phase,
             flash_corr_epi_full_ptr + {stage},
@@ -8237,10 +8271,14 @@ if warp_idx == 15:
         if is_causal and not fa4_stat_handoff
         else ""
     )
+    # flash_pvt's direct-gmem partition already includes the CTA rank. Start it
+    # from the rank-zero base tile so the follower does not apply its rank twice.
+    corr_output_m_tile0 = output_m_tile0 if not epi_smem else "flash_m_tile0"
+    corr_output_m_tile1 = output_m_tile1 if not epi_smem else "flash_m_tile1"
     if cfg.skip_rescale_stats:
         corr_inner = f"""        # Final: divide by row_sum, cast, store (waits MMA's last-tile O_full).
-{_corr_epi("0", "flash_m_tile0")}
-{_corr_epi("1", "flash_m_tile1")}
+{_corr_epi("0", corr_output_m_tile0)}
+{_corr_epi("1", corr_output_m_tile1)}
 {corr_epi_empty_toggle}
 {corr_cons_advance.rstrip()}
         flash_o_full_phase ^= 1"""
@@ -8250,9 +8288,9 @@ if warp_idx == 15:
 {corr_stage1}
 {textwrap.indent(corr_cons_advance.rstrip(), "    ")}
         # Final: divide by row_sum, cast, store (waits MMA's last-tile O_full).
-{_corr_epi("0", "flash_m_tile0")}
+{_corr_epi("0", corr_output_m_tile0)}
         {_corr_release_p_ready("0")}
-{_corr_epi("1", "flash_m_tile1")}
+{_corr_epi("1", corr_output_m_tile1)}
         {_corr_release_p_ready("1")}
 {corr_epi_empty_toggle}
 {corr_cons_advance.rstrip()}
