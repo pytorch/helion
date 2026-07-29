@@ -1365,6 +1365,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=7,
                     num_compile_failures=1,
+                    num_worker_failures=2,
                     num_accuracy_failures=2,
                     num_generations=3,
                 )
@@ -1395,6 +1396,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=11,
                     num_compile_failures=3,
+                    num_worker_failures=4,
                     num_accuracy_failures=5,
                     num_generations=6,
                 )
@@ -1446,6 +1448,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         self.assertEqual(lfbo_instances[0].seed_configs, [Config(num_warps=4)])
         self.assertEqual(search._autotune_metrics.num_configs_tested, 18)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 4)
+        self.assertEqual(search._autotune_metrics.num_worker_failures, 6)
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 7)
         self.assertEqual(search._autotune_metrics.num_generations, 9)
         self.assertEqual(search.hybrid_stage_breakdown["llm_seed_configs_tested"], 7)
@@ -1498,6 +1501,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=4,
                     num_compile_failures=1,
+                    num_worker_failures=1,
                     num_accuracy_failures=0,
                     num_generations=2,
                 )
@@ -1529,6 +1533,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=6,
                     num_compile_failures=2,
+                    num_worker_failures=2,
                     num_accuracy_failures=1,
                     num_generations=5,
                 )
@@ -1580,6 +1585,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         )
         self.assertEqual(search._autotune_metrics.num_configs_tested, 10)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 3)
+        self.assertEqual(search._autotune_metrics.num_worker_failures, 3)
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
         self.assertEqual(search._autotune_metrics.num_generations, 7)
 

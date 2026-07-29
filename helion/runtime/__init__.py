@@ -3475,7 +3475,11 @@ def _create_cute_wrapper(
         [line + "\n" for line in source.splitlines()],
         filename,
     )
-    exec(compile(source, filename, "exec"), namespace)
+    try:
+        exec(compile(source, filename, "exec"), namespace)
+    except BaseException:
+        linecache.cache.pop(filename, None)
+        raise
     return namespace[func_name]
 
 
