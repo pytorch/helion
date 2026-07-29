@@ -985,7 +985,10 @@ class DeviceIR:
                 )
                 # Stash (rdim, used_graphs) for build_reduction_facts (see the field def).
                 self._rollable_reduction_records.append((rdim, used_graphs))
-                if env.backend_name == "cute":
+                # flydsl shares cute's per-reduction-block vector-width knob:
+                # V (elems/thread) is independent of the warp count (which comes
+                # from thread_count = chunk // V). Mirrors CuteBackend.
+                if env.backend_name in ("cute", "flydsl"):
                     env.config_spec.cute_vector_widths.append(
                         CuteVectorWidthSpec(
                             block_id=rdim.block_id,

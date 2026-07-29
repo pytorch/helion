@@ -113,6 +113,12 @@ def _(state: CodegenState) -> ast.AST:
     return state.ast_arg(0)
 
 
+@_decorators.codegen(subscript, "flydsl")
+def _(state: CodegenState) -> ast.AST:
+    # FlyDSL per-thread scalars: shape-only subscripts like [:, None] are no-ops.
+    return state.ast_arg(0)
+
+
 @_decorators.ref(subscript)
 def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
     # pyrefly: ignore [bad-index]

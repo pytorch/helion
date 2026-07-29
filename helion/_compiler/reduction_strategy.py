@@ -1097,6 +1097,32 @@ class LoopedReductionStrategy(ReductionStrategy):
                 thread_count, tile_dispatch.strategies
             )
         self._thread_count = thread_count
+        _bm = int(fn.config.block_sizes[0]) if fn.config.block_sizes else 1
+        if env.backend.name == "flydsl" and thread_count > 0:
+            # flydsl pins one wavefront (64 threads) per row. For bm>1 that is
+            # 64*bm threads = bm warps, each warp folding its own row -> per-row
+            # thread_count is 64. For bm==1 the row may span W wavefronts:
+            # thread_count = chunk // V (V from the shared cute_vector_widths knob),
+            # so W = thread_count // 64 and V are independent (chunk = 64*W*V);
+            # memory_ops derives redcol_vec = chunk // thread_count = V for free.
+            # (max_reduction_threads=1024 makes the base value chunk-sized, so we
+            # must override it here for every flydsl case.)
+            if _bm == 1:
+                _vw = cast(
+                    "list[int]", fn.config.config.get("cute_vector_widths", []) or []
+                )
+                # flydsl loads are ≥128-bit (V≥4); V=1/2 would waste bandwidth, so
+                # clamp up. Default (unset -> 1) becomes V=4 = the old 1-warp
+                # behavior at chunk=256; W>1 comes from larger chunks (chunk=64*W*4).
+                _v = max(
+                    4,
+                    env.config_spec.cute_vector_widths.config_get(_vw, block_index, 1)
+                    or 1,
+                )
+                _tc = (block_size // _v // 64) * 64
+                self._thread_count = max(64, min(1024, _tc))
+            else:
+                self._thread_count = 64
         self.block_size = block_size
         self._loop_block_size = block_size
         self._cute_reduction_lane_var: str | None = None
@@ -1261,6 +1287,23 @@ class LoopedReductionStrategy(ReductionStrategy):
         )
         return result_var
 
+    def _register_block_size_constexpr(
+        self, state: CodegenState, block_size_var: str
+    ) -> None:
+        # Register the loop block size as a constexpr kernel param and define it
+        # host-side.
+        if CompileEnvironment.current().backend.name == "flydsl":
+            # flydsl lowers the reduction loop to a runtime scf.for whose step must
+            # materialize as an in-region SSA value; a dynamic Constexpr kernel
+            # param does not (region isolation), so inline the per-config-constant
+            # block size as a module-level literal instead.
+            state.device_function.constexpr_arg(block_size_var, self._loop_block_size)
+            return
+        if state.device_function.constexpr_arg(block_size_var):
+            state.codegen.host_statements.append(
+                statement_from_string(f"{block_size_var} = {self._loop_block_size!r}")
+            )
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
         block_index = self.block_index
@@ -1269,10 +1312,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         index_var = self.index_var(block_index)
         block_size_var = self.block_size_var(block_index)
         assert block_size_var is not None
-        if state.device_function.constexpr_arg(block_size_var):
-            state.codegen.host_statements.append(
-                statement_from_string(f"{block_size_var} = {self._loop_block_size!r}")
-            )
+        self._register_block_size_constexpr(state, block_size_var)
         inner_body: list[ast.AST] = [
             statement_from_string(
                 f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)}"
@@ -1447,7 +1487,19 @@ class LoopedReductionStrategy(ReductionStrategy):
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+
             acc_full = backend.full_expr(shape_dims, constant_repr(default), acc_dtype)
+            if backend.name == "flydsl":
+                # flydsl's runtime scf.for carries the accumulator as an iter_arg
+                # whose init type must match the vector<Vxf32> the loop body yields.
+                # V = per-lane elements = loop chunk / thread count (identical to
+                # the redcol_vec derived in memory_ops).
+                _tc = self._thread_count or 0
+                _v = max(1, self._loop_block_size // _tc) if _tc else 1
+                acc_full = (
+                    f"fx.Vector.filled({_v}, {acc_full}, "
+                    f"{backend.dtype_str(acc_dtype)})"
+                )
             device_loop.outer_prefix.append(
                 statement_from_string(f"{acc} = {acc_full}")
             )
@@ -1547,6 +1599,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                         f"tl.static_assert({result}.dtype == {_dtype_str(fake_output.dtype)})"
                     )
                 )
+
             return expr_from_string(result)
 
 
