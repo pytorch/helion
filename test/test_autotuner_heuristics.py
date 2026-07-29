@@ -32,6 +32,7 @@ from helion._compiler.autotuner_heuristics.triton import (
 from helion._compiler.autotuner_heuristics.triton import _h100_matmul_tile
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
@@ -54,6 +55,8 @@ from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+from helion._compiler.cute.cute_flash import FLASH_LEGACY_CONFIG_KEYS
+from helion._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
 from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
 from helion._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
@@ -62,6 +65,8 @@ from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
 from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILIES
+from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
 from helion._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
 from helion._compiler.cute.cute_flash import FLASH_RECOMPUTE_TILE_COORDS_KEY
@@ -77,6 +82,7 @@ from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
 from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
 from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+from helion._compiler.cute.cute_flash import FLASH_USE_2CTA_KEY
 from helion._compiler.cute.cute_flash import flash_attention_seed_config
 from helion._compiler.cute.cute_flash import flash_attention_seed_configs
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
@@ -335,7 +341,7 @@ class TestAutotunerHeuristic(TestCase):
         self.assertTrue(spec.autotune_seed_configs())
 
         config_gen = spec.create_config_generation()
-        self.assertIn(FLASH_TOPOLOGY_KEY, config_gen._config_value_priors)
+        self.assertIn(FLASH_PIPELINE_FAMILY_KEY, config_gen._config_value_priors)
         self.assertIn(FLASH_CAUSAL_KV_ORDER_KEY, config_gen._config_value_priors)
         population = config_gen.random_population(4)
 
@@ -1663,8 +1669,25 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
 
     def test_cute_flash_accepts_extra_knobs(self) -> None:
-        self.assertIn(FLASH_MMA_INTERLEAVE_KEY, FLASH_CONFIG_KEYS)
-        self.assertIn(FLASH_Q_TILE_COUNT_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
+        self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_CONFIG_KEYS)
+        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 13)
+        self.assertEqual(
+            set(FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS),
+            {
+                FLASH_TOPOLOGY_KEY,
+                FLASH_CGA2_LOCAL_KEY,
+                FLASH_CLC_KEY,
+                FLASH_LOCAL_TMA_PARTITION_KEY,
+                FLASH_TENSOR_4D_TMA_KEY,
+                FLASH_USE_2CTA_KEY,
+            },
+        )
+        for legacy_key in FLASH_LEGACY_CONFIG_KEYS:
+            self.assertIn(legacy_key, FLASH_CONFIG_KEYS)
+            self.assertNotIn(legacy_key, FLASH_AUTOTUNE_CONFIG_KEYS)
+        self.assertIn(FLASH_MMA_INTERLEAVE_KEY, FLASH_LEGACY_CONFIG_KEYS)
+        self.assertIn(FLASH_Q_TILE_COUNT_KEY, FLASH_LEGACY_CONFIG_KEYS)
         self.assertIn(FLASH_PERSISTENT_CTAS_PER_SM_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_P_STORE_REP_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_S_LOAD_REP_KEY, FLASH_CONFIG_KEYS)
@@ -1698,7 +1721,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             assert seed is not None
             config = seed.config
             self.assertEqual(config["block_sizes"], [1, 128, 128])
-            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
             self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
             self.assertEqual(config[FLASH_KV_STAGE_KEY], 3)
             self.assertTrue(config[FLASH_PERSISTENT_KEY])
@@ -1723,9 +1746,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
             self.assertFalse(config[FLASH_SKIP_RESCALE_STATS_KEY])
             self.assertFalse(config[FLASH_PACKED_REDUCE_KEY])
-            self.assertFalse(config[FLASH_CLC_KEY])
-            self.assertFalse(config[FLASH_LOCAL_TMA_PARTITION_KEY])
-            self.assertFalse(config[FLASH_TENSOR_4D_TMA_KEY])
+            for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
+                self.assertNotIn(legacy_key, config)
 
         for (
             num_kv,
@@ -1893,7 +1915,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             assert seed is not None
             config = seed.config
             self.assertEqual(config["block_sizes"], [1, 128, 128])
-            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            if cga2_local:
+                expected_family = "fa4_cga2_local"
+            elif clc:
+                expected_family = (
+                    "fa4_clc_local_tma" if local_tma_partition else "fa4_clc"
+                )
+            elif local_tma_partition:
+                expected_family = "fa4_local_tma"
+            else:
+                expected_family = "fa4"
+            self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], expected_family)
             self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
             self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
             self.assertTrue(config[FLASH_PERSISTENT_KEY])
@@ -1922,16 +1954,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
             self.assertEqual(config[FLASH_SKIP_RESCALE_STATS_KEY], skip_rescale_stats)
             self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
-            self.assertEqual(config[FLASH_CGA2_LOCAL_KEY], cga2_local)
-            self.assertEqual(config[FLASH_CLC_KEY], clc)
             self.assertEqual(config[FLASH_CLC_HEADS_PER_BATCH_KEY], clc_heads_per_batch)
-            self.assertEqual(config[FLASH_LOCAL_TMA_PARTITION_KEY], local_tma_partition)
-            self.assertFalse(config[FLASH_TENSOR_4D_TMA_KEY])
+            for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
+                self.assertNotIn(legacy_key, config)
 
         very_long_seed = flash_attention_seed_config(64, 2048)
         assert very_long_seed is not None
         very_long_config = very_long_seed.config
-        self.assertEqual(very_long_config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(very_long_config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertEqual(very_long_config[FLASH_KV_STAGE_KEY], 3)
         self.assertEqual(very_long_config[FLASH_E2E_SCHEDULE_KEY], "16/4")
         self.assertEqual(very_long_config[FLASH_E2E_OFFSET_KEY], 0)
@@ -1952,8 +1982,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
         self.assertEqual(very_long_config[FLASH_RESCALE_CHUNK_COLS_KEY], 8)
         self.assertTrue(very_long_config[FLASH_PACKED_REDUCE_KEY])
-        self.assertFalse(very_long_config[FLASH_LOCAL_TMA_PARTITION_KEY])
-        self.assertFalse(very_long_config[FLASH_TENSOR_4D_TMA_KEY])
+        for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
+            self.assertNotIn(legacy_key, very_long_config)
 
         dense_sp_seed = flash_attention_seed_config(
             64,
@@ -1971,9 +2001,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(dense_sp_config[FLASH_KV_ORDER_KEY], "descending")
         self.assertEqual(dense_sp_config[FLASH_CORR_REGS_KEY], 80)
         self.assertEqual(dense_sp_config[FLASH_OTHER_REGS_KEY], 32)
-        self.assertFalse(dense_sp_config[FLASH_CGA2_LOCAL_KEY])
-        self.assertTrue(dense_sp_config[FLASH_LOCAL_TMA_PARTITION_KEY])
-        self.assertTrue(dense_sp_config[FLASH_TENSOR_4D_TMA_KEY])
+        self.assertEqual(dense_sp_config[FLASH_PIPELINE_FAMILY_KEY], "fa4_local_tma_4d")
         dense_sp_512_seed = flash_attention_seed_config(
             64,
             512,
@@ -1996,7 +2024,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         short_seed = flash_attention_seed_config(64, 8)
         assert short_seed is not None
-        self.assertEqual(short_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(short_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertNotIn(FLASH_E2E_OFFSET_KEY, short_seed.config)
 
         sparse_seed = flash_attention_seed_config(
@@ -2006,7 +2034,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             requires_ws_overlap=True,
         )
         assert sparse_seed is not None
-        self.assertEqual(sparse_seed.config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertEqual(sparse_seed.config[FLASH_PIPELINE_FAMILY_KEY], "ws_overlap")
         self.assertTrue(sparse_seed.config[FLASH_PACKED_REDUCE_KEY])
         self.assertNotIn(FLASH_E2E_OFFSET_KEY, sparse_seed.config)
 
@@ -2050,7 +2078,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             assert seed is not None
             config = seed.config
             self.assertEqual(config["block_sizes"], [1, 128, 128])
-            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
             self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
             self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
             self.assertFalse(config[FLASH_PERSISTENT_KEY])
@@ -2206,7 +2234,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
         assert seed is not None
         self.assertEqual(seed.config["block_sizes"], [1, 128, 128])
-        self.assertEqual(seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertNotIn(FLASH_E2E_OFFSET_KEY, seed.config)
         self.assertIn(seed, bound.config_spec.compiler_seed_configs)
         self.assertIsNone(bound.config_spec.compiler_default_config)
@@ -2247,9 +2275,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(dense_2048_seed.config[FLASH_CORR_TILE_SIZE_KEY], 16)
         self.assertEqual(dense_2048_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
         self.assertFalse(dense_2048_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertFalse(dense_2048_seed.config[FLASH_CLC_KEY])
-        self.assertFalse(dense_2048_seed.config[FLASH_LOCAL_TMA_PARTITION_KEY])
-        self.assertFalse(dense_2048_seed.config[FLASH_TENSOR_4D_TMA_KEY])
+        self.assertEqual(dense_2048_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertIn(
             dense_2048_seed, dense_2048_bound.config_spec.compiler_seed_configs
         )
@@ -2279,9 +2305,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
         self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
         self.assertTrue(dense_8192_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertFalse(dense_8192_seed.config[FLASH_CLC_KEY])
-        self.assertFalse(dense_8192_seed.config[FLASH_LOCAL_TMA_PARTITION_KEY])
-        self.assertFalse(dense_8192_seed.config[FLASH_TENSOR_4D_TMA_KEY])
+        self.assertEqual(dense_8192_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertNotIn(FLASH_CAUSAL_LPT_SWIZZLE_KEY, dense_8192_seed.config)
         dense_8192_gen = ConfigGeneration(dense_8192_bound.config_spec)
         dense_8192_roundtrip = dense_8192_gen.unflatten(
@@ -2306,7 +2330,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         assert causal_hd64_seed is not None
         self.assertEqual(causal_hd64_seed.config["block_sizes"], [1, 128, 128])
-        self.assertEqual(causal_hd64_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(causal_hd64_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertTrue(causal_hd64_seed.config[FLASH_PACKED_REDUCE_KEY])
         self.assertIn(
             causal_hd64_seed, causal_hd64_bound.config_spec.compiler_seed_configs
@@ -2397,7 +2421,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             causal_hd128_bound.env, causal_hd128_bound.host_function.device_ir
         )
         assert causal_hd128_seed is not None
-        self.assertEqual(causal_hd128_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(causal_hd128_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertEqual(causal_hd128_seed.config[FLASH_KV_STAGE_KEY], 2)
 
         # fp32 attention is not flash-eligible (the kernel hardcodes fp16).

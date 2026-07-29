@@ -891,6 +891,83 @@ _FLASH_NUM_REGS_PRODUCER = 96
 _FLASH_NUM_REGS_CONSUMER = 184
 
 
+class FlashPipelineFamilyFlags(NamedTuple):
+    topology: str
+    use_2cta_instrs: bool = False
+    use_cga2_local_cta: bool = False
+    use_clc_scheduler: bool = False
+    local_tma_partition: bool = False
+    tensor_4d_tma: bool = False
+
+
+FLASH_PIPELINE_FAMILY_FLAGS: dict[str, FlashPipelineFamilyFlags] = {
+    "ws_overlap": FlashPipelineFamilyFlags("ws_overlap"),
+    "fa4": FlashPipelineFamilyFlags("fa4"),
+    "fa4_tma_4d": FlashPipelineFamilyFlags("fa4", tensor_4d_tma=True),
+    "fa4_local_tma": FlashPipelineFamilyFlags("fa4", local_tma_partition=True),
+    "fa4_local_tma_4d": FlashPipelineFamilyFlags(
+        "fa4", local_tma_partition=True, tensor_4d_tma=True
+    ),
+    "fa4_cga2_local": FlashPipelineFamilyFlags("fa4", use_cga2_local_cta=True),
+    "fa4_cga2_local_tma_4d": FlashPipelineFamilyFlags(
+        "fa4", use_cga2_local_cta=True, tensor_4d_tma=True
+    ),
+    "fa4_2cta": FlashPipelineFamilyFlags("fa4", use_2cta_instrs=True),
+    "fa4_2cta_tma_4d": FlashPipelineFamilyFlags(
+        "fa4", use_2cta_instrs=True, tensor_4d_tma=True
+    ),
+    "fa4_clc": FlashPipelineFamilyFlags("fa4", use_clc_scheduler=True),
+    "fa4_clc_tma_4d": FlashPipelineFamilyFlags(
+        "fa4", use_clc_scheduler=True, tensor_4d_tma=True
+    ),
+    "fa4_clc_local_tma": FlashPipelineFamilyFlags(
+        "fa4", use_clc_scheduler=True, local_tma_partition=True
+    ),
+    "fa4_clc_local_tma_4d": FlashPipelineFamilyFlags(
+        "fa4",
+        use_clc_scheduler=True,
+        local_tma_partition=True,
+        tensor_4d_tma=True,
+    ),
+}
+FLASH_PIPELINE_FAMILIES = tuple(FLASH_PIPELINE_FAMILY_FLAGS)
+
+
+def _flash_pipeline_family_flags(
+    family: object,
+) -> FlashPipelineFamilyFlags | None:
+    return FLASH_PIPELINE_FAMILY_FLAGS.get(family) if isinstance(family, str) else None
+
+
+def _flash_pipeline_family_from_flags(
+    *,
+    topology: str,
+    use_2cta_instrs: bool,
+    use_cga2_local_cta: bool,
+    use_clc_scheduler: bool,
+    local_tma_partition: bool,
+    tensor_4d_tma: bool,
+) -> str:
+    if topology != "fa4":
+        return "ws_overlap"
+    if use_2cta_instrs:
+        base = "fa4_2cta"
+        local_tma_partition = False
+    elif use_cga2_local_cta:
+        base = "fa4_cga2_local"
+        local_tma_partition = False
+    elif use_clc_scheduler:
+        base = "fa4_clc"
+    else:
+        base = "fa4"
+    if local_tma_partition:
+        base += "_local_tma"
+    if tensor_4d_tma:
+        base += "_tma_4d" if not local_tma_partition else "_4d"
+    assert base in FLASH_PIPELINE_FAMILY_FLAGS
+    return base
+
+
 @dataclasses.dataclass(frozen=True)
 class FlashAttentionConfig:
     """Resolved topology config for the CuTe flash-attention codegen.
@@ -910,12 +987,12 @@ class FlashAttentionConfig:
 
     # Stage B/C topology fields (consumed by the fa4 emitter)
     topology: str = "ws_overlap"
+    pipeline_family: str = "ws_overlap"
     num_softmax_warpgroups: int = 1
     num_correction_warps: int = 0
     num_mma_warps: int = 0
     num_load_warps: int = 0
     num_epilogue_warps: int = 0
-    q_tile_count: int = 1
     acc_stage: int = 1
     epi_stage: int = 1
     # exp2 defaults to the FMA/XU pipe-split (split f8/r2): measured +2.9pp hd64
@@ -936,7 +1013,6 @@ class FlashAttentionConfig:
     e2e_offset0: int = 0
     tmem_plan: str = "separate"
     tmem_s_to_p_offset: int = 0
-    mma_interleave: bool = False
     # fa4 Stage 2b: issue the MMA-warp QK/PV via the FA4 ``gemm_ptx_partial`` (one
     # inline-asm region with literal-immediate descriptors) instead of cute.gemm.
     # Fits the MMA warp at 48 regs (cute.gemm spills ~116 STL/133 LDL) AND folds the
@@ -1325,12 +1401,27 @@ def resolve_flash_config(
     # length is a multiple of 256 (the fa4 body handles two 128-row Q tiles per
     # work item); otherwise fall back to ws_overlap.
     topology_default = "fa4" if num_kv % 2 == 0 else "ws_overlap"
-    topology = os.environ.get("HELION_CUTE_FLASH_TOPOLOGY", topology_default)
-    # Config override: the autotuner picks the topology. Stale/ineligible fa4
-    # values can appear for best-config cache transfer, but are clamped below.
-    topology_cfg = _cfg(FLASH_TOPOLOGY_KEY)
-    if topology_cfg is not None:
-        topology = str(topology_cfg)
+    legacy_structural_config = any(
+        _cfg(key) is not None for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
+    )
+    pipeline_family_cfg = _cfg(FLASH_PIPELINE_FAMILY_KEY)
+    pipeline_family_env = os.environ.get("HELION_CUTE_FLASH_PIPELINE_FAMILY")
+    requested_family_flags = (
+        _flash_pipeline_family_flags(pipeline_family_cfg)
+        if pipeline_family_cfg is not None
+        else None
+        if legacy_structural_config
+        else _flash_pipeline_family_flags(pipeline_family_env)
+    )
+    if requested_family_flags is not None:
+        topology = requested_family_flags.topology
+    else:
+        topology = os.environ.get("HELION_CUTE_FLASH_TOPOLOGY", topology_default)
+        # Legacy fixed configs and environment overrides remain accepted. The
+        # compound family above takes precedence when explicitly selected.
+        topology_cfg = _cfg(FLASH_TOPOLOGY_KEY)
+        if topology_cfg is not None:
+            topology = str(topology_cfg)
     if topology not in ("ws_overlap", "fa4"):
         topology = "ws_overlap"
     if topology == "fa4" and num_kv % 2 != 0:
@@ -1412,10 +1503,6 @@ def resolve_flash_config(
     num_mma_warps = int(os.environ.get("HELION_CUTE_FLASH_NUM_MMA_WARPS", "0"))
     num_load_warps = int(os.environ.get("HELION_CUTE_FLASH_NUM_LOAD_WARPS", "0"))
     num_epilogue_warps = int(os.environ.get("HELION_CUTE_FLASH_NUM_EPI_WARPS", "0"))
-    q_tile_count = int(os.environ.get("HELION_CUTE_FLASH_Q_TILE_COUNT", "1"))
-    q_tile_count_cfg = _cfg(FLASH_Q_TILE_COUNT_KEY)
-    if q_tile_count_cfg is not None:
-        q_tile_count = int(q_tile_count_cfg)  # type: ignore[arg-type]
     acc_stage = int(os.environ.get("HELION_CUTE_FLASH_ACC_STAGE", "1"))
     epi_stage = int(os.environ.get("HELION_CUTE_FLASH_EPI_STAGE", "1"))
     # Exp2 pipe-split schedule. The autotuner sees this as one paired schedule
@@ -1530,10 +1617,6 @@ def resolve_flash_config(
     tmem_s_to_p_offset = int(
         os.environ.get("HELION_CUTE_FLASH_TMEM_S_TO_P_OFFSET", "0")
     )
-    mma_interleave = _flash_bool_env("HELION_CUTE_FLASH_MMA_INTERLEAVE", False)
-    mma_interleave_cfg = _cfg(FLASH_MMA_INTERLEAVE_KEY)
-    if mma_interleave_cfg is not None:
-        mma_interleave = bool(mma_interleave_cfg)
     # fa4 Stage 2b: PTX-path MMA warp (default ON for fa4). HELION_CUTE_FLASH_MMA_PTX=0
     # reverts to the cute.gemm path (the Stage-1/2a body, for A/B comparison).
     mma_ptx = _flash_bool_env("HELION_CUTE_FLASH_MMA_PTX", True)
@@ -1862,10 +1945,13 @@ def resolve_flash_config(
         role_map = "helion"
     if topology != "fa4":
         role_map = "helion"
-    use_2cta_instrs = _flash_bool_env("HELION_CUTE_FLASH_USE_2CTA", False)
-    use_2cta_cfg = _cfg(FLASH_USE_2CTA_KEY)
-    if use_2cta_cfg is not None:
-        use_2cta_instrs = bool(use_2cta_cfg)
+    if requested_family_flags is not None:
+        use_2cta_instrs = requested_family_flags.use_2cta_instrs
+    else:
+        use_2cta_instrs = _flash_bool_env("HELION_CUTE_FLASH_USE_2CTA", False)
+        use_2cta_cfg = _cfg(FLASH_USE_2CTA_KEY)
+        if use_2cta_cfg is not None:
+            use_2cta_instrs = bool(use_2cta_cfg)
     dense_hd64_2cta = (
         head_dim == 64 and 256 <= num_kv <= 1024 and dtype is torch.float16
     )
@@ -1887,6 +1973,7 @@ def resolve_flash_config(
         # split publication are required to beat the established one-CTA seed.
         epi_tma = True
         epi_stg = False
+        epi_stg_store = "slice"
         epi_stg_gmem = "stage"
         p_store_repetition = 16
         split_p_arrive = True
@@ -1896,15 +1983,20 @@ def resolve_flash_config(
     use_cga2_local_default = (
         _flash_dense_hd64_seed_cga2_local(num_kv) if long_dense_hd64_fa4 else False
     )
-    use_cga2_local_cta = _flash_bool_env(
-        "HELION_CUTE_FLASH_CGA2_LOCAL", use_cga2_local_default
-    )
     use_cga2_local_cfg = _cfg(FLASH_CGA2_LOCAL_KEY)
-    use_cga2_local_overridden = (
-        "HELION_CUTE_FLASH_CGA2_LOCAL" in os.environ or use_cga2_local_cfg is not None
-    )
-    if use_cga2_local_cfg is not None:
-        use_cga2_local_cta = bool(use_cga2_local_cfg)
+    if requested_family_flags is not None:
+        use_cga2_local_cta = requested_family_flags.use_cga2_local_cta
+        use_cga2_local_overridden = True
+    else:
+        use_cga2_local_cta = _flash_bool_env(
+            "HELION_CUTE_FLASH_CGA2_LOCAL", use_cga2_local_default
+        )
+        use_cga2_local_overridden = (
+            "HELION_CUTE_FLASH_CGA2_LOCAL" in os.environ
+            or use_cga2_local_cfg is not None
+        )
+        if use_cga2_local_cfg is not None:
+            use_cga2_local_cta = bool(use_cga2_local_cfg)
     if (
         topology != "fa4"
         or is_causal
@@ -1916,12 +2008,15 @@ def resolve_flash_config(
     use_clc_scheduler_default = (
         _flash_dense_hd64_seed_clc(num_kv) if long_dense_hd64_fa4 else False
     )
-    use_clc_scheduler = _flash_bool_env(
-        "HELION_CUTE_FLASH_CLC", use_clc_scheduler_default
-    )
-    use_clc_scheduler_cfg = _cfg(FLASH_CLC_KEY)
-    if use_clc_scheduler_cfg is not None:
-        use_clc_scheduler = bool(use_clc_scheduler_cfg)
+    if requested_family_flags is not None:
+        use_clc_scheduler = requested_family_flags.use_clc_scheduler
+    else:
+        use_clc_scheduler = _flash_bool_env(
+            "HELION_CUTE_FLASH_CLC", use_clc_scheduler_default
+        )
+        use_clc_scheduler_cfg = _cfg(FLASH_CLC_KEY)
+        if use_clc_scheduler_cfg is not None:
+            use_clc_scheduler = bool(use_clc_scheduler_cfg)
     if use_clc_scheduler and use_cga2_local_cta and not use_cga2_local_overridden:
         use_cga2_local_cta = False
     if (
@@ -1979,25 +2074,41 @@ def resolve_flash_config(
         if long_dense_hd64_fa4
         else False
     )
-    local_tma_partition = _flash_bool_env(
-        "HELION_CUTE_FLASH_LOCAL_TMA", local_tma_partition_default
+    if requested_family_flags is not None:
+        local_tma_partition = requested_family_flags.local_tma_partition
+    else:
+        local_tma_partition = _flash_bool_env(
+            "HELION_CUTE_FLASH_LOCAL_TMA", local_tma_partition_default
+        )
+        local_tma_partition_cfg = _cfg(FLASH_LOCAL_TMA_PARTITION_KEY)
+        if local_tma_partition_cfg is not None:
+            local_tma_partition = bool(local_tma_partition_cfg)
+    local_tma_partition = (
+        local_tma_partition
+        and topology == "fa4"
+        and persistent
+        and not use_2cta_instrs
+        and not use_cga2_local_cta
     )
-    local_tma_partition_cfg = _cfg(FLASH_LOCAL_TMA_PARTITION_KEY)
-    if local_tma_partition_cfg is not None:
-        local_tma_partition = bool(local_tma_partition_cfg)
-    local_tma_partition = local_tma_partition and topology == "fa4"
-    if use_cga2_local_cta:
-        local_tma_partition = False
     tensor_4d_tma_default = (
         _flash_dense_hd64_seed_tensor_4d_tma(num_kv) if long_dense_hd64_fa4 else False
     )
-    tensor_4d_tma = _flash_bool_env(
-        "HELION_CUTE_FLASH_TENSOR_4D", tensor_4d_tma_default
+    if requested_family_flags is not None:
+        tensor_4d_tma = requested_family_flags.tensor_4d_tma
+    else:
+        tensor_4d_tma = _flash_bool_env(
+            "HELION_CUTE_FLASH_TENSOR_4D", tensor_4d_tma_default
+        )
+        tensor_4d_tma_cfg = _cfg(FLASH_TENSOR_4D_TMA_KEY)
+        if tensor_4d_tma_cfg is not None:
+            tensor_4d_tma = bool(tensor_4d_tma_cfg)
+    tensor_4d_tma = (
+        tensor_4d_tma
+        and topology == "fa4"
+        and not is_causal
+        and head_dim == 64
+        and dtype is torch.float16
     )
-    tensor_4d_tma_cfg = _cfg(FLASH_TENSOR_4D_TMA_KEY)
-    if tensor_4d_tma_cfg is not None:
-        tensor_4d_tma = bool(tensor_4d_tma_cfg)
-    tensor_4d_tma = tensor_4d_tma and topology == "fa4"
     causal_loop_split_default = (
         causal_hd64_seeded_fa4 and causal_kv_order == "descending"
     )
@@ -2009,6 +2120,28 @@ def resolve_flash_config(
         causal_loop_split = bool(causal_loop_split_cfg)
     if not is_causal or topology != "fa4" or causal_kv_order != "descending":
         causal_loop_split = False
+    if topology == "fa4":
+        # FA4 has a fixed two-query score pipeline. The generic WS s-stage and
+        # row-reduction choices do not participate in its emitted source.
+        s_stage = 2
+        packed_reduce = True
+        if not softmax_disc:
+            disc_pipe_depth = 1
+    else:
+        # Canonicalize FA4-only children so WS candidates that emit the same
+        # source also have the same normalized config identity.
+        disc_pipe_depth = 1
+        e2e_offset = 0
+        e2e_offset0 = 0
+        causal_lpt_swizzle = 0
+    pipeline_family = _flash_pipeline_family_from_flags(
+        topology=topology,
+        use_2cta_instrs=use_2cta_instrs,
+        use_cga2_local_cta=use_cga2_local_cta,
+        use_clc_scheduler=use_clc_scheduler,
+        local_tma_partition=local_tma_partition,
+        tensor_4d_tma=tensor_4d_tma,
+    )
     return FlashAttentionConfig(
         s_stage=s_stage,
         kv_stage=kv_stage,
@@ -2018,12 +2151,12 @@ def resolve_flash_config(
         num_regs_producer=_FLASH_NUM_REGS_PRODUCER,
         num_regs_consumer=_FLASH_NUM_REGS_CONSUMER,
         topology=topology,
+        pipeline_family=pipeline_family,
         num_softmax_warpgroups=num_softmax_warpgroups,
         num_correction_warps=num_correction_warps,
         num_mma_warps=num_mma_warps,
         num_load_warps=num_load_warps,
         num_epilogue_warps=num_epilogue_warps,
-        q_tile_count=q_tile_count,
         acc_stage=acc_stage,
         epi_stage=epi_stage,
         exp2_impl=exp2_impl,
@@ -2037,7 +2170,6 @@ def resolve_flash_config(
         e2e_offset0=e2e_offset0,
         tmem_plan=tmem_plan,
         tmem_s_to_p_offset=tmem_s_to_p_offset,
-        mma_interleave=mma_interleave,
         mma_ptx=mma_ptx,
         softmax_disc=softmax_disc,
         disc_pipe_depth=disc_pipe_depth,
@@ -2079,11 +2211,10 @@ def resolve_flash_config(
 # Autotune surface for the flash-attention config (Tasks #25 + #28).
 #
 # Mirrors the ``Tcgen05WarpSpec`` pattern in ``strategies.py`` /
-# ``tcgen05_config.py``: each autotunable field gets its own config key so the
-# autotuner can permute them independently, a ``FLASH_CONFIG_KEYS`` tuple
-# aggregates them, and ``flash_config_from_config`` reconstructs the dataclass
-# from a config Mapping (falling back to env/shape resolution for every key the
-# config does not carry).
+# ``tcgen05_config.py``. Independent arithmetic fields retain individual keys;
+# structural scheduling is represented by one compound pipeline-family key.
+# ``FLASH_CONFIG_KEYS`` aggregates the active and legacy inputs, and
+# ``flash_config_from_config`` reconstructs the effective dataclass.
 #
 # Gating: these keys are ONLY inserted into the search surface when
 # ``ConfigSpec.cute_flash_search_enabled`` is True (set when the flash detector
@@ -2106,6 +2237,8 @@ FLASH_E2E_FREQ_KEY = "cute_flash_e2e_freq"
 FLASH_E2E_RES_KEY = "cute_flash_e2e_res"
 FLASH_MMA_INTERLEAVE_KEY = "cute_flash_mma_interleave"
 FLASH_Q_TILE_COUNT_KEY = "cute_flash_q_tile_count"
+# Compound schedule family. Legacy topology/cluster/TMA keys normalize into it.
+FLASH_PIPELINE_FAMILY_KEY = "cute_flash_pipeline_family"
 # fa4 win (commit 38ff4d1a): the topology selector + the two fa4 perf levers.
 FLASH_TOPOLOGY_KEY = "cute_flash_topology"
 FLASH_SOFTMAX_DISC_KEY = "cute_flash_softmax_disc"
@@ -2152,7 +2285,7 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_MASKED_E2E_SCHEDULE_KEY,
     FLASH_E2E_OFFSET_KEY,
     FLASH_E2E_OFFSET0_KEY,
-    FLASH_TOPOLOGY_KEY,
+    FLASH_PIPELINE_FAMILY_KEY,
     FLASH_SOFTMAX_DISC_KEY,
     FLASH_DISC_PIPE_KEY,
     FLASH_SPLIT_P_ARRIVE_KEY,
@@ -2177,15 +2310,19 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_CAUSAL_LPT_SWIZZLE_KEY,
     FLASH_CAUSAL_KV_ORDER_KEY,
     FLASH_ROLE_MAP_KEY,
-    FLASH_USE_2CTA_KEY,
-    FLASH_CGA2_LOCAL_KEY,
-    FLASH_CLC_KEY,
     FLASH_CLC_HEADS_PER_BATCH_KEY,
     FLASH_CLC_PDL_KEY,
     FLASH_CLC_STAGES_KEY,
+    FLASH_CAUSAL_LOOP_SPLIT_KEY,
+)
+
+FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
+    FLASH_TOPOLOGY_KEY,
+    FLASH_USE_2CTA_KEY,
+    FLASH_CGA2_LOCAL_KEY,
+    FLASH_CLC_KEY,
     FLASH_LOCAL_TMA_PARTITION_KEY,
     FLASH_TENSOR_4D_TMA_KEY,
-    FLASH_CAUSAL_LOOP_SPLIT_KEY,
 )
 
 FLASH_LEGACY_CONFIG_KEYS: tuple[str, ...] = (
@@ -2194,11 +2331,58 @@ FLASH_LEGACY_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_E2E_RES_KEY,
     FLASH_MMA_INTERLEAVE_KEY,
     FLASH_Q_TILE_COUNT_KEY,
+    *FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS,
 )
 
 FLASH_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_AUTOTUNE_CONFIG_KEYS + FLASH_LEGACY_CONFIG_KEYS
 )
+
+
+def flash_effective_config_values(
+    config: FlashAttentionConfig,
+) -> dict[str, object]:
+    """Project a resolved flash config onto the active autotune schema."""
+    return {
+        FLASH_S_STAGE_KEY: config.s_stage,
+        FLASH_KV_STAGE_KEY: config.kv_stage,
+        FLASH_PERSISTENT_KEY: config.persistent,
+        FLASH_PERSISTENT_CTAS_PER_SM_KEY: config.persistent_ctas_per_sm,
+        FLASH_RECOMPUTE_TILE_COORDS_KEY: config.recompute_tile_coords,
+        FLASH_E2E_SCHEDULE_KEY: config.e2e_schedule,
+        FLASH_MASKED_E2E_SCHEDULE_KEY: config.masked_e2e_schedule,
+        FLASH_E2E_OFFSET_KEY: config.e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: config.e2e_offset0,
+        FLASH_PIPELINE_FAMILY_KEY: config.pipeline_family,
+        FLASH_SOFTMAX_DISC_KEY: config.softmax_disc,
+        FLASH_DISC_PIPE_KEY: config.disc_pipe_depth,
+        FLASH_SPLIT_P_ARRIVE_KEY: config.split_p_arrive,
+        FLASH_P_STORE_REP_KEY: config.p_store_repetition,
+        FLASH_S_LOAD_REP_KEY: config.s_load_repetition,
+        FLASH_PRECOMPUTE_QK_DESC_KEY: config.precompute_qk_desc,
+        FLASH_FIRST_LOAD_ORDER_KEY: config.first_load_order,
+        FLASH_KV_ORDER_KEY: config.kv_order,
+        FLASH_EPI_TMA_KEY: config.epi_tma,
+        FLASH_EPI_STG_KEY: config.epi_stg,
+        FLASH_EPI_STG_STORE_KEY: config.epi_stg_store,
+        FLASH_EPI_STG_GMEM_KEY: config.epi_stg_gmem,
+        FLASH_RESCALE_THRESHOLD_KEY: config.rescale_threshold,
+        FLASH_SKIP_RESCALE_STATS_KEY: config.skip_rescale_stats,
+        FLASH_RESCALE_CHUNK_COLS_KEY: config.rescale_chunk_cols,
+        FLASH_SOFTMAX_REGS_KEY: config.softmax_regs,
+        FLASH_CORR_REGS_KEY: config.corr_regs,
+        FLASH_OTHER_REGS_KEY: config.other_regs,
+        FLASH_CORR_TILE_SIZE_KEY: config.corr_tile_size,
+        FLASH_PACKED_REDUCE_KEY: config.packed_reduce,
+        FLASH_SMALL_BIASED_KEY: config.small_biased,
+        FLASH_CAUSAL_LPT_SWIZZLE_KEY: config.causal_lpt_swizzle,
+        FLASH_CAUSAL_KV_ORDER_KEY: config.causal_kv_order,
+        FLASH_ROLE_MAP_KEY: config.role_map,
+        FLASH_CLC_HEADS_PER_BATCH_KEY: config.clc_heads_per_batch,
+        FLASH_CLC_PDL_KEY: config.clc_use_pdl,
+        FLASH_CLC_STAGES_KEY: config.clc_stages,
+        FLASH_CAUSAL_LOOP_SPLIT_KEY: config.causal_loop_split,
+    }
 
 
 def _flash_choices_with_default(default: _T, choices: Iterable[_T]) -> tuple[_T, ...]:
@@ -2448,18 +2632,28 @@ def flash_attention_value_prior_weights(
         clc_heads_per_batch = _flash_dense_hd64_seed_clc_heads_per_batch(num_kv)
         persistent_ctas_per_sm = _flash_dense_hd64_seed_persistent_ctas_per_sm(num_kv)
         recompute_tile_coords = _flash_dense_hd64_seed_recompute_tile_coords(num_kv)
-        local_tma_partition = _flash_dense_hd64_seed_local_tma_partition(num_kv)
+        pipeline_family = _flash_pipeline_family_from_flags(
+            topology="fa4",
+            use_2cta_instrs=False,
+            use_cga2_local_cta=_flash_dense_hd64_seed_cga2_local(num_kv),
+            use_clc_scheduler=clc,
+            local_tma_partition=_flash_dense_hd64_seed_local_tma_partition(num_kv),
+            tensor_4d_tma=_flash_dense_hd64_seed_tensor_4d_tma(num_kv),
+        )
+        pipeline_family_priors: dict[object, float] = {
+            pipeline_family: 4.0,
+            "ws_overlap": 1.0,
+        }
+        if pipeline_family != "fa4":
+            pipeline_family_priors["fa4"] = 1.0
+        if num_kv == 512 and dtype is torch.float16:
+            pipeline_family_priors["fa4_2cta"] = 4.0
         very_long_dense_hd64_fa4 = num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
         priors = cast(
             "dict[str, dict[object, float]]",
             {
                 FLASH_S_STAGE_KEY: {2: 1.0},
-                FLASH_TOPOLOGY_KEY: {"fa4": 4.0, "ws_overlap": 1.0},
-                FLASH_USE_2CTA_KEY: (
-                    {True: 4.0, False: 2.0}
-                    if num_kv == 512 and dtype is torch.float16
-                    else {False: 1.0}
-                ),
+                FLASH_PIPELINE_FAMILY_KEY: pipeline_family_priors,
                 FLASH_PERSISTENT_KEY: {True: 1.0},
                 FLASH_PERSISTENT_CTAS_PER_SM_KEY: {
                     persistent_ctas_per_sm: 4.0,
@@ -2582,24 +2776,12 @@ def flash_attention_value_prior_weights(
                     **{stage: 2.0 for stage in (2, 3) if stage != kv_stage},
                 },
                 FLASH_PACKED_REDUCE_KEY: {packed_reduce: 4.0, not packed_reduce: 1.0},
-                FLASH_CGA2_LOCAL_KEY: (
-                    {False: 2.0, True: 2.0} if num_kv % 4 == 0 else {False: 1.0}
-                ),
-                FLASH_CLC_KEY: {clc: 4.0, not clc: 1.0},
                 FLASH_CLC_HEADS_PER_BATCH_KEY: {
                     clc_heads_per_batch: 4.0,
                     **{heads: 2.0 for heads in (0, 32) if heads != clc_heads_per_batch},
                 },
                 FLASH_CLC_PDL_KEY: {False: 4.0, True: 1.0},
                 FLASH_CLC_STAGES_KEY: {2: 4.0, 3: 1.0, 1: 1.0},
-                FLASH_LOCAL_TMA_PARTITION_KEY: {
-                    local_tma_partition: 4.0,
-                    not local_tma_partition: 1.0,
-                },
-                FLASH_TENSOR_4D_TMA_KEY: {
-                    _flash_dense_hd64_seed_tensor_4d_tma(num_kv): 4.0,
-                    (not _flash_dense_hd64_seed_tensor_4d_tma(num_kv)): 2.0,
-                },
                 FLASH_E2E_OFFSET_KEY: {
                     e2e_offset: 4.0,
                     **{offset: 2.0 for offset in (0, 1, 2, 3) if offset != e2e_offset},
@@ -2617,9 +2799,6 @@ def flash_attention_value_prior_weights(
                     FLASH_EPI_STG_STORE_KEY: {"slice": 1.0},
                     FLASH_EPI_STG_GMEM_KEY: {"stage": 1.0},
                     FLASH_PACKED_REDUCE_KEY: {packed_reduce: 1.0},
-                    FLASH_CGA2_LOCAL_KEY: {
-                        _flash_dense_hd64_seed_cga2_local(num_kv): 1.0
-                    },
                     FLASH_SKIP_RESCALE_STATS_KEY: {False: 1.0},
                 }
             )
@@ -2687,7 +2866,7 @@ def flash_attention_value_prior_weights(
         return cast(
             "dict[str, dict[object, float]]",
             {
-                FLASH_TOPOLOGY_KEY: {"fa4": 4.0, "ws_overlap": 1.0},
+                FLASH_PIPELINE_FAMILY_KEY: {"fa4": 4.0, "ws_overlap": 1.0},
                 FLASH_PERSISTENT_KEY: {False: 1.0},
                 FLASH_KV_STAGE_KEY: {
                     2: 4.0,
@@ -2812,7 +2991,7 @@ def _flash_default_seed_config(
     if small_biased_candidate:
         _flash_seed_set(seed, fragments, FLASH_SMALL_BIASED_KEY, True)
     if topology is not None and not _flash_seed_set(
-        seed, fragments, FLASH_TOPOLOGY_KEY, topology
+        seed, fragments, FLASH_PIPELINE_FAMILY_KEY, topology
     ):
         return None
 
@@ -2835,6 +3014,14 @@ def _flash_default_seed_config(
         ) = _flash_dense_hd64_seed_params(num_kv)
         rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
         family_values = {
+            FLASH_PIPELINE_FAMILY_KEY: _flash_pipeline_family_from_flags(
+                topology="fa4",
+                use_2cta_instrs=False,
+                use_cga2_local_cta=_flash_dense_hd64_seed_cga2_local(num_kv),
+                use_clc_scheduler=_flash_dense_hd64_seed_clc(num_kv),
+                local_tma_partition=_flash_dense_hd64_seed_local_tma_partition(num_kv),
+                tensor_4d_tma=_flash_dense_hd64_seed_tensor_4d_tma(num_kv),
+            ),
             FLASH_S_STAGE_KEY: 2,
             FLASH_KV_STAGE_KEY: kv_stage,
             FLASH_PERSISTENT_KEY: True,
@@ -2871,17 +3058,11 @@ def _flash_default_seed_config(
             ),
             FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk_cols,
             FLASH_PACKED_REDUCE_KEY: packed_reduce,
-            FLASH_CGA2_LOCAL_KEY: _flash_dense_hd64_seed_cga2_local(num_kv),
-            FLASH_CLC_KEY: _flash_dense_hd64_seed_clc(num_kv),
             FLASH_CLC_HEADS_PER_BATCH_KEY: _flash_dense_hd64_seed_clc_heads_per_batch(
                 num_kv
             ),
             FLASH_CLC_PDL_KEY: False,
             FLASH_CLC_STAGES_KEY: 2 if _flash_dense_hd64_seed_clc(num_kv) else 1,
-            FLASH_LOCAL_TMA_PARTITION_KEY: _flash_dense_hd64_seed_local_tma_partition(
-                num_kv
-            ),
-            FLASH_TENSOR_4D_TMA_KEY: _flash_dense_hd64_seed_tensor_4d_tma(num_kv),
         }
         role_map = _flash_dense_hd64_seed_role_map(num_kv)
         if role_map != "helion":
@@ -2949,7 +3130,7 @@ def _flash_dense_sp_seed_config(
     rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
     seed: dict[str, object] = {"block_sizes": block_sizes}
     family_values: dict[str, object] = {
-        FLASH_TOPOLOGY_KEY: "fa4",
+        FLASH_PIPELINE_FAMILY_KEY: "fa4_local_tma_4d",
         FLASH_S_STAGE_KEY: 2,
         FLASH_KV_STAGE_KEY: kv_stage,
         FLASH_PERSISTENT_KEY: True,
@@ -2982,12 +3163,8 @@ def _flash_dense_sp_seed_config(
         FLASH_SKIP_RESCALE_STATS_KEY: _flash_dense_hd64_seed_skip_rescale_stats(num_kv),
         FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk_cols,
         FLASH_PACKED_REDUCE_KEY: packed_reduce,
-        FLASH_CGA2_LOCAL_KEY: False,
-        FLASH_CLC_KEY: False,
         FLASH_CLC_PDL_KEY: False,
         FLASH_CLC_STAGES_KEY: 1,
-        FLASH_LOCAL_TMA_PARTITION_KEY: True,
-        FLASH_TENSOR_4D_TMA_KEY: True,
     }
     if not _flash_seed_set_all(seed, fragments, family_values):
         return None
@@ -3032,7 +3209,7 @@ def _flash_causal_lpt_seed_config(
     offset0 = _flash_causal_hd64_seed_offset0(num_kv)
     seed: dict[str, object] = {"block_sizes": block_sizes}
     family_values: dict[str, object] = {
-        FLASH_TOPOLOGY_KEY: "fa4",
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
         FLASH_S_STAGE_KEY: 2,
         FLASH_KV_STAGE_KEY: 2,
         FLASH_PERSISTENT_KEY: False,
@@ -3103,7 +3280,7 @@ def _flash_causal_split_seed_config(
     split_offset0 = 0 if num_kv <= 128 else _flash_causal_hd64_seed_offset0(num_kv)
     seed: dict[str, object] = {"block_sizes": block_sizes}
     family_values: dict[str, object] = {
-        FLASH_TOPOLOGY_KEY: "fa4",
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
         FLASH_S_STAGE_KEY: 2,
         FLASH_KV_STAGE_KEY: 2,
         FLASH_PERSISTENT_KEY: False,
@@ -3259,6 +3436,7 @@ def flash_autotune_fragments(
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
     topology_override: str | None = None,
+    pipeline_family_override: str | None = None,
 ) -> dict[str, ConfigSpecFragment]:
     """Return ``{config_key: ConfigSpecFragment}`` for the flash autotune surface.
 
@@ -3288,14 +3466,11 @@ def flash_autotune_fragments(
         preserve the FA4-aligned program order, but gives the autotuner the same
         phase freedom for the first softmax warpgroup when a shape benefits from
         different XU/FMA pipe staggering.
-      * ``topology`` — the device-body topology selector. ``ws_overlap`` (the
-        fallback) plus ``fa4`` (the commit-38ff4d1a win, ~77% SDPA) WHEN the
-        shape meets the fa4 2-Q-tile envelope (``seq % 256 == 0`` i.e.
-        ``num_kv`` even; head_dim is already pinned to {64, 128} by the
-        detector, and ``resolve_flash_config`` clamps FA4's aliased K/V ring to
-        at least 2 stages). Causal even-KV shapes also use FA4, but with the
-        persistent scheduler disabled; odd-KV shapes accept stale cached
-        ``fa4`` configs and resolve them back to ``ws_overlap`` before codegen.
+      * ``pipeline_family`` — one compound device schedule. It replaces the
+        independent topology, cluster, CLC, local-TMA, and tensor-map switches,
+        so the search enumerates legal emitted schedules instead of a Boolean
+        product containing aliases. Legacy fixed configs are normalized into
+        this family before candidate identity is constructed.
       * ``disc_pipe`` / ``epi_tma`` / ``rescale_threshold`` / ``packed_reduce`` —
         fa4/ws perf levers for PASS2 software-pipelining, epilogue TMA-store,
         alpha-pin O-rescale skipping, rescale chunk width, and packed ws row
@@ -3335,23 +3510,31 @@ def flash_autotune_fragments(
     build. They are sourced from ``resolve_flash_config`` (env/shape) as single
     values and can be promoted to fragments once characterized.
     """
-    env_topology = os.environ.get("HELION_CUTE_FLASH_TOPOLOGY")
     valid_topology_override = (
         topology_override if topology_override in ("fa4", "ws_overlap") else None
     )
-    topology_config = "ws_overlap" if requires_ws_overlap else valid_topology_override
-    if topology_config is None and env_topology is not None:
-        topology_config = (
-            env_topology if env_topology in ("fa4", "ws_overlap") else None
-        )
+    valid_pipeline_family_override = (
+        pipeline_family_override
+        if pipeline_family_override in FLASH_PIPELINE_FAMILY_FLAGS
+        else None
+    )
+    if requires_ws_overlap:
+        defaults_config: Mapping[str, object] | None = {
+            FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"
+        }
+    elif valid_pipeline_family_override is not None:
+        defaults_config = {FLASH_PIPELINE_FAMILY_KEY: valid_pipeline_family_override}
+    elif valid_topology_override is not None:
+        # Preserve legacy topology semantics, including shape-derived cluster
+        # and CLC defaults. Re-encoding this as the base family would suppress
+        # those defaults before legacy configs are normalized.
+        defaults_config = {FLASH_TOPOLOGY_KEY: valid_topology_override}
+    else:
+        defaults_config = None
     defaults = resolve_flash_config(
         head_dim,
         num_kv,
-        (
-            {FLASH_TOPOLOGY_KEY: topology_config}
-            if topology_config is not None
-            else None
-        ),
+        defaults_config,
         dtype=dtype,
         is_causal=is_causal,
         prefer_packed_reduce=has_kv_tile_pruning or requires_ws_overlap,
@@ -3517,44 +3700,10 @@ def flash_autotune_fragments(
     else:
         masked_e2e_schedule_choices = ("inherit",)
         masked_e2e_schedule_search_choices = None
-    # Topology: default to fa4 only when the shape meets the fa4 2-Q-tile envelope.
-    # The fa4 device body processes a PAIR of adjacent 128-row Q-tiles per CTA, so
-    # it requires ``seq % 256 == 0``. The codegen already gates seq % 128 == 0 (so
-    # seq == num_kv * 128); ``seq % 256 == 0`` is therefore exactly ``num_kv`` even.
-    # Ineligible shapes still include fa4 as a cache-compatibility enum value, but
-    # resolve_flash_config() clamps it to ws_overlap before codegen. The FIRST
-    # choice is the env/shape-resolved default. With no env override, eligible
-    # shapes default to fa4 so the default config exercises the faster topology;
-    # invalid env values are sanitized by resolve_flash_config().
+    # FA4 processes a pair of adjacent Q tiles and therefore requires an even
+    # KV-tile count. Family choices are constructed after the cluster/CLC
+    # eligibility checks below.
     fa4_eligible = num_kv % 2 == 0
-    topology_search_choices: tuple[str, ...] | None = None
-    if requires_ws_overlap:
-        topology_choices = ("ws_overlap",)
-        topology_search_choices = None
-    elif dense_hd64_fa4 or causal_hd64_seeded_fa4:
-        topology_choices = _flash_choices_with_default(
-            defaults.topology, ("fa4", "ws_overlap")
-        )
-        topology_search_defaults = ("fa4", "ws_overlap")
-        topology_search_choices = (
-            ("fa4",)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                defaults.topology, topology_search_defaults
-            )
-        )
-    elif fa4_eligible:
-        # Seed with the resolved default first, then the other topology.
-        topology_choices: tuple[str, ...] = (
-            defaults.topology,
-            "fa4" if defaults.topology != "fa4" else "ws_overlap",
-        )
-    else:
-        # Ineligible shapes still accept stale cached fa4 configs so best-available
-        # autotune handoff can transfer dense runs to causal/odd-KV runs. The
-        # resolver clamps fa4 back to ws_overlap before codegen, so this is only
-        # cache compatibility, not a second device topology.
-        topology_choices = ("ws_overlap", "fa4")
     if dense_hd64_fa4:
         softmax_disc_choices = _flash_choices_with_default(
             defaults.softmax_disc, (True, False)
@@ -3944,13 +4093,13 @@ def flash_autotune_fragments(
         else (defaults.role_map,)
     )
     dense_hd128_fa4 = (
-        topology_choices[0] == "fa4"
+        defaults.topology == "fa4"
         and not is_causal
         and head_dim == 128
         and num_kv % 4 == 0
     )
     dense_hd64_2cta_fa4 = (
-        topology_choices[0] == "fa4"
+        defaults.topology == "fa4"
         and not is_causal
         and head_dim == 64
         and 256 <= num_kv <= 1024
@@ -3961,31 +4110,6 @@ def flash_autotune_fragments(
         and not small_biased_candidate
     )
     use_2cta_eligible = dense_hd128_fa4 or dense_hd64_2cta_fa4
-    use_2cta_choices = (
-        _flash_choices_with_default(defaults.use_2cta_instrs, (False, True))
-        if use_2cta_eligible
-        else (False,)
-    )
-    use_2cta_search_choices: tuple[bool, ...] | None = (
-        use_2cta_choices if use_2cta_eligible else (False,)
-    )
-    use_cga2_local_eligible = (
-        dense_hd64_fa4 and not is_causal and head_dim == 64 and num_kv % 4 == 0
-    )
-    use_cga2_local_choices = (
-        _flash_choices_with_default(defaults.use_cga2_local_cta, (False, True))
-        if use_cga2_local_eligible
-        else (False,)
-    )
-    use_cga2_local_search_choices: tuple[bool, ...] | None = (
-        # The very-long hd64 target already saturates with one CTA per tile, so
-        # two-local-CTA variants remain manual.
-        (defaults.use_cga2_local_cta,)
-        if very_long_dense_hd64_fa4
-        else use_cga2_local_choices
-        if use_cga2_local_eligible
-        else (False,)
-    )
     use_clc_eligible = (
         dense_hd64_fa4
         and not is_causal
@@ -3993,18 +4117,25 @@ def flash_autotune_fragments(
         and num_kv % 2 == 0
         and defaults.persistent
     )
-    use_clc_choices = (
-        _flash_choices_with_default(defaults.use_clc_scheduler, (True, False))
-        if use_clc_eligible
-        else (False,)
-    )
-    use_clc_search_choices: tuple[bool, ...] | None = (
-        (defaults.use_clc_scheduler,)
-        if use_clc_eligible and very_long_dense_hd64_fa4
-        else use_clc_choices
-        if use_clc_eligible
-        else (False,)
-    )
+    if requires_ws_overlap:
+        pipeline_family_choices = ("ws_overlap",)
+        pipeline_family_search_choices: tuple[str, ...] | None = None
+    else:
+        pipeline_family_choices = _flash_choices_with_default(
+            defaults.pipeline_family, FLASH_PIPELINE_FAMILIES
+        )
+        pipeline_family_search: list[str] = ["fa4" if fa4_eligible else "ws_overlap"]
+        if not long_causal_hd64_seeded_fa4:
+            pipeline_family_search.append("ws_overlap")
+        if use_2cta_eligible:
+            pipeline_family_search.append("fa4_2cta")
+        if use_clc_eligible and (
+            not very_long_dense_hd64_fa4 or defaults.use_clc_scheduler
+        ):
+            pipeline_family_search.append("fa4_clc")
+        pipeline_family_search_choices = _flash_choices_with_default(
+            defaults.pipeline_family, pipeline_family_search
+        )
     clc_heads_choices = _flash_choices_with_default(
         defaults.clc_heads_per_batch, (0, 1, 2, 4, 8, 16, 32, 64)
     )
@@ -4038,31 +4169,6 @@ def flash_autotune_fragments(
         else (2, 3)
         if use_clc_eligible
         else (1,)
-    )
-    local_tma_eligible = dense_hd64_fa4 and not is_causal and head_dim == 64
-    local_tma_choices = (
-        _flash_choices_with_default(defaults.local_tma_partition, (False, True))
-        if local_tma_eligible
-        else (False,)
-    )
-    local_tma_search_choices: tuple[bool, ...] | None = (
-        (defaults.local_tma_partition,)
-        if very_long_dense_hd64_fa4
-        else local_tma_choices
-        if local_tma_eligible
-        else (False,)
-    )
-    tensor_4d_tma_choices = (
-        _flash_choices_with_default(defaults.tensor_4d_tma, (False, True))
-        if local_tma_eligible
-        else (False,)
-    )
-    tensor_4d_tma_search_choices: tuple[bool, ...] | None = (
-        (defaults.tensor_4d_tma,)
-        if very_long_dense_hd64_fa4
-        else tensor_4d_tma_choices
-        if local_tma_eligible
-        else (False,)
     )
     causal_loop_split_choices = (
         defaults.causal_loop_split,
@@ -4163,7 +4269,9 @@ def flash_autotune_fragments(
         FLASH_E2E_OFFSET0_KEY: EnumFragment(
             e2e_offset0_choices, e2e_offset0_search_choices
         ),
-        FLASH_TOPOLOGY_KEY: EnumFragment(topology_choices, topology_search_choices),
+        FLASH_PIPELINE_FAMILY_KEY: EnumFragment(
+            pipeline_family_choices, pipeline_family_search_choices
+        ),
         FLASH_SOFTMAX_DISC_KEY: EnumFragment(
             softmax_disc_choices, softmax_disc_search_choices
         ),
@@ -4224,23 +4332,12 @@ def flash_autotune_fragments(
             causal_kv_order_choices, causal_kv_order_search_choices
         ),
         FLASH_ROLE_MAP_KEY: EnumFragment(role_map_choices, role_map_search_choices),
-        FLASH_USE_2CTA_KEY: EnumFragment(use_2cta_choices, use_2cta_search_choices),
-        FLASH_CGA2_LOCAL_KEY: EnumFragment(
-            use_cga2_local_choices, use_cga2_local_search_choices
-        ),
-        FLASH_CLC_KEY: EnumFragment(use_clc_choices, use_clc_search_choices),
         FLASH_CLC_HEADS_PER_BATCH_KEY: EnumFragment(
             clc_heads_choices, clc_heads_search_choices
         ),
         FLASH_CLC_PDL_KEY: EnumFragment(clc_pdl_choices, clc_pdl_search_choices),
         FLASH_CLC_STAGES_KEY: EnumFragment(
             clc_stages_choices, clc_stages_search_choices
-        ),
-        FLASH_LOCAL_TMA_PARTITION_KEY: EnumFragment(
-            local_tma_choices, local_tma_search_choices
-        ),
-        FLASH_TENSOR_4D_TMA_KEY: EnumFragment(
-            tensor_4d_tma_choices, tensor_4d_tma_search_choices
         ),
         FLASH_CAUSAL_LOOP_SPLIT_KEY: EnumFragment(
             causal_loop_split_choices, causal_loop_split_search_choices
@@ -8978,7 +9075,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     num_kv = (seq + 127) // 128
     flash_config: Mapping[str, object] | None = df.config
     if score_plan.requires_ws_overlap:
-        flash_config = {**df.config, FLASH_TOPOLOGY_KEY: "ws_overlap"}
+        flash_config = {**df.config, FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
     cfg = resolve_flash_config(
         head_dim,
         num_kv,

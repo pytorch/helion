@@ -26,8 +26,6 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
-from .._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
-from .._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
@@ -35,13 +33,17 @@ from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
-from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+from .._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
 from .._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
-from .._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from .._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from .._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
+from .._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
 from .._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+from .._compiler.cute.cute_flash import FlashAttentionConfig
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_offset0
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_params
@@ -51,6 +53,9 @@ from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
 from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
+from .._compiler.cute.cute_flash import _flash_pipeline_family_flags
+from .._compiler.cute.cute_flash import flash_effective_config_values
+from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -799,22 +804,42 @@ class ConfigSpec:
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_has_non_tcgen05_operand = value
 
+    def _resolve_cute_flash_config(
+        self, config: Mapping[str, object]
+    ) -> FlashAttentionConfig:
+        assert self._cute_flash_head_dim is not None
+        assert self._cute_flash_num_kv is not None
+        flash_config = config
+        if self._cute_flash_requires_ws_overlap:
+            flash_config = {**config, FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
+        return resolve_flash_config(
+            self._cute_flash_head_dim,
+            self._cute_flash_num_kv,
+            flash_config,
+            dtype=self._cute_flash_dtype,
+            is_causal=self._cute_flash_is_causal,
+            prefer_packed_reduce=(
+                self._cute_flash_has_kv_tile_pruning
+                or self._cute_flash_requires_ws_overlap
+            ),
+        )
+
     def _normalize_cute_flash(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        """Normalize the flash-attention knobs (Tasks #25 + #28).
+        """Normalize the flash-attention autotune surface.
 
         Only runs when ``cute_flash_search_enabled`` is set (the flash detector
-        fired). Mirrors ``CuteTcgen05Config.normalize_strategy``: each key in
-        ``FLASH_CONFIG_KEYS`` is validated against its fragment's choices and
-        defaulted (to the fragment default = env/shape-resolved current value)
-        when absent. When the flag is off this is a no-op so configs never grow
-        the flash keys and behavior is byte-identical to today.
+        fired). Active keys are validated against their fragments, while legacy
+        structural keys are projected into the compound pipeline-family key and
+        removed before the config is used as an autotune identity.
         """
         if not self.cute_flash_search_enabled:
             return
         assert self._cute_flash_head_dim is not None
         assert self._cute_flash_num_kv is not None
+        config.pop(FLASH_Q_TILE_COUNT_KEY, None)
+        config.pop(FLASH_MMA_INTERLEAVE_KEY, None)
         from .._compiler.cute.cute_flash import flash_autotune_fragments
 
         block_size_targets = self._cute_flash_block_size_target_list()
@@ -829,15 +854,46 @@ class ConfigSpec:
         elif not self._is_cute_flash_config_envelope(config, block_size_targets):
             return
 
+        has_legacy_structural_config = any(
+            config.get(key) is not None for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
+        )
+        legacy_effective = None
+        if has_legacy_structural_config and FLASH_PIPELINE_FAMILY_KEY not in config:
+            legacy_resolution_config = {
+                key: config[key]
+                for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
+                if key in config
+            }
+            if FLASH_PERSISTENT_KEY in config:
+                legacy_resolution_config[FLASH_PERSISTENT_KEY] = config[
+                    FLASH_PERSISTENT_KEY
+                ]
+            legacy_effective = self._resolve_cute_flash_config(legacy_resolution_config)
         if self._cute_flash_requires_ws_overlap:
-            config[FLASH_TOPOLOGY_KEY] = "ws_overlap"
+            config[FLASH_PIPELINE_FAMILY_KEY] = "ws_overlap"
             topology_override = "ws_overlap"
+            pipeline_family_override = "ws_overlap"
         else:
-            valid_manual_topologies = {"fa4", "ws_overlap"}
-            topology_value = config.get(FLASH_TOPOLOGY_KEY)
-            topology_override = (
-                topology_value if topology_value in valid_manual_topologies else None
+            requested_family = _flash_pipeline_family_flags(
+                config.get(FLASH_PIPELINE_FAMILY_KEY)
             )
+            pipeline_family_override = (
+                str(config[FLASH_PIPELINE_FAMILY_KEY])
+                if requested_family is not None
+                else legacy_effective.pipeline_family
+                if legacy_effective is not None
+                else None
+            )
+            if requested_family is not None:
+                topology_override = requested_family.topology
+            else:
+                valid_manual_topologies = {"fa4", "ws_overlap"}
+                topology_value = config.get(FLASH_TOPOLOGY_KEY)
+                topology_override = (
+                    topology_value
+                    if topology_value in valid_manual_topologies
+                    else None
+                )
         fragments = flash_autotune_fragments(
             self._cute_flash_head_dim,
             self._cute_flash_num_kv,
@@ -847,10 +903,14 @@ class ConfigSpec:
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             topology_override=cast("str | None", topology_override),
+            pipeline_family_override=pipeline_family_override,
         )
         e2e_offset_was_present = FLASH_E2E_OFFSET_KEY in config
         e2e_offset0_was_present = FLASH_E2E_OFFSET0_KEY in config
         e2e_offset_keys = (FLASH_E2E_OFFSET_KEY, FLASH_E2E_OFFSET0_KEY)
+        explicit_e2e_offsets = {
+            key: config[key] for key in e2e_offset_keys if key in config
+        }
         for key, fragment in fragments.items():
             choices = cast("EnumFragment", fragment).choices
             if key in config:
@@ -868,22 +928,21 @@ class ConfigSpec:
                             f"got {config[key]!r}"
                         )
             else:
-                if key not in e2e_offset_keys:
+                if key not in (*e2e_offset_keys, FLASH_PIPELINE_FAMILY_KEY):
                     config[key] = fragment.default()
-        effective_topology = cast("str", config[FLASH_TOPOLOGY_KEY])
-        if effective_topology == "fa4" and self._cute_flash_num_kv % 2 != 0:
-            effective_topology = "ws_overlap"
-        if fix_invalid:
-            config[FLASH_TOPOLOGY_KEY] = effective_topology
-        if effective_topology != "fa4":
-            config[FLASH_ROLE_MAP_KEY] = "helion"
-            config[FLASH_EPI_TMA_KEY] = False
-            config[FLASH_MASKED_E2E_SCHEDULE_KEY] = "inherit"
-            config[FLASH_CAUSAL_KV_ORDER_KEY] = "ascending"
-            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
-        causal_kv_order = config.get(FLASH_CAUSAL_KV_ORDER_KEY)
-        if not self._cute_flash_is_causal or causal_kv_order != "descending":
-            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
+        if FLASH_PIPELINE_FAMILY_KEY not in config:
+            family_fragment = fragments[FLASH_PIPELINE_FAMILY_KEY]
+            config[FLASH_PIPELINE_FAMILY_KEY] = (
+                legacy_effective.pipeline_family
+                if legacy_effective is not None
+                else family_fragment.default()
+            )
+
+        effective = self._resolve_cute_flash_config(config)
+        effective_topology = effective.topology
+        config.update(flash_effective_config_values(effective))
+        if effective_topology == "fa4":
+            config.update(explicit_e2e_offsets)
         e2e_schedule_default = (
             "8/2"
             if (
@@ -1021,6 +1080,12 @@ class ConfigSpec:
             effective_topology,
             fix_invalid=fix_invalid,
         )
+        for key in (
+            *FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS,
+            FLASH_Q_TILE_COUNT_KEY,
+            FLASH_MMA_INTERLEAVE_KEY,
+        ):
+            config.pop(key, None)
 
     def _normalize_cute_flash_register_budget(
         self,
@@ -2178,6 +2243,8 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
+                return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
         return False, None
 
