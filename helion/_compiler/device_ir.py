@@ -3662,6 +3662,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_kv_tile_pruning=flash_shape.has_kv_tile_pruning,
                     requires_ws_overlap=flash_shape.requires_ws_overlap,
                     small_biased_candidate=flash_shape.small_biased_candidate,
+                    standard_dense_output=flash_shape.standard_dense_output,
                 )
             else:
                 from ..language.matmul_ops import enable_cute_tcgen05_search

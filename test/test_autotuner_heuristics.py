@@ -44,6 +44,7 @@ from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
 from helion._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
 from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
+from helion._compiler.cute.cute_flash import FLASH_DERIVED_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
@@ -52,6 +53,7 @@ from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
 from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
 from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
 from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+from helion._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
 from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
@@ -80,9 +82,11 @@ from helion._compiler.cute.cute_flash import FLASH_SMALL_BIASED_KEY
 from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
 from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
+from helion._compiler.cute.cute_flash import FLASH_STAT_TRANSPORT_KEY
 from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
 from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from helion._compiler.cute.cute_flash import FLASH_USE_2CTA_KEY
+from helion._compiler.cute.cute_flash import FLASH_WAIT_HINT_KEY
 from helion._compiler.cute.cute_flash import flash_attention_seed_config
 from helion._compiler.cute.cute_flash import flash_attention_seed_configs
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
@@ -1671,7 +1675,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_flash_accepts_extra_knobs(self) -> None:
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_CONFIG_KEYS)
-        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 13)
+        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 15)
         self.assertEqual(
             set(FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS),
             {
@@ -1686,8 +1690,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         for legacy_key in FLASH_LEGACY_CONFIG_KEYS:
             self.assertIn(legacy_key, FLASH_CONFIG_KEYS)
             self.assertNotIn(legacy_key, FLASH_AUTOTUNE_CONFIG_KEYS)
-        self.assertIn(FLASH_MMA_INTERLEAVE_KEY, FLASH_LEGACY_CONFIG_KEYS)
-        self.assertIn(FLASH_Q_TILE_COUNT_KEY, FLASH_LEGACY_CONFIG_KEYS)
+        self.assertIn(FLASH_MMA_INTERLEAVE_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
+        self.assertIn(FLASH_Q_TILE_COUNT_KEY, FLASH_DERIVED_CONFIG_KEYS)
+        self.assertNotIn(FLASH_Q_TILE_COUNT_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
+        self.assertNotIn(FLASH_Q_TILE_COUNT_KEY, FLASH_LEGACY_CONFIG_KEYS)
+        self.assertIn(FLASH_WAIT_HINT_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
+        self.assertIn(FLASH_EXP2_PACKET_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
+        self.assertIn(FLASH_STAT_TRANSPORT_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
         self.assertIn(FLASH_PERSISTENT_CTAS_PER_SM_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_P_STORE_REP_KEY, FLASH_CONFIG_KEYS)
         self.assertIn(FLASH_S_LOAD_REP_KEY, FLASH_CONFIG_KEYS)

@@ -67,6 +67,7 @@ class FlashSearchSurface(NamedTuple):
     has_kv_tile_pruning: bool
     requires_ws_overlap: bool
     small_biased_candidate: bool
+    standard_dense_output: bool
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -2790,6 +2791,9 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         from .cute.cute_flash import (
             flash_attention_graph_small_biased_candidate_from_graphs,
         )
+        from .cute.cute_flash import (
+            flash_attention_graph_standard_dense_output_from_graphs,
+        )
 
         if not flash_attention_graph_lse_plan_valid_from_graphs(
             device_ir.graphs,
@@ -2805,6 +2809,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 kv_block_id=block_ids[0],
                 score_plan=pattern.score_plan,
             )
+        )
+        standard_dense_output = flash_attention_graph_standard_dense_output_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
         )
         q_seq = env.block_sizes[root_grid_ids[1]].size
         kv_seq = env.block_sizes[block_ids[0]].size
@@ -2844,6 +2854,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             has_kv_tile_pruning=pattern.score_plan.has_kv_tile_pruning,
             requires_ws_overlap=pattern.score_plan.requires_ws_overlap,
             small_biased_candidate=small_biased_candidate,
+            standard_dense_output=standard_dense_output,
         )
     return None
 

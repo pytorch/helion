@@ -53,6 +53,9 @@ _cute_grouped_reduce_shared_tree = importlib.import_module(
     "helion._compiler.cute.reduce_helpers"
 )._cute_grouped_reduce_shared_tree
 _cute_flash = importlib.import_module("helion._compiler.cute.cute_flash")
+flash_fa4_shared_storage = importlib.import_module(
+    "helion._compiler.cute._flash_runtime"
+).flash_fa4_shared_storage
 resolve_flash_config = _cute_flash.resolve_flash_config
 
 
@@ -2510,6 +2513,235 @@ class TestCuteBackend(TestCase):
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_fa4_deep_one_cta_matches_sdpa(self) -> None:
+        cases = (
+            (torch.float16, 64, (2, 3, 4)),
+            (torch.float16, 128, (2,)),
+            (torch.bfloat16, 64, (3,)),
+        )
+        for dtype, head_dim, kv_stages in cases:
+            q, k, v = (
+                torch.randn(1, 2, 512, head_dim, dtype=dtype, device=DEVICE)
+                for _ in range(3)
+            )
+            expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            for kv_stage in kv_stages:
+                with self.subTest(
+                    dtype=str(dtype), head_dim=head_dim, kv_stage=kv_stage
+                ):
+                    code, out = code_and_output(
+                        cute_dense_attention,
+                        (q, k, v),
+                        block_sizes=[1, 128, 128],
+                        cute_flash_pipeline_family="fa4_deep_1cta",
+                        cute_flash_kv_stage=kv_stage,
+                    )
+                    self.assertIn("sV = storage.sV.get_tensor", code)
+                    self.assertIn("barrier_storage=storage.k_mbar_ptr.data_ptr()", code)
+                    self.assertIn("barrier_storage=storage.v_mbar_ptr.data_ptr()", code)
+                    self.assertIn(
+                        "barrier_storage=storage.k_mbar_ptr.data_ptr(), "
+                        "defer_sync=True",
+                        code,
+                    )
+                    self.assertIn(
+                        f"assert _flash_storage_cls.size_in_bytes() == "
+                        f"{flash_fa4_shared_storage(head_dim, kv_stage, separate_kv=True).size_in_bytes()}",
+                        code,
+                    )
+                    self.assertIn("flash_k_prod.tail()", code)
+                    self.assertIn("flash_v_prod.tail()", code)
+                    self.assertNotIn("flash_kv_prod", code)
+                    self.assertNotIn("is_two_cta=True", code)
+                    self.assertNotIn("PipelineClcFetchAsync", code)
+                    self.assertNotIn("sO = storage.sO.get_tensor", code)
+                    tol = 3e-2 if dtype is torch.bfloat16 else 1e-2
+                    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+    def test_flash_attention_fa4_sync_schedule_controls_match_sdpa(self) -> None:
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=str(dtype)):
+                q, k, v = (
+                    torch.randn(1, 1, 512, 64, dtype=dtype, device=DEVICE)
+                    for _ in range(3)
+                )
+                code, (out, _lse) = code_and_output(
+                    cute_causal_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family="fa4",
+                    cute_flash_mma_interleave=False,
+                    cute_flash_wait_hint=0,
+                    cute_flash_exp2_packet="8x2",
+                )
+                steady_start = code.index(
+                    "for flash_i in cutlass.range(flash_num_active_kv - 1"
+                )
+                steady_end = code.index("flash_pfor_phase ^= 1", steady_start)
+                steady = code[steady_start:steady_end]
+                self.assertLess(
+                    steady.index("gemm_ptx_precomputed_pv_ts(flash_o1_addr"),
+                    steady.index("flash_k_full ="),
+                )
+                self.assertIn("pair_batch=8, emu_batch=2", code)
+                self.assertIn("flash_pfor_phase, 0)", code)
+                self.assertIn("wait_hint=0", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=True
+                )
+                tol = 3e-2 if dtype is torch.bfloat16 else 1e-2
+                torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+    def test_flash_attention_single_stat_handoff_persistent_modifier_lse(self) -> None:
+        q, k, v = (
+            torch.randn(1, 64, 768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bias = torch.randn(1, 64, 768, 768, dtype=torch.float16, device=DEVICE) * 0.25
+        code, (out, lse) = code_and_output(
+            cute_biased_attention_with_lse,
+            (q, k, v, bias),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_stat_transport="single",
+        )
+        self.assertIn("while flash_tile_id < 192", code)
+        self.assertNotIn("flash_s_corr_prod_phase", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=bias
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        self.assertTrue(torch.isfinite(lse).all())
+
+    def test_flash_attention_fa4_deep_one_cta_causal_split_matches_sdpa(
+        self,
+    ) -> None:
+        q, k, v = (
+            torch.randn(1, 1, 512, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True
+        )
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(64)
+        causal_mask = torch.ones(512, 512, dtype=torch.bool, device=DEVICE).tril()
+        expected_lse = torch.logsumexp(
+            scores.masked_fill(~causal_mask, -torch.inf), dim=-1
+        ) * math.log2(math.e)
+        for kv_stage in (2, 3, 4):
+            with self.subTest(kv_stage=kv_stage):
+                code, (out, lse) = code_and_output(
+                    cute_causal_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family="fa4_deep_1cta",
+                    cute_flash_kv_stage=kv_stage,
+                    cute_flash_causal_kv_order="descending",
+                    cute_flash_causal_loop_split=True,
+                )
+                self.assertIn("flash_num_active_kv", code)
+                self.assertIn("for flash_kv_mask_iter in cutlass.range(", code)
+                self.assertIn("for flash_kv_unmask_iter in cutlass.range(", code)
+                self.assertIn("flash_k_prod.tail()", code)
+                self.assertIn("flash_v_prod.tail()", code)
+                self.assertNotIn("flash_kv_prod", code)
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+                torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_fa4_deep_one_cta_persistent_boundary(self) -> None:
+        q, k, v = (
+            torch.randn(1, 1, 38400, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_deep_1cta",
+            cute_flash_kv_stage=2,
+            cute_flash_persistent=True,
+            cute_flash_persistent_ctas_per_sm=1,
+        )
+        self.assertIn("while flash_tile_id < 150", code)
+        self.assertIn("flash_k_prod.tail()", code)
+        self.assertIn("flash_v_prod.tail()", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_fa4_causal_two_cta_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(1, 2, 512, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True
+        )
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(64)
+        causal_mask = torch.ones(512, 512, dtype=torch.bool, device=DEVICE).tril()
+        expected_lse = torch.logsumexp(
+            scores.masked_fill(~causal_mask, -torch.inf), dim=-1
+        ) * math.log2(math.e)
+
+        code, (out, lse) = code_and_output(
+            cute_causal_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta_causal",
+            cute_flash_kv_stage=2,
+            cute_flash_causal_kv_order="descending",
+            cute_flash_causal_loop_split=True,
+        )
+
+        self.assertIn("cute.arch.cluster_idx()[0]", code)
+        self.assertIn("flash_q_mma_tile1 + cutlass.Int32(1)", code)
+        self.assertIn("cute_tcgen05_flash.CtaGroup.TWO", code)
+        self.assertIn("is_two_cta=True", code)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_fa4_causal_two_cta_modifier_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(1, 1, 512, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bias = torch.randn(1, 1, 512, 512, dtype=torch.float16, device=DEVICE) * 0.25
+        code, out = code_and_output(
+            cute_causal_biased_attention,
+            (q, k, v, bias),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta_causal",
+        )
+        self.assertIn("add_score_bias_t2r", code)
+        self.assertIn("flash_q_mma_tile0 * cutlass.Int32(2)", code)
+        causal_mask = torch.ones(512, 512, dtype=torch.bool, device=DEVICE).tril()
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias.masked_fill(~causal_mask, -torch.inf),
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_fa4_causal_two_cta_tma_epilogue_matches_sdpa(
+        self,
+    ) -> None:
+        q, k, v = (
+            torch.randn(1, 1, 4096, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, (out, _lse) = code_and_output(
+            cute_causal_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta_causal",
+        )
+        self.assertIn("_flash_tma_o", code)
+        self.assertIn("flash_mma_tile_coord_v", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=True
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_fa4_zero_threshold_publishes_computed_alpha(
         self,
     ) -> None:
@@ -2689,7 +2921,9 @@ class TestCuteBackend(TestCase):
                 self.assertIn("fa4_correction_epilogue_to_smem_scoped_2cta", code)
                 self.assertIn("'use_2cta_instrs': True", code)
                 self.assertIn("gemm_ptx_precomputed_qk_static", code)
-                self.assertIn(", True, 8, 2)", code)
+                self.assertIn(
+                    "early_split_publish=True, pair_batch=8, emu_batch=2", code
+                )
 
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
@@ -2762,7 +2996,7 @@ class TestCuteBackend(TestCase):
                     cute_causal_attention, (q, k, v), block_sizes=[1, 128, 128]
                 )
                 self.assertTrue(_flash_fired(code))
-                self.assertIn("fa4_disc_rowmax_causal", code)
+                self.assertIn("fa4_disc_rowmax_causal_balanced", code)
                 self.assertIn("flash_lpt_group", code)
                 self.assertIn("flash_s0_corr_full_ptr", code)
                 expected = torch.nn.functional.scaled_dot_product_attention(
@@ -2785,6 +3019,25 @@ class TestCuteBackend(TestCase):
                 ) * math.log2(math.e)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
                 torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_fa4_sload16_balanced_rowmax_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(1, 2, 512, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_softmax_disc=True,
+            cute_flash_p_store_rep=16,
+            cute_flash_s_load_rep=16,
+        )
+        self.assertIn("fa4_disc_rowmax_balanced", code)
+        self.assertIn("fa4_disc_exp_convert_store_sload16_pair_pipe", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
     def test_flash_attention_causal_packed_reduce_matches_sdpa(self) -> None:
         q, k, v = (
@@ -2843,9 +3096,18 @@ class TestCuteBackend(TestCase):
             v,
             is_causal=True,
         )
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(64)
+        causal_mask = torch.ones(512, 512, dtype=torch.bool, device=DEVICE).tril()
+        expected_lse = torch.logsumexp(
+            scores.masked_fill(~causal_mask, -torch.inf), dim=-1
+        ) * math.log2(math.e)
+        boundary_rows = torch.tensor(
+            [0, 127, 128, 255, 256, 383, 384, 511],
+            device=DEVICE,
+        )
         for loop_split in (True, False):
             with self.subTest(loop_split=loop_split):
-                code, (out, _lse) = code_and_output(
+                code, (out, lse) = code_and_output(
                     cute_causal_attention,
                     (q, k, v),
                     block_sizes=[1, 128, 128],
@@ -2865,11 +3127,86 @@ class TestCuteBackend(TestCase):
                 self.assertTrue(_flash_fired(code))
                 self.assertIn("fa4_disc_zero_store", code)
                 if loop_split:
-                    self.assertIn("for flash_kv_mask_iter in", code)
+                    self.assertIn(
+                        "for flash_kv_mask_iter in cutlass.range(",
+                        code,
+                    )
+                    self.assertIn(
+                        "for flash_kv_unmask_iter in cutlass.range(",
+                        code,
+                    )
+                    self.assertNotIn(
+                        "range_constexpr(flash_m_tile",
+                        code,
+                    )
+                    masked_start = code.index(
+                        "for flash_kv_mask_iter in cutlass.range("
+                    )
+                    unmasked_start = code.index(
+                        "for flash_kv_unmask_iter in cutlass.range(", masked_start
+                    )
+                    masked_stage0 = code[masked_start:unmasked_start]
+                    alpha_store = masked_stage0.index(
+                        "flash_scale_t[flash_s_corr_prod_index, 0, "
+                        "flash_local_tidx] = flash_alpha"
+                    )
+                    alpha_publish = masked_stage0.index(
+                        "cute.arch.barrier_arrive(", alpha_store
+                    )
+                    self.assertEqual(masked_stage0.count("flash_minus_max_scale ="), 1)
+                    minus_scale = masked_stage0.index("flash_minus_max_scale =")
+                    probability_pass = masked_stage0.index(
+                        "flash_p_sum = cutlass.Float32(0.0)", minus_scale
+                    )
+                    self.assertLess(alpha_store, alpha_publish)
+                    self.assertLess(alpha_publish, minus_scale)
+                    self.assertLess(minus_scale, probability_pass)
                 else:
                     self.assertIn("for flash_kv_iter in", code)
                     self.assertNotIn("flash_kv_mask_iter", code)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+                torch.testing.assert_close(
+                    lse[:, :, boundary_rows],
+                    expected_lse[:, :, boundary_rows],
+                    atol=2e-2,
+                    rtol=2e-2,
+                )
+
+    def test_flash_attention_causal_fa4_split_bfloat16_boundaries(self) -> None:
+        q, k, v = (
+            torch.randn(1, 1, 256, 64, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, (out, lse) = code_and_output(
+            cute_causal_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_causal_kv_order="descending",
+            cute_flash_causal_loop_split=True,
+            cute_flash_softmax_disc=True,
+        )
+        self.assertIn("for flash_kv_unmask_iter in cutlass.range(", code)
+        self.assertNotIn("range_constexpr(flash_m_tile", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+        )
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / math.sqrt(64)
+        causal_mask = torch.ones(256, 256, dtype=torch.bool, device=DEVICE).tril()
+        expected_lse = torch.logsumexp(
+            scores.masked_fill(~causal_mask, -torch.inf), dim=-1
+        ) * math.log2(math.e)
+        boundary_rows = torch.tensor([0, 127, 128, 255], device=DEVICE)
+        torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            lse[:, :, boundary_rows],
+            expected_lse[:, :, boundary_rows],
+            atol=4e-2,
+            rtol=4e-2,
+        )
 
     def test_flash_attention_causal_single_warpgroup_matches_sdpa(self) -> None:
         q, k, v = (
@@ -2892,6 +3229,41 @@ class TestCuteBackend(TestCase):
             is_causal=True,
         )
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_dense_degree1_packet_matches_sdpa(self) -> None:
+        cases = (
+            (32768, "deg1_8x2_corr10", 5, 1),
+            (65536, "deg1_8x2_corr10", 2, 1),
+            (131072, "deg1_8x2_corr10", 2, 1),
+            (196608, "deg1_8x2_corr10", 2, 1),
+            (262144, "deg1_16x8", 0, 10),
+        )
+        for sequence_length, packet, offset, offset0 in cases:
+            with self.subTest(sequence_length=sequence_length):
+                torch.manual_seed(20260728 + sequence_length)
+                q, k, v = (
+                    torch.randn(
+                        1,
+                        1,
+                        sequence_length,
+                        64,
+                        dtype=torch.float16,
+                        device=DEVICE,
+                    )
+                    for _ in range(3)
+                )
+                code, out = code_and_output(
+                    cute_dense_attention,
+                    (q, k, v),
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family="fa4_2cta",
+                    cute_flash_exp2_packet=packet,
+                    cute_flash_e2e_offset=offset,
+                    cute_flash_e2e_offset0=offset0,
+                )
+                self.assertIn("degree1=True", code)
+                expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
 
     def test_flash_attention_bias_fires_and_matches_sdpa(self) -> None:
         q, k, v = (
@@ -3072,12 +3444,23 @@ class TestCuteBackend(TestCase):
             cute_causal_biased_attention,
             (q, k, v, bias),
             block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_causal_kv_order="descending",
+            cute_flash_causal_loop_split=True,
         )
         self.assertTrue(_flash_fired(code))
         self.assertIn("add_score_bias_t2r", code)
         self.assertIn("causal_mask_t2r", code)
         self.assertIn("flash_fa4_shared_storage", code)
+        self.assertNotIn("flash_kv_unmask_iter", code)
         _assert_score_modified_reductions(self, code)
+        modifier_loop = code.index("for flash_kv_iter in cutlass.range(")
+        minus_scale = code.index("flash_minus_max_scale =", modifier_loop)
+        alpha_store = code.index(
+            "flash_scale_t[flash_s_corr_prod_index, 0, flash_local_tidx] = flash_alpha",
+            modifier_loop,
+        )
+        self.assertLess(minus_scale, alpha_store)
         causal_mask = torch.ones(256, 256, dtype=torch.bool, device=DEVICE).tril()
         expected = torch.nn.functional.scaled_dot_product_attention(
             q,
@@ -3524,6 +3907,82 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg.topology, "fa4")
         self.assertFalse(cfg.persistent)
         self.assertEqual(cfg.kv_stage, 2)
+
+    def test_flash_attention_deep_one_cta_resource_normalization(self) -> None:
+        self.assertEqual(
+            [
+                flash_fa4_shared_storage(64, stage, separate_kv=True).size_in_bytes()
+                for stage in (2, 3, 4)
+            ],
+            [101_376, 134_144, 166_912],
+        )
+        self.assertEqual(
+            flash_fa4_shared_storage(128, 2, separate_kv=True).size_in_bytes(),
+            199_680,
+        )
+        family = {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_deep_1cta"}
+        for requested, expected in ((1, 2), (2, 2), (3, 3), (4, 4), (8, 4)):
+            with self.subTest(head_dim=64, requested=requested):
+                cfg = resolve_flash_config(
+                    64,
+                    512,
+                    {
+                        **family,
+                        _cute_flash.FLASH_KV_STAGE_KEY: requested,
+                        _cute_flash.FLASH_EPI_TMA_KEY: True,
+                        _cute_flash.FLASH_EPI_STG_KEY: True,
+                    },
+                )
+                self.assertEqual(cfg.pipeline_family, "fa4_deep_1cta")
+                self.assertTrue(cfg.separate_kv_rings)
+                self.assertEqual(cfg.kv_stage, expected)
+                self.assertEqual(cfg.s_stage, 2)
+                self.assertFalse(cfg.epi_tma)
+                self.assertFalse(cfg.epi_stg)
+                self.assertFalse(cfg.use_2cta_instrs)
+                self.assertFalse(cfg.use_cga2_local_cta)
+                self.assertFalse(cfg.use_clc_scheduler)
+                self.assertFalse(cfg.local_tma_partition)
+                self.assertFalse(cfg.tensor_4d_tma)
+
+        hd128 = resolve_flash_config(
+            128,
+            512,
+            {**family, _cute_flash.FLASH_KV_STAGE_KEY: 4},
+        )
+        self.assertEqual(hd128.pipeline_family, "fa4_deep_1cta")
+        self.assertEqual(hd128.kv_stage, 2)
+
+    def test_flash_attention_unsupported_family_variants_normalize_atomically(
+        self,
+    ) -> None:
+        unsupported = (
+            resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: ("fa4_cga2_causal_multicast")},
+                is_causal=True,
+            ),
+            resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta_causal"},
+                dtype=torch.bfloat16,
+                is_causal=True,
+            ),
+            resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta_causal_deep"},
+                is_causal=True,
+            ),
+        )
+        for cfg in unsupported:
+            self.assertEqual(cfg.pipeline_family, "fa4")
+            self.assertFalse(cfg.separate_kv_rings)
+            self.assertFalse(cfg.causal_two_cta)
+            self.assertFalse(cfg.use_2cta_instrs)
+            self.assertFalse(cfg.use_cga2_local_cta)
 
     def test_flash_attention_fa4_disc_pipe_defaults_by_head_dim(self) -> None:
         with patch.dict(
@@ -4206,6 +4665,8 @@ class TestCuteBackend(TestCase):
             dense_128k = resolve_flash_config(64, 1024, force_two_cta)
             dense_unaligned = resolve_flash_config(64, 258, force_two_cta)
             dense_256k = resolve_flash_config(64, 2048, force_two_cta)
+            dense_midrange = resolve_flash_config(64, 1536, force_two_cta)
+            dense_above_range = resolve_flash_config(64, 2052, force_two_cta)
             dense_bf16 = resolve_flash_config(
                 64, 512, force_two_cta, dtype=torch.bfloat16
             )
@@ -4226,8 +4687,12 @@ class TestCuteBackend(TestCase):
         self.assertTrue(dense_128k.use_2cta_instrs)
         self.assertFalse(dense_unaligned.use_2cta_instrs)
         self.assertEqual(dense_unaligned.pipeline_family, "fa4")
-        self.assertFalse(dense_256k.use_2cta_instrs)
-        self.assertEqual(dense_256k.pipeline_family, "fa4")
+        self.assertTrue(dense_256k.use_2cta_instrs)
+        self.assertEqual(dense_256k.pipeline_family, "fa4_2cta")
+        self.assertTrue(dense_midrange.use_2cta_instrs)
+        self.assertEqual(dense_midrange.pipeline_family, "fa4_2cta")
+        self.assertFalse(dense_above_range.use_2cta_instrs)
+        self.assertEqual(dense_above_range.pipeline_family, "fa4")
         self.assertFalse(dense_bf16.use_2cta_instrs)
         self.assertEqual(dense_bf16.pipeline_family, "fa4")
         self.assertFalse(causal.use_2cta_instrs)
@@ -4260,34 +4725,68 @@ class TestCuteBackend(TestCase):
             ineligible_unaligned[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
             or (),
         )
-        ineligible = _cute_flash.flash_autotune_fragments(64, 2048)
+        eligible_256k = _cute_flash.flash_autotune_fragments(64, 2048)
+        self.assertIn(
+            "fa4_2cta",
+            eligible_256k[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices or (),
+        )
+        eligible_midrange = _cute_flash.flash_autotune_fragments(64, 1536)
+        self.assertIn(
+            "fa4_2cta",
+            eligible_midrange[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
+            or (),
+        )
+        ineligible_above_range = _cute_flash.flash_autotune_fragments(64, 2052)
         self.assertNotIn(
             "fa4_2cta",
-            ineligible[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices or (),
+            ineligible_above_range[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
+            or (),
         )
 
     def test_flash_attention_pipeline_family_resolution(self) -> None:
         expected_flags = {
-            "ws_overlap": ("ws_overlap", False, False, False, False, False),
-            "fa4": ("fa4", False, False, False, False, False),
-            "fa4_tma_4d": ("fa4", False, False, False, False, True),
-            "fa4_local_tma": ("fa4", False, False, False, True, False),
-            "fa4_local_tma_4d": ("fa4", False, False, False, True, True),
-            "fa4_cga2_local": ("fa4", False, True, False, False, False),
+            "ws_overlap": (
+                "ws_overlap",
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ),
+            "fa4": ("fa4", False, False, False, False, False, False, False),
+            "fa4_deep_1cta": ("fa4", True, False, False, False, False, False, False),
+            "fa4_2cta_causal": ("fa4", False, True, True, False, False, False, False),
+            "fa4_tma_4d": ("fa4", False, False, False, False, False, False, True),
+            "fa4_local_tma": ("fa4", False, False, False, False, False, True, False),
+            "fa4_local_tma_4d": ("fa4", False, False, False, False, False, True, True),
+            "fa4_cga2_local": ("fa4", False, False, False, True, False, False, False),
             "fa4_cga2_local_tma_4d": (
                 "fa4",
+                False,
+                False,
                 False,
                 True,
                 False,
                 False,
                 True,
             ),
-            "fa4_2cta": ("fa4", True, False, False, False, False),
-            "fa4_2cta_tma_4d": ("fa4", True, False, False, False, True),
-            "fa4_clc": ("fa4", False, False, True, False, False),
-            "fa4_clc_tma_4d": ("fa4", False, False, True, False, True),
-            "fa4_clc_local_tma": ("fa4", False, False, True, True, False),
-            "fa4_clc_local_tma_4d": ("fa4", False, False, True, True, True),
+            "fa4_2cta": ("fa4", False, False, True, False, False, False, False),
+            "fa4_2cta_tma_4d": ("fa4", False, False, True, False, False, False, True),
+            "fa4_clc": ("fa4", False, False, False, False, True, False, False),
+            "fa4_clc_tma_4d": ("fa4", False, False, False, False, True, False, True),
+            "fa4_clc_local_tma": ("fa4", False, False, False, False, True, True, False),
+            "fa4_clc_local_tma_4d": (
+                "fa4",
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+                True,
+            ),
         }
         self.assertEqual(set(expected_flags), set(_cute_flash.FLASH_PIPELINE_FAMILIES))
 
@@ -4299,11 +4798,14 @@ class TestCuteBackend(TestCase):
                         512,
                         {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
                         dtype=torch.float16,
+                        is_causal="causal" in family_name,
                     )
                     self.assertEqual(cfg.pipeline_family, family_name)
                     self.assertEqual(
                         (
                             cfg.topology,
+                            cfg.separate_kv_rings,
+                            cfg.causal_two_cta,
                             cfg.use_2cta_instrs,
                             cfg.use_cga2_local_cta,
                             cfg.use_clc_scheduler,
@@ -4418,7 +4920,7 @@ class TestCuteBackend(TestCase):
                 512,
                 {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"},
             )
-            with_dead_knobs = resolve_flash_config(
+            with_legacy_values = resolve_flash_config(
                 64,
                 512,
                 {
@@ -4427,10 +4929,103 @@ class TestCuteBackend(TestCase):
                     _cute_flash.FLASH_MMA_INTERLEAVE_KEY: 9,
                 },
             )
-            self.assertEqual(with_dead_knobs, base)
+            self.assertEqual(with_legacy_values, base)
             field_names = {field.name for field in dataclasses.fields(base)}
-            self.assertNotIn("q_tile_count", field_names)
-            self.assertNotIn("mma_interleave", field_names)
+            self.assertIn("q_tile_count", field_names)
+            self.assertIn("mma_interleave", field_names)
+            self.assertEqual(base.q_tile_count, 2)
+            self.assertTrue(base.mma_interleave)
+
+    def test_flash_attention_sync_and_softmax_controls_normalize(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            fa4 = resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"},
+            )
+            self.assertEqual(fa4.q_tile_count, 2)
+            self.assertTrue(fa4.mma_interleave)
+            self.assertEqual(fa4.wait_hint, 10_000_000)
+            self.assertEqual(fa4.exp2_packet, "1x1")
+            self.assertEqual(fa4.stat_transport, "single")
+
+            ws = resolve_flash_config(
+                64,
+                512,
+                {
+                    _cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap",
+                    _cute_flash.FLASH_Q_TILE_COUNT_KEY: 17,
+                    _cute_flash.FLASH_MMA_INTERLEAVE_KEY: True,
+                    _cute_flash.FLASH_WAIT_HINT_KEY: 0,
+                    _cute_flash.FLASH_EXP2_PACKET_KEY: "8x2",
+                    _cute_flash.FLASH_STAT_TRANSPORT_KEY: "single",
+                },
+            )
+            self.assertEqual(ws.q_tile_count, 1)
+            self.assertFalse(ws.mma_interleave)
+            self.assertEqual(ws.wait_hint, 10_000_000)
+            self.assertEqual(ws.exp2_packet, "1x1")
+            self.assertEqual(ws.stat_transport, "ring2")
+
+            two_cta = resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta"},
+            )
+            self.assertEqual(two_cta.exp2_packet, "8x2")
+            hd128_two_cta = resolve_flash_config(
+                128,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta"},
+            )
+            self.assertEqual(hd128_two_cta.exp2_packet, "1x1")
+
+            tuned = resolve_flash_config(
+                64,
+                512,
+                {
+                    _cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                    _cute_flash.FLASH_MMA_INTERLEAVE_KEY: False,
+                    _cute_flash.FLASH_WAIT_HINT_KEY: 0,
+                    _cute_flash.FLASH_EXP2_PACKET_KEY: "8x2",
+                    _cute_flash.FLASH_STAT_TRANSPORT_KEY: "ring2",
+                },
+            )
+            self.assertFalse(tuned.mma_interleave)
+            self.assertEqual(tuned.wait_hint, 0)
+            self.assertEqual(tuned.exp2_packet, "8x2")
+            self.assertEqual(tuned.stat_transport, "ring2")
+
+            causal = resolve_flash_config(
+                64,
+                512,
+                {
+                    _cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                    _cute_flash.FLASH_STAT_TRANSPORT_KEY: "single",
+                },
+                is_causal=True,
+            )
+            self.assertEqual(causal.stat_transport, "ring2")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_FLASH_Q_TILE_COUNT": "legacy-nonnumeric",
+                "HELION_CUTE_FLASH_MMA_PTX": "0",
+            },
+            clear=True,
+        ):
+            inactive = resolve_flash_config(
+                64,
+                512,
+                {
+                    _cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                    _cute_flash.FLASH_Q_TILE_COUNT_KEY: "also-ignored",
+                    _cute_flash.FLASH_MMA_INTERLEAVE_KEY: False,
+                },
+            )
+        self.assertEqual(inactive.q_tile_count, 2)
+        self.assertTrue(inactive.mma_interleave)
 
     def test_flash_attention_fa4_persistent_config_overrides_env(self) -> None:
         with patch.dict(os.environ, {"HELION_CUTE_FLASH_PERSISTENT": "1"}, clear=True):
@@ -9326,6 +9921,15 @@ class TestCuteConfigValuePriors(TestCase):
             FLASH_EPI_STG_GMEM_KEY: {"stage"},
         }.items():
             self._assert_prior_choices(tma_priors[key], tma_fragments[key], values)
+        bound.config_spec._cute_flash_num_kv = 2048
+        bound.config_spec._cute_flash_dtype = torch.float16
+        two_cta_priors = CuteBackend().config_value_priors(bound.config_spec)
+        two_cta_fragments = bound.config_spec._flat_fields()
+        self._assert_prior_choices(
+            two_cta_priors[FLASH_PIPELINE_FAMILY_KEY],
+            two_cta_fragments[FLASH_PIPELINE_FAMILY_KEY],
+            {"fa4", "ws_overlap", "fa4_2cta"},
+        )
         bound.config_spec._cute_flash_num_kv = 64
 
         gen = ConfigGeneration(bound.config_spec)

@@ -3815,6 +3815,7 @@ class TestCuteAutotuner(TestCase):
         into the search surface.
         """
         from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
+        from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_PIPELINE_FAMILIES
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
@@ -3834,6 +3835,7 @@ class TestCuteAutotuner(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
         from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
@@ -3862,9 +3864,11 @@ class TestCuteAutotuner(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
         from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_STAT_TRANSPORT_KEY
         from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
         from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
         from helion._compiler.cute.cute_flash import FLASH_USE_2CTA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_WAIT_HINT_KEY
         from helion._compiler.cute.cute_flash import flash_autotune_fragments
         from helion._compiler.cute.cute_flash import flash_config_from_config
         from helion._compiler.cute.cute_flash import flash_effective_config_values
@@ -4018,7 +4022,7 @@ class TestCuteAutotuner(TestCase):
                 FLASH_TENSOR_4D_TMA_KEY,
             },
         )
-        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 13)
+        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 15)
         # seq=256 -> num_kv=2 (even) is fa4-eligible (seq % 256 == 0), so the
         # topology fragment must offer fa4 (alongside the ws_overlap default
         # seed first) so the autotuner can pick the fa4 win for this shape.
@@ -4055,7 +4059,15 @@ class TestCuteAutotuner(TestCase):
         self.assertNotIn(FLASH_TOPOLOGY_KEY, sparse_fa4_config)
         e2e_schedule_choices = flash_fragments[FLASH_E2E_SCHEDULE_KEY].choices
         self.assertEqual(e2e_schedule_choices[0], "16/4")
-        self.assertEqual(set(e2e_schedule_choices), {"16/4", "8/2", "16/2", "xu"})
+        # The manual exp2 packets canonicalize onto "16/6"/"16/8", so those
+        # cadences are selectable as manual overrides on fa4 hd64 without
+        # entering the search surface.
+        self.assertEqual(
+            set(e2e_schedule_choices), {"16/4", "8/2", "16/2", "xu", "16/6", "16/8"}
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices, ("16/4", "8/2")
+        )
         self.assertEqual(
             flash_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices, ("inherit",)
         )
@@ -4065,6 +4077,46 @@ class TestCuteAutotuner(TestCase):
         e2e_offset0_choices = flash_fragments[FLASH_E2E_OFFSET0_KEY].choices
         self.assertEqual(e2e_offset0_choices[0], 0)
         self.assertEqual(set(e2e_offset0_choices), set(range(16)))
+        self.assertEqual(
+            set(flash_fragments[FLASH_WAIT_HINT_KEY].choices), {0, 10_000_000}
+        )
+        # The polynomial packets are manual-only overrides: selectable as fixed
+        # configs but never offered to the search.
+        self.assertEqual(
+            set(flash_fragments[FLASH_EXP2_PACKET_KEY].choices),
+            {
+                "1x1",
+                "4x1",
+                "4x2",
+                "8x1",
+                "8x2",
+                "deg2_16x6",
+                "hybrid_deg1_16x8",
+                "deg1_16x8",
+                "deg1_8x2_corr10",
+            },
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_EXP2_PACKET_KEY].search_choices, ("1x1", "4x1")
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_STAT_TRANSPORT_KEY].choices),
+            {"ring2", "single"},
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_MMA_INTERLEAVE_KEY].choices), {False, True}
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_MMA_INTERLEAVE_KEY].search_choices, (True,)
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_STAT_TRANSPORT_KEY].search_choices, ("single",)
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_EXP2_PACKET_KEY].search_choices or ()),
+            {"1x1", "4x1"},
+        )
+        self.assertNotIn(FLASH_Q_TILE_COUNT_KEY, flash_fragments)
         # The fa4 levers offer narrow validated search sets.
         self.assertEqual(flash_fragments[FLASH_DISC_PIPE_KEY].choices[0], 4)
         self.assertEqual(
@@ -4165,7 +4217,7 @@ class TestCuteAutotuner(TestCase):
             env_xu_long_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
             set(env_xu_long_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
-            {"16/4", "8/2", "16/2", "xu"},
+            {"16/4", "8/2", "16/2", "xu", "16/6", "16/8"},
         )
         self.assertEqual(
             env_xu_long_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
@@ -4211,12 +4263,33 @@ class TestCuteAutotuner(TestCase):
             bad_topology_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
             set(bad_topology_fragments[FLASH_PIPELINE_FAMILY_KEY].choices),
-            set(FLASH_PIPELINE_FAMILIES),
+            set(FLASH_AUTOTUNE_PIPELINE_FAMILIES),
         )
         self.assertEqual(
             bad_topology_fragments[FLASH_PIPELINE_FAMILY_KEY].choices[0],
             "ws_overlap",
         )
+        for manual_family, causal in (
+            ("fa4_deep_1cta", False),
+            ("fa4_2cta_causal", True),
+        ):
+            with (
+                self.subTest(manual_family=manual_family),
+                unittest.mock.patch.dict(
+                    os.environ,
+                    {"HELION_CUTE_FLASH_PIPELINE_FAMILY": manual_family},
+                    clear=False,
+                ),
+            ):
+                manual_fragments = flash_autotune_fragments(
+                    64,
+                    512,
+                    is_causal=causal,
+                )
+            manual_fragment = manual_fragments[FLASH_PIPELINE_FAMILY_KEY]
+            self.assertIn(manual_family, manual_fragment.choices)
+            self.assertNotEqual(manual_fragment.default(), manual_family)
+            self.assertNotIn(manual_family, manual_fragment.search_choices or ())
         self.assertEqual(
             set(bad_topology_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
             {"16/4", "8/2", "16/2", "xu"},
@@ -4279,7 +4352,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices,
-            ("inherit", "xu", "16/4", "8/2"),
+            ("inherit", "xu", "16/4", "8/2", "16/6", "16/8"),
         )
         self.assertEqual(
             causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].search_choices,
@@ -4401,7 +4474,7 @@ class TestCuteAutotuner(TestCase):
         long_dense_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
             set(long_dense_fragments[FLASH_PIPELINE_FAMILY_KEY].choices),
-            set(FLASH_PIPELINE_FAMILIES),
+            set(FLASH_AUTOTUNE_PIPELINE_FAMILIES),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_PIPELINE_FAMILY_KEY].search_choices,
@@ -4413,7 +4486,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
-            {"16/4", "8/2", "16/2", "xu"},
+            {"16/4", "8/2", "16/2", "xu", "16/6", "16/8"},
         )
         self.assertEqual(
             long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
@@ -4653,7 +4726,7 @@ class TestCuteAutotuner(TestCase):
                 FLASH_CLC_STAGES_KEY: (2,),
             },
             2048: {
-                FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap"),
+                FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap", "fa4_2cta"),
                 FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_CORR_TILE_SIZE_KEY: (8, 16),
                 FLASH_SOFTMAX_REGS_KEY: (192, 200),
@@ -4836,11 +4909,11 @@ class TestCuteAutotuner(TestCase):
         )
         odd_bound = flash_attention.bind((q_odd, k_odd, v_odd))
         odd_fragments = odd_bound.config_spec._flat_fields()
-        # Odd-KV shapes keep all families in the manual enum surface for cache
+        # Odd-KV shapes retain the production family enum surface for cache
         # transfer, but only search ws_overlap and clamp stale fa4 families.
         self.assertEqual(
             set(odd_fragments[FLASH_PIPELINE_FAMILY_KEY].choices),
-            set(FLASH_PIPELINE_FAMILIES),
+            set(FLASH_AUTOTUNE_PIPELINE_FAMILIES),
         )
         self.assertEqual(
             odd_fragments[FLASH_PIPELINE_FAMILY_KEY].search_choices,
@@ -4895,7 +4968,7 @@ class TestCuteAutotuner(TestCase):
             cute_flash_clc_pdl=True,
             cute_flash_clc_stages=3,
             cute_flash_q_tile_count=-1,
-            cute_flash_mma_interleave=999,
+            cute_flash_mma_interleave=True,
         )
         family_compound = helion.Config(
             block_sizes=[1, 128, 128],
@@ -4904,8 +4977,8 @@ class TestCuteAutotuner(TestCase):
             cute_flash_clc_pdl=True,
             cute_flash_clc_stages=3,
         )
-        # Legacy configs without the family slot flatten identically, including
-        # before normalization. Dead knobs do not contribute to identity.
+        # Legacy structural configs flatten identically before normalization;
+        # the family-derived Q count does not add an independent search slot.
         self.assertEqual(
             long_gen.flatten(legacy_compound), long_gen.flatten(family_compound)
         )
@@ -4918,8 +4991,8 @@ class TestCuteAutotuner(TestCase):
         )
         for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
             self.assertNotIn(legacy_key, legacy_compound)
-        self.assertNotIn(FLASH_Q_TILE_COUNT_KEY, legacy_compound)
-        self.assertNotIn(FLASH_MMA_INTERLEAVE_KEY, legacy_compound)
+        self.assertEqual(legacy_compound.config[FLASH_Q_TILE_COUNT_KEY], 2)
+        self.assertTrue(legacy_compound.config[FLASH_MMA_INTERLEAVE_KEY])
 
         clc_q, clc_k, clc_v = (
             torch.empty(1, 1, 131072, 64, dtype=torch.float16, device=DEVICE)
@@ -5126,6 +5199,17 @@ class TestCuteAutotuner(TestCase):
             self.assertIn(random_long[FLASH_EPI_STG_KEY], {False, True})
             self.assertIn(random_long[FLASH_EPI_STG_STORE_KEY], {"slice", "whole"})
             self.assertIn(random_long[FLASH_EPI_STG_GMEM_KEY], {"stage", "pair"})
+            self.assertIn(random_long[FLASH_WAIT_HINT_KEY], {0, 10_000_000})
+            self.assertIn(
+                random_long[FLASH_EXP2_PACKET_KEY],
+                {"1x1", "4x1", "4x2", "8x1", "8x2"},
+            )
+            self.assertIn(random_long[FLASH_STAT_TRANSPORT_KEY], {"ring2", "single"})
+            self.assertIn(random_long[FLASH_MMA_INTERLEAVE_KEY], {False, True})
+            self.assertEqual(
+                random_long[FLASH_Q_TILE_COUNT_KEY],
+                1 if random_long[FLASH_PIPELINE_FAMILY_KEY] == "ws_overlap" else 2,
+            )
             self.assertEqual(random_long[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
             self.assertIn(random_long[FLASH_RESCALE_CHUNK_COLS_KEY], {16, 32})
             self.assertEqual(random_long[FLASH_S_STAGE_KEY], 2)
