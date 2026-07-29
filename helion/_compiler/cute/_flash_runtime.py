@@ -1833,12 +1833,8 @@ def fa4_correction_epilogue_handoff_to_smem(
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
 
 
-def fa4_correction_epilogue_handoff_to_smem_scoped(
-    o_full_ptr_stage: object,
-    o_full_phase: object,
-    corr_epi_empty_ptr_stage: object,
-    corr_epi_empty_phase: object,
-    corr_epi_full_ptr_stage: object,
+@dsl_user_op
+def fa4_correction_epilogue_to_smem_scoped(
     flash_pvt: object,
     tOtO: cute.Tensor,
     sO: cute.Tensor,
@@ -1847,11 +1843,11 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
     head_dim: int,
     corr_tile_size: int,
     o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
 ) -> None:
-    """FA4 correction epilogue with copy-view lifetimes scoped after waits."""
-    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
-    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
-
+    """FA4 correction epilogue with copy-view lifetimes scoped to the copy body."""
     o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
     epi_subtile = (128, corr_tile_size)
     tmem_atom = sm100_utils_flash.get_tmem_load_op(
@@ -1886,6 +1882,36 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
         cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
         reg.store(reg.load() * inv_sum)
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
+
+
+def fa4_correction_epilogue_handoff_to_smem_scoped(
+    o_full_ptr_stage: object,
+    o_full_phase: object,
+    corr_epi_empty_ptr_stage: object,
+    corr_epi_empty_phase: object,
+    corr_epi_full_ptr_stage: object,
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    inv_sum: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+) -> None:
+    """Wait for O/epilogue handoff, scope copy views, then publish staged O."""
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    fa4_correction_epilogue_to_smem_scoped(
+        flash_pvt,
+        tOtO,
+        sO,
+        tidx,
+        inv_sum,
+        head_dim,
+        corr_tile_size,
+        o_dtype,
+    )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
 
