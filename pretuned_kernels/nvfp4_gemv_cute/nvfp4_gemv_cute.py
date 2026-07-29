@@ -4,19 +4,15 @@ Helion CuTe (tcgen05) backend.
 The CuTe counterpart of ``pretuned_kernels/nvfp4_gemv`` (the Triton variant):
 same two decode regimes, same NVFP4 weight layout (packed E2M1 bytes with
 per-16-value E4M3 block scales in PyTorch's SWIZZLE_32_4_4 layout), but backed by
-the hand-written ``@cute.kernel`` inline-PTX fast paths from
-https://github.com/pytorch/helion/pull/2738 (``examples/nvfp4_gemv.py``):
+actual Helion DSL kernels compiled with ``backend="cute"``:
 
 * :func:`_nvfp4_gemv_fp4in` -- NVFP4 weight * NVFP4 activation (W4A4).
 * :func:`_nvfp4_gemv_bf16in` -- NVFP4 weight * BF16 activation (W4A16).
 
-Unlike the Triton variant, these are hand-PTX kernels launched directly (fixed
-block/grid via ``default_cute_launcher``), so there are no tunable configs -- the
-sm100 marker heuristic exists only so ``pretuned_kernels/run.py`` gates the
-kernel to B200. The example only compiles its CuTe fast paths when imported under
-``HELION_BACKEND=cute``, so this module force-imports a private copy under that
-backend (restoring the env afterwards, so a same-process Triton kernel run is
-unaffected).
+The kernels use the portable FP32-decode bodies from ``examples/nvfp4_gemv.py``
+and checked-in B200 CuTe configs. They go through Helion's normal compilation,
+configuration, caching, and launch path; there is no direct ``@cute.kernel`` or
+``default_cute_launcher`` shim.
 
 Benchmarked against the production vLLM CUTLASS NVFP4 GEMM
 (``ops.cutlass_scaled_fp4_mm`` -- the NVFP4 analog of ``cutlass_scaled_mm``,
@@ -28,57 +24,127 @@ slower than the kernel, so it is not a timed baseline).
 
 from __future__ import annotations
 
-import importlib.util
 import os
 from pathlib import Path
 import sys
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
+
+import helion
+from helion._testing import import_path
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 _EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
-
-
-def _load_cute_example() -> object:
-    """Import a private copy of examples/nvfp4_gemv.py under HELION_BACKEND=cute.
-
-    The example gates compilation of its hand-PTX CuTe fast paths on the backend
-    selected *at import time*, so it must be imported fresh under the cute
-    backend (a distinct module name from the Triton variant's import). The env is
-    restored afterwards so a same-process Triton kernel run still sees its own
-    backend.
-    """
-    prev = os.environ.get("HELION_BACKEND")
-    os.environ["HELION_BACKEND"] = "cute"
-    try:
-        module_name = "_pretuned_nvfp4_gemv_cute_example"
-        spec = importlib.util.spec_from_file_location(
-            module_name, _EXAMPLES_DIR / "nvfp4_gemv.py"
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        if prev is None:
-            os.environ.pop("HELION_BACKEND", None)
-        else:
-            os.environ["HELION_BACKEND"] = prev
-
-
-_ex = _load_cute_example()
+_ex = import_path(_EXAMPLES_DIR / "nvfp4_gemv.py")
 make_fp8_scales = _ex.make_fp8_scales
 reference_nvfp4_gemv_fp4in = _ex.reference_nvfp4_gemv_fp4in
 reference_nvfp4_gemv_bf16in = _ex.reference_nvfp4_gemv_bf16in
+swizzled_scale_offsets = _ex.swizzled_scale_offsets
 
 # torch.compile of the NVFP4 dequant references -- a speedup-comparison baseline
 # only (correctness is checked against the eager reference).
 compiled_reference_nvfp4_gemv_fp4in = torch.compile(reference_nvfp4_gemv_fp4in)
 compiled_reference_nvfp4_gemv_bf16in = torch.compile(reference_nvfp4_gemv_bf16in)
+
+
+@helion.aot_kernel(backend="cute", static_shapes=True)
+def nvfp4_gemv_bf16in_kernel(
+    weight_fp4x2: torch.Tensor,
+    x_values: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Helion CuTe W4A16 GEMV with FP32 accumulation."""
+    M, K_groups, _ = weight_fp4x2.shape
+    block_m = hl.register_block_size(1, 1)
+    block_k = hl.register_block_size(16, K_groups)
+
+    for tile_m in hl.tile(M, block_size=block_m):
+        row = tile_m.begin
+        acc = hl.zeros([], dtype=torch.float32)
+        for tile_k in hl.tile(K_groups, block_size=block_k):
+            contrib = hl.zeros([tile_k], dtype=torch.float32)
+            for byte in hl.static_range(8):
+                weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
+                    weight_fp4x2[row, tile_k, byte]
+                )
+                contrib = contrib + weight_lo * x_values[tile_k, byte * 2].to(
+                    torch.float32
+                )
+                contrib = contrib + weight_hi * x_values[tile_k, byte * 2 + 1].to(
+                    torch.float32
+                )
+            scale_offsets = swizzled_scale_offsets(
+                cast("int", row), tile_k.index, K_groups
+            )
+            scale = hl.load(
+                weight_scale,
+                [scale_offsets],
+                extra_mask=tile_k.index < K_groups,
+            ).to(torch.float32)
+            acc = acc + (contrib * scale).sum()
+        out[row] = (acc * alpha).to(torch.bfloat16)
+    return out
+
+
+@helion.aot_kernel(backend="cute", static_shapes=True)
+def nvfp4_gemv_fp4in_kernel(
+    weight_fp4x2: torch.Tensor,
+    x_fp4x2: torch.Tensor,
+    weight_scale: torch.Tensor,
+    x_scale: torch.Tensor,
+    out: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Helion CuTe W4A4 GEMV with FP32 accumulation."""
+    M, K_groups, _ = weight_fp4x2.shape
+    block_m = hl.register_block_size(1, 1)
+    block_k = hl.register_block_size(16, K_groups)
+
+    for tile_m in hl.tile(M, block_size=block_m):
+        row = tile_m.begin
+        acc = hl.zeros([], dtype=torch.float32)
+        for tile_k in hl.tile(K_groups, block_size=block_k):
+            contrib = hl.zeros([tile_k], dtype=torch.float32)
+            for byte in hl.static_range(8):
+                weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
+                    weight_fp4x2[row, tile_k, byte]
+                )
+                x_lo, x_hi = hl.float4_e2m1fn_x2_to_float32(x_fp4x2[tile_k, byte])
+                contrib = contrib + weight_lo * x_lo + weight_hi * x_hi
+            weight_scale_offsets = swizzled_scale_offsets(
+                cast("int", row), tile_k.index, K_groups
+            )
+            x_scale_offsets = swizzled_scale_offsets(
+                tile_k.index * 0, tile_k.index, K_groups
+            )
+            scale = hl.load(
+                weight_scale,
+                [weight_scale_offsets],
+                extra_mask=tile_k.index < K_groups,
+            ).to(torch.float32)
+            scale = scale * hl.load(
+                x_scale,
+                [x_scale_offsets],
+                extra_mask=tile_k.index < K_groups,
+            ).to(torch.float32)
+            acc = acc + (contrib * scale).sum()
+        out[row] = (acc * alpha).to(torch.bfloat16)
+    return out
+
+
+def _as_fp4x2(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype is torch.float4_e2m1fn_x2:
+        return tensor
+    if tensor.dtype is torch.uint8:
+        return tensor.view(torch.float4_e2m1fn_x2)
+    raise TypeError(f"expected uint8 or float4_e2m1fn_x2 tensor, got {tensor.dtype}")
 
 
 def _nvfp4_gemv_fp4in(
@@ -88,9 +154,30 @@ def _nvfp4_gemv_fp4in(
     x_scale: torch.Tensor,
     alpha: float = 1.0,
 ) -> torch.Tensor:
-    """W4A4 NVFP4 GEMV via the CuTe hand-PTX fast path."""
-    return _ex.nvfp4_gemv_fp4in(
-        weight_packed, x_packed, weight_scale, x_scale, alpha, backend="cute"
+    """Run the Helion CuTe W4A4 kernel."""
+    _ex._check_contiguous("weight_packed", weight_packed)
+    _ex._check_contiguous("x_packed", x_packed)
+    weight_fp4x2 = _as_fp4x2(weight_packed)
+    x_fp4x2 = _as_fp4x2(x_packed)
+    weight_bytes = weight_fp4x2.view(torch.uint8)
+    x_bytes = x_fp4x2.view(torch.uint8)
+    _ex._check_fp4_weight_storage("weight_packed", weight_bytes)
+    _ex._check_numel("x_packed", x_bytes, weight_bytes.shape[1])
+    groups = weight_bytes.shape[1] // 8
+    _ex._check_swizzled_scales(
+        "weight_scale", weight_scale, weight_bytes.shape[0], groups
+    )
+    _ex._check_swizzled_scales("x_scale", x_scale, 1, groups)
+    out = torch.empty(
+        weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
+    )
+    return nvfp4_gemv_fp4in_kernel(
+        weight_fp4x2.view(weight_bytes.shape[0], groups, 8),
+        x_fp4x2.view(groups, 8),
+        weight_scale.reshape(-1),
+        x_scale.reshape(-1),
+        out,
+        alpha,
     )
 
 
@@ -100,9 +187,26 @@ def _nvfp4_gemv_bf16in(
     weight_scale: torch.Tensor,
     alpha: float = 1.0,
 ) -> torch.Tensor:
-    """W4A16 NVFP4 GEMV via the CuTe hand-PTX fast path."""
-    return _ex.nvfp4_gemv_bf16in(
-        weight_packed, x_bf16, weight_scale, alpha, backend="cute"
+    """Run the Helion CuTe W4A16 kernel."""
+    _ex._check_contiguous("weight_packed", weight_packed)
+    _ex._check_contiguous("x_bf16", x_bf16)
+    weight_fp4x2 = _as_fp4x2(weight_packed)
+    weight_bytes = weight_fp4x2.view(torch.uint8)
+    _ex._check_fp4_weight_storage("weight_packed", weight_bytes)
+    _ex._check_numel("x_bf16", x_bf16, weight_bytes.shape[1] * 2)
+    groups = weight_bytes.shape[1] // 8
+    _ex._check_swizzled_scales(
+        "weight_scale", weight_scale, weight_bytes.shape[0], groups
+    )
+    out = torch.empty(
+        weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
+    )
+    return nvfp4_gemv_bf16in_kernel(
+        weight_fp4x2.view(weight_bytes.shape[0], groups, 8),
+        x_bf16.view(groups, 16),
+        weight_scale.reshape(-1),
+        out,
+        alpha,
     )
 
 
@@ -186,13 +290,15 @@ def use_cudagraph() -> bool:
     return True
 
 
-# The CuTe fast path requires k_bytes % 2048 == 0 (see _can_use_fast_cute_path in
-# the example), so every K here is a multiple of 4096 elements. Decode (M=1) NVFP4
-# GEMV weight shapes (N=output features, K=reduction dim) for common projections.
+# Decode (M=1) NVFP4 GEMV weight shapes (N=output features, K=reduction dim) for
+# common projections. These match the Triton variant's shape coverage.
 SHAPES = [  # (N, K)
     (4096, 4096),  # Llama-3-8B o_proj (square)
     (6144, 4096),  # Llama-3-8B qkv_proj (q4096 + kv1024*2)
     (28672, 4096),  # Llama-3-8B gate_up_proj (2 * 14336)
+    (4096, 14336),  # Llama-3-8B down_proj
+    (5120, 5120),  # 13B-class attention o_proj
+    (15360, 5120),  # 13B-class qkv_proj (3 * 5120)
     (8192, 8192),  # 70B-class square projection (nvfp4_backend_comparison "o")
     (10240, 8192),  # wide fused projection
     (8192, 28672),  # nvfp4_backend_comparison "down": K_bytes=14336

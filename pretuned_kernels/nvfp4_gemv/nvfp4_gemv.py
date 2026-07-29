@@ -7,19 +7,11 @@ SWIZZLE_32_4_4 layout. Two variants ship, matching the two decode regimes:
 * :func:`_nvfp4_gemv_fp4in` -- NVFP4 weight * NVFP4 activation (W4A4).
 * :func:`_nvfp4_gemv_bf16in` -- NVFP4 weight * BF16 activation (W4A16).
 
-These are the coalesced-load FP16-decode Triton GEMV kernels from
-https://github.com/pytorch/helion/pull/3079: the weight (and, for W4A4, the
+These are the coalesced-load FP16-decode Triton GEMV kernels: the weight (and, for W4A4, the
 activation) NVFP4 bytes are loaded and unpacked with
 ``hl.load_float4_e2m1fn_x16_to_float16``, the per-group dot runs in fp16, and
 the E4M3 block scale is applied in fp32. They tile over M (a vector accumulator,
 ``out[tile_m]``), so ``block_m > 1`` is correct and reused across rows.
-
-Benchmarked against the production vLLM CUTLASS NVFP4 GEMM
-(``ops.cutlass_scaled_fp4_mm`` -- the NVFP4 analog of ``cutlass_scaled_mm``,
-which has no dedicated GEMV, so decode is served by the M=1 GEMM) and
-``torch.compile`` of the NVFP4 dequant reference. The eager dequant reference is
-used only for a one-shot correctness check per shape (it is orders of magnitude
-slower than the kernel, so it is not a timed baseline).
 """
 
 from __future__ import annotations
