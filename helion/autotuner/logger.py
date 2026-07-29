@@ -137,8 +137,10 @@ class AutotuningLogger:
             sink.start_run()
             try:
                 yield sink
-            finally:
+                # Only record the dataset if the tuning succeeds. If the tuning
+                # run fails raise the actual tuning error.
                 sink.end_run()
+            finally:
                 self._detach_sink()
 
     def record_autotune_entry(self, entry: AutotuneLogEntry) -> None:
