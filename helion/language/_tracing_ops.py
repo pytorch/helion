@@ -383,6 +383,74 @@ def _(tensor: torch.Tensor, other: float) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+@_decorators.codegen(_mask_to, "flydsl")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+
+    from .memory_ops import _flydsl_col_tail_pred
+
+    env = CompileEnvironment.current()
+    df = state.device_function
+    # Bind the masked value to a var so the mask/select can reference it several
+    # times. ``expr`` is a per-thread vector (length V).
+    e_var = df.new_var("_maskin", dce=True)
+    state.add_statement(
+        statement_from_string(f"{e_var} = {{expr}}", expr=state.ast_arg(0))
+    )
+
+    # Build a per-element bool VECTOR mask matching ``expr``. For the looped
+    # reduction column with a tail, use the exact per-element predicate
+    # (``roffset + lane*V + iota < N``) -- the strategy's scalar ``mask_var``
+    # (``rindex < N``) is only correct at V=1. Other dims (e.g. a bm>1 row mask)
+    # contribute a scalar ``mask_var`` broadcast to the vector shape.
+    mask_terms: list[str] = []
+    for size in tensor.size():
+        index = env.resolve_block_id(size)
+        if index is None:
+            continue
+        strategy = df.tile_strategy.block_id_to_strategy.get((index,))
+        _tc = getattr(strategy, "_thread_count", 0) or 0
+        _lb = getattr(strategy, "_loop_block_size", 0) or 0
+        if (
+            env.block_sizes[index].reduction
+            and strategy is not None
+            and _tc > 0
+            and _lb >= _tc
+            and not env.known_multiple(env.block_sizes[index].numel, _lb)
+        ):
+            _v = max(1, _lb // _tc)
+            _pred = _flydsl_col_tail_pred(
+                state,
+                strategy.offset_var(index),
+                _v,
+                state.sympy_expr(env.block_sizes[index].numel),
+            )
+            mask_terms.append(_pred)
+        elif (mask_var := state.codegen.mask_var(index)) is not None:
+            mask_terms.append(
+                f"fx.Vector.filled_like({e_var}, {mask_var}, dtype=fx.Boolean)"
+            )
+
+    if not mask_terms:
+        return expr_from_string(e_var)
+
+    mask_expr = (
+        mask_terms[0]
+        if len(mask_terms) == 1
+        else " & ".join(f"({m})" for m in mask_terms)
+    )
+    dtype_str = env.backend.dtype_str(tensor.dtype)
+    other_typed = f"{dtype_str}({constant_repr(other)})"
+    # Broadcast identity to expr's shape via a shape-only zero vector (NaN-safe
+    # for +/-inf, unlike ``(e)-(e)``).
+    return expr_from_string(
+        f"({mask_expr}).select({e_var}, (fx.Vector.filled_like({e_var}, 0) + ({other_typed})))"
+    )
+
+
 @_decorators.get_masked_value(_mask_to)
 def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]
