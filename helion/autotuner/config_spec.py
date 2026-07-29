@@ -2170,6 +2170,11 @@ class ConfigSpec:
         merged = dict(self._base_default_config().config)
         merged.update(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
+        # Then normalize, so a promoted compiler default has the same canonical field set as the
+        # ``_base_default_config`` path: without this its ``repr``/equality differs from its own
+        # flatten/unflatten round-trip, which breaks callers that key on the config identity
+        # (e.g. benchmark result maps).
+        self.normalize(config, _fix_invalid=True)
         self._shrink_for_numel_constraints(config)
         return config
 
