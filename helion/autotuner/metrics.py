@@ -33,6 +33,7 @@ class AutotuneMetrics:
     _start_time: float = dataclasses.field(default_factory=time.perf_counter)
     num_configs_tested: int = 0
     num_compile_failures: int = 0
+    num_worker_failures: int = 0
     num_accuracy_failures: int = 0
     num_generations: int = 0
     autotune_time: float = 0.0
@@ -57,6 +58,7 @@ class AutotuneMetrics:
             "search_algorithm": self.search_algorithm,
             "num_configs_tested": self.num_configs_tested,
             "num_compile_failures": self.num_compile_failures,
+            "num_worker_failures": self.num_worker_failures,
             "num_accuracy_failures": self.num_accuracy_failures,
             "num_generations": self.num_generations,
             "autotune_time": self.autotune_time,

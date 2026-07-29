@@ -1522,7 +1522,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_DISC_PIPE_KEY], 4)
             self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
             self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
-            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertEqual(config[FLASH_PRECOMPUTE_QK_DESC_KEY], num_kv == 512)
             self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
             self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], 0)
             self.assertEqual(config[FLASH_KV_ORDER_KEY], "ascending")
@@ -1638,7 +1638,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 3,
                 1,
                 True,
-                32.0,
+                8.0,
                 8,
                 False,
                 1,
@@ -1666,11 +1666,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 False,
                 1,
                 "descending",
-                8,
+                16,
                 False,
-                0,
+                4,
                 200,
-                72,
+                80,
                 32,
                 False,
                 False,
@@ -1717,9 +1717,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
             self.assertEqual(config[FLASH_SOFTMAX_DISC_KEY], softmax_disc)
             self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
+            self.assertEqual(config[FLASH_SPLIT_P_ARRIVE_KEY], num_kv == 512)
             self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
             self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
-            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertEqual(config[FLASH_PRECOMPUTE_QK_DESC_KEY], num_kv == 512)
             self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
             self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], first_load_order)
             self.assertEqual(config[FLASH_KV_ORDER_KEY], kv_order)
@@ -1760,7 +1761,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(very_long_config[FLASH_EPI_STG_KEY])
         self.assertEqual(very_long_config[FLASH_CORR_TILE_SIZE_KEY], 8)
         self.assertEqual(very_long_config.get(FLASH_ROLE_MAP_KEY, "helion"), "helion")
-        self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 32.0)
+        self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
         self.assertEqual(very_long_config[FLASH_RESCALE_CHUNK_COLS_KEY], 8)
         self.assertTrue(very_long_config[FLASH_PACKED_REDUCE_KEY])
         self.assertFalse(very_long_config[FLASH_LOCAL_TMA_PARTITION_KEY])
@@ -2021,6 +2022,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertNotIn(FLASH_E2E_OFFSET_KEY, seed.config)
         self.assertIn(seed, bound.config_spec.compiler_seed_configs)
         self.assertIsNone(bound.config_spec.compiler_default_config)
+
+        bf16_args = tuple(
+            torch.empty(1, 1, 49152, 64, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        )
+        bf16_bound = flash_attn.bind(bf16_args)
+        self.assertIs(bf16_bound.config_spec._cute_flash_dtype, torch.bfloat16)
+        bf16_seed = heuristic.get_seed_config(
+            bf16_bound.env, bf16_bound.host_function.device_ir
+        )
+        assert bf16_seed is not None
+        self.assertEqual(bf16_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 32.0)
 
         dense_2048_args = tuple(
             torch.empty(1, 1, 2048, 64, dtype=torch.float16, device=DEVICE)
@@ -2306,6 +2319,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             default_cluster_m2_config.config["block_sizes"],
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
         )
+
+        # The clustered scheduler still assigns physical cluster M/N to work-tile
+        # coordinates 0/1. Autotuning repairs an alternate loop order to the
+        # default; an explicit user config gets a clear validation error.
+        clustered_alt_order = helion.Config.from_dict(default_cluster_m2_config.config)
+        clustered_alt_order.config["loop_orders"] = [[1, 0]]
+        bound.config_spec.normalize(clustered_alt_order, _fix_invalid=True)
+        self.assertEqual(clustered_alt_order.config["tcgen05_cluster_m"], 2)
+        self.assertEqual(clustered_alt_order.loop_orders, [[0, 1]])
+
+        clustered_alt_order.config["loop_orders"] = [[1, 0]]
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            r"non-default loop_orders require tcgen05 cluster shape \(1, 1\)",
+        ):
+            bound.config_spec.normalize(clustered_alt_order)
 
         # An explicit FFI request still projects onto the generalized seed.
         requested_ffi_config = helion.Config(
@@ -4392,12 +4421,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # Future heuristics may add more compiler seeds; this test only
         # requires the CuTe cluster-m2 seed to be present.
         self.assertGreaterEqual(len(acf_configs), 2)
-        self.assertEqual(
+        acf_seed_configs = [
+            config
+            for config in acf_configs
+            if config.config["advanced_controls_file"] == "/tmp/helion-test.acf"
+        ]
+        self.assertGreaterEqual(len(acf_seed_configs), 1)
+        self.assertLessEqual(
             {config.config["advanced_controls_file"] for config in acf_configs},
-            {"/tmp/helion-test.acf"},
+            {"", "/tmp/helion-test.acf"},
         )
         self._assert_cute_tcgen05_cluster_m2_seeded(
-            acf_configs,
+            acf_seed_configs,
             expected_block_k=128,
             expected_indexing_length=3,
         )

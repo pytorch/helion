@@ -586,9 +586,14 @@ def _shape_dict(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _helion_codegen_markers(code: str) -> dict[str, bool]:
+    tcgen05_prefixes = ("cute.nvgpu.tcgen05.", "cute_tcgen05_flash.")
     return {
-        "uses_tcgen05": "cute.nvgpu.tcgen05.CtaGroup" in code,
-        "uses_tcgen05_two_cta": "cute.nvgpu.tcgen05.CtaGroup.TWO" in code,
+        "uses_tcgen05": any(prefix in code for prefix in tcgen05_prefixes),
+        "uses_tcgen05_two_cta": any(
+            f"{prefix}CtaGroup.TWO" in code for prefix in tcgen05_prefixes
+        )
+        or "is_two_cta=True" in code
+        or "'use_2cta_instrs': True" in code,
         "uses_tma_umma_pipeline": "PipelineTmaUmma.create(" in code,
     }
 
@@ -684,9 +689,13 @@ def _compiler_flash_seed_config(
         return None
     config_spec = cast("_BoundWithConfigSpec", bound).config_spec
     if config_spec.compiler_default_config is not None:
-        return dict(config_spec.default_config().config)
-    if config_spec.compiler_seed_configs:
-        return dict(config_spec.compiler_seed_configs[0].config)
+        default_config = dict(config_spec.default_config().config)
+        if any(key.startswith("cute_flash_") for key in default_config):
+            return default_config
+    for seed in config_spec.compiler_seed_configs:
+        seed_config = dict(seed.config)
+        if any(key.startswith("cute_flash_") for key in seed_config):
+            return seed_config
     return None
 
 

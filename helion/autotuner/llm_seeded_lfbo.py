@@ -48,6 +48,7 @@ _DISALLOWED_SECOND_STAGE_ALGORITHMS = {
 _AGGREGATED_METRIC_FIELDS = (
     "num_configs_tested",
     "num_compile_failures",
+    "num_worker_failures",
     "num_accuracy_failures",
     "num_generations",
 )

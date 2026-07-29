@@ -3352,6 +3352,35 @@ class TestPallas(TestCase):
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret("slicing error in JAX interpret mode")
+    def test_scalar_row_ragged_col_store(self) -> None:
+        """A store with a scalar row index and a ragged-tile column on the
+        same tensor must not misalign the value slice with the tensor's dims.
+
+        ``sliced_value_for_store`` clamp-slices a ``TilePattern`` dim whose
+        last tile is narrower than ``block_size`` (here ``m=20`` -> a
+        remainder tile of 108 against ``block_size=128``). The literal ``0`` row
+        index is a scalar (``ArbitraryIndexPattern``): it consumes a tensor
+        dim but is squeezed out of the *value*'s shape, so it must not get a
+        slice entry of its own -- otherwise the clamp slice is built against
+        the wrong dimension of the (lower-rank) value and Pallas rejects it
+        with "Too many indices".
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_row_ragged_col_store(x: torch.Tensor) -> torch.Tensor:
+            _n, m = x.shape
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(m):
+                out[0, tile_m] = x[0, tile_m] * 2.0
+            return out
+
+        x = torch.randn(1, 20, device=DEVICE)
+        _, result = code_and_output(
+            scalar_row_ragged_col_store, (x,), block_sizes=[128]
+        )
+        torch.testing.assert_close(result, x * 2.0)
+
     @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
     )
@@ -4823,9 +4852,9 @@ class TestPallas(TestCase):
         consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
         multiplicative load mask.
 
-        The deferral is an FX-graph pass, so it is independent of the pallas loop
-        type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
-        generic (non-attention) per-token jagged projection whose partial tiles
+        The deferral is an FX-graph pass, so it is independent of worklist
+        flattening -- asserted here for ordinary ``fori_loop`` and flattened
+        ``unroll`` on a generic per-token jagged projection whose partial tiles
         make the mask load-bearing.
         """
 
@@ -4855,13 +4884,14 @@ class TestPallas(TestCase):
             s, e = int(offsets[i]), int(offsets[i + 1])
             ref[s:e] = torch.bmm(x[s:e].transpose(0, 1), w).transpose(0, 1)
 
-        for loop_type in ("fori_loop", "compact_worklist"):
-            with self.subTest(loop_type=loop_type):
+        for loop_type, grouping in (("fori_loop", 0), ("unroll", 1)):
+            with self.subTest(loop_type=loop_type, grouping=grouping):
                 code, out = code_and_output(
                     jagged_proj,
                     (x, w, offsets),
                     block_sizes=[block],
                     pallas_loop_type=loop_type,
+                    pallas_worklist_grouping=grouping,
                 )
                 # x's masked load is raw (no eager ``* mask``), feeds a transpose,
                 # and the mask reappears as a post-transpose ``jnp.where``.
@@ -4870,11 +4900,11 @@ class TestPallas(TestCase):
                 self.assertRegex(producer, r"= x\[")
                 self.assertNotIn("* mask", producer)
                 self.assertIn("jnp.where", code)
-                # compact_worklist matches the eager reference on the partial
-                # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
+                # Worklist flattening matches the eager reference on the partial
+                # tiles. fori_loop miscompiles jagged tiles in pallas interpret
                 # (a pre-existing, unrelated issue), so it is not a sound numeric
                 # oracle here; for it we assert only the codegen above.
-                if loop_type == "compact_worklist":
+                if grouping == 1:
                     torch.testing.assert_close(
                         out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2
                     )

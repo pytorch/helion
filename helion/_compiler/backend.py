@@ -58,6 +58,7 @@ log: logging.Logger = logging.getLogger(__name__)
 class FlashSearchSurface(NamedTuple):
     head_dim: int
     num_kv: int
+    io_dtype: torch.dtype
     block_size_targets: dict[int, int]
     is_causal: bool
     has_kv_tile_pruning: bool
@@ -67,6 +68,7 @@ class FlashSearchSurface(NamedTuple):
 
 class AttentionSoftmaxPattern(NamedTuple):
     score_plan: AttentionScorePlan
+    io_dtype: torch.dtype
 
     @property
     def head_dim(self) -> int:
@@ -2572,7 +2574,8 @@ def _attention_softmax_pattern_head_dim(
     )
     if not score_plan.has_lowering():
         return None
-    return AttentionSoftmaxPattern(score_plan=score_plan)
+    assert operand_dtype is not None
+    return AttentionSoftmaxPattern(score_plan=score_plan, io_dtype=operand_dtype)
 
 
 def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | None:
@@ -2663,6 +2666,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         return FlashSearchSurface(
             head_dim=pattern.head_dim,
             num_kv=(kv_seq + 127) // 128,
+            io_dtype=pattern.io_dtype,
             block_size_targets=block_size_targets,
             is_causal=pattern.is_causal,
             has_kv_tile_pruning=pattern.score_plan.has_kv_tile_pruning,

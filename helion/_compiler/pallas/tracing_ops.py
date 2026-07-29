@@ -9,6 +9,7 @@ the same eager timing as before.
 from __future__ import annotations
 
 import ast
+import contextlib
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -41,6 +42,7 @@ log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ...runtime.config import Config
@@ -112,27 +114,28 @@ def _extract_subscript_vals(subscript: object) -> list[object]:
 def _(state: CodegenState) -> object:
     """Emit inner device loops for Pallas/TPU.
 
-    When ``pallas_loop_type="emit_pipeline"``, generates ``pltpu.emit_pipeline``
-    calls with automatic DMA pipelining.  When ``pallas_loop_type="fori_loop"``,
-    generates ``jax.lax.fori_loop`` with explicit ``pltpu.make_async_copy`` DMA.
-    Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
+    Worklist flattening is handled before the ordinary loop-type dispatch: its
+    compact tile is already represented by the work-item grid, while its ordered
+    loop uses the configured resident or streaming lowering.
     """
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
+    if CompileEnvironment.current().compact_worklist_plan is not None:
+        if _is_compact_ordered_inner_loop(state):
+            if pallas_loop_type == "unroll":
+                return _codegen_resident_cache(state)
+            if pallas_loop_type == "emit_pipeline":
+                return _codegen_emit_pipeline(state)
+            assert pallas_loop_type == "fori_loop"
+        if _is_compact_tile_loop(state):
+            plan = CompileEnvironment.current().compact_worklist_plan
+            assert plan is not None
+            if plan.grouping == 2:
+                return _codegen_grouped_compact_tile(state)
+        return _codegen_fori_loop(state)
     if pallas_loop_type == "emit_pipeline":
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
-        return _codegen_fori_loop(state)
-    if pallas_loop_type == "compact_worklist":
-        # The compact tile becomes the grid (no loop).  The ordered inner tile
-        # uses the resident-cache fori path when the ordered range can be
-        # proven/windowed; otherwise it streams through emit_pipeline.  The
-        # single-iteration compact tile lowers through the fori path.  Both have
-        # begin/end remapped to metadata refs (see _compact_worklist_bounds).
-        if _is_compact_ordered_inner_loop(state):
-            if _resident_cache_applies(state):
-                return _codegen_resident_cache(state)
-            return _codegen_emit_pipeline(state)
         return _codegen_fori_loop(state)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
@@ -144,58 +147,46 @@ def _(state: CodegenState) -> None:
     """Emit inner stepped device loops for Pallas/TPU."""
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
+    if CompileEnvironment.current().compact_worklist_plan is not None:
+        if _is_compact_ordered_inner_loop(state):
+            if pallas_loop_type == "unroll":
+                _codegen_resident_cache(state)
+                return None
+            if pallas_loop_type == "emit_pipeline":
+                _codegen_emit_pipeline(state)
+                return None
+            assert pallas_loop_type == "fori_loop"
+        if _is_compact_tile_loop(state):
+            plan = CompileEnvironment.current().compact_worklist_plan
+            assert plan is not None
+            if plan.grouping == 2:
+                _codegen_grouped_compact_tile(state)
+                return None
+        _codegen_fori_loop(state)
+        return None
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None
-    if pallas_loop_type in ("fori_loop", "compact_worklist"):
-        # Route compact_worklist through the same lowering as _for_loop so the
-        # compact metadata (begin/end remap, synthetic compact tile) is applied
-        # rather than falling through to the common (non-compact) codegen.
-        if pallas_loop_type == "compact_worklist" and _is_compact_ordered_inner_loop(
-            state
-        ):
-            if _resident_cache_applies(state):
-                _codegen_resident_cache(state)
-                return None
-            _codegen_emit_pipeline(state)
-            return None
+    if pallas_loop_type == "fori_loop":
         _codegen_fori_loop(state)
         return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
 
-def _resident_cache_applies(state: CodegenState) -> bool:
-    """Whether the ordered reduction should use the resident-cache path.
-
-    Automatic compile-time decision (not a tuning knob), gated on:
-    - a bound-checkable ordered range plus compact active-owner mask: packed offset
-      arrays prove both the ordered length and which owners produce work; and
-    - a viable physical window: VMEM can hold at least one ordered block of the
-      resident operands.
-
-    If the range/window proof is absent -- unusual ordered bounds or an oversized
-    per-token footprint -- the ordered loop stays on the streamed
-    ``emit_pipeline`` path unchanged.
-    """
-    env = CompileEnvironment.current()
-    decision = env.compact_worklist_resident_cache_decision
-    return decision is not None and decision.active
-
-
 def _codegen_resident_cache(state: CodegenState) -> object:
     """Range-keyed resident-window lowering for the compact-worklist ordered loop.
 
-    Selected by :func:`_resident_cache_applies` for an ordered inner reduction
-    with a guardable packed range and a viable VMEM window.  The ordered operand
-    is held in a per-range resident ``pl.Element(C)`` window keyed on
-    ``range_start`` (``C`` is the compile-threaded physical window).  Optional
-    prep-cache descriptors are handled inside ``_codegen_fori_loop``.
+    The ordered operand is held in a per-range resident ``pl.Element(C)`` window
+    keyed on ``range_start`` (``C`` is the compile-threaded physical window).
+    Optional prep-cache descriptors are handled inside ``_codegen_fori_loop``.
 
-    Ranges longer than ``C`` are NOT handled in-kernel: the launcher raises
-    (``runtime._compact_raise_if_range_exceeds_window``) rather than over-read the
-    fixed window -- there is no in-kernel streamed ``else``.
+    Ranges longer than ``C`` are NOT handled in-kernel: the torch launcher raises
+    (``runtime._compact_raise_if_range_exceeds_window``), while JAX export keeps
+    this as a caller precondition. There is no in-kernel streamed ``else``.
     """
+    decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
+    assert decision is not None and decision.active
     return _codegen_fori_loop(state)
 
 
@@ -252,6 +243,17 @@ def _prepare_resident_prep_lowerings(
     metadata_ref_for_field(plan, "range_len")
 
     graph_info = state.get_graph(state.proxy_arg(0))
+    cache_key = (
+        graph_info.graph_id,
+        decision.physical_window,
+        active_hoists,
+    )
+    common_statements = state.codegen.grouped_compact_common_statements
+    if common_statements is not None:
+        cached = state.codegen.grouped_resident_prep_lowering_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     load_nodes = {node.name: node for node in graph_info.graph.nodes}
     needed_hosts = {hoist.host_arg for hoist in active_hoists}
     resident_windows: dict[str, tuple[str, torch.Tensor]] = {}
@@ -302,17 +304,14 @@ def _prepare_resident_prep_lowerings(
                 tail_fill_value=0.0,
             )
         )
-    # These lowerings are now installed (all validation above passed; any fallback
-    # returned early), so it is safe to drop the redundant per-tile masks on exactly
-    # these loads -- keyed on each lowering's declared tail fill, which also preserves
-    # a flash-style _mask_to(scores, -inf) whose fill differs.  Coupling elision to the
-    # installed set (not admission) keeps correctness off the "prep always emits" path.
-    load_tail_fills: dict[str, float] = {}
-    for lw in lowerings:
-        fill = lw.tail_fill_value
-        if fill is not None:
-            load_tail_fills[lw.hoist.load_node_name] = fill
+    # Fallback paths above return before declaring any tail-fill guarantees.
+    load_tail_fills = {
+        lowering.hoist.load_node_name: lowering.tail_fill_value
+        for lowering in lowerings
+    }
     elide_installed_prep_load_masks(graph_info.graph, load_tail_fills)
+    if common_statements is not None:
+        state.codegen.grouped_resident_prep_lowering_cache[cache_key] = lowerings
     return lowerings
 
 
@@ -353,12 +352,9 @@ def _emit_resident_prep_refill(
     refill_tail_stmts: list[ast.stmt] = []
     for lowering in lowerings:
         assert isinstance(lowering, ResidentPrepLowering)
-        # The tail fill is emitted as a bare literal below, so it must be a finite
-        # number.  A non-finite (inf/-inf/nan) or undeclared (None) fill would need
-        # deliberate literal formatting; today only the transpose prep (0.0) reaches
-        # here, so assert rather than silently mis-emit.
+        # Generated fill literals currently support finite values only.
         tail_fill = lowering.tail_fill_value
-        assert tail_fill is not None and -float("inf") < tail_fill < float("inf"), (
+        assert -float("inf") < tail_fill < float("inf"), (
             "resident prep refill supports only finite numeric tail_fill_value"
         )
         perm = lowering.hoist.perm
@@ -563,10 +559,9 @@ def _compact_axis_kind(state: CodegenState, loop_dim_index: int) -> str | None:
 def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
     """True if this ``_for_loop`` is the compact-worklist ordered inner tile.
 
-    The ordered tile is the carried inner reduction; it is the only
-    compact-worklist loop that may stream via ``_codegen_emit_pipeline`` when the
-    resident-cache window is inactive.  The owner grid and the single-iteration
-    compact tile stay on the fori path.
+    The ordered tile is the carried inner reduction selected by
+    ``pallas_loop_type``. The owner grid and single-iteration compact tile stay
+    on the fori path.
     """
     from ..device_ir import ForLoopGraphInfo
 
@@ -577,6 +572,168 @@ def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
         _compact_axis_kind(state, i) == "ordered"
         for i in range(len(graph_info.block_ids))
     )
+
+
+def _is_compact_tile_loop(state: CodegenState) -> bool:
+    """True for the parallel compact-tile loop represented by the work item."""
+    from ..device_ir import ForLoopGraphInfo
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None:
+        return False
+    graph_info = state.get_graph(state.proxy_arg(0))
+    if not isinstance(graph_info, ForLoopGraphInfo):
+        return False
+    if graph_info.block_ids != [plan.compact_axis.block_id]:
+        return False
+    args = state.proxy_args[-1]
+    return isinstance(args, list) and not _loop_carried_indices(state, len(args))
+
+
+@contextlib.contextmanager
+def _compact_block_variant(state: CodegenState, factor: int) -> Iterator[None]:
+    """Temporarily codegen the compact loop with ``factor * base_block``."""
+    if factor == 1:
+        yield
+        return
+
+    from ...runtime.config import Config
+    from ..tile_dispatch import TileStrategyDispatch
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    assert plan is not None and factor == 2
+    block_id = plan.compact_axis.block_id
+    fn = state.device_function
+
+    block_sizes = [*fn.config.block_sizes]
+    block_index = env.config_spec.block_sizes.block_id_to_index(block_id)
+    block_sizes[block_index] *= factor
+    variant_config = Config.from_dict({**fn.config.config, "block_sizes": block_sizes})
+
+    original_config = fn.config
+    original_tile_strategy = fn.tile_strategy
+    original_block_cache = fn.block_size_var_cache
+    original_expr_cache = fn.expr_to_var_info
+
+    variant_block_cache = original_block_cache.copy()
+    variant_block_cache.pop((block_id,), None)
+    variant_expr_cache = {}
+    for expr, info in original_expr_cache.items():
+        block_mapping, _ = find_block_size_symbols(expr)
+        if block_id not in block_mapping.values():
+            variant_expr_cache[expr] = info
+
+    fn.config = variant_config
+    fn.block_size_var_cache = variant_block_cache
+    fn.expr_to_var_info = variant_expr_cache
+    try:
+        fn.tile_strategy = TileStrategyDispatch(fn, variant_config)
+        yield
+    finally:
+        fn.config = original_config
+        fn.tile_strategy = original_tile_strategy
+        fn.block_size_var_cache = original_block_cache
+        fn.expr_to_var_info = original_expr_cache
+
+
+def _compact_output_initializers(state: CodegenState) -> list[ast.stmt]:
+    """Zero the full max-sized output window before the one-tile body."""
+    from ..device_function import TensorArg
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    assert plan is not None and plan.grouping == 2
+    output_hosts = {
+        policy.arg_name
+        for policy in plan.tensor_policies
+        if policy.kind == "compact_exact_store"
+    }
+    statements: list[ast.stmt] = []
+    for arg in state.device_function.arguments:
+        if not isinstance(arg, TensorArg) or arg.host_str() not in output_hosts:
+            continue
+        indices = ", ".join(":" for _ in range(arg.fake_value.ndim))
+        statements.append(
+            statement_from_string(
+                f"{arg.name}[{indices}] = jnp.zeros_like({arg.name}[{indices}])"
+            )
+        )
+    assert len(statements) == len(output_hosts)
+    return statements
+
+
+def _codegen_grouped_compact_tile(state: CodegenState) -> None:
+    """Emit static base-block and double-block compact-body variants."""
+    from .compact_worklist import compact_ref_names
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    assert plan is not None and plan.grouping == 2
+    assert _is_compact_tile_loop(state)
+
+    codegen = state.codegen
+    common_statements: list[ast.AST] = []
+    branch_defs: list[ast.FunctionDef] = []
+    extent_ref = f"{compact_ref_names(plan)[1]}_ref"
+
+    counter_names = (
+        "atomic_op_index",
+        "device_load_index",
+        "device_load_cache_modifier_index",
+        "device_store_index",
+        "device_store_cache_modifier_index",
+        "device_memory_op_index",
+    )
+    initial_counters = {
+        name: getattr(state.device_function, name) for name in counter_names
+    }
+    final_counters: dict[str, int] | None = None
+    previous_common = codegen.grouped_compact_common_statements
+    assert previous_common is None
+    assert not codegen.grouped_resident_prep_lowering_cache
+    assert not codegen.grouped_resident_prep_refill_cache
+    assert not codegen.grouped_fori_dma_resource_cache
+    codegen.grouped_compact_common_statements = common_statements
+    try:
+        for factor in (1, 2):
+            for name, value in initial_counters.items():
+                setattr(state.device_function, name, value)
+            branch_body: list[ast.AST] = []
+            with (
+                codegen.set_statements(branch_body),
+                _compact_block_variant(state, factor),
+            ):
+                result = _codegen_fori_loop(state)
+            assert result is None
+            if factor == 1:
+                branch_body[:0] = _compact_output_initializers(state)
+                final_counters = {
+                    name: getattr(state.device_function, name) for name in counter_names
+                }
+
+            fn_name = state.device_function.new_var(f"_compact_group_{factor}")
+            comparison = "<=" if factor == 1 else ">"
+            fn_def = statement_from_string(
+                f"@pl.when({extent_ref}[_wid] {comparison} "
+                f"{env.compact_worklist_block})\n"
+                f"def {fn_name}():\n"
+                f"    pass"
+            )
+            assert isinstance(fn_def, ast.FunctionDef)
+            fn_def.body = cast("list[ast.stmt]", branch_body) or [ast.Pass()]
+            branch_defs.append(fn_def)
+    finally:
+        codegen.grouped_compact_common_statements = previous_common
+        codegen.grouped_resident_prep_lowering_cache.clear()
+        codegen.grouped_resident_prep_refill_cache.clear()
+        codegen.grouped_fori_dma_resource_cache.clear()
+        for name, value in (final_counters or initial_counters).items():
+            setattr(state.device_function, name, value)
+
+    for statement in common_statements:
+        state.add_statement(statement)
+    for fn_def in branch_defs:
+        state.add_statement(fn_def)
 
 
 def _compact_worklist_bounds(
@@ -601,7 +758,7 @@ def _get_loop_begin_and_end(
 ) -> tuple[str, str]:
     """Extract the begin and end values from the _for_loop state args.
 
-    Under ``compact_worklist`` the compact tile's begin/end are remapped to the
+    Under worklist flattening the compact tile's begin/end are remapped to the
     per-work-item metadata refs: begin =
     ``tile_starts_ref[_wid]``, end =
     ``tile_starts_ref[_wid] + tile_extents_ref[_wid]`` (and likewise the ordered
@@ -2667,7 +2824,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     )
 
     # Compact worklist: the compact-tile aligned_load and exact_store tensors use
-    # per-tile pl.Element BlockSpecs, which Pallas double-buffers across the
+    # max-sized pl.Element BlockSpecs, which Pallas double-buffers across the
     # work-item grid.  Keep them OUT of the manual make_async_copy DMA path: with
     # a single straight-line compact tile there is no inner loop to overlap, so a
     # DMA start()/wait() would run fully serial (load -> wait -> compute -> store
@@ -2756,15 +2913,36 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         uses_load_prefetch = load_buffer_count == 2
         state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
         hbm_name = state.device_function.tensor_arg(fake).name
-        vmem_name = state.device_function.register_scratch(
-            (load_buffer_count, *vmem_shape) if uses_load_prefetch else vmem_shape,
-            fake.dtype,
-            name_hint=hbm_name.replace("_hbm", "") + "_buf",
+        resource_key = (
+            graph_info.graph_id,
+            hbm_name,
+            direction,
+            vmem_shape,
+            load_buffer_count,
         )
-        sem_name = state.device_function.register_dma_semaphore(
-            name_hint=hbm_name.replace("_hbm", "") + "_sem",
-            shape=(load_buffer_count,) if uses_load_prefetch else (),
+        resource_cache = (
+            state.codegen.grouped_fori_dma_resource_cache
+            if state.codegen.grouped_compact_common_statements is not None
+            and _is_compact_ordered_inner_loop(state)
+            else None
         )
+        cached_resource = (
+            resource_cache.get(resource_key) if resource_cache is not None else None
+        )
+        if cached_resource is None:
+            vmem_name = state.device_function.register_scratch(
+                (load_buffer_count, *vmem_shape) if uses_load_prefetch else vmem_shape,
+                fake.dtype,
+                name_hint=hbm_name.replace("_hbm", "") + "_buf",
+            )
+            sem_name = state.device_function.register_dma_semaphore(
+                name_hint=hbm_name.replace("_hbm", "") + "_sem",
+                shape=(load_buffer_count,) if uses_load_prefetch else (),
+            )
+            if resource_cache is not None:
+                resource_cache[resource_key] = (vmem_name, sem_name)
+        else:
+            vmem_name, sem_name = cached_resource
         tensor_to_dma_scratch[hbm_name] = vmem_name
         tensor_to_sem[hbm_name] = sem_name
         if uses_load_prefetch:
@@ -2840,14 +3018,38 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     )
     if resident_prep_lowerings:
         assert len(grid_parts) == 1
-        num_ordered_tiles = state.device_function.new_var("_rc_num_ordered_tiles")
-        state.add_statement(
-            statement_from_string(f"{num_ordered_tiles} = {grid_parts[0]}")
+        refill_key = tuple(
+            (
+                lowering.hoist.graph_id,
+                lowering.hoist.prep_node_name,
+                lowering.cache_name,
+            )
+            for lowering in resident_prep_lowerings
         )
+        common_statements = state.codegen.grouped_compact_common_statements
+        num_ordered_tiles = (
+            state.codegen.grouped_resident_prep_refill_cache.get(refill_key)
+            if common_statements is not None
+            else None
+        )
+        if num_ordered_tiles is None:
+            num_ordered_tiles = state.device_function.new_var("_rc_num_ordered_tiles")
+            target = common_statements
+            with state.codegen.set_statements(target):
+                state.add_statement(
+                    statement_from_string(f"{num_ordered_tiles} = {grid_parts[0]}")
+                )
+                _emit_resident_prep_refill(
+                    state,
+                    block_ids,
+                    [num_ordered_tiles],
+                    resident_prep_lowerings,
+                )
+            if common_statements is not None:
+                state.codegen.grouped_resident_prep_refill_cache[refill_key] = (
+                    num_ordered_tiles
+                )
         grid_parts = [num_ordered_tiles]
-        _emit_resident_prep_refill(
-            state, block_ids, grid_parts, resident_prep_lowerings
-        )
 
     def _build_dma_slices(
         fake: torch.Tensor,
@@ -3111,21 +3313,14 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             ):
                 state.codegen.add_statement(statement)
 
-    # Compact-worklist outer tile: it IS the grid (exactly one tile per work
-    # item, since the builder guarantees extent <= BLOCK), so emit the body
+    # Compact-worklist outer tile: it IS the grid (exactly one static compact
+    # body per work item), so emit the body
     # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
     # would add control-flow overhead and block pipelining for the common
-    # no-ordered-axis case).  The ordered inner tile does not reach here: it lowers
-    # separately via the resident-cache path or emit_pipeline fallback (see the
-    # _for_loop pallas dispatch).
-    plan = CompileEnvironment.current().compact_worklist_plan
-    is_compact_tile = (
-        plan is not None
-        and not carried  # the compact tile is parallel (no carried state)
-        and len(block_ids) == 1
-        and block_ids[0] == plan.compact_axis.block_id
-    )
-    if is_compact_tile:
+    # no-ordered-axis case). The ordered inner tile does not reach here: it lowers
+    # separately through the loop type selected by the _for_loop Pallas dispatch.
+    if _is_compact_tile_loop(state):
+        assert not carried
         # No nonlocal declarations: the body runs at kernel scope (scratch refs
         # are kernel params, directly assignable -- nonlocal would be invalid).
         state.add_statement(statement_from_string(f"{loop_vars[0]} = 0"))
