@@ -19,7 +19,10 @@ def _tpu_device() -> torch.device:
 
 class TestRuntimeGetNumSm(unittest.TestCase):
     def test_pallas_interpret_cpu_returns_one(self) -> None:
-        with patch("helion.runtime._module_is_pallas_interpret", return_value=True):
+        with patch(
+            "helion.runtime.triton.launcher._module_is_pallas_interpret",
+            return_value=True,
+        ):
             self.assertEqual(helion.runtime.get_num_sm(torch.device("cpu")), 1)
             self.assertEqual(
                 helion.runtime.get_num_sm(torch.device("cpu"), reserved_sms=8),
@@ -28,7 +31,10 @@ class TestRuntimeGetNumSm(unittest.TestCase):
 
     def test_normal_cpu_still_unsupported(self) -> None:
         with (
-            patch("helion.runtime._module_is_pallas_interpret", return_value=False),
+            patch(
+                "helion.runtime.triton.launcher._module_is_pallas_interpret",
+                return_value=False,
+            ),
             self.assertRaisesRegex(
                 AssertionError,
                 "TODO: implement for other devices",
