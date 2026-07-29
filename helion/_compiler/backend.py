@@ -3342,6 +3342,14 @@ class FlyDSLBackend(Backend):
         from ..runtime.config import Config
 
         spec = bound_kernel.config_spec
+        if any(
+            f.block_id in spec.block_sizes.valid_block_ids()
+            for f in spec.reduction_facts
+        ):
+            raise exc.BackendUnsupported(
+                self.name,
+                "explicit hl.tile(n) reductions; use whole-row : reduction instead",
+            )
         default = spec.default_config()
         default_bs = default.config.get("block_sizes")
         if not isinstance(default_bs, list) or not default_bs:

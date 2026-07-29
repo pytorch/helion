@@ -430,8 +430,12 @@ def _(state: CodegenState) -> ast.AST:
             )
             mask_terms.append(_pred)
         elif (mask_var := state.codegen.mask_var(index)) is not None:
+            # Broadcast the runtime scalar mask to a bool vector: flydsl's
+            # ``filled`` only accepts a compile-time constant fill, so AND the
+            # scalar into an all-true bool vector (``&`` promotes scalar->vector).
             mask_terms.append(
-                f"fx.Vector.filled_like({e_var}, {mask_var}, dtype=fx.Boolean)"
+                f"(fx.Vector.filled_like({e_var}, True, dtype=fx.Boolean) "
+                f"& ({mask_var}))"
             )
 
     if not mask_terms:

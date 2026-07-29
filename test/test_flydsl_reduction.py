@@ -282,9 +282,19 @@ class TestFlydslReduction(TestCase):
         cfg = bk.autotune((x, w, 1e-5), force=True)
         self.assertIn("block_sizes", cfg.config)
         out, _ = bk.compile_config(cfg)(x, w, 1e-5)
+
         torch.testing.assert_close(
             out.float(), ref_rms(x, w).float(), rtol=1e-2, atol=1e-2
         )
+
+    def test_autotune_rejects_explicit_tile_reduction(self) -> None:
+        # autotune() on a kernel with an explicit hl.tile(n) inner reduction must
+        # raise BackendUnsupported immediately (before touching the GPU), so we
+        # never get faults or silent wrong answers.
+        x = torch.randn(8, 1024, device=DEVICE, dtype=torch.float16)
+        bk = tiled_sum.bind((x,))
+        with pytest.raises(helion.exc.BackendUnsupported):
+            bk.autotune((x,), force=True)
 
 
 if __name__ == "__main__":
