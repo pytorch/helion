@@ -1945,6 +1945,17 @@ class DeviceIR:
         return tls.device_irs[-1]
 
 
+def _is_static_slice_bound(bound: object) -> bool:
+    """A compile-time-known slice bound: a plain int or a backed SymInt."""
+    from .compile_environment import _has_unbacked
+
+    if isinstance(bound, int):
+        return True
+    if isinstance(bound, torch.SymInt):
+        return not _has_unbacked(bound._sympy_())
+    return False
+
+
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
@@ -2724,9 +2735,12 @@ class WalkDeviceAST(NodeVisitor):
         else:
             step = self.visit(node.step)
 
-        # Convert slice to hl.arange when step is None or 1 and we have both bounds
-        # This allows FX tracing to handle slice operations with dynamic bounds
-        if lower is not None and upper is not None and (step is None or step == 1):
+        # A fully-bounded unit-step slice becomes hl.arange so FX can trace
+        # dynamic bounds.  Static bounds don't need that and stay a real slice.
+        if step not in (None, 1) or lower is None or upper is None:
+            return slice(lower, upper, step)
+
+        if not (_is_static_slice_bound(lower) and _is_static_slice_bound(upper)):
             # pyrefly: ignore [bad-argument-type]
             return hl.arange(lower, upper)
 
