@@ -470,6 +470,7 @@ class _FakeBoundKernel:
         error: Exception | None = None,
         accuracy_failure_indices: list[int] | None = None,
         compile_failure_indices: list[int] | None = None,
+        worker_failure_indices: list[int] | None = None,
     ) -> None:
         self.config_spec = config_spec
         self.settings = SimpleNamespace(
@@ -483,8 +484,10 @@ class _FakeBoundKernel:
         self.error = error
         self.accuracy_failure_indices = accuracy_failure_indices or []
         self.compile_failure_indices = compile_failure_indices or []
+        self.worker_failure_indices = worker_failure_indices or []
         self.accuracy_failures = len(self.accuracy_failure_indices)
         self.compile_failures = len(self.compile_failure_indices)
+        self.worker_failures = len(self.worker_failure_indices)
 
 
 class _FakeLocalBenchmarkProvider:
@@ -506,6 +509,7 @@ class _FakeLocalBenchmarkProvider:
         self._autotune_metrics = autotune_metrics
         self._accuracy_failure_config_ids: list[int] = []
         self._compile_failure_config_ids: list[int] = []
+        self._worker_failure_config_ids: list[int] = []
         self.benchmark_calls: list[tuple[list[Config], str]] = []
         self.setup_count = 0
         self.cleanup_count = 0
@@ -529,6 +533,7 @@ class _FakeLocalBenchmarkProvider:
             raise self.kernel.error
         self._autotune_metrics.num_accuracy_failures += self.kernel.accuracy_failures
         self._autotune_metrics.num_compile_failures += self.kernel.compile_failures
+        self._autotune_metrics.num_worker_failures += self.kernel.worker_failures
         self._accuracy_failure_config_ids.extend(
             id(config)
             for index, config in enumerate(configs)
@@ -538,6 +543,11 @@ class _FakeLocalBenchmarkProvider:
             id(config)
             for index, config in enumerate(configs)
             if index in self.kernel.compile_failure_indices
+        )
+        self._worker_failure_config_ids.extend(
+            id(config)
+            for index, config in enumerate(configs)
+            if index in self.kernel.worker_failure_indices
         )
         if len(configs) > len(self.kernel.timings):
             raise AssertionError("fake child received too many configs")
@@ -744,12 +754,14 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
                     [math.inf, math.inf, 3.0],
                     accuracy_failure_indices=[0, 1],
                     compile_failure_indices=[0],
+                    worker_failure_indices=[0, 1],
                 ),
                 _FakeBoundKernel(
                     spec,
                     [math.inf, 2.0, math.inf],
                     accuracy_failure_indices=[0, 2],
                     compile_failure_indices=[0, 1],
+                    worker_failure_indices=[0, 2],
                 ),
             ]
         )
@@ -764,6 +776,7 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
 
         self.assertEqual(metrics.num_accuracy_failures, 3)
         self.assertEqual(metrics.num_compile_failures, 2)
+        self.assertEqual(metrics.num_worker_failures, 3)
 
     def test_invalid_anchor_materialization_discards_only_one_config(self) -> None:
         spec = _make_config_spec()

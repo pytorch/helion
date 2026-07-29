@@ -478,6 +478,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._autotune_metrics = autotune_metrics
         self._accuracy_failure_config_ids: list[int] = []
         self._compile_failure_config_ids: list[int] = []
+        self._worker_failure_config_ids: list[int] = []
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._precompile_baseline_path: str | None = None
@@ -509,6 +510,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     def _record_compile_failure(self, config: Config) -> None:
         self._autotune_metrics.num_compile_failures += 1
         self._compile_failure_config_ids.append(id(config))
+
+    def _record_worker_failure(
+        self,
+        config: Config,
+        status: Literal["error", "timeout"],
+    ) -> None:
+        self._last_benchmark_failure_status = status
+        self._autotune_metrics.num_worker_failures += 1
+        self._worker_failure_config_ids.append(id(config))
 
     def _compute_baseline(
         self,
@@ -1249,10 +1259,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
-            self._last_benchmark_failure_status = (
-                "timeout" if isinstance(e, BenchmarkTimeout) else "error"
+            self._record_worker_failure(
+                config,
+                "timeout" if isinstance(e, BenchmarkTimeout) else "error",
             )
-            self._autotune_metrics.num_worker_failures += 1
             return inf
         except Exception as e:
             e.__traceback__ = None
@@ -1281,10 +1291,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
                 )
-                self._last_benchmark_failure_status = (
-                    "timeout" if isinstance(e, BenchmarkTimeout) else "error"
+                self._record_worker_failure(
+                    config,
+                    "timeout" if isinstance(e, BenchmarkTimeout) else "error",
                 )
-                self._autotune_metrics.num_worker_failures += 1
                 return inf
             except Exception as e:
                 e.__traceback__ = None
@@ -1656,6 +1666,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             (
                 len(child._accuracy_failure_config_ids),
                 len(child._compile_failure_config_ids),
+                len(child._worker_failure_config_ids),
             )
             for child in self.children
         ]
@@ -1671,7 +1682,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         if record_results:
             accuracy_failure_ids: set[int] = set()
             compile_failure_ids: set[int] = set()
-            for child, (before_accuracy, before_compile) in zip(
+            worker_failure_ids: set[int] = set()
+            for child, (before_accuracy, before_compile, before_worker) in zip(
                 self.children, child_failure_snapshots, strict=True
             ):
                 accuracy_failure_ids.update(
@@ -1680,8 +1692,12 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 compile_failure_ids.update(
                     child._compile_failure_config_ids[before_compile:]
                 )
+                worker_failure_ids.update(
+                    child._worker_failure_config_ids[before_worker:]
+                )
             self._autotune_metrics.num_accuracy_failures += len(accuracy_failure_ids)
             self._autotune_metrics.num_compile_failures += len(compile_failure_ids)
+            self._autotune_metrics.num_worker_failures += len(worker_failure_ids)
         for child_config_index, config_index in enumerate(valid_indices):
             original = configs[config_index]
             row = [child[child_config_index] for child in child_results]
