@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import builtins
-from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
+import torch
 
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _to_sympy
 from . import _decorators
-
-if TYPE_CHECKING:
-    import torch
 
 
 def compute_symbolic_min_max(
@@ -33,20 +31,43 @@ def compute_symbolic_min_max(
     return shape_env.create_symintnode(expr, hint=hint)  # type: ignore[return-value]
 
 
-@_decorators.device_func_replacement(builtins.min)
-def _builtin_min(*args: int | torch.SymInt) -> torch.SymInt | int:
-    """Device replacement for builtin min() that supports symbolic integers.
+def _compute_scalar_tensor_min(
+    args: tuple[int | torch.SymInt | torch.Tensor, ...],
+) -> torch.Tensor:
+    reference = next(arg for arg in args if isinstance(arg, torch.Tensor))
+    assert isinstance(reference, torch.Tensor)
+    if any(isinstance(arg, torch.Tensor) and arg.ndim != 0 for arg in args):
+        raise TypeError("device min/max only supports scalar tensor arguments")
+    tensor_args = [
+        arg
+        if isinstance(arg, torch.Tensor)
+        else torch.full_like(reference, cast("int", arg))
+        for arg in args
+    ]
+    result = tensor_args[0]
+    for arg in tensor_args[1:]:
+        result = torch.minimum(result, arg)
+    return result
 
-    Returns the minimum value among the provided arguments, preserving
-    symbolic integer expressions when present.
+
+@_decorators.device_func_replacement(builtins.min)
+def _builtin_min(
+    *args: int | torch.SymInt | torch.Tensor,
+) -> torch.SymInt | torch.Tensor | int:
+    """Device replacement for min() over symbolic ints or scalar tensors.
+
+    A scalar tensor result is used when any input is a scalar tensor; otherwise
+    symbolic integer expressions are preserved.
 
     Args:
-        *args: Integer arguments, which may be concrete ints or symbolic SymInts
+        *args: Concrete ints, symbolic SymInts, or scalar tensors.
 
     Returns:
-        The minimum value, as a SymInt if any argument is symbolic, otherwise int
+        The minimum value with the corresponding scalar representation.
     """
-    return compute_symbolic_min_max(args, op=builtins.min)
+    if any(isinstance(arg, torch.Tensor) for arg in args):
+        return _compute_scalar_tensor_min(args)
+    return compute_symbolic_min_max(args, op=builtins.min)  # type: ignore[arg-type]
 
 
 @_decorators.device_func_replacement(builtins.max)
