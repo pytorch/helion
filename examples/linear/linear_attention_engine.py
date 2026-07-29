@@ -310,7 +310,7 @@ def chunk_cumsum_gc_helion(g: torch.Tensor) -> torch.Tensor:
     for tile_bhn, tile_d in hl.tile([BHN, D]):
         idx = hl.arange(C)
         ltri = (idx[:, None] >= idx[None, :]).to(torch.float32)  # [C, C] incl. diag
-        L = ltri[None, :, :].broadcast_to([tile_bhn, C, C])
+        L = ltri[None, :, :].broadcast_to([tile_bhn, C, C])  # pyrefly: ignore[no-matching-overload]
         gt = g[tile_bhn, :, tile_d].to(torch.float32)  # [b, C, d]
         gc[tile_bhn, :, tile_d] = hl.dot(L, gt)
     return gc
@@ -360,7 +360,7 @@ def chunk_fwd_h_diag_fused(
     for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
         idx = tile_bh.id
         if has_h0:
-            h_acc = h0[idx, tile_d, tile_dv].float()
+            h_acc = h0[idx, tile_d, tile_dv].float()  # pyrefly: ignore[unsupported-operation]
         else:
             h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
 
@@ -787,7 +787,9 @@ def chunk_bwd_dqkw_delta_helion(
             dk_state = hl.zeros([tile_bhn, C, tile_d], dtype=torch.float32)
             for tile_dv in hl.tile(DV):
                 S_h = h[tile_bhn, tile_d, tile_dv].to(hdt)  # [1, bd, dv]
-                do_dv = (do[tile_bhn, :, tile_dv].to(torch.float32) * scale).to(hdt)  # [1, C, dv]
+                do_dv = (do[tile_bhn, :, tile_dv].to(torch.float32) * scale).to(
+                    hdt
+                )  # [1, C, dv]
                 dSf_dv = dS_future[tile_bhn, tile_d, tile_dv].to(hdt)  # [1, bd, dv]
                 dvni_h = dvni[tile_bhn, :, tile_dv].to(hdt)  # [1, C, dv]
                 vnew_h = v_new[tile_bhn, :, tile_dv].to(hdt)  # [1, C, dv]
@@ -1476,10 +1478,10 @@ def chunk_bwd_dqk_helion(
         qt = q[tile_bhn, :, tile_d]
         kt = k[tile_bhn, :, tile_d]
         if use_g:
-            gc = g_cs[tile_bhn, :]
+            gc = g_cs[tile_bhn, :]  # pyrefly: ignore[unsupported-operation]
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
             dA = dA_raw * decay_ij * causal
-            gl = g_last[tile_bhn]
+            gl = g_last[tile_bhn]  # pyrefly: ignore[unsupported-operation]
             exp_gc = torch.exp(gc)[:, :, None]
             exp_gl_minus_gc = torch.exp(gl[:, None] - gc)[:, :, None]
             # Decay the cross/state terms, then fold the add into the accumulator.
@@ -1669,8 +1671,8 @@ def chunk_bwd_dv_helion(
                 attn = hl.dot(q[tile_bhn, :, tile_d], kt.transpose(-2, -1), acc=attn)
                 dv_acc = hl.dot(kt, dht.to(kt.dtype), acc=dv_acc)
             elif diag_anchored:
-                gct = g_cs[tile_bhn, :, tile_d].float()
-                gc_last = g_cs[tile_bhn, C - 1, tile_d].float()
+                gct = g_cs[tile_bhn, :, tile_d].float()  # pyrefly: ignore[unsupported-operation]
+                gc_last = g_cs[tile_bhn, C - 1, tile_d].float()  # pyrefly: ignore[unsupported-operation]
                 kg = (
                     kt.float() * torch.exp2((gc_last[:, None, :] - gct) * RCP_LN2)
                 ).to(kt.dtype)
@@ -1684,7 +1686,7 @@ def chunk_bwd_dv_helion(
         idx = hl.arange(C)
         causal = idx[:, None] >= idx[None, :]
         if scalar_decay:
-            gc = g_cs[tile_bhn, :].float()
+            gc = g_cs[tile_bhn, :].float()  # pyrefly: ignore[unsupported-operation]
             decay_ij = torch.exp2((gc[:, :, None] - gc[:, None, :]) * RCP_LN2)
             attn = torch.where(causal, attn * decay_ij * scale, 0.0)
             exp_dk = torch.exp2((g_last[tile_bhn].float()[:, None] - gc) * RCP_LN2)  # pyrefly: ignore[unsupported-operation]
@@ -1692,7 +1694,7 @@ def chunk_bwd_dv_helion(
         elif diag_anchored:
             attn = A[tile_bhn, :, :]  # pyrefly: ignore[unsupported-operation]
         elif use_g:
-            gc = g_cs[tile_bhn, :]
+            gc = g_cs[tile_bhn, :]  # pyrefly: ignore[unsupported-operation]
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
             attn = torch.where(causal, attn * decay_ij, 0.0)
         else:
