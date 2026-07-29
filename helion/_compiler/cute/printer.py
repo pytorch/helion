@@ -24,21 +24,21 @@ class HelionCutePrinter(HelionTritonPrinter):
 
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+        return f"(({self._print_basic_expr(lhs)}) // ({self._print_basic_expr(rhs)}))"
 
     def _print_CleanDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+        return f"(({self._print_basic_expr(lhs)}) // ({self._print_basic_expr(rhs)}))"
 
     def _print_CeilDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
         lhs_printed = self._print_basic_expr(lhs)
         rhs_printed = self._print_basic_expr(rhs)
-        return f"(({lhs_printed} + {rhs_printed} - 1) // {rhs_printed})"
+        return f"((({lhs_printed}) + ({rhs_printed}) - 1) // ({rhs_printed}))"
 
     def _print_PythonMod(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} % {self._print_basic_expr(rhs)})"
+        return f"(({self._print_basic_expr(lhs)}) % ({self._print_basic_expr(rhs)}))"
 
 
 def cute_texpr(expr: sympy.Expr) -> str:

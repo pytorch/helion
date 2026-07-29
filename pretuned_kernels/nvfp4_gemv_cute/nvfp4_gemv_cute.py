@@ -1,5 +1,5 @@
 """Low-latency NVFP4 GEMV for decode (batch-size-1) inference on Blackwell --
-Helion CuTe (tcgen05) backend.
+Helion CuTe backend.
 
 The CuTe counterpart of ``pretuned_kernels/nvfp4_gemv`` (the Triton variant):
 same two decode regimes, same NVFP4 weight layout (packed E2M1 bytes with
@@ -9,10 +9,13 @@ actual Helion DSL kernels compiled with ``backend="cute"``:
 * :func:`_nvfp4_gemv_fp4in` -- NVFP4 weight * NVFP4 activation (W4A4).
 * :func:`_nvfp4_gemv_bf16in` -- NVFP4 weight * BF16 activation (W4A16).
 
-The kernels use the portable FP32-decode bodies from ``examples/nvfp4_gemv.py``
-and checked-in B200 CuTe configs. They go through Helion's normal compilation,
-configuration, caching, and launch path; there is no direct ``@cute.kernel`` or
-``default_cute_launcher`` shim.
+The kernels load each 16-value group as one aligned 64-bit word, decode FP4 (and
+BF16 activations) to FP16 with CuTe inline PTX, and accumulate in FP32. Programs
+compute two output rows for ``N <= 8192`` and four rows for wider outputs, which
+balances register pressure against activation reuse. Checked-in B200 CuTe
+configs select the reduction tile size. The implementation goes through
+Helion's normal compilation, configuration, caching, and launch path; there is
+no direct ``@cute.kernel`` or ``default_cute_launcher`` shim.
 
 Benchmarked against the production vLLM CUTLASS NVFP4 GEMM
 (``ops.cutlass_scaled_fp4_mm`` -- the NVFP4 analog of ``cutlass_scaled_mm``,
@@ -52,90 +55,317 @@ compiled_reference_nvfp4_gemv_fp4in = torch.compile(reference_nvfp4_gemv_fp4in)
 compiled_reference_nvfp4_gemv_bf16in = torch.compile(reference_nvfp4_gemv_bf16in)
 
 
+def _scaled_row_partial(
+    row: torch.SymInt,
+    tile_g: hl.Tile,
+    weight_bytes: torch.Tensor,
+    weight_scale: torch.Tensor,
+    x: tuple[torch.Tensor, ...],
+    x_scale_value: torch.Tensor | None,
+    groups: int,
+    rows: int,
+) -> torch.Tensor:
+    row_index = cast("int", row)
+    group_mask = tile_g.index < groups
+    row_mask = row_index < rows
+    weight = hl.load_float4_e2m1fn_x16_to_float16(
+        weight_bytes,
+        row_index * groups + tile_g.index,
+        extra_mask=group_mask & row_mask,
+    )
+    contribution = hl.zeros([tile_g], dtype=torch.float16)
+    for i in hl.static_range(16):
+        contribution = contribution + weight[i] * x[i]
+    scale_offsets = swizzled_scale_offsets(row_index, tile_g.index, groups)
+    scale = hl.load(
+        weight_scale,
+        [scale_offsets],
+        extra_mask=group_mask & row_mask,
+    ).to(torch.float32)
+    if x_scale_value is not None:
+        scale = scale * x_scale_value
+    return (contribution.to(torch.float32) * scale).sum()
+
+
 @helion.aot_kernel(backend="cute", static_shapes=True)
-def nvfp4_gemv_bf16in_kernel(
-    weight_fp4x2: torch.Tensor,
+def nvfp4_gemv_bf16in_rows2_kernel(
+    weight_bytes: torch.Tensor,
     x_values: torch.Tensor,
     weight_scale: torch.Tensor,
     out: torch.Tensor,
     alpha: float = 1.0,
 ) -> torch.Tensor:
-    """Helion CuTe W4A16 GEMV with FP32 accumulation."""
-    M, K_groups, _ = weight_fp4x2.shape
-    block_m = hl.register_block_size(1, 1)
-    block_k = hl.register_block_size(16, K_groups)
-
-    for tile_m in hl.tile(M, block_size=block_m):
-        row = tile_m.begin
-        acc = hl.zeros([], dtype=torch.float32)
-        for tile_k in hl.tile(K_groups, block_size=block_k):
-            contrib = hl.zeros([tile_k], dtype=torch.float32)
-            for byte in hl.static_range(8):
-                weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
-                    weight_fp4x2[row, tile_k, byte]
-                )
-                contrib = contrib + weight_lo * x_values[tile_k, byte * 2].to(
-                    torch.float32
-                )
-                contrib = contrib + weight_hi * x_values[tile_k, byte * 2 + 1].to(
-                    torch.float32
-                )
-            scale_offsets = swizzled_scale_offsets(
-                cast("int", row), tile_k.index, K_groups
+    """Helion CuTe W4A16 GEMV with coalesced FP4 decode."""
+    M, K_bytes = weight_bytes.shape
+    K_groups = K_bytes // 8
+    block_g = hl.register_block_size(16, K_groups)
+    for program in hl.grid((M + 1) // 2):
+        row0 = program * 2
+        row1 = row0 + 1
+        acc0 = hl.zeros([], dtype=torch.float32)
+        acc1 = hl.zeros([], dtype=torch.float32)
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            group_mask = tile_g.index < K_groups
+            x = hl.load_bfloat16_x16_to_float16(
+                x_values,
+                tile_g.index,
+                extra_mask=group_mask,
             )
-            scale = hl.load(
-                weight_scale,
-                [scale_offsets],
-                extra_mask=tile_k.index < K_groups,
-            ).to(torch.float32)
-            acc = acc + (contrib * scale).sum()
-        out[row] = (acc * alpha).to(torch.bfloat16)
+            acc0 = acc0 + _scaled_row_partial(
+                row0, tile_g, weight_bytes, weight_scale, x, None, K_groups, M
+            )
+            acc1 = acc1 + _scaled_row_partial(
+                row1, tile_g, weight_bytes, weight_scale, x, None, K_groups, M
+            )
+        hl.store(
+            out,
+            [row0],
+            (acc0 * alpha).to(torch.bfloat16),
+            extra_mask=row0 < M,
+        )
+        hl.store(
+            out,
+            [row1],
+            (acc1 * alpha).to(torch.bfloat16),
+            extra_mask=row1 < M,
+        )
     return out
 
 
 @helion.aot_kernel(backend="cute", static_shapes=True)
-def nvfp4_gemv_fp4in_kernel(
-    weight_fp4x2: torch.Tensor,
-    x_fp4x2: torch.Tensor,
+def nvfp4_gemv_fp4in_rows2_kernel(
+    weight_bytes: torch.Tensor,
+    x_bytes: torch.Tensor,
     weight_scale: torch.Tensor,
     x_scale: torch.Tensor,
     out: torch.Tensor,
     alpha: float = 1.0,
 ) -> torch.Tensor:
-    """Helion CuTe W4A4 GEMV with FP32 accumulation."""
-    M, K_groups, _ = weight_fp4x2.shape
-    block_m = hl.register_block_size(1, 1)
-    block_k = hl.register_block_size(16, K_groups)
-
-    for tile_m in hl.tile(M, block_size=block_m):
-        row = tile_m.begin
-        acc = hl.zeros([], dtype=torch.float32)
-        for tile_k in hl.tile(K_groups, block_size=block_k):
-            contrib = hl.zeros([tile_k], dtype=torch.float32)
-            for byte in hl.static_range(8):
-                weight_lo, weight_hi = hl.float4_e2m1fn_x2_to_float32(
-                    weight_fp4x2[row, tile_k, byte]
-                )
-                x_lo, x_hi = hl.float4_e2m1fn_x2_to_float32(x_fp4x2[tile_k, byte])
-                contrib = contrib + weight_lo * x_lo + weight_hi * x_hi
-            weight_scale_offsets = swizzled_scale_offsets(
-                cast("int", row), tile_k.index, K_groups
+    """Helion CuTe W4A4 GEMV with coalesced FP4 decode."""
+    M, K_bytes = weight_bytes.shape
+    K_groups = K_bytes // 8
+    block_g = hl.register_block_size(16, K_groups)
+    for program in hl.grid((M + 1) // 2):
+        row0 = program * 2
+        row1 = row0 + 1
+        acc0 = hl.zeros([], dtype=torch.float32)
+        acc1 = hl.zeros([], dtype=torch.float32)
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            group_mask = tile_g.index < K_groups
+            x = hl.load_float4_e2m1fn_x16_to_float16(
+                x_bytes,
+                tile_g.index,
+                extra_mask=group_mask,
             )
             x_scale_offsets = swizzled_scale_offsets(
-                tile_k.index * 0, tile_k.index, K_groups
+                tile_g.index * 0, tile_g.index, K_groups
             )
-            scale = hl.load(
-                weight_scale,
-                [weight_scale_offsets],
-                extra_mask=tile_k.index < K_groups,
-            ).to(torch.float32)
-            scale = scale * hl.load(
+            x_scale_value = hl.load(
                 x_scale,
                 [x_scale_offsets],
-                extra_mask=tile_k.index < K_groups,
+                extra_mask=group_mask,
             ).to(torch.float32)
-            acc = acc + (contrib * scale).sum()
-        out[row] = (acc * alpha).to(torch.bfloat16)
+            acc0 = acc0 + _scaled_row_partial(
+                row0,
+                tile_g,
+                weight_bytes,
+                weight_scale,
+                x,
+                x_scale_value,
+                K_groups,
+                M,
+            )
+            acc1 = acc1 + _scaled_row_partial(
+                row1,
+                tile_g,
+                weight_bytes,
+                weight_scale,
+                x,
+                x_scale_value,
+                K_groups,
+                M,
+            )
+        hl.store(
+            out,
+            [row0],
+            (acc0 * alpha).to(torch.bfloat16),
+            extra_mask=row0 < M,
+        )
+        hl.store(
+            out,
+            [row1],
+            (acc1 * alpha).to(torch.bfloat16),
+            extra_mask=row1 < M,
+        )
+    return out
+
+
+@helion.aot_kernel(backend="cute", static_shapes=True)
+def nvfp4_gemv_bf16in_rows4_kernel(
+    weight_bytes: torch.Tensor,
+    x_values: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    M, K_bytes = weight_bytes.shape
+    K_groups = K_bytes // 8
+    block_g = hl.register_block_size(16, K_groups)
+    for program in hl.grid((M + 3) // 4):
+        row0 = program * 4
+        row1 = row0 + 1
+        row2 = row0 + 2
+        row3 = row0 + 3
+        acc0 = hl.zeros([], dtype=torch.float32)
+        acc1 = hl.zeros([], dtype=torch.float32)
+        acc2 = hl.zeros([], dtype=torch.float32)
+        acc3 = hl.zeros([], dtype=torch.float32)
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            group_mask = tile_g.index < K_groups
+            x = hl.load_bfloat16_x16_to_float16(
+                x_values,
+                tile_g.index,
+                extra_mask=group_mask,
+            )
+            acc0 = acc0 + _scaled_row_partial(
+                row0, tile_g, weight_bytes, weight_scale, x, None, K_groups, M
+            )
+            acc1 = acc1 + _scaled_row_partial(
+                row1, tile_g, weight_bytes, weight_scale, x, None, K_groups, M
+            )
+            acc2 = acc2 + _scaled_row_partial(
+                row2, tile_g, weight_bytes, weight_scale, x, None, K_groups, M
+            )
+            acc3 = acc3 + _scaled_row_partial(
+                row3, tile_g, weight_bytes, weight_scale, x, None, K_groups, M
+            )
+        hl.store(
+            out,
+            [row0],
+            (acc0 * alpha).to(torch.bfloat16),
+            extra_mask=row0 < M,
+        )
+        hl.store(
+            out,
+            [row1],
+            (acc1 * alpha).to(torch.bfloat16),
+            extra_mask=row1 < M,
+        )
+        hl.store(
+            out,
+            [row2],
+            (acc2 * alpha).to(torch.bfloat16),
+            extra_mask=row2 < M,
+        )
+        hl.store(
+            out,
+            [row3],
+            (acc3 * alpha).to(torch.bfloat16),
+            extra_mask=row3 < M,
+        )
+    return out
+
+
+@helion.aot_kernel(backend="cute", static_shapes=True)
+def nvfp4_gemv_fp4in_rows4_kernel(
+    weight_bytes: torch.Tensor,
+    x_bytes: torch.Tensor,
+    weight_scale: torch.Tensor,
+    x_scale: torch.Tensor,
+    out: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    M, K_bytes = weight_bytes.shape
+    K_groups = K_bytes // 8
+    block_g = hl.register_block_size(16, K_groups)
+    for program in hl.grid((M + 3) // 4):
+        row0 = program * 4
+        row1 = row0 + 1
+        row2 = row0 + 2
+        row3 = row0 + 3
+        acc0 = hl.zeros([], dtype=torch.float32)
+        acc1 = hl.zeros([], dtype=torch.float32)
+        acc2 = hl.zeros([], dtype=torch.float32)
+        acc3 = hl.zeros([], dtype=torch.float32)
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            group_mask = tile_g.index < K_groups
+            x = hl.load_float4_e2m1fn_x16_to_float16(
+                x_bytes,
+                tile_g.index,
+                extra_mask=group_mask,
+            )
+            x_scale_offsets = swizzled_scale_offsets(
+                tile_g.index * 0, tile_g.index, K_groups
+            )
+            x_scale_value = hl.load(
+                x_scale,
+                [x_scale_offsets],
+                extra_mask=group_mask,
+            ).to(torch.float32)
+            acc0 = acc0 + _scaled_row_partial(
+                row0,
+                tile_g,
+                weight_bytes,
+                weight_scale,
+                x,
+                x_scale_value,
+                K_groups,
+                M,
+            )
+            acc1 = acc1 + _scaled_row_partial(
+                row1,
+                tile_g,
+                weight_bytes,
+                weight_scale,
+                x,
+                x_scale_value,
+                K_groups,
+                M,
+            )
+            acc2 = acc2 + _scaled_row_partial(
+                row2,
+                tile_g,
+                weight_bytes,
+                weight_scale,
+                x,
+                x_scale_value,
+                K_groups,
+                M,
+            )
+            acc3 = acc3 + _scaled_row_partial(
+                row3,
+                tile_g,
+                weight_bytes,
+                weight_scale,
+                x,
+                x_scale_value,
+                K_groups,
+                M,
+            )
+        hl.store(
+            out,
+            [row0],
+            (acc0 * alpha).to(torch.bfloat16),
+            extra_mask=row0 < M,
+        )
+        hl.store(
+            out,
+            [row1],
+            (acc1 * alpha).to(torch.bfloat16),
+            extra_mask=row1 < M,
+        )
+        hl.store(
+            out,
+            [row2],
+            (acc2 * alpha).to(torch.bfloat16),
+            extra_mask=row2 < M,
+        )
+        hl.store(
+            out,
+            [row3],
+            (acc3 * alpha).to(torch.bfloat16),
+            extra_mask=row3 < M,
+        )
     return out
 
 
@@ -171,9 +401,14 @@ def _nvfp4_gemv_fp4in(
     out = torch.empty(
         weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
-    return nvfp4_gemv_fp4in_kernel(
-        weight_fp4x2.view(weight_bytes.shape[0], groups, 8),
-        x_fp4x2.view(groups, 8),
+    kernel = (
+        nvfp4_gemv_fp4in_rows4_kernel
+        if weight_bytes.shape[0] > 8192
+        else nvfp4_gemv_fp4in_rows2_kernel
+    )
+    return kernel(
+        weight_bytes,
+        x_bytes,
         weight_scale.reshape(-1),
         x_scale.reshape(-1),
         out,
@@ -201,8 +436,13 @@ def _nvfp4_gemv_bf16in(
     out = torch.empty(
         weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
-    return nvfp4_gemv_bf16in_kernel(
-        weight_fp4x2.view(weight_bytes.shape[0], groups, 8),
+    kernel = (
+        nvfp4_gemv_bf16in_rows4_kernel
+        if weight_bytes.shape[0] > 8192
+        else nvfp4_gemv_bf16in_rows2_kernel
+    )
+    return kernel(
+        weight_bytes,
         x_bf16.view(groups, 16),
         weight_scale.reshape(-1),
         out,
