@@ -504,14 +504,7 @@ class TestPallasPartialSlice(TestCase):
         self.assertIn("16:", code)
         torch.testing.assert_close(out, src)
 
-    @xfailIfPallas(
-        "fully-bounded slice (8:16) is lowered to an index tensor by the "
-        "front-end, not a slice, so it hits the indirect scatter/gather path "
-        "instead of ArbitrarySlicePattern"
-    )
     def test_partial_slice_both_bounds(self) -> None:
-        # Slice with both start and stop set (``8:16``): a middle window,
-        # not just an open-ended prefix/suffix.
         @helion.kernel(backend="pallas")
         def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
             for tile in hl.tile(src.size(0)):
@@ -522,7 +515,8 @@ class TestPallasPartialSlice(TestCase):
 
         src = torch.randn((64, 32), device=DEVICE)
         dst = torch.zeros((64, 32), device=DEVICE)
-        _code, out = code_and_output(kernel, (src, dst), block_sizes=[16])
+        code, out = code_and_output(kernel, (src, dst), block_sizes=[16])
+        self.assertIn("8:16", code)
         expected = src.clone()
         expected[:, 8:16] *= 2.0
         torch.testing.assert_close(out, expected)
