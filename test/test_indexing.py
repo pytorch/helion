@@ -1840,9 +1840,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected[:, -1] = 1.0
         torch.testing.assert_close(result, expected)
 
-    @skipIfNormalMode(
-        "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
-    )
     def test_ellipsis_indexing(self):
         """Test both setter from scalar and getter for [..., i]"""
 
