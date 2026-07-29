@@ -138,8 +138,12 @@ class RecordingRandomSearch(RandomSearch):
         super().__init__(*args, **kwargs)
         self.samples: list[float] = []
 
-    def _autotune(self):
+    def _autotune(self) -> helion.Config:
         self.samples.append(random.random())
+        if torch.version.hip is not None:
+            # This test covers seed propagation, not benchmark behavior. Avoid
+            # competing GPU benchmarks across ROCm xdist workers.
+            return self.config_spec.default_config()
         return super()._autotune()
 
 
