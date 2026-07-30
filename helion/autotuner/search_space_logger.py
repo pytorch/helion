@@ -21,6 +21,10 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from typing import Any
+
+    from ..autotuner.block_id_sequence import BlockIdSequence
+    from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_spec import ConfigSpec
     from ..runtime.config import Config
 
@@ -192,14 +196,21 @@ class FeatureExplorationStats:
 
 @dataclasses.dataclass
 class ExplorationReport:
-    """Complete report on feature exploration during autotuning."""
+    """Complete report on feature exploration during autotuning.
 
-    kernel_name: str
-    backend: str
+    Identity/search-space fields (``kernel_name``, ``backend``,
+    ``total_search_space_size``) are not stored separately: they are composed
+    from a :class:`SearchSpaceSummary` and exposed as read-only properties so
+    there is a single source of truth for that metadata.
+    """
+
+    # Composed search-space metadata (the single source of truth for
+    # kernel_name / backend / total_search_space_size).
+    summary: SearchSpaceSummary
+
     search_algorithm: str
     elapsed_seconds: float
     configs_tested: int
-    total_search_space_size: int | None
 
     # Per-feature exploration stats
     feature_stats: list[FeatureExplorationStats]
@@ -217,6 +228,18 @@ class ExplorationReport:
     # same config across generations).
     explored_valid: int = 0
     explored_invalid: int = 0
+
+    @property
+    def kernel_name(self) -> str:
+        return self.summary.kernel_name
+
+    @property
+    def backend(self) -> str:
+        return self.summary.backend
+
+    @property
+    def total_search_space_size(self) -> int | None:
+        return self.summary.total_search_space_size
 
     @property
     def explored_total(self) -> int:
@@ -412,12 +435,10 @@ class FeatureExplorationTracker:
             min_coverage = 0.0
 
         return ExplorationReport(
-            kernel_name=self.search_summary.kernel_name,
-            backend=self.search_summary.backend,
+            summary=self.search_summary,
             search_algorithm=search_algorithm,
             elapsed_seconds=elapsed_seconds,
             configs_tested=len(self.tested_configs),
-            total_search_space_size=self.search_summary.total_search_space_size,
             feature_stats=feature_stats,
             avg_feature_coverage=avg_coverage,
             min_feature_coverage=min_coverage,
@@ -436,38 +457,21 @@ def _extract_feature_value(config: Config, feature_name: str) -> object:
     Returns:
         The feature value, or None if not applicable
     """
-    # Handle special cases
-    if feature_name == "block_sizes":
-        return tuple(config.block_sizes)
+    # List-valued config attributes must be coerced to a hashable tuple so the
+    # tracker can add them to a set. These are the only genuine special cases;
+    # every scalar feature (pid_type, num_warps, num_stages, maxnreg,
+    # epilogue_subtile, ...) is a plain Config attribute handled by the generic
+    # getattr path below.
+    if feature_name in ("block_sizes", "loop_orders", "l2_groupings", "flatten_loops"):
+        return tuple(getattr(config, feature_name))
 
-    if feature_name == "pid_type":
-        return config.pid_type
-
-    if feature_name == "num_warps":
-        return config.num_warps
-
-    if feature_name == "num_stages":
-        return config.num_stages
-
-    if feature_name == "maxnreg":
-        return config.maxnreg
-
-    if feature_name == "loop_orders":
-        return tuple(config.loop_orders)
-
+    # ``pallas_loop_type`` is stored in the config dict but is not exposed as a
+    # Config attribute/property, so it must be read via ``get``.
     if feature_name == "pallas_loop_type":
         return config.get("pallas_loop_type")
 
-    if feature_name == "epilogue_subtile":
-        return config.epilogue_subtile
-
-    if feature_name == "l2_groupings":
-        return tuple(config.l2_groupings)
-
-    if feature_name == "flatten_loops":
-        return tuple(config.flatten_loops)
-
-    # Generic attribute access
+    # Generic attribute access (covers pid_type, num_warps, num_stages,
+    # maxnreg, epilogue_subtile, and any other scalar tunable).
     return getattr(config, feature_name, None)
 
 
@@ -502,20 +506,21 @@ def analyze_search_space(
     disabled_features: list[str] = []
     shape_constraints: list[str] = []
 
-    # Analyze each config key
+    flat_fields = config_spec._flat_fields()
+    for name, field in flat_fields.items():
+        enabled_features.append(name)
+        dim = _dimension_from_field(name, field, config_spec)
+        if dim is not None:
+            dimensions.append(dim)
+
     for key in sorted(VALID_KEYS):
-        supported = config_spec.supports_config_key(key)
-
-        if supported:
-            enabled_features.append(key)
-
-            # Calculate dimension size for this key
-            dim = _analyze_dimension_size(config_spec, key)
-            if dim is not None:
-                dimensions.append(dim)
-        else:
-            reason = _get_disable_reason(config_spec, key)
-            disabled_features.append(f"{key}: {reason}")
+        if key in flat_fields:
+            continue
+        if config_spec.supports_config_key(key):
+            # Supported but not materialized as a tunable field for this kernel.
+            continue
+        reason = _get_disable_reason(config_spec, key)
+        disabled_features.append(f"{key}: {reason}")
 
     # Check shape-dependent constraints
     if config_spec.block_sizes:
@@ -588,6 +593,141 @@ def analyze_search_space(
     )
 
 
+# Dimensions requiring bespoke handling; routed to _analyze_dimension_size.
+# Every other field goes through the generic fragment dispatch.
+_SPECIAL_DIMENSIONS: frozenset[str] = frozenset(
+    {
+        "block_sizes",
+        "pid_type",
+        "num_stages",
+        "loop_orders",
+        "l2_groupings",
+        "flatten_loops",
+        "epilogue_subtile",
+        "pallas_loop_type",
+    }
+)
+
+
+def _fragment_size(frag: ConfigSpecFragment) -> int:
+    """Number of distinct values a scalar fragment can take.
+
+    Dispatches on fragment *type* rather than config key, so any current or
+    future scalar tunable is handled without a per-key branch.
+    """
+    from ..autotuner.config_fragment import BaseIntegerFragment
+    from ..autotuner.config_fragment import BooleanFragment
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import IntegerFragment
+    from ..autotuner.config_fragment import NumThreadsFragment
+    from ..autotuner.config_fragment import PermutationFragment
+    from ..autotuner.config_fragment import PowerOfTwoFragment
+
+    if isinstance(frag, EnumFragment):
+        return len(frag._active_choices())
+    if isinstance(frag, BooleanFragment):
+        return 2
+    if isinstance(frag, PermutationFragment):
+        return math.factorial(frag.length)
+    if isinstance(frag, NumThreadsFragment):
+        # "0" (auto) plus every power of two up to ``high``.
+        return 1 + _count_power_of_two_values(1, frag.high)
+    if isinstance(frag, IntegerFragment):
+        return frag.high - frag.low + 1
+    if isinstance(frag, PowerOfTwoFragment):
+        # Covers BlockSizeFragment / NumWarpsFragment as well.
+        return _count_power_of_two_values(frag.low, frag.high)
+    if isinstance(frag, BaseIntegerFragment):
+        return frag.high - frag.low + 1
+    # Unknown fragment type: fall back to its encoded dimension as a lower bound.
+    return frag.dim()
+
+
+def _fragment_values(frag: ConfigSpecFragment) -> list[object] | None:
+    """Explicit list of values for a scalar fragment, when enumerable.
+
+    Returns ``None`` when the values aren't cheaply/usefully enumerable.
+    """
+    from ..autotuner.config_fragment import BaseIntegerFragment
+    from ..autotuner.config_fragment import BooleanFragment
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import IntegerFragment
+    from ..autotuner.config_fragment import NumThreadsFragment
+    from ..autotuner.config_fragment import PowerOfTwoFragment
+
+    if isinstance(frag, EnumFragment):
+        return list(frag._active_choices())
+    if isinstance(frag, BooleanFragment):
+        return [False, True]
+    if isinstance(frag, NumThreadsFragment):
+        return [0, *_power_of_two_values(1, frag.high)]
+    if isinstance(frag, IntegerFragment):
+        return list(range(frag.low, frag.high + 1))
+    if isinstance(frag, PowerOfTwoFragment):
+        return _power_of_two_values(frag.low, frag.high)
+    if isinstance(frag, BaseIntegerFragment):
+        return list(range(frag.low, frag.high + 1))
+    return None
+
+
+def _dimension_from_field(
+    name: str,
+    field: BlockIdSequence[Any] | ConfigSpecFragment,
+    config_spec: ConfigSpec,
+) -> SearchSpaceDimension | None:
+    """Build a :class:`SearchSpaceDimension` for one tunable field.
+
+    Genuinely special dimensions (see ``_SPECIAL_DIMENSIONS``) are delegated to
+    :func:`_analyze_dimension_size` to preserve their bespoke sizing/messages.
+    A :class:`BlockIdSequence` field multiplies its per-item fragment sizes.
+    Any other field is a scalar fragment dispatched generically on its type.
+    """
+    from ..autotuner.block_id_sequence import BlockIdSequence
+
+    if name in _SPECIAL_DIMENSIONS:
+        return _analyze_dimension_size(config_spec, name)
+
+    if isinstance(field, BlockIdSequence):
+        num_items = len(field)
+        if num_items == 0:
+            return SearchSpaceDimension(
+                name=name,
+                dim_type="discrete",
+                size=0,
+                constrained_by="0 loop(s)",
+            )
+        total = 1
+        for item in field:
+            total *= _fragment_size(item._fragment(config_spec))
+        return SearchSpaceDimension(
+            name=name,
+            dim_type="discrete",
+            size=total,
+            constrained_by=f"{num_items} loop(s)",
+        )
+
+    # Scalar fragment: dispatch generically on fragment type.
+    size = _fragment_size(field)
+    values = _fragment_values(field)
+    return SearchSpaceDimension(
+        name=name,
+        dim_type="categorical",
+        size=size,
+        values=values if values is not None and size <= 100 else None,
+    )
+
+
+def _power_of_two_values(min_val: int, max_val: int) -> list[object]:
+    """List power-of-two values in ``[min_val, max_val]``."""
+    values: list[object] = []
+    val = 1
+    while val <= max_val:
+        if val >= min_val:
+            values.append(val)
+        val *= 2
+    return values
+
+
 def _analyze_dimension_size(
     config_spec: ConfigSpec,
     key: str,
@@ -595,7 +735,6 @@ def _analyze_dimension_size(
     """Analyze the size of one config dimension."""
     from ..autotuner.config_fragment import IntegerFragment
     from ..autotuner.config_spec import AUTOTUNED_PALLAS_LOOP_TYPES
-    from ..autotuner.config_spec import VALID_MAXNREG
     from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
 
     # Handle special cases
@@ -632,15 +771,6 @@ def _analyze_dimension_size(
             ),
         )
 
-    if key == "num_warps":
-        # num_warps is typically [1, 32] power-of-two
-        return SearchSpaceDimension(
-            name="num_warps",
-            dim_type="discrete",
-            size=6,  # 1, 2, 4, 8, 16, 32
-            values=[1, 2, 4, 8, 16, 32],
-        )
-
     if key == "num_stages":
         frag = config_spec._num_stages_fragment()
         if isinstance(frag, IntegerFragment):
@@ -651,16 +781,9 @@ def _analyze_dimension_size(
                 size=size,
                 values=list(range(frag.low, frag.high + 1)) if size <= 20 else None,
             )
+        return None
 
-    elif key == "maxnreg":
-        return SearchSpaceDimension(
-            name="maxnreg",
-            dim_type="categorical",
-            size=len(VALID_MAXNREG),
-            values=[str(v) for v in VALID_MAXNREG],
-        )
-
-    elif key == "loop_orders":
+    if key == "loop_orders":
         # ``config.loop_orders`` is a list[list[int]]: one permutation per loop
         # spec. Each spec permutes ``len(spec.block_ids)`` block_ids, so the
         # number of distinct orderings for that spec is
@@ -682,7 +805,7 @@ def _analyze_dimension_size(
             else None,
         )
 
-    elif key == "pallas_loop_type":
+    if key == "pallas_loop_type":
         if config_spec.has_pallas_inner_loops:
             choices = (
                 VALID_PALLAS_LOOP_TYPES
@@ -702,7 +825,7 @@ def _analyze_dimension_size(
             constrained_by="no pallas inner loops",
         )
 
-    elif key == "epilogue_subtile":
+    if key == "epilogue_subtile":
         if config_spec.epilogue_subtile_autotune_choices:
             return SearchSpaceDimension(
                 name="epilogue_subtile",
@@ -717,7 +840,7 @@ def _analyze_dimension_size(
             constrained_by="not a matmul-like kernel or k_hint too small",
         )
 
-    elif key == "l2_groupings":
+    if key == "l2_groupings":
         # ``config.l2_groupings`` is a list[int]: one power-of-two value per
         # spec. Each slot uses PowerOfTwoFragment(1, 64, 1) → {1, 2, 4, 8, 16,
         # 32, 64} = 7 values.
@@ -732,7 +855,7 @@ def _analyze_dimension_size(
             constrained_by=f"{num_specs} loop(s)",
         )
 
-    elif key == "flatten_loops":
+    if key == "flatten_loops":
         # Boolean per loop
         num_specs = len(config_spec.flatten_loops)
         if num_specs == 0:

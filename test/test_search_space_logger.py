@@ -250,12 +250,10 @@ class TestExploredValidityTracking(unittest.TestCase):
 
     def test_zero_total_percent_is_zero(self) -> None:
         report = ExplorationReport(
-            kernel_name="k",
-            backend="triton",
+            summary=_summary(dimensions=[], total=100),
             search_algorithm="RandomSearch",
             elapsed_seconds=1.0,
             configs_tested=0,
-            total_search_space_size=100,
             feature_stats=[],
             avg_feature_coverage=0.0,
             min_feature_coverage=0.0,
@@ -276,12 +274,10 @@ class TestExploredValidityTracking(unittest.TestCase):
         self, *, explored_valid: int, explored_invalid: int
     ) -> ExplorationReport:
         return ExplorationReport(
-            kernel_name="k",
-            backend="triton",
+            summary=_summary(dimensions=[], total=100),
             search_algorithm="RandomSearch",
             elapsed_seconds=1.0,
             configs_tested=explored_valid,
-            total_search_space_size=100,
             feature_stats=[],
             avg_feature_coverage=0.0,
             min_feature_coverage=0.0,
@@ -350,12 +346,10 @@ class TestExplorationReportSummary(unittest.TestCase):
             )
         ]
         report = ExplorationReport(
-            kernel_name="k",
-            backend="triton",
+            summary=_summary(dimensions=[], total=138240),
             search_algorithm="LFBOTreeSearch",
             elapsed_seconds=1.0,
             configs_tested=1,
-            total_search_space_size=138240,
             feature_stats=stats,
             avg_feature_coverage=0.024,
             min_feature_coverage=0.024,
@@ -580,12 +574,10 @@ class TestSaveOutputPathHandling(unittest.TestCase):
 
     def _report_obj(self) -> ExplorationReport:
         return ExplorationReport(
-            kernel_name="k",
-            backend="triton",
+            summary=_summary(dimensions=[], total=6),
             search_algorithm="Test",
             elapsed_seconds=1.0,
             configs_tested=3,
-            total_search_space_size=6,
             feature_stats=[],
             avg_feature_coverage=0.0,
             min_feature_coverage=0.0,
