@@ -2459,6 +2459,17 @@ def _emit_mma_pipeline(
             "tcgen05 MMA codegen",
         )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
+    tcgen05_role_local_small_n_edge_tma = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+        and _tcgen05_cluster_n(df.config) == 1
+        and 0 < n_size < bn
+        and rhs_operand.trailing_transpose
+        and m_size % bm == 0
+        and k_total_size % bk == 0
+    )
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=bm,
         cluster_m=tcgen05_cluster_m,
@@ -2566,6 +2577,7 @@ def _emit_mma_pipeline(
         and not tcgen05_m_edge_only
         and not tcgen05_n_edge_only
         and not tcgen05_double_edge_tma
+        and not tcgen05_role_local_small_n_edge_tma
     ):
         # Mixed TMA full K tiles + scalar fallback tails are currently
         # validated only for flat one-CTA kernels. Persistent CtaGroup.TWO
@@ -2640,12 +2652,12 @@ def _emit_mma_pipeline(
         TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY
     )
     if df.config.get(TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY, False):
-        one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
-        one_shot_n_slots = n_size // bn
+        one_shot_m_slots = ((m_size + bm - 1) // bm) * (2 if tcgen05_is_two_cta else 1)
+        one_shot_n_slots = (n_size + bn - 1) // bn
         one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
         if not (
             tcgen05_pid_is_persistent
-            and tcgen05_static_full_tiles
+            and (tcgen05_static_full_tiles or tcgen05_role_local_small_n_edge_tma)
             and input_dtype == torch.float8_e4m3fn
             and not analysis.has_leading_passthrough
             and role_scheduler_cluster_cap is None
@@ -2656,7 +2668,8 @@ def _emit_mma_pipeline(
             raise exc.BackendUnsupported(
                 "cute",
                 f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY}=True requires a "
-                "static-full, unbatched persistent FP8 grid without a role "
+                "static-full or small-N-edge unbatched persistent FP8 grid "
+                "without a role "
                 "scheduler cluster cap and with at most "
                 f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS} work CTAs",
             )
@@ -2749,6 +2762,7 @@ def _emit_mma_pipeline(
             or tcgen05_role_local_m_edge_tma
             or tcgen05_role_local_n_edge_tma
             or tcgen05_role_local_double_edge_tma
+            or tcgen05_role_local_small_n_edge_tma
         )
         and tcgen05_role_local_codegen_allowed
         and tcgen05_pid_is_persistent
@@ -2939,6 +2953,8 @@ def _emit_mma_pipeline(
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
+        # Narrow stores are faster through the direct SIMT epilogue.
+        and bn >= 32
         and (
             tcgen05_static_full_tiles
             or tcgen05_role_local_k_tail_tma
@@ -4426,7 +4442,7 @@ def _emit_mma_pipeline(
                 f"{m_offset_var} < cutlass.Int32({m_size}) "
                 f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
             )
-        if tcgen05_role_local_n_edge_tma:
+        if tcgen05_role_local_n_edge_tma or tcgen05_role_local_small_n_edge_tma:
             # The role-local N-edge path lets TMA handle the partial B stripe
             # while the SIMT epilogue predicates aux loads and D stores.
             return (
