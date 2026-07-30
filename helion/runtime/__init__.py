@@ -28,8 +28,8 @@ from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
 from .settings import is_pallas_interpret as _module_is_pallas_interpret
-from .triton.launcher import default_launcher as default_launcher
-from .triton.launcher import get_num_sm as get_num_sm
+from .triton.launcher import default_launcher as _triton_default_launcher
+from .triton.launcher import get_num_sm as _triton_get_num_sm
 from .triton.launcher import set_triton_allocator as set_triton_allocator
 
 if TYPE_CHECKING:
@@ -80,6 +80,55 @@ def _patch_cutlass_jit_shutdown_unload() -> None:
     module_type.__del__ = _helion_del
     module_type._helion_shutdown_patch = True
     _CUTLASS_SHUTDOWN_PATCHED = True
+
+
+def default_launcher(
+    triton_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    num_warps: int,
+    num_stages: int,
+    ptx_options: str | None = None,
+    launch_cooperative_grid: bool = False,
+    **kwargs: dict,
+) -> object:
+    """Thin in-process wrapper over the dependency-free
+    :func:`helion.runtime.triton.launcher.default_launcher` that translates
+    Triton's opaque "incompatible dimensions" error into
+    :class:`helion.exc.ShapeMismatch`.
+    """
+    try:
+        return _triton_default_launcher(
+            triton_kernel,
+            grid,
+            *args,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            ptx_options=ptx_options,
+            launch_cooperative_grid=launch_cooperative_grid,
+            **kwargs,
+        )
+    except Exception as error:
+        message = str(error)
+        if "Cannot make_shape_compatible: incompatible dimensions" in message:
+            raise exc.ShapeMismatch("kernel operands", message) from error
+        raise
+
+
+def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
+    """Number of SMs (persistent-kernel grid size) for any Helion device.
+
+    Adds the CPU (Pallas-interpret) and TPU cases on top of the dependency-free
+    GPU helper :func:`helion.runtime.triton.launcher.get_num_sm`. See that
+    function for argument/return semantics.
+    """
+    if device.type == "cpu":
+        if not _module_is_pallas_interpret():
+            raise AssertionError("TODO: implement for other devices")
+        return 1
+    if device.type == "tpu":
+        return 1
+    return _triton_get_num_sm(device, reserved_sms=reserved_sms)
 
 
 def _pallas_make_block_spec(
