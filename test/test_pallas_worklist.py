@@ -1435,6 +1435,21 @@ def _eager_causal_jagged(q, k, v, offsets):
     return out
 
 
+def _exact_causal_jagged_inputs(offsets, num_heads, head_dim):
+    length = int(offsets[-1])
+    q = torch.ones(length, num_heads, head_dim, dtype=torch.float32)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    tokens = torch.arange(length)
+    heads = torch.arange(num_heads)
+    features = tokens.remainder(head_dim)
+    k[tokens[:, None], heads[None, :], features[:, None]] = 1.0
+    v[tokens[:, None], heads[None, :], features[:, None]] = (
+        (tokens[:, None] + 1) * (heads[None, :] + 1)
+    ).to(torch.float32)
+    return q.to(DEVICE), k.to(DEVICE), v.to(DEVICE)
+
+
 @onlyBackends(["pallas"])
 class TestUpperBoundPacking(unittest.TestCase):
     """Only packed-offset bounds are accepted; non-packed is rejected.
@@ -1594,11 +1609,7 @@ class TestWorklistNumerics(unittest.TestCase):
     def test_causal_dependent_tile_end_matches_eager(self):
         H, D, block = 2, 128, 8
         offsets = _offsets([20])
-        length = int(offsets[-1])
-        torch.manual_seed(0)
-        q = torch.randn(length, H, D, device=DEVICE, dtype=torch.float32)
-        k = torch.randn(length, H, D, device=DEVICE, dtype=torch.float32)
-        v = torch.randn(length, H, D, device=DEVICE, dtype=torch.float32)
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
         ref = _eager_causal_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
         for grouping in (1, 2):
             with self.subTest(grouping=grouping):
@@ -1609,7 +1620,7 @@ class TestWorklistNumerics(unittest.TestCase):
                         [block, block], loop_type="unroll", grouping=grouping
                     ),
                 )
-                torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+                torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
 
     @skipIfPallasInterpret(
         "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
@@ -1617,11 +1628,7 @@ class TestWorklistNumerics(unittest.TestCase):
     def test_causal_dependent_tile_end_streaming_matches_eager(self):
         H, D, block = 2, 128, 8
         offsets = _offsets([20, 13])
-        length = int(offsets[-1])
-        torch.manual_seed(0)
-        q = torch.randn(length, H, D, device=DEVICE, dtype=torch.float32)
-        k = torch.randn(length, H, D, device=DEVICE, dtype=torch.float32)
-        v = torch.randn(length, H, D, device=DEVICE, dtype=torch.float32)
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
         ref = _eager_causal_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
         for grouping in (1, 2):
             for loop_type in ("fori_loop", "emit_pipeline"):
@@ -1635,7 +1642,7 @@ class TestWorklistNumerics(unittest.TestCase):
                             grouping=grouping,
                         ),
                     )
-                    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+                    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
 
     def test_dense_kv_empty_batch_zero_grid(self):
         # total_q == 0 => num_work == 0 => dynamic grid=(0,).  End-to-end guard
