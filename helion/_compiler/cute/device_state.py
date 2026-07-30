@@ -387,10 +387,10 @@ class CuteDeviceFunctionState:
         # matmul accumulator. When a single accumulator fans out to multiple
         # output stores (e.g. aux = pre-activation, out = gelu(pre)), each store
         # site must emit its own descriptor kernel params or the generated
-        # function gets duplicate argument names. Track which StoreValue object
-        # ids have already emitted their TMA-store kernel params so 2nd+ store
-        # sites can allocate fresh per-store names.
-        self._tcgen05_emitted_tma_store_value_ids: set[int] = set()
+        # Track which StoreValue object ids have emitted a store so 2nd+ fan-out
+        # sites reuse the accumulator without repeating its lifecycle. TMA
+        # stores also use this to allocate fresh per-store descriptor names.
+        self._tcgen05_emitted_store_value_ids: set[int] = set()
         # Snapshot of the accumulator consumer-state stage index, keyed by the
         # acc consumer-state variable name. A multi-store fan-out reads the same
         # accumulator TMEM stage; the primary store advances the consumer state
@@ -527,20 +527,17 @@ class CuteDeviceFunctionState:
         self._tcgen05_acc_stage_index_vars[acc_consumer_state] = snapshot
         return snapshot, True
 
-    def tcgen05_tma_store_names_already_emitted(
-        self, value: CuteTcgen05StoreValue
-    ) -> bool:
-        """Return whether this StoreValue already emitted TMA-store kernel params.
+    def tcgen05_store_value_already_emitted(self, value: CuteTcgen05StoreValue) -> bool:
+        """Return whether this StoreValue already emitted an output store.
 
-        The first store site that uses a given accumulator's StoreValue keeps the
-        per-matmul ``tma_store_atom`` / ``tma_store_tensor`` names. Later store
-        sites fanning out from the same accumulator must allocate fresh per-store
-        names so the generated kernel signature has no duplicate parameters and so
-        each store binds its own TMA descriptor.
+        The first store owns the accumulator wait/advance and one-shot pipeline
+        and TMEM cleanup. Later fan-out stores reuse the live accumulator without
+        repeating that lifecycle, regardless of whether the stores use TMA or
+        SIMT. TMA callers additionally allocate fresh descriptor names.
         """
         value_id = id(value)
-        already_emitted = value_id in self._tcgen05_emitted_tma_store_value_ids
-        self._tcgen05_emitted_tma_store_value_ids.add(value_id)
+        already_emitted = value_id in self._tcgen05_emitted_store_value_ids
+        self._tcgen05_emitted_store_value_ids.add(value_id)
         return already_emitted
 
     def register_tcgen05_matmul_plan(self, plan: CuteTcgen05MatmulPlan) -> None:

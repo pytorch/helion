@@ -6300,7 +6300,7 @@ class TestCuteBackend(TestCase):
             tcgen05_one_shot_role_scheduler=True,
         )
         with self.assertRaisesRegex(
-            BackendUnsupported, "static-full, unbatched persistent FP8 grid"
+            BackendUnsupported, "static-full or small-N-edge unbatched"
         ):
             bound.to_triton_code(config)
 

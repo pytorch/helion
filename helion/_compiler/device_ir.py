@@ -3726,6 +3726,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             item.explicit_epi_tile_compatible
                             for item, _lhs, _plan in search_candidates
                         ),
+                        allow_fp8_small_n_persistent=(
+                            all(
+                                item.operands.rhs.trailing_transpose
+                                for item, _lhs, _plan in search_candidates
+                            )
+                        ),
                     )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
