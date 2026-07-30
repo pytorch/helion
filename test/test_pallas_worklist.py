@@ -1109,7 +1109,14 @@ class TestWorklistConfig(unittest.TestCase):
         self.assertIn("_wid = pl.program_id(0)", code)
         self.assertIn("work_seq_ref[_wid]", code)
 
-    def test_unsupported_kernel_raises(self):
+    def test_unsupported_kernel_downgrades(self):
+        """A kernel with no owner ``hl.grid`` can't build a compact-worklist
+        plan, but ``pallas_worklist_grouping`` is an independent autotune knob
+        that may still be set on it. Compiling with grouping in (1, 2) must
+        downgrade to a no-op — the generated code contains no compact-worklist
+        builder — rather than raising ``InvalidConfig`` past the autotuner's
+        skip path (which would fail the whole sweep step)."""
+
         def fn(x, y):
             out = torch.empty_like(x)
             for tile in hl.tile(out.size()):
@@ -1120,8 +1127,12 @@ class TestWorklistConfig(unittest.TestCase):
         args = (torch.randn(64, 64), torch.randn(64, 64))
         bound = kernel.bind(args)
         for grouping in (1, 2):
-            with self.subTest(grouping=grouping), self.assertRaises(exc.InvalidConfig):
-                bound.to_triton_code(_worklist_config([16, 16], grouping=grouping))
+            with self.subTest(grouping=grouping):
+                code = bound.to_triton_code(
+                    _worklist_config([16, 16], grouping=grouping)
+                )
+                self.assertNotIn("_compact_build_worklist=", code)
+                self.assertNotIn("def _build_worklist(", code)
 
     def test_invalid_worklist_grouping_raises(self):
         args = (torch.randn(64, 64), torch.randn(64, 64))
