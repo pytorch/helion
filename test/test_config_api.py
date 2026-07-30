@@ -449,15 +449,16 @@ class TestSettingsEnv(TestCase):
     def test_autotune_force_persistent_clamps_on_symm_mem(self) -> None:
         # force_persistent + a symm-mem arg must clamp to the signal-pad budget.
         settings = helion.Settings(autotune_force_persistent=True)
-        device = torch.device("cuda", 0)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
             patch("helion.runtime.get_num_sm", return_value=200),
             patch("helion._dist_utils.is_symm_mem_tensor", return_value=True),
         ):
-            env = CompileEnvironment(device, settings)
-            env.restrict_pid_types_for_persistent((torch.empty(1, device=device),))
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            # is_symm_mem_tensor is mocked, so a plain CPU tensor is enough and
+            # avoids requiring a CUDA build on the runner.
+            env.restrict_pid_types_for_persistent((torch.empty(1),))
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
 
     @skipIfXPU("Uses torch.device('cuda') directly")
@@ -500,15 +501,14 @@ class TestSettingsEnv(TestCase):
         # A symm-mem tensor arg (no barrier) is the other persistent signal and
         # must restrict pid_types just like a barrier does.
         settings = helion.Settings()
-        device = torch.device("cuda", 0)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
             patch("helion.runtime.get_num_sm", return_value=200),
             patch("helion._dist_utils.is_symm_mem_tensor", return_value=True),
         ):
-            env = CompileEnvironment(device, settings)
-            env.restrict_pid_types_for_persistent((torch.empty(1, device=device),))
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env.restrict_pid_types_for_persistent((torch.empty(1),))
         self.assertEqual(
             env.config_spec.allowed_pid_types,
             ("persistent_blocked", "persistent_interleaved"),
@@ -517,30 +517,28 @@ class TestSettingsEnv(TestCase):
     def test_persistent_block_limit_caps_num_sm_multiplier(self) -> None:
         # max_blocks=10000, 200 SMs -> 10000 // 200 = 50 -> floor pow2 = 32
         settings = helion.Settings()
-        device = torch.device("cuda", 0)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
             patch("helion.runtime.get_num_sm", return_value=200),
             patch("helion._dist_utils.is_symm_mem_tensor", return_value=True),
         ):
-            env = CompileEnvironment(device, settings)
-            env.restrict_pid_types_for_persistent((torch.empty(1, device=device),))
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env.restrict_pid_types_for_persistent((torch.empty(1),))
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
 
     def test_persistent_block_limit_handles_zero_raw_max(self) -> None:
         # max_blocks=144, 148 SMs -> 144 // 148 = 0 -> must clamp to 1
         # without crashing on `1 << -1`.
         settings = helion.Settings()
-        device = torch.device("cuda", 0)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=144),
             patch("helion.runtime.get_num_sm", return_value=148),
             patch("helion._dist_utils.is_symm_mem_tensor", return_value=True),
         ):
-            env = CompileEnvironment(device, settings)
-            env.restrict_pid_types_for_persistent((torch.empty(1, device=device),))
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env.restrict_pid_types_for_persistent((torch.empty(1),))
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 1)
 
     def test_backend_env_var_accepts_cute(self) -> None:
