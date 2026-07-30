@@ -295,14 +295,46 @@ RCP_LN2 = 1.4426950408889634
 
 
 @helion.kernel()
-def chunk_cumsum_gc_helion(g: torch.Tensor) -> torch.Tensor:
+def l2norm_fwd_helion(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Unit-norm each row over the last (head) axis, in fp32.
+    y[..., d] = x[..., d] / sqrt(sum_d x^2 + eps)     # [B, T, H, D]"""
+    B, T, H, D = x.size()
+    y = torch.empty_like(x)
+    for tile_b, tile_t, tile_h in hl.tile([B, T, H]):
+        xt = x[tile_b, tile_t, tile_h, :].to(torch.float32)
+        rstd = torch.rsqrt((xt * xt).sum(dim=-1, keepdim=True) + eps)
+        y[tile_b, tile_t, tile_h, :] = (xt * rstd).to(x.dtype)
+    return y
+
+
+@helion.kernel()
+def chunk_cumsum_gc_helion(
+    g: torch.Tensor,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    H: int = 1,
+    N: int = 1,
+    use_gate: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    has_bias: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    use_lower_bound: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+) -> torch.Tensor:
     """Per-chunk cumulative log-decay over the chunk (C) axis.
         gc[i] = sum_{j <= i} g[j]        # [BHN, C, D], fp32
     Computed as the tensor-core matmul gc = L @ g with L the [C, C]
     lower-triangular ones matrix, instead of a strided scan over the C axis
     (dim -2 of a [BH, N, C, D] tensor) whose steps stride by D. The bf16 g is
     exactly representable in tf32, and the sum accumulates in fp32, so gc keeps
-    the same precision as an fp32 scan while reading g once through the MMA."""
+    the same precision as an fp32 scan while reading g once through the MMA.
+
+    With use_gate=True, g arrives pre-activation and the gate is applied before the
+    sum, over rows flattened as [B, H, N]:
+        h  = (r // N) % H                # head of row r
+        gb = g + dt_bias[h]              # has_bias=True, else gb = g
+      - use_lower_bound=True (default):
+            g = lower_bound * sigmoid(exp(A_log[h]) * gb)
+      - use_lower_bound=False:
+            g = -exp(A_log[h]) * softplus(gb)"""
     BHN = g.size(0)
     C = hl.specialize(g.size(1))
     D = g.size(2)
@@ -312,6 +344,16 @@ def chunk_cumsum_gc_helion(g: torch.Tensor) -> torch.Tensor:
         ltri = (idx[:, None] >= idx[None, :]).to(torch.float32)  # [C, C] incl. diag
         L = ltri[None, :, :].broadcast_to([tile_bhn, C, C])  # pyrefly: ignore[no-matching-overload]
         gt = g[tile_bhn, :, tile_d].to(torch.float32)  # [b, C, d]
+        if use_gate:
+            h_idx = (tile_bhn.index // N) % H
+            a = torch.exp(A_log[h_idx].to(torch.float32))[:, None, None]  # pyrefly: ignore[unsupported-operation]
+            if has_bias:
+                gt = gt + dt_bias[h_idx, tile_d][:, None, :]  # pyrefly: ignore[unsupported-operation]
+            if use_lower_bound:
+                gt = lower_bound * torch.sigmoid(a * gt)  # pyrefly: ignore[unsupported-operation]
+            else:
+                sp = torch.clamp(gt, min=0.0) + torch.log1p(torch.exp(-torch.abs(gt)))
+                gt = -a * sp
         gc[tile_bhn, :, tile_d] = hl.dot(L, gt)
     return gc
 
@@ -1831,6 +1873,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         initial_state: torch.Tensor | None,
         return_final_state: bool,
         scale: float = 1.0,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        lower_bound: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         tensors = [q, k, v]
         ctx.has_g = g is not None
@@ -1864,6 +1909,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 initial_state=initial_state,
                 return_final_state=return_final_state,
                 scale=scale,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
             )
             ctx.h_all = h_all
             ctx.v_new_all = v_new_all
@@ -1901,6 +1949,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         None,
         None,
         None,
+        None,
+        None,
+        None,
     ]:
         tensors = ctx.saved_tensors
         q, k, v = tensors[:3]
@@ -1928,7 +1979,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 scale=ctx.scale,
                 needs_dg=ctx.needs_input_grad[3],
             )
-            return dq, dk, dv, dg, None, None, None, None, None, None
+            return dq, dk, dv, dg, None, None, None, None, None, None, None, None, None
 
         A_inv = ctx.A_inv
         w_wy = ctx.w_wy
@@ -1951,7 +2002,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 w_wy=w_wy,
                 scale=ctx.scale,
             )
-            return dq, dk, dv, dg, dbeta, None, None, None, None, None
+            return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None, None
 
         dq, dk, dv, dg, dbeta, da = _helion_chunked_bwd_delta(
             q,
@@ -1968,7 +2019,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
             g=g,
             scale=ctx.scale,
         )
-        return dq, dk, dv, dg, dbeta, da, None, None, None, None
+        return dq, dk, dv, dg, dbeta, da, None, None, None, None, None, None, None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2138,6 +2189,9 @@ def _helion_chunked_fwd_delta(
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
     scale: float = 1.0,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -2176,7 +2230,17 @@ def _helion_chunked_fwd_delta(
         decay_last = g_cs[:, :, -1]
         g_cs_flat = g_cs.reshape(BHN, C)
     elif diag_anchored:
-        g_cs_flat = chunk_cumsum_gc_helion(g.reshape(BHN, C, D))
+        g_cs_flat = chunk_cumsum_gc_helion(
+            g.reshape(BHN, C, D),
+            A_log,
+            dt_bias,
+            lower_bound,
+            H,
+            N,
+            use_gate=A_log is not None,
+            has_bias=dt_bias is not None,
+            use_lower_bound=lower_bound is not None,
+        )
         g_cs = g_cs_flat.reshape(BH, N, C, D)
         decay_last = g_cs[:, :, -1, :]
 
@@ -2692,6 +2756,9 @@ def chunked_linear_attn(
     return_final_state: Literal[False] = ...,
     head_first: bool = ...,
     scale: float = ...,
+    A_log: torch.Tensor | None = ...,
+    dt_bias: torch.Tensor | None = ...,
+    lower_bound: float | None = ...,
 ) -> torch.Tensor: ...
 
 
@@ -2708,6 +2775,9 @@ def chunked_linear_attn(
     return_final_state: Literal[True] = ...,
     head_first: bool = ...,
     scale: float = ...,
+    A_log: torch.Tensor | None = ...,
+    dt_bias: torch.Tensor | None = ...,
+    lower_bound: float | None = ...,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -2723,6 +2793,9 @@ def chunked_linear_attn(
     return_final_state: bool = False,
     head_first: bool = True,
     scale: float = 1.0,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Public entry point for chunked linear attention. g=None means no decay.
 
@@ -2768,7 +2841,19 @@ def chunked_linear_attn(
             a = torch.nn.functional.pad(a, [0, 0, 0, pad])
 
     o, final_state = ChunkedLinearAttnFn.apply(
-        q, k, v, g, beta, a, C, initial_state, return_final_state, scale
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a,
+        C,
+        initial_state,
+        return_final_state,
+        scale,
+        A_log,
+        dt_bias,
+        lower_bound,
     )
 
     if pad > 0:
@@ -2989,9 +3074,52 @@ def helion_chunk_kda(
     scale: float = 1.0,
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """KDA, optionally applying the model's input transforms on the way in.
+
+    All three flags default off, meaning the caller has already transformed its
+    inputs. Turning one on moves that transform into the kernels:
+      - use_qk_l2norm_in_kernel=True: q, k arrive raw, normed per head over D:
+            q = q / ||q||,  k = k / ||k||
+      - use_gate_in_kernel=True: g arrives pre-activation, A_log [H] required,
+        dt_bias [H, D] and lower_bound optional:
+            g = lower_bound * sigmoid(exp(A_log) * (g + dt_bias))   lower_bound set
+            g = -exp(A_log) * softplus(g + dt_bias)                 otherwise
+      - use_beta_sigmoid_in_kernel=True: beta arrives as logits:
+            beta = sigmoid(beta)
+    None of the three transforms has a backward, so a flag set on an input with
+    requires_grad=True raises NotImplementedError.
+    """
     assert g is not None
     assert beta is not None
+    any_flag = (
+        use_qk_l2norm_in_kernel or use_gate_in_kernel or use_beta_sigmoid_in_kernel
+    )
+    needs_grad = (
+        q.requires_grad or k.requires_grad or g.requires_grad or beta.requires_grad
+    )
+    if any_flag and needs_grad:
+        raise NotImplementedError(
+            "the in-kernel KDA preamble is forward-only; call with the flags off "
+            "and transform the inputs outside the kernel to keep gradients"
+        )
+
+    if use_qk_l2norm_in_kernel:
+        q, k = l2norm_fwd_helion(q), l2norm_fwd_helion(k)
+    if use_beta_sigmoid_in_kernel:
+        beta = torch.sigmoid(beta)
+    if use_gate_in_kernel:
+        assert A_log is not None
+    else:
+        A_log = None
+        dt_bias = None
+        lower_bound = None
     return chunked_linear_attn(
         q,
         k,
@@ -3002,6 +3130,9 @@ def helion_chunk_kda(
         scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
     )
 
 
