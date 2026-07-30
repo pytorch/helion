@@ -4,9 +4,9 @@
 Companion to build_dashboard_data.py for the pretuned-kernel suite
 (pretuned_kernels/run.py output). Fetches runs of the "Benchmark Pretuned
 Dispatch" workflow, downloads each run's pretuned-results-* artifacts, and
-aggregates the per-kernel SUMMARY metrics (geomean speedup vs eager, win count,
-best speedup) into a single JSON the dashboard's Pretuned tab renders with no
-client-side computation. Supports incremental updates via --existing-url.
+aggregates the per-kernel results (including failures and SUMMARY metrics) into
+a single JSON the dashboard's Pretuned tab renders with no client-side
+computation. Supports incremental updates via --existing-url.
 
 Scheduled runs (GitHub event == "schedule") are treated as the nightly trend;
 manual workflow_dispatch runs stay in per-kernel history for context but never
@@ -154,43 +154,60 @@ def parse_run(run_dir, active_platforms=None):
         except (json.JSONDecodeError, OSError):
             continue
         for rec in records or []:
-            if "geomean" not in rec:
-                # Kernel crashed on this run; skip (build_history records gaps).
+            if "geomean" not in rec and "error" not in rec:
+                # Unsupported kernels are intentionally skipped on platforms
+                # without a checked-in heuristic.
                 continue
-            kernels.append(
-                {
-                    "kernel": rec["kernel"],
-                    "platform": rec.get("device", platform_short),
-                    "platform_short": platform_short,
-                    "compute": rec.get("compute_capability", ""),
-                    "cudagraph": bool(rec.get("cudagraph", False)),
-                    "geomean": rec["geomean"],
-                    "helion_wins": rec.get("helion_wins", 0),
-                    "total": rec.get("total", 0),
-                    "best_speedup": rec.get("best_speedup", 0.0),
-                    # Per-baseline breakdown for the dashboard dropdown (or None
-                    # for single-baseline kernels).
-                    "baselines": rec.get("baselines"),
-                }
-            )
+            kernel = {
+                "kernel": rec["kernel"],
+                "platform": rec.get("device", platform_short),
+                "platform_short": platform_short,
+                "compute": rec.get("compute_capability", ""),
+            }
+            if "cudagraph" in rec:
+                kernel["cudagraph"] = bool(rec["cudagraph"])
+            if "error" in rec:
+                kernel["error"] = rec["error"]
+            else:
+                kernel.update(
+                    {
+                        "geomean": rec["geomean"],
+                        "helion_wins": rec.get("helion_wins", 0),
+                        "total": rec.get("total", 0),
+                        "best_speedup": rec.get("best_speedup", 0.0),
+                        # Per-baseline breakdown for the dashboard dropdown (or
+                        # None for single-baseline kernels).
+                        "baselines": rec.get("baselines"),
+                    }
+                )
+            kernels.append(kernel)
     return kernels
 
 
 def build_history_entry(run, k):
-    return {
+    entry = {
         "run_id": run["run_id"],
         "sha": run["sha"],
         "full_sha": run["full_sha"],
         "date": run["date"],
         "branch": run.get("branch", "main"),
         "is_nightly": bool(run.get("is_nightly")),
-        "cudagraph": bool(k.get("cudagraph", False)),
-        "geomean": round(k["geomean"], 4),
-        "helion_wins": k["helion_wins"],
-        "total": k["total"],
-        "best_speedup": round(k["best_speedup"], 4),
-        "baselines": k.get("baselines"),
     }
+    if "cudagraph" in k:
+        entry["cudagraph"] = bool(k["cudagraph"])
+    if "error" in k:
+        entry["error"] = k["error"]
+    else:
+        entry.update(
+            {
+                "geomean": round(k["geomean"], 4),
+                "helion_wins": k["helion_wins"],
+                "total": k["total"],
+                "best_speedup": round(k["best_speedup"], 4),
+                "baselines": k.get("baselines"),
+            }
+        )
+    return entry
 
 
 def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platforms=None):
@@ -240,15 +257,19 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
         for k in run["kernels"]:
             key = f"{k['kernel']}|{k['platform_short']}"
             if key not in kernel_index:
+                previous = existing_summary.get(key, {})
                 kernel_index[key] = {
                     "kernel": k["kernel"],
                     "platform": k["platform"],
                     "platform_short": k["platform_short"],
                     "compute": k["compute"],
-                    "cudagraph": k.get("cudagraph", False),
+                    "cudagraph": k.get(
+                        "cudagraph", previous.get("cudagraph", False)
+                    ),
                     "history": [],
                 }
-            kernel_index[key]["cudagraph"] = k.get("cudagraph", False)
+            if "cudagraph" in k:
+                kernel_index[key]["cudagraph"] = k["cudagraph"]
             kernel_index[key]["history"].append(build_history_entry(run, k))
 
     # Backfill from cached history for runs whose artifacts have expired.
@@ -280,20 +301,21 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
     summary = []
     for key, entry in sorted(kernel_index.items()):
-        latest = prev = None
-        for h in reversed(entry["history"]):
-            if not is_nightly_main(h):
-                continue
-            if latest is None:
-                latest = h
-            elif prev is None:
-                prev = h
-                break
+        nightly_history = [h for h in entry["history"] if is_nightly_main(h)]
+        latest = nightly_history[-1] if nightly_history else None
+        failed = bool(latest and "error" in latest)
+        prev = next(
+            (h for h in reversed(nightly_history[:-1]) if "geomean" in h), None
+        )
         geomean_delta = (
-            fmt_delta(latest["geomean"], prev["geomean"]) if latest and prev else None
+            fmt_delta(latest["geomean"], prev["geomean"])
+            if latest and not failed and prev
+            else None
         )
         status = (
-            "improved"
+            "failed"
+            if failed
+            else "improved"
             if geomean_delta and geomean_delta > 10
             else "regressed"
             if geomean_delta and geomean_delta < -10
@@ -307,13 +329,15 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
                 "compute": entry["compute"],
                 "cudagraph": bool(entry.get("cudagraph", False)),
                 "has_nightly_data": latest is not None,
+                "failed": failed,
+                "error": latest.get("error") if failed else None,
                 "status": status,
                 "geomean_delta_pct": geomean_delta,
-                "geomean": latest["geomean"] if latest else 0,
-                "helion_wins": latest["helion_wins"] if latest else 0,
-                "total": latest["total"] if latest else 0,
-                "best_speedup": latest["best_speedup"] if latest else 0,
-                "baselines": latest.get("baselines") if latest else None,
+                "geomean": latest.get("geomean", 0) if latest else 0,
+                "helion_wins": latest.get("helion_wins", 0) if latest else 0,
+                "total": latest.get("total", 0) if latest else 0,
+                "best_speedup": latest.get("best_speedup", 0) if latest else 0,
+                "baselines": latest.get("baselines") if latest and not failed else None,
                 "last_seen_date": latest["date"] if latest else None,
                 "history": entry["history"],
             }
@@ -325,6 +349,8 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
     unique_kernels = sorted({s["kernel"] for s in nightly_summary})
     improved = sum(1 for s in nightly_summary if s["status"] == "improved")
     regressed = sum(1 for s in nightly_summary if s["status"] == "regressed")
+    failed = sum(1 for s in nightly_summary if s["failed"])
+    successful_summary = [s for s in nightly_summary if not s["failed"]]
 
     overview_runs = [r for r in runs_meta_sorted if is_nightly_main(r)]
     latest_nightly_run = overview_runs[-1] if overview_runs else {}
@@ -343,9 +369,16 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             "num_platforms": len(platforms),
             "improved_count": improved,
             "regressed_count": regressed,
-            "unchanged_count": len(nightly_summary) - improved - regressed,
-            "geomean": round(geo_mean([s["geomean"] for s in nightly_summary]), 4),
-            "helion_wins": sum(1 for s in nightly_summary if s["geomean"] > 1.0),
+            "failed_count": failed,
+            "unchanged_count": sum(
+                1 for s in nightly_summary if s["status"] == "unchanged"
+            ),
+            "geomean": round(
+                geo_mean([s["geomean"] for s in successful_summary]), 4
+            ),
+            "helion_wins": sum(
+                1 for s in successful_summary if s["geomean"] > 1.0
+            ),
         },
         "summary": summary,
     }
@@ -399,8 +432,19 @@ def main():
     cache_dir = "./pretuned-benchmark-cache"
     os.makedirs(cache_dir, exist_ok=True)
     existing_ids = {r["run_id"] for r in existing.get("runs", [])}
+    latest_nightly_id = max(
+        (
+            r
+            for r in runs
+            if r.get("is_nightly") and r.get("branch", "main") == "main"
+        ),
+        key=lambda r: r["date"],
+        default={},
+    ).get("run_id")
     for r in runs:
-        if r["run_id"] in existing_ids:
+        # Refresh the latest nightly so newly added result fields (such as
+        # per-kernel errors) take effect without waiting for another run.
+        if r["run_id"] in existing_ids and r["run_id"] != latest_nightly_id:
             continue
         print(f"Downloading run {r['run_id']} ({r['sha']})...")
         download_artifacts(args.repo, r["run_id"], os.path.join(cache_dir, r["run_id"]))
