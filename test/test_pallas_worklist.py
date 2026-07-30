@@ -1678,7 +1678,7 @@ class TestResidentCacheWindowGuard(unittest.TestCase):
         operands = [((total, 4, 128), 2), ((total, 4, 128), 2)]
         c = compact_ordered_physical_window(
             operands,
-            _get_vmem_limit_bytes(pltpu),
+            _get_vmem_limit_bytes(pltpu, False),
             128,
             prep_operands=operands,
         )

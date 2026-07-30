@@ -1385,7 +1385,7 @@ class PallasBackend(Backend):
                 plan,
                 host_fn.params.arguments,
                 ordered_block=env.compact_worklist_ordered_block,
-                vmem_bytes=_get_vmem_limit_bytes(pltpu),
+                vmem_bytes=_get_vmem_limit_bytes(pltpu, env.settings.pallas_interpret),
             )
             if not admission.decision.active:
                 raise exc.InvalidConfig(
