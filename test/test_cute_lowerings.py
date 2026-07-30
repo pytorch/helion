@@ -2824,7 +2824,7 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
 
         self.assertIn(
-            "tcgen05_epilogue_tile = (cute.make_layout(64), cute.make_layout(64))",
+            "tcgen05_epi_tile = (cute.make_layout(64), cute.make_layout(64))",
             code,
         )
         if get_cute_mma_support().tcgen05_f8:

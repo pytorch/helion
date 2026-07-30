@@ -6222,7 +6222,9 @@ class TestCuteBackend(TestCase):
             tcgen05_c_stages=2,
             tcgen05_one_shot_role_scheduler=True,
         )
-        with self.assertRaisesRegex(BackendUnsupported, "static-full, unbatched"):
+        with self.assertRaisesRegex(
+            BackendUnsupported, "static-full or small-N-edge unbatched"
+        ):
             bound.to_triton_code(config)
 
     def test_matmul_mma_tcgen05_one_shot_rejects_leading_batch(self) -> None:

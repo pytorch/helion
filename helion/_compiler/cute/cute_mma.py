@@ -619,7 +619,7 @@ def _analyze_mma_operand(
             order, (list, tuple)
         ):
             return None
-        normalized = tuple(int(dim) % value_fake.ndim for dim in order)
+        normalized = tuple(int(cast("int", dim)) % value_fake.ndim for dim in order)
         if normalized != (
             *range(value_fake.ndim - 2),
             value_fake.ndim - 1,
@@ -2674,7 +2674,7 @@ def _emit_mma_pipeline(
                 f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS} work CTAs",
             )
     if role_scheduler_cluster_cap is not None:
-        role_scheduler_cluster_cap = int(role_scheduler_cluster_cap)
+        role_scheduler_cluster_cap = int(cast("int", role_scheduler_cluster_cap))
         scheduler_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
         scheduler_n_slots = n_size // bn
         scheduler_cluster_size = tcgen05_cluster_m * tcgen05_cluster_n

@@ -1834,6 +1834,8 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_aux_epi_warp_count = tcgen05_value.epi_warp_count
     tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
     tcgen05_aux_use_tma_store_epilogue = tcgen05_value.use_tma_store_epilogue
+    tcgen05_aux_partial_output_tma_store = tcgen05_value.partial_output_tma_store
+    tcgen05_aux_output_column_major = tcgen05_value.output_column_major
     tcgen05_explicit_store_tile_expr: str | None = None
     if tcgen05_value.has_explicit_epilogue_tile:
         assert tcgen05_value.explicit_epi_tile_m is not None
@@ -2818,11 +2820,11 @@ def _codegen_cute_store_tcgen05_tile(
                 elif (
                     tcgen05_is_two_cta_m128(
                         is_two_cta=tcgen05_lifecycle.is_two_cta,
-                        bm=tcgen05_value.bm,
+                        bm=tcgen05_aux_bm,
                     )
-                    and tcgen05_value.use_tma_store_epilogue
-                    and not tcgen05_value.partial_output_tma_store
-                    and not tcgen05_value.output_column_major
+                    and tcgen05_aux_use_tma_store_epilogue
+                    and not tcgen05_aux_partial_output_tma_store
+                    and not tcgen05_aux_output_column_major
                 ):
                     lines.append(
                         _materialize_two_row_colvec_source(

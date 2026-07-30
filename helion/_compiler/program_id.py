@@ -1331,7 +1331,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY
         )
         if cluster_cap is not None:
-            return f"min(({total_clusters}), {int(cluster_cap)})"
+            cluster_cap = int(cast("int", cluster_cap))
+            return f"min(({total_clusters}), {cluster_cap})"
         max_persistent_clusters = self._tcgen05_max_persistent_work_clusters_expr()
         return f"min(({total_clusters}), ({max_persistent_clusters}))"
 
