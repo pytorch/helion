@@ -992,10 +992,6 @@ class Backend(abc.ABC):
         return triton_precision_by_dot_precision.get(precision, "")
 
 
-# TPU does not natively support 64-bit element types.
-_PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
-
-
 def _largest_divisor_at_most(size: int, limit: int) -> int:
     for divisor in range(limit, 0, -1):
         if size % divisor == 0:

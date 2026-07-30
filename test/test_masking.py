@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +8,8 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compiler.aten_lowering import matmul_masked_value
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -16,6 +19,26 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+
+class TestMatmulMaskedValue(unittest.TestCase):
+    def test_requires_fast_math_and_two_zero_padded_operands(self) -> None:
+        graph = torch.fx.Graph()
+        lhs = graph.placeholder("lhs")
+        rhs = graph.placeholder("rhs")
+        lhs.meta["masked_value"] = 0
+        rhs.meta["masked_value"] = 0
+        mm = graph.call_function(torch.ops.aten.mm.default, (lhs, rhs))
+
+        env = types.SimpleNamespace(settings=types.SimpleNamespace(fast_math=False))
+        with patch.object(CompileEnvironment, "current", return_value=env):
+            self.assertIsNone(matmul_masked_value(mm))
+
+            env.settings.fast_math = True
+            self.assertEqual(matmul_masked_value(mm), 0)
+
+            rhs.meta["masked_value"] = None
+            self.assertIsNone(matmul_masked_value(mm))
 
 
 @onlyBackends(["triton", "cute"])

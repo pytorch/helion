@@ -356,8 +356,8 @@ def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
     Single-XCD parts and CPX-partitioned devices (which expose one XCD) are
     skipped, since xcd_remap is a no-op there.
     """
-    from helion._compat import get_num_xcd
     from helion._compat import supports_amd_cdna_tunables
+    from helion.runtime.triton.launcher import get_num_xcd
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(

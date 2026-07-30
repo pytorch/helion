@@ -182,8 +182,9 @@ def _codegen_resident_cache(state: CodegenState) -> object:
     Optional prep-cache descriptors are handled inside ``_codegen_fori_loop``.
 
     Ranges longer than ``C`` are NOT handled in-kernel: the torch launcher raises
-    (``runtime._compact_raise_if_range_exceeds_window``), while JAX export keeps
-    this as a caller precondition. There is no in-kernel streamed ``else``.
+    (``runtime.pallas.launcher._compact_raise_if_range_exceeds_window``), while
+    JAX export keeps this as a caller precondition. There is no in-kernel streamed
+    ``else``.
     """
     decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
     assert decision is not None and decision.active
@@ -304,16 +305,11 @@ def _prepare_resident_prep_lowerings(
                 tail_fill_value=0.0,
             )
         )
-    # These lowerings are now installed (all validation above passed; any fallback
-    # returned early), so it is safe to drop the redundant per-tile masks on exactly
-    # these loads -- keyed on each lowering's declared tail fill, which also preserves
-    # a flash-style _mask_to(scores, -inf) whose fill differs.  Coupling elision to the
-    # installed set (not admission) keeps correctness off the "prep always emits" path.
-    load_tail_fills: dict[str, float] = {}
-    for lw in lowerings:
-        fill = lw.tail_fill_value
-        if fill is not None:
-            load_tail_fills[lw.hoist.load_node_name] = fill
+    # Fallback paths above return before declaring any tail-fill guarantees.
+    load_tail_fills = {
+        lowering.hoist.load_node_name: lowering.tail_fill_value
+        for lowering in lowerings
+    }
     elide_installed_prep_load_masks(graph_info.graph, load_tail_fills)
     if common_statements is not None:
         state.codegen.grouped_resident_prep_lowering_cache[cache_key] = lowerings
@@ -357,12 +353,9 @@ def _emit_resident_prep_refill(
     refill_tail_stmts: list[ast.stmt] = []
     for lowering in lowerings:
         assert isinstance(lowering, ResidentPrepLowering)
-        # The tail fill is emitted as a bare literal below, so it must be a finite
-        # number.  A non-finite (inf/-inf/nan) or undeclared (None) fill would need
-        # deliberate literal formatting; today only the transpose prep (0.0) reaches
-        # here, so assert rather than silently mis-emit.
+        # Generated fill literals currently support finite values only.
         tail_fill = lowering.tail_fill_value
-        assert tail_fill is not None and -float("inf") < tail_fill < float("inf"), (
+        assert -float("inf") < tail_fill < float("inf"), (
             "resident prep refill supports only finite numeric tail_fill_value"
         )
         perm = lowering.hoist.perm
