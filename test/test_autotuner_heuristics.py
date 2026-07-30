@@ -414,6 +414,26 @@ class TestAutotunerHeuristic(TestCase):
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
             self.assertFalse(_NotPromoting.should_promote(env))
 
+    def test_should_promote_declines_on_unclassifiable_device(self) -> None:
+        # On a device Helion cannot classify (e.g. MTIA), get_hardware_info raises
+        # RuntimeError. should_promote must degrade to "do not promote" rather than
+        # letting the exception escape and crash compilation.
+        env = MagicMock()
+        env.device = "mtia"
+
+        class _Sm90Only(AutotunerHeuristic):
+            promote_seed_to_default = True
+            PROMOTE_TARGETS = (("cuda", "sm90"),)
+
+        with patch(
+            "helion._hardware.get_hardware_info",
+            side_effect=RuntimeError(
+                "No supported GPU or TPU device found. "
+                "Helion requires CUDA, ROCm, XPU, or TPU."
+            ),
+        ):
+            self.assertFalse(_Sm90Only.should_promote(env))
+
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_pointwise_seed_promotes_only_on_target_arch(self) -> None:
