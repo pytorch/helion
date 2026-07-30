@@ -634,6 +634,11 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        # Set after device-IR lowering when the config-independent compact-worklist
+        # detector accepts the traced kernel. Keep this stricter than the coarse
+        # grid/dynamic-bound facts above so autotuning never offers grouping values
+        # that codegen is guaranteed to reject.
+        self.pallas_worklist_search_enabled: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating (Tasks #25 + #28).
         # Default False so the flash knobs never appear in the search surface
@@ -2335,18 +2340,18 @@ class ConfigSpec:
         if self.has_pallas_inner_loops:
             choices = AUTOTUNED_PALLAS_LOOP_TYPES
             if self.has_symbolic_or_data_dependent_bounds:
-                # Exclude "unroll" (uses Python range(), can't handle traced
-                # bounds) and put "fori_loop" first: it handles both DMA-aligned
-                # and unaligned inner blocks, while "emit_pipeline" fails on
-                # unaligned dims.
+                # Exclude ordinary "unroll" for traced bounds and put
+                # "fori_loop" first: it handles both DMA-aligned and unaligned
+                # inner blocks, while "emit_pipeline" fails on unaligned dims.
                 # TODO(thcmbs): Also exclude "emit_pipeline" when has_pallas_dma_unaligned
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
-                if self.grid_block_ids:
-                    # Owner hl.grid + jagged bounds may be compactable. The full
-                    # detector remains authoritative, so residual mismatches are
-                    # autotuner-skippable InvalidConfig candidates.
+                if self.pallas_worklist_search_enabled:
+                    # A detected compact worklist has its own dynamic resident
+                    # unroll lowering, so it can safely add this choice back.
                     choices = (*choices, "unroll")
+                    # Actual codegen repeats detection as a strict safety check
+                    # for explicit configs.
                     fields["pallas_worklist_grouping"] = EnumFragment(
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
                     )

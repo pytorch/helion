@@ -471,6 +471,17 @@ def _add_kernel(x, y):
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _nested_tile_no_grid_kernel(x, y):
+    """Nested tiles without the owner ``hl.grid`` required by worklists."""
+    out = torch.empty_like(x)
+    m_block = hl.register_block_size(x.size(0))
+    for mb_cta in hl.tile(x.size(0), block_size=m_block):
+        for mb in hl.tile(mb_cta.begin, mb_cta.end):
+            out[mb, :] = x[mb, :] + y[mb, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _noprep_ordered_kernel(q, k, q_offsets):
     """Jagged ordered reduction whose reused operand (k) has NO transpose prep:
     k is summed over each ordered tile, never head-major transposed.  It can still
@@ -724,6 +735,29 @@ class TestDetectAndGating(unittest.TestCase):
         self.assertEqual(choices, ("fori_loop", "emit_pipeline", "unroll"))
         self.assertEqual(grouping_field.choices, (0, 1, 2))
         self.assertEqual(list(bk.env.config_spec.grid_block_ids), [0])
+        self.assertTrue(bk.env.config_spec.pallas_worklist_search_enabled)
+
+    def test_gating_rejects_nested_tile_without_owner_grid(self):
+        bk = _nested_tile_no_grid_kernel.bind(
+            (torch.randn(128, 64), torch.randn(128, 64))
+        )
+        fields = bk.env.config_spec._flat_fields()
+
+        self.assertFalse(bk.env.config_spec.pallas_worklist_search_enabled)
+        self.assertNotIn("pallas_worklist_grouping", fields)
+        loop_type_field = fields["pallas_loop_type"]
+        self.assertIsInstance(loop_type_field, EnumFragment)
+        self.assertEqual(loop_type_field.choices, ("fori_loop", "emit_pipeline"))
+
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping), self.assertRaises(exc.InvalidConfig):
+                bk.to_triton_code(
+                    helion.Config(
+                        block_sizes=[128, 32],
+                        pallas_loop_type="unroll",
+                        pallas_worklist_grouping=grouping,
+                    )
+                )
 
     def test_gating_absent_for_non_jagged(self):
         bk = _add_kernel.bind((torch.randn(64, 64), torch.randn(64, 64)))

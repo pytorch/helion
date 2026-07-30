@@ -3580,6 +3580,26 @@ def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
         existing.add(block_id)
 
 
+def _configure_pallas_worklist_search(
+    config_spec: ConfigSpec, host_fn: HostFunction, device_ir: DeviceIR
+) -> None:
+    """Enable worklist tuning only for a structurally compatible kernel."""
+    config_spec.pallas_worklist_search_enabled = False
+    if (
+        not config_spec.has_symbolic_or_data_dependent_bounds
+        or not config_spec.grid_block_ids
+    ):
+        return
+
+    from .pallas.compact_worklist import detect_compact_worklist_plan
+
+    try:
+        detect_compact_worklist_plan(host_fn, device_ir=device_ir)
+    except exc.InvalidConfig:
+        return
+    config_spec.pallas_worklist_search_enabled = True
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
@@ -3637,6 +3657,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
         config_spec.epilogue_subtile_k_hint = 0
         config_spec.epilogue_subtile_autotune_choices = None
+        if CompileEnvironment.current().backend.name == "pallas":
+            _configure_pallas_worklist_search(config_spec, func, device_ir)
 
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (build_reduction_kernel_fact, after _collect_memory_op_facts) so it can

@@ -17,9 +17,10 @@ The supported loop shape is::
                 acc = update(acc, ...)
             out[tile_m] = finalize(acc)  # store in the compact region
 
-Detection rejects anything outside this shape with ``exc.InvalidConfig`` so the
-autotuner scores an offered-but-unmatched grouping-1 config ``inf`` and skips it,
-while an explicit grouping of 1 surfaces the clear error.
+Detection rejects anything outside this shape with ``exc.InvalidConfig``. The
+autotune search surface runs detection once up front and does not offer grouping
+for an unmatched kernel; codegen repeats detection so an explicit grouping still
+surfaces the clear error.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Mapping
 
+    from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
 
@@ -1087,6 +1089,8 @@ def _validate_host_bounds(
 
 def detect_compact_worklist_plan(
     host_fn: HostFunction,
+    *,
+    device_ir: DeviceIR | None = None,
 ) -> CompactWorklistPlan:
     """Recognise the compactable nest and build a :class:`CompactWorklistPlan`.
 
@@ -1102,7 +1106,8 @@ def detect_compact_worklist_plan(
     offered" rather than miscompiling -- which is also why the autotuner-gating
     safety net (only append compact when the pattern matches) matters.
     """
-    device_ir = host_fn.device_ir
+    if device_ir is None:
+        device_ir = host_fn.device_ir
     if len(device_ir.grid_block_ids) != 1:
         raise exc.InvalidConfig(
             "compact_worklist requires exactly one owner hl.grid; found "
