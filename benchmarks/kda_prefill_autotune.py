@@ -20,7 +20,19 @@ from examples.linear.kda_prefill import prepare_chunk_offsets
 import torch
 
 
-def _matrix_args(sequence_length: int, varlen: bool = False) -> tuple[object, ...]:
+def _matrix_args(
+    sequence_length: int,
+    varlen: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    bool,
+]:
     batch, heads, key_dim = 1, 16, 128
     q = torch.nn.functional.normalize(
         torch.randn(
@@ -95,9 +107,7 @@ def _kernel_args(
     q, k, g, beta, cu_seqlens, chunk_indices, _, is_varlen = matrix_args
     v = torch.randn_like(q)
     matrix_kernel = (
-        _intra_matrices_wide_forward
-        if preinvert_diagonal
-        else _intra_matrices_wide
+        _intra_matrices_wide_forward if preinvert_diagonal else _intra_matrices_wide
     )
     aqk, akk = matrix_kernel(
         *matrix_args,
@@ -145,9 +155,7 @@ def _kernel_args(
         return k, g, beta, inverse, cu_seqlens, chunk_indices, is_varlen
     if kernel_name in {"state", "output"}:
         solve_kernel = (
-            _intra_solve_recompute_newton
-            if newton_schulz
-            else _intra_solve_recompute
+            _intra_solve_recompute_newton if newton_schulz else _intra_solve_recompute
         )
         w, u = solve_kernel(
             akk,
@@ -222,9 +230,7 @@ def main() -> None:
     args = parser.parse_args()
 
     fused_kernel = (
-        _intra_solve_recompute_newton
-        if args.newton_schulz
-        else _intra_solve_recompute
+        _intra_solve_recompute_newton if args.newton_schulz else _intra_solve_recompute
     )
     state_kernel = _chunk_state_varlen if args.varlen else _chunk_state
     matrix_kernel = (

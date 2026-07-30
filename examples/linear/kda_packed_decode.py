@@ -29,8 +29,8 @@ import statistics
 import sys
 from types import ModuleType
 from typing import Callable
-from typing import cast
 from typing import Literal
+from typing import cast
 
 import torch
 
@@ -53,6 +53,7 @@ _KDA_CONFIG = helion.Config(
     indexing="pointer",
     pid_type="xyz",
 )
+
 
 @helion.kernel(
     static_shapes=False,
@@ -151,7 +152,6 @@ def _helion_fused_recurrent_kda_packed_decode(
             initial_state[state_index, i_hv, tile_v.index, k_offsets] = state
 
     return out
-
 
 
 def _validate_packed_decode_inputs(
@@ -745,7 +745,9 @@ def benchmark_one(
     for round_index in range(rounds):
         round_benchmarks = benchmarks if round_index % 2 == 0 else benchmarks[::-1]
         for name, fn in round_benchmarks:
-            samples[name].append(float(do_bench(fn, warmup=warmup_ms, rep=rep_ms)))
+            samples[name].append(
+                cast("float", do_bench(fn, warmup=warmup_ms, rep=rep_ms))
+            )
     return statistics.median(samples["SGLang"]), statistics.median(samples["Helion"])
 
 
@@ -815,9 +817,7 @@ def main() -> None:
         action="store_true",
         help="Jointly autotune one config before running the selected mode.",
     )
-    parser.add_argument(
-        "--tune-batch-sizes", type=int, nargs="+", default=[1, 256]
-    )
+    parser.add_argument("--tune-batch-sizes", type=int, nargs="+", default=[1, 256])
     parser.add_argument(
         "--tune-aggregation", choices=("geomean", "max"), default="geomean"
     )
