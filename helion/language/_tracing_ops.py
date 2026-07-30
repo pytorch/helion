@@ -406,6 +406,15 @@ def _(state: CodegenState) -> ast.AST:
     # (``roffset + lane*V + iota < N``) -- the strategy's scalar ``mask_var``
     # (``rindex < N``) is only correct at V=1. Other dims (e.g. a bm>1 row mask)
     # contribute a scalar ``mask_var`` broadcast to the vector shape.
+    # The vectorized column dim (flydsl tiles V=4 contiguous elems/thread over it)
+    # is the last tensor dim with a block id; its mask must be per-element, while
+    # row dims broadcast one scalar mask across the thread's vector.
+    _col_index = None
+    for size in tensor.size():
+        _bi = env.resolve_block_id(size)
+        if _bi is not None:
+            _col_index = _bi
+
     mask_terms: list[str] = []
     for size in tensor.size():
         index = env.resolve_block_id(size)
@@ -414,6 +423,7 @@ def _(state: CodegenState) -> ast.AST:
         strategy = df.tile_strategy.block_id_to_strategy.get((index,))
         _tc = getattr(strategy, "_thread_count", 0) or 0
         _lb = getattr(strategy, "_loop_block_size", 0) or 0
+        mask_var = state.codegen.mask_var(index)
         if (
             env.block_sizes[index].reduction
             and strategy is not None
@@ -429,7 +439,21 @@ def _(state: CodegenState) -> ast.AST:
                 state.sympy_expr(env.block_sizes[index].numel),
             )
             mask_terms.append(_pred)
-        elif (mask_var := state.codegen.mask_var(index)) is not None:
+        elif index == _col_index and _tc == 0 and mask_var is not None:
+            # Explicit ``hl.tile(n)`` reduction column (user-tiled, so NOT a
+            # ``reduction=True`` looped strategy): this dim is vectorized V=4
+            # elems/thread, element j at column ``index_var*4 + j``. The scalar
+            # ``mask_var`` (``idx < N``) is only correct at V=1, so build the
+            # per-element predicate matching the copy's column addressing.
+            _ci = state.codegen.index_var(index)
+            _v = 4
+            _elems = ", ".join(str(j) for j in range(_v))
+            _iota = f"fx.Vector.from_elements([{_elems}], fx.Int32)"
+            mask_terms.append(
+                f"((({_ci}) * {_v}) + {_iota}) "
+                f"< ({state.sympy_expr(env.block_sizes[index].numel)})"
+            )
+        elif mask_var is not None:
             # Broadcast the runtime scalar mask to a bool vector: flydsl's
             # ``filled`` only accepts a compile-time constant fill, so AND the
             # scalar into an all-true bool vector (``&`` promotes scalar->vector).

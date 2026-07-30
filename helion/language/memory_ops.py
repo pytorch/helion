@@ -5562,6 +5562,16 @@ def _(state: CodegenState) -> ast.AST:
 
         _atom_name = setup["atom"]
         _div_name = setup["div"]
+        # Explicit hl.tile(n) column tail: N not a multiple of the per-iteration
+        # span (4 * 64 * W) -> the last chunk's high lanes address past column N.
+        _expl_tail = (
+            is_vec
+            and not is_redcol
+            and not env.known_multiple(
+                env.block_sizes[col_block_id].numel,
+                4 * 64 * (getattr(backend, "_flydsl_warps_per_row", 1) or 1),
+            )
+        )
         if redcol_pred is not None:
             # Column tail: the vectorized BufferCopy is a single transaction and
             # cannot be predicated per element, so (like CuTe's scalar edge
@@ -5576,6 +5586,21 @@ def _(state: CodegenState) -> ast.AST:
                     f"{redcol_offset} + (fx.thread_idx.x % {_lane_mod}) "
                     f"* {vec_width} + {_j}"
                 )
+                state.add_statement(
+                    statement_from_string(
+                        f"if ({_colj}) < ({_n_expr}):\n"
+                        f"    fx.memref_store(fx.memref_load({r_var}, {_j}), {_row}, {_colj})"
+                    )
+                )
+        elif _expl_tail:
+            # Explicit-tile column tail: guarded scalar stores (the vectorized
+            # BufferCopy can't be per-element predicated). Element j of this thread
+            # is column ``chunk_idx * 4 + j``; store only when in range so tail
+            # columns are never written into the next row.
+            _n_expr = state.sympy_expr(env.block_sizes[col_block_id].numel)
+            _row = setup["row"]
+            for _j in range(vec_width):
+                _colj = f"(({chunk_idx_s}) * {vec_width}) + {_j}"
                 state.add_statement(
                     statement_from_string(
                         f"if ({_colj}) < ({_n_expr}):\n"
@@ -6018,6 +6043,23 @@ def _(state: CodegenState) -> ast.AST:
             chunk_idx = state.codegen.index_var(col_block_id)
         else:
             chunk_idx = "fx.thread_idx.x"
+        # Explicit hl.tile(n) column tail: N not a multiple of the per-iteration
+        # span (4 * 64 * W) -> the last chunk's high lanes would read past column N
+        # via the vectorized BufferCopy. The AMD buffer descriptor has max_size set
+        # to 0xFFFFFFFF which should return 0 for OOB reads, but in practice the
+        # hardware still fires a GPU page fault when the byte address exceeds the
+        # tensor's actual allocation (e.g. N=640, last tile reads cols 640-767 which
+        # falls one page past the end). Use guarded scalar loads instead so no
+        # memory access ever goes past the last valid column.
+        _expl_tail = (
+            is_vec
+            and not is_redcol
+            and not env.known_multiple(
+                env.block_sizes[col_block_id].numel,
+                4 * 64 * (getattr(backend, "_flydsl_warps_per_row", 1) or 1),
+            )
+        )
+
         state.add_statement(
             statement_from_string(
                 f"{r_var} = fx.make_rmem_tensor({vec_width}, {dtype_str})"
@@ -6025,6 +6067,27 @@ def _(state: CodegenState) -> ast.AST:
         )
         _atom_name = setup["atom"]
         _div_name = setup["div"]
+        _row = setup["row"]
+
+        if _expl_tail:
+            # Explicit-tile column tail: use guarded scalar loads to avoid reading
+            # past the tensor allocation. Element j of this thread is column
+            # ``chunk_idx * vec_width + j``; load from the row buffer only when
+            # in range, otherwise write the zero identity into r_var.
+            _n_expr = state.sympy_expr(env.block_sizes[col_block_id].numel)
+            _zero = f"{dtype_str}(0)"
+            for _j in range(vec_width):
+                _colj = f"(({chunk_idx}) * {vec_width}) + {_j}"
+                state.add_statement(
+                    statement_from_string(
+                        f"if ({_colj}) < ({_n_expr}):\n"
+                        f"    fx.memref_store(fx.memref_load({_row}, {_colj}), {r_var}, {_j})\n"
+                        f"else:\n"
+                        f"    fx.memref_store({_zero}, {r_var}, {_j})"
+                    )
+                )
+            return expr_from_string(f"fx.memref_load_vec({r_var})")
+
         state.add_statement(
             statement_from_string(
                 f"fx.copy_atom_call({_atom_name}, fx.slice({_div_name}, (None, {chunk_idx})), {r_var})"

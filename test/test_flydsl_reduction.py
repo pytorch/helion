@@ -260,6 +260,15 @@ class TestFlydslReduction(TestCase):
         _, out = code_and_output(tiled_sum, (x,), block_sizes=[1, 256])
         torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-2, atol=1e-1)
 
+    def test_explicit_tile_reduction_tail(self) -> None:
+        # Explicit hl.tile(n) reduction with a tail (N % inner-tile != 0): the
+        # per-element column mask on the load must drop out-of-range columns so
+        # the reduction does not sum neighbour-row data.
+        for n in (300, 700, 1000):
+            x = torch.randn(8, n, device=DEVICE, dtype=torch.float32)
+            _, out = code_and_output(tiled_sum, (x,), block_sizes=[1, 256])
+            torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-3, atol=1e-3)
+
     def test_min_reduction(self) -> None:
         # Whole-row min fold (reduce_ops "min"; sum/max already covered).
         x = torch.randn(8, 4096, device=DEVICE, dtype=torch.float16)
@@ -287,14 +296,16 @@ class TestFlydslReduction(TestCase):
             out.float(), ref_rms(x, w).float(), rtol=1e-2, atol=1e-2
         )
 
-    def test_autotune_rejects_explicit_tile_reduction(self) -> None:
-        # autotune() on a kernel with an explicit hl.tile(n) inner reduction must
-        # raise BackendUnsupported immediately (before touching the GPU), so we
-        # never get faults or silent wrong answers.
-        x = torch.randn(8, 1024, device=DEVICE, dtype=torch.float16)
+    def test_autotune_explicit_tile_reduction(self) -> None:
+        # autotune() on a kernel with an explicit hl.tile(n) inner reduction now
+        # returns a valid, correct config (per-element tail masking + guarded
+        # stores make it safe; it previously raised BackendUnsupported).
+        x = torch.randn(8, 500, device=DEVICE, dtype=torch.float32)
         bk = tiled_sum.bind((x,))
-        with pytest.raises(helion.exc.BackendUnsupported):
-            bk.autotune((x,), force=True)
+        cfg = bk.autotune((x,), force=True)
+        self.assertIn("block_sizes", cfg.config)
+        out = bk.compile_config(cfg)(x)
+        torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
