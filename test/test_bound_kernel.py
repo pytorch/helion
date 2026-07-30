@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from typing import Any
 import unittest
 
 import torch
@@ -19,6 +20,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessPallas
 import helion.language as hl
 
 _FREE = helion.OutputCodeOptions(allow_helion_deps=False)
@@ -123,6 +125,25 @@ def _run_add_no_helion(code: str, entrypoint: str, shape: tuple[int, int]) -> No
             )
 
 
+def _import_code(code: str, name: str, tmp: str) -> Any:
+    """Import generated standalone source as a module (registered in
+    ``sys.modules`` before ``exec_module`` so any inlined ``@dataclass`` can
+    resolve ``cls.__module__``)."""
+    import importlib.util
+
+    path = _write(tmp, code)
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return mod
+
+
 @onlyBackends(["triton"])
 @skipIfRefEager("to_code compiles real Triton code; not meaningful in ref-eager")
 class TestToCodeTriton(TestCase):
@@ -203,6 +224,81 @@ class TestToCodeTriton(TestCase):
         y = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
         code = get_num_sm.bind((x, y)).to_code(options=_FREE)
         _run_add_no_helion(code, "get_num_sm", (128, 128))
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[8]), static_shapes=False, backend="pallas"
+)
+def pallas_rows_times_two(x: torch.Tensor) -> torch.Tensor:
+    """static_shapes=False Pallas (torch-tensor): the standalone must run at any
+    leading dim (grid + output shape derived from the runtime input)."""
+    n, _d = x.shape
+    out = torch.empty_like(x)
+    for tile in hl.tile(n):
+        out[tile, :] = x[tile, :] * 2.0
+    return out
+
+
+def _pallas_to_code(
+    kernel: Any, args: tuple[object, ...], options: helion.OutputCodeOptions
+) -> str:
+    """``to_code`` with an explicit config. These kernels are never run/autotuned in
+    the test, so ``to_code(config=None)`` has no implicit config to resolve; use the
+    kernel's own config when it declares one, else the backend default."""
+    bound = kernel.bind(args)
+    configs = bound.kernel.configs
+    config = configs[0] if len(configs) == 1 else bound.config_spec.default_config()
+    return bound.to_code(config, options=options)
+
+
+@skipUnlessPallas("Pallas to_code test requires the Pallas backend / TPU")
+@skipIfRefEager("to_code compiles real kernels; not meaningful in ref-eager")
+class TestToCodePallas(TestCase):
+    def test_pallas_torch_standalone_runs(self) -> None:
+        x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_add, (x, y), _FREE)
+        # The helion package is never imported; the dependency-free Pallas launcher
+        # is inlined into a local ``helion.runtime`` shim instead.
+        self.assertNotIn("import helion", code)
+        self.assertNotIn("from helion", code)
+        self.assertIn("def default_pallas_launcher(", code)
+        self.assertIn(
+            "_default_pallas_launcher = helion.runtime.default_pallas_launcher", code
+        )
+        self.assertIn("def pallas_add(", code)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "pallas_add_standalone_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                torch.testing.assert_close(mod.pallas_add(x, y), x + y)
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_torch_dynamic_shapes(self) -> None:
+        """A static_shapes=False Pallas (torch) standalone runs at other shapes."""
+        d = 128
+        x0 = torch.zeros(512, d, device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_rows_times_two, (x0,), _FREE)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "pallas_rt2_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                for t in (512, 128, 256):
+                    x = torch.randn(t, d, device=DEVICE, dtype=torch.float32)
+                    out = mod.pallas_rows_times_two(x)
+                    self.assertEqual(tuple(out.shape), (t, d))
+                    torch.testing.assert_close(out, x * 2.0)
+            finally:
+                sys.modules.pop(name, None)
 
 
 if __name__ == "__main__":

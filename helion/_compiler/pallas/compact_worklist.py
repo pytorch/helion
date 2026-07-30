@@ -703,7 +703,6 @@ def render_build_worklist(
     lines = [
         f"def {builder_name}({', '.join(offset_params)}):",
         "    import jax.numpy as jnp",
-        "    from helion.runtime.compact_worklist import flatten_worklist",
         f"    {owner_array} = jnp.arange({num_owners_expr}, dtype=jnp.int32)",
         f"    base = {base_src}",
         f"    length = {length_src}",

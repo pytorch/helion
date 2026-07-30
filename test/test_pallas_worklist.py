@@ -749,7 +749,10 @@ class TestWorklistRender(unittest.TestCase):
         src, offset_params = render_build_worklist(
             plan, block_expr=str(self.BLOCK), upper_expr=str(upper)
         )
-        namespace: dict = {}
+        # The rendered builder now calls a module-level ``flatten_worklist``
+        # (provided by the backend's embedded-helper inlining in real generated
+        # modules) rather than importing it inline, so supply it here.
+        namespace: dict = {"flatten_worklist": flatten_worklist}
         exec(compile(src, "<build_worklist>", "exec"), namespace)
         builder = namespace["_build_worklist"]
         return src, offset_params, builder(*offset_arrays)
@@ -881,7 +884,10 @@ class TestBuilderDistinctTensors(unittest.TestCase):
         self.assertEqual(offset_params, ["lo", "hi"])
         self.assertIn("jnp.arange(lo.shape[0]", src)
 
-        namespace: dict = {}
+        # The rendered builder now calls a module-level ``flatten_worklist``
+        # (supplied by the backend's embedded-helper inlining in real modules)
+        # rather than importing it inline, so provide it here.
+        namespace: dict = {"flatten_worklist": flatten_worklist}
         exec(compile(src, "<bw>", "exec"), namespace)
         meta = namespace["_build_worklist"](
             jnp.asarray(lo.numpy()), jnp.asarray(hi.numpy())
@@ -1064,6 +1070,22 @@ class TestWorklistConfig(unittest.TestCase):
         # builder kwargs; there is no separate launcher name.
         self.assertIn("_compact_build_worklist=_build_worklist", code)
         self.assertIn("def _build_worklist(", code)
+        # Regular output imports ``flatten_worklist`` from helion (the builder calls
+        # it as a module-level name); the dependency-free path embeds it instead.
+        self.assertIn(
+            "from helion.runtime.compact_worklist import flatten_worklist", code
+        )
+        ast.parse(code)
+        # Dependency-free output embeds the helper source at module scope (no helion
+        # import), so the standalone is self-contained, and it still parses.
+        free = bound.to_code(
+            _worklist_config([8]),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+        self.assertIn("def flatten_worklist(", free)
+        self.assertNotIn("from helion.runtime.compact_worklist import", free)
+        self.assertNotIn("import helion", free)
+        ast.parse(free)
         # Offsets arg index is non-empty (q_offsets feeds the builder).
         self.assertRegex(code, r"_compact_offset_arg_indices=\[\d")
         self.assertIn("_compact_num_scalar_prefetch=3", code)
