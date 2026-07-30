@@ -187,7 +187,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
         best = self.best
         self.log("=" * 70)
-        self.log(f"✓ Best configuration: {best.perf:.4f} ms")
+        self.log(f"✓ Best configuration: {self.format_performance(best.perf)}")
         self.log(f"Total evaluations: {len(self.all_observations)}")
         self.log("=" * 70)
 
@@ -235,7 +235,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         surrogate_status = "SURROGATE" if use_surrogate else "STANDARD"
         self.log(
             f"Gen {generation}: {surrogate_status} | "
-            f"best={best_perf:.4f} ms | replaced={replacements}/{self.population_size} | "
+            f"best={self.format_performance(best_perf)} | "
+            f"replaced={replacements}/{self.population_size} | "
             f"total_evals={len(self.all_observations)}"
         )
 
