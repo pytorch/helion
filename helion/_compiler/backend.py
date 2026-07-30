@@ -79,6 +79,42 @@ class AttentionSoftmaxPattern(NamedTuple):
         return self.score_plan.is_causal
 
 
+@dataclasses.dataclass(frozen=True)
+class LauncherInfo:
+    """Per-backend info for inlining the dependency-free launcher as a local
+    ``helion.runtime`` shim (see :mod:`helion.runtime.precompile`), used by
+    ``BoundKernel.to_code(options=OutputCodeOptions(allow_helion_deps=False))``."""
+
+    launcher_module: str  # dotted path of the dep-free launcher, inlined verbatim
+    launcher_symbol: str  # public launcher name that module defines
+    launcher_alias: str  # underscore alias generated code binds it to
+    deps: str  # runtime deps, for the header comment
+    # ``helion.runtime.<fn>`` runtime helpers the generated host wrapper calls
+    # (besides the launcher); the shim re-exports these so the body runs verbatim.
+    runtime_helper_names: tuple[str, ...] = ()
+
+
+def read_launcher_source(module_name: str) -> str:
+    """Raw source of a dependency-free launcher module."""
+    import importlib
+    from pathlib import Path
+
+    module = importlib.import_module(module_name)
+    assert module.__file__ is not None
+    return Path(module.__file__).read_text()
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    """De-duplicate ``items`` keeping first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -702,6 +738,29 @@ class Backend(abc.ABC):
         values are the corresponding import statements.
         """
         ...
+
+    def embedded_helper_source(self, body: str) -> str:
+        """Source of in-kernel runtime helpers to inline into the generated module.
+
+        Backends that call a helion-defined helper from inside the generated
+        kernel can return its source here (instead of importing it) so the output
+        is self-contained -- which lets the precompiler produce a helion-free
+        standalone. Only helpers actually referenced in ``body`` should be
+        emitted. Injected between the imports and the kernel body. Default: none.
+        """
+        return ""
+
+    @property
+    def dependency_free_launcher_info(self) -> LauncherInfo:
+        """Info for inlining this backend's dependency-free launcher as a local
+        ``helion.runtime`` shim, used by
+        ``to_code(options=OutputCodeOptions(allow_helion_deps=False))``. Backends
+        that cannot yet emit a helion-free module raise ``NotImplementedError``.
+        """
+        raise NotImplementedError(
+            f"the {self.name!r} backend does not support "
+            "to_code(allow_helion_deps=False) yet"
+        )
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []

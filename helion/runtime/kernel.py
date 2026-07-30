@@ -207,6 +207,22 @@ def _device_specialization_key(
     return device.type, target_device_capability(device)
 
 
+@dataclasses.dataclass
+class OutputCodeOptions:
+    """Options for :meth:`BoundKernel.to_code`.
+
+    Passing ``options=None`` (the default) keeps ``to_code``'s original behavior.
+
+    Attributes:
+        allow_helion_deps: When ``False``, emit a self-contained module that does
+            not import ``helion`` at runtime -- the dependency-free launcher is
+            inlined (and any in-kernel runtime helpers are embedded) so the only
+            deps are ``torch`` + the backend DSL.
+    """
+
+    allow_helion_deps: bool = True
+
+
 class Kernel(Generic[_R]):
     def __init__(
         self,
@@ -1095,6 +1111,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self,
         config: ConfigLike | None = None,
         *,
+        options: OutputCodeOptions | None = None,
         emit_repro_caller: bool = False,
         output_origin_lines: bool | None = None,
     ) -> str:
@@ -1103,6 +1120,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Args:
             config: The configuration to use for code generation.
+            options: Optional :class:`~helion.runtime.precompile.OutputCodeOptions`.
+                With ``allow_helion_deps=False`` the returned module is
+                self-contained (no ``helion`` import at runtime); ``jax_fn=True``
+                (Pallas only) emits a pure-JAX module operating on ``jax.Array``s.
+                ``None`` keeps the default behavior.
             emit_repro_caller: Emits a main function to call the kernel with example inputs.
 
         Returns:
@@ -1141,8 +1163,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     body_start = len(root.body)
                 body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
                 ast.fix_missing_locations(body_root)
-                imports = "\n".join(import_lines)
+                if options is not None and not options.allow_helion_deps:
+                    # Optional AST step: rewrite body_root (+ import_lines) into a
+                    # self-contained, helion-free module before it is unparsed.
+                    from .._compiler.output_code_utils import build_dependency_free_code
+
+                    body_root = build_dependency_free_code(
+                        self, options, import_lines, body_root
+                    )
                 body = unparse(body_root, output_origin_lines=output_origin_lines)
+                imports = "\n".join(import_lines)
                 if imports:
                     return f"from __future__ import annotations\n\n{imports}\n\n{body}"
                 return f"from __future__ import annotations\n\n{body}"
