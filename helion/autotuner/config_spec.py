@@ -639,7 +639,7 @@ class ConfigSpec:
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
-        # CuTe flash-attention autotune surface gating (Tasks #25 + #28).
+        # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
         # and behavior is byte-identical to the env-only path. Set True when the
         # flash detector fires (see ``lower_to_device_ir``). The shape needed to
@@ -653,9 +653,13 @@ class ConfigSpec:
         self._cute_flash_requires_ws_overlap: bool = False
         self._cute_flash_small_biased_candidate: bool = False
         self._cute_flash_standard_dense_output: bool = False
+        self._cute_flash_standard_causal_output: bool = False
         self._cute_flash_block_size_targets: dict[int, int] = {}
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
+        # Compiler paths can opt their seeds into a single bounded timeout
+        # retry. ``None`` leaves all benchmark behavior unchanged.
+        self.compiler_seed_timeout_retry_repetitions: int | None = None
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
         # The Stage-1 categorizing product the reduction seed + allocator consume.
@@ -1160,6 +1164,7 @@ class ConfigSpec:
         requires_ws_overlap: bool = False,
         small_biased_candidate: bool = False,
         standard_dense_output: bool = False,
+        standard_causal_output: bool = False,
     ) -> None:
         self.cute_flash_search_enabled = True
         self._cute_flash_head_dim = head_dim
@@ -1170,6 +1175,7 @@ class ConfigSpec:
         self._cute_flash_requires_ws_overlap = requires_ws_overlap
         self._cute_flash_small_biased_candidate = small_biased_candidate
         self._cute_flash_standard_dense_output = standard_dense_output
+        self._cute_flash_standard_causal_output = standard_causal_output
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -1384,6 +1390,8 @@ class ConfigSpec:
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
+                    standard_dense_output=self._cute_flash_standard_dense_output,
+                    standard_causal_output=self._cute_flash_standard_causal_output,
                     block_size_targets=self._cute_flash_block_size_target_list(),
                 )
             )
@@ -2234,9 +2242,32 @@ class ConfigSpec:
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
+        effective_overrides = overrides
+        family_override: str | None = None
+        if self.cute_flash_search_enabled and overrides:
+            exact_family = overrides.get(FLASH_PIPELINE_FAMILY_KEY)
+            if _flash_pipeline_family_flags(exact_family) is not None:
+                family_override = cast("str", exact_family)
+            elif FLASH_PIPELINE_FAMILY_KEY not in overrides:
+                legacy = {
+                    key: overrides[key]
+                    for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
+                    if overrides.get(key) is not None
+                }
+                if legacy:
+                    if FLASH_PERSISTENT_KEY in overrides:
+                        legacy[FLASH_PERSISTENT_KEY] = overrides[FLASH_PERSISTENT_KEY]
+                    family_override = self._resolve_cute_flash_config(
+                        legacy
+                    ).pipeline_family
+                    effective_overrides = {
+                        **overrides,
+                        FLASH_PIPELINE_FAMILY_KEY: family_override,
+                    }
         return ConfigGeneration(
             self,
-            overrides=overrides,
+            overrides=effective_overrides,
+            _flash_pipeline_family_override=family_override,
             advanced_controls_files=advanced_controls_files,
             process_group_name=process_group_name,
         )
@@ -2306,6 +2337,12 @@ class ConfigSpec:
     def _flat_fields(
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        return self._flat_fields_with_flash_family()
+
+    def _flat_fields_with_flash_family(
+        self,
+        _flash_pipeline_family_override: str | None = None,
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
         """Return {key: field} for all tunable fields in flat_config() order.
 
         This is the single source of truth for field ordering.
@@ -2333,6 +2370,7 @@ class ConfigSpec:
                             self._cute_flash_small_biased_candidate
                         ),
                         standard_dense_output=self._cute_flash_standard_dense_output,
+                        pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )
             elif self.supports_config_key("num_threads"):
@@ -2520,16 +2558,29 @@ class ConfigSpec:
         return EnumFragment(tuple(files))
 
     def flat_key_layout(
-        self, *, advanced_controls_files: list[str] | None = None
+        self,
+        *,
+        advanced_controls_files: list[str] | None = None,
     ) -> list[tuple[str, int, bool]]:
         """Return (key_name, num_flat_entries, is_sequence) for each field.
 
         is_sequence is True for BlockIdSequence keys whose list values
         are spread across individual flat slots.
         """
-        result = [
-            (key, *field._flat_key_info()) for key, field in self._flat_fields().items()
-        ]
+        fields = self._flat_fields()
+        result = [(key, *field._flat_key_info()) for key, field in fields.items()]
+        if self._advanced_controls_file_fragment(advanced_controls_files) is not None:
+            result.append(("advanced_controls_file", 1, False))
+        return result
+
+    def _flat_key_layout_with_flash_family(
+        self,
+        *,
+        advanced_controls_files: list[str] | None,
+        flash_pipeline_family: str,
+    ) -> list[tuple[str, int, bool]]:
+        fields = self._flat_fields_with_flash_family(flash_pipeline_family)
+        result = [(key, *field._flat_key_info()) for key, field in fields.items()]
         if self._advanced_controls_file_fragment(advanced_controls_files) is not None:
             result.append(("advanced_controls_file", 1, False))
         return result
@@ -2541,8 +2592,34 @@ class ConfigSpec:
         advanced_controls_files: list[str] | None = None,
     ) -> helion.Config:
         """Map a flattened version of the config using the given function."""
+        return self._flat_config_from_fields(
+            fn,
+            self._flat_fields(),
+            advanced_controls_files=advanced_controls_files,
+        )
+
+    def _flat_config_with_flash_family(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None,
+        flash_pipeline_family: str,
+    ) -> helion.Config:
+        return self._flat_config_from_fields(
+            fn,
+            self._flat_fields_with_flash_family(flash_pipeline_family),
+            advanced_controls_files=advanced_controls_files,
+        )
+
+    def _flat_config_from_fields(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        fields: Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment],
+        *,
+        advanced_controls_files: list[str] | None,
+    ) -> helion.Config:
         config: dict[str, Any] = {}
-        for key, field in self._flat_fields().items():
+        for key, field in fields.items():
             config[key] = field._flat_config(self, fn)
 
         for name in (

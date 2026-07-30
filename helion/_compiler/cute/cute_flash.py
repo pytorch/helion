@@ -822,28 +822,50 @@ def flash_attention_graph_standard_dense_output_from_graphs(
     kv_block_id: int | None = None,
     score_plan: AttentionScorePlan,
 ) -> bool:
-    """Detector-time mirror of the codegen ``standard_dense_output`` gate.
-
-    ``resolve_flash_config`` uses this flag to decide whether the manual
-    degree-1 exp2 packets are selectable, so config normalization has to reach
-    the same answer as codegen or it would project a requested ``deg1_*`` packet
-    back onto the generic default.
-    """
+    """Return whether the graph has canonical dense output-only semantics."""
     graph_plan = _flash_graph_output_plan_from_graphs(
         graphs,
         root_block_ids=root_block_ids,
         kv_block_id=kv_block_id,
         score_plan=score_plan,
     )
-    if graph_plan is None:
-        return False
-    return (
-        not score_plan.is_causal
+    return bool(
+        graph_plan is not None
         and graph_plan.lse_name is None
         and not graph_plan.bias_names
         and not graph_plan.alibi_names
         and not graph_plan.document_names
         and _standard_dense_score_plan_supported(score_plan)
+    )
+
+
+def flash_attention_graph_standard_causal_output_from_graphs(
+    graphs: Iterable[GraphInfo],
+    *,
+    root_block_ids: Sequence[int] | None = None,
+    kv_block_id: int | None = None,
+    score_plan: AttentionScorePlan,
+) -> bool:
+    """Return whether the graph has canonical causal output-only semantics."""
+    graph_plan = _flash_graph_output_plan_from_graphs(
+        graphs,
+        root_block_ids=root_block_ids,
+        kv_block_id=kv_block_id,
+        score_plan=score_plan,
+    )
+    return bool(
+        graph_plan is not None
+        and graph_plan.lse_name is None
+        and not graph_plan.bias_names
+        and not graph_plan.alibi_names
+        and not graph_plan.document_names
+        and score_plan.modifier_kinds == (CAUSAL_MASK_KIND,)
+        and math.isclose(
+            score_plan.qk_scale_log2,
+            math.log2(math.e) / math.sqrt(score_plan.head_dim),
+            rel_tol=1e-8,
+            abs_tol=1e-8,
+        )
     )
 
 
@@ -1143,7 +1165,7 @@ class FlashAttentionConfig:
     precompute_qk_desc: bool = False
     # Initial TMA prologue order for the FA4 load warp. 0 preserves Helion's
     # original Q0/K/Q1/V order; 4 keeps the measured K/Q0/Q1/V variant for
-    # long-shape seeds. The remaining values are manual/autotune experiments.
+    # long-shape seeds. The remaining values are available as manual overrides.
     first_load_order: int = 0
     # KV traversal order for FA4. Upstream FA4 walks dense non-causal KV blocks
     # from the end toward the beginning; Helion's original path was ascending.
@@ -1191,7 +1213,7 @@ class FlashAttentionConfig:
     skip_rescale_stats: bool = False
     # TMEM O-rescale chunk width. hd64 defaults to 32 cols because 64 cols pushes
     # some FA4 attention shapes over the ptxas register target, but manual
-    # experiments can opt into 64 cols to test reduced loop/address overhead.
+    # Manual configurations can opt into 64 columns.
     rescale_chunk_cols: int = 0
     # FA4 setmaxregister budgets for softmax and correction warpgroups. Softmax
     # regs are part of the characterized autotune surface; correction regs stay
@@ -1281,6 +1303,7 @@ def _flash_causal_hd64_seed_num_kv_supported(num_kv: int | None) -> bool:
 
 
 _FLASH_CAUSAL_HD64_LONG_AUTOTUNE_MIN_KV = 4096
+_FLASH_CAUSAL_HD64_HYBRID_SEED_MIN_KV = 512
 
 
 def _flash_causal_hd64_seed_params(num_kv: int) -> tuple[int, int, int, int]:
@@ -1395,6 +1418,11 @@ _FLASH_DEG1_EXP2_PACKETS = frozenset(
 )
 _FLASH_DEG1_EXP2_OFFSET = 0
 _FLASH_DEG1_EXP2_OFFSET0 = 10
+# Dense hd64 two-CTA uses fixed per-CTA resources, so sequence length does not
+# impose an upper bound.  The degree-1 packets require at least this many
+# aligned KV tiles to stay within their validated numerical envelope.
+_FLASH_DENSE_HD64_2CTA_MIN_KV = 256
+_FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV = 2048
 _FLASH_MANUAL_EXP2_PACKET_PARAMS: dict[str, tuple[int, int]] = {
     _FLASH_DEG2_EXP2_PACKET: (8, 3),
     _FLASH_HYBRID_EXP2_PACKET: (8, 4),
@@ -1407,6 +1435,11 @@ _FLASH_MANUAL_EXP2_PACKET_SCHEDULES: dict[str, tuple[int, int]] = {
     _FLASH_DEG1_EXP2_PACKET: (16, 8),
     _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET: (8, 2),
 }
+
+
+def _flash_dense_hd64_2cta_num_kv_supported(num_kv: int) -> bool:
+    """Return whether ``num_kv`` is in the aligned dense hd64 2CTA envelope."""
+    return num_kv >= _FLASH_DENSE_HD64_2CTA_MIN_KV and num_kv % 4 == 0
 
 
 class _FlashDiscExp2CodegenParams(NamedTuple):
@@ -2330,8 +2363,7 @@ def resolve_flash_config(
     )
     if separate_kv_rings:
         # The one-CTA family isolates K/V depth. The causal cluster family may
-        # compose the already-validated TMA epilogue after its no-epilogue
-        # attribution run.
+        # compose the already-validated TMA epilogue.
         use_2cta_instrs = causal_two_cta
         use_cga2_local_cta = False
         use_clc_scheduler = False
@@ -2348,11 +2380,11 @@ def resolve_flash_config(
             epi_stg_gmem = "stage"
         kv_stage = min(max(kv_stage, 2), _flash_deep_1cta_kv_stage_cap(head_dim))
     dense_degree1_packet = (
-        _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
-        if 256 <= num_kv < 2048
+        None
+        if not _flash_dense_hd64_2cta_num_kv_supported(num_kv)
+        else _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+        if num_kv < _FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV
         else _FLASH_DEG1_EXP2_PACKET
-        if num_kv == 2048
-        else None
     )
     dense_degree1_eligible = (
         standard_dense_output
@@ -2579,7 +2611,7 @@ def resolve_flash_config(
 
 
 # ---------------------------------------------------------------------------
-# Autotune surface for the flash-attention config (Tasks #25 + #28).
+# Autotune surface for the flash-attention config.
 #
 # Mirrors the ``Tcgen05WarpSpec`` pattern in ``strategies.py`` /
 # ``tcgen05_config.py``. Independent arithmetic fields retain individual keys;
@@ -2784,11 +2816,6 @@ _FLASH_DENSE_HD64_MID_MIN_KV = 16
 _FLASH_DENSE_HD64_LONG_MIN_KV = 64
 _FLASH_DENSE_HD64_VERY_LONG_MIN_KV = 256
 _FLASH_RESCALE_THRESHOLD_VALUES = (0.0, 4.0, 8.0, 12.0, 16.0, 32.0)
-
-
-def _flash_dense_hd64_2cta_num_kv_supported(num_kv: int) -> bool:
-    """Return whether dense hd64 two-CTA supports the bounded long-sequence range."""
-    return 256 <= num_kv <= 2048 and num_kv % 4 == 0
 
 
 def _flash_safe_rescale_threshold_values(dtype: torch.dtype) -> tuple[float, ...]:
@@ -3043,7 +3070,7 @@ def flash_attention_value_prior_weights(
         }
         if pipeline_family != "fa4":
             pipeline_family_priors["fa4"] = 1.0
-        if num_kv in (512, 2048) and dtype is torch.float16:
+        if _flash_dense_hd64_2cta_num_kv_supported(num_kv) and dtype is torch.float16:
             pipeline_family_priors["fa4_2cta"] = 4.0
         very_long_dense_hd64_fa4 = num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
         priors = cast(
@@ -3334,6 +3361,7 @@ def _flash_seed_fragments(
     has_kv_tile_pruning: bool,
     requires_ws_overlap: bool,
     small_biased_candidate: bool,
+    standard_dense_output: bool = False,
     topology_override: str | None,
 ) -> dict[str, ConfigSpecFragment]:
     return flash_autotune_fragments(
@@ -3344,6 +3372,7 @@ def _flash_seed_fragments(
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
         topology_override=topology_override,
     )
 
@@ -3479,6 +3508,66 @@ def _flash_default_seed_config(
     return Config.from_dict(seed)
 
 
+def _flash_dense_degree1_seed_config(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    block_size_targets: Sequence[int],
+) -> Config | None:
+    """Return a general dense degree-1 seed from ``fa4_2cta`` defaults."""
+    if (
+        not standard_dense_output
+        or is_causal
+        or dtype is not torch.float16
+        or head_dim != 64
+        or has_kv_tile_pruning
+        or requires_ws_overlap
+        or small_biased_candidate
+        or not _flash_dense_hd64_2cta_num_kv_supported(num_kv)
+    ):
+        return None
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return None
+
+    fragments = flash_autotune_fragments(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        pipeline_family_override="fa4_2cta",
+    )
+    values = {key: fragment.default() for key, fragment in fragments.items()}
+    packet_values: dict[str, object]
+    if num_kv < _FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV:
+        packet_values = {
+            FLASH_EXP2_PACKET_KEY: _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
+            FLASH_E2E_SCHEDULE_KEY: "8/2",
+        }
+    else:
+        packet_values = {
+            FLASH_EXP2_PACKET_KEY: _FLASH_DEG1_EXP2_PACKET,
+            FLASH_E2E_SCHEDULE_KEY: "16/8",
+            FLASH_E2E_OFFSET_KEY: _FLASH_DEG1_EXP2_OFFSET,
+            FLASH_E2E_OFFSET0_KEY: _FLASH_DEG1_EXP2_OFFSET0,
+            FLASH_KV_STAGE_KEY: 2,
+        }
+    packet_values[FLASH_PIPELINE_FAMILY_KEY] = "fa4_2cta"
+    if not _flash_seed_set_all(values, fragments, packet_values):
+        return None
+    return Config.from_dict({"block_sizes": block_sizes, **values})
+
+
 def _flash_dense_sp_seed_config(
     head_dim: int,
     num_kv: int,
@@ -3490,7 +3579,7 @@ def _flash_dense_sp_seed_config(
     small_biased_candidate: bool,
     block_size_targets: Sequence[int],
 ) -> Config | None:
-    # This is a manual experiment seed for the resident softmax variant. It is
+    # This is an explicit seed for the resident softmax variant. It is
     # intentionally not emitted by flash_attention_seed_configs() until that
     # family is faster and stable enough for automatic autotune exploration.
     if (
@@ -3672,6 +3761,7 @@ def _flash_causal_split_seed_config(
         softmax_regs,
         lpt_swizzle,
     ) = _flash_causal_hd64_seed_params(num_kv)
+    use_long_causal_schedule = num_kv >= 512
     split_masked_schedule = "16/4"
     split_lpt_swizzle = 8 if num_kv <= 128 else lpt_swizzle
     split_disc_pipe = 2 if num_kv <= 128 else 4
@@ -3699,6 +3789,97 @@ def _flash_causal_split_seed_config(
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: split_lpt_swizzle,
         FLASH_CAUSAL_KV_ORDER_KEY: _flash_causal_hd64_seed_kv_order(num_kv),
         FLASH_SOFTMAX_REGS_KEY: softmax_regs,
+    }
+    if use_long_causal_schedule:
+        family_values.update(
+            {
+                FLASH_E2E_SCHEDULE_KEY: "16/4",
+                FLASH_MASKED_E2E_SCHEDULE_KEY: "8/2",
+                FLASH_E2E_OFFSET_KEY: 0,
+                FLASH_E2E_OFFSET0_KEY: 14,
+                FLASH_DISC_PIPE_KEY: 3,
+                FLASH_EXP2_PACKET_KEY: "4x1",
+                FLASH_WAIT_HINT_KEY: 0,
+                FLASH_EPI_TMA_KEY: False,
+                FLASH_EPI_STG_KEY: True,
+                FLASH_EPI_STG_GMEM_KEY: "pair",
+                FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+                FLASH_ROLE_MAP_KEY: "fa4",
+            }
+        )
+    if not _flash_seed_set_all(seed, fragments, family_values):
+        return None
+    return Config.from_dict(seed)
+
+
+def _flash_causal_hybrid_seed_config(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_causal_output: bool,
+    block_size_targets: Sequence[int],
+) -> Config | None:
+    """Return the long-causal hybrid-exp2 compiler seed.
+
+    The hybrid packet uses degree 1 only in the unmasked suffix; diagonal tiles
+    retain degree 2. It remains a compiler seed because manual packet modes are
+    accepted by the fragments but excluded from random search.
+    """
+    if (
+        not is_causal
+        or head_dim != 64
+        or dtype is not torch.float16
+        or has_kv_tile_pruning
+        or requires_ws_overlap
+        or small_biased_candidate
+        or not standard_causal_output
+        or num_kv < _FLASH_CAUSAL_HD64_HYBRID_SEED_MIN_KV
+        or not _flash_causal_hd64_seed_num_kv_supported(num_kv)
+    ):
+        return None
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return None
+
+    fragments = _flash_seed_fragments(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        topology_override="fa4",
+    )
+    seed: dict[str, object] = {"block_sizes": block_sizes}
+    family_values: dict[str, object] = {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_S_STAGE_KEY: 2,
+        FLASH_KV_STAGE_KEY: 2,
+        FLASH_PERSISTENT_KEY: False,
+        FLASH_E2E_SCHEDULE_KEY: "16/8",
+        FLASH_MASKED_E2E_SCHEDULE_KEY: "16/8",
+        FLASH_E2E_OFFSET_KEY: 0,
+        FLASH_E2E_OFFSET0_KEY: 10,
+        FLASH_DISC_PIPE_KEY: 3,
+        FLASH_EXP2_PACKET_KEY: _FLASH_HYBRID_EXP2_PACKET,
+        FLASH_WAIT_HINT_KEY: 10_000_000,
+        FLASH_EPI_TMA_KEY: False,
+        FLASH_EPI_STG_KEY: False,
+        FLASH_EPI_STG_GMEM_KEY: "stage",
+        FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+        FLASH_ROLE_MAP_KEY: "helion",
+        FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+        FLASH_PACKED_REDUCE_KEY: True,
+        FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
+        FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+        FLASH_SOFTMAX_REGS_KEY: _flash_causal_hd64_seed_params(num_kv)[2],
     }
     if not _flash_seed_set_all(seed, fragments, family_values):
         return None
@@ -3772,6 +3953,62 @@ def flash_attention_seed_config(
     raise AssertionError(f"unknown flash attention seed kind: {seed_kind!r}")
 
 
+def _flash_canonical_family_seed_configs(
+    head_dim: int,
+    num_kv: int | None,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    block_size_targets: Sequence[int],
+) -> tuple[Config, ...]:
+    """Return one dependency-consistent seed per legal pipeline family."""
+    if num_kv is None:
+        return ()
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return ()
+
+    fragments = flash_autotune_fragments(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+    )
+    family_fragment = fragments[FLASH_PIPELINE_FAMILY_KEY]
+    assert isinstance(family_fragment, EnumFragment)
+    families = (
+        family_fragment.choices
+        if family_fragment.search_choices is None
+        else family_fragment.search_choices
+    )
+    seeds: list[Config] = []
+    for family in families:
+        assert isinstance(family, str)
+        family_fragments = flash_autotune_fragments(
+            head_dim,
+            num_kv,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            standard_dense_output=standard_dense_output,
+            pipeline_family_override=family,
+        )
+        values = {key: fragment.default() for key, fragment in family_fragments.items()}
+        values[FLASH_PIPELINE_FAMILY_KEY] = family
+        seeds.append(Config.from_dict({"block_sizes": block_sizes, **values}))
+    return tuple(seeds)
+
+
 def flash_attention_seed_configs(
     head_dim: int,
     num_kv: int | None,
@@ -3781,6 +4018,8 @@ def flash_attention_seed_configs(
     has_kv_tile_pruning: bool = False,
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
+    standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
 ) -> tuple[Config, ...]:
     seeds: list[Config] = []
@@ -3796,6 +4035,20 @@ def flash_attention_seed_configs(
     )
     if default_seed is not None:
         seeds.append(default_seed)
+    if num_kv is not None:
+        dense_degree1_seed = _flash_dense_degree1_seed_config(
+            head_dim,
+            num_kv,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            standard_dense_output=standard_dense_output,
+            block_size_targets=block_size_targets,
+        )
+        if dense_degree1_seed is not None:
+            seeds.append(dense_degree1_seed)
     causal_lpt_seed = flash_attention_seed_config(
         head_dim,
         num_kv,
@@ -3822,6 +4075,33 @@ def flash_attention_seed_configs(
     )
     if causal_split_seed is not None:
         seeds.append(causal_split_seed)
+    if num_kv is not None:
+        causal_hybrid_seed = _flash_causal_hybrid_seed_config(
+            head_dim,
+            num_kv,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            standard_causal_output=standard_causal_output,
+            block_size_targets=block_size_targets,
+        )
+        if causal_hybrid_seed is not None:
+            seeds.append(causal_hybrid_seed)
+    for family_seed in _flash_canonical_family_seed_configs(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        block_size_targets=block_size_targets,
+    ):
+        if family_seed not in seeds:
+            seeds.append(family_seed)
     return tuple(seeds)
 
 
@@ -3847,7 +4127,7 @@ def flash_autotune_fragments(
       * ``s_stage`` — warp-spec double-buffered-S overlap (1 vs 2).
       * ``kv_stage`` — K/V TMA ring depth. Most flash kernels keep the validated
         2/3-stage envelope; dense hd64 FA4 additionally accepts sparse deeper
-        manual/cache-transfer values while actively searching only the stable
+        manual values while actively searching only the stable
         2/3-stage subset.
       * ``persistent`` — static-persistent scheduler on/off.
       * ``e2e_schedule`` — paired exp2-pipe-split schedule choices. This
@@ -3890,7 +4170,7 @@ def flash_autotune_fragments(
         compact set of batch/head interleave group sizes.
       * ``causal_kv_order`` — causal-only KV traversal order. The original
         Helion stream walks left-to-right; upstream FA4 walks diagonal-first and
-        then backward. Both orders remain accepted for manual/cache-transfer
+        then backward. Both orders remain accepted for fixed
         configs; causal hd64 actively searches the diagonal-first descending
         stream so split-loop candidates are meaningful rather than clamped away.
       * ``small_biased`` — enables the small contiguous biased-attention SIMT
@@ -4163,7 +4443,7 @@ def flash_autotune_fragments(
         )
     # fa4 disc PASS2 software-pipeline depth lever. The first choice is the
     # shape-resolved default; the remaining validated depths are accepted for
-    # autotune/cache transfer. They are consumed only by the fa4 emitter.
+    # fixed configurations. They are consumed only by the fa4 emitter.
     if dense_hd64_fa4 or causal_hd64_seeded_fa4:
         disc_pipe_choices = _flash_choices_with_default(
             defaults.disc_pipe_depth,
@@ -4564,7 +4844,7 @@ def flash_autotune_fragments(
         pipeline_family_search_choices: tuple[str, ...] | None = None
     else:
         pipeline_family_search: list[str] = ["fa4" if fa4_eligible else "ws_overlap"]
-        if not long_causal_hd64_seeded_fa4:
+        if pipeline_family_search[0] != "ws_overlap":
             pipeline_family_search.append("ws_overlap")
         if use_2cta_eligible:
             pipeline_family_search.append("fa4_2cta")

@@ -238,6 +238,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.config_spec = SimpleNamespace(
             default_config=lambda: helion.Config(block_sizes=[1]),
             cute_flash_search_enabled=False,
+            compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
                 should_deduplicate_generated_sources=lambda config_spec: False,
                 get_do_bench=lambda: None,
@@ -3803,7 +3804,7 @@ class TestCuteAutotuner(TestCase):
         torch.testing.assert_close(actual, args[0] @ args[1], atol=0.125, rtol=0.02)
 
     def test_cute_flash_search_surface(self) -> None:
-        """The flash-attention autotune surface (Tasks #25 + #28) appears only
+        """The flash-attention autotune surface appears only
         when the dense flash dataflow is detected.
 
         For an attention kernel bind ``cute_flash_search_enabled`` is True and
@@ -4451,7 +4452,7 @@ class TestCuteAutotuner(TestCase):
             FLASH_KV_STAGE_KEY: (2,),
             FLASH_E2E_SCHEDULE_KEY: ("8/2",),
             FLASH_MASKED_E2E_SCHEDULE_KEY: ("16/4",),
-            FLASH_PIPELINE_FAMILY_KEY: ("fa4",),
+            FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap"),
             FLASH_DISC_PIPE_KEY: (4,),
             FLASH_E2E_OFFSET_KEY: (9,),
             FLASH_E2E_OFFSET0_KEY: (3,),
@@ -5429,6 +5430,23 @@ class TestCuteAutotuner(TestCase):
         for key in FLASH_CONFIG_KEYS:
             self.assertNotIn(key, mm_keys)
 
+    def test_cute_flash_two_cta_uses_general_softmax_register_search(self) -> None:
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from helion._compiler.cute.cute_flash import flash_autotune_fragments
+
+        for num_kv in (512, 1536, 2048):
+            with self.subTest(num_kv=num_kv):
+                fragment = flash_autotune_fragments(
+                    64,
+                    num_kv,
+                    dtype=torch.float16,
+                    is_causal=False,
+                    standard_dense_output=True,
+                    pipeline_family_override="fa4_2cta",
+                )[FLASH_SOFTMAX_REGS_KEY]
+                self.assertEqual(set(fragment.search_choices or ()), {192, 200})
+                self.assertLessEqual({192, 200}, set(fragment.choices))
+
 
 @onlyBackends(["triton"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
@@ -6326,7 +6344,8 @@ class TestAutotuneBudget(TestCase):
         search.args = ()
         search.log = AutotuningLogger(settings)
         search.config_spec = SimpleNamespace(
-            default_config=lambda: helion.Config(block_sizes=[1])
+            default_config=lambda: helion.Config(block_sizes=[1]),
+            compiler_seed_timeout_retry_repetitions=None,
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
@@ -6595,6 +6614,41 @@ class TestAutotuneBudget(TestCase):
             search._autotune_budget_exceeded,
         )
 
+    def test_prepare_registers_normalized_compiler_seeds(self) -> None:
+        normalized = helion.Config(block_sizes=[64])
+
+        class RecordingProvider(LocalBenchmarkProvider):
+            def __init__(self, *, config_spec, **_kwargs) -> None:
+                self.config_spec = config_spec
+
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        config_gen = Mock()
+        config_gen.seed_flat_config_pairs.return_value = [([64], normalized)]
+        search.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=3,
+            create_config_generation=Mock(return_value=config_gen),
+        )
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search._benchmark_provider_cls = RecordingProvider
+        search._prepared = False
+
+        search._prepare()
+        normalized.config["block_sizes"][0] = 128
+
+        self.assertEqual(
+            search.benchmark_provider._compiler_seed_configs,
+            {helion.Config(block_sizes=[64])},
+        )
+        search.config_spec.create_config_generation.assert_called_once_with(
+            overrides=None,
+            advanced_controls_files=None,
+            process_group_name=None,
+        )
+
     def _make_stub_provider(self):
         """Construct a minimal ``LocalBenchmarkProvider`` for budget-loop
         tests without standing up a real kernel/config_spec.
@@ -6636,6 +6690,8 @@ class TestAutotuneBudget(TestCase):
         provider._precompile_tmpdir = None
         provider._effective_source_hashes = set()
         provider._effective_source_results = {}
+        provider._compiler_seed_configs = set()
+        provider._compiler_seed_source_hashes = set()
         return provider
 
     def test_cute_flash_benchmark_deduplicates_effective_sources(self) -> None:
@@ -6687,6 +6743,76 @@ class TestAutotuneBudget(TestCase):
         self.assertIsNot(repeated_results[0], results[0])
         self.assertEqual(provider._autotune_metrics.num_unique_sources, 2)
         self.assertEqual(provider._autotune_metrics.num_source_deduplications, 2)
+
+    def test_compiler_seed_alias_marks_source_for_timeout_retry(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=3,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        representative = helion.Config(block_sizes=[1])
+        compiler_seed_alias = helion.Config(block_sizes=[2])
+        provider.set_compiler_seed_configs([compiler_seed_alias])
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            return_value=1.0,
+        ) as benchmark:
+            results = provider.benchmark([representative, compiler_seed_alias])
+
+        self.assertEqual([result.perf for result in results], [1.0, 1.0])
+        benchmark.assert_called_once_with(
+            representative,
+            results[0].fn,
+            effective_source_hash="shared",
+        )
+
+    def test_compiler_seed_source_provenance_survives_batches(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=3,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        compiler_seed = helion.Config(block_sizes=[1])
+        later_alias = helion.Config(block_sizes=[2])
+        provider.set_compiler_seed_configs([compiler_seed])
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(math.inf, 1.0),
+        ) as benchmark:
+            first = provider.benchmark([compiler_seed])
+            second = provider.benchmark([later_alias])
+
+        self.assertEqual(first[0].perf, math.inf)
+        self.assertEqual(second[0].perf, 1.0)
+        self.assertEqual(
+            benchmark.call_args_list[1],
+            unittest.mock.call(
+                later_alias,
+                second[0].fn,
+                effective_source_hash="shared",
+            ),
+        )
+
+    def test_disabled_compiler_seed_retry_does_not_register_seeds(self) -> None:
+        provider = self._make_stub_provider()
+        seed = helion.Config(block_sizes=[1])
+
+        provider.set_compiler_seed_configs([seed])
+
+        self.assertFalse(provider._is_compiler_seed_config(seed))
+        self.assertEqual(provider._compiler_seed_configs, set())
 
     def test_backend_policy_can_disable_effective_source_dedup(self) -> None:
         provider = self._make_stub_provider()

@@ -90,6 +90,7 @@ def compiler_seed_configs(
     configs: list[Config] = []
     env.config_spec.autotuner_heuristics = []
     env.config_spec.compiler_default_config = None
+    env.config_spec.compiler_seed_timeout_retry_repetitions = None
     if env.settings.disable_autotuner_heuristics:
         return configs
 

@@ -505,6 +505,7 @@ def do_bench(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,
+    fixed_repetitions: int | None = None,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -522,6 +523,8 @@ def do_bench(
     :type quantiles: list[float], optional
     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
     :type return_mode: str
+    :param fixed_repetitions: Skip adaptive estimation and time exactly this many
+        calls after the initial setup call.
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
@@ -542,22 +545,29 @@ def do_bench(
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
 
-    # Estimate the runtime of the function
-    start_event = di.Event(enable_timing=True)
-    end_event = di.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5):
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
-        benchmark_function()
-    end_event.record()
-    di.synchronize()
-    estimate_ms = sync_object(
-        start_event.elapsed_time(end_event) / 5, process_group_name=process_group_name
-    )
+    if fixed_repetitions is None:
+        # Estimate the runtime of the function
+        start_event = di.Event(enable_timing=True)
+        end_event = di.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(5):
+            runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+            benchmark_function()
+        end_event.record()
+        di.synchronize()
+        estimate_ms = sync_object(
+            start_event.elapsed_time(end_event) / 5,
+            process_group_name=process_group_name,
+        )
 
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
+        # compute number of warmup and repeat
+        n_warmup = max(1, int(warmup / estimate_ms))
+        n_repeat = max(1, int(rep / estimate_ms))
+    else:
+        if fixed_repetitions < 1:
+            raise ValueError("fixed_repetitions must be at least 1")
+        n_warmup = 0
+        n_repeat = fixed_repetitions
     start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
@@ -593,9 +603,13 @@ def do_bench_generic(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
+    fixed_repetitions: int | None = None,
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
+
+    ``fixed_repetitions`` skips adaptive estimation and times exactly that many
+    calls after the initial setup call.
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
@@ -604,22 +618,28 @@ def do_bench_generic(
 
     clear_l2 = _make_l2_cache_clearer()
 
-    # Estimate the runtime of the function
-    synchronize_device()
-    start = time.perf_counter()
-    for _ in range(5):
-        clear_l2()
-        # Keep the latest asynchronous output alive through synchronization.
-        _output = fn()
-    synchronize_device()
-    end = time.perf_counter()
-    estimate_ms = sync_object(
-        (end - start) * 1000 / 5, process_group_name=process_group_name
-    )
+    if fixed_repetitions is None:
+        # Estimate the runtime of the function
+        synchronize_device()
+        start = time.perf_counter()
+        for _ in range(5):
+            clear_l2()
+            # Keep the latest asynchronous output alive through synchronization.
+            _output = fn()
+        synchronize_device()
+        end = time.perf_counter()
+        estimate_ms = sync_object(
+            (end - start) * 1000 / 5, process_group_name=process_group_name
+        )
 
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
+        # compute number of warmup and repeat
+        n_warmup = max(1, int(warmup / estimate_ms))
+        n_repeat = max(1, int(rep / estimate_ms))
+    else:
+        if fixed_repetitions < 1:
+            raise ValueError("fixed_repetitions must be at least 1")
+        n_warmup = 0
+        n_repeat = fixed_repetitions
     # Warm-up
     for _ in range(n_warmup):
         fn()

@@ -29,6 +29,7 @@ class BenchmarkJob:
     warmup: int = 1
     rep: int = 50
     use_wall_clock: bool = False
+    fixed_repetitions: int | None = None
 
     def __call__(self) -> float:
         # Subprocess inherits parent stderr; capture so Triton runtime
@@ -39,14 +40,25 @@ class BenchmarkJob:
                 args = load_trusted_kernel_args(self.args_path)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # return_mode="median" guarantees a float return.
-                return cast(
-                    "float",
-                    bench(
-                        functools.partial(fn, *args),
+                benchmark_fn = functools.partial(fn, *args)
+                if self.fixed_repetitions is None:
+                    result = bench(
+                        benchmark_fn,
                         return_mode="median",
                         warmup=self.warmup,
                         rep=self.rep,
-                    ),
+                    )
+                else:
+                    result = bench(
+                        benchmark_fn,
+                        return_mode="median",
+                        warmup=self.warmup,
+                        rep=self.rep,
+                        fixed_repetitions=self.fixed_repetitions,
+                    )
+                return cast(
+                    "float",
+                    result,
                 )
             finally:
                 _unload_compiled_fn(fn)

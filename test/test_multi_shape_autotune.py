@@ -471,6 +471,8 @@ class _FakeBoundKernel:
         accuracy_failure_indices: list[int] | None = None,
         compile_failure_indices: list[int] | None = None,
         worker_failure_indices: list[int] | None = None,
+        unique_sources: int = 0,
+        source_deduplications: int = 0,
     ) -> None:
         self.config_spec = config_spec
         self.settings = SimpleNamespace(
@@ -488,6 +490,8 @@ class _FakeBoundKernel:
         self.accuracy_failures = len(self.accuracy_failure_indices)
         self.compile_failures = len(self.compile_failure_indices)
         self.worker_failures = len(self.worker_failure_indices)
+        self.unique_sources = unique_sources
+        self.source_deduplications = source_deduplications
 
 
 class _FakeLocalBenchmarkProvider:
@@ -511,6 +515,7 @@ class _FakeLocalBenchmarkProvider:
         self._compile_failure_config_ids: list[int] = []
         self._worker_failure_config_ids: list[int] = []
         self.benchmark_calls: list[tuple[list[Config], str]] = []
+        self.compiler_seed_config_calls: list[list[Config]] = []
         self.setup_count = 0
         self.cleanup_count = 0
         self.budget_exceeded_fn: Callable[[], bool] = lambda: False
@@ -518,6 +523,9 @@ class _FakeLocalBenchmarkProvider:
 
     def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
         self.budget_exceeded_fn = fn
+
+    def set_compiler_seed_configs(self, configs: Sequence[Config]) -> None:
+        self.compiler_seed_config_calls.append(list(configs))
 
     def setup(self) -> None:
         self.setup_count += 1
@@ -534,6 +542,10 @@ class _FakeLocalBenchmarkProvider:
         self._autotune_metrics.num_accuracy_failures += self.kernel.accuracy_failures
         self._autotune_metrics.num_compile_failures += self.kernel.compile_failures
         self._autotune_metrics.num_worker_failures += self.kernel.worker_failures
+        self._autotune_metrics.num_unique_sources += self.kernel.unique_sources
+        self._autotune_metrics.num_source_deduplications += (
+            self.kernel.source_deduplications
+        )
         self._accuracy_failure_config_ids.extend(
             id(config)
             for index, config in enumerate(configs)
@@ -629,6 +641,58 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
             self.assertEqual(desc, f"joint shape {index + 1}")
             self.assertEqual(received[0].block_sizes, [64])
             self.assertIsNot(received[0], configs[0])
+
+    def test_deduplicated_child_result_is_successful(self) -> None:
+        spec = _make_config_spec()
+        provider, _ = self._make_provider(
+            [
+                _FakeBoundKernel(spec, [1.0], statuses=["deduplicated"]),
+                _FakeBoundKernel(spec, [4.0]),
+            ],
+            relative_to="default",
+            references=(0.5, 2.0),
+        )
+        config = Config(block_sizes=[64])
+
+        result = provider.benchmark([config])[0]
+
+        self.assertEqual(result.perf, 2.0)
+        self.assertEqual(result.status, "ok")
+        summary = _format_selected_multi_shape_measurement(
+            provider.args, _materialize_multi_shape_config(spec, config)
+        )
+        assert summary is not None
+        self.assertIn("latency=1.000000 ms, status=deduplicated", summary)
+        self.assertIn("ratio=2.000000x", summary)
+
+    def test_deduplicated_default_reference_is_successful(self) -> None:
+        spec = _make_config_spec()
+        provider, _ = self._make_provider(
+            [
+                _FakeBoundKernel(spec, [1.0], statuses=["deduplicated"]),
+                _FakeBoundKernel(spec, [4.0]),
+            ],
+            relative_to="default",
+        )
+
+        provider.setup()
+
+        self.assertEqual(provider.args.reference_latencies, (1.0, 4.0))
+
+    def test_compiler_seed_configs_are_forwarded_to_children(self) -> None:
+        spec = _make_config_spec()
+        provider, _ = self._make_provider(
+            [_FakeBoundKernel(spec, [1.0]), _FakeBoundKernel(spec, [2.0])]
+        )
+        configs = [Config(block_sizes=[64]), Config(block_sizes=[128])]
+
+        provider.set_compiler_seed_configs(configs)
+
+        children = cast("list[_FakeLocalBenchmarkProvider]", provider.children)
+        self.assertEqual(
+            [child.compiler_seed_config_calls for child in children],
+            [[configs], [configs]],
+        )
 
     def test_raw_and_relative_max_choose_different_configs(self) -> None:
         spec = _make_config_spec()
@@ -777,6 +841,24 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         self.assertEqual(metrics.num_accuracy_failures, 3)
         self.assertEqual(metrics.num_compile_failures, 2)
         self.assertEqual(metrics.num_worker_failures, 3)
+
+    def test_source_metrics_sum_child_deltas(self) -> None:
+        spec = _make_config_spec()
+        provider, metrics = self._make_provider(
+            [
+                _FakeBoundKernel(
+                    spec, [1.0], unique_sources=2, source_deduplications=1
+                ),
+                _FakeBoundKernel(
+                    spec, [2.0], unique_sources=3, source_deduplications=4
+                ),
+            ]
+        )
+
+        provider.benchmark([Config(block_sizes=[64])])
+
+        self.assertEqual(metrics.num_unique_sources, 5)
+        self.assertEqual(metrics.num_source_deduplications, 5)
 
     def test_invalid_anchor_materialization_discards_only_one_config(self) -> None:
         spec = _make_config_spec()
@@ -1223,7 +1305,7 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
         )
 
         for second_stage in invalid_second_stages:
-            with self.subTest(config=second_stage.config):
+            with self.subTest(has_config=second_stage.config is not None):
                 search, seeded = self._make_search(
                     _StageSearch(winner, 0.6, 2), second_stage
                 )

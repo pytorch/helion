@@ -96,6 +96,33 @@ def _manual_config(
     return config
 
 
+def _hybrid_runtime_config() -> dict[str, object]:
+    return {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_pipeline_family": "fa4",
+        "cute_flash_s_stage": 2,
+        "cute_flash_kv_stage": 2,
+        "cute_flash_persistent": False,
+        "cute_flash_e2e_schedule": "16/8",
+        "cute_flash_masked_e2e_schedule": "16/8",
+        "cute_flash_e2e_offset": 0,
+        "cute_flash_e2e_offset0": 10,
+        "cute_flash_disc_pipe": 3,
+        "cute_flash_exp2_packet": _HYBRID_PACKET,
+        "cute_flash_wait_hint": 10_000_000,
+        "cute_flash_p_store_rep": 16,
+        "cute_flash_s_load_rep": 32,
+        "cute_flash_epi_tma": False,
+        "cute_flash_epi_stg": False,
+        "cute_flash_role_map": "helion",
+        "cute_flash_rescale_chunk_cols": 16,
+        "cute_flash_causal_loop_split": True,
+        "cute_flash_causal_lpt_swizzle": 0,
+        "cute_flash_causal_kv_order": "descending",
+        "cute_flash_softmax_regs": 184,
+    }
+
+
 def test_degree2_polynomial_relative_error_bound() -> None:
     x = torch.linspace(0.0, 1.0, 100_001, dtype=torch.float32)
     c0, c1, c2 = _flash_runtime._POLY_EX2_DEG2
@@ -373,7 +400,7 @@ def test_short_degree1_packet_reverses_steady_correction_order(
 
 @onlyBackends(["cute"])
 def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
-    torch.manual_seed(20260810)
+    torch.manual_seed(101)
     q, k, v = (
         torch.randn(1, 2, 1024, 64, dtype=torch.float16, device=DEVICE)
         for _ in range(3)
@@ -386,27 +413,7 @@ def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
     code, out = code_and_output(
         _causal_attention_output,
         (q, k, v),
-        block_sizes=[1, 128, 128],
-        cute_flash_pipeline_family="fa4",
-        cute_flash_s_stage=2,
-        cute_flash_kv_stage=2,
-        cute_flash_persistent=False,
-        cute_flash_e2e_schedule="16/8",
-        cute_flash_masked_e2e_schedule="16/8",
-        cute_flash_e2e_offset=0,
-        cute_flash_e2e_offset0=10,
-        cute_flash_disc_pipe=3,
-        cute_flash_exp2_packet=_HYBRID_PACKET,
-        cute_flash_wait_hint=10_000_000,
-        cute_flash_p_store_rep=16,
-        cute_flash_s_load_rep=32,
-        cute_flash_epi_tma=False,
-        cute_flash_epi_stg=False,
-        cute_flash_role_map="helion",
-        cute_flash_causal_loop_split=True,
-        cute_flash_causal_lpt_swizzle=0,
-        cute_flash_causal_kv_order="descending",
-        cute_flash_softmax_regs=184,
+        **_hybrid_runtime_config(),
     )
     assert "degree1=True" in code
     assert "degree2=True" in code
@@ -419,6 +426,46 @@ def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
         atol=0.05,
         rtol=0.02,
     )
+
+
+@onlyBackends(["cute"])
+def test_hybrid_packet_runtime_matches_sdpa_at_long_causal_threshold() -> None:
+    torch.manual_seed(102)
+    q, k, v = (
+        torch.randn(1, 1, 65_536, 64, dtype=torch.float16, device=DEVICE)
+        for _ in range(3)
+    )
+    q[:, :, 0, :] = 4.0
+    k[:, :, 0, :] = 4.0
+    q[:, :, 32_768, :] = -4.0
+    k[:, :, 32_768, :] = -4.0
+
+    _code, out = code_and_output(
+        _causal_attention_output,
+        (q, k, v),
+        **_hybrid_runtime_config(),
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
+
+
+@onlyBackends(["cute"])
+def test_hybrid_packet_runtime_matches_sdpa_beyond_previous_seed_cap() -> None:
+    torch.manual_seed(103)
+    q, k, v = (
+        torch.randn(1, 1, 1_048_576, 64, dtype=torch.float16, device=DEVICE)
+        for _ in range(3)
+    )
+
+    code, out = code_and_output(
+        _causal_attention_output,
+        (q, k, v),
+        **_hybrid_runtime_config(),
+    )
+    assert "degree1=True" in code
+    assert "degree2=True" in code
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
 
 
 def test_degree2_packet_normalizes_by_effective_schedule() -> None:
