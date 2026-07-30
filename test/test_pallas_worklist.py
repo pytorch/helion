@@ -1665,9 +1665,11 @@ class TestResidentCacheWindowGuard(unittest.TestCase):
     def _setup(self):
         from jax.experimental.pallas import tpu as pltpu
 
-        from helion.runtime import _compact_raise_if_range_exceeds_window
-        from helion.runtime import _get_vmem_limit_bytes
-        from helion.runtime import compact_ordered_physical_window
+        from helion.runtime.pallas.launcher import (
+            _compact_raise_if_range_exceeds_window,
+        )
+        from helion.runtime.pallas.launcher import _get_vmem_limit_bytes
+        from helion.runtime.pallas.launcher import compact_ordered_physical_window
 
         # Two ordered operands (K/V) large enough that C is VMEM-bound, not
         # clamped to the leading dim (so a source CAN exceed C).
@@ -1747,14 +1749,14 @@ class TestOrderedWindowBudget(unittest.TestCase):
     """Resident-cache VMEM budget capacity and derived physical window sizing."""
 
     def _budget(self, operands, vmem=64 * 1024 * 1024, *, prep_operands):
-        from helion.runtime import compact_ordered_budget_capacity
+        from helion.runtime.pallas.launcher import compact_ordered_budget_capacity
 
         return compact_ordered_budget_capacity(
             operands, vmem, prep_operands=prep_operands
         )
 
     def _physical(self, operands, block, vmem=64 * 1024 * 1024, *, prep_operands):
-        from helion.runtime import compact_ordered_physical_window
+        from helion.runtime.pallas.launcher import compact_ordered_physical_window
 
         return compact_ordered_physical_window(
             operands, vmem, block, prep_operands=prep_operands
@@ -2105,7 +2107,9 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         lq = int(qo[-1])
         args = (torch.randn(lq, 4, 128), torch.randn(lq, 4, 128), qo)
         with (
-            patch("helion.runtime._get_vmem_limit_bytes", return_value=1),
+            patch(
+                "helion.runtime.pallas.launcher._get_vmem_limit_bytes", return_value=1
+            ),
             self.assertRaisesRegex(
                 exc.InvalidConfig, "VMEM budget cannot hold one ordered block"
             ),
