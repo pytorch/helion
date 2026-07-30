@@ -510,6 +510,11 @@ result3 = rms_norm_fwd(torch.randn([2048, 2048], device="cuda"), weight_2048)  #
 Use `hl.specialize()` when a dimension is performance-critical and you want
 it specialized regardless of how the kernel is called.
 
+Tensor strides can be specialized in the same way, for example
+`row_stride = hl.specialize(x.stride(0))`. The stride is inlined in generated
+code and included in the kernel cache key, so inputs with different layouts
+compile separate variants.
+
 ### `torch._dynamo.mark_static()` - External Specialization
 
 Use `torch._dynamo.mark_static()` **before** calling the kernel to specialize

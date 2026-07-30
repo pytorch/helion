@@ -20,7 +20,6 @@ import torch.distributed as dist
 
 from .._compat import _regs_per_block
 from .._compat import device_num_sm
-from .._compat import get_num_xcd
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -30,6 +29,7 @@ from .._compat import warps_to_threads
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
+from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
@@ -38,7 +38,9 @@ from .._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
 from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
 from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from .._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_offset0
@@ -57,6 +59,7 @@ from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraint
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..exc import InvalidConfig
+from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
@@ -443,6 +446,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "matrix_instr_nonkdim",
         "num_ctas",
         "occupancy",
+        "pallas_worklist_grouping",
         "pallas_loop_type",
         "pallas_pre_broadcast",
         *CUTE_TCGEN05_TUNABLE_KEYS,
@@ -520,12 +524,8 @@ VALID_KEYS: frozenset[str] = frozenset(
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
-# Full validation superset: "compact_worklist" is a tuned loop type but is only
-# *offered* to compactable kernels (owner hl.grid + jagged bounds), so it is gate
-# -appended to the search choices rather than living in the default set.  Keeping
-# AUTOTUNED_PALLAS_LOOP_TYPES first preserves `[0] == "emit_pipeline"` for the
-# setdefault below.
-VALID_PALLAS_LOOP_TYPES = (*AUTOTUNED_PALLAS_LOOP_TYPES, "compact_worklist")
+VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
+VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -709,6 +709,7 @@ class ConfigSpec:
         self.cute_flash_search_enabled: bool = False
         self._cute_flash_head_dim: int | None = None
         self._cute_flash_num_kv: int | None = None
+        self._cute_flash_dtype: torch.dtype = torch.float16
         self._cute_flash_is_causal: bool = False
         self._cute_flash_has_kv_tile_pruning: bool = False
         self._cute_flash_requires_ws_overlap: bool = False
@@ -920,6 +921,7 @@ class ConfigSpec:
         fragments = flash_autotune_fragments(
             self._cute_flash_head_dim,
             self._cute_flash_num_kv,
+            dtype=self._cute_flash_dtype,
             is_causal=self._cute_flash_is_causal,
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
@@ -1093,12 +1095,78 @@ class ConfigSpec:
                         f"{FLASH_E2E_SCHEDULE_KEY}={config[FLASH_E2E_SCHEDULE_KEY]!r}, "
                         f"got {e2e_offset!r}"
                     )
+        self._normalize_cute_flash_register_budget(
+            config,
+            fragments,
+            effective_topology,
+            fix_invalid=fix_invalid,
+        )
+
+    def _normalize_cute_flash_register_budget(
+        self,
+        config: dict[str, object],
+        fragments: Mapping[str, ConfigSpecFragment],
+        effective_topology: str,
+        *,
+        fix_invalid: bool,
+    ) -> None:
+        if effective_topology != "fa4":
+            return
+        softmax_regs = config.get(FLASH_SOFTMAX_REGS_KEY)
+        corr_regs = config.get(FLASH_CORR_REGS_KEY)
+        other_regs = config.get(FLASH_OTHER_REGS_KEY)
+        if (
+            type(softmax_regs) is not int
+            or type(corr_regs) is not int
+            or type(other_regs) is not int
+        ):
+            return
+        budget = 2 * softmax_regs + corr_regs + other_regs
+        if budget <= 512:
+            return
+        message = (
+            "FA4 register budget exceeds 512: "
+            f"2 * {FLASH_SOFTMAX_REGS_KEY} ({softmax_regs}) + "
+            f"{FLASH_CORR_REGS_KEY} ({corr_regs}) + "
+            f"{FLASH_OTHER_REGS_KEY} ({other_regs}) = {budget}"
+        )
+        if not fix_invalid:
+            raise InvalidConfig(message)
+
+        def _int_choices(key: str) -> tuple[int, ...]:
+            fragment = cast("EnumFragment", fragments[key])
+            return tuple(value for value in fragment.choices if type(value) is int)
+
+        current = (softmax_regs, corr_regs, other_regs)
+        best: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+        for softmax_candidate in _int_choices(FLASH_SOFTMAX_REGS_KEY):
+            for corr_candidate in _int_choices(FLASH_CORR_REGS_KEY):
+                for other_candidate in _int_choices(FLASH_OTHER_REGS_KEY):
+                    candidate = (softmax_candidate, corr_candidate, other_candidate)
+                    if 2 * softmax_candidate + corr_candidate + other_candidate > 512:
+                        continue
+                    score = (
+                        sum(a != b for a, b in zip(candidate, current, strict=True)),
+                        sum(
+                            abs(a - b) for a, b in zip(candidate, current, strict=True)
+                        ),
+                        -softmax_candidate,
+                    )
+                    if best is None or score < best[0]:
+                        best = (score, candidate)
+        if best is None:
+            raise InvalidConfig(message)
+        _score, (softmax_regs, corr_regs, other_regs) = best
+        config[FLASH_SOFTMAX_REGS_KEY] = softmax_regs
+        config[FLASH_CORR_REGS_KEY] = corr_regs
+        config[FLASH_OTHER_REGS_KEY] = other_regs
 
     def enable_cute_flash_search(
         self,
         *,
         head_dim: int,
         num_kv: int,
+        dtype: torch.dtype = torch.float16,
         block_size_targets: Mapping[int, int],
         is_causal: bool = False,
         has_kv_tile_pruning: bool = False,
@@ -1108,6 +1176,7 @@ class ConfigSpec:
         self.cute_flash_search_enabled = True
         self._cute_flash_head_dim = head_dim
         self._cute_flash_num_kv = num_kv
+        self._cute_flash_dtype = dtype
         self._cute_flash_is_causal = is_causal
         self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
         self._cute_flash_requires_ws_overlap = requires_ws_overlap
@@ -1321,6 +1390,7 @@ class ConfigSpec:
                 flash_attention_seed_configs(
                     self._cute_flash_head_dim,
                     self._cute_flash_num_kv,
+                    dtype=self._cute_flash_dtype,
                     is_causal=self._cute_flash_is_causal,
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
@@ -2187,6 +2257,11 @@ class ConfigSpec:
         merged = dict(self._base_default_config().config)
         merged.update(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
+        # Then normalize, so a promoted compiler default has the same canonical field set as the
+        # ``_base_default_config`` path: without this its ``repr``/equality differs from its own
+        # flatten/unflatten round-trip, which breaks callers that key on the config identity
+        # (e.g. benchmark result maps).
+        self.normalize(config, _fix_invalid=True)
         self._shrink_for_numel_constraints(config)
         return config
 
@@ -2230,6 +2305,7 @@ class ConfigSpec:
                     flash_autotune_fragments(
                         self._cute_flash_head_dim,
                         self._cute_flash_num_kv,
+                        dtype=self._cute_flash_dtype,
                         is_causal=self._cute_flash_is_causal,
                         has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                         requires_ws_overlap=self._cute_flash_requires_ws_overlap,
@@ -2240,15 +2316,9 @@ class ConfigSpec:
                 )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
-                # Universal pid emission honors ``loop_orders`` (the
-                # launch grid swaps which tile axis is outer), and the
-                # better order is shape-dependent. Expose only on the
-                # non-tcgen05 branch — the tcgen05 persistent
-                # scheduler relies on a fixed
-                # ``pid_info[0]=M, pid_info[1]=N`` mapping for
-                # ``cluster_m`` / virtual-PID logic, so sampling
-                # ``loop_orders=[[1, 0]]`` there would steer cluster
-                # logic onto the wrong axis.
+                # Universal pid emission honors ``loop_orders`` and the
+                # better order is shape-dependent. tcgen05 exposes the same
+                # field from CuteTcgen05Config.flat_fields().
                 if (
                     self.supports_config_key("loop_orders")
                     and len(self.loop_orders) > 0
@@ -2350,8 +2420,6 @@ class ConfigSpec:
         else:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
-            # Default to the non-compact set; "compact_worklist" is gated below so
-            # it never leaks into non-jagged kernels.
             choices = AUTOTUNED_PALLAS_LOOP_TYPES
             if self.has_symbolic_or_data_dependent_bounds:
                 # Exclude "unroll" (uses Python range(), can't handle traced
@@ -2362,12 +2430,13 @@ class ConfigSpec:
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
                 if self.grid_block_ids:
-                    # Owner hl.grid + jagged bounds => compaction is applicable.
-                    # Offer it as a tuned choice; detect_compact_worklist_plan
-                    # raises exc.InvalidConfig (autotuner-skippable) if the full
-                    # pattern doesn't match, so a residual mismatch is scored inf
-                    # and skipped rather than fatal.
-                    choices = (*choices, "compact_worklist")
+                    # Owner hl.grid + jagged bounds may be compactable. The full
+                    # detector remains authoritative, so residual mismatches are
+                    # autotuner-skippable InvalidConfig candidates.
+                    choices = (*choices, "unroll")
+                    fields["pallas_worklist_grouping"] = EnumFragment(
+                        choices=VALID_PALLAS_WORKLIST_GROUPINGS
+                    )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()

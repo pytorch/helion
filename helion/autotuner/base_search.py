@@ -628,6 +628,12 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to compile failures."
             )
+        if self._autotune_metrics.num_worker_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_worker_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed in "
+                "isolated benchmark workers."
+            )
         # Log search space analysis. This is purely diagnostic; any failure
         # here (analysis, logging, or writing report files) must never block or
         # crash autotuning, so the whole block is best-effort.
@@ -1007,8 +1013,8 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             A population member with the benchmark results.
         """
-        config = self.config_gen.unflatten(flat_values)
-        member = PopulationMember(_unset_fn, [], flat_values, config)
+        canonical_flat, config = self.config_gen.canonicalize_flat(flat_values)
+        member = PopulationMember(_unset_fn, [], canonical_flat, config)
         self.benchmark_population([member], desc="Benchmarking")
         return member
 
@@ -1062,11 +1068,11 @@ class PopulationBasedSearch(BaseSearch):
             configuration is invalid.
         """
         try:
-            config = self.config_gen.unflatten(flat_values)
+            canonical_flat, config = self.config_gen.canonicalize_flat(flat_values)
         except exc.InvalidConfig:
             self.config_gen.invalid_config_count += 1
             return None
-        return PopulationMember(_unset_fn, [], flat_values, config)
+        return PopulationMember(_unset_fn, [], canonical_flat, config)
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
@@ -1198,7 +1204,8 @@ class PopulationBasedSearch(BaseSearch):
         """
         results = self.benchmark_batch([m.config for m in members], desc=desc)
         for member, result in zip(members, results, strict=True):
-            assert result.config is member.config
+            member.config = result.config
+            member.flat_values = self.config_gen.flatten(result.config)
             member.perfs.append(result.perf)
             member.fn = result.fn
             member.status = result.status
@@ -1238,7 +1245,11 @@ class PopulationBasedSearch(BaseSearch):
             # cannot change this key's hash (-> KeyError on prune / orphaned
             # entries) or the config recompiled during final verification.
             snapshot = copy.deepcopy(config)
-            target[snapshot] = dataclasses.replace(member, config=snapshot)
+            target[snapshot] = dataclasses.replace(
+                member,
+                flat_values=copy.deepcopy(member.flat_values),
+                config=snapshot,
+            )
 
     def _prune_benchmarked_members(self, top_k: int) -> None:
         if len(self._benchmarked_members) <= top_k:
@@ -1794,7 +1805,7 @@ class PopulationBasedSearch(BaseSearch):
         current = PopulationMember(
             fn=current.fn,
             perfs=current.perfs,
-            flat_values=current.flat_values,
+            flat_values=self.config_gen.flatten(minimal_config),
             config=minimal_config,
             status=current.status,
             compile_time=current.compile_time,

@@ -142,7 +142,7 @@ class CarryStorePlan(NamedTuple):
     sublane: int
     block_row: int
     block_col: int
-    n_cols: int
+    n_cols: int | torch.SymInt
 
 
 def _carry_store_plan(
@@ -188,14 +188,10 @@ def _carry_store_plan(
     block_row = fn.resolved_block_size(row_block_id)
     block_col = fn.resolved_block_size(col_block_id)
     n_cols = tensor.size(1)
-    if not (
-        isinstance(block_row, int)
-        and isinstance(block_col, int)
-        and isinstance(n_cols, int)
-    ):
+    if not (isinstance(block_row, int) and isinstance(block_col, int)):
         raise NotImplementedError(
-            "Pallas ordered carry needs static block/column sizes "
-            f"(block_row={block_row!r}, block_col={block_col!r}, cols={n_cols!r})."
+            "Pallas ordered carry needs static block sizes "
+            f"(block_row={block_row!r}, block_col={block_col!r})."
         )
     if block_row % S != 0:
         raise NotImplementedError(

@@ -1777,7 +1777,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src2_result, expected_src2)
         torch.testing.assert_close(dst2_result, expected_dst2)
 
-    @skipIfNormalMode("InternalError: Negative indexes")
+    @xfailIfCute("InternalError: Negative indexes")
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
@@ -1802,6 +1802,43 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_dst = expected_src.clone()
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+    @xfailIfCute("InternalError: Negative indexes")
+    def test_negative_indexing_multidim(self):
+        """Test negative indexing on multiple dimensions: x[-1, -1]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            for _ in hl.grid(1):
+                x[-1, -1] = 42.0
+            return x
+
+        M, N = 64, 128
+        x = torch.zeros([M, N], device=DEVICE)
+        result = kernel(x)
+
+        expected = torch.zeros([M, N], device=DEVICE)
+        expected[-1, -1] = 42.0
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfCute("InternalError: Negative indexes")
+    def test_negative_indexing_with_tile(self):
+        """Test mixed tile and negative index: x[tile, -1]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            (rows,) = x.shape[:1]
+            for tile_r in hl.tile(rows):
+                x[tile_r, -1] = 1.0
+            return x
+
+        M, N = 64, 128
+        x = torch.zeros([M, N], device=DEVICE)
+        result = kernel(x)
+
+        expected = torch.zeros([M, N], device=DEVICE)
+        expected[:, -1] = 1.0
+        torch.testing.assert_close(result, expected)
 
     @skipIfNormalMode(
         "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"

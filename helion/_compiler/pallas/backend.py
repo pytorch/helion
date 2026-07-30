@@ -4,11 +4,13 @@ helion/_compiler/backend.py."""
 from __future__ import annotations
 
 import ast
+import dataclasses
 import enum
 import math
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import cast
 
 import torch
 
@@ -103,20 +105,12 @@ class PallasBackend(Backend):
     def map_dot_precision(precision: DotPrecision) -> str:
         """Map Helion dot precision to Pallas-specific precision string.
 
-        Pallas/TPU has limited support for different precisions, often
-        falling back to the highest available precision.
+        Pallas/TPU does not support Triton-style TF32/IEEE controls. On the
+        current TPU stack, JAX ``high``/``highest`` fp32 dot precision is less
+        compatible with PyTorch eager references than JAX default precision, so
+        all Helion aliases intentionally lower to the Pallas default.
         """
-        pallas_precision_by_dot_precision = {
-            "default": "default",
-            # "high" is mapped to "highest" because Pallas/Mosaic doesn't yet
-            # support it on TPU.
-            "high": "highest",
-            "highest": "highest",
-            "tf32": "highest",
-            "tf32x3": "highest",
-            "ieee": "highest",
-        }
-        return pallas_precision_by_dot_precision.get(precision, "default")
+        return "default"
 
     @property
     def max_tensor_numel(self) -> int | None:
@@ -186,6 +180,7 @@ class PallasBackend(Backend):
             "block_sizes",
             "loop_orders",
             "flatten_loops",
+            "pallas_worklist_grouping",
             "pallas_loop_type",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
@@ -1088,7 +1083,6 @@ class PallasBackend(Backend):
                 launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
-        pallas_loop_type = config.get("pallas_loop_type", "unroll")
         scratch_shapes = [
             (
                 s.shape,
@@ -1098,7 +1092,10 @@ class PallasBackend(Backend):
             for s in device_fn._scratch_args
         ]
         if scratch_shapes:
-            launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+            from ..host_function import HostFunction
+
+            scratch_shapes_str = HostFunction.current().literal_expr(scratch_shapes)
+            launcher_args.append(f"_scratch_shapes={scratch_shapes_str}")
 
         # Identify which launcher arg positions correspond to pipeline-body
         # tensors (need HBM refs); all others get proper BlockSpecs.
@@ -1132,7 +1129,10 @@ class PallasBackend(Backend):
         if matmul_spec is not None:
             launcher_args.append(f"_matmul_dot_general={matmul_spec!r}")
 
-        if pallas_loop_type == "compact_worklist" and sorted_args is not None:
+        if (
+            CompileEnvironment.current().compact_worklist_plan is not None
+            and sorted_args is not None
+        ):
             launcher_args.extend(self._compact_worklist_launcher_args(sorted_args))
 
         return launcher_args
@@ -1159,7 +1159,7 @@ class PallasBackend(Backend):
                 name_to_index[arg.host_str()] = i
         offset_indices = [name_to_index[n] for n in env.compact_worklist_offset_params]
         fields = metadata_field_names(plan)
-        # Compact-tile tensors (aligned load + exact store) both get a per-tile
+        # Compact-tile tensors (aligned load + exact store) both get a max-sized
         # pl.Element BlockSpec sliced at tile_start, so Pallas double-buffers BOTH
         # the load prefetch and the store write-back across work items.
         #
@@ -1236,7 +1236,7 @@ class PallasBackend(Backend):
             f"_compact_num_scalar_prefetch={len(fields)}",
             f"_compact_aligned_arg_indices={aligned_indices!r}",
             f"_compact_tile_start_ref_pos={fields.index('tile_starts')}",
-            f"_compact_block={env.compact_worklist_block}",
+            f"_compact_block={env.compact_worklist_block * plan.grouping}",
             f"_compact_ordered_aligned_arg_indices={ordered_indices!r}",
             f"_compact_range_start_ref_pos={range_start_ref_pos}",
             f"_compact_ordered_offset_arg_index={ordered_offset_arg_index}",
@@ -1247,10 +1247,9 @@ class PallasBackend(Backend):
     def build_launcher_name(self, config: Config) -> str:
         """Return the single Pallas launcher name.
 
-        All ``pallas_loop_type`` values (``unroll``, ``emit_pipeline``,
-        ``fori_loop``, ``compact_worklist``) route through the same
-        ``default_pallas_launcher``; the loop-shape choice happens
-        inside based on the launcher-observable kwargs codegen emits.
+        All ``pallas_loop_type`` values route through the same
+        ``default_pallas_launcher``; worklist flattening is selected separately
+        by its launcher-observable kwargs.
         """
         from ...autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
 
@@ -1279,19 +1278,39 @@ class PallasBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from ...autotuner.config_spec import VALID_PALLAS_WORKLIST_GROUPINGS
         from ..compile_environment import CompileEnvironment
         from .plan_tiling import plan_tiling
+
+        # Validate pallas_loop_type before any codegen setup.
+        self.build_launcher_name(config)
+        grouping = config.get("pallas_worklist_grouping", 0)
+        if type(grouping) is not int or grouping not in VALID_PALLAS_WORKLIST_GROUPINGS:
+            raise exc.InvalidConfig(
+                "Invalid pallas_worklist_grouping "
+                f"{grouping!r}. Expected one of {VALID_PALLAS_WORKLIST_GROUPINGS}."
+            )
+
+        env = CompileEnvironment.current()
+        if (
+            grouping == 0
+            and config.get("pallas_loop_type", "unroll") == "unroll"
+            and env.config_spec.has_symbolic_or_data_dependent_bounds
+        ):
+            raise exc.InvalidConfig(
+                "pallas_loop_type='unroll' requires static inner-loop bounds or "
+                "pallas_worklist_grouping in (1, 2)."
+            )
 
         plan_tiling(graphs, config, tile_strategy)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
         # reused across all configs of a BoundKernel (see CompileEnvironment's
-        # "no config-specific state" contract).  Reset before re-detecting so a
-        # later non-compact config never inherits a prior compact config's plan
+        # "no config-specific state" contract). Reset before re-detecting so a
+        # later non-flattened config never inherits a prior compact config's plan
         # -- many lowering paths gate on ``env.compact_worklist_plan is not None``
         # (PID strategy, loop-bound remap, fori handling, ds slicing), not on
-        # pallas_loop_type, so a stale plan would mis-lower a fori/emit config.
-        env = CompileEnvironment.current()
+        # config values, so a stale plan would mis-lower a later config.
         env.compact_worklist_plan = None
         env.compact_worklist_resident_cache_decision = None
         env.compact_worklist_resident_prep_hoists = ()
@@ -1300,7 +1319,7 @@ class PallasBackend(Backend):
         env.compact_worklist_ordered_block = 1
         env.compact_worklist_offset_params = []
 
-        if config.get("pallas_loop_type") == "compact_worklist":
+        if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
 
     def _setup_compact_worklist(self, graphs: list[GraphInfo], config: Config) -> None:
@@ -1313,17 +1332,18 @@ class PallasBackend(Backend):
         megablocks ``UPPER``.  ``detect_*`` raises ``exc.InvalidConfig`` on a
         non-matching kernel (autotuner-skippable).
         """
-        from ...runtime import _get_vmem_limit_bytes
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
-        from .compact_worklist import build_resident_cache_admission
         from .compact_worklist import detect_compact_worklist_plan
         from .compact_worklist import metadata_arg_names
 
         env = CompileEnvironment.current()
         host_fn = HostFunction.current()
-        plan = detect_compact_worklist_plan(host_fn)
+        plan = dataclasses.replace(
+            detect_compact_worklist_plan(host_fn),
+            grouping=cast("int", config.get("pallas_worklist_grouping", 1)),
+        )
         env.compact_worklist_plan = plan
 
         device_fn = DeviceFunction.current()
@@ -1349,36 +1369,46 @@ class PallasBackend(Backend):
                 env.compact_worklist_ordered_block = int(ordered_block)
         env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
 
-        import jax.experimental.pallas.tpu as pltpu
+        if config.get("pallas_loop_type", "unroll") == "unroll" and (
+            plan.ordered_axis is not None
+        ):
+            import jax.experimental.pallas.tpu as pltpu
 
-        # Choose C from the conservative device-reported VMEM budget.  The runtime
-        # may pass a higher Mosaic compile ceiling for resident-window kernels so TPU7x
-        # accepts this already-sized allocation, but that ceiling is deliberately
-        # not used here as an allocation budget.
-        vmem_bytes = _get_vmem_limit_bytes(pltpu)
-        admission = build_resident_cache_admission(
-            graphs,
-            plan,
-            host_fn.params.arguments,
-            ordered_block=env.compact_worklist_ordered_block,
-            vmem_bytes=vmem_bytes,
-        )
-        env.compact_worklist_resident_prep_hoists = admission.prep_hoists
-        env.compact_worklist_resident_cache_decision = admission.decision
+            from ...runtime.pallas.launcher import _get_vmem_limit_bytes
+            from .compact_worklist import build_resident_cache_admission
+
+            # Choose C from the conservative device-reported VMEM budget. The
+            # higher Mosaic compile ceiling used by the runtime is not an
+            # allocation budget.
+            admission = build_resident_cache_admission(
+                graphs,
+                plan,
+                host_fn.params.arguments,
+                ordered_block=env.compact_worklist_ordered_block,
+                vmem_bytes=_get_vmem_limit_bytes(pltpu, env.settings.pallas_interpret),
+            )
+            if not admission.decision.active:
+                raise exc.InvalidConfig(
+                    "pallas_loop_type='unroll' requires resident ordered-loop "
+                    f"admission: {admission.decision.inactive_reason}."
+                )
+            env.compact_worklist_resident_prep_hoists = admission.prep_hoists
+            env.compact_worklist_resident_cache_decision = admission.decision
 
     def _compact_worklist_upper(
         self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction
     ) -> int:
         """Static UPPER: the padded length of the worklist metadata arrays.
 
-        Must be >= the worst-case ``num_work = sum_owners cdiv(length, BLOCK)``,
+        Must be >= the worst-case
+        ``num_work = sum_owners cdiv(length, BLOCK * grouping)``,
         else the dynamic Pallas grid indexes past the scalar-prefetch metadata
         (``jnp.repeat(total_repeat_length=UPPER)`` would silently truncate the
         worklist).  Detection only accepts the packed-offsets idiom (store
-        safety), so owner ranges are contiguous/non-overlapping
-        (``sum(length) == total``) and the tight megablocks bound
-        ``cdiv(total, BLOCK) + num_owners - 1`` provably holds.  All terms are
-        concrete ints under ``static_shapes=True``.
+        safety), so owner ranges are contiguous/non-overlapping. The compact
+        input shape is at least their packed total (and may include padding), so
+        ``cdiv(total, BLOCK * grouping) + num_owners - 1`` provably holds. All
+        terms are concrete ints under ``static_shapes=True``.
         """
         from ...runtime.compact_worklist import packed_upper_bound
         from ..compile_environment import CompileEnvironment
@@ -1396,11 +1426,11 @@ class PallasBackend(Backend):
                 f"compact_worklist: could not evaluate owner-count expression "
                 f"{plan.num_owners_expr!r}: {e}"
             ) from e
-        # total_compact = leading dim of the compact_aligned_load tensor.
+        # total_compact = padded leading dim of the compact_aligned_load tensor.
         compact_arg = next(
             p.arg_name for p in plan.tensor_policies if p.kind == "compact_aligned_load"
         )
         total = int(params[compact_arg].shape[0])
-        block = CompileEnvironment.current().compact_worklist_block
+        block = CompileEnvironment.current().compact_worklist_block * plan.grouping
         # Single source of the tight megablocks bound (also unit-tested).
         return packed_upper_bound(total, num_owners, block)

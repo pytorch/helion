@@ -8,6 +8,7 @@
 # real module compiled without that flag, and be imported by the generated code.
 import functools
 from functools import partial
+from itertools import starmap
 from typing import Any
 from typing import cast
 
@@ -21,6 +22,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Float32
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
+import cutlass.utils.blackwell_helpers as sm100_utils_flash
 
 
 @functools.cache
@@ -204,6 +206,8 @@ def mbarrier_arrive(
 ) -> None:
     if cutlass.const_expr(peer_cta_rank is None):
         cute.arch.mbarrier_arrive(pfor_ptr_stage)
+    elif cutlass.const_expr(self_cta_rank is None):
+        cute.arch.mbarrier_arrive(pfor_ptr_stage, peer_cta_rank)
     else:
 
         def local_arrive() -> None:
@@ -320,6 +324,41 @@ def ex2_emulation_2(x: Float32, y: Float32) -> tuple:
     x_out = _combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0])
     y_out = _combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1])
     return x_out, y_out
+
+
+def ex2_emulation_batch(pairs: list[tuple]) -> list[tuple]:
+    """Level-schedule software exp2 for independent packed pairs."""
+    xy_clamped = [
+        (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0)) for x, y in pairs
+    ]
+    xy_rounded = [
+        cute.arch.add_packed_f32x2(
+            pair,
+            (_FP32_ROUND_INT, _FP32_ROUND_INT),
+            rnd="rm",
+        )
+        for pair in xy_clamped
+    ]
+    xy_rounded_back = [
+        _sub_packed_f32x2(pair, (_FP32_ROUND_INT, _FP32_ROUND_INT))
+        for pair in xy_rounded
+    ]
+    xy_frac = list(
+        starmap(_sub_packed_f32x2, zip(xy_clamped, xy_rounded_back, strict=True))
+    )
+    xy_frac_ex2 = [(_POLY_EX2_DEG3[-1], _POLY_EX2_DEG3[-1]) for _ in pairs]
+    for coefficient in reversed(_POLY_EX2_DEG3[:-1]):
+        xy_frac_ex2 = [
+            _fma_packed_f32x2(poly, frac, (coefficient, coefficient))
+            for poly, frac in zip(xy_frac_ex2, xy_frac, strict=True)
+        ]
+    return [
+        (
+            _combine_int_frac_ex2(rounded[0], frac_ex2[0]),
+            _combine_int_frac_ex2(rounded[1], frac_ex2[1]),
+        )
+        for rounded, frac_ex2 in zip(xy_rounded, xy_frac_ex2, strict=True)
+    ]
 
 
 def exp2_split_inplace(
@@ -946,6 +985,8 @@ def _disc_chunk_exp(
     e2e_res: int,
     e2e_offset: int,
     last_frag: bool,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> None:
     """In-place packed scale-subtract then exp2(pipe-split) over ONE 32-elem chunk.
 
@@ -955,18 +996,56 @@ def _disc_chunk_exp(
     Verbatim from the serial ``fa4_disc_exp_convert_store`` body; factored out so the
     serial and software-pipelined pass2 share the SAME per-chunk numerics."""
     nf = cute.size(frg)
-    for i in range(0, nf, 2):
-        r0, r1 = cute.arch.fma_packed_f32x2(
-            (frg[i], frg[i + 1]),
-            (scale, scale),
-            (minus_max_scale, minus_max_scale),
-        )
-        use_xu = ((i + e2e_offset) % e2e_freq) < (e2e_freq - e2e_res) or last_frag
-        if use_xu:
-            frg[i] = cute.arch.exp2(r0)
-            frg[i + 1] = cute.arch.exp2(r1)
-        else:
-            frg[i], frg[i + 1] = ex2_emulation_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
+    if pair_batch == 1:
+        # Preserve the established instruction order for every caller that does
+        # not explicitly opt into cross-pair scheduling.
+        for i in range(0, nf, 2):
+            r0, r1 = cute.arch.fma_packed_f32x2(
+                (frg[i], frg[i + 1]),
+                (scale, scale),
+                (minus_max_scale, minus_max_scale),
+            )
+            use_xu = ((i + e2e_offset) % e2e_freq) < (e2e_freq - e2e_res) or last_frag
+            if use_xu:
+                frg[i] = cute.arch.exp2(r0)
+                frg[i + 1] = cute.arch.exp2(r1)
+            else:
+                frg[i], frg[i + 1] = ex2_emulation_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
+        return
+    assert pair_batch > 0 and nf % (2 * pair_batch) == 0
+    assert emu_batch > 0
+    for batch_start in range(0, nf, 2 * pair_batch):
+        scaled = []
+        for pair in range(pair_batch):
+            i = batch_start + 2 * pair
+            r0, r1 = cute.arch.fma_packed_f32x2(
+                (frg[i], frg[i + 1]),
+                (scale, scale),
+                (minus_max_scale, minus_max_scale),
+            )
+            use_xu = ((i + e2e_offset) % e2e_freq) < (e2e_freq - e2e_res) or last_frag
+            scaled.append((i, r0, r1, use_xu))
+        pending_indices = []
+        pending_values = []
+        for i, r0, r1, use_xu in scaled:
+            if use_xu:
+                frg[i] = cute.arch.exp2(r0)
+                frg[i + 1] = cute.arch.exp2(r1)
+            elif emu_batch == 1:
+                frg[i], frg[i + 1] = ex2_emulation_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
+            else:
+                pending_indices.append(i)
+                pending_values.append((r0, r1))
+                if len(pending_values) == emu_batch:
+                    results = ex2_emulation_batch(pending_values)
+                    for pending_i, result in zip(pending_indices, results, strict=True):
+                        frg[pending_i], frg[pending_i + 1] = result
+                    pending_indices = []
+                    pending_values = []
+        if pending_values:
+            results = ex2_emulation_batch(pending_values)
+            for pending_i, result in zip(pending_indices, results, strict=True):
+                frg[pending_i], frg[pending_i + 1] = result
 
 
 def _disc_chunk_convert_store(
@@ -1784,6 +1863,221 @@ def fa4_store_o_smem_to_gmem_whole(
         )
 
 
+def fa4_correction_epilogue_to_smem(
+    tiled_t2r: object,
+    tiled_r2s: object,
+    tOtO_corr_t2r: cute.Tensor,
+    tOsO_corr_r2s: cute.Tensor,
+    tOcO_corr_t2r: cute.Tensor,
+    inv_sum: object,
+    chunks: int,
+) -> None:
+    """FA4 correction epilogue: rescale O in TMEM and stage fp16 output in SMEM."""
+    for i in range(chunks):
+        reg_src = cast("cute.Tensor", tOcO_corr_t2r[None, 0, 0, i])
+        reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO_corr_t2r[None, 0, 0, i], reg)
+        reg.store(reg.load() * inv_sum)
+        cvt_copy(tiled_r2s, reg, tOsO_corr_r2s[None, 0, 0, i])
+
+
+def fa4_correction_epilogue_handoff_to_smem(
+    o_full_ptr_stage: object,
+    o_full_phase: object,
+    corr_epi_empty_ptr_stage: object,
+    corr_epi_empty_phase: object,
+    corr_epi_full_ptr_stage: object,
+    tiled_t2r: object,
+    tiled_r2s: object,
+    tOtO_corr_t2r: cute.Tensor,
+    tOsO_corr_r2s: cute.Tensor,
+    tOcO_corr_t2r: cute.Tensor,
+    inv_sum: object,
+    chunks: int,
+) -> None:
+    """Wait for O/epilogue handoff, stage final O in SMEM, then publish it."""
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    fa4_correction_epilogue_to_smem(
+        tiled_t2r,
+        tiled_r2s,
+        tOtO_corr_t2r,
+        tOsO_corr_r2s,
+        tOcO_corr_t2r,
+        inv_sum,
+        chunks,
+    )
+    cute.arch.fence_view_async_shared()
+    cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
+
+
+@dsl_user_op
+def fa4_correction_epilogue_to_smem_scoped(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    inv_sum: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """FA4 correction epilogue with copy-view lifetimes scoped to the copy body."""
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (128, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=False,
+    )
+    cO = cute.make_identity_tensor((128, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+    # sO is per CTA, so both CTAs use the rank-zero SMEM mapping.
+    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    smem_atom = sm100_utils_flash.get_smem_store_op(
+        o_layout, o_dtype, cutlass.Float32, tiled_t2r
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
+        reg.store(reg.load() * inv_sum)
+        cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
+
+
+@dsl_user_op
+def fa4_correction_epilogue_to_smem_scoped_2cta(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    inv_sum: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Two-CTA correction epilogue with a CTA-local shared-memory destination."""
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (256, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=True,
+    )
+    cO = cute.make_identity_tensor((256, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    smem_atom = sm100_utils_flash.get_smem_store_op(
+        o_layout, o_dtype, cutlass.Float32, tiled_t2r
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
+        reg.store(reg.load() * inv_sum)
+        cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
+
+
+def fa4_correction_epilogue_handoff_to_smem_scoped(
+    o_full_ptr_stage: object,
+    o_full_phase: object,
+    corr_epi_empty_ptr_stage: object,
+    corr_epi_empty_phase: object,
+    corr_epi_full_ptr_stage: object,
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    inv_sum: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+) -> None:
+    """Wait for O/epilogue handoff, scope copy views, then publish staged O."""
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    fa4_correction_epilogue_to_smem_scoped(
+        flash_pvt,
+        tOtO,
+        sO,
+        tidx,
+        inv_sum,
+        head_dim,
+        corr_tile_size,
+        o_dtype,
+    )
+    cute.arch.fence_view_async_shared()
+    cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
+
+
+def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
+    o_full_ptr_stage: object,
+    o_full_phase: object,
+    corr_epi_empty_ptr_stage: object,
+    corr_epi_empty_phase: object,
+    corr_epi_full_ptr_stage: object,
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    inv_sum: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+) -> None:
+    """Wait for handoff and stage a two-CTA output in CTA-local shared memory."""
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    fa4_correction_epilogue_to_smem_scoped_2cta(
+        flash_pvt,
+        tOtO,
+        sO,
+        tidx,
+        inv_sum,
+        head_dim,
+        corr_tile_size,
+        o_dtype,
+    )
+    cute.arch.fence_view_async_shared()
+    cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
+
+
 def _fa4_sp_exp_convert_store_impl(
     tLDrS: cute.Tensor,
     tiled_st: object,
@@ -1802,6 +2096,9 @@ def _fa4_sp_exp_convert_store_impl(
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
     whole_row_sum: bool = False,
+    early_split_publish: bool = False,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -1813,29 +2110,71 @@ def _fa4_sp_exp_convert_store_impl(
     src = cute.logical_divide(tLDrS, cute.make_layout(32))
     dst = cute.logical_divide(tSTrS_e, cute.make_layout(32))
     frag_count = cute.size(tLDrS) // 32
-    for ci in range(frag_count):
-        frg = cast("cute.Tensor", src[None, ci])
-        _disc_chunk_exp(
-            frg,
-            scale,
-            minus_max_scale,
-            e2e_freq,
-            e2e_res,
-            e2e_offset,
-            ci >= frag_count - 1,
-        )
-        cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
-    for ci in range(p_store_chunks):
-        cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    cute.arch.fence_view_async_tmem_store()
-    if cutlass.const_expr(pfor2_ptr_stage is None):
+    if cutlass.const_expr(early_split_publish and pfor2_ptr_stage is not None):
+        for ci in range(p_store_split):
+            frg = cast("cute.Tensor", src[None, ci])
+            _disc_chunk_exp(
+                frg,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ci >= frag_count - 1,
+                pair_batch,
+                emu_batch,
+            )
+            cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
+        for ci in range(p_store_split):
+            cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
+        cute.arch.fence_view_async_tmem_store()
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
-    else:
+        for ci in range(p_store_split, frag_count):
+            frg = cast("cute.Tensor", src[None, ci])
+            _disc_chunk_exp(
+                frg,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ci >= frag_count - 1,
+                pair_batch,
+                emu_batch,
+            )
+            cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
+        for ci in range(p_store_split, p_store_chunks):
+            cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
+        cute.arch.fence_view_async_tmem_store()
         mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    else:
+        for ci in range(frag_count):
+            frg = cast("cute.Tensor", src[None, ci])
+            _disc_chunk_exp(
+                frg,
+                scale,
+                minus_max_scale,
+                e2e_freq,
+                e2e_res,
+                e2e_offset,
+                ci >= frag_count - 1,
+                pair_batch,
+                emu_batch,
+            )
+            cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
+        for ci in range(p_store_chunks):
+            cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
+            if cutlass.const_expr(pfor2_ptr_stage is not None):
+                if ci == p_store_split - 1:
+                    cute.arch.fence_view_async_tmem_store()
+                    mbarrier_arrive(
+                        pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank
+                    )
+        cute.arch.fence_view_async_tmem_store()
+        if cutlass.const_expr(pfor2_ptr_stage is None):
+            mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+        else:
+            mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     if cutlass.const_expr(whole_row_sum):
         return fadd_reduce_packed(tLDrS)
     p_sum = cutlass.Float32(0.0)
@@ -1862,6 +2201,9 @@ def fa4_sp_exp_convert_store(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    early_split_publish: bool = False,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -1884,6 +2226,10 @@ def fa4_sp_exp_convert_store(
         io_dtype,
         pfor_peer_cta_rank,
         pfor_self_cta_rank,
+        False,
+        early_split_publish,
+        pair_batch,
+        emu_batch,
     )
 
 
@@ -1905,6 +2251,9 @@ def fa4_sp_exp_convert_store_whole_rowsum(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    early_split_publish: bool = False,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -1928,6 +2277,9 @@ def fa4_sp_exp_convert_store_whole_rowsum(
         pfor_peer_cta_rank,
         pfor_self_cta_rank,
         True,
+        early_split_publish,
+        pair_batch,
+        emu_batch,
     )
 
 

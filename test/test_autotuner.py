@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextlib import nullcontext
+import copy
 import csv
+import functools
 import logging
 import math
 import multiprocessing as mp
@@ -28,6 +30,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion import _hardware
 from helion import exc
 from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
@@ -36,6 +39,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import assert_close_with_mismatch_tolerance
+from helion._testing import get_test_float32_matmul_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
@@ -120,6 +124,50 @@ def _get_examples_matmul():
     return import_path(examples_dir / "matmul.py").matmul
 
 
+# Pin the compute capability for config-space golden tests. The matmul-seed
+# heuristics are hardware-gated (the H100 formula fires on sm90, the B200 table on
+# sm100), so which compiler seed configs get injected into ``random_population``
+# depends on the CI runner's GPU. Force a fixed capability so the golden is stable
+# across every runner (H100/B200/A10G) and does not shift as new sm-gated seed
+# heuristics are added. sm90 is used because ``examples/matmul.py`` is a clean 2-D
+# static GEMM that the sm90 budget-formula seed fires on.
+_SM90_HARDWARE = _hardware.HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA H100",
+    runtime_version="12.8",
+    compute_capability="sm90",
+)
+
+
+def _pin_sm90(fn):
+    """Run ``fn`` with ``get_hardware_info`` pinned to sm90, and evict the shared
+    ``examples/matmul`` bound-kernel cache on both entry and exit.
+
+    The pin only patches ``get_hardware_info``; the ``Kernel`` bind cache keys on the
+    *real* device capability instead (``_device_specialization_key``). Without the
+    eviction, a config computed under this pin (the sm90 budget-formula seed, e.g.
+    ``block_sizes=[64, 64, 64], num_stages=6``) is cached against the real-GPU key and
+    then reused by a later *un-pinned* test that actually compiles/executes it — which
+    OOMs on a smaller GPU (A10G's 99KB shared memory). Clearing on entry gives this test
+    a clean compute; clearing on exit guarantees no sm90-simulated config leaks into a
+    test that runs on the true hardware.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        matmul = _get_examples_matmul()
+        with patch.object(
+            _hardware, "get_hardware_info", lambda device=None: _SM90_HARDWARE
+        ):
+            matmul._bound_kernels.clear()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                matmul._bound_kernels.clear()
+
+    return wrapper
+
+
 @contextmanager
 def without_env_var(name: str):
     sentinel = object()
@@ -136,9 +184,40 @@ class RecordingRandomSearch(RandomSearch):
         super().__init__(*args, **kwargs)
         self.samples: list[float] = []
 
-    def _autotune(self):
+    def _autotune(self) -> helion.Config:
         self.samples.append(random.random())
+        if torch.version.hip is not None:
+            # This test covers seed propagation, not benchmark behavior. Avoid
+            # competing GPU benchmarks across ROCm xdist workers.
+            return self.config_spec.default_config()
         return super()._autotune()
+
+
+class TestMismatchTolerance(TestCase):
+    def test_get_test_float32_matmul_precision_pallas_interpret(self) -> None:
+        with (
+            patch("helion._testing._get_backend", return_value="pallas"),
+            patch("helion._testing.is_pallas_interpret", return_value=True),
+        ):
+            self.assertEqual(get_test_float32_matmul_precision(), "high")
+
+    def test_get_test_float32_matmul_precision_real_pallas(self) -> None:
+        with (
+            patch("helion._testing._get_backend", return_value="pallas"),
+            patch("helion._testing.is_pallas_interpret", return_value=False),
+        ):
+            self.assertEqual(get_test_float32_matmul_precision(), "medium")
+
+    def test_assert_close_with_mismatch_tolerance_bounds_mismatches(self) -> None:
+        with self.assertRaisesRegex(
+            AssertionError, "Mismatched absolute diff too large"
+        ):
+            assert_close_with_mismatch_tolerance(
+                torch.tensor([10.0, 1.0, 1.0, 1.0], device=DEVICE),
+                torch.tensor([1.0, 1.0, 1.0, 1.0], device=DEVICE),
+                max_mismatch_pct=0.5,
+                max_mismatched_abs_diff=5.0,
+            )
 
 
 @onlyBackends(["triton"])
@@ -899,6 +978,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         super().setUp()
         random.seed(112)
 
+    @_pin_sm90
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
@@ -959,6 +1039,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
+    @_pin_sm90
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
@@ -1419,6 +1500,81 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         for _ in range(50):
             result = gen.differential_mutation(base, a, b, c, crossover_rate=0.9)
             self.assertEqual(result[warp_idx], base[warp_idx])
+
+    def test_population_member_canonicalizes_overridden_flat_values(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        gen = ConfigGeneration(spec, overrides={"num_warps": 8})
+        raw_flat = gen.default_flat()
+        original_flat = copy.deepcopy(raw_flat)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_gen = gen
+
+        member = search.make_unbenchmarked(raw_flat)
+
+        self.assertIsNotNone(member)
+        assert member is not None
+        self.assertEqual(raw_flat, original_flat)
+        self.assertIsNot(member.flat_values, raw_flat)
+        self.assertEqual(member.config.num_warps, 8)
+        self.assertEqual(member.flat_values[gen.num_warps_index], 8)
+        self.assertEqual(member.flat_values, gen.flatten(member.config))
+        gen.encode_config(member.flat_values)
+
+        [(seed_flat, seed_config)] = gen.user_seed_flat_config_pairs(
+            [helion.Config(num_warps=4)]
+        )
+        self.assertEqual(seed_config.num_warps, 8)
+        self.assertEqual(seed_flat, gen.flatten(seed_config))
+
+    def test_scalar_list_override_has_encodable_flat_values(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        gen = ConfigGeneration(spec, overrides={"indexing": "pointer"})
+
+        flat, config = gen.canonicalize_flat(gen.default_flat())
+
+        indexing_indices, is_sequence = gen._key_to_flat_indices["indexing"]
+        self.assertFalse(is_sequence)
+        self.assertEqual(len(indexing_indices), 1)
+        self.assertEqual(flat[indexing_indices[0]], ["pointer"] * spec.indexing.length)
+        self.assertEqual(flat, gen.flatten(config))
+        gen.encode_config(flat)
+
+    def test_population_adopts_config_filter_replacement(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        search = PatternSearch(bound_kernel, args, initial_population=1)
+        member = search.make_unbenchmarked(search.config_gen.default_flat())
+        assert member is not None
+        replacement = helion.Config.from_dict({**member.config.config, "num_warps": 8})
+        result = SimpleNamespace(
+            config=replacement,
+            perf=float("inf"),
+            fn=lambda: None,
+            status="error",
+            compile_time=None,
+        )
+
+        with patch.object(search, "benchmark_batch", return_value=[result]):
+            search.benchmark_population([member])
+
+        self.assertIs(member.config, replacement)
+        self.assertEqual(member.flat_values, search.config_gen.flatten(replacement))
+        self.assertEqual(
+            member.flat_values[search.config_gen.num_warps_index],
+            8,
+        )
+        search.config_gen.encode_config(member.flat_values)
 
     def test_lfbo_pattern_search_skips_overridden_indices(self):
         """LFBOPatternSearch._generate_neighbors skips overridden indices."""
@@ -3604,26 +3760,39 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(round_tripped.loop_orders, [[1, 0]])
 
-    def test_cute_tcgen05_search_surface_excludes_loop_orders(self) -> None:
-        """tcgen05 persistent scheduler relies on a fixed
-        ``pid_info[0]=M, pid_info[1]=N`` mapping (``cluster_m`` and
-        virtual-PID logic). Sampling ``loop_orders=[[1, 0]]`` for a
-        tcgen05 config would steer cluster logic onto the wrong axis.
-        The cute non-tcgen05 widening must not leak into the tcgen05
-        branch.
-        """
-        bound = _get_examples_matmul().bind(
-            (
-                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
-                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
-            )
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="tcgen05 requires CUDA capability >= 10.0"
+    )
+    def test_cute_tcgen05_search_surface_includes_loop_orders(self) -> None:
+        """tcgen05 autotuning can explore alternate output-tile orders."""
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
         )
+        bound = _get_examples_matmul().bind(args)
         # Confirm we are on the tcgen05 search branch.
         self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
         flat_keys = {
             key for key, _count, _is_sequence in bound.config_spec.flat_key_layout()
         }
-        self.assertNotIn("loop_orders", flat_keys)
+        self.assertIn("loop_orders", flat_keys)
+
+        gen = ConfigGeneration(bound.config_spec)
+        config = helion.Config(
+            block_sizes=[128, 128, 64],
+            loop_orders=[[1, 0]],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+        )
+        round_tripped = gen.unflatten(gen.flatten(config))
+        self.assertEqual(round_tripped.loop_orders, [[1, 0]])
+        code = bound.to_triton_code(round_tripped)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("StaticPersistentTileScheduler", code)
+
+        actual = bound.compile_config(round_tripped)(*args)
+        torch.testing.assert_close(actual, args[0] @ args[1], atol=0.125, rtol=0.02)
 
     def test_cute_flash_search_surface(self) -> None:
         """The flash-attention autotune surface (Tasks #25 + #28) appears only
@@ -3894,9 +4063,7 @@ class TestCuteAutotuner(TestCase):
         )
         rescale_threshold_choices = flash_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices
         self.assertEqual(rescale_threshold_choices[0], 8.0)
-        self.assertEqual(
-            set(rescale_threshold_choices), {0.0, 4.0, 8.0, 12.0, 16.0, 32.0}
-        )
+        self.assertEqual(set(rescale_threshold_choices), {0.0, 4.0, 8.0, 12.0})
         rescale_chunk_cols_choices = flash_fragments[
             FLASH_RESCALE_CHUNK_COLS_KEY
         ].choices
@@ -3912,8 +4079,10 @@ class TestCuteAutotuner(TestCase):
         self.assertEqual(manual_config[FLASH_RESCALE_CHUNK_COLS_KEY], 64)
         manual_corr_config = dict(attn_bound.config_spec.default_config().config)
         manual_corr_config[FLASH_CORR_REGS_KEY] = 72
+        manual_corr_config[FLASH_OTHER_REGS_KEY] = 40
         attn_bound.config_spec.normalize(manual_corr_config)
         self.assertEqual(manual_corr_config[FLASH_CORR_REGS_KEY], 72)
+        self.assertEqual(manual_corr_config[FLASH_OTHER_REGS_KEY], 40)
         manual_bad_corr_config = dict(attn_bound.config_spec.default_config().config)
         manual_bad_corr_config[FLASH_CORR_REGS_KEY] = 96
         with self.assertRaises(exc.InvalidConfig):
@@ -4044,7 +4213,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_ws_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+            {0.0, 4.0, 8.0, 12.0},
         )
         self.assertEqual(
             set(long_ws_fragments[FLASH_PACKED_REDUCE_KEY].choices), {False, True}
@@ -4245,7 +4414,14 @@ class TestCuteAutotuner(TestCase):
         very_long_dense_fragments = flash_autotune_fragments(64, 256, is_causal=False)
         self.assertEqual(
             very_long_dense_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
-            (8.0, 32.0, 16.0),
+            (8.0, 12.0),
+        )
+        very_long_bf16_fragments = flash_autotune_fragments(
+            64, 384, dtype=torch.bfloat16, is_causal=False
+        )
+        self.assertEqual(
+            very_long_bf16_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (32.0, 16.0, 8.0),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_PERSISTENT_CTAS_PER_SM_KEY].search_choices,
@@ -4396,7 +4572,7 @@ class TestCuteAutotuner(TestCase):
         }
         very_long_dense_search_choices_by_num_kv = {
             256: {
-                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (40,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
                 FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
@@ -4412,7 +4588,7 @@ class TestCuteAutotuner(TestCase):
                 FLASH_KV_STAGE_KEY: (2, 3),
             },
             384: {
-                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (32,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
                 FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
@@ -4428,24 +4604,26 @@ class TestCuteAutotuner(TestCase):
                 FLASH_KV_STAGE_KEY: (2, 3),
             },
             512: {
-                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (32,),
-                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (4,),
                 FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
-                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
-                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_SPLIT_P_ARRIVE_KEY: (True,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (True,),
                 FLASH_E2E_OFFSET0_KEY: (0,),
                 FLASH_KV_ORDER_KEY: ("descending",),
                 FLASH_CGA2_LOCAL_KEY: (False,),
-                FLASH_CORR_REGS_KEY: (72,),
+                FLASH_CORR_REGS_KEY: (80,),
+                FLASH_CORR_TILE_SIZE_KEY: (16, 8),
                 FLASH_EPI_TMA_KEY: (False,),
                 FLASH_EPI_STG_KEY: (True,),
                 FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
                 FLASH_TENSOR_4D_TMA_KEY: (False,),
                 FLASH_KV_STAGE_KEY: (2, 3),
+                FLASH_ROLE_MAP_KEY: ("fa4", "helion"),
             },
             1024: {
-                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (40,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
                 FLASH_E2E_SCHEDULE_KEY: ("16/4", "8/2"),
@@ -4463,9 +4641,10 @@ class TestCuteAutotuner(TestCase):
                 FLASH_KV_STAGE_KEY: (2, 3),
                 FLASH_CLC_KEY: (True,),
                 FLASH_CLC_HEADS_PER_BATCH_KEY: (32,),
+                FLASH_CLC_STAGES_KEY: (2,),
             },
             2048: {
-                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_CORR_TILE_SIZE_KEY: (8, 16),
                 FLASH_SOFTMAX_REGS_KEY: (192, 200),
                 FLASH_ROLE_MAP_KEY: ("helion", "fa4"),
@@ -4591,7 +4770,7 @@ class TestCuteAutotuner(TestCase):
             long_dense_fragments[FLASH_CLC_PDL_KEY].search_choices, (False, True)
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices, (1, 2, 3)
+            long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices, (2, 3)
         )
         self.assertEqual(
             long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
@@ -4674,7 +4853,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+            {0.0, 4.0, 8.0, 12.0},
         )
         long_odd_fragments = flash_autotune_fragments(64, 65, is_causal=False)
         self.assertEqual(
@@ -4689,7 +4868,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
-            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+            {0.0, 4.0, 8.0, 12.0},
         )
         valid_wide_offset = helion.Config(
             block_sizes=[1, 128, 128],
@@ -4744,9 +4923,11 @@ class TestCuteAutotuner(TestCase):
         long_manual_corr = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_corr_regs=72,
+            cute_flash_other_regs=40,
         )
         long_bound.config_spec.normalize(long_manual_corr)
         self.assertEqual(long_manual_corr.config[FLASH_CORR_REGS_KEY], 72)
+        self.assertEqual(long_manual_corr.config[FLASH_OTHER_REGS_KEY], 40)
         long_manual_inf_threshold = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_rescale_threshold=math.inf,
@@ -6200,6 +6381,7 @@ class TestAutotuneBudget(TestCase):
         provider._autotune_metrics = SimpleNamespace(
             num_configs_tested=0,
             num_compile_failures=0,
+            num_worker_failures=0,
             num_accuracy_failures=0,
             num_generations=0,
             kernel_source="",
@@ -6439,8 +6621,57 @@ class TestConfigValuePriors(TestCase):
         ):
             # 1 default + 10 random fill slots (seeds suppressed above).
             gen.random_population_flat(11)
-        self.assertEqual(biased.call_count, 5)
-        self.assertEqual(uniform.call_count, 5)
+        # Duplicate or invalid draws are retried, but attempts continue to
+        # alternate between biased and uniform sampling.
+        self.assertGreaterEqual(biased.call_count + uniform.call_count, 10)
+        self.assertLessEqual(abs(biased.call_count - uniform.call_count), 1)
+
+    def test_population_fill_pads_after_unique_configs_exhausted(self) -> None:
+        gen, _ = self._add_config_gen()
+        default_flat = gen.default_flat()
+        normalized = gen.unflatten(default_flat)
+        gen.config_spec.cute_flash_search_enabled = True
+        with (
+            patch.object(gen, "default_flat", return_value=default_flat),
+            patch.object(gen, "user_seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "biased_random_flat", return_value=default_flat),
+            patch.object(gen, "random_flat", return_value=default_flat),
+            patch.object(gen, "unflatten", return_value=normalized),
+            patch.object(gen, "flatten", return_value=default_flat),
+        ):
+            population = gen.random_population_flat(6)
+        self.assertEqual(population, [default_flat] * 6)
+
+    def test_flash_population_stores_normalized_flat_configs(self) -> None:
+        gen, _ = self._add_config_gen()
+        default_flat = gen.default_flat()
+        normalized = gen.unflatten(default_flat)
+        gen.config_spec.cute_flash_search_enabled = True
+        canonical_flat = [*default_flat]
+        with (
+            patch.object(gen, "default_flat", return_value=default_flat),
+            patch.object(gen, "user_seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "seed_flat_config_pairs", return_value=[]),
+            patch.object(gen, "unflatten", return_value=normalized),
+            patch.object(gen, "flatten", return_value=canonical_flat) as flatten,
+        ):
+            population = gen.random_population_flat(1)
+        self.assertEqual(population, [canonical_flat])
+        flatten.assert_called_once_with(normalized)
+
+    def test_non_flash_population_propagates_generation_failure(self) -> None:
+        gen, _ = self._add_config_gen()
+        gen.config_spec.cute_flash_search_enabled = False
+        with (
+            patch.object(
+                gen,
+                "random_population_flat",
+                side_effect=exc.InvalidConfig("invalid default"),
+            ),
+            self.assertRaisesRegex(exc.InvalidConfig, "invalid default"),
+        ):
+            gen.random_population(1)
 
 
 if __name__ == "__main__":

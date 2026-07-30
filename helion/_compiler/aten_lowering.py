@@ -494,15 +494,28 @@ def apply_dot_requirements(lowering: AtenLowering, node: Node) -> Lowering:
     return lowering
 
 
+def matmul_masked_value(node: Node) -> float | bool | None:
+    """Propagate zero padding through a matmul under fast-math semantics."""
+    if not CompileEnvironment.current().settings.fast_math:
+        # In strict mode, zero multiplied by NaN or infinity is not zero.
+        return None
+    lhs, rhs = cast("tuple[Node, Node]", node.args[:2])
+    return (
+        0 if cached_masked_value(lhs) == 0 and cached_masked_value(rhs) == 0 else None
+    )
+
+
 bmm_lowering = register_lowering(
     torch.ops.aten.bmm.default,
     apply_dot_requirements,
+    masked_value_fn=matmul_masked_value,
 )
 
 
 mm_lowering = register_lowering(
     torch.ops.aten.mm.default,
     apply_dot_requirements,
+    masked_value_fn=matmul_masked_value,
 )
 
 
