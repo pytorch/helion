@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import ast
 import dataclasses
 import functools
 import logging
@@ -762,6 +763,35 @@ class Backend(abc.ABC):
         raise NotImplementedError(
             f"the {self.name!r} backend does not support "
             "to_code(allow_helion_deps=False) yet"
+        )
+
+    def capture_jax_launch_metadata(
+        self, bound: BoundKernel[Any], config: Config | dict[str, object]
+    ) -> object:
+        """Capture jax_fn launch metadata (Pallas only) by compiling the kernel and
+        running a capturing launch on real tensors -- must run *outside* the
+        fake-tensor env. Consumed by :meth:`build_jax_fn_code`; backends without a
+        JAX launch path raise."""
+        raise NotImplementedError(
+            f"the {self.name!r} backend does not support to_code(jax_fn=True)"
+        )
+
+    def build_jax_fn_code(
+        self,
+        body_root: ast.Module,
+        import_lines: list[str],
+        meta: object,
+        *,
+        allow_helion_deps: bool,
+    ) -> ast.Module:
+        """Rewrite the generated module AST into a jax-native standalone module
+        (Pallas only). The entrypoint operates on ``jax.Array`` inputs;
+        ``allow_helion_deps`` toggles whether the launch core is inlined (helion-free)
+        or imported from helion. ``meta`` is the value from
+        :meth:`capture_jax_launch_metadata`. Backends without a JAX launch path raise.
+        """
+        raise NotImplementedError(
+            f"the {self.name!r} backend does not support to_code(jax_fn=True)"
         )
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:

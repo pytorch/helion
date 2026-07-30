@@ -1,7 +1,7 @@
 """Tests for :meth:`helion.runtime.kernel.BoundKernel.to_code` with
 :class:`helion.OutputCodeOptions` -- i.e. emitting dependency-free ("standalone")
 output code that runs with no ``helion`` runtime dependency (``torch`` + the
-backend DSL only)."""
+backend DSL only, or ``jax`` alone for ``jax_fn=True``)."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from helion._testing import skipUnlessPallas
 import helion.language as hl
 
 _FREE = helion.OutputCodeOptions(allow_helion_deps=False)
+_JAX = helion.OutputCodeOptions(allow_helion_deps=False, jax_fn=True)
 
 
 @helion.kernel(config=helion.Config(block_sizes=[32, 32]))
@@ -247,6 +248,94 @@ def pallas_rows_times_two(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_cast_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """bf16 in, f32 out -- the ``.to(float32)`` casts emit ``lax.*`` in the device
+    body, so the jax_fn module must import ``jax.lax``."""
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile].to(torch.float32) + y[tile].to(torch.float32)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_add_sub(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two outputs -- exercises the multi-output launcher return / unpack."""
+    a = torch.empty_like(x)
+    b = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        a[tile] = x[tile] + y[tile]
+        b[tile] = x[tile] - y[tile]
+    return a, b
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Uses dot_general -- a Pallas feature the jax_fn path gates out."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc += x[tile_m, tile_k] @ y[tile_k, tile_n]
+        out[tile_m, tile_n] = acc
+    return out
+
+
+_JAX_FN_FILL = -1e30  # module scalar -> host wrapper lifts it to a (1,) const tensor
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_masked_row_sum(x: torch.Tensor, thr: torch.Tensor) -> torch.Tensor:
+    """Launch args beyond the user inputs: ``hl.specialize(k)`` passes the
+    reduction-dim size as a non-tensor int, and the module scalar ``_JAX_FN_FILL``
+    is lifted to a ``(1,)`` constant tensor. jax_fn export must bake both in."""
+    t, k = x.shape
+    k = hl.specialize(k)
+    out = torch.empty([t], dtype=torch.float32, device=x.device)
+    for tile_t in hl.tile(t):
+        row = x[tile_t, :]
+        keep = row > thr[tile_t][:, None]
+        masked = torch.where(keep, row, _JAX_FN_FILL)
+        z = torch.zeros_like(masked)
+        masked = torch.where(masked > 0.0, masked, z)
+        out[tile_t] = torch.sum(masked, dim=-1)
+    return out
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[8]), static_shapes=False, backend="pallas"
+)
+def pallas_dynamic_rows(x: torch.Tensor) -> torch.Tensor:
+    """static_shapes=False: the jax_fn module must run at any leading (row) dim."""
+    n, _d = x.shape
+    out = torch.empty_like(x)
+    for tile in hl.tile(n):
+        out[tile, :] = x[tile, :] * 2.0
+    return out
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[128]), static_shapes=False, backend="pallas"
+)
+def pallas_dynamic_row_sum(x: torch.Tensor) -> torch.Tensor:
+    """static_shapes=False *reduction*: a per-row reduction makes the host wrapper
+    materialize the row count as a scalar launch arg (the tile mask ``indices <
+    t``); jax_fn export must derive that scalar from the runtime input too, else
+    the mask is wrong at other shapes. (T, k) -> (T,)."""
+    t, _k = x.shape
+    out = torch.empty([t], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(t):
+        row = x[tile, :]
+        out[tile] = torch.sum(
+            torch.exp(row - torch.amax(row, dim=-1, keepdim=True)), dim=-1
+        )
+    return out
+
+
 def _pallas_to_code(
     kernel: Any, args: tuple[object, ...], options: helion.OutputCodeOptions
 ) -> str:
@@ -299,6 +388,218 @@ class TestToCodePallas(TestCase):
                     torch.testing.assert_close(out, x * 2.0)
             finally:
                 sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_standalone_runs(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+
+        x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_add, (x, y), _JAX)
+        # jax_fn module is jax-only: no helion AND no torch.
+        self.assertNotIn("import helion", code)
+        self.assertNotIn("from helion", code)
+        self.assertNotIn("import torch", code)
+        self.assertIn("import jax", code)
+        # Reuses the real pl.kernel compile core via the inlined _pallas_jax_call.
+        self.assertIn("def _pallas_jax_call(", code)
+        self.assertIn("pl.kernel(", code)
+        self.assertIn("def pallas_add(", code)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "pallas_add_jax_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                xj = jnp.asarray(x.detach().float().cpu().numpy())
+                yj = jnp.asarray(y.detach().float().cpu().numpy())
+                out = mod.pallas_add(xj, yj)
+                np.testing.assert_allclose(
+                    np.asarray(out), (x + y).cpu().numpy(), rtol=1e-5, atol=1e-5
+                )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_cast_imports_lax(self) -> None:
+        """A dtype-casting kernel emits ``lax.*`` in the device body; the jax_fn
+        module must import ``jax.lax`` (else NameError)."""
+        import jax.numpy as jnp
+        import numpy as np
+
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        code = _pallas_to_code(pallas_cast_add, (x, y), _JAX)
+        self.assertNotIn("import helion", code)
+        self.assertNotIn("import torch", code)
+        self.assertIn("import jax.lax as lax", code)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "pallas_cast_jax_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                xj = jnp.asarray(x.float().cpu().numpy()).astype(jnp.bfloat16)
+                yj = jnp.asarray(y.float().cpu().numpy()).astype(jnp.bfloat16)
+                out = mod.pallas_cast_add(xj, yj)
+                expected = (x.float() + y.float()).cpu().numpy()
+                np.testing.assert_allclose(
+                    np.asarray(out), expected, rtol=1e-3, atol=1e-3
+                )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_multi_output(self) -> None:
+        """Two-output kernel: exercises the tuple launcher return / multi-out."""
+        import jax.numpy as jnp
+        import numpy as np
+
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_add_sub, (x, y), _JAX)
+        self.assertNotIn("import helion", code)
+        self.assertNotIn("import torch", code)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "pallas_add_sub_jax_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                xj = jnp.asarray(x.cpu().numpy())
+                yj = jnp.asarray(y.cpu().numpy())
+                a, b = mod.pallas_add_sub(xj, yj)
+                np.testing.assert_allclose(
+                    np.asarray(a), (x + y).cpu().numpy(), rtol=1e-5, atol=1e-5
+                )
+                np.testing.assert_allclose(
+                    np.asarray(b), (x - y).cpu().numpy(), rtol=1e-5, atol=1e-5
+                )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_const_and_nontensor_args(self) -> None:
+        """A kernel whose host wrapper passes launch args beyond the user inputs (a
+        lifted module-scalar constant tensor + a non-tensor specialization int):
+        both are baked into the jax_fn module, whose entrypoint still takes only the
+        user tensor inputs."""
+        import jax.numpy as jnp
+        import numpy as np
+
+        t_dim, k_dim = 32, 16
+        x = torch.randn([t_dim, k_dim], device=DEVICE, dtype=torch.float32)
+        thr = torch.zeros([t_dim], device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_masked_row_sum, (x, thr), _JAX)
+        self.assertNotIn("import helion", code)
+        self.assertNotIn("import torch", code)
+        self.assertIn("constants baked in from the original host wrapper", code)
+        self.assertIn("jnp.array(", code)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "masked_row_sum_jax_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                xj = jnp.asarray(x.detach().cpu().numpy())
+                thrj = jnp.asarray(thr.detach().cpu().numpy())
+                out = mod.pallas_masked_row_sum(xj, thrj)
+                m = torch.where(x > thr[:, None], x, torch.full_like(x, _JAX_FN_FILL))
+                m = torch.where(m > 0.0, m, torch.zeros_like(m))
+                expected = m.sum(dim=-1).cpu().numpy()
+                np.testing.assert_allclose(
+                    np.asarray(out), expected, rtol=1e-4, atol=1e-4
+                )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_dynamic_shapes(self) -> None:
+        """A static_shapes=False kernel's jax_fn module derives the grid + output
+        shapes from the runtime input, so it runs at shapes other than the sample."""
+        import jax.numpy as jnp
+        import numpy as np
+
+        d = 128
+        x0 = torch.zeros(512, d, device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_dynamic_rows, (x0,), _JAX)
+        self.assertNotIn("import helion", code)
+        self.assertNotIn("import torch", code)
+        self.assertIn("inputs[0].shape[0]", code)  # derived, not baked
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "dynamic_rows_jax_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                for t in (512, 128, 256):
+                    xj = jnp.arange(t * d, dtype=jnp.float32).reshape(t, d)
+                    out = mod.pallas_dynamic_rows(xj)
+                    self.assertEqual(tuple(out.shape), (t, d))
+                    np.testing.assert_allclose(
+                        np.asarray(out), np.asarray(xj) * 2.0, rtol=1e-6, atol=1e-6
+                    )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_dynamic_shapes_reduction(self) -> None:
+        """A static_shapes=False *reduction* jax_fn module must derive the scalar
+        row-count launch arg from the runtime input too -- checked by running at
+        shapes other than the sample and comparing values (a baked row count would
+        be wrong even where the output shape looks right)."""
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        k = 64
+        x0 = torch.zeros(128, k, device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_dynamic_row_sum, (x0,), _JAX)
+        self.assertNotIn("import helion", code)
+        self.assertNotIn("import torch", code)
+        self.assertIn("jnp.array([inputs[0].shape[0]]", code)  # derived, not baked
+        self.assertNotIn("jnp.array([128]", code)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "dynamic_row_sum_jax_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                for t in (128, 256, 384):
+                    xj = jax.random.normal(jax.random.PRNGKey(t), (t, k), jnp.float32)
+                    out = mod.pallas_dynamic_row_sum(xj)
+                    ref = jnp.sum(jnp.exp(xj - jnp.max(xj, -1, keepdims=True)), -1)
+                    self.assertEqual(tuple(out.shape), (t,))
+                    np.testing.assert_allclose(
+                        np.asarray(out), np.asarray(ref), rtol=1e-2, atol=1e-2
+                    )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_jax_fn_with_helion_deps_imports_launcher(self) -> None:
+        """``jax_fn`` is orthogonal to ``allow_helion_deps``: with deps allowed the
+        entrypoint still operates on ``jax.Array``s, but imports the launch core from
+        helion instead of inlining the jax-only slice."""
+        import jax.numpy as jnp
+        import numpy as np
+
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(
+            pallas_add,
+            (x, y),
+            helion.OutputCodeOptions(jax_fn=True, allow_helion_deps=True),
+        )
+        # Launch core imported from helion, not inlined; still jax-array (no torch).
+        self.assertIn(
+            "from helion.runtime.pallas.launcher import _pallas_jax_call", code
+        )
+        self.assertNotIn("def _pallas_jax_call(", code)
+        self.assertNotIn("import torch", code)
+        self.assertIn("def pallas_add(", code)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "pallas_add_jax_deps_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                xj = jnp.asarray(x.detach().float().cpu().numpy())
+                yj = jnp.asarray(y.detach().float().cpu().numpy())
+                out = mod.pallas_add(xj, yj)
+                np.testing.assert_allclose(
+                    np.asarray(out), (x + y).cpu().numpy(), rtol=1e-5, atol=1e-5
+                )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_unsupported_feature_raises(self) -> None:
+        """A dot_general (matmul) kernel is gated: jax_fn export must raise a clear
+        ``NotImplementedError`` rather than emit a silently-wrong module."""
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(NotImplementedError):
+            _pallas_to_code(pallas_matmul, (x, y), _JAX)
 
 
 if __name__ == "__main__":
