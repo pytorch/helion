@@ -1041,6 +1041,8 @@ class CuteBackend(Backend):
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
+            "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
+            "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
@@ -1056,6 +1058,18 @@ class CuteBackend(Backend):
         )
 
         class HelionCuteDSLOpOverrides(CuteDSLOpOverrides):
+            @staticmethod
+            def floordiv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_binary_op(a, b, "(({a}) // ({b}))")
+
+            @staticmethod
+            def mod(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_binary_op(a, b, "(({a}) % ({b}))")
+
+            @staticmethod
+            def remainder(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides.mod(a, b)
+
             @staticmethod
             def where(
                 condition: CuteDSLArg,
