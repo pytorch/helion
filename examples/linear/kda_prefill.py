@@ -323,9 +323,7 @@ def _gate_cumsum_operands_fixed(
         ).float()
         if activate:
             if has_bias:
-                value = value + dt_bias[tile_h.id * K + tile_k.index].float()[
-                    None, :
-                ]
+                value = value + dt_bias[tile_h.id * K + tile_k.index].float()[None, :]
             value = _activate_gate(
                 value,
                 a_log[tile_h.id],
@@ -468,9 +466,7 @@ def _gate_cumsum_operands_varlen(
         ).float()
         if activate:
             if has_bias:
-                value = value + dt_bias[tile_h.id * K + tile_k.index].float()[
-                    None, :
-                ]
+                value = value + dt_bias[tile_h.id * K + tile_k.index].float()[None, :]
             value = _activate_gate(
                 value,
                 a_log[tile_h.id],
@@ -830,7 +826,7 @@ def _intra_matrices_wide(
             g_anchor = hl.load(
                 g_rows,
                 [anchor, tile_k.index],
-                extra_mask=anchor_token < end,
+                extra_mask=anchor_token < end,  # pyrefly: ignore[bad-argument-type]
             ).float()
             if tile_row_block.id > 0:
                 k_col = hl.load(
@@ -849,12 +845,12 @@ def _intra_matrices_wide(
                     g_anchor[None, :] - g_col,
                     0.0,
                 )
-                q_off = (
-                    q_row * torch.exp2(g_row - g_anchor[None, :])
-                ).to(torch.bfloat16)
-                k_off = (
-                    k_row * torch.exp2(g_row - g_anchor[None, :])
-                ).to(torch.bfloat16)
+                q_off = (q_row * torch.exp2(g_row - g_anchor[None, :])).to(
+                    torch.bfloat16
+                )
+                k_off = (k_row * torch.exp2(g_row - g_anchor[None, :])).to(
+                    torch.bfloat16
+                )
                 k_col_off = (k_col * torch.exp2(off_col_delta)).to(torch.bfloat16)
                 aqk_off = hl.dot(
                     q_off,
@@ -1050,7 +1046,7 @@ def _intra_matrices(
                 g_anchor = hl.load(
                     g_rows,
                     [anchor, tile_k.index],
-                    extra_mask=anchor_row < end,
+                    extra_mask=anchor_row < end,  # pyrefly: ignore[bad-argument-type]
                 ).float()
 
                 if tile_row_block.id == tile_col_block.id:
@@ -1570,8 +1566,19 @@ def _recompute_w_kg(
             extra_mask=row_valid[:, None],
         ).float()
         if is_varlen:
-            chunk_end = end.new_full([], CHUNK_SIZE) + chunk_begin
-            last_token = torch.minimum(chunk_end, end) - 1
+            chunk_end = (
+                end.new_full(  # pyrefly: ignore[missing-attribute]
+                    [], CHUNK_SIZE
+                )
+                + chunk_begin
+            )
+            last_token = (
+                torch.minimum(
+                    chunk_end,
+                    end,  # pyrefly: ignore[bad-argument-type]
+                )
+                - 1
+            )
         else:
             last_token = min(chunk_begin + CHUNK_SIZE, end) - 1
         last = last_token * H + tile_h.id
@@ -1949,9 +1956,7 @@ def chunk_kda_fwd_intra(
 
     preinvert_diagonal = not newton_schulz
     matrix_kernel = (
-        _intra_matrices_wide_forward
-        if preinvert_diagonal
-        else _intra_matrices_wide
+        _intra_matrices_wide_forward if preinvert_diagonal else _intra_matrices_wide
     )
     aqk, akk = matrix_kernel(
         q,
@@ -1966,9 +1971,7 @@ def chunk_kda_fwd_intra(
         newton_schulz,
     )
     solve_kernel = (
-        _intra_solve_recompute_newton
-        if newton_schulz
-        else _intra_solve_recompute
+        _intra_solve_recompute_newton if newton_schulz else _intra_solve_recompute
     )
     w, u = solve_kernel(
         akk,
@@ -2278,7 +2281,7 @@ def chunk_kda(
         scale = k.shape[-1] ** -0.5
     if initial_state is None or initial_state_indices is None:
         raise ValueError("KDA prefill requires an indexed initial-state pool")
-    newton_schulz = bool(kwargs.get("newton_schulz", False))
+    newton_schulz = bool(kwargs.get("newton_schulz"))
 
     q = q.contiguous()
     k = k.contiguous()
