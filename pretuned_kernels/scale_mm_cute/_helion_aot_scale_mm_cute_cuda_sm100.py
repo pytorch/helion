@@ -95,10 +95,27 @@ _SMALL_M_SWAP_KEYS = [
         (4096, 6144),
     )
 ]
+_SMALL_M_SWAP_KEYS.extend(
+    (m, k, n)
+    for m in (2, 8, 16, 32)
+    for k, n in (
+        (2048, 12288),
+        (5120, 5120),
+        (6144, 2048),
+    )
+)
 
 
 def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
-    if m == 32:
+    if m == 32 and (k, n) in {
+        (2048, 12288),
+        (5120, 5120),
+        (6144, 2048),
+    }:
+        block_sizes = [64, 32, 256]
+        ab_stages = 7
+        acc_stages = 1
+    elif m == 32:
         block_sizes = [64, 32, 128]
         ab_stages = 12
         acc_stages = 1
@@ -124,7 +141,7 @@ def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
         "tcgen05_num_epi_warps": 4,
         "tcgen05_l2_swizzle_size": 1,
         "tcgen05_persistence_model": "static_persistent",
-        "tcgen05_one_shot_role_scheduler": True,
+        "tcgen05_one_shot_role_scheduler": n <= block_sizes[0] * 148,
     }
 
 
