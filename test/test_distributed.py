@@ -32,6 +32,7 @@ from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion.autotuner import search_algorithms
 from helion.autotuner.effort_profile import _PROFILES
@@ -658,6 +659,38 @@ class TestDistributedGating(CommonTestCase):
         self.assertLess(spec.max_num_sm_multiplier, 128)
         self.assertIsNotNone(bound.env.process_group_name)
         self.assertIn("ProcessGroupNameNotFound", stderr)
+
+    @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
+    @skipIfRefEager("barrier pid_type restriction only materializes in compiled mode")
+    @skipIfTileIR("TileIR does not support barrier operations")
+    def test_barrier_kernel_restricts_pid_but_keeps_multiplier(self) -> None:
+        # A barrier inside a distributed process forces persistent pid_types but
+        # is NOT a symm-mem signal, so max_num_sm_multiplier must stay unclamped.
+        @helion.kernel(autotune_effort="none")
+        def barrier_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            partial = torch.empty([m], dtype=torch.float32, device=x.device)
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                partial[tile_m] = x[tile_m, :].to(torch.float32).sum(-1)
+            hl.barrier()
+            for tile_m in hl.tile(m):
+                out[tile_m] = partial[tile_m] * 2.0
+            return out
+
+        x = torch.randn([256, 512], device=DEVICE, dtype=torch.float32)
+        self.assertFalse(kernel_uses_symm_mem((x,)))
+        with (
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            patch("helion.runtime.get_num_sm", return_value=200),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            bound = barrier_reduction.bind((x,))
+        spec = bound.env.config_spec
+        self.assertTrue(bound.env.has_barrier)
+        self.assertNotIn("flat", spec.allowed_pid_types)
+        self.assertNotIn("xyz", spec.allowed_pid_types)
+        self.assertEqual(spec.max_num_sm_multiplier, 128)
 
     @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
     @skipIfRefEager("process-group resolution only happens in compiled mode")

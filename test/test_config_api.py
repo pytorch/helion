@@ -428,9 +428,9 @@ class TestSettingsEnv(TestCase):
         )
 
     @skipIfXPU("Uses torch.device('cuda') directly")
-    def test_autotune_force_persistent_clamps_when_distributed(self) -> None:
-        # force_persistent + distributed must still clamp to the signal-pad budget
-        # at construction (restrict_pid_types_for_persistent early-returns for it).
+    def test_autotune_force_persistent_no_symm_mem_keeps_multiplier(self) -> None:
+        # force_persistent + distributed but no symm-mem signal must NOT clamp the
+        # signal-pad budget; the clamp is symm-mem-specific.
         settings = helion.Settings(autotune_force_persistent=True)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
@@ -438,6 +438,26 @@ class TestSettingsEnv(TestCase):
             patch("helion.runtime.get_num_sm", return_value=200),
         ):
             env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env.restrict_pid_types_for_persistent(())
+        self.assertEqual(env.config_spec.max_num_sm_multiplier, 128)
+        self.assertEqual(
+            env.config_spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved"),
+        )
+
+    @skipIfXPU("Uses torch.device('cuda') directly")
+    def test_autotune_force_persistent_clamps_on_symm_mem(self) -> None:
+        # force_persistent + a symm-mem arg must clamp to the signal-pad budget.
+        settings = helion.Settings(autotune_force_persistent=True)
+        device = torch.device("cuda", 0)
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            patch("helion.runtime.get_num_sm", return_value=200),
+            patch("helion._dist_utils.is_symm_mem_tensor", return_value=True),
+        ):
+            env = CompileEnvironment(device, settings)
+            env.restrict_pid_types_for_persistent((torch.empty(1, device=device),))
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
 
     @skipIfXPU("Uses torch.device('cuda') directly")
@@ -458,8 +478,8 @@ class TestSettingsEnv(TestCase):
 
     @skipIfXPU("Uses torch.device('cuda') directly")
     def test_distributed_barrier_limits_pid_types_to_persistent(self) -> None:
-        # A barrier is one of the two persistent signals and must restrict
-        # pid_types.
+        # A barrier restricts pid_types but is NOT a symm-mem signal, so it must
+        # leave max_num_sm_multiplier untouched.
         settings = helion.Settings()
         with (
             patch("torch.distributed.is_initialized", return_value=True),
@@ -473,6 +493,7 @@ class TestSettingsEnv(TestCase):
             env.config_spec.allowed_pid_types,
             ("persistent_blocked", "persistent_interleaved"),
         )
+        self.assertEqual(env.config_spec.max_num_sm_multiplier, 128)
 
     @skipIfXPU("Uses torch.device('cuda') directly")
     def test_distributed_symm_mem_arg_limits_pid_types_to_persistent(self) -> None:
@@ -496,28 +517,30 @@ class TestSettingsEnv(TestCase):
     def test_persistent_block_limit_caps_num_sm_multiplier(self) -> None:
         # max_blocks=10000, 200 SMs -> 10000 // 200 = 50 -> floor pow2 = 32
         settings = helion.Settings()
+        device = torch.device("cuda", 0)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
             patch("helion.runtime.get_num_sm", return_value=200),
+            patch("helion._dist_utils.is_symm_mem_tensor", return_value=True),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
-            env.has_barrier = True
-            env.restrict_pid_types_for_persistent(())
+            env = CompileEnvironment(device, settings)
+            env.restrict_pid_types_for_persistent((torch.empty(1, device=device),))
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
 
     def test_persistent_block_limit_handles_zero_raw_max(self) -> None:
         # max_blocks=144, 148 SMs -> 144 // 148 = 0 -> must clamp to 1
         # without crashing on `1 << -1`.
         settings = helion.Settings()
+        device = torch.device("cuda", 0)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=144),
             patch("helion.runtime.get_num_sm", return_value=148),
+            patch("helion._dist_utils.is_symm_mem_tensor", return_value=True),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
-            env.has_barrier = True
-            env.restrict_pid_types_for_persistent(())
+            env = CompileEnvironment(device, settings)
+            env.restrict_pid_types_for_persistent((torch.empty(1, device=device),))
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 1)
 
     def test_backend_env_var_accepts_cute(self) -> None:
