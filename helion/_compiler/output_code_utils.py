@@ -28,6 +28,7 @@ from .backend import dedupe_preserve_order
 from .backend import read_launcher_source
 
 if TYPE_CHECKING:
+    from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import OutputCodeOptions
     from .backend import LauncherInfo
@@ -74,6 +75,37 @@ def build_dependency_free_code(
     ast.fix_missing_locations(body_root)
     _check_kernel_name_not_shadowed(body_root, import_lines, kernel_name)
     return body_root
+
+
+def capture_jax_launch_metadata(
+    bound: BoundKernel[Any], config: Config | dict[str, object]
+) -> object:
+    """Capture ``to_code(jax_fn=True)`` launch metadata (Pallas only) -- the one
+    non-AST step: the backend compiles the kernel and runs a capturing launch on real
+    tensors, so this must be called *outside* the fake-tensor env. The result feeds
+    :func:`build_jax_fn_module`."""
+    return bound.env.backend.capture_jax_launch_metadata(bound, config)
+
+
+def build_jax_fn_module(
+    bound: BoundKernel[Any],
+    options: OutputCodeOptions,
+    import_lines: list[str],
+    body_root: ast.Module,
+    meta: object,
+) -> ast.Module:
+    """Rewrite ``body_root`` into the jax-native standalone module (AST in, AST out).
+
+    An optional AST processing step for ``to_code(jax_fn=True)``: the emitted
+    entrypoint operates on ``jax.Array`` inputs. Orthogonal to ``allow_helion_deps``:
+    ``False`` inlines the launch core (``jax`` the only runtime dependency), ``True``
+    imports it from helion (``jax`` + ``helion``). ``meta`` is the pre-captured value
+    from :func:`capture_jax_launch_metadata`; ``import_lines`` is mutated in place to
+    the jax import set. Pallas only.
+    """
+    return bound.env.backend.build_jax_fn_code(
+        body_root, import_lines, meta, allow_helion_deps=options.allow_helion_deps
+    )
 
 
 def _reject_body_helion_imports(body_root: ast.Module, kernel_name: str) -> None:
