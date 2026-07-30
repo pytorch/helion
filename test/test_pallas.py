@@ -7,6 +7,7 @@ import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import cast
 import unittest
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
@@ -2150,6 +2151,63 @@ class TestPallas(TestCase):
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
+    @skipIfPallasInterpret(
+        "device-sync semantics need a real TPU; CPU-interpret executes synchronously"
+    )
+    def test_device_sync_waits_for_compiled_output(self) -> None:
+        """``torch.accelerator.synchronize()`` must block on a ``torch.compile`` op.
+
+        Regression guard for torch_tpu#2402: when the device-wide sync returns
+        before a compiled graph finishes, the wall-clock benchmark measures a
+        ``torch.compile`` baseline as ~0ms and its deferred work is charged to
+        the next candidate's timing window (the flash_attention dashboard
+        inflation investigated in the benchmarking fix).
+
+        Non-flaky by construction: instead of an absolute time bound, it compares
+        the device-wide sync against a per-output wait on the *same* heavy
+        compiled op. If the sync materializes the op the two are comparable; if
+        it returns early the ratio collapses (~600x gap observed), so the 0.5x
+        threshold has a large margin.
+        """
+        import time
+
+        import torch.nn.functional as F
+
+        from helion.autotuner.benchmarking import synchronize_device
+
+        q, k, v = (
+            torch.randn(8, 32, 8192, 256, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        compiled = torch.compile(F.scaled_dot_product_attention)
+        for _ in range(5):  # warm up / trigger compilation
+            compiled(q, k, v)
+        synchronize_device()
+
+        def best_ms(stop: Callable[[object], None]) -> float:
+            best = math.inf
+            for _ in range(3):
+                synchronize_device()  # drain before timing
+                start = time.perf_counter()
+                out = compiled(q, k, v)
+                stop(out)
+                best = min(best, (time.perf_counter() - start) * 1000)
+            return best
+
+        from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
+            synchronize as tpu_sync,
+        )
+
+        device_sync_ms = best_ms(lambda out: synchronize_device())
+        per_output_ms = best_ms(lambda out: tpu_sync(out, wait=True))
+        self.assertGreater(
+            device_sync_ms,
+            0.5 * per_output_ms,
+            f"torch.accelerator.synchronize() returned before the compiled op "
+            f"finished (device_sync={device_sync_ms:.2f}ms vs "
+            f"per_output_wait={per_output_ms:.2f}ms) — torch_tpu#2402",
+        )
+
     def test_pallas_matmul_dot_general_lowering_fires_on_no_tiling(self) -> None:
         """No-tiling 2-input matmul emits ``lax.dot_general``, not ``pl.pallas_call``.
 
@@ -2159,8 +2217,8 @@ class TestPallas(TestCase):
         """
         from unittest.mock import patch
 
-        from helion import runtime as helion_runtime
         from helion.runtime.config import Config
+        from helion.runtime.pallas import launcher as pallas_launcher
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def _matmul_dot_general_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -2188,9 +2246,9 @@ class TestPallas(TestCase):
         no_tiling_cfg = Config(block_sizes=[256, 256, 256])
 
         with patch.object(
-            helion_runtime,
+            pallas_launcher,
             "_build_matmul_dot_general_jit_fn",
-            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+            wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
         ) as build_spy:
             compiled_fn = bound.compile_config(no_tiling_cfg)
             result_no_tiling = compiled_fn(x, y)
@@ -2208,9 +2266,9 @@ class TestPallas(TestCase):
         bound_ref = _matmul_dot_general_pin.bind((x, y))
         tiled_cfg = Config(block_sizes=[128, 128, 128])
         with patch.object(
-            helion_runtime,
+            pallas_launcher,
             "_build_matmul_dot_general_jit_fn",
-            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+            wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
         ) as build_spy_tiled:
             compiled_ref = bound_ref.compile_config(tiled_cfg)
             result_tiled = compiled_ref(x, y)
@@ -2227,6 +2285,37 @@ class TestPallas(TestCase):
             5e-2,
             f"dot_general output diverged from pallas_call by {max_abs_diff}",
         )
+
+    def test_pallas_matmul_dot_general_lowering_pins_default_precision(self) -> None:
+        """The no-tiling dot-general shortcut must not inherit JAX global precision."""
+        from unittest.mock import patch
+
+        import jax
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas import launcher as pallas_launcher
+
+        spec: dict[str, object] = {
+            "lhs_tensor_arg_index": 0,
+            "rhs_tensor_arg_index": 1,
+            "out_dtype": "jnp.float32",
+            "f32_accumulator": False,
+        }
+        with (
+            patch.object(jax, "jit", lambda fn: fn),
+            patch.object(jax.lax, "dot_general", wraps=jax.lax.dot_general) as dot_spy,
+        ):
+            fn = pallas_launcher._build_matmul_dot_general_jit_fn(spec)
+            result = cast(
+                "Any",
+                fn(
+                    jnp.ones((2, 3), dtype=jnp.float32),
+                    jnp.ones((3, 4), dtype=jnp.float32),
+                ),
+            )
+
+        self.assertEqual(result.shape, (2, 4))
+        self.assertEqual(dot_spy.call_args.kwargs["precision"], "default")
 
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
@@ -3262,6 +3351,35 @@ class TestPallas(TestCase):
         self.assertNotIn("_smem_arg_indices", code)
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
+
+    @skipIfPallasInterpret("slicing error in JAX interpret mode")
+    def test_scalar_row_ragged_col_store(self) -> None:
+        """A store with a scalar row index and a ragged-tile column on the
+        same tensor must not misalign the value slice with the tensor's dims.
+
+        ``sliced_value_for_store`` clamp-slices a ``TilePattern`` dim whose
+        last tile is narrower than ``block_size`` (here ``m=20`` -> a
+        remainder tile of 108 against ``block_size=128``). The literal ``0`` row
+        index is a scalar (``ArbitraryIndexPattern``): it consumes a tensor
+        dim but is squeezed out of the *value*'s shape, so it must not get a
+        slice entry of its own -- otherwise the clamp slice is built against
+        the wrong dimension of the (lower-rank) value and Pallas rejects it
+        with "Too many indices".
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_row_ragged_col_store(x: torch.Tensor) -> torch.Tensor:
+            _n, m = x.shape
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(m):
+                out[0, tile_m] = x[0, tile_m] * 2.0
+            return out
+
+        x = torch.randn(1, 20, device=DEVICE)
+        _, result = code_and_output(
+            scalar_row_ragged_col_store, (x,), block_sizes=[128]
+        )
+        torch.testing.assert_close(result, x * 2.0)
 
     @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
@@ -4734,9 +4852,9 @@ class TestPallas(TestCase):
         consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
         multiplicative load mask.
 
-        The deferral is an FX-graph pass, so it is independent of the pallas loop
-        type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
-        generic (non-attention) per-token jagged projection whose partial tiles
+        The deferral is an FX-graph pass, so it is independent of worklist
+        flattening -- asserted here for ordinary ``fori_loop`` and flattened
+        ``unroll`` on a generic per-token jagged projection whose partial tiles
         make the mask load-bearing.
         """
 
@@ -4766,13 +4884,14 @@ class TestPallas(TestCase):
             s, e = int(offsets[i]), int(offsets[i + 1])
             ref[s:e] = torch.bmm(x[s:e].transpose(0, 1), w).transpose(0, 1)
 
-        for loop_type in ("fori_loop", "compact_worklist"):
-            with self.subTest(loop_type=loop_type):
+        for loop_type, grouping in (("fori_loop", 0), ("unroll", 1)):
+            with self.subTest(loop_type=loop_type, grouping=grouping):
                 code, out = code_and_output(
                     jagged_proj,
                     (x, w, offsets),
                     block_sizes=[block],
                     pallas_loop_type=loop_type,
+                    pallas_worklist_grouping=grouping,
                 )
                 # x's masked load is raw (no eager ``* mask``), feeds a transpose,
                 # and the mask reappears as a post-transpose ``jnp.where``.
@@ -4781,11 +4900,11 @@ class TestPallas(TestCase):
                 self.assertRegex(producer, r"= x\[")
                 self.assertNotIn("* mask", producer)
                 self.assertIn("jnp.where", code)
-                # compact_worklist matches the eager reference on the partial
-                # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
+                # Worklist flattening matches the eager reference on the partial
+                # tiles. fori_loop miscompiles jagged tiles in pallas interpret
                 # (a pre-existing, unrelated issue), so it is not a sound numeric
                 # oracle here; for it we assert only the codegen above.
-                if loop_type == "compact_worklist":
+                if grouping == 1:
                     torch.testing.assert_close(
                         out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2
                     )
@@ -4824,7 +4943,11 @@ class TestPallas(TestCase):
         )
 
         # Eager mask retained on the direct dot input; nothing to defer past.
-        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+        self.assertRegex(
+            code,
+            r"(y\[[^\n]*\][^\n]*\*\s*mask_\d+\.astype|"
+            r"mask_\d+\.astype[^\n]*\*[^\n]*y\[)",
+        )
         self.assertNotRegex(code, r"jnp\.transpose\(")
 
         s, e = 0, 50

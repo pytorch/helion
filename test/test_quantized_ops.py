@@ -95,6 +95,85 @@ class TestCuteQuantizedOps(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(hi, _dequant_e2m1((raw_i32 >> 4) & 0xF))
         self.assertIn("_cute_float4_e2m1fn_x2_to_float32", code)
 
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="FP4 conversion instructions require Blackwell"
+    )
+    def test_load_float4_e2m1fn_x16_to_float16(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def fp4_to_f16_lanes(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                (offsets.size(0), 16), dtype=torch.float16, device=x.device
+            )
+            for tile in hl.tile(offsets.size(0), block_size=4):
+                lanes = hl.load_float4_e2m1fn_x16_to_float16(
+                    x,
+                    offsets[tile],
+                    extra_mask=tile.index < offsets.size(0),
+                )
+                for i in hl.static_range(16):
+                    out[tile, i] = lanes[i]
+            return out
+
+        raw = torch.arange(16, dtype=torch.uint8, device=DEVICE) * 17
+        offsets = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(fp4_to_f16_lanes, (raw, offsets))
+
+        raw_i32 = raw.view(2, 8).to(torch.int32)
+        nibbles = torch.stack((raw_i32 & 0xF, (raw_i32 >> 4) & 0xF), dim=-1)
+        expected = _dequant_e2m1(nibbles.reshape(2, 16)).to(torch.float16)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("cute.arch.load", code)
+        self.assertIn("cutlass.Uint64", code)
+        self.assertIn("_cute_float4_e2m1fn_x16_to_float16", code)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Packed BF16 conversion requires Blackwell"
+    )
+    def test_load_bfloat16_x16_to_float16(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def bf16_to_f16_lanes(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                (offsets.size(0), 16), dtype=torch.float16, device=x.device
+            )
+            for tile in hl.tile(offsets.size(0), block_size=4):
+                lanes = hl.load_bfloat16_x16_to_float16(
+                    x,
+                    offsets[tile],
+                    extra_mask=tile.index < offsets.size(0),
+                )
+                for i in hl.static_range(16):
+                    out[tile, i] = lanes[i]
+            return out
+
+        values = torch.randn(32, dtype=torch.bfloat16, device=DEVICE)
+        offsets = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(bf16_to_f16_lanes, (values, offsets))
+
+        torch.testing.assert_close(result, values.view(2, 16).to(torch.float16))
+        self.assertIn("cute.arch.load", code)
+        self.assertIn("_cute_bfloat16_x16_to_float16", code)
+
+    @skipIfNotCUDA()
+    def test_grouped_row_index_precedence(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def grouped_row_indices(out: torch.Tensor) -> torch.Tensor:
+            for program in hl.grid(out.size(0)):
+                row = program * 2 + 1
+                out[program] = (row // 128) * 100 + row % 32
+            return out
+
+        out = torch.empty(130, dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(grouped_row_indices, (out,))
+
+        program = torch.arange(130, dtype=torch.int64, device=DEVICE)
+        row = program * 2 + 1
+        expected = (row // 128) * 100 + row % 32
+        torch.testing.assert_close(result, expected)
+        self.assertIn("//", code)
+        self.assertIn("%", code)
+
 
 @onlyBackends(["triton"])
 class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):

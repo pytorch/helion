@@ -853,10 +853,29 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 result[tile] = x[tile]
             return result
 
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[32, 32],
+                indexing=["tensor_descriptor", "pointer"],
+            ),
+        )
+        def copy_int_dict(xs: dict[int, torch.Tensor]) -> torch.Tensor:
+            x = xs[0]
+            result = torch.empty(x.size(), device=x.device, dtype=x.dtype)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile]
+            return result
+
         x = torch.randn([64, 1024], device=DEVICE, dtype=HALF_DTYPE)
-        code, result = code_and_output(copy_dict, ({"x": x},))
-        torch.testing.assert_close(result, x)
-        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+        for kernel, args in (
+            (copy_dict, ({"x": x},)),
+            (copy_int_dict, ({0: x},)),
+        ):
+            code, result = code_and_output(kernel, args)
+            torch.testing.assert_close(result, x)
+            self.assertNotIn(get_tensor_descriptor_fn_name(), code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfRefEager("Test checks bound kernel specialization cache")

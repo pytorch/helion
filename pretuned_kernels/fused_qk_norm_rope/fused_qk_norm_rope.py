@@ -15,31 +15,13 @@ import torch
 import helion
 import helion.language as hl
 
-# Optional vLLM baseline: the production composition this is benchmarked against.
-# The pretuned test env has only torch + helion (guarded import); the nightly
-# benchmark workflow installs vLLM, so main() then compares against the real
-# vLLM ops (rms_norm + RotaryEmbedding.forward_static). Both pieces must import
-# for the vLLM baseline to be used.
+# Optional vLLM baseline: the production kernel this is benchmarked against. The
+# pretuned test env has only torch + helion (guarded import); the nightly
+# benchmark workflow installs vLLM, so main() then compares against the real op.
 try:
-    from vllm import ir as _vllm_ir
-    from vllm.model_executor.layers.rotary_embedding import (
-        RotaryEmbedding as _VllmRotaryEmbedding,
-    )
+    import vllm  # noqa: F401  (registers torch.ops._C.*)
 
-    _HAS_VLLM = hasattr(_vllm_ir.ops, "rms_norm") and hasattr(
-        _VllmRotaryEmbedding, "forward_static"
-    )
-    if _HAS_VLLM:
-        # Match vLLM's CUDA eager default (see cuda.py get_default_ir_op_priority)
-        # so the baseline dispatches rms_norm to the compiled vllm_c kernel
-        # instead of the pure-PyTorch "native" fallback -- otherwise the vLLM
-        # baseline is artificially slow (and logs a "Priority not set" warning).
-        # import_ir_kernels() registers the platform's impls (e.g. vllm_c) that
-        # set_default requires; it's lazily imported, like vLLM's own KernelConfig.
-        from vllm.platforms import current_platform
-
-        current_platform.import_ir_kernels()
-        _vllm_ir.ops.rms_norm.set_default(["vllm_c", "native"])
+    _HAS_VLLM = hasattr(torch.ops._C, "fused_qk_norm_rope")
 except ImportError:
     _HAS_VLLM = False
 
@@ -211,30 +193,21 @@ def _fused_qk_norm_rope_vllm(
     position_ids: torch.Tensor,
     forced_token_heads_per_warp: int = -1,  # dummy
 ) -> None:
-    """vLLM baseline: a Python composition of vLLM's rms_norm + RoPE ops.
-
-    Replicates the production baseline (vLLM PR 44010): per-head RMSNorm on the Q
-    and K heads (via ``vllm.ir.ops.rms_norm``) followed by rotary embedding (via
-    ``RotaryEmbedding.forward_static``), written back into ``qkv`` in place.
-    """
-    q_size = num_heads_q * head_dim
-    kv_size = num_heads_k * head_dim
-
-    q, k, _v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-
-    q_by_head = q.view(*q.shape[:-1], q.shape[-1] // head_dim, head_dim)
-    q_by_head = _vllm_ir.ops.rms_norm(q_by_head, q_weight, eps)
-    q = q_by_head.view(q.shape)
-
-    k_by_head = k.view(*k.shape[:-1], k.shape[-1] // head_dim, head_dim)
-    k_by_head = _vllm_ir.ops.rms_norm(k_by_head, k_weight, eps)
-    k = k_by_head.view(k.shape)
-
-    q, k = _VllmRotaryEmbedding.forward_static(
-        position_ids, q, k, head_dim, cos_sin_cache.shape[1], cos_sin_cache, is_neox
+    """vLLM compiled baseline (torch.ops._C.fused_qk_norm_rope)."""
+    torch.ops._C.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+        forced_token_heads_per_warp,
     )
-    qkv[:, :q_size].copy_(q)
-    qkv[:, q_size : q_size + kv_size].copy_(k)
 
 
 def _baselines() -> list[tuple[str, object]]:

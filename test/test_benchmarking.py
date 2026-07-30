@@ -197,10 +197,16 @@ def test_attention_compiler_flash_seed_config_falls_back_to_seed_list():
             compiler_seed_configs=[
                 SimpleNamespace(
                     config={
+                        "block_sizes": [64, 64],
+                        "num_warps": 8,
+                    }
+                ),
+                SimpleNamespace(
+                    config={
                         "block_sizes": [1, 128, 128],
                         "cute_flash_kv_order": "ascending",
                     }
-                )
+                ),
             ],
         )
     )
@@ -210,6 +216,32 @@ def test_attention_compiler_flash_seed_config_falls_back_to_seed_list():
     assert config == {
         "block_sizes": [1, 128, 128],
         "cute_flash_kv_order": "ascending",
+    }
+
+
+def test_attention_compiler_flash_seed_config_skips_nonflash_default():
+    bound = SimpleNamespace(
+        config_spec=SimpleNamespace(
+            compiler_default_config=object(),
+            compiler_seed_configs=[
+                SimpleNamespace(
+                    config={
+                        "block_sizes": [1, 128, 128],
+                        "cute_flash_topology": "fa4",
+                    }
+                )
+            ],
+            default_config=lambda: SimpleNamespace(
+                config={"block_sizes": [64, 64], "num_warps": 8}
+            ),
+        )
+    )
+
+    config = compare_attention_backends._compiler_flash_seed_config(bound, "cute")
+
+    assert config == {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_topology": "fa4",
     }
 
 
@@ -270,6 +302,30 @@ def test_attention_helion_cute_timer_selects_bench_fn():
         is None
     )
     assert calls == ["get_do_bench"]
+
+
+@pytest.mark.parametrize(
+    "two_cta_marker",
+    (
+        "cute_tcgen05_flash.CtaGroup.TWO",
+        "is_two_cta=True",
+        "'use_2cta_instrs': True",
+    ),
+)
+def test_attention_codegen_markers_accept_generated_tcgen05_alias(
+    two_cta_marker: str,
+):
+    code = f"""
+from cutlass.cute.nvgpu import tcgen05 as cute_tcgen05_flash
+cute_tcgen05_flash.commit(ptr, mask, {two_cta_marker})
+PipelineTmaUmma.create()
+"""
+
+    assert compare_attention_backends._helion_codegen_markers(code) == {
+        "uses_tcgen05": True,
+        "uses_tcgen05_two_cta": True,
+        "uses_tma_umma_pipeline": True,
+    }
 
 
 def test_attention_markdown_and_wide_csv_include_timer():

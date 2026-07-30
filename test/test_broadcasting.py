@@ -210,7 +210,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, a + b[None, :, None])
 
     @skipIfRefEager("ref-eager does not support non-last-dim implicit broadcast")
-    @xfailIfPallas("scatter: only indirect dim 0 is supported")
     def test_implicit_broadcast_mixed_tile_and_slice(self):
         """b[tile0, 0:K] broadcast into a[tile0, tile1, 0:K]."""
 

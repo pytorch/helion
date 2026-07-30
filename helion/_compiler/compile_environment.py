@@ -58,43 +58,84 @@ class TensorDescriptorLayoutGuard:
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
 
 
-def _is_supported_tensor_descriptor_layout_guard_source(source: Source) -> bool:
+def _is_supported_tensor_input_source(source: Source) -> bool:
+    if isinstance(source, LocalSource):
+        return True
+    if isinstance(source, GetItemSource):
+        return (
+            isinstance(source.index, (int, str))
+            and not source.index_is_slice
+            and _is_supported_tensor_input_source(source.base)
+        )
+    return False
+
+
+def _is_supported_tensor_descriptor_layout_guard_source(
+    source: Source,
+    root_values: typing.Mapping[str, object],
+) -> bool:
     if isinstance(source, LocalSource):
         return True
     if isinstance(source, GetItemSource):
         return (
             isinstance(source.index, int)
             and not source.index_is_slice
-            and _is_supported_tensor_descriptor_layout_guard_source(source.base)
+            and _is_supported_tensor_descriptor_layout_guard_source(
+                source.base, root_values
+            )
+            and isinstance(
+                _replay_tensor_input_source(source.base, root_values), (list, tuple)
+            )
         )
     return False
 
 
-def _replay_tensor_descriptor_layout_guard_source(
+def _replay_tensor_input_source(
     source: Source,
     root_values: typing.Mapping[str, object],
 ) -> object:
     if isinstance(source, LocalSource):
         return root_values.get(source.local_name)
     if isinstance(source, GetItemSource):
-        if not isinstance(source.index, int) or source.index_is_slice:
+        if not isinstance(source.index, (int, str)) or source.index_is_slice:
             return None
-        base = _replay_tensor_descriptor_layout_guard_source(source.base, root_values)
-        if isinstance(base, (list, tuple)) and 0 <= source.index < len(base):
+        base = _replay_tensor_input_source(source.base, root_values)
+        if (
+            isinstance(source.index, int)
+            and isinstance(base, (list, tuple))
+            and 0 <= source.index < len(base)
+        ):
             return base[source.index]
+        if isinstance(base, dict) and source.index in base:
+            return base[source.index]
+        if isinstance(source.index, str) and base is not None:
+            return getattr(base, source.index, None)
     return None
 
 
-def _find_tensor_descriptor_layout_guard_source(
+def _find_tensor_input_source(
     target: torch.Tensor,
     value: object,
     source: Source,
 ) -> Source | None:
     if value is target:
         return source
-    if isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            result = _find_tensor_descriptor_layout_guard_source(
+    if isinstance(value, dict):
+        items = value.items()
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        items = (
+            (field.name, getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        )
+    elif isinstance(value, tuple) and hasattr(value, "_fields"):
+        items = ((name, getattr(value, name)) for name in value._fields)
+    elif isinstance(value, (list, tuple)):
+        items = enumerate(value)
+    else:
+        return None
+    for index, item in items:
+        if isinstance(index, (int, str)):
+            result = _find_tensor_input_source(
                 target,
                 item,
                 GetItemSource(source, index),
@@ -275,17 +316,16 @@ class CompileEnvironment:
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
-        self.specialized_strides: set[tuple[str, int]] = set()
+        self.specialized_strides: set[TensorPropertySource] = set()
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
-        self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
+        self._tensor_input_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
-        # Set by the Pallas backend when config["pallas_loop_type"] ==
-        # "compact_worklist" and detect_compact_worklist_plan succeeds; gates the
-        # whole compact-worklist codegen path (see helion/_compiler/pallas/
-        # compact_worklist.py).
+        # Set by the Pallas backend when worklist grouping is 1 or 2 and
+        # detect_compact_worklist_plan succeeds; gates the compact-worklist
+        # codegen path (see helion/_compiler/pallas/compact_worklist.py).
         self.compact_worklist_plan: CompactWorklistPlan | None = None
         # Final resident-cache decision for this concrete config.  This includes
         # the cached physical window integer; runtime/codegen consumers must read
@@ -311,6 +351,7 @@ class CompileEnvironment:
         # them to host-call arg positions.
         self.compact_worklist_offset_params: list[str] = []
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self._input_symint_cache: dict[Source, torch.SymInt] = {}
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
@@ -417,8 +458,8 @@ class CompileEnvironment:
         """Specialize dynamic kernels on TD-relevant stride layout predicates."""
         if self.settings.static_shapes:
             return
-        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
-        if source is None:
+        source = self.tensor_input_source(fake_tensor)
+        if source is None or not self._is_tensor_descriptor_layout_guard_source(source):
             return
         guard = self.tensor_descriptor_layout_guards.setdefault(
             source,
@@ -435,15 +476,26 @@ class CompileEnvironment:
     def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
         if self.settings.static_shapes:
             return True
-        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
-        return source is not None and source in self.tensor_descriptor_layout_guards
+        source = self.tensor_input_source(fake_tensor)
+        return (
+            source is not None
+            and self._is_tensor_descriptor_layout_guard_source(source)
+            and source in self.tensor_descriptor_layout_guards
+        )
 
-    def _tensor_descriptor_layout_guard_source(
-        self, fake_tensor: torch.Tensor
-    ) -> Source | None:
+    def _is_tensor_descriptor_layout_guard_source(self, source: Source) -> bool:
+        from .host_function import HostFunction
+
+        return _is_supported_tensor_descriptor_layout_guard_source(
+            source,
+            HostFunction.current().params.arguments,
+        )
+
+    def tensor_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
+        """Return a replayable source for a direct or container tensor input."""
         cache_key = id(fake_tensor)
-        if cache_key in self._tensor_descriptor_layout_guard_source_cache:
-            return self._tensor_descriptor_layout_guard_source_cache[cache_key]
+        if cache_key in self._tensor_input_source_cache:
+            return self._tensor_input_source_cache[cache_key]
 
         source = self.input_sources.get(fake_tensor)
         from .host_function import HostFunction
@@ -451,15 +503,14 @@ class CompileEnvironment:
         root_values = HostFunction.current().params.arguments
         if (
             source is not None
-            and _is_supported_tensor_descriptor_layout_guard_source(source)
-            and _replay_tensor_descriptor_layout_guard_source(source, root_values)
-            is fake_tensor
+            and _is_supported_tensor_input_source(source)
+            and _replay_tensor_input_source(source, root_values) is fake_tensor
         ):
             result = source
         else:
             result = None
             for local_name, value in root_values.items():
-                candidate = _find_tensor_descriptor_layout_guard_source(
+                candidate = _find_tensor_input_source(
                     fake_tensor,
                     value,
                     LocalSource(local_name, is_input=True),
@@ -468,7 +519,7 @@ class CompileEnvironment:
                     result = candidate
                     break
 
-        self._tensor_descriptor_layout_guard_source_cache[cache_key] = result
+        self._tensor_input_source_cache[cache_key] = result
         return result
 
     def tensor_descriptor_layout_signature(
@@ -797,6 +848,33 @@ class CompileEnvironment:
         if result is None:
             result = self.create_unbacked_symint(hint)
             self._symint_cache[key] = result
+        return result
+
+    def input_symint(self, value: int | torch.SymInt, source: Source) -> torch.SymInt:
+        """Represent an input property with an independent symbolic value.
+
+        FakeTensor may express a contiguous stride in terms of a size symbol.  A
+        dynamic kernel can be reused with a different layout, so exposing that
+        expression to user code would incorrectly couple the runtime stride to
+        the runtime size.
+        """
+        result = self._input_symint_cache.get(source)
+        if result is None:
+            hint = self.size_hint(value)
+            expr = self.shape_env.create_symbol(
+                hint,
+                source,
+                dynamic_dim=DimDynamic.DYNAMIC,
+            )
+            result = typing.cast(
+                "torch.SymInt",
+                self.shape_env.create_symintnode(
+                    expr,
+                    hint=hint,
+                    source=source,
+                ),
+            )
+            self._input_symint_cache[source] = result
         return result
 
     def _normalize_shape_to_block_vars(

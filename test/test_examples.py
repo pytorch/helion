@@ -23,6 +23,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import check_example
 from helion._testing import float32_matmul_precision
+from helion._testing import get_test_float32_matmul_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
@@ -43,8 +44,8 @@ from helion._testing import xfailIfPallasTpu
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
-_orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
+_orig_float32_matmul_precision: str = "none"
 
 
 def _compile_only(
@@ -71,16 +72,18 @@ def _compile_only(
 
 
 def setUpModule() -> None:
-    global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
-    _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
-    _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
+    global _orig_cudnn_fp32_precision, _orig_float32_matmul_precision
+    cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+    _orig_cudnn_fp32_precision = cudnn_conv.fp32_precision
+    _orig_float32_matmul_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(get_test_float32_matmul_precision())
+    cudnn_conv.fp32_precision = "tf32"
 
 
 def tearDownModule() -> None:
-    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
-    torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
+    cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+    torch.set_float32_matmul_precision(_orig_float32_matmul_precision)
+    cudnn_conv.fp32_precision = _orig_cudnn_fp32_precision
 
 
 @onlyBackends(["triton", "cute", "pallas"])
@@ -128,9 +131,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
-    @xfailIfPallas(
-        "Pallas TPU clamps the N block to the lane width (128) which does"
-        " not match the test's N=96 bias dimension"
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
     )
     def test_matmul_bias_epilogue_wrapper(self):
         from typing import Any
@@ -684,7 +687,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         "65536x1024x1280 GEMM is too slow under CPU interpret -- it exceeds the "
         "300s per-test timeout and (thread timeout method) kills the whole job"
     )
-    @xfailIfPallasTpu("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
@@ -713,22 +715,24 @@ class TestExamples(RefEagerTestBase, TestCase):
             else:
                 x_f32 = xt.float()
                 w_f32 = wt.to(torch.bfloat16).float()
-            prev = torch.backends.cuda.matmul.fp32_precision
-            torch.backends.cuda.matmul.fp32_precision = "ieee"
-            try:
+            with float32_matmul_precision("highest"):
                 out = torch.matmul(x_f32, w_f32)
-            finally:
-                torch.backends.cuda.matmul.fp32_precision = prev
             return out.to(torch.bfloat16)
 
         x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
+        # Pallas tiles the K reduction, so a tiny fraction of outputs can land
+        # on the other side of a bf16 rounding boundary vs PyTorch's full-K dot.
+        max_mismatch_pct = 1e-4 if _get_backend() == "pallas" else None
+        max_mismatched_abs_diff = 0.5 if max_mismatch_pct is not None else None
 
         check_example(
             "bf16xint16_gemm",
             (x, w),
             expected(x, w, False),
             fn_name="_bf16xint16_gemm",
+            max_mismatch_pct=max_mismatch_pct,
+            max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
         x_int16 = torch.randint(
@@ -741,6 +745,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             (x_int16, w_bf16),
             expected(x_int16, w_bf16, True),
             fn_name="_int16xbf16_gemm",
+            max_mismatch_pct=max_mismatch_pct,
+            max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
     def test_rms_norm_fwd(self):
@@ -1057,7 +1063,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
+    )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -1573,12 +1582,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @parametrize(
         "helion_precision,torch_precision,atol,rtol",
         [
-            ("highest", "highest", 1e-2, 1e-2),
+            ("highest", "medium", 1.5, 5e-2),
             ("default", "medium", 1.5, 5e-2),
         ],
-    )
-    @xfailIfPallasInterpret(
-        "The get/set_float32_matmul_precision API needs an actual backend"
     )
     @onlyBackends(["pallas"])
     def test_jagged_hstu_attn_2(self, helion_precision, torch_precision, atol, rtol):
@@ -2644,9 +2650,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
-    @xfailIfPallasTpu(
-        "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
-    )
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,

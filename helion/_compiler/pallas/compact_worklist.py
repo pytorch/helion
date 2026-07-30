@@ -1,4 +1,4 @@
-"""Compile-time plan + resolver for the ``compact_worklist`` Pallas loop type.
+"""Compile-time plan and resolver for Pallas compact-worklist flattening.
 
 Recognises the supported jagged loop nest, captures each axis's ``(base,
 length)`` as resolvable host AST, and renders the per-kernel ``jnp`` gathers
@@ -18,9 +18,8 @@ The supported loop shape is::
             out[tile_m] = finalize(acc)  # store in the compact region
 
 Detection rejects anything outside this shape with ``exc.InvalidConfig`` so the
-autotuner scores an offered-but-unmatched config ``inf`` and skips it (rather
-than aborting), while an explicit hardcoded ``compact_worklist`` surfaces the
-clear error.
+autotuner scores an offered-but-unmatched grouping-1 config ``inf`` and skips it,
+while an explicit grouping of 1 surfaces the clear error.
 """
 
 from __future__ import annotations
@@ -115,6 +114,8 @@ class CompactWorklistPlan:
     # bound (NOT assumed to be base.shape[0] - 1, which only holds for the
     # offsets-array idiom).
     num_owners_expr: str = ""
+    # Number of consecutive compact base tiles combined into one work item.
+    grouping: int = 1
 
     @property
     def owner_axis(self) -> Axis:
@@ -429,7 +430,7 @@ def build_resident_cache_admission(
     candidates, account for their scratch footprint, choose the one physical
     resident window, and drop optional prep when it cannot fit.
     """
-    from ...runtime import compact_ordered_physical_window
+    from ...runtime.pallas.launcher import compact_ordered_physical_window
 
     resident_operands = _tensor_footprints(
         host_args,
@@ -475,45 +476,28 @@ def elide_installed_prep_load_masks(
     graph: torch.fx.Graph,
     load_tail_fills: Mapping[str, float],
 ) -> None:
-    """Drop the redundant per-tile OOB masks on loads whose prep cache was installed.
+    """Drop redundant masks after resident prep lowerings are installed.
 
-    ``load_tail_fills`` maps the load node name of each ACTUALLY-installed prep lowering
-    to the value that lowering's refill writes into the cache's padded tail (its
-    ``tail_fill_value``).  Because the refill already wrote that value there, a
-    downstream ``_mask_to`` with the same fill is redundant; deleting it also lets
-    Mosaic fold the transpose into the matmul push.
-
-    Called from prep-lowering installation with only the lowerings that survived
-    validation, so a prep that fell back to resident-only leaves its load's mask in
-    place (correctness is never coupled to admission-time optimism).  Elision is keyed
-    on the declared ``tail_fill_value``: a flash-style ``_mask_to(scores, -inf)`` (fill
-    != the cache's tail fill, and downstream of the dot) is preserved automatically.
-    Non-resident (streamed) deferred loads keep their unknown masked value untouched.
+    ``load_tail_fills`` maps each installed load to the value written into its prep
+    cache's padded tail. Deferred loads without an installed prep remain unknown and
+    keep their masks.
     """
     from ..host_function import HostFunction
     from ..node_masking import remove_unnecessary_masking
 
     if not load_tail_fills:
         return
-    # ``remove_unnecessary_masking`` recomputes masked values, which for loop-carried
-    # (phi) nodes walks the enclosing graphs via ``DeviceIR.current()``; make the device
-    # IR current since prep-lowering install runs during codegen, outside the pass.
+    # Loop placeholders resolve masked values through the enclosing device IR.
     with HostFunction.current().device_ir:
         for node in graph.nodes:
-            fill = load_tail_fills.get(node.name)
-            if fill is not None:
-                # The refill wrote ``fill`` into the padded tail: declare it so the
-                # matching-fill ``_mask_to`` downstream is judged redundant.
-                node.meta["masked_value"] = fill
-            elif (
-                node.meta.get("masked_value") is None
-                and "pallas_deferred_mask_block_ids" in node.meta
-            ):
-                # A non-resident deferred load: keep its unknown masked value so its
-                # (still-needed) deferred mask is preserved.
+            if node.op == "placeholder":
+                # Prep installation changes inner loads and their descendants only.
                 continue
+            if node.name in load_tail_fills:
+                node.meta["masked_value"] = load_tail_fills[node.name]
+            elif "pallas_deferred_mask_block_ids" in node.meta:
+                node.meta["masked_value"] = None
             else:
-                # Drop the stale cache so masked values recompute from the loads above.
                 node.meta.pop("masked_value", None)
         remove_unnecessary_masking(graph)
 
@@ -709,6 +693,7 @@ def render_build_worklist(
             f"    dep_len = {ast.unparse(dep_len_resolved)}",
         ]
         dep_kwargs = ", dep_base=dep_base, dep_len=dep_len"
+    grouping_kwarg = "" if plan.grouping == 1 else f", grouping={plan.grouping}"
 
     # The owner-count expression (e.g. "offsets.shape[0] - 1" or "B") may
     # introduce additional free host names the builder must take as params.
@@ -725,7 +710,8 @@ def render_build_worklist(
         *dep_lines,
         (
             "    return flatten_worklist("
-            f"base, length, {block_expr}, {upper_expr}{dep_kwargs})"
+            f"base, length, {block_expr}, {upper_expr}"
+            f"{grouping_kwarg}{dep_kwargs})"
         ),
     ]
     return "\n".join(lines), offset_params
