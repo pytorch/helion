@@ -73,26 +73,55 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     raise NotInsideKernel
 
 
+def _is_full_slice(val: object) -> bool:
+    return isinstance(val, slice) and (val.start, val.stop, val.step) == (
+        None,
+        None,
+        None,
+    )
+
+
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     env = CompileEnvironment.current()
-    if env.backend_name == "pallas":
-        from .._compiler.indexing_strategy import SubscriptIndexing
-
-        # Resident Ref discovery needs shapes for selectors that ordinary
-        # device-value subscript lowering may still reject.
-        return env.new_index_result(
-            tensor, SubscriptIndexing.compute_shape(tensor, index)
-        )
-
+    # Pallas additionally accepts one narrowing entry, which lets a kernel read
+    # a single token or a small run out of an already-loaded tile.  Every form
+    # below has a materializing lowering, so accepting it here never depends on
+    # an optimization firing later.
+    allow_narrowing = env.backend_name == "pallas"
     input_size = collections.deque(tensor.size())
     output_size = []
+    narrowed = 0
     for val in index:
         if val is None:
             output_size.append(1)
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
+            continue
+        if _is_full_slice(val):
             output_size.append(input_size.popleft())
+            continue
+        if not allow_narrowing:
+            raise exc.InvalidIndexingType(repr(val))
+        if isinstance(val, int):
+            # A constant index drops the dimension.
+            input_size.popleft()
+        elif isinstance(val, slice):
+            if val.step not in (None, 1) or not isinstance(val.start, int):
+                raise exc.InvalidIndexingType(repr(val))
+            if not isinstance(val.stop, int) or val.stop <= val.start:
+                raise exc.InvalidIndexingType(repr(val))
+            input_size.popleft()
+            output_size.append(val.stop - val.start)
+        elif isinstance(val, torch.SymInt):
+            # ``tile.begin`` selects one position and drops the dimension.
+            input_size.popleft()
+        elif isinstance(val, torch.Tensor) and val.ndim == 1:
+            # ``tile.index`` selects a whole inner block.
+            input_size.popleft()
+            output_size.append(val.size(0))
         else:
+            raise exc.InvalidIndexingType(repr(val))
+        narrowed += 1
+        if narrowed > 1:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
     return env.new_index_result(tensor, output_size)

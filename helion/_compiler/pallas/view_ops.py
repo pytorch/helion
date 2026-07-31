@@ -1,12 +1,25 @@
-"""Pallas view codegen and resident Ref composition."""
+"""Pallas-backend codegen for ops defined in ``helion.language.view_ops``.
+
+This module also implements *subview folding*.  When every consumer of a tile
+load narrows one dimension to a contiguous run -- ``block = x[outer, :, :]``
+followed by ``block[local.begin, :, :]`` inside a nested loop -- the load is
+emitted as a Pallas Ref rather than a materialized array, and each consumer
+becomes a small read out of that Ref.
+
+The load node stays where it is, in the outer loop body, so the block is still
+staged and DMA double-buffered once per outer tile; only the read of an
+individual slice moves into the inner loop.  Folding is an optimization only:
+``hl.subscript`` has a materializing lowering for every index form it accepts,
+so declining to fold always leaves a working kernel.
+"""
 
 from __future__ import annotations
 
-from math import prod
+import ast
+import dataclasses
+import enum
 from typing import TYPE_CHECKING
-from typing import cast
 
-import sympy
 import torch
 
 from ... import exc
@@ -22,278 +35,421 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_expr
 
 if TYPE_CHECKING:
-    import ast
-
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
 
+# Set on a ``load`` node that subview folding wants emitted as a Pallas Ref.
+_LOAD_AS_REF = "pallas_load_as_ref"
+# Set on a ``subscript`` node that reads out of such a Ref.
+_SUBVIEW = "pallas_subview"
 
-_RESIDENT_REF = "pallas_resident_ref"
+CONFIG_KEY = "pallas_resident_subviews"
 
-# Factor, physical shape, hidden singleton dimensions, and outstanding
-# (physical dimension, outer block id) logical-validity obligations.
-_ResidentVariant = tuple[
-    int, tuple[int, ...], tuple[int, ...], tuple[tuple[int, int], ...]
-]
-# kind, logical dim, local block, static begin, width, mask
-_ResidentSpec = tuple[str, int, int, int, int, bool]
-# Mode ("ref" preserves the Ref; "read" materializes it), worklist variants,
-# and the transform spec.
-_ResidentInfo = tuple[str, tuple[_ResidentVariant, ...], _ResidentSpec | None]
-_PlannedTransform = tuple[
-    torch.fx.Node,
-    tuple[torch.fx.Node, ...],
-    tuple[_ResidentVariant, ...],
-    _ResidentSpec | None,
-    bool,
-]
+
+@dataclasses.dataclass(frozen=True)
+class _Block:
+    """The tile of one dimension that a foldable load brings into VMEM."""
+
+    dim: int
+    """Dimension of the tensor the load tiles."""
+
+    block_id: int
+    """Tile loop that produced the block."""
+
+    extent: int
+    """Size of the block along ``dim``."""
+
+    whole_dim: bool
+    """The tile loop sweeps the tensor dimension end to end, so every row of
+    the block holds real data and narrowing reads need no range masking."""
+
+
+class _SelectorKind(enum.Enum):
+    """How a subview picks the run it reads out of a block."""
+
+    CONSTANT = enum.auto()
+    """A literal index or slice."""
+
+    TILE = enum.auto()
+    """An inner tile loop's offset, one block wide."""
+
+    DYNAMIC = enum.auto()
+    """A data-dependent start with a constant width, as written by
+    ``block[live - 3 : live]``."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Selector:
+    """One contiguous run narrowed out of a single dimension of a block."""
+
+    kind: _SelectorKind
+
+    dim: int
+    """Dimension of the block being narrowed."""
+
+    width: int
+    """Length of the run.  For ``TILE`` this is the inner loop's block size."""
+
+    block_extent: int
+    """Size of the block along ``dim``, so a data-dependent start can be
+    clamped to a run that stays inside it."""
+
+    begin: int = 0
+    """Literal start of the run.  Only used by ``CONSTANT``."""
+
+    block_id: int = -1
+    """Inner tile loop driving the run.  Only used by ``TILE``."""
+
+    squeeze: bool = False
+    """The narrowed dimension does not appear in the result."""
+
+    masked: bool = False
+    """The run can extend past the rows the tile actually covers, so the read
+    has to be multiplied by the driving loop's mask."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Subview:
+    """A ``subscript`` that reads a contiguous run out of a folded block load."""
+
+    source: torch.fx.Node
+    selector: _Selector
 
 
 def _node_value(value: object) -> object:
     return value.meta.get("val") if isinstance(value, torch.fx.Node) else value
 
 
-def _resident_info(node: torch.fx.Node) -> _ResidentInfo | None:
-    value = node.meta.get(_RESIDENT_REF)
-    return value if isinstance(value, tuple) else None
+def _input_rank(node: torch.fx.Node) -> int:
+    """Rank of the value a ``subscript`` narrows, or -1 if it is not a tensor."""
+    input_node = node.args[0]
+    value = _node_value(input_node)
+    return value.ndim if isinstance(value, torch.Tensor) else -1
 
 
-def _current_variant(state: CodegenState, info: _ResidentInfo) -> _ResidentVariant:
-    variants = info[1]
-    if len(variants) == 1:
-        return variants[0]
-
-    env = CompileEnvironment.current()
-    plan = env.compact_worklist_plan
-    assert plan is not None and plan.grouping == 2
-    block_id = plan.compact_axis.block_id
-    current = state.device_function.resolved_block_size(block_id)
-    assert isinstance(current, int)
-    factor = current // env.compact_worklist_block
-    return next(variant for variant in variants if variant[0] == factor)
+def subview_of(node: torch.fx.Node) -> _Subview | None:
+    """Return the folding plan recorded for a ``subscript`` node, if any."""
+    plan = node.meta.get(_SUBVIEW)
+    return plan if isinstance(plan, _Subview) else None
 
 
-def maybe_materialize_resident_ref(node: torch.fx.Node, result: ast.AST) -> ast.AST:
-    """Materialize a registered reshape-family Ref at its value boundary."""
-    info = _resident_info(node)
-    assert info is not None
-    if info[0] == "ref":
-        return result
-    assert all(not variant[3] for variant in info[1])
-    return expr_from_string("{result}[...]", result=result)
+def load_is_ref(node: torch.fx.Node) -> bool:
+    """True when subview folding wants this ``load`` emitted as a Pallas Ref."""
+    return node.meta.get(_LOAD_AS_REF) is True
 
 
-def _contains(value: object, target: torch.fx.Node) -> bool:
-    if value is target:
-        return True
-    return isinstance(value, (list, tuple)) and any(
-        _contains(item, target) for item in value
-    )
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
 
 
-def _node_signature(node: torch.fx.Node) -> tuple[object, ...]:
-    return (
-        node.name,
-        node.op,
-        node.target,
-        tuple(n.name for n in node.all_input_nodes),
-    )
-
-
-def _capture_edges(
+def _control_flow_parents(
     graphs: list[GraphInfo],
-) -> tuple[
-    dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
-    dict[int, torch.fx.Node],
-]:
-    """Build read-only capture edges on the current config graph copies."""
-    from ..device_ir import ElseGraphInfo
-    from ..device_ir import ForLoopGraphInfo
-    from ..device_ir import IfGraphInfo
-    from ..host_function import HostFunction
+) -> dict[int, tuple[torch.fx.Node, int]]:
+    """Map each subgraph id to the node that runs it and its capture-arg index.
 
-    original_infos = {
-        info.graph_id: info for info in HostFunction.current().device_ir.graphs
-    }
-    original_graph_ids = {info.graph: info.graph_id for info in original_infos.values()}
-    current_graph_ids = {info.graph: info.graph_id for info in graphs}
-
-    parents: dict[int, torch.fx.Node] = {}
+    ``_for_loop(graph_id, begin, end, args)`` and
+    ``_for_loop_step(graph_id, begin, end, args, step)`` pass captures in
+    ``args[3]``; ``_if(test, if_graph_id, else_graph_id, if_args, else_args)``
+    passes them in ``args[3]`` and ``args[4]``.
+    """
+    parents: dict[int, tuple[torch.fx.Node, int]] = {}
     for info in graphs:
         for node in info.graph.nodes:
-            if node.op != "call_function":
+            if node.op != "call_function" or not node.args:
                 continue
-            if (
-                _tracing_ops.is_for_loop_target(node.target)
-                and node.args
-                and isinstance(node.args[0], int)
+            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
+                node.args[0], int
             ):
-                parents[node.args[0]] = node
-            elif node.target is _tracing_ops._if and len(node.args) >= 3:
+                parents[node.args[0]] = (node, 3)
+            elif node.target is _tracing_ops._if and len(node.args) >= 5:
                 if isinstance(node.args[1], int):
-                    parents[node.args[1]] = node
+                    parents[node.args[1]] = (node, 3)
                 if isinstance(node.args[2], int):
-                    parents[node.args[2]] = node
+                    parents[node.args[2]] = (node, 4)
+    return parents
 
+
+def _capture_map(
+    graphs: list[GraphInfo], parents: dict[int, tuple[torch.fx.Node, int]]
+) -> dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]]:
+    """Map an outer node to the ``(placeholder, parent)`` pairs that bind it.
+
+    A subgraph's placeholders were traced from exactly the list its parent node
+    carries -- ``DeviceIR.add_graph(node_args=inputs.get_node_args(tracer))`` and
+    the parent's capture argument are both built from the same
+    ``inputs.get_tensor_args()`` -- so position ``i`` of one always corresponds
+    to position ``i`` of the other.  This is the correspondence
+    ``NodeArgsGraphInfo.placeholder_to_outer_arg`` relies on, read off the
+    per-config graph copies rather than the originals.
+    """
     captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]] = {}
     for info in graphs:
-        if not isinstance(info, (ForLoopGraphInfo, IfGraphInfo, ElseGraphInfo)):
+        entry = parents.get(info.graph_id)
+        if entry is None:
             continue
-        original = original_infos.get(info.graph_id)
-        parent = parents.get(info.graph_id)
-        if original is None or parent is None or type(original) is not type(info):
-            continue
+        parent, arg_index = entry
+        outer_args = parent.args[arg_index] if arg_index < len(parent.args) else None
         placeholders = list(info.graph.find_nodes(op="placeholder"))
-        if isinstance(info, ForLoopGraphInfo):
-            capture_args = parent.args[3]
-            noncapture = (*parent.args[:3], *parent.args[4:])
-        elif isinstance(info, IfGraphInfo):
-            capture_args = parent.args[3]
-            noncapture = parent.args[:3]
-        else:
-            capture_args = parent.args[4]
-            noncapture = parent.args[:3]
-        if not isinstance(capture_args, (list, tuple)) or not (
-            len(original.node_args) == len(capture_args) == len(placeholders)
+        if not isinstance(outer_args, (list, tuple)) or len(outer_args) != len(
+            placeholders
         ):
             continue
-        for original_outer, outer, placeholder in zip(
-            original.node_args, capture_args, placeholders, strict=True
-        ):
-            if (
-                isinstance(outer, torch.fx.Node)
-                and original_graph_ids.get(original_outer.graph)
-                == current_graph_ids.get(outer.graph)
-                and _node_signature(original_outer) == _node_signature(outer)
-                and not _contains(noncapture, outer)
-            ):
+        for outer, placeholder in zip(outer_args, placeholders, strict=True):
+            if isinstance(outer, torch.fx.Node):
                 captures.setdefault(outer, []).append((placeholder, parent))
-    return captures, parents
+    return captures
 
 
-def _variant_factors() -> tuple[int, ...]:
-    plan = CompileEnvironment.current().compact_worklist_plan
-    return (1, 2) if plan is not None and plan.grouping == 2 else (1,)
+def _effective_users(
+    node: torch.fx.Node,
+    captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
+) -> list[torch.fx.Node]:
+    """Users of ``node`` after seeing through renames and loop captures.
+
+    ``_new_var`` and capture placeholders only rebind the value to another
+    name, which a Pallas Ref survives unchanged, so they are transparent here
+    and need no annotation of their own.
+    """
+    results: list[torch.fx.Node] = []
+    seen: set[torch.fx.Node] = {node}
+    stack: list[torch.fx.Node] = [node]
+    while stack:
+        current = stack.pop()
+        edges = captures.get(current, ())
+        consumers = {parent for _placeholder, parent in edges}
+        for user in current.users:
+            if user in consumers or user.target is torch.ops.aten.sym_size.int:
+                continue
+            if user.target is _tracing_ops._new_var:
+                if user not in seen:
+                    seen.add(user)
+                    stack.append(user)
+            else:
+                results.append(user)
+        for placeholder, _parent in edges:
+            if placeholder not in seen:
+                seen.add(placeholder)
+                stack.append(placeholder)
+    return results
 
 
-def _variant_block_size(block_id: int, config: Config, factor: int) -> int | None:
-    env = CompileEnvironment.current()
-    value = env.block_sizes[block_id].from_config(config)
-    if not isinstance(value, int):
-        return None
-    plan = env.compact_worklist_plan
+def _mutated_tensor_ids(graphs: list[GraphInfo]) -> set[int]:
+    """Ids of fake tensors written by a store or atomic anywhere on device.
+
+    A folded load reads its Ref at the consumer's program point instead of at
+    the load, so a write to the same tensor in between would be seen by reads
+    that must observe the pre-write data.  Ruling out every written tensor is
+    coarse, but it keeps the rule simple to state and cheap to check.
+    """
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ...language.memory_ops import store
+
+    targets = ATOMIC_OPS | {store}
+    mutated: set[int] = set()
+    for info in graphs:
+        for node in info.graph.nodes:
+            if node.op == "call_function" and node.target in targets and node.args:
+                value = _node_value(node.args[0])
+                if isinstance(value, torch.Tensor):
+                    mutated.add(id(value))
+    return mutated
+
+
+def _loop_bounds(
+    graph_info: GraphInfo, parent: torch.fx.Node | None, block_id: int
+) -> tuple[object, object] | None:
+    """Return the ``(begin, end)`` a for-loop graph iterates ``block_id`` over."""
+    from ..device_ir import ForLoopGraphInfo
+
     if (
-        factor == 2
-        and plan is not None
-        and plan.grouping == 2
-        and block_id == plan.compact_axis.block_id
+        not isinstance(graph_info, ForLoopGraphInfo)
+        or parent is None
+        or block_id not in graph_info.block_ids
     ):
-        value *= 2
-    return value
+        return None
+    position = graph_info.block_ids.index(block_id)
+    begins, ends = parent.args[1:3]
+    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
+        return None
+    return _node_value(begins[position]), _node_value(ends[position])
 
 
-def _concrete_size(size: object, config: Config, factor: int) -> int | None:
-    if isinstance(size, int):
-        return size
-    env = CompileEnvironment.current()
-    block_id = env.resolve_block_id(size)
-    if block_id is not None:
-        return _variant_block_size(block_id, config, factor)
-    if isinstance(size, torch.SymInt):
-        value = env.try_concretize_symint(size)
-        return value if isinstance(value, int) else None
-    return None
-
-
-def _physical_shape(
-    value: torch.Tensor, config: Config, factor: int
-) -> tuple[int, ...] | None:
-    shape = tuple(_concrete_size(size, config, factor) for size in value.shape)
-    return cast("tuple[int, ...]", shape) if None not in shape else None
-
-
-def _root_variants(
-    producer: torch.fx.Node,
+def _foldable_block(
+    node: torch.fx.Node,
     graph_info: GraphInfo,
     parent: torch.fx.Node | None,
     config: Config,
-) -> tuple[_ResidentVariant, ...] | None:
-    from ..device_ir import ForLoopGraphInfo
+    mutated: set[int],
+) -> _Block | None:
+    """Describe the block a foldable ``load`` brings in, or return None.
+
+    A foldable load tiles exactly one dimension and passes every other one
+    through, so its result keeps the tensor's rank and a ``pl.ds`` slice of the
+    Ref addresses the same elements the materialized array would have held.
+    """
     from .backend import SliceAddressing
     from .backend import _slice_addressing
     from .plan_tiling import IndirectGatherPattern
 
-    tensor = _node_value(producer.args[0])
-    value = producer.meta.get("val")
-    indices = producer.args[1]
+    tensor = _node_value(node.args[0])
+    value = node.meta.get("val")
+    indices = node.args[1]
     if (
         not isinstance(tensor, torch.Tensor)
         or not isinstance(value, torch.Tensor)
         or tensor.ndim != value.ndim
-        or producer.args[2] is not None
+        or node.args[2] is not None
         or not isinstance(indices, (list, tuple))
+        or id(tensor) in mutated
         or any(
             isinstance(pattern, IndirectGatherPattern)
-            for pattern in producer.meta.get("indexing_patterns") or ()
+            for pattern in node.meta.get("indexing_patterns") or ()
         )
     ):
         return None
 
-    selected = [dim for dim, index in enumerate(indices) if index != slice(None)]
-    if len(selected) != 1:
+    tiled = [dim for dim, index in enumerate(indices) if index != slice(None)]
+    if len(tiled) != 1:
         return None
-    dim = selected[0]
-    outer_block_id = CompileEnvironment.current().resolve_block_id(
-        _node_value(indices[dim])
-    )
-    if outer_block_id is None:
+    dim = tiled[0]
+
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(_node_value(indices[dim]))
+    if block_id is None:
+        return None
+    extent = env.block_sizes[block_id].from_config(config)
+    if not isinstance(extent, int):
+        return None
+    lane_extent = env.size_hint(value.shape[-1])
+    if _slice_addressing(value, dim, lane_extent) is not SliceAddressing.DIRECT:
         return None
 
-    full_loop = False
-    if (
-        isinstance(graph_info, ForLoopGraphInfo)
-        and outer_block_id in graph_info.block_ids
-        and parent is not None
-    ):
-        position = graph_info.block_ids.index(outer_block_id)
-        starts, ends = parent.args[1:3]
-        if isinstance(starts, (list, tuple)) and isinstance(ends, (list, tuple)):
-            start = _node_value(starts[position])
-            end = _node_value(ends[position])
-            start_zero = isinstance(start, (int, torch.SymInt)) and (
-                CompileEnvironment.current().known_equal(start, 0)
-            )
-            full_loop = (
-                start_zero
-                and isinstance(end, (int, torch.SymInt))
-                and CompileEnvironment.current().known_equal(end, tensor.shape[dim])
-            )
+    bounds = _loop_bounds(graph_info, parent, block_id)
+    whole_dim = False
+    if bounds is not None:
+        begin, end = bounds
+        whole_dim = (
+            isinstance(begin, (int, torch.SymInt))
+            and isinstance(end, (int, torch.SymInt))
+            and env.known_equal(begin, 0)
+            and env.known_equal(end, tensor.shape[dim])
+        )
+    return _Block(dim, block_id, extent, whole_dim)
 
-    variants: list[_ResidentVariant] = []
-    for factor in _variant_factors():
-        shape = _physical_shape(value, config, factor)
-        if (
-            shape is None
-            or _slice_addressing(value, dim, shape[-1]) is not SliceAddressing.DIRECT
-        ):
+
+def _bounded_by_block(value: torch.SymInt, block_id: int) -> bool:
+    """True when ``value`` is the live extent of the tile owning ``block_id``.
+
+    A loop running to that extent only visits rows the outer tile really
+    covers, which is what lets a narrowing read skip the range mask the outer
+    load would otherwise have applied.
+    """
+    from ..type_info import _detect_outer_block_bound
+
+    env = CompileEnvironment.current()
+    if env.get_block_id(value) is not None:
+        return False
+    return _detect_outer_block_bound(value, env) == block_id
+
+
+def _tile_driven_selector(
+    index: torch.fx.Node,
+    graph_info: GraphInfo,
+    parent: torch.fx.Node | None,
+    config: Config,
+    block: _Block,
+) -> _Selector | None:
+    """Validate a ``tile.begin`` or ``tile.index`` narrowing of ``block``."""
+    from ..host_function import HostFunction
+    from ..variable_origin import TileBeginOrigin
+
+    env = CompileEnvironment.current()
+    index_value = index.meta.get("val")
+    squeeze = isinstance(index_value, torch.SymInt)
+    if squeeze:
+        expr = _symint_expr(index_value)
+        origin = (
+            HostFunction.current().expr_to_origin.get(expr)
+            if expr is not None
+            else None
+        )
+        if origin is None or not isinstance(origin.origin, TileBeginOrigin):
             return None
-        backing = _concrete_size(tensor.shape[dim], config, factor)
-        full = full_loop and backing is not None and backing % shape[dim] == 0
-        validity = () if full else ((dim, outer_block_id),)
-        variants.append((factor, shape, (), validity))
-    return tuple(variants)
+        inner_block_id = origin.origin.block_id
+    elif index.target is tile_index and index.args:
+        resolved = env.resolve_block_id(_node_value(index.args[0]))
+        if resolved is None:
+            return None
+        inner_block_id = resolved
+    else:
+        return None
+
+    bounds = _loop_bounds(graph_info, parent, inner_block_id)
+    if bounds is None:
+        return None
+    begin, end = bounds
+    if not isinstance(begin, (int, torch.SymInt)) or not env.known_equal(begin, 0):
+        return None
+
+    width = env.block_sizes[inner_block_id].from_config(config)
+    if not isinstance(width, int) or width < 1 or width > block.extent:
+        return None
+    if squeeze and width != 1:
+        return None
+    # The tail iteration must stop at the end of the block, not past it.
+    if block.extent % width != 0:
+        return None
+
+    if isinstance(end, int):
+        # A constant trip count only stays within live rows when the whole
+        # block is live and the loop covers exactly it.
+        if not block.whole_dim or end != block.extent:
+            return None
+    elif isinstance(end, torch.SymInt):
+        if not block.whole_dim and not _bounded_by_block(end, block.block_id):
+            return None
+    else:
+        return None
+
+    return _Selector(
+        _SelectorKind.TILE,
+        block.dim,
+        width,
+        block.extent,
+        block_id=inner_block_id,
+        squeeze=squeeze,
+        masked=not squeeze,
+    )
 
 
-def _logical_to_physical(logical_dim: int, hidden: tuple[int, ...], rank: int) -> int:
-    logical = -1
-    for physical in range(rank):
-        if physical in hidden:
-            continue
-        logical += 1
-        if logical == logical_dim:
-            return physical
-    raise AssertionError("logical dimension is outside resident Ref rank")
+def _iota_selector(index: torch.fx.Node, block: _Block) -> _Selector | None:
+    """Validate a constant-width run at a data-dependent start.
+
+    ``block[live - 3 : live]`` traces to an ``iota`` of a constant length, so
+    the width is static even though the start is not.  The start is clamped
+    into the block at codegen, which is what ``jax.lax.dynamic_slice`` does
+    with an out-of-range start, so the folded and materializing lowerings
+    agree on every input.
+    """
+    if index.target is not torch.ops.prims.iota.default or not index.args:
+        return None
+    width = _node_value(index.args[0])
+    start = _node_value(index.kwargs.get("start"))
+    if (
+        not isinstance(width, int)
+        or width < 1
+        or width > block.extent
+        or index.kwargs.get("step") != 1
+        or not isinstance(start, (int, torch.SymInt))
+    ):
+        return None
+    # A start past the live rows would read stale data rather than the zeros
+    # the outer load's mask would have produced, so require a full block.
+    if not block.whole_dim:
+        return None
+    return _Selector(_SelectorKind.DYNAMIC, block.dim, width, block.extent)
 
 
 def _selector(
@@ -301,423 +457,302 @@ def _selector(
     graph_info: GraphInfo,
     parent: torch.fx.Node | None,
     config: Config,
-    variants: tuple[_ResidentVariant, ...],
-) -> tuple[tuple[_ResidentVariant, ...], _ResidentSpec, bool] | None:
-    """Validate one contiguous Ref selector and return its output state."""
-    from ..device_ir import ForLoopGraphInfo
-    from ..device_ir import IfGraphInfo
-    from ..host_function import HostFunction
-    from ..type_info import _detect_outer_block_bound
-    from ..variable_origin import TileBeginOrigin
-    from .backend import SliceAddressing
-    from .backend import _slice_addressing
-
+    block: _Block,
+) -> _Selector | None:
+    """Validate one ``subscript`` of a folded block, or return None."""
     indices = node.args[1]
-    input_node = node.args[0]
-    input_value = (
-        input_node.meta.get("val") if isinstance(input_node, torch.fx.Node) else None
-    )
-    if not isinstance(indices, (list, tuple)) or not isinstance(
-        input_value, torch.Tensor
+    if not isinstance(indices, (list, tuple)) or any(
+        index is None for index in indices
     ):
         return None
-    selected = [dim for dim, index in enumerate(indices) if index != slice(None)]
-    if len(selected) != 1:
+    narrowed = [
+        position for position, index in enumerate(indices) if index != slice(None)
+    ]
+    # With no ``None`` entries the subscript positions are the block's
+    # dimensions, so the narrowed position has to be the tiled one.
+    if len(narrowed) != 1 or narrowed[0] != block.dim:
         return None
-    logical_dim = selected[0]
-    index = indices[logical_dim]
-    env = CompileEnvironment.current()
+    index = indices[block.dim]
 
-    kind = ""
-    local_block_id = -1
-    outer_block_id = -1
-    static_begin = -1
-    static_width = -1
-    squeeze = False
-    requires_mask = False
-    static_loop_extent = -1
-
-    def exact_outer_live(value: torch.SymInt) -> int | None:
-        if env.get_block_id(value) is not None:
+    if isinstance(index, int):
+        if index < 0 or index >= block.extent or not block.whole_dim:
             return None
-        return _detect_outer_block_bound(value, env)
-
-    if isinstance(graph_info, IfGraphInfo) and isinstance(index, torch.fx.Node):
-        if index.target is not torch.ops.prims.iota.default or not index.args:
-            return None
-        width = _node_value(index.args[0])
-        start = _node_value(index.kwargs.get("start"))
-        predicate = _node_value(parent.args[0]) if parent is not None else None
-        if (
-            not isinstance(width, int)
-            or width < 1
-            or index.kwargs.get("step") != 1
-            or not isinstance(start, torch.SymInt)
-        ):
-            return None
-        live = start + width
-        detected_outer = exact_outer_live(live)
-        outer_block_id = detected_outer if detected_outer is not None else -1
-        live_expr = _symint_expr(live)
-        if (
-            outer_block_id < 0
-            or not isinstance(predicate, torch.SymBool)
-            or live_expr is None
-            or predicate._sympy_() != sympy.Ge(live_expr, width)
-        ):
-            return None
-        kind = "tail"
-        static_width = width
-    elif isinstance(graph_info, ForLoopGraphInfo) and isinstance(index, torch.fx.Node):
-        value = index.meta.get("val")
-        squeeze = isinstance(value, torch.SymInt)
-        if squeeze:
-            expr = _symint_expr(value)
-            origin = (
-                HostFunction.current().expr_to_origin.get(expr)
-                if expr is not None
-                else None
-            )
-            if origin is None or not isinstance(origin.origin, TileBeginOrigin):
-                return None
-            local_block_id = origin.origin.block_id
-        elif index.target is tile_index and index.args:
-            detected_local = env.resolve_block_id(_node_value(index.args[0]))
-            local_block_id = detected_local if detected_local is not None else -1
-        else:
-            return None
-        if local_block_id not in graph_info.block_ids or parent is None:
-            return None
-        position = graph_info.block_ids.index(local_block_id)
-        starts, ends = parent.args[1:3]
-        start = (
-            _node_value(starts[position]) if isinstance(starts, (list, tuple)) else None
+        return _Selector(
+            _SelectorKind.CONSTANT,
+            block.dim,
+            1,
+            block.extent,
+            begin=index,
+            squeeze=True,
         )
-        if (
-            not isinstance(starts, (list, tuple))
-            or not isinstance(ends, (list, tuple))
-            or not isinstance(start, (int, torch.SymInt))
-            or not env.known_equal(start, 0)
-        ):
-            return None
-        end = _node_value(ends[position])
-        if isinstance(end, int):
-            if end < 1:
-                return None
-            static_loop_extent = end
-        elif not isinstance(end, torch.SymInt):
-            return None
-        else:
-            detected_outer = exact_outer_live(end)
-            outer_block_id = detected_outer if detected_outer is not None else -1
-            if outer_block_id < 0:
-                return None
-        kind = "tile"
-        requires_mask = not squeeze
-    elif isinstance(index, int):
-        if index < 0:
-            return None
-        kind = "static"
-        static_begin = index
-        static_width = 1
-        squeeze = True
-    elif isinstance(index, slice):
+
+    if isinstance(index, slice):
         if (
             index.step not in (None, 1)
             or not isinstance(index.start, int)
             or not isinstance(index.stop, int)
             or index.start < 0
             or index.stop <= index.start
+            or index.stop > block.extent
+            or not block.whole_dim
         ):
             return None
-        kind = "static"
-        static_begin = index.start
-        static_width = index.stop - index.start
-    else:
-        return None
-
-    output: list[_ResidentVariant] = []
-    for factor, shape, hidden, validity in variants:
-        physical_dim = _logical_to_physical(logical_dim, hidden, len(shape))
-        lane_block = shape[-1]
-        if (
-            _slice_addressing(input_value, logical_dim, lane_block)
-            is not SliceAddressing.DIRECT
-        ):
-            return None
-        width = (
-            _variant_block_size(local_block_id, config, factor)
-            if kind == "tile"
-            else static_width
+        return _Selector(
+            _SelectorKind.CONSTANT,
+            block.dim,
+            index.stop - index.start,
+            block.extent,
+            begin=index.start,
         )
-        if not isinstance(width, int) or width < 1 or (squeeze and width != 1):
-            return None
-        if width > shape[physical_dim]:
-            return None
-        if kind == "static":
-            if static_begin + width > shape[physical_dim] or any(
-                dim == physical_dim for dim, _block in validity
-            ):
-                return None
-        elif kind == "tile":
-            if shape[physical_dim] % width != 0 or (
-                static_loop_extent >= 0 and static_loop_extent != shape[physical_dim]
-            ):
-                return None
 
-        remaining = tuple(
-            guard
-            for guard in validity
-            if not (guard[0] == physical_dim and guard[1] == outer_block_id)
-        )
-        new_shape = list(shape)
-        new_shape[physical_dim] = width
-        new_hidden = tuple(sorted((*hidden, physical_dim))) if squeeze else hidden
-        output.append((factor, tuple(new_shape), new_hidden, remaining))
-
-    spec: _ResidentSpec = (
-        kind,
-        logical_dim,
-        local_block_id,
-        static_begin,
-        static_width,
-        requires_mask,
-    )
-    return tuple(output), spec, requires_mask
-
-
-def _reshape_variants(
-    node: torch.fx.Node,
-    config: Config,
-    variants: tuple[_ResidentVariant, ...],
-) -> tuple[_ResidentVariant, ...] | None:
-    value = node.meta.get("val")
-    if not isinstance(value, torch.Tensor) or value.dtype is torch.bool:
-        return None
-    output: list[_ResidentVariant] = []
-    for factor, shape, _hidden, validity in variants:
-        new_shape = _physical_shape(value, config, factor)
-        if (
-            validity
-            or len(shape) < 2
-            or new_shape is None
-            or prod(shape) != prod(new_shape)
-            or shape[-2:] != new_shape[-2:]
-        ):
-            return None
-        output.append((factor, new_shape, (), ()))
-    return tuple(output)
-
-
-def _registered_transform(
-    node: torch.fx.Node,
-    graph_info: GraphInfo,
-    parent: torch.fx.Node | None,
-    config: Config,
-    variants: tuple[_ResidentVariant, ...],
-) -> tuple[tuple[_ResidentVariant, ...], _ResidentSpec | None, bool] | None:
-    from ..aten_lowering import AtenLowering
-    from ..aten_lowering import reshape_lowering
-    from ..aten_lowering import squeeze_lowering
-    from ..aten_lowering import unsqueeze_lowering
-    from ..aten_lowering import view_lowering
-    from ..inductor_lowering import APIFuncLowering
-
-    lowering = node.meta.get("lowering")
-    if (
-        isinstance(lowering, APIFuncLowering)
-        and lowering.api_func is subscript
-        and "pallas_ref" in lowering.api_func._codegen
-    ):
-        return _selector(node, graph_info, parent, config, variants)
-    if isinstance(lowering, AtenLowering) and "pallas_ref" in lowering.codegen_impls:
-        if not any(
-            lowering is candidate
-            for candidate in (
-                reshape_lowering,
-                squeeze_lowering,
-                unsqueeze_lowering,
-                view_lowering,
-            )
-        ):
-            return None
-        output = _reshape_variants(node, config, variants)
-        return (output, None, False) if output is not None else None
+    if isinstance(index, torch.fx.Node):
+        if index.target is torch.ops.prims.iota.default:
+            return _iota_selector(index, block)
+        return _tile_driven_selector(index, graph_info, parent, config, block)
     return None
 
 
-def _effective_users(
-    node: torch.fx.Node,
-    captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
-) -> list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]]:
-    results: list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]] = []
-    seen: set[torch.fx.Node] = set()
-    stack: list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]] = [(node, ())]
-    while stack:
-        current, transports = stack.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        edges = captures.get(current, ())
-        parent_calls = {parent for _placeholder, parent in edges}
-        for user in current.users:
-            if user in parent_calls or user.target == torch.ops.aten.sym_size.int:
-                continue
-            if user.target is _tracing_ops._new_var:
-                stack.append((user, (*transports, user)))
-            else:
-                results.append((user, transports))
-        for placeholder, _parent in edges:
-            stack.append((placeholder, (*transports, placeholder)))
-    return results
-
-
-def discover_resident_ref_subviews(graphs: list[GraphInfo], config: Config) -> None:
-    """Mark conservative resident Ref transform chains on config graph copies."""
-    captures, parents = _capture_edges(graphs)
-    graph_infos = {info.graph: info for info in graphs}
+def plan_subview_folding(graphs: list[GraphInfo], config: Config) -> None:
+    """Mark block loads that can stay Refs and the subviews that read them."""
     for info in graphs:
         for node in info.graph.nodes:
-            node.meta.pop(_RESIDENT_REF, None)
+            node.meta.pop(_LOAD_AS_REF, None)
+            node.meta.pop(_SUBVIEW, None)
+    if not config.get(CONFIG_KEY, True):
+        return
+
+    parents = _control_flow_parents(graphs)
+    captures = _capture_map(graphs, parents)
+    graph_infos = {info.graph: info for info in graphs}
+    mutated = _mutated_tensor_ids(graphs)
+
+    def parent_of(info: GraphInfo) -> torch.fx.Node | None:
+        entry = parents.get(info.graph_id)
+        return entry[0] if entry is not None else None
 
     for info in graphs:
-        for producer in info.graph.nodes:
-            if producer.op != "call_function" or producer.target is not load:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target is not load:
                 continue
-            variants = _root_variants(
-                producer, info, parents.get(info.graph_id), config
-            )
-            if variants is None:
+            block = _foldable_block(node, info, parent_of(info), config, mutated)
+            if block is None:
                 continue
 
-            annotations: dict[torch.fx.Node, _ResidentInfo] = {}
+            rank = node.meta["val"].ndim
+            plans: list[tuple[torch.fx.Node, _Selector]] = []
+            for user in _effective_users(node, captures):
+                user_info = graph_infos.get(user.graph)
+                if (
+                    user.op != "call_function"
+                    or user.target is not subscript
+                    or user_info is None
+                    or _input_rank(user) != rank
+                ):
+                    plans = []
+                    break
+                selector = _selector(
+                    user, user_info, parent_of(user_info), config, block
+                )
+                if selector is None:
+                    plans = []
+                    break
+                plans.append((user, selector))
 
-            def analyze(
-                node: torch.fx.Node,
-                node_variants: tuple[_ResidentVariant, ...],
-                spec: _ResidentSpec | None,
-                *,
-                root: bool = False,
-                must_read: bool = False,
-                _annotations: dict[torch.fx.Node, _ResidentInfo] = annotations,
-            ) -> bool:
-                users = _effective_users(node, captures)
-                planned: list[_PlannedTransform] = []
-                unsupported = False
-                for user, transports in users:
-                    user_info = graph_infos.get(user.graph)
-                    if user_info is None:
-                        unsupported = True
-                        continue
-                    result = _registered_transform(
-                        user,
-                        user_info,
-                        parents.get(user_info.graph_id),
-                        config,
-                        node_variants,
-                    )
-                    if result is None:
-                        unsupported = True
-                    else:
-                        planned.append((user, transports, *result))
-
-                if root and (unsupported or not planned):
-                    return False
-                if not root and (must_read or unsupported or not planned):
-                    if any(variant[3] for variant in node_variants):
-                        return False
-                    _annotations[node] = ("read", node_variants, spec)
-                    return True
-
-                _annotations[node] = ("ref", node_variants, spec)
-                for user, transports, output, user_spec, user_must_read in planned:
-                    transport_info: _ResidentInfo = ("ref", node_variants, None)
-                    for transport in transports:
-                        _annotations[transport] = transport_info
-                    if not analyze(
-                        user,
-                        output,
-                        user_spec,
-                        must_read=user_must_read,
-                    ):
-                        return False
-                return True
-
-            if analyze(producer, variants, None, root=True):
-                for node, resident_info in annotations.items():
-                    node.meta[_RESIDENT_REF] = resident_info
+            if not plans:
+                continue
+            node.meta[_LOAD_AS_REF] = True
+            for user, selector in plans:
+                user.meta[_SUBVIEW] = _Subview(node, selector)
 
 
-@_decorators.codegen(subscript, "pallas_ref")
-def _resident_subscript(state: CodegenState) -> ast.AST:
-    assert state.fx_node is not None
-    info = _resident_info(state.fx_node)
-    assert info is not None and info[2] is not None
-    variant = _current_variant(state, info)
-    kind, logical_dim, local_block_id, begin, width, mask = info[2]
-    input_node = state.fx_node.args[0]
-    assert isinstance(input_node, torch.fx.Node)
-    input_info = _resident_info(input_node)
-    assert input_info is not None
-    input_variant = _current_variant(state, input_info)
-    physical_dim = _logical_to_physical(
-        logical_dim, input_variant[2], len(input_variant[1])
-    )
-    if kind == "tile":
-        begin_expr = state.codegen.offset_var(local_block_id)
-        width_value = state.device_function.resolved_block_size(local_block_id)
-        assert isinstance(width_value, int)
-    elif kind == "tail":
-        indices = state.fx_node.args[1]
-        assert isinstance(indices, (list, tuple))
-        index = indices[logical_dim]
-        assert isinstance(index, torch.fx.Node)
-        begin_expr = state.device_function.literal_expr(
-            _node_value(index.kwargs.get("start"))
-        )
-        width_value = width
-    else:
-        begin_expr = str(begin)
-        width_value = width
+# ---------------------------------------------------------------------------
+# Codegen
+# ---------------------------------------------------------------------------
 
-    parts = [":" for _ in input_variant[1]]
-    parts[physical_dim] = f"pl.ds({begin_expr}, {width_value})"
-    result = expr_from_string(f"{{base}}.at[{', '.join(parts)}]", base=state.ast_arg(0))
-    if info[0] == "ref":
+
+def _mask_expr(
+    state: CodegenState, block_id: int, dim: int, result: ast.AST
+) -> ast.AST:
+    """Zero the positions a tile-driven read takes past its loop's extent."""
+    mask_var = state.codegen.mask_var(block_id)
+    if mask_var is None:
         return result
+    assert state.fx_node is not None
+    value = state.fx_node.meta["val"]
+    assert isinstance(value, torch.Tensor)
+    dtype = CompileEnvironment.current().backend.dtype_str(value.dtype)
+    expand = state.tile_strategy.expand_str([*value.shape], dim)
+    return expr_from_string(
+        f"{{result}} * ({mask_var}.astype({dtype}){expand})", result=result
+    )
 
-    assert not variant[3]
-    result = expr_from_string("{result}[...]", result=result)
-    hidden = variant[2]
-    if hidden:
-        squeeze_parts = [
-            "0" if dim in hidden else ":" for dim in range(len(variant[1]))
-        ]
-        result = expr_from_string(
-            f"{{result}}[{', '.join(squeeze_parts)}]", result=result
+
+def _dynamic_begin_expr(state: CodegenState, selector: _Selector) -> str:
+    """Clamped start of a data-dependent run, matching ``lax.dynamic_slice``."""
+    assert state.fx_node is not None
+    indices = state.fx_node.args[1]
+    assert isinstance(indices, (list, tuple))
+    iota = indices[selector.dim]
+    assert isinstance(iota, torch.fx.Node)
+    start = state.device_function.literal_expr(_node_value(iota.kwargs.get("start")))
+    return f"jnp.clip({start}, 0, {selector.block_extent - selector.width})"
+
+
+def _codegen_subview_read(state: CodegenState, plan: _Subview) -> ast.AST:
+    """Read one contiguous run out of a block that was emitted as a Ref."""
+    selector = plan.selector
+    assert state.fx_node is not None
+    rank = _input_rank(state.fx_node)
+    width = selector.width
+    if selector.kind is _SelectorKind.TILE:
+        resolved = state.device_function.resolved_block_size(selector.block_id)
+        assert isinstance(resolved, int)
+        begin, width = state.codegen.offset_var(selector.block_id), resolved
+    elif selector.kind is _SelectorKind.DYNAMIC:
+        begin = _dynamic_begin_expr(state, selector)
+    else:
+        begin = str(selector.begin)
+
+    parts = [":"] * rank
+    parts[selector.dim] = f"pl.ds({begin}, {width})"
+    result = expr_from_string(f"{{base}}[{', '.join(parts)}]", base=state.ast_arg(0))
+    if selector.squeeze:
+        keys = ["0" if dim == selector.dim else ":" for dim in range(rank)]
+        result = expr_from_string(f"{{result}}[{', '.join(keys)}]", result=result)
+    if selector.masked:
+        result = _mask_expr(state, selector.block_id, selector.dim, result)
+    return result
+
+
+def _dynamic_narrowing(
+    state: CodegenState, position: int
+) -> tuple[ast.AST, int, bool, int]:
+    """Return ``(offset, width, squeeze, block_id)`` for a narrowing entry.
+
+    ``tile.begin`` selects a single row and drops the dimension; ``tile.index``
+    selects a whole inner block and keeps it, masked at the tail; an ``iota``
+    selects a constant-width run at a data-dependent start.
+    """
+    assert state.fx_node is not None
+    index_args = state.fx_node.args[1]
+    assert isinstance(index_args, (list, tuple))
+    index_node = index_args[position]
+    ast_args = state.ast_args[1]
+    assert isinstance(ast_args, (list, tuple))
+
+    proxy = state.proxy_arg(1)
+    assert isinstance(proxy, (list, tuple))
+    if isinstance(proxy[position], torch.SymInt):
+        offset = ast_args[position]
+        assert isinstance(offset, ast.AST)
+        return offset, 1, True, -1
+
+    env = CompileEnvironment.current()
+    if isinstance(index_node, torch.fx.Node):
+        if index_node.target is tile_index and index_node.args:
+            block_id = env.resolve_block_id(_node_value(index_node.args[0]))
+            width = (
+                state.device_function.resolved_block_size(block_id)
+                if block_id is not None
+                else None
+            )
+            if block_id is not None and isinstance(width, int):
+                return (
+                    expr_from_string(state.codegen.offset_var(block_id)),
+                    width,
+                    False,
+                    block_id,
+                )
+        elif index_node.target is torch.ops.prims.iota.default and index_node.args:
+            width = _node_value(index_node.args[0])
+            start = _node_value(index_node.kwargs.get("start"))
+            if isinstance(width, int) and isinstance(start, (int, torch.SymInt)):
+                offset = expr_from_string(state.device_function.literal_expr(start))
+                return offset, width, False, -1
+    raise exc.InvalidIndexingType(repr(proxy[position]))
+
+
+def _codegen_value_subscript(state: CodegenState) -> ast.AST:
+    """Index a materialized array.
+
+    Covers every form ``hl.subscript``'s fake accepts: any number of ``None``
+    and ``:`` entries plus at most one narrowing entry, which may be a constant
+    index, a constant slice, a ``tile.begin`` offset, or a ``tile.index`` run.
+    """
+    index = list(state.proxy_arg(1))  # pyrefly: ignore [bad-argument-type]
+    base = state.ast_arg(0)
+
+    def is_full_slice(value: object) -> bool:
+        return isinstance(value, slice) and (value.start, value.stop, value.step) == (
+            None,
+            None,
+            None,
         )
-    if mask:
-        mask_var = state.codegen.mask_var(local_block_id)
-        if mask_var is None:
-            raise exc.InvalidConfig("fixed resident Ref subview requires a loop mask")
-        value = state.fx_node.meta.get("val")
-        assert isinstance(value, torch.Tensor)
-        expand = state.tile_strategy.expand_str([*value.shape], logical_dim)
-        dtype = CompileEnvironment.current().backend.dtype_str(value.dtype)
-        result = expr_from_string(
-            f"{{result}} * ({mask_var}.astype({dtype}){expand})", result=result
+
+    dynamic = [
+        position
+        for position, value in enumerate(index)
+        if isinstance(value, (torch.SymInt, torch.Tensor))
+    ]
+    if len(dynamic) > 1:
+        raise exc.InvalidIndexingType(repr(index[dynamic[1]]))
+
+    # ``None`` adds a dimension, so an entry's axis in the input value is its
+    # position among the non-``None`` entries.
+    axis_of: list[int] = []
+    axis = 0
+    for value in index:
+        axis_of.append(-1 if value is None else axis)
+        axis += 0 if value is None else 1
+
+    squeeze_position = -1
+    mask: tuple[int, int] | None = None
+    if dynamic:
+        position = dynamic[0]
+        offset, width, squeeze, block_id = _dynamic_narrowing(state, position)
+        base = expr_from_string(
+            f"jax.lax.dynamic_slice_in_dim({{base}}, {{offset}}, {width}, "
+            f"{axis_of[position]})",
+            base=base,
+            offset=offset,
         )
+        if squeeze:
+            squeeze_position = position
+        elif block_id >= 0:
+            mask = (block_id, axis_of[position])
+
+    keys: list[str] = []
+    for position, value in enumerate(index):
+        if value is None:
+            keys.append("None")
+        elif position == squeeze_position:
+            keys.append("0")
+        elif position in dynamic or is_full_slice(value):
+            keys.append(":")
+        elif isinstance(value, slice):
+            if value.step not in (None, 1):
+                raise exc.InvalidIndexingType(repr(value))
+            start = "" if value.start is None else str(value.start)
+            stop = "" if value.stop is None else str(value.stop)
+            keys.append(f"{start}:{stop}")
+        elif isinstance(value, int):
+            keys.append(str(value))
+        else:
+            raise exc.InvalidIndexingType(repr(value))
+
+    result = expr_from_string(f"{{base}}[{', '.join(keys)}]", base=base)
+    if mask is not None:
+        result = _mask_expr(state, mask[0], mask[1], result)
     return result
 
 
 @_decorators.codegen(subscript, "pallas")
 def _(state: CodegenState) -> ast.AST:
     assert state.fx_node is not None
-    if _resident_info(state.fx_node) is not None:
-        # pyrefly: ignore [missing-attribute]
-        return subscript._codegen["pallas_ref"](state)
-    # pyrefly: ignore [missing-attribute]
-    return subscript._codegen["common"](state)
+    plan = subview_of(state.fx_node)
+    if plan is not None and state.device_function.pallas_ref_loads.get(plan.source):
+        return _codegen_subview_read(state, plan)
+    return _codegen_value_subscript(state)
 
 
 @_decorators.codegen(split, "pallas")

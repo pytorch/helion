@@ -1268,9 +1268,11 @@ class TestPallas(TestCase):
                 pallas_loop_type="fori_loop",
             )
 
-    def test_resident_ref_scalar_subview(self) -> None:
+    def test_subview_fold_scalar(self) -> None:
+        """One token at a time out of a tile: the shape both target kernels use."""
+
         @helion.kernel(backend="pallas", static_shapes=True)
-        def resident_scalar(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+        def running_sum(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
             tokens, _heads, _width = x.size()
             block_t = hl.register_block_size(2, tokens)
             out = torch.empty_like(x)
@@ -1298,18 +1300,24 @@ class TestPallas(TestCase):
         for loop_type in ("fori_loop", "emit_pipeline"):
             with self.subTest(loop_type=loop_type):
                 code, actual = code_and_output(
-                    resident_scalar,
+                    running_sum,
                     (x, initial),
                     block_sizes=[4],
                     pallas_loop_type=loop_type,
                 )
-                self.assertRegex(
-                    code,
-                    r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
-                )
+                # The block stays a Ref and the inner loop reads one row of it.
+                self.assertRegex(code, r"x_block = x\.at\[pl\.ds\(")
+                self.assertRegex(code, r"\[pl\.ds\(offset_\d+, 1\), :, :\]\[0, :, :\]")
+                self.assertNotIn("dynamic_slice_in_dim", code)
                 torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
-    def test_resident_ref_short_conv_recurrence(self) -> None:
+    def test_subview_fold_keeps_dma_prefetch(self) -> None:
+        """Folding must not move the load out of the outer loop.
+
+        The block is still staged and double-buffered once per outer tile; only
+        the read of a single row moves into the inner loop.
+        """
+
         @helion.kernel(backend="pallas", static_shapes=True)
         def short_conv(
             x: torch.Tensor,
@@ -1365,44 +1373,19 @@ class TestPallas(TestCase):
             pallas_loop_type="fori_loop",
             pallas_load_buffer_count=[2, 1, 1, 1, 1],
         )
+        # The block is DMA'd into a double-buffered scratch once per tile, and
+        # the folded read indexes that scratch rather than re-addressing x.
         self.assertIn("pltpu.make_async_copy(x.at[pl.ds(", code)
-        self.assertRegex(
-            code,
-            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
-        )
+        self.assertRegex(code, r"x_block = x_buf\.at\[_j % 2\]")
+        self.assertRegex(code, r"\[pl\.ds\(offset_\d+, 1\), :, :\]\[0, :, :\]")
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
         torch.testing.assert_close(final, x[-3:].unsqueeze(0))
 
-    def test_resident_ref_static_unroll(self) -> None:
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def static_unroll(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(initial)
-            state = initial[0, :, :].float()
-            for outer in hl.tile(x.size(0), block_size=4):
-                x_block = x[outer, :, :]
-                for local in hl.tile(4, block_size=1):
-                    state += x_block[local.begin, :, :].float()
-            out[0, :, :] = state.to(out.dtype)
-            return out
+    def test_subview_fold_tile_and_dynamic_runs(self) -> None:
+        """A masked inner tile and a data-dependent run out of the same block."""
 
-        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        expected = (initial.float() + x.float().sum(dim=0, keepdim=True)).bfloat16()
-        code, actual = code_and_output(
-            static_unroll,
-            (x, initial),
-            block_sizes=[],
-            pallas_loop_type="unroll",
-        )
-        self.assertRegex(
-            code,
-            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-    def test_resident_ref_fixed_and_guarded_subviews(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
-        def resident_windows(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+        def windows(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
             tokens, _heads, _width = x.size()
             block_t = hl.register_block_size(4, tokens)
             out = torch.empty_like(initial)
@@ -1426,162 +1409,203 @@ class TestPallas(TestCase):
         expected += x[1:4].float().sum(dim=0, keepdim=True)
         expected += x[5:8].float().sum(dim=0, keepdim=True)
         code, actual = code_and_output(
-            resident_windows,
+            windows,
             (x, initial),
             block_sizes=[4],
             pallas_loop_type="fori_loop",
         )
-        self.assertRegex(code, r"\.at\[pl\.ds\(offset_\d+, 2\), :, :\]\[\.\.\.\]")
-        self.assertRegex(code, r"\.at\[pl\.ds\([^,]+, 3\), :, :\]\[\.\.\.\]")
+        self.assertRegex(code, r"\[pl\.ds\(offset_\d+, 2\), :, :\]")
+        # A data-dependent start is clamped into the block, matching what
+        # jax.lax.dynamic_slice does with an out-of-range start.
+        self.assertRegex(code, r"\[pl\.ds\(jnp\.clip\([^)]+, 0, 1\), 3\), :, :\]")
         self.assertIn(".astype(jnp.bfloat16)[:, None, None]", code)
         torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
 
-    def test_resident_ref_flatten_worklist_grouping_two(self) -> None:
+    def test_subview_fold_matches_unfolded(self) -> None:
+        """Folding is an optimization: the knob must not change results."""
+
         @helion.kernel(backend="pallas", static_shapes=True)
-        def grouped_worklist(
-            q: torch.Tensor, k: torch.Tensor, offsets: torch.Tensor
-        ) -> torch.Tensor:
-            out = torch.empty_like(q)
-            for sequence in hl.grid(offsets.size(0) - 1):
-                begin = offsets[sequence]
-                end = offsets[sequence + 1]
-                for tile_q in hl.tile(begin, end):
-                    q_block = q[tile_q, :, :]
-                    live = tile_q.end - tile_q.begin
-                    seed = hl.zeros([1, q.size(1), q.size(2)], dtype=torch.float32)
-                    if live >= 1:
-                        seed = q_block[live - 1 : live, :, :].float()
-                    state = hl.zeros(
-                        [tile_q, q.size(1), q.size(2)], dtype=torch.float32
-                    )
-                    state += seed
-                    for tile_k in hl.tile(begin, end):
-                        state += k[tile_k, :, :].float().sum(dim=0, keepdim=True)
-                    out[tile_q, :, :] = state.to(out.dtype)
+        def windows(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            tokens, _heads, _width = x.size()
+            block_t = hl.register_block_size(4, tokens)
+            out = torch.empty_like(initial)
+            for request in hl.grid(1):
+                state = initial[request, :, :].to(torch.float32)
+                for outer in hl.tile(tokens, block_size=block_t):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=2):
+                        state = state + x_block[local.index, :, :].float().sum(dim=0)
+                    state = state + x_block[1, :, :].float()
+                out[request, :, :] = state.to(out.dtype)
             return out
 
-        q = torch.arange(24 * 2 * 128, device=DEVICE, dtype=torch.float32).reshape(
-            24, 2, 128
-        )
-        offsets = torch.tensor([0, 8, 24], device=DEVICE, dtype=torch.int32)
-        expected = torch.empty_like(q)
-        for begin, end in ((0, 8), (8, 24)):
-            total = q[begin:end].sum(dim=0, keepdim=True)
-            for tile_begin in range(begin, end, 8):
-                expected[tile_begin : tile_begin + 8] = (
-                    total + q[tile_begin + 7 : tile_begin + 8]
-                )
-
-        code, actual = code_and_output(
-            grouped_worklist,
-            (q, q, offsets),
-            block_sizes=[4, 4],
-            pallas_loop_type="fori_loop",
-            pallas_worklist_grouping=2,
-        )
-        self.assertIn("def _compact_group_1", code)
-        self.assertIn("def _compact_group_2", code)
-        self.assertEqual(
-            len(re.findall(r"\.at\[pl\.ds\([^,]+, 1\), :, :\]\[\.\.\.\]", code)),
-            2,
-        )
-        torch.testing.assert_close(actual, expected)
-
-    def test_resident_ref_does_not_miscompile_cross_dim_read(self) -> None:
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def cross_dim_read(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty([1, 2, 128], device=x.device, dtype=x.dtype)
-            state = hl.zeros([2, 128], dtype=torch.float32)
-            for outer in hl.tile(x.size(0), block_size=4):
-                x_block = x[outer, :, :, :]
-                state += x_block[:, 0, :, :].float().sum(dim=0)
-            out[0, :, :] = state.to(out.dtype)
-            return out
-
-        x = torch.ones(7, 2, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        try:
-            _code, actual = code_and_output(
-                cross_dim_read,
-                (x,),
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        results = {}
+        for folded in (True, False):
+            code, actual = code_and_output(
+                windows,
+                (x, initial),
                 block_sizes=[4],
                 pallas_loop_type="fori_loop",
+                pallas_resident_subviews=folded,
             )
-        except helion.exc.InvalidIndexingType:
-            return
-        torch.testing.assert_close(
-            actual,
-            torch.full_like(actual, 7),
-        )
+            self.assertEqual("x_block = x.at[" in code, folded)
+            self.assertEqual("dynamic_slice_in_dim" in code, not folded)
+            results[folded] = actual
+        torch.testing.assert_close(results[True], results[False])
 
-    def test_resident_ref_composed_views(self) -> None:
+    def test_subview_fold_declines_when_source_is_written(self) -> None:
+        """A store to the loaded tensor must keep the load materializing.
+
+        A folded load reads its Ref where the consumer runs, so it would
+        otherwise observe a write issued after the load.
+        """
+
         @helion.kernel(backend="pallas", static_shapes=True)
-        def composed_views(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-            tokens, chunks, heads, width = x.size()
-            assert chunks == 4 and heads == 2 and width == 128
+        def read_then_write(
+            x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+        ) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :]
+                    x[outer, :, :] = y[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        acc = acc + x_block[local.begin, :, :].float()
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.zeros(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(
+            read_then_write, (x, y, out), pallas_loop_type="fori_loop"
+        )
+        self.assertNotIn("x_block = x.at[", code)
+        self.assertIn("dynamic_slice_in_dim", code)
+        # Every row read predates the overwrite, so the sum is the input's.
+        torch.testing.assert_close(out, torch.full_like(out, 8.0))
+
+    def test_subview_value_fallback_index_forms(self) -> None:
+        """Every index form the fake accepts lowers without folding.
+
+        Consuming the block whole blocks folding, so each subscript here takes
+        the materializing path.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def all_forms(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :]
+                    # Whole-block use: nothing below can be folded.
+                    acc = acc + x_block.float().sum(dim=0)
+                    acc = acc + x_block[1, :, :].float()
+                    acc = acc + x_block[1:3, :, :].float().sum(dim=0)
+                    for local in hl.tile(4, block_size=2):
+                        acc = acc + x_block[local.begin, :, :].float()
+                        acc = acc + x_block[local.index, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        expected = torch.zeros(2, 128, device=DEVICE, dtype=torch.float32)
+        for begin in (0, 4):
+            block = x[begin : begin + 4]
+            expected = expected + block.sum(dim=0)
+            expected = expected + block[1]
+            expected = expected + block[1:3].sum(dim=0)
+            for local_begin in (0, 2):
+                expected = expected + block[local_begin]
+                expected = expected + block[local_begin : local_begin + 2].sum(dim=0)
+        code, _ = code_and_output(all_forms, (x, out), pallas_loop_type="fori_loop")
+        self.assertNotIn("x_block = x.at[", code)
+        torch.testing.assert_close(out[0], expected, rtol=1e-4, atol=1e-4)
+
+    def test_subview_fold_then_view(self) -> None:
+        """A view of the folded result is an ordinary value reshape."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def folded_then_viewed(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            tokens, _channels, _width = x.size()
             block_t = hl.register_block_size(2, tokens)
             out = torch.empty_like(initial)
             for request in hl.grid(1):
                 state = initial[request, :, :, :].float()
                 for outer in hl.tile(tokens, block_size=block_t):
-                    x_block = x[outer, :, :, :]
-                    live = outer.end - outer.begin
-                    for local in hl.tile(live, block_size=1):
-                        token = x_block[local.begin, :, :, :]
-                        matrix = token.reshape(2, 2, 2, 128)
-                        state += matrix[0:1, :, :, :].float().sum(dim=0)
-                out[request, :, :, :] = state.to(out.dtype)
-            return out
-
-        x = torch.randn(9, 4, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        initial = torch.zeros(1, 2, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        expected = x.float().reshape(9, 2, 2, 2, 128)[:, 0].sum(0, keepdim=True)
-        code, actual = code_and_output(
-            composed_views,
-            (x, initial),
-            block_sizes=[4],
-            pallas_loop_type="fori_loop",
-        )
-        self.assertRegex(
-            code,
-            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :, :\]",
-        )
-        self.assertIn(".reshape((2, 2, 2, 128))", code)
-        self.assertIn(".at[pl.ds(0, 1), :, :, :][...]", code)
-        torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
-
-    def test_resident_ref_reshape_fallback(self) -> None:
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def reshape_fallback(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-            tokens, _channels, _width = x.size()
-            block_t = hl.register_block_size(2, tokens)
-            out = torch.empty_like(initial)
-            for request in hl.grid(1):
-                state = initial[request, :, :].float()
-                for outer in hl.tile(tokens, block_size=block_t):
                     x_block = x[outer, :, :]
                     live = outer.end - outer.begin
                     for local in hl.tile(live, block_size=1):
                         token = x_block[local.begin, :, :]
-                        state += token.reshape(2, 2, 64).float().sum(dim=0)
-                out[request, :, :] = state.to(out.dtype)
+                        state += token.reshape(2, 2, 64).float()
+                out[request, :, :, :] = state.to(out.dtype)
             return out
 
-        x = torch.randn(9, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        initial = torch.zeros(1, 2, 64, device=DEVICE, dtype=torch.bfloat16)
-        expected = x.float().reshape(9, 2, 2, 64).sum((0, 1)).unsqueeze(0)
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.zeros(1, 2, 2, 64, device=DEVICE, dtype=torch.bfloat16)
+        expected = x.float().reshape(8, 2, 2, 64).sum(dim=0, keepdim=True)
         code, actual = code_and_output(
-            reshape_fallback,
+            folded_then_viewed,
             (x, initial),
             block_sizes=[4],
             pallas_loop_type="fori_loop",
         )
-        self.assertRegex(
-            code,
-            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
-        )
+        self.assertRegex(code, r"x_block = x\.at\[pl\.ds\(")
         self.assertIn("jnp.reshape(", code)
-        self.assertNotIn(".reshape((2, 2, 64))", code)
         torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
+
+    def test_subview_fold_declines_on_untiled_dim(self) -> None:
+        """Only the tiled dimension folds; anything else materializes.
+
+        Narrowing a dimension the load did not tile would need the block's
+        layout rather than a slice of it, so the load stays materialized.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def untiled_dim(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _channels, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :, :]
+                    acc = acc + x_block[:, 0, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.randn(8, 2, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(untiled_dim, (x, out), pallas_loop_type="fori_loop")
+        self.assertNotIn("x_block = x.at[", code)
+        torch.testing.assert_close(
+            out[0], x[:, 0, :, :].sum(dim=0), rtol=1e-4, atol=1e-4
+        )
+
+    def test_tile_count_inside_fori_loop(self) -> None:
+        """``tile.count`` has to honour a non-zero loop begin.
+
+        The pipelined loop types record their own begin/end, so the count is
+        ``cdiv(end - begin, block)`` rather than ``cdiv(end, block)``.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def count_tiles(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([1, 128], dtype=torch.float32)
+                for outer in hl.tile(4, 12, block_size=4):
+                    acc = acc + outer.count
+                out[0:1, :] = acc
+
+        x = torch.zeros(16, 128, device=DEVICE, dtype=torch.float32)
+        for loop_type in ("unroll", "fori_loop"):
+            with self.subTest(loop_type=loop_type):
+                out = torch.zeros(1, 128, device=DEVICE, dtype=torch.float32)
+                code_and_output(count_tiles, (x, out), pallas_loop_type=loop_type)
+                # Two tiles cover [4, 12), and each reports a count of two.
+                torch.testing.assert_close(out, torch.full_like(out, 4.0))
 
     @unittest.expectedFailure  # nested-scratch resolution bug; see _find_dma_scratch_loop TODO
     def test_fori_loop_nested_same_tensor_scratch_miscompiles(self) -> None:

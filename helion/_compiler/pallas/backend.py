@@ -294,6 +294,7 @@ class PallasBackend(Backend):
             "pallas_loop_type",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
+            "pallas_resident_subviews",
         }
     )
 
@@ -1510,9 +1511,9 @@ class PallasBackend(Backend):
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
 
-        from .view_ops import discover_resident_ref_subviews
+        from .view_ops import plan_subview_folding
 
-        discover_resident_ref_subviews(graphs, config)
+        plan_subview_folding(graphs, config)
 
     def _setup_compact_worklist(self, graphs: list[GraphInfo], config: Config) -> None:
         """Detect + stash the compact-worklist plan before device codegen.
