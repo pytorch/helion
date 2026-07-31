@@ -119,6 +119,9 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS
+from .tcgen05_constants import TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -5083,6 +5086,53 @@ def _emit_mma_pipeline(
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    role_scheduler_cluster_cap = df.config.get(
+        TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY
+    )
+    if df.config.get(TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY, False):
+        one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
+        one_shot_n_slots = n_size // bn
+        one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
+        if not (
+            tcgen05_pid_is_persistent
+            and tcgen05_static_full_tiles
+            and input_dtype == torch.float8_e4m3fn
+            and (analysis is None or not analysis.has_leading_passthrough)
+            and role_scheduler_cluster_cap is None
+            and one_shot_work_ctas <= TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS
+            and one_shot_m_slots % tcgen05_cluster_m == 0
+            and one_shot_n_slots % tcgen05_cluster_n == 0
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY}=True requires a "
+                "static-full, unbatched persistent FP8 grid without a role "
+                "scheduler cluster cap and with at most "
+                f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS} work CTAs",
+            )
+    if role_scheduler_cluster_cap is not None:
+        role_scheduler_cluster_cap = int(cast("int", role_scheduler_cluster_cap))
+        scheduler_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
+        scheduler_n_slots = n_size // bn
+        scheduler_cluster_size = tcgen05_cluster_m * tcgen05_cluster_n
+        scheduler_work_clusters = (scheduler_m_slots // tcgen05_cluster_m) * (
+            scheduler_n_slots // tcgen05_cluster_n
+        )
+        if not (
+            tcgen05_pid_is_persistent
+            and tcgen05_static_full_tiles
+            and input_dtype == torch.float8_e4m3fn
+            and scheduler_m_slots % tcgen05_cluster_m == 0
+            and scheduler_n_slots % tcgen05_cluster_n == 0
+            and role_scheduler_cluster_cap <= scheduler_work_clusters
+            and role_scheduler_cluster_cap * scheduler_cluster_size
+            <= TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY} requires an "
+                "static-full persistent FP8 cluster grid within residency",
+            )
     tcgen05_role_local_k_tail_tma = (
         tcgen05_preserve_tma_for_two_cta_k_tail
         and tcgen05_is_two_cta

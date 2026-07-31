@@ -2341,9 +2341,7 @@ class CuteBackend(Backend):
                 inactive_block_ids=inactive_block_ids,
             )
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-        block_size = functools.reduce(
-            operator.mul, nd_block_size
-        )  # pyrefly: ignore[incompatible-overload-residual]
+        block_size = functools.reduce(operator.mul, nd_block_size)  # pyrefly: ignore[incompatible-overload-residual]
         # Resolve per-axis thread counts then flatten to a single total
         all_auto = all(nt <= 0 for nt in num_threads_config)
         flat_num_threads = functools.reduce(
