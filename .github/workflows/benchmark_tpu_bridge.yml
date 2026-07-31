@@ -111,18 +111,31 @@ jobs:
               continue
             fi
 
-            # TPU differences vs GPU (benchmark.yml): --device tpu, --precision
-            # bf16 (match run_tpu), drop --cudagraph and
+            # TPU differences vs GPU (benchmark.yml): --device tpu, per-kernel
+            # --precision (see below), drop --cudagraph and
             # --latency-measure-mode triton_do_bench (CUDA/Triton-only; TPU uses
             # the wall-clock _do_bench_tpu path). Shapes are tritonbench's own,
             # count-capped by --num-inputs; per-kernel shape args (e.g. embedding
             # --B/--T/--D/--v-range) are supplied via inputs.env-vars / custom
             # args where a default shape exceeds TPU vmem.
+            #
+            # Precision follows the canonical helion examples per kernel: bf16
+            # for gemm/softmax/layer_norm/rms_norm (examples/rms_norm.py runs
+            # both fwd and bwd at bf16), and fp32 for kl_div and welford
+            # (examples/kl_div.py and examples/welford.py use fp32 inputs).
+            # kl_div keeps its loss reduction in fp32; welford's bf16 layer-norm
+            # output drifts ~1 ULP on near-zero values and trips the 1e-2
+            # accuracy tolerance for every correct impl. Force fp32 for those two
+            # so each impl isn't compared against a downcast bf16 baseline.
+            PRECISION=bf16
+            case "$kernel" in
+              kl_div|welford) PRECISION=fp32 ;;
+            esac
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
               python benchmarks/run.py \
                 --op $kernel \
                 --device tpu \
-                --precision bf16 \
+                --precision $PRECISION \
                 --helion-backend pallas \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
