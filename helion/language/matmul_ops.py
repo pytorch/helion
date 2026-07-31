@@ -353,7 +353,7 @@ def plan_cute_tcgen05_search(
         or static_n is None
         or static_k is None
         or static_m < 64
-        or static_n < 8
+        or static_n < 1
         or static_k < mma_k
     ):
         return None
@@ -367,7 +367,7 @@ def plan_cute_tcgen05_search(
     def pow2_floor_at_least(value: int, minimum: int) -> int:
         return 1 << (max(minimum, value).bit_length() - 1)
 
-    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
+    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 16))
     max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
     max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
     max_search_n = max_tcgen05_n
@@ -417,6 +417,7 @@ def enable_cute_tcgen05_search(
     input_dtype: torch.dtype,
     has_leading_passthrough: bool,
     explicit_epi_tile_compatible: bool,
+    allow_fp8_small_n_persistent: bool,
 ) -> None:
     """Apply one preflighted tcgen05 search plan to the shared config."""
     env = CompileEnvironment.current()
@@ -439,6 +440,13 @@ def enable_cute_tcgen05_search(
     allow_full_tile_persistent_pid_types = (
         static_m % max_search_m == 0
         and static_n % max_search_n == 0
+        and static_k % max_search_k == 0
+    )
+    allow_fp8_small_n_persistent_pid_types = (
+        plan.is_fp8
+        and allow_fp8_small_n_persistent
+        and 0 < static_n < max_search_n
+        and static_m % max_search_m == 0
         and static_k % max_search_k == 0
     )
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
@@ -492,7 +500,10 @@ def enable_cute_tcgen05_search(
                 allow_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
     spec.narrow_tcgen05_autotune_to_validated_configs(
-        allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
+        allow_persistent_pid_types=(
+            allow_full_tile_persistent_pid_types
+            or allow_fp8_small_n_persistent_pid_types
+        ),
         allow_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
         allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,

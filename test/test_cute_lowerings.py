@@ -6798,6 +6798,105 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
 
+    def test_tcgen05_fp8_narrow_simt_aux_load_precedes_acc_wait(self) -> None:
+        """A narrow SIMT epilogue overlaps scale loads with the MMA wait."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = (
+                    acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
+                ).to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([64, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 16], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([64, 1], device=DEVICE).expand(64, 16),
+            torch.empty([16], device=DEVICE),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[64, 16, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        loop_pos = code.find("for _tcgen05_subtile in cutlass.range")
+        aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
+        acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+        t2r_copy_pos = code.find("cute.copy(tcgen05_tiled_copy_t2r,", loop_pos)
+        self.assertGreater(loop_pos, 0)
+        self.assertGreater(aux_load_pos, loop_pos)
+        self.assertGreater(acc_wait_pos, aux_load_pos)
+        self.assertGreater(t2r_copy_pos, acc_wait_pos)
+
+    def test_tcgen05_fp8_small_n_tma_runtime_correctness(self) -> None:
+        """TMA zero-fills an FP8 N edge smaller than the tcgen05 tile."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def small_n_fp8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            out_t = out.T
+            for tile_n, tile_m in hl.tile([n, m]):
+                acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        y[tile_k, tile_n].T,
+                        x[tile_m, tile_k].T,
+                        acc=acc,
+                    )
+                out_t[tile_n, tile_m] = acc.to(torch.bfloat16)
+            return out
+
+        x = torch.randn([2, 128], device=DEVICE).to(torch.float8_e4m3fn)
+        y = torch.randn([128, 64], device=DEVICE).to(torch.float8_e4m3fn)
+        y = y.T.contiguous().T
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[64, 16, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_one_shot_role_scheduler=True,
+            indexing=["tensor_descriptor"] * 3,
+        )
+        with patch_cute_mma_support():
+            bound = small_n_fp8.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            actual = bound(x, y)
+        expected = (x.float() @ y.float()).to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.05)
+
     def test_tcgen05_fused_bias_broadcast_runtime_correctness(self) -> None:
         """``out[tile] = (acc + bias[tile_n]).to(x.dtype)`` after a
         tcgen05 matmul splices the rank-1 bias load inline at the
