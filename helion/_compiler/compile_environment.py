@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import contextvars
 import dataclasses
 import logging
 import sys
@@ -293,6 +294,13 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self._runtime_arg_values_by_name: contextvars.ContextVar[
+            dict[str, object] | None
+        ] = contextvars.ContextVar(
+            f"helion_runtime_arg_values_{id(self)}",
+            default=None,
+        )
+        self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         try:
@@ -387,6 +395,20 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
+
+    @property
+    def runtime_arg_values_by_name(self) -> dict[str, object]:
+        return self._runtime_arg_values_by_name.get() or {}
+
+    @contextlib.contextmanager
+    def use_runtime_arg_values(
+        self, values: dict[str, object]
+    ) -> typing.Iterator[None]:
+        token = self._runtime_arg_values_by_name.set(values)
+        try:
+            yield
+        finally:
+            self._runtime_arg_values_by_name.reset(token)
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""

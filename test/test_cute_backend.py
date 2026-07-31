@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import gc
 import importlib
 import math
 import os
+import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
 from unittest.mock import patch
+import weakref
 
 import pytest
 import torch
@@ -24,7 +29,7 @@ from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
 from helion.exc import InvalidConfig
 import helion.language as hl
-from helion.runtime import _build_cute_schema_and_args
+import helion.runtime as helion_runtime
 from helion.runtime import _cute_cluster_shape
 from helion.runtime import _cute_cluster_shape_from_wrapper_plans
 from helion.runtime import _ensure_cute_dsl_arch_env
@@ -32,6 +37,9 @@ from helion.runtime import _get_compiled_cute_launcher
 from helion.runtime import default_cute_launcher
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
+    from collections.abc import Sequence
+
     from helion.autotuner.config_spec import ConfigSpec
 
 cutlass = pytest.importorskip("cutlass")
@@ -2276,6 +2284,31 @@ def _attention_from_log2_scores(
 ) -> torch.Tensor:
     probs = torch.softmax(scores_log2.float() * math.log(2.0), dim=-1)
     return torch.matmul(probs.to(v.dtype), v)
+
+
+def _launch_entry(
+    schema: tuple[tuple[object, ...], ...],
+    launch_args: tuple[object, ...],
+    owned_tensors: tuple[torch.Tensor, ...] = (),
+) -> helion_runtime._CuteLaunchArgCacheEntry:
+    return helion_runtime._CuteLaunchArgCacheEntry(
+        schema, launch_args, (), owned_tensors
+    )
+
+
+def _runtime_identity_kernel() -> Any:
+    @helion.kernel(backend="cute")
+    def identity(x: torch.Tensor, layout: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.numel()):
+            out[tile] = x[tile]
+        return out
+
+    return identity
+
+
+def _runtime_layout(bound: Any) -> torch.Tensor:
+    return cast("torch.Tensor", bound.env.runtime_arg_values_by_name["layout"])
 
 
 @onlyBackends(["cute"])
@@ -6686,45 +6719,6 @@ class TestCuteBackend(TestCase):
             _ensure_cute_dsl_arch_env((tensor,))
             self.assertEqual(os.environ["CUTE_DSL_ARCH"], expected)
 
-    def test_cute_launcher_cache_key_includes_wrapper_plans(self) -> None:
-        cute_kernel = type("DummyCuteKernel", (), {})()
-        schema_key = (("tensor", 2, "float32"),)
-        block = (32, 1, 1)
-        created: list[str] = []
-
-        def make_wrapper(*_args: object, **_kwargs: object) -> str:
-            created.append("wrapper")
-            return f"wrapper-{len(created)}"
-
-        with patch("helion.runtime._create_cute_wrapper", side_effect=make_wrapper):
-            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-a"}]
-            wrapper_a0 = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
-            wrapper_a1 = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
-            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-b"}]
-            wrapper_b = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
-
-        self.assertEqual(wrapper_a0, wrapper_a1)
-        self.assertNotEqual(wrapper_a0, wrapper_b)
-
-    def test_cute_launcher_cache_key_includes_cluster_shape(self) -> None:
-        cute_kernel = type("DummyCuteKernel", (), {})()
-        schema_key = (("tensor", 2, "float32"),)
-        block = (32, 1, 1)
-        created: list[str] = []
-
-        def make_wrapper(*_args: object, **_kwargs: object) -> str:
-            created.append("wrapper")
-            return f"wrapper-{len(created)}"
-
-        with patch("helion.runtime._create_cute_wrapper", side_effect=make_wrapper):
-            cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-a"}]
-            cute_kernel._helion_cute_cluster_shape = (1, 1, 1)
-            wrapper_a = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
-            cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
-            wrapper_b = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
-
-        self.assertNotEqual(wrapper_a, wrapper_b)
-
     def test_cute_launcher_cache_key_includes_compile_options(self) -> None:
         cute_kernel = type("DummyCuteKernel", (), {})()
         schema_key = (("tensor", 2, "float32"),)
@@ -6841,9 +6835,9 @@ class TestCuteBackend(TestCase):
             _cute_kernel: object,
             args: tuple[object, ...],
             grid: tuple[int, int, int],
-        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
             build_calls.append((args, grid))
-            return (("scalar", "int"),), ("launch-arg", *args, *grid)
+            return _launch_entry((("scalar", "int"),), ("launch-arg", *args, *grid))
 
         with (
             patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
@@ -6883,6 +6877,7 @@ class TestCuteBackend(TestCase):
         build_calls: list[tuple[object, ...]] = []
         launched_args: list[tuple[object, ...]] = []
         streams = iter(["stream-A", "stream-B", "stream-C"])
+        owned_tensors = (torch.empty(1),)
 
         class FakeCompiled:
             def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
@@ -6893,10 +6888,10 @@ class TestCuteBackend(TestCase):
             _cute_kernel: object,
             args: tuple[object, ...],
             _grid: tuple[int, int, int],
-        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
             build_calls.append(args)
             # Note: no stream baked into the returned launch args.
-            return (("scalar", "int"),), ("launch-arg",)
+            return _launch_entry((("scalar", "int"),), ("launch-arg",), owned_tensors)
 
         with (
             patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
@@ -6907,6 +6902,7 @@ class TestCuteBackend(TestCase):
                 "helion.runtime._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
+            patch("helion.runtime._record_cute_owned_launch_tensors") as record_owned,
         ):
             first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
             second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
@@ -6915,6 +6911,8 @@ class TestCuteBackend(TestCase):
         # Build (and thus the cached args) happens once; the stream is appended
         # fresh on each of the three launches.
         self.assertEqual(build_calls, [(7,)])
+        self.assertEqual(record_owned.call_count, 3)
+        record_owned.assert_called_with(owned_tensors)
         self.assertEqual(
             launched_args,
             [
@@ -6926,6 +6924,598 @@ class TestCuteBackend(TestCase):
         self.assertEqual(first, ("launched", ("launch-arg", "stream-A")))
         self.assertEqual(second, ("launched", ("launch-arg", "stream-B")))
         self.assertEqual(third, ("launched", ("launch-arg", "stream-C")))
+
+    def test_cute_owned_launch_tensor_survives_cross_stream_lru_eviction(
+        self,
+    ) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("CuTe launch ownership test needs CUDA")
+        cuda_runtime = importlib.import_module("cuda.bindings.runtime")
+        producer_stream = torch.cuda.Stream(device=DEVICE)
+        launch_stream = torch.cuda.Stream(device=DEVICE)
+        tensor_size = 4 * 1024 * 1024
+
+        with torch.cuda.stream(producer_stream):
+            owned = torch.ones(tensor_size, dtype=torch.uint8, device=DEVICE)
+        producer_stream.synchronize()
+        owned_ref = weakref.ref(owned)
+        output = torch.empty_like(owned)
+        launch = _launch_entry((), (), (owned,))
+
+        with torch.cuda.stream(launch_stream):
+            # Keep the raw-pointer read pending while the launch-argument entry
+            # is evicted. Unlike a torch op, this memcpy does not retain or
+            # register the source tensor with the caching allocator.
+            torch.cuda._sleep(500_000_000)
+            copy_result = cuda_runtime.cudaMemcpyAsync(
+                output.data_ptr(),
+                owned.data_ptr(),
+                tensor_size,
+                cuda_runtime.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                cuda_runtime.cudaStream_t(launch_stream.cuda_stream),
+            )
+            self.assertEqual(copy_result[0], cuda_runtime.cudaError_t.cudaSuccess)
+            helion_runtime._record_cute_owned_launch_tensors(launch.owned_tensors)
+
+        cache = {0: launch}
+        cache.update(
+            (index, _launch_entry((), ()))
+            for index in range(1, helion_runtime._CUTE_LAUNCH_ARG_CACHE_LIMIT + 1)
+        )
+        cache.pop(next(iter(cache)))
+        self.assertNotIn(0, cache)
+        del launch, owned
+        gc.collect()
+        self.assertIsNone(owned_ref())
+
+        with torch.cuda.stream(producer_stream):
+            replacement = torch.full(
+                (tensor_size,), 7, dtype=torch.uint8, device=DEVICE
+            )
+        producer_stream.synchronize()
+        launch_stream.synchronize()
+
+        self.assertTrue(torch.all(replacement == 7).item())
+        self.assertTrue(torch.all(output == 1).item())
+
+    def test_grouped_dynamic_tensormap_workspace_isolated_by_stream(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("dynamic TensorMap workspace test needs CUDA")
+        runtime_mod = importlib.import_module("helion.runtime")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [
+            {
+                "kind": "tcgen05_grouped_static_persistent",
+                "layout_idx": 0,
+                "dynamic_ab_tensormaps": True,
+            }
+        ]
+        layout = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+        streams = [
+            torch.cuda.Stream(device=DEVICE)
+            for _ in range(
+                runtime_mod._TCGEN05_DYNAMIC_TENSORMAP_WORKSPACE_CACHE_LIMIT + 1
+            )
+        ]
+        stream_a, stream_b = streams[:2]
+
+        with torch.cuda.stream(stream_a):
+            context_a = runtime_mod._cute_dynamic_tensormap_contexts(
+                cute_kernel, (layout,)
+            )
+            workspace_a = runtime_mod._tcgen05_grouped_dynamic_tensormap_workspace(
+                cute_kernel, device=layout.device, tensormap_count=2
+            )
+            workspace_a_again = (
+                runtime_mod._tcgen05_grouped_dynamic_tensormap_workspace(
+                    cute_kernel, device=layout.device, tensormap_count=2
+                )
+            )
+        with torch.cuda.stream(stream_b):
+            context_b = runtime_mod._cute_dynamic_tensormap_contexts(
+                cute_kernel, (layout,)
+            )
+            workspace_b = runtime_mod._tcgen05_grouped_dynamic_tensormap_workspace(
+                cute_kernel, device=layout.device, tensormap_count=2
+            )
+
+        self.assertIs(workspace_a_again, workspace_a)
+        self.assertIsNot(workspace_b, workspace_a)
+        self.assertNotEqual(workspace_b.data_ptr(), workspace_a.data_ptr())
+        self.assertNotEqual(context_a, context_b)
+        self.assertIsNone(context_a[0][3])
+        self.assertIsNone(context_b[0][3])
+
+        for stream in streams[2:]:
+            with torch.cuda.stream(stream):
+                runtime_mod._tcgen05_grouped_dynamic_tensormap_workspace(
+                    cute_kernel, device=layout.device, tensormap_count=2
+                )
+        cache = cute_kernel._helion_tcgen05_dynamic_tensormap_workspace_cache
+        self.assertEqual(
+            len(cache), runtime_mod._TCGEN05_DYNAMIC_TENSORMAP_WORKSPACE_CACHE_LIMIT
+        )
+        self.assertFalse(any(cached is workspace_a for cached in cache.values()))
+        self.assertTrue(any(cached is workspace_b for cached in cache.values()))
+
+    def test_grouped_static_capture_query_fails_closed(self) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("grouped capture context test needs CUDA")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [
+            {"kind": "tcgen05_grouped_static_persistent", "layout_idx": 0}
+        ]
+        layout = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+
+        with (
+            patch(
+                "helion.runtime._cuda_stream_capture_context",
+                side_effect=BackendUnsupported("cute", "capture query failed"),
+            ),
+            self.assertRaisesRegex(BackendUnsupported, "capture query failed"),
+        ):
+            helion_runtime._cute_grouped_launch_contexts(cute_kernel, (layout,))
+
+    def test_grouped_dynamic_tensormap_workspace_retained_per_capture(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("dynamic TensorMap workspace test needs CUDA")
+        runtime_mod = importlib.import_module("helion.runtime")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [
+            {
+                "kind": "tcgen05_grouped_static_persistent",
+                "layout_idx": 0,
+                "dynamic_ab_tensormaps": True,
+            }
+        ]
+        layout = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+        args = (layout,)
+        grid = (1, 1, 1)
+        capture_stream = torch.cuda.Stream(device=DEVICE)
+        graphs: list[torch.cuda.CUDAGraph] = []
+        contexts: list[tuple[int, int | None]] = []
+        workspaces: list[torch.Tensor] = []
+        launch_keys: list[tuple[object, ...]] = []
+        guards: list[Any] = []
+        replay_aliases: list[Callable[[], None]] = []
+
+        runtime_mod.get_num_sm(DEVICE)
+        runtime_mod._cuda_stream_capture_context(DEVICE)
+        torch.empty(1, device=DEVICE).fill_(0)
+        torch.cuda.synchronize(DEVICE)
+        for value in range(1, 10):
+            with runtime_mod.cute_cuda_graph(stream=capture_stream) as graph:
+                replay_alias = graph.replay
+                context = runtime_mod._cuda_stream_capture_context(DEVICE)
+                launch_key = runtime_mod._cute_launch_arg_cache_key(
+                    cute_kernel, args, grid
+                )
+                if guards:
+                    self.assertFalse(guards[-1].matches(cute_kernel, args, grid))
+                guard = runtime_mod._cute_last_launch_arg_guard(cute_kernel, args, grid)
+                self.assertTrue(guard.matches(cute_kernel, args, grid))
+                workspace = runtime_mod._tcgen05_grouped_dynamic_tensormap_workspace(
+                    cute_kernel, device=DEVICE, tensormap_count=2
+                )
+                workspace.fill_(value)
+            graphs.append(graph)
+            contexts.append(context)
+            workspaces.append(workspace)
+            launch_keys.append(launch_key)
+            guards.append(guard)
+            replay_aliases.append(replay_alias)
+
+        self.assertEqual({context[0] for context in contexts}, {contexts[0][0]})
+        self.assertNotIn(None, {context[1] for context in contexts})
+        self.assertEqual(len({context[1] for context in contexts}), len(contexts))
+        self.assertEqual(len({workspace.data_ptr() for workspace in workspaces}), 9)
+        self.assertEqual(len(set(launch_keys)), 9)
+        cache = cute_kernel._helion_tcgen05_dynamic_tensormap_workspace_cache
+        self.assertEqual(len(cache), 9)
+        for workspace in workspaces:
+            self.assertTrue(any(cached is workspace for cached in cache.values()))
+
+        replay_aliases[0]()
+        replay_aliases[-1]()
+        torch.cuda.synchronize(DEVICE)
+        self.assertEqual(workspaces[0].flatten()[0].item(), 1)
+        self.assertEqual(workspaces[-1].flatten()[0].item(), 9)
+
+        replay_alias = replay_aliases.pop(0)
+        first_graph = graphs.pop(0)
+        graph_refs = [
+            weakref.ref(first_graph),
+            *(weakref.ref(graph) for graph in graphs),
+        ]
+        del first_graph
+        gc.collect()
+        self.assertIsNotNone(graph_refs[0]())
+        self.assertEqual(len(cache), 9)
+        replay_alias()
+        torch.cuda.synchronize(DEVICE)
+        self.assertEqual(workspaces[0].flatten()[0].item(), 1)
+
+        graphs.clear()
+        replay_aliases.clear()
+        del graph, replay_alias
+        gc.collect()
+        self.assertTrue(all(graph_ref() is None for graph_ref in graph_refs))
+        self.assertEqual(cache, {})
+
+    def test_grouped_dynamic_tensormap_context_guards_launcher_caches(
+        self,
+    ) -> None:
+        runtime_mod = importlib.import_module("helion.runtime")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        context_a = (("cuda", 0, 101, None),)
+        context_b = (("cuda", 0, 202, 7),)
+        current_context: list[tuple[tuple[str, int | None, int, int | None], ...]] = [
+            context_a
+        ]
+        build_calls: list[tuple[tuple[str, int | None, int, int | None], ...]] = []
+        launched_args: list[tuple[object, ...]] = []
+        streams = iter(["stream-A", "stream-B", "stream-C"])
+        generic_matcher = runtime_mod._cute_last_launch_cache_entry
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_contexts(
+            _cute_kernel: object,
+            _args: tuple[object, ...],
+        ) -> tuple[tuple[str, int | None, int, int | None], ...]:
+            return current_context[0]
+
+        def fake_build(
+            _cute_kernel: object,
+            _args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
+            build_calls.append(current_context[0])
+            return _launch_entry((("scalar", "int"),), (current_context[0],))
+
+        with (
+            patch(
+                "helion.runtime._cute_dynamic_tensormap_contexts",
+                side_effect=fake_contexts,
+            ),
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+            ),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+            patch(
+                "helion.runtime._cute_last_launch_cache_entry",
+                wraps=generic_matcher,
+            ) as generic_match,
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), 7)
+            current_context[0] = context_b
+            second = default_cute_launcher(cute_kernel, (1,), 7)
+            third = default_cute_launcher(cute_kernel, (1,), 7)
+
+        self.assertEqual(build_calls, [context_a, context_b])
+        self.assertEqual(generic_match.call_count, 3)
+        self.assertEqual(
+            launched_args,
+            [
+                (context_a, "stream-A"),
+                (context_b, "stream-B"),
+                (context_b, "stream-C"),
+            ],
+        )
+        self.assertEqual(first, ("launched", (context_a, "stream-A")))
+        self.assertEqual(second, ("launched", (context_b, "stream-B")))
+        self.assertEqual(third, ("launched", (context_b, "stream-C")))
+
+    def test_grouped_capture_retains_generated_tensors_beyond_launch_lru(
+        self,
+    ) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("grouped capture ownership test needs CUDA")
+        runtime_mod = importlib.import_module("helion.runtime")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "layout_idx": 0,
+            "n_sizes_idx": 1,
+            "group_count": 2,
+            "bm": 128,
+            "bn": 64,
+            "bk": 128,
+            "n_size": 256,
+            "k_total_size": 128,
+            "problem_sizes_arg": "tcgen05_grouped_problem_sizes_0",
+            "starts_arg": "tcgen05_grouped_starts_0",
+            "total_clusters_arg": "tcgen05_grouped_total_clusters_0",
+        }
+        cute_kernel._helion_cute_wrapper_plans = [plan]
+
+        def make_args(signature: int) -> tuple[torch.Tensor, torch.Tensor]:
+            first_group_size = 128 * (signature + 1)
+            layout = torch.cat(
+                (
+                    torch.zeros(first_group_size, dtype=torch.int32, device=DEVICE),
+                    torch.ones(128, dtype=torch.int32, device=DEVICE),
+                )
+            )
+            n_offset = 64 * (signature % 4)
+            n_sizes = torch.tensor(
+                (64 + n_offset, 256 - n_offset),
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+            return layout, n_sizes
+
+        def fake_imports() -> tuple[object, object, object]:
+            def make_ptr(
+                _dtype: object,
+                data_ptr: int,
+                _space: object,
+                *,
+                assumed_align: int,
+            ) -> int:
+                self.assertEqual(assumed_align, 16)
+                return data_ptr
+
+            return object(), make_ptr, object()
+
+        first_args = make_args(0)
+        grid = (1, 1, 1)
+        # Metadata must be ready before capture, but leave the launch-argument
+        # cache cold so capture exercises the new-build ownership path.
+        runtime_mod._build_tcgen05_grouped_static_metadata(
+            cute_kernel, plan, first_args
+        )
+        runtime_mod._cuda_stream_capture_context(DEVICE)
+        torch.empty(1, device=DEVICE).fill_(0)
+        torch.cuda.synchronize(DEVICE)
+
+        capture_stream = torch.cuda.Stream(device=DEVICE)
+        with (
+            patch(
+                "helion.runtime._get_cute_launcher_imports", side_effect=fake_imports
+            ),
+            patch("helion.runtime._torch_dtype_to_cutlass", side_effect=str),
+        ):
+            with runtime_mod.cute_cuda_graph(stream=capture_stream) as graph:
+                runtime_mod._build_cached_cute_schema_and_args(
+                    cute_kernel, first_args, grid
+                )
+                capture_owned = cute_kernel._helion_cute_capture_owned_launch_tensors
+                self.assertEqual(len(capture_owned), 1)
+                capture_context = next(iter(capture_owned))
+                capture_tensors = capture_owned[capture_context]
+                problem_tensor = next(
+                    tensor for tensor in capture_tensors.values() if tensor.ndim == 2
+                )
+                problem_ref = weakref.ref(problem_tensor)
+                problem_ptr = problem_tensor.data_ptr()
+
+                # Drop one promoted tensor, then ensure the cache-hit path
+                # promotes it again from the bounded launch ownership cache.
+                capture_tensors.pop(id(problem_tensor))
+                runtime_mod._build_cached_cute_schema_and_args(
+                    cute_kernel, first_args, grid
+                )
+                self.assertIs(capture_tensors[id(problem_tensor)], problem_tensor)
+                problem_tensor.fill_(17)
+
+            torch.cuda.synchronize(DEVICE)
+            problem_tensor.zero_()
+            torch.cuda.synchronize(DEVICE)
+            del capture_owned, capture_tensors, problem_tensor
+
+            other_args = [make_args(signature) for signature in range(1, 9)]
+            for args in other_args:
+                runtime_mod._build_cached_cute_schema_and_args(cute_kernel, args, grid)
+
+        self.assertEqual(len(cute_kernel._helion_cute_launch_arg_cache), 8)
+        self.assertTrue(
+            all(
+                entry.owned_tensors
+                for entry in cute_kernel._helion_cute_launch_arg_cache.values()
+            )
+        )
+        self.assertEqual(
+            len(cute_kernel._helion_tcgen05_grouped_static_metadata_cache), 8
+        )
+        first_problem = problem_ref()
+        self.assertIsNotNone(first_problem)
+        assert first_problem is not None
+        self.assertFalse(
+            any(
+                tensor is first_problem
+                for entry in cute_kernel._helion_cute_launch_arg_cache.values()
+                for tensor in entry.owned_tensors
+            )
+        )
+        self.assertFalse(
+            any(
+                value is first_problem
+                for entry in cute_kernel._helion_tcgen05_grouped_static_metadata_cache.values()
+                for value in entry.result.tensors()
+            )
+        )
+        del first_problem
+
+        gc.collect()
+        allocator_churn = [
+            torch.empty((2, 4), dtype=torch.int32, device=DEVICE) for _ in range(32)
+        ]
+        graph.replay()
+        torch.cuda.synchronize(DEVICE)
+
+        retained_problem = problem_ref()
+        self.assertIsNotNone(retained_problem)
+        assert retained_problem is not None
+        self.assertEqual(retained_problem.data_ptr(), problem_ptr)
+        self.assertTrue(torch.all(retained_problem == 17).item())
+        self.assertEqual(len(allocator_churn), 32)
+
+        capture_owned = cute_kernel._helion_cute_capture_owned_launch_tensors
+        self.assertEqual(len(capture_owned), 1)
+        del retained_problem, graph
+        gc.collect()
+        self.assertEqual(capture_owned, {})
+        self.assertIsNone(problem_ref())
+
+    def test_grouped_worklist_metadata_cache_guards_source_extents(self) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("grouped worklist metadata test needs CUDA")
+        runtime_mod = importlib.import_module("helion.runtime")
+        plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "layout_idx": 2,
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "group_count": 1,
+            "bm": 128,
+            "bn": 64,
+            "bk": 64,
+            "n_size": 64,
+            "k_total_size": 64,
+            "worklist_metadata": True,
+            "dynamic_ab_tensormaps": True,
+            "problem_sizes_arg": "problem_sizes",
+            "starts_arg": "starts",
+            "real_groups_arg": "real_groups",
+            "total_clusters_arg": "total_clusters",
+        }
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [plan]
+        layout = torch.tensor(((0, 0, 128, 0),), dtype=torch.int32, device=DEVICE)
+        rhs = torch.empty((1, 64, 64), dtype=torch.bfloat16, device=DEVICE)
+
+        runtime_mod._build_tcgen05_grouped_static_metadata(
+            cute_kernel,
+            plan,
+            (torch.empty((128, 64), dtype=torch.bfloat16, device=DEVICE), rhs, layout),
+        )
+        with self.assertRaisesRegex(BackendUnsupported, "row exceeds A extent"):
+            runtime_mod._build_tcgen05_grouped_static_metadata(
+                cute_kernel,
+                plan,
+                (
+                    torch.empty((64, 64), dtype=torch.bfloat16, device=DEVICE),
+                    rhs,
+                    layout,
+                ),
+            )
+        with self.assertRaisesRegex(BackendUnsupported, "outside B_grouped"):
+            runtime_mod._build_tcgen05_grouped_static_metadata(
+                cute_kernel,
+                plan,
+                (
+                    torch.empty((128, 64), dtype=torch.bfloat16, device=DEVICE),
+                    torch.empty((0, 64, 64), dtype=torch.bfloat16, device=DEVICE),
+                    layout,
+                ),
+            )
+
+    def test_grouped_inference_metadata_tracks_value_mutation(self) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("grouped inference metadata test needs CUDA")
+        runtime_mod = importlib.import_module("helion.runtime")
+        kernel_mod = importlib.import_module("helion.runtime.kernel")
+        plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "layout_idx": 0,
+            "n_sizes_idx": 1,
+            "group_count": 2,
+            "bm": 128,
+            "bn": 64,
+            "bk": 128,
+            "n_size": 256,
+            "k_total_size": 128,
+            "problem_sizes_arg": "problem_sizes",
+            "starts_arg": "starts",
+            "total_clusters_arg": "total_clusters",
+        }
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [plan]
+
+        with torch.inference_mode():
+            layout = torch.cat(
+                (
+                    torch.zeros(128, dtype=torch.int32, device=DEVICE),
+                    torch.ones(128, dtype=torch.int32, device=DEVICE),
+                )
+            )
+            n_sizes = torch.tensor((64, 256), dtype=torch.int32, device=DEVICE)
+            args = (layout, n_sizes)
+            self.assertTrue(torch.is_inference(layout))
+
+            first = runtime_mod._build_tcgen05_grouped_static_metadata(
+                cute_kernel, plan, args
+            )
+            self.assertIs(
+                runtime_mod._build_tcgen05_grouped_static_metadata(
+                    cute_kernel, plan, args
+                ),
+                first,
+            )
+            first_problem_sizes = first.result.problem_sizes.cpu().clone()
+            first_launch_key = runtime_mod._cute_launch_arg_cache_key(
+                cute_kernel, args, (1, 1, 1)
+            )
+            first_guard = runtime_mod._cute_last_launch_arg_guard(
+                cute_kernel, args, (1, 1, 1)
+            )
+            values_cache = kernel_mod.WeakIdKeyDictionary()
+            self.assertEqual(
+                kernel_mod._cute_int_1d_tensor_values(n_sizes, values_cache),
+                (64, 256),
+            )
+
+            n_sizes.copy_(torch.tensor((128, 192), dtype=torch.int32, device=DEVICE))
+
+            self.assertFalse(first_guard.matches(cute_kernel, args, (1, 1, 1)))
+            self.assertNotEqual(
+                runtime_mod._cute_launch_arg_cache_key(cute_kernel, args, (1, 1, 1)),
+                first_launch_key,
+            )
+            self.assertEqual(
+                kernel_mod._cute_int_1d_tensor_values(n_sizes, values_cache),
+                (128, 192),
+            )
+            updated = runtime_mod._build_tcgen05_grouped_static_metadata(
+                cute_kernel, plan, args
+            )
+
+        self.assertIsNot(updated, first)
+        self.assertFalse(
+            torch.equal(updated.result.problem_sizes.cpu(), first_problem_sizes)
+        )
+        with (
+            patch(
+                "helion.runtime._cuda_stream_capture_context",
+                return_value=(123, 456),
+            ),
+            self.assertRaisesRegex(BackendUnsupported, "inference tensor.*capture"),
+        ):
+            runtime_mod._tcgen05_grouped_tensor_mutation_key(n_sizes)
+
+    def test_grouped_metadata_rejects_mixed_cuda_devices(self) -> None:
+        if torch.cuda.device_count() < 2:
+            self.skipTest("mixed-device grouped metadata test needs two CUDA devices")
+        runtime_mod = importlib.import_module("helion.runtime")
+        device0 = torch.device(DEVICE.type, 0)
+        device1 = torch.device(DEVICE.type, 1)
+        layout = torch.zeros(128, dtype=torch.int32, device=device0)
+        other = torch.empty(1, device=device1)
+
+        with self.assertRaisesRegex(
+            BackendUnsupported, "every tensor argument.*mismatched argument indices"
+        ):
+            runtime_mod._build_tcgen05_grouped_static_metadata(
+                object(), {"layout_idx": 0}, (layout, other)
+            )
 
     def test_cute_build_schema_excludes_stream_from_cached_args(self) -> None:
         # The stream must never be part of the cached launch args produced by
@@ -6956,14 +7546,14 @@ class TestCuteBackend(TestCase):
                 "helion.runtime._cute_kernel_param_is_constexpr", return_value=(False,)
             ),
         ):
-            schema, launch_args = _build_cute_schema_and_args(
+            launch = helion_runtime._build_cute_schema_and_args(
                 cute_kernel, (7,), (2, 1, 1)
             )
 
         # Args end with the grid; the stream is not baked in.
-        self.assertEqual(launch_args, (7, 2, 1, 1))
-        self.assertNotIn(sentinel_stream, launch_args)
-        self.assertEqual(schema, (("scalar", "int"),))
+        self.assertEqual(launch.launch_args, (7, 2, 1, 1))
+        self.assertNotIn(sentinel_stream, launch.launch_args)
+        self.assertEqual(launch.schema, (("scalar", "int"),))
 
     def test_cute_launcher_launch_arg_cache_distinguishes_signed_zero(
         self,
@@ -6981,9 +7571,9 @@ class TestCuteBackend(TestCase):
             _cute_kernel: object,
             args: tuple[object, ...],
             _grid: tuple[int, int, int],
-        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
             build_calls.append(args)
-            return (("scalar", "float"),), (f"float-{len(build_calls)}",)
+            return _launch_entry((("scalar", "float"),), (f"float-{len(build_calls)}",))
 
         with (
             patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
@@ -7001,6 +7591,54 @@ class TestCuteBackend(TestCase):
         self.assertEqual(positive, ("launched", ("float-1", "stream")))
         self.assertEqual(negative, ("launched", ("float-2", "stream")))
 
+    def test_cute_launcher_last_launch_distinguishes_scalar_kinds(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[object, ...]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
+            build_calls.append(args)
+            scalar_kind = type(args[0]).__name__
+            return _launch_entry(
+                (("scalar", scalar_kind),), (f"{scalar_kind}-{len(build_calls)}",)
+            )
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            bool_launch = default_cute_launcher(cute_kernel, (1,), True)
+            bool_hit = default_cute_launcher(cute_kernel, (1,), True)
+            int_miss = default_cute_launcher(cute_kernel, (1,), 1)
+            float_miss = default_cute_launcher(cute_kernel, (1,), 1.0)
+
+        self.assertEqual(build_calls, [(True,), (1,), (1.0,)])
+        self.assertEqual(bool_launch, bool_hit)
+        self.assertEqual(int_miss, ("launched", ("int-2", "stream")))
+        self.assertEqual(float_miss, ("launched", ("float-3", "stream")))
+        self.assertEqual(
+            launched_args,
+            [
+                ("bool-1", "stream"),
+                ("bool-1", "stream"),
+                ("int-2", "stream"),
+                ("float-3", "stream"),
+            ],
+        )
+
     def test_cute_launcher_sets_arch_env_only_before_first_compile(self) -> None:
         cute_kernel = type("DummyCuteKernel", (), {})()
 
@@ -7011,7 +7649,7 @@ class TestCuteBackend(TestCase):
         with (
             patch(
                 "helion.runtime._build_cute_schema_and_args",
-                return_value=((("scalar", "int"),), ("launch-arg",)),
+                return_value=_launch_entry((("scalar", "int"),), ("launch-arg",)),
             ),
             patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
@@ -7084,9 +7722,11 @@ class TestCuteBackend(TestCase):
             _cute_kernel: object,
             args: tuple[object, ...],
             _grid: tuple[int, int, int],
-        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
             build_calls.append(cast("torch.Tensor", args[0]).data_ptr())
-            return (("tensor", "torch.float32", 1),), (f"ptr-{len(build_calls)}",)
+            return _launch_entry(
+                (("tensor", "torch.float32", 1),), (f"ptr-{len(build_calls)}",)
+            )
 
         with (
             patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
@@ -7107,6 +7747,489 @@ class TestCuteBackend(TestCase):
         )
         self.assertEqual(first, second)
         self.assertEqual(third, ("launched", ("ptr-2", "stream")))
+
+    def test_cute_launcher_last_launch_guards_launch_parameters(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[object, ...]] = []
+        compiled_calls: list[tuple[tuple[int, int, int], str | None]] = []
+        launched: list[tuple[int, tuple[object, ...]]] = []
+
+        class FakeCompiled:
+            def __init__(self, index: int) -> None:
+                self.index = index
+
+            def __call__(self, *args: object) -> tuple[int, tuple[object, ...]]:
+                launched.append((self.index, args))
+                return (self.index, args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            grid: tuple[int, int, int],
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
+            build_calls.append((*args, *grid))
+            return _launch_entry((("scalar", "int"),), ("launch", *args, *grid))
+
+        def fake_get(
+            _cute_kernel: object,
+            _schema_key: tuple[tuple[object, ...], ...],
+            block: tuple[int, int, int],
+            *,
+            compile_options: str | None = None,
+            arch_args: tuple[object, ...] | None = None,
+        ) -> FakeCompiled:
+            self.assertIsNotNone(arch_args)
+            compiled_calls.append((block, compile_options))
+            return FakeCompiled(len(compiled_calls))
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch("helion.runtime._get_compiled_cute_launcher", side_effect=fake_get),
+        ):
+            first = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            options_miss = default_cute_launcher(
+                cute_kernel,
+                (2,),
+                7,
+                block=(32, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+            block_miss = default_cute_launcher(
+                cute_kernel,
+                (2,),
+                7,
+                block=(64, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+            grid_miss = default_cute_launcher(
+                cute_kernel,
+                (3,),
+                7,
+                block=(64, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+
+        self.assertEqual(first[0], 1)
+        self.assertEqual(second[0], 1)
+        self.assertEqual(options_miss[0], 2)
+        self.assertEqual(block_miss[0], 3)
+        self.assertEqual(grid_miss[0], 4)
+        self.assertEqual(len(compiled_calls), 4)
+        self.assertEqual(
+            [entry[0] for entry in launched],
+            [1, 1, 2, 3, 4],
+        )
+        self.assertEqual(
+            build_calls,
+            [
+                (7, 2, 1, 1),
+                (7, 3, 1, 1),
+            ],
+        )
+
+    def test_cute_launcher_last_launch_guards_tensor_pointer_and_schema(
+        self,
+    ) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("CuTe launcher tensor guard test needs CUDA")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        tensor = torch.empty(4, device=DEVICE)
+        same_storage_view = tensor.view_as(tensor)
+        self.assertEqual(tensor.data_ptr(), same_storage_view.data_ptr())
+        self.assertNotEqual(id(tensor), id(same_storage_view))
+        build_calls: list[tuple[int, bool]] = []
+        compiled_calls: list[int] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
+            build_calls.append(
+                (
+                    id(args[0]),
+                    bool(
+                        getattr(
+                            _cute_kernel,
+                            "_helion_cute_disable_bake_tensor_shapes",
+                            False,
+                        )
+                    ),
+                )
+            )
+            return _launch_entry(
+                (("tensor", "torch.float32", 1),), (f"ptr-{len(build_calls)}",)
+            )
+
+        def fake_get(*_args: object, **_kwargs: object) -> FakeCompiled:
+            compiled_calls.append(len(compiled_calls) + 1)
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch("helion.runtime._get_compiled_cute_launcher", side_effect=fake_get),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), tensor)
+            second = default_cute_launcher(cute_kernel, (1,), tensor)
+            view_hit = default_cute_launcher(cute_kernel, (1,), same_storage_view)
+            cute_kernel._helion_cute_disable_bake_tensor_shapes = True
+            schema_miss = default_cute_launcher(cute_kernel, (1,), same_storage_view)
+
+        self.assertEqual(first, ("launched", ("ptr-1", "stream")))
+        self.assertEqual(second, first)
+        self.assertEqual(view_hit, first)
+        self.assertEqual(schema_miss, ("launched", ("ptr-2", "stream")))
+        self.assertEqual(
+            build_calls,
+            [
+                (id(tensor), False),
+                (id(same_storage_view), True),
+            ],
+        )
+        self.assertEqual(len(compiled_calls), 2)
+
+    def test_cute_launcher_last_launch_misses_on_same_tensor_metadata_mutation(
+        self,
+    ) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("CuTe launcher tensor guard test needs CUDA")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        base = torch.empty(32, device=DEVICE)
+        tensor = base.as_strided((4, 2), (2, 1), 0)
+        tensor_id = id(tensor)
+        build_calls: list[tuple[tuple[int, ...], tuple[int, ...], int, int]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> helion_runtime._CuteLaunchArgCacheEntry:
+            tensor_arg = cast("torch.Tensor", args[0])
+            build_calls.append(
+                (
+                    tuple(int(size) for size in tensor_arg.shape),
+                    tuple(int(stride) for stride in tensor_arg.stride()),
+                    int(tensor_arg.storage_offset()),
+                    int(tensor_arg.data_ptr()),
+                )
+            )
+            return _launch_entry(
+                (("tensor", "torch.float32", 2),), (f"ptr-{len(build_calls)}",)
+            )
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), tensor)
+            second = default_cute_launcher(cute_kernel, (1,), tensor)
+            tensor.as_strided_((4, 2), (1, 4), 0)
+            stride_miss = default_cute_launcher(cute_kernel, (1,), tensor)
+            tensor.as_strided_((4, 2), (2, 1), 1)
+            offset_miss = default_cute_launcher(cute_kernel, (1,), tensor)
+
+        self.assertEqual(id(tensor), tensor_id)
+        self.assertEqual(first, second)
+        self.assertEqual(stride_miss, ("launched", ("ptr-2", "stream")))
+        self.assertEqual(offset_miss, ("launched", ("ptr-3", "stream")))
+        self.assertEqual(
+            [(shape, stride, offset) for shape, stride, offset, _ in build_calls],
+            [
+                ((4, 2), (2, 1), 0),
+                ((4, 2), (1, 4), 0),
+                ((4, 2), (2, 1), 1),
+            ],
+        )
+        self.assertEqual(build_calls[0][3], build_calls[1][3])
+        self.assertNotEqual(build_calls[1][3], build_calls[2][3])
+
+    def test_kernel_late_cute_specialization_rekeys_bound_kernel(self) -> None:
+        identity = _runtime_identity_kernel()
+        x = torch.empty(1)
+        layout = torch.zeros(128, dtype=torch.int64)
+        args = (x, layout)
+        bound = identity.bind(args)
+        signature = identity._base_specialization_key(args)
+        plan: dict[str, object] = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "layout_bind_idx": 1,
+            "group_count": 1,
+            "bm": 128,
+        }
+        kernel_mod = importlib.import_module("helion.runtime.kernel")
+        self.assertEqual(
+            kernel_mod._cute_grouped_static_tail_extra_descriptors([plan]), ()
+        )
+        plan.update(
+            grouped_static_has_m_tail=True,
+            grouped_static_has_n_tail=False,
+        )
+        bound.env.cute_resolved_wrapper_plans = [plan]
+        self.assertEqual(bound._base_spec_key, signature)
+        with bound.env, bound._runtime_arg_values_for_codegen():
+            self.assertEqual(
+                bound.env.runtime_arg_values_by_name,
+                {"x": x, "layout": layout},
+            )
+            bound._register_cute_grouped_static_tail_specializations()
+
+        key0 = identity._fast_dispatch_key(args)
+        self.assertIs(identity.bind(args), bound)
+        layout[64:] = -1
+        key1 = identity._fast_dispatch_key(args)
+
+        self.assertNotEqual(key0, key1)
+        self.assertIsNot(identity.bind(args), bound)
+
+    def test_kernel_growing_late_specialization_evicts_all_stale_keys(self) -> None:
+        identity = _runtime_identity_kernel()
+        x = torch.empty(1)
+        layout_a = torch.tensor([0, 0], dtype=torch.int64)
+        args_a = (x, layout_a)
+        signature = identity._base_specialization_key(args_a)
+        bound_a = identity.bind(args_a)
+
+        def first(values: Sequence[object]) -> Hashable:
+            return int(cast("torch.Tensor", values[1])[0].item())
+
+        def last(values: Sequence[object]) -> Hashable:
+            return int(cast("torch.Tensor", values[1])[-1].item())
+
+        identity._extend_bound_kernel_specializations(
+            bound_a, signature, [first], args_a
+        )
+        args_b = (x, torch.tensor([1, 1], dtype=torch.int64))
+        bound_b = identity.bind(args_b)
+        self.assertIsNot(bound_b, bound_a)
+        identity._dispatch_cache.update(old_a=bound_a, old_b=bound_b)
+
+        identity._extend_bound_kernel_specializations(
+            bound_a, signature, [last], args_a
+        )
+
+        signature_entries = [
+            (key, cached_bound)
+            for key, cached_bound in identity._bound_kernels.items()
+            if key.specialization_key == signature
+        ]
+        self.assertEqual(len(signature_entries), 1)
+        self.assertEqual(signature_entries[0][0].extra_results, (0, 0))
+        self.assertIs(signature_entries[0][1], bound_a)
+        self.assertEqual(identity._dispatch_cache, {})
+
+    def test_bound_kernel_runtime_args_are_scoped_to_codegen(self) -> None:
+        @helion.kernel()
+        def identity(
+            x: torch.Tensor, layout: torch.Tensor, n_sizes: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile]
+            return out
+
+        x = torch.empty(16, device=DEVICE)
+        layout = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        n_sizes = torch.tensor([128], device=DEVICE, dtype=torch.int64)
+        bound = identity.bind((x, layout, n_sizes))
+        layout_ref = weakref.ref(layout)
+
+        self.assertEqual(bound.env.runtime_arg_values_by_name, {})
+        with bound._runtime_arg_values_for_codegen():
+            self.assertEqual(
+                bound.env.runtime_arg_values_by_name,
+                {"x": x, "layout": layout, "n_sizes": n_sizes},
+            )
+        self.assertEqual(bound.env.runtime_arg_values_by_name, {})
+
+        del layout
+        gc.collect()
+        self.assertIsNone(layout_ref())
+
+    def test_bound_kernel_codegen_uses_stable_bind_and_current_call_args(self) -> None:
+        identity = _runtime_identity_kernel()
+        x = torch.empty(1)
+        layout_a = torch.zeros(1, dtype=torch.int64)
+        layout_b = torch.ones(1, dtype=torch.int64)
+        bound = identity.bind((x, layout_a))
+        self.assertIs(identity.bind((x, layout_b)), bound)
+        delayed_codegen_layouts: list[torch.Tensor] = []
+
+        def fake_generate_ast(*_args: object, **_kwargs: object) -> ast.Module:
+            delayed_codegen_layouts.append(_runtime_layout(bound))
+            return ast.parse("pass")
+
+        with patch("helion.runtime.kernel.generate_ast", side_effect=fake_generate_ast):
+            bound.to_code(helion.Config(block_sizes=[1]))
+
+        self.assertEqual(delayed_codegen_layouts, [layout_a])
+        call_codegen_layouts: list[torch.Tensor] = []
+
+        def fake_ensure(_args: tuple[object, ...]) -> None:
+            with bound._runtime_arg_values_for_codegen():
+                call_codegen_layouts.append(_runtime_layout(bound))
+            bound._run = lambda _x, layout: layout
+
+        with patch.object(bound, "ensure_config_exists", side_effect=fake_ensure):
+            result = bound(x, layout_b)
+
+        self.assertEqual(call_codegen_layouts, [layout_b])
+        self.assertIs(result, layout_b)
+
+    def test_concurrent_first_compile_uses_each_calls_runtime_args(self) -> None:
+        identity = _runtime_identity_kernel()
+        x = torch.empty(1)
+        layouts = {
+            "a": torch.zeros(1, dtype=torch.int64),
+            "b": torch.ones(1, dtype=torch.int64),
+        }
+        bind_lock = identity._bind_lock
+        both_binds_waiting = threading.Event()
+        bind_attempts: list[None] = []
+
+        class TrackingBindLock:
+            def __enter__(self) -> None:
+                bind_attempts.append(None)
+                if len(bind_attempts) == 2:
+                    both_binds_waiting.set()
+                bind_lock.acquire()
+
+            def __exit__(self, *_args: object) -> None:
+                bind_lock.release()
+
+        identity._bind_lock = TrackingBindLock()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            bind_lock.acquire()
+            try:
+                bound_a = executor.submit(identity.bind, (x, layouts["a"]))
+                bound_b = executor.submit(identity.bind, (x, layouts["b"]))
+                self.assertTrue(both_binds_waiting.wait(timeout=5))
+            finally:
+                bind_lock.release()
+            bound = bound_a.result(timeout=5)
+            self.assertIs(bound_b.result(timeout=5), bound)
+        identity._bind_lock = bind_lock
+
+        first_compile_entered = threading.Event()
+        second_compile_waiting = threading.Event()
+        release_first_compile = threading.Event()
+        seen_layouts: list[torch.Tensor] = []
+        compile_lock = bound._first_compile_lock
+
+        class TrackingCompileLock:
+            def __enter__(self) -> None:
+                if first_compile_entered.is_set():
+                    second_compile_waiting.set()
+                compile_lock.acquire()
+
+            def __exit__(self, *_args: object) -> None:
+                compile_lock.release()
+
+        bound._first_compile_lock = cast("Any", TrackingCompileLock())
+
+        def layout_value(values: tuple[object, ...]) -> int:
+            return int(cast("torch.Tensor", values[1]).item())
+
+        def fake_ensure(current_bound: Any, call_args: tuple[object, ...]) -> None:
+            with current_bound._runtime_arg_values_for_codegen():
+                seen_layouts.append(_runtime_layout(current_bound))
+            if current_bound is bound:
+                first_compile_entered.set()
+                self.assertTrue(release_first_compile.wait(timeout=5))
+                identity._extend_bound_kernel_specializations(
+                    current_bound,
+                    current_bound._base_spec_key,
+                    [layout_value],
+                    call_args,
+                )
+            current_bound._run = lambda _x, layout: layout
+
+        with (
+            patch(
+                "helion.runtime.kernel.BoundKernel.ensure_config_exists",
+                new=fake_ensure,
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            future_a = executor.submit(identity, x, layouts["a"])
+            self.assertTrue(first_compile_entered.wait(timeout=5))
+            future_b = executor.submit(identity, x, layouts["b"])
+            try:
+                self.assertTrue(second_compile_waiting.wait(timeout=5))
+            finally:
+                release_first_compile.set()
+            output_a = future_a.result(timeout=5)
+            output_b = future_b.result(timeout=5)
+
+        self.assertEqual(seen_layouts, [layouts["a"], layouts["b"]])
+        self.assertIs(output_a, layouts["a"])
+        self.assertIs(output_b, layouts["b"])
+        rebound_b = identity.bind((x, layouts["b"]))
+        self.assertIsNot(rebound_b, bound)
+        fast_key_b = identity._fast_dispatch_key((x, layouts["b"]))
+        self.assertIsNotNone(fast_key_b)
+        assert fast_key_b is not None
+        self.assertIs(identity._dispatch_cache[fast_key_b], rebound_b)
+
+        def stale_run(*_args: object) -> torch.Tensor:
+            raise AssertionError("fast dispatch used the pre-specialization kernel")
+
+        bound._run = stale_run
+        self.assertIs(identity(x, layouts["b"]), layouts["b"])
+
+    def test_compile_cache_lookup_normalizes_config_copy(self) -> None:
+        identity = _runtime_identity_kernel()
+        bound = identity.bind((torch.empty(16), torch.empty(1)))
+        config = helion.Config(block_sizes=[16])
+        normalized = bound._normalized_config_copy(config)
+        self.assertNotEqual(config, normalized)
+        compiled = cast("Any", lambda x: x)
+        bound._compile_cache[normalized] = compiled
+
+        self.assertIs(bound.compile_config(config), compiled)
+        self.assertEqual(config, helion.Config(block_sizes=[16]))
+
+    def test_bound_kernel_ignores_non_tensor_runtime_args(self) -> None:
+        @dataclass(frozen=True)
+        class RuntimeMetadata:
+            layout: torch.Tensor
+            label: str
+
+        @helion.kernel()
+        def identity(x: torch.Tensor, metadata: RuntimeMetadata) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile]
+            return out
+
+        x = torch.empty(16, device=DEVICE)
+        layout = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        metadata = RuntimeMetadata(layout=layout, label="grouped-layout")
+        metadata_ref = weakref.ref(metadata)
+        layout_ref = weakref.ref(layout)
+        bound = identity.bind((x, metadata))
+
+        with bound._runtime_arg_values_for_codegen():
+            self.assertEqual(bound.env.runtime_arg_values_by_name, {"x": x})
+
+        del metadata, layout
+        gc.collect()
+        self.assertIsNone(metadata_ref())
+        self.assertIsNone(layout_ref())
 
     def test_cute_launcher_tensor_shape_baking(self) -> None:
         tensor = torch.empty((2, 128, 64), device=DEVICE, dtype=torch.float16)
@@ -7131,12 +8254,12 @@ class TestCuteBackend(TestCase):
                 kernel = type("DummyCuteKernel", (), {})()
                 kernel._helion_cute_wrapper_plans = [plan]
                 kernel._helion_cute_disable_bake_tensor_shapes = disable_bake
-                schema, launch_args = _build_cute_schema_and_args(
+                launch = helion_runtime._build_cute_schema_and_args(
                     kernel, (tensor,), (128, 2, 1)
                 )
                 if expected_baked:
                     self.assertEqual(
-                        schema,
+                        launch.schema,
                         (
                             (
                                 "tensor",
@@ -7147,10 +8270,10 @@ class TestCuteBackend(TestCase):
                             ),
                         ),
                     )
-                    self.assertEqual(len(launch_args), 4)
+                    self.assertEqual(len(launch.launch_args), 4)
                 else:
-                    self.assertEqual(schema, (("tensor", "torch.float16", 3),))
-                    self.assertEqual(len(launch_args), 10)
+                    self.assertEqual(launch.schema, (("tensor", "torch.float16", 3),))
+                    self.assertEqual(len(launch.launch_args), 10)
 
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))

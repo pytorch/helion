@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import textwrap
+import threading
 import types
 from typing import TYPE_CHECKING
 from typing import Any
@@ -24,6 +25,7 @@ from typing import TypeVar
 from typing import cast
 from typing import overload
 from typing_extensions import Protocol
+import weakref
 
 import torch
 from torch._dynamo.source import GetItemSource
@@ -33,6 +35,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 import torch.distributed as dist
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
@@ -67,6 +70,7 @@ from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from collections.abc import Hashable
 
     from torch._guards import Source
@@ -259,6 +263,7 @@ class Kernel(Generic[_R]):
             Config(**config) if isinstance(config, dict) else config
             for config in configs or []
         ]
+        self._bind_lock = threading.RLock()
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         # Fast dispatch cache: maps a cheap, fine-grained argument key (exact
         # dtype/shape/stride/device per tensor) directly to a BoundKernel,
@@ -266,6 +271,10 @@ class Kernel(Generic[_R]):
         self._dispatch_cache: dict[Hashable, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
+        ] = {}
+        self._has_specialization_extras = False
+        self._cute_grouped_static_tail_extra_descriptors: dict[
+            Hashable, set[Hashable]
         ] = {}
         if any(
             param.kind
@@ -342,8 +351,46 @@ class Kernel(Generic[_R]):
         from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
         self._specialize_extra[signature] = extra_fns = bound_kernel._specialize_extra()
+        if extra_fns:
+            self._has_specialization_extras = True
         extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
         return BoundKernelInMemoryCacheKey(signature, extra_results)
+
+    def _extend_bound_kernel_specializations(
+        self,
+        bound_kernel: BoundKernel,
+        signature: tuple[Hashable, ...],
+        extractors: list[Callable[[Sequence[object]], Hashable]],
+        args: Sequence[object],
+    ) -> None:
+        if not extractors:
+            return
+
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
+        with self._bind_lock:
+            existing_extractors = self._specialize_extra.setdefault(signature, [])
+            existing_extractors.extend(extractors)
+            self._has_specialization_extras = True
+            with unset_fake_temporarily():
+                current_results = tuple(
+                    extractor(args) for extractor in existing_extractors
+                )
+
+            stale_keys = [
+                key
+                for key in self._bound_kernels
+                if key.specialization_key == signature
+                and len(key.extra_results) < len(existing_extractors)
+            ]
+            for stale_key in stale_keys:
+                self._bound_kernels.pop(stale_key)
+            for fast_key, cached_bound in list(self._dispatch_cache.items()):
+                if cached_bound._base_spec_key == signature:
+                    self._dispatch_cache.pop(fast_key)
+            self._bound_kernels[
+                BoundKernelInMemoryCacheKey(signature, current_results)
+            ] = bound_kernel
 
     def _compute_is_distributed(self, args: Sequence[object]) -> bool:
         """Whether this call should compile as a distributed kernel.
@@ -370,6 +417,10 @@ class Kernel(Generic[_R]):
         different full keys also produce different fast keys.  That makes it
         safe to map a fast key directly to the BoundKernel that a full
         ``bind()`` resolved for the same arguments.
+
+        If a base signature has extra specialization extractors, their results
+        are appended to preserve the same no-collision invariant for
+        value-based specializations.
 
         Returns None when an argument type is not handled (tensor subclasses,
         containers, ...), or when there is no tensor argument to pin down the
@@ -403,8 +454,17 @@ class Kernel(Generic[_R]):
         if not has_tensor:
             return None
         key.append(self._compute_is_distributed(args))
+        signature = (
+            self._base_specialization_key(args)
+            if self._has_specialization_extras
+            else None
+        )
         if self._key_fn is not None:
-            key.append(self._key_fn(*args))
+            key.append(signature[-1] if signature is not None else self._key_fn(*args))
+        if signature is not None:
+            extra_fns = self._specialize_extra.get(signature)
+            if extra_fns is not None:
+                key.append(tuple(s(args) for s in extra_fns))
         return tuple(key)
 
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
@@ -417,6 +477,14 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
+        # Dynamo executes bind while capturing the call but cannot trace an RLock.
+        # Eager binds, including all cache mutations, remain serialized.
+        if torch.compiler.is_compiling():
+            return self._bind(args)
+        with self._bind_lock:
+            return self._bind(args)
+
+    def _bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         with measure("Kernel.bind"):
             if not isinstance(args, tuple):
                 assert isinstance(args, list), "args must be a tuple or list"
@@ -858,6 +926,11 @@ class Kernel(Generic[_R]):
             return self.bind(args)(*args)
         bound = self.bind(args)
         result = bound(*args)
+        if self._has_specialization_extras:
+            # A concurrent first compile can discover a late specialization and
+            # make BoundKernel.__call__ rebind internally. Resolve it again so
+            # the fast-dispatch key never points at the pre-specialization bound.
+            bound = self.bind(args)
         if bound._run is not None:
             fast_key = self._fast_dispatch_key(args)
             if fast_key is not None:
@@ -924,6 +997,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
+        # Direct to_code() has no call arguments, so keep this bound kernel's
+        # construction-time tensor values as its stable weak fallback.
+        self._runtime_tensor_refs_by_name = {
+            name: weakref.ref(value)
+            for name, value in zip(self.kernel.signature.parameters, args, strict=False)
+            if isinstance(value, torch.Tensor)
+        }
+        self._first_compile_lock = threading.RLock()
         self._backward_compiled: (
             tuple[Kernel[object], str, BoundKernel[object]] | None
         ) = None
@@ -948,7 +1029,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self._env.process_group_name = _find_process_group_name(
                 kernel.fn, args, is_distributed
             )
-
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
             constexpr_args = {}
@@ -1097,6 +1177,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         # pyrefly: ignore [bad-argument-type]
         return Config(**config)
 
+    def _normalized_config_copy(self, config: ConfigLike) -> Config:
+        normalized = self._normalize_config(config)
+        normalized = Config(**normalized.config)  # pyrefly: ignore[bad-argument-type]
+        self.env.config_spec.normalize(normalized)
+        return normalized
+
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
         parts = [
@@ -1133,17 +1219,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if config is None:
             config = self._require_implicit_config()
         with self.env, measure("BoundKernel.to_code"):
-            config = self._normalize_config(config)
-            # Work on a copy so the caller's Config is not mutated with
-            # normalize defaults (e.g. indexing, load_eviction_policies)
-            # specific to this BoundKernel's config_spec.  Without this,
-            # reusing the same Config across compilations with different
-            # constexpr values carries stale entries from an earlier call.
-            config = Config(**config.config)  # pyrefly: ignore [bad-argument-type]
-            self.env.config_spec.normalize(config)
-            with measure("BoundKernel.generate_ast"):
+            # Work on a copy so the caller's Config is not mutated with defaults
+            # specific to this BoundKernel's config_spec.
+            config = self._normalized_config_copy(config)
+            with (
+                self._runtime_arg_values_for_codegen(),
+                measure("BoundKernel.generate_ast"),
+            ):
                 # pyrefly: ignore [bad-argument-type]
                 root = generate_ast(self.host_function, config, emit_repro_caller)
+                self._register_cute_grouped_static_tail_specializations()
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             with measure("BoundKernel.unparse"):
@@ -1206,7 +1291,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        config = self._normalize_config(config)
+        requested_config = self._normalize_config(config)
+        config = self._normalized_config_copy(requested_config)
         dist_check_config_consistancy(
             config, process_group_name=self._env.process_group_name
         )
@@ -1249,10 +1335,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
-                self.format_kernel_decorator(config, self.settings),
+                self.format_kernel_decorator(requested_config, self.settings),
                 exc_info=True,
             )
-            self.maybe_log_repro(log.warning, self.fake_args, config=config)
+            self.maybe_log_repro(log.warning, self.fake_args, config=requested_config)
             raise
         if allow_print:
             log.info("Output code written to: %s", module.__file__)
@@ -1303,7 +1389,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        config = self._normalize_config(config)
+        requested_config = self._normalize_config(config)
+        if requested_config in self._cache_path_map:
+            return self._cache_path_map[requested_config]
+        try:
+            config = self._normalized_config_copy(requested_config)
+        except exc.InvalidConfig:
+            return None
         return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
@@ -1492,6 +1584,50 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(td_layout_extractor)
         return extractors
 
+    @contextlib.contextmanager
+    def _runtime_arg_values_for_codegen(self) -> Generator[None, None, None]:
+        values: dict[str, object] = self.env.runtime_arg_values_by_name
+        if not values:
+            values = {
+                name: value
+                for name, ref in self._runtime_tensor_refs_by_name.items()
+                if (value := ref()) is not None
+            }
+        with self.env.use_runtime_arg_values(values):
+            yield
+
+    def _register_cute_grouped_static_tail_specializations(self) -> None:
+        if self.kernel.settings.backend != "cute":
+            return
+        signature = self._base_spec_key
+        descriptors = _cute_grouped_static_tail_extra_descriptors(
+            self.env.cute_resolved_wrapper_plans
+        )
+        if not descriptors:
+            return
+        seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
+            signature,
+            set(),
+        )
+        new_descriptors: list[Hashable] = []
+        new_extractors: list[Callable[[Sequence[object]], Hashable]] = []
+        for descriptor in descriptors:
+            if descriptor in seen:
+                continue
+            new_descriptors.append(descriptor)
+            new_extractors.append(_make_cute_grouped_static_tail_extractor(descriptor))
+        runtime_args = tuple(
+            self.env.runtime_arg_values_by_name.get(name)
+            for name in self.kernel.signature.parameters
+        )
+        self.kernel._extend_bound_kernel_specializations(
+            self,
+            signature,
+            new_extractors,
+            runtime_args,
+        )
+        seen.update(new_descriptors)
+
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
         if self._config is not None:
@@ -1587,14 +1723,35 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
+        if self.kernel._has_specialization_extras:
+            rebound = self.kernel.bind(args)
+            if rebound is not self:
+                return rebound(*args)
+
         if self._run is None:
-            if is_ref_mode_enabled(self.kernel.settings):
-                if (config := self._implicit_config()) is not None:
-                    self._config = config
-                return self.run_ref(*args)
-            self.ensure_config_exists(args)
-            assert self._run is not None
-            self.maybe_log_repro(log.warning, args)
+            with self._first_compile_lock:
+                # Another caller may have discovered a late specialization while
+                # this caller waited for the first compile.
+                if self.kernel._has_specialization_extras:
+                    rebound = self.kernel.bind(args)
+                    if rebound is not self:
+                        return rebound(*args)
+                if self._run is None:
+                    if is_ref_mode_enabled(self.kernel.settings):
+                        if (config := self._implicit_config()) is not None:
+                            self._config = config
+                        return self.run_ref(*args)
+                    runtime_args: dict[str, object] = {
+                        name: value
+                        for name, value in zip(
+                            self.kernel.signature.parameters, args, strict=False
+                        )
+                        if isinstance(value, torch.Tensor)
+                    }
+                    with self.env.use_runtime_arg_values(runtime_args):
+                        self.ensure_config_exists(args)
+                    assert self._run is not None
+                    self.maybe_log_repro(log.warning, args)
 
         return self._run(*args)
 
@@ -1617,7 +1774,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        config = self._normalize_config(config)
+        config = self._normalized_config_copy(config)
         compiled_fn = self._compile_cache.get(config)
         if compiled_fn is None:
             return None
@@ -1923,6 +2080,163 @@ def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
         ]
         return (obj.__code__, *closures)
     return obj.__code__
+
+
+def _cute_grouped_layout_has_m_tail(
+    layout_values: tuple[int, ...],
+    *,
+    bm: int,
+    group_count: int,
+) -> bool | None:
+    cursor = 0
+    has_m_tail = False
+    for expected_group in range(group_count):
+        if expected_group > 0:
+            next_m_boundary = ((cursor + bm - 1) // bm) * bm
+            while (
+                cursor < len(layout_values)
+                and cursor < next_m_boundary
+                and layout_values[cursor] < 0
+            ):
+                cursor += 1
+            if cursor != next_m_boundary or (
+                cursor < len(layout_values) and layout_values[cursor] < 0
+            ):
+                return None
+        if cursor >= len(layout_values) or layout_values[cursor] != expected_group:
+            return None
+        start = cursor
+        while cursor < len(layout_values) and layout_values[cursor] == expected_group:
+            cursor += 1
+        actual_m = cursor - start
+        if start % bm != 0:
+            return None
+        has_m_tail = has_m_tail or actual_m % bm != 0
+    if cursor != len(layout_values):
+        if all(value < 0 for value in layout_values[cursor:]):
+            cursor = len(layout_values)
+    if cursor != len(layout_values):
+        return None
+    return has_m_tail
+
+
+def _cute_grouped_static_tail_extra_descriptors(
+    plans: Sequence[dict[str, object]],
+) -> tuple[Hashable, ...]:
+    descriptors: list[Hashable] = []
+    for plan in plans:
+        if plan.get("kind") != "tcgen05_grouped_static_persistent" or bool(
+            plan.get("worklist_metadata")
+        ):
+            continue
+        if not (
+            isinstance(plan.get("grouped_static_has_m_tail"), bool)
+            or isinstance(plan.get("grouped_static_has_n_tail"), bool)
+        ):
+            continue
+        layout_idx = plan.get("layout_bind_idx")
+        group_count = plan.get("group_count")
+        bm = plan.get("bm")
+        if not (
+            isinstance(layout_idx, int)
+            and isinstance(group_count, int)
+            and isinstance(bm, int)
+        ):
+            continue
+        n_sizes_idx = plan.get("n_sizes_bind_idx")
+        bn = plan.get("bn")
+        descriptors.append(
+            (
+                "cute_grouped_static_tail",
+                layout_idx,
+                group_count,
+                bm,
+                n_sizes_idx if isinstance(n_sizes_idx, int) else None,
+                bn if isinstance(bn, int) else None,
+            )
+        )
+    return tuple(sorted(descriptors, key=repr))
+
+
+def _cute_int_1d_tensor_values(
+    value: object,
+    cache: WeakIdKeyDictionary,
+) -> tuple[int, ...] | None:
+    if not (
+        isinstance(value, torch.Tensor)
+        and value.ndim == 1
+        and value.dtype in (torch.int32, torch.int64)
+    ):
+        return None
+    if torch.is_inference(value):
+        return tuple(int(v) for v in value.detach().cpu().tolist())
+    signature = (
+        int(value._version),
+        int(value.data_ptr()),
+        tuple(value.shape),
+        tuple(value.stride()),
+        value.dtype,
+    )
+    try:
+        cached_signature, cached_values = cache[value]
+    except KeyError:
+        pass
+    else:
+        if cached_signature == signature:
+            return cached_values
+    values = tuple(int(v) for v in value.detach().cpu().tolist())
+    cache[value] = (signature, values)
+    return values
+
+
+def _make_cute_grouped_static_tail_extractor(
+    descriptor: Hashable,
+) -> Callable[[Sequence[object]], Hashable]:
+    (
+        _label,
+        layout_idx,
+        group_count,
+        bm,
+        n_sizes_idx,
+        bn,
+    ) = cast("tuple[object, int, int, int, int | None, int | None]", descriptor)
+    tensor_values_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+    def cute_grouped_static_tail_extractor(
+        args: Sequence[object],
+        *,
+        _descriptor: Hashable = descriptor,
+        _layout_idx: int = layout_idx,
+        _group_count: int = group_count,
+        _bm: int = bm,
+        _n_sizes_idx: int | None = n_sizes_idx,
+        _bn: int | None = bn,
+    ) -> Hashable:
+        layout_has_m_tail: bool | None = None
+        if _layout_idx < len(args):
+            layout_values = _cute_int_1d_tensor_values(
+                args[_layout_idx],
+                tensor_values_cache,
+            )
+            if layout_values is not None:
+                layout_has_m_tail = _cute_grouped_layout_has_m_tail(
+                    layout_values,
+                    bm=_bm,
+                    group_count=_group_count,
+                )
+        n_sizes_has_n_tail: bool | None = None
+        if _n_sizes_idx is not None and _bn is not None and _n_sizes_idx < len(args):
+            n_sizes_values = _cute_int_1d_tensor_values(
+                args[_n_sizes_idx],
+                tensor_values_cache,
+            )
+            if n_sizes_values is not None and len(n_sizes_values) == _group_count:
+                n_sizes_has_n_tail = any(
+                    group_n % _bn != 0 for group_n in n_sizes_values
+                )
+        return (_descriptor, layout_has_m_tail, n_sizes_has_n_tail)
+
+    return cute_grouped_static_tail_extractor
 
 
 def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
