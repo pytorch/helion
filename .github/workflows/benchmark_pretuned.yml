@@ -122,6 +122,22 @@ jobs:
             --extra-index-url https://wheels.vllm.ai/nightly
           python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
 
+      - name: Install CuTe DSL
+        # vLLM may upgrade nvidia-cutlass-dsl, but the vLLM baselines used here
+        # call precompiled operators and do not use the Python DSL at runtime.
+        # Reinstall Helion's tested pin so its CuTe kernels compile against the
+        # expected API.
+        if: inputs.alias == 'b200'
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh cu13
+          python - <<'PY'
+          from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
+
+          check_cute_backend_requirements()
+          print("Helion CuTe backend requirements OK")
+          PY
+
       - name: CUDA Compute Check
         if: startsWith(inputs.image, 'nvidia')
         run: |

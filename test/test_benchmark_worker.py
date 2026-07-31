@@ -390,6 +390,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.log = Mock()
         provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
 
         with patch.object(
             provider,
@@ -409,6 +410,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.log = Mock()
         provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
 
         with patch.object(
             provider,
