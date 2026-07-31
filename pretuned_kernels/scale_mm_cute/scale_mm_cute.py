@@ -28,6 +28,13 @@ import helion.language as hl
 
 # M at or below this uses the skinny-M kernel (mirrors examples/fp8_gemm.py).
 _SKINNY_M_MAX = 1
+_SWAP_AB_SHAPES = {
+    (64, 4096, 6144),
+    (64, 4096, 24576),
+    (64, 5120, 5120),
+    (64, 5120, 51200),
+    (64, 25600, 5120),
+}
 
 
 @helion.aot_kernel(backend="cute", static_shapes=True)
@@ -47,8 +54,31 @@ def scale_mm_cute(
         for tile_k in hl.tile(k):
             acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         # RowWise scale in the epilogue (per-row scale_a x per-column scale_b).
-        acc = acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
-        out[tile_m, tile_n] = acc.to(torch.bfloat16)
+        out[tile_m, tile_n] = (acc * scale_a[tile_m, tile_n] * scale_b[tile_n]).to(
+            torch.bfloat16
+        )
+    return out
+
+
+@helion.aot_kernel(backend="cute", static_shapes=True)
+def scale_mm_cute_m512(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> torch.Tensor:
+    """M512 variant with an explicit per-row scale broadcast."""
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    scale_a_2d = scale_a[:, :1].expand(m, n)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        tile_scale = scale_a_2d[tile_m, tile_n] * scale_b[tile_n]
+        out[tile_m, tile_n] = (acc * tile_scale).to(torch.bfloat16)
     return out
 
 
@@ -73,8 +103,37 @@ def scale_mm_cute_skinny_m(
         acc = hl.zeros([m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
-        acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
+        scale = scale_a[:, tile_n] * scale_b[tile_n]
+        acc = acc * scale
         out[:, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.aot_kernel(backend="cute", static_shapes=True)
+def scale_mm_cute_swap_ab(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> torch.Tensor:
+    """M64 FP8 GEMM using CUTLASS's swapped 4-CTA cluster topology."""
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    out_t = out.T
+    scale_a_t = scale_a.unsqueeze(0)
+    scale_b_t = scale_b.unsqueeze(-1).expand(n, m)
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                y[tile_k, tile_n].T,
+                x[tile_m, tile_k].T,
+                acc=acc,
+            )
+        scale = scale_b_t[tile_n, tile_m] * scale_a_t[tile_n, tile_m]
+        out_t[tile_n, tile_m] = (acc * scale).to(torch.bfloat16)
     return out
 
 
@@ -87,6 +146,11 @@ def _scale_mm_cute(
     """Dispatch to the skinny-M kernel for small M, else the [M, N]-tiled one."""
     if x.size(0) <= _SKINNY_M_MAX:
         return scale_mm_cute_skinny_m(x, y, scale_a, scale_b)
+    if x.size(0) == 512:
+        return scale_mm_cute_m512(x, y, scale_a, scale_b)
+    shape = (x.size(0), x.size(1), y.size(1))
+    if shape in _SWAP_AB_SHAPES:
+        return scale_mm_cute_swap_ab(x, y, scale_a[:, 0], scale_b)
     return scale_mm_cute(x, y, scale_a, scale_b)
 
 
