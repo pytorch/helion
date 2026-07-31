@@ -107,7 +107,8 @@ def _td_layout_guard_active_for_config(
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
 
-# Opt-in: auto-capture Pallas kernels under torch.compile (see _tpu_compile_capture).
+# Opt-in: auto-capture Pallas kernels under torch.compile (see
+# pallas._tpu_compile_capture).
 # Off by default so the eager dispatch path is unchanged.
 _TPU_COMPILE_CAPTURE = os.environ.get("HELION_TPU_COMPILE_CAPTURE", "0") == "1"
 
@@ -323,7 +324,7 @@ class Kernel(Generic[_R]):
         # registration (unannotated, mutating, or autotuning among configs=[...]).
         self._capture_op: Callable[..., Any] | None = None
         if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
-            from ._tpu_compile_capture import register_decoration_op
+            from .pallas._tpu_compile_capture import register_decoration_op
 
             self._capture_op = register_decoration_op(self)
 
@@ -923,8 +924,8 @@ class Kernel(Generic[_R]):
         if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
             # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
             # not ready when kernel.py first loads during ``import helion``.
-            from ._tpu_compile_capture import RUN_NORMAL
-            from ._tpu_compile_capture import auto_capture_call
+            from .pallas._tpu_compile_capture import RUN_NORMAL
+            from .pallas._tpu_compile_capture import auto_capture_call
 
             result = auto_capture_call(self, args)
             if result is not RUN_NORMAL:
@@ -963,7 +964,7 @@ class Kernel(Generic[_R]):
 
         This only supports kernels compiled for the Pallas backend.
         """
-        from .pallas_jax_export import make_jax_fn
+        from .pallas.jax_export import make_jax_fn
 
         cached = getattr(self, "_jax_fn_callable", None)
         if cached is not None:

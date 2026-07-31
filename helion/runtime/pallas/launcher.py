@@ -2,7 +2,7 @@
 
 Holds `default_pallas_launcher` (the torch-tensor / TorchTPU launcher that
 generated Pallas code invokes) plus the shared block-spec / compile / caching
-helpers it and the pure-JAX export path (`helion.runtime.pallas_jax_export`)
+helpers it and the pure-JAX export path (`helion.runtime.pallas.jax_export`)
 build on.
 
 Depends only on ``torch`` and ``jax`` -- no other ``helion`` module -- so the

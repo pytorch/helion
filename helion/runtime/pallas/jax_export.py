@@ -40,8 +40,8 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from .kernel import Kernel
-    from .pallas.launcher import _BlockSpecInfo
+    from ..kernel import Kernel
+    from .launcher import _BlockSpecInfo
 
 
 _TORCH_TO_JNP_DTYPE: dict[torch.dtype, object] | None = None
@@ -294,9 +294,9 @@ def default_pallas_jax_launcher(
     output(s) as ``_JaxExportTensor`` so the Helion wrapper's trailing
     reshape/view operations stay traceable.
     """
-    from .pallas.launcher import _pallas_apply_ds_padding
-    from .pallas.launcher import _pallas_jax_call
-    from .settings import is_pallas_interpret
+    from ..settings import is_pallas_interpret
+    from .launcher import _pallas_apply_ds_padding
+    from .launcher import _pallas_jax_call
 
     interpret = (
         _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
