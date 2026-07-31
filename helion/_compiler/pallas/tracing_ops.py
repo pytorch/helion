@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..generate_ast import ResidentPrepLowering
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import LoopDimInfo
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
 
@@ -99,7 +100,14 @@ def _proxy_loop_parts(value: object) -> list[object]:
 
 
 def _dependent_tile_end_expr(state: CodegenState, loop_dim_index: int) -> str | None:
-    """Render a supported enclosing-``Tile.end`` bound from its provenance."""
+    """Render a supported enclosing-``Tile.end`` bound from its provenance.
+
+    Accepts ``tile.end`` and ``min(<host expr>, tile.end)`` on the traced
+    SymInt, for kernels with no worklist plan.  Returns ``None`` for any other
+    bound, leaving the caller to fall back.
+    ``compact_worklist._ordered_source_end`` recognizes the same two forms on
+    the source AST; extend the two together.
+    """
     from ..variable_origin import TileEndOrigin
 
     graph_info = state.get_graph(state.proxy_arg(0))
@@ -871,6 +879,8 @@ def _compact_worklist_bounds(
     begin = f"{begin_ref}[_wid]"
     end = f"{begin} + {extent_ref}[_wid]"
     if kind == "ordered" and plan.ordered_end_clamped_to_compact:
+        # The source range above still spans the whole reused window; this work
+        # item computes only through the compact tile's current end.
         compact_begin, compact_extent = (
             f"{name}_ref" for name in compact_ref_names(plan)
         )
@@ -916,6 +926,32 @@ def _get_loop_begin_and_end(
 def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
     begin, end = _get_loop_begin_and_end(state, loop_dim_index)
     return f"(({end}) - ({begin}))"
+
+
+def _loop_dim_infos(
+    state: CodegenState,
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> dict[int, LoopDimInfo]:
+    """Per-dim bounds for an inner device loop, shared by every loop lowering.
+
+    ``tile.end``/``tile.count`` on an enclosing tile read ``end_var_name`` back
+    out of here, so all three lowerings must publish the same bounds they
+    generate code against; building them in one place keeps them from drifting.
+    """
+    from ..tile_strategy import LoopDimInfo
+
+    infos: dict[int, LoopDimInfo] = {}
+    for i, block_id in enumerate(block_ids):
+        block_size = env.block_sizes[block_id]
+        begin_expr, end_expr = _get_loop_begin_and_end(state, i)
+        infos[block_id] = LoopDimInfo(
+            begin_var_name=begin_expr,
+            end_var_name=end_expr,
+            # No SymPy numel exists when the block size has no static size.
+            end_expr=block_size.numel if block_size.size is not None else None,
+        )
+    return infos
 
 
 def _is_static_int(expr: str) -> bool:
@@ -2166,7 +2202,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import EmitPipelineLoopState
-    from ..tile_strategy import LoopDimInfo
 
     graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
@@ -2523,17 +2558,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     ]
 
     # Build block_id_to_info for the pipeline state
-    block_id_to_info: dict[int, LoopDimInfo] = {}
-    for i, block_id in enumerate(block_ids):
-        block_size = env.block_sizes[block_id]
-        # when the block_size.size is None, we cannot form a SymPy expr for the numel
-        sympy_end_expr = block_size.numel if block_size.size is not None else None
-        begin_expr, end_expr = _get_loop_begin_and_end(state, i)
-        block_id_to_info[block_id] = LoopDimInfo(
-            begin_var_name=begin_expr,
-            end_var_name=end_expr,
-            end_expr=sympy_end_expr,
-        )
+    block_id_to_info = _loop_dim_infos(state, block_ids, env)
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -2922,7 +2947,6 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import ForiLoopState
-    from ..tile_strategy import LoopDimInfo
 
     graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
@@ -2966,17 +2990,10 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
         offset_expr_fn=lambda _i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
     )
 
-    begin_expr, end_expr = _get_loop_begin_and_end(state, 0)
-    block_id_to_info = {
-        block_ids[0]: LoopDimInfo(
-            begin_var_name=begin_expr,
-            end_var_name=end_expr,
-        )
-    }
     body_fn_name = state.device_function.new_var("_dynamic_unroll_body")
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
-        block_id_to_info=block_id_to_info,
+        block_id_to_info=_loop_dim_infos(state, block_ids, env),
         body_fn_name=body_fn_name,
         loop_var_name=loop_var,
         inner_statements=body_stmts,
@@ -2991,9 +3008,12 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     _emit_resident_prep_refill_once(state, block_ids, resident_prep_lowerings)
 
     carried = sorted(_loop_carried_indices(state, len(args)))
+    # Uniquely named: a nested dynamic-unroll body would otherwise shadow the
+    # enclosing loop's carry tuple and silently rebind reads of it.
+    carry_var = state.device_function.new_var("_carry")
     body_args = [*args]
     for carry_index, arg_index in enumerate(carried):
-        body_args[arg_index] = expr_from_string(f"_carry[{carry_index}]")
+        body_args[arg_index] = expr_from_string(f"{carry_var}[{carry_index}]")
 
     with state.codegen.add_fori_loop(fori_state):
         with state.codegen.resident_prep_lowering_scope(resident_prep_lowerings):
@@ -3013,11 +3033,11 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
                 statement_from_string(f"return ({return_values})")
             )
         else:
-            state.codegen.add_statement(statement_from_string("return _carry"))
+            state.codegen.add_statement(statement_from_string(f"return {carry_var}"))
 
     _emit_nonlocal_scratch_declarations(state, body_stmts)
     body_fn = statement_from_string(
-        f"def {body_fn_name}({loop_var}, _carry):\n    pass"
+        f"def {body_fn_name}({loop_var}, {carry_var}):\n    pass"
     )
     assert isinstance(body_fn, ast.FunctionDef)
     body_fn.body = cast("list[ast.stmt]", body_stmts)
@@ -3057,7 +3077,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import ForiLoopState
-    from ..tile_strategy import LoopDimInfo
 
     graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
@@ -3259,17 +3278,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     dim_idx_exprs: list[str] = loop_vars
 
     # Build block_id_to_info
-    block_id_to_info: dict[int, LoopDimInfo] = {}
-    for i, block_id in enumerate(block_ids):
-        block_size = env.block_sizes[block_id]
-        # when the block_size.size is None, we cannot form a SymPy expr for the numel
-        sympy_end_expr = block_size.numel if block_size.size is not None else None
-        begin_expr, end_expr = _get_loop_begin_and_end(state, i)
-        block_id_to_info[block_id] = LoopDimInfo(
-            begin_var_name=begin_expr,
-            end_var_name=end_expr,
-            end_expr=sympy_end_expr,
-        )
+    block_id_to_info = _loop_dim_infos(state, block_ids, env)
 
     # Emit offset_<bid>/indices_<bid> at the body prologue.
     _emit_inner_loop_offset_indices(

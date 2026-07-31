@@ -1844,6 +1844,17 @@ class ConfigSpec:
         else:
             config.pop("pallas_load_buffer_count", None)
 
+        if (
+            self.supports_config_key("pallas_pre_broadcast")
+            and self.has_pallas_inner_loops
+            and config.get("pallas_loop_type") not in ("fori_loop", "emit_pipeline")
+        ):
+            # The transform widens loop-carried VMEM scratch, so it only applies
+            # to the streaming lowerings.  "unroll" carries values through the
+            # jax.lax.fori_loop tuple and allocates no scratch to widen; pin the
+            # flag off there so both settings do not autotune as distinct configs.
+            config.pop("pallas_pre_broadcast", None)
+
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
                 if config["pid_type"] not in VALID_PID_TYPES:

@@ -661,32 +661,41 @@ class TestDetectAndGating(unittest.TestCase):
         with bk.env:
             return detect_compact_worklist_plan(bk.host_function)
 
-    def test_direct_tile_end_requires_matching_begins(self):
+    def test_dependent_bound_grammar(self):
+        """The AST recognizer accepts exactly the two clamped-end forms.
+
+        The traced-SymInt recognizer for kernels without a worklist plan
+        (``tracing_ops._dependent_tile_end_expr``) must accept the same forms;
+        it is covered end-to-end by the dense tests in test_pallas.py.
+        """
         from helion._compiler.pallas.compact_worklist import _ordered_source_end
 
-        source_end, clamped = _ordered_source_end(
-            _expr("offsets[seq_idx]"),
-            _expr("tile_q.end"),
-            "tile_q",
-            _expr("offsets[seq_idx]"),
-            _expr("offsets[seq_idx + 1]"),
-        )
-        self.assertTrue(clamped)
-        self.assertEqual(ast.unparse(source_end), "offsets[seq_idx + 1]")
-
-        source_end, clamped = _ordered_source_end(
-            _expr("offsets[seq_idx]"),
-            _expr("builtins.min(offsets[seq_idx + 1], hl.tile_end(tile_q))"),
-            "tile_q",
-            _expr("offsets[seq_idx]"),
-            _expr("offsets[seq_idx + 1]"),
-        )
-        self.assertTrue(clamped)
-        self.assertEqual(ast.unparse(source_end), "offsets[seq_idx + 1]")
+        for accepted in (
+            "tile_q.end",
+            "hl.tile_end(tile_q)",
+            "min(offsets[seq_idx + 1], tile_q.end)",
+            "builtins.min(offsets[seq_idx + 1], hl.tile_end(tile_q))",
+            "min(hl.tile_end(tile_q), offsets[seq_idx + 1])",
+        ):
+            with self.subTest(accepted=accepted):
+                source_end, clamped = _ordered_source_end(
+                    _expr("offsets[seq_idx]"),
+                    _expr(accepted),
+                    "tile_q",
+                    _expr("offsets[seq_idx]"),
+                    _expr("offsets[seq_idx + 1]"),
+                )
+                self.assertTrue(clamped)
+                # Either form yields the full source end, never the clamped one.
+                self.assertEqual(ast.unparse(source_end), "offsets[seq_idx + 1]")
 
         for unsupported in (
             "foo.tile_end(tile_q)",
             "foo.min(offsets[seq_idx + 1], tile_q.end)",
+            # A different tile's edge is not the enclosing compact tile.
+            "min(offsets[seq_idx + 1], tile_k.end)",
+            # Begin edges (sliding windows) are not recognized yet.
+            "max(offsets[seq_idx], tile_q.begin)",
         ):
             with self.subTest(unsupported=unsupported):
                 source_end, clamped = _ordered_source_end(
@@ -699,6 +708,11 @@ class TestDetectAndGating(unittest.TestCase):
                 self.assertFalse(clamped)
                 self.assertEqual(ast.unparse(source_end), unsupported)
 
+    def test_direct_tile_end_requires_matching_begins(self):
+        from helion._compiler.pallas.compact_worklist import _ordered_source_end
+
+        # A bare tile.end names no source end, so it can only stand in for the
+        # compact tile's own range when the two begins agree.
         with self.assertRaisesRegex(exc.InvalidConfig, "begins to match"):
             _ordered_source_end(
                 _expr("kv_offsets[seq_idx]"),
@@ -707,6 +721,18 @@ class TestDetectAndGating(unittest.TestCase):
                 _expr("q_offsets[seq_idx]"),
                 _expr("q_offsets[seq_idx + 1]"),
             )
+
+        # The min form renders both sides from what the kernel wrote, so
+        # mismatched begins are fine there.
+        source_end, clamped = _ordered_source_end(
+            _expr("kv_offsets[seq_idx]"),
+            _expr("min(kv_offsets[seq_idx + 1], tile_q.end)"),
+            "tile_q",
+            _expr("q_offsets[seq_idx]"),
+            _expr("q_offsets[seq_idx + 1]"),
+        )
+        self.assertTrue(clamped)
+        self.assertEqual(ast.unparse(source_end), "kv_offsets[seq_idx + 1]")
 
     def _fully_jagged_plan(self):
         qo = _offsets([16, 16, 16, 16])
@@ -1281,6 +1307,27 @@ class TestWorklistLoopDispatch(unittest.TestCase):
         self.assertNotIn("pltpu.emit_pipeline(", code)
         self.assertNotIn("scratch_0", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
+
+    def test_pre_broadcast_dropped_when_loop_type_cannot_apply_it(self):
+        """The transform widens loop-carried VMEM scratch, which only the
+        streaming lowerings allocate.  Pinning the flag off for "unroll" keeps
+        both settings from autotuning as two configs that generate one kernel.
+        """
+        spec = _fully_jagged_kernel.bind(self._fully_jagged_args()).env.config_spec
+        for loop_type, retained in (
+            ("unroll", False),
+            ("fori_loop", True),
+            ("emit_pipeline", True),
+        ):
+            with self.subTest(loop_type=loop_type):
+                config: dict[str, object] = {
+                    "block_sizes": [8, 8],
+                    "pallas_loop_type": loop_type,
+                    "pallas_worklist_grouping": 1,
+                    "pallas_pre_broadcast": True,
+                }
+                spec.normalize(config)
+                self.assertEqual("pallas_pre_broadcast" in config, retained)
 
     def test_grouping_two_emits_static_compact_variants(self):
         qo = _offsets([12, 20, 5, 30])

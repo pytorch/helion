@@ -908,8 +908,27 @@ def _ordered_source_end(
     compact_begin: ast.AST,
     compact_end: ast.AST,
 ) -> tuple[ast.AST, bool]:
-    """Separate a compact-clamped ordered end from its full source end."""
+    """Split an ordered end into its source end and whether it clamps.
+
+    Accepts two forms on the ordered loop's end argument::
+
+        tile.end / hl.tile_end(tile)   -> source end is the compact tile's own
+        min(<host expr>, tile.end)     -> source end is <host expr>
+
+    Returns the full SOURCE end -- what sizes range_len, the resident window,
+    and its refills -- plus whether the per-work-item compute range is clamped
+    to the compact tile's end.  Not recognized: ``max(src, tile.begin)`` (what
+    a sliding window needs), offsets from the edge, and enclosing axes other
+    than the compact tile.
+
+    Two other places recognize the same shape and must be extended in step:
+    ``tracing_ops._dependent_tile_end_expr`` matches it on the traced SymInt for
+    kernels with no worklist plan, and ``tile_strategy._fold_tile_end_op``
+    matches the bare form for every backend.
+    """
     if _is_tile_end(end, compact_var):
+        # A bare ``tile.end`` names no source end, so the compact tile's own
+        # source range has to be the ordered range for range_len to be right.
         if not _same_ast(begin, compact_begin):
             raise exc.InvalidConfig(
                 "compact_worklist: an ordered bound of tile.end requires the "
@@ -925,6 +944,9 @@ def _ordered_source_end(
     ):
         lhs_is_end = _is_tile_end(end.args[0], compact_var)
         rhs_is_end = _is_tile_end(end.args[1], compact_var)
+        # Exactly one side is the tile edge; the other is the source end.  Both
+        # sides render faithfully from what the kernel wrote, so unlike the bare
+        # form this needs no agreement between the two begins.
         if lhs_is_end != rhs_is_end:
             return (end.args[1] if lhs_is_end else end.args[0]), True
 
