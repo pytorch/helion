@@ -323,6 +323,24 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 out.add(name)
         return out
 
+    def _clear_attention_flash_state(self) -> None:
+        cute_state = self.device_function.cute_state
+        cute_state.attention_flash_block_ids = None
+        cute_state.attention_flash_score_plan = None
+        cute_state.attention_flash_threads = 128
+
+    def _try_codegen_attention_flash_root(self) -> bool:
+        cute_state = self.device_function.cute_state
+        if cute_state.attention_flash_block_ids is None:
+            return False
+
+        from .cute.cute_flash import codegen_attention_flash
+
+        if codegen_attention_flash(self):
+            return True
+        self._clear_attention_flash_state()
+        raise exc.BackendUnsupported("cute", "flash attention failed late validation")
+
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
             return
@@ -1083,27 +1101,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                         codegen_fn(state)
                     root = root_graph_info.graph
-                    grid_state = self.current_grid_state
-                    if isinstance(grid_state, DeviceGridState):
-                        # Codegen the body first so synthetic free-``hl.arange``
-                        # lane loops registered *during* body lowering (CuTe
-                        # over-budget chunking) are visible to the wrap below.
-                        wrapped_body: list[ast.AST] = []
-                        with self.set_statements(wrapped_body):
-                            codegen_call_with_graph(self, root, [])
-                        if grid_state.has_lane_loops():
-                            self.statements_stack[-1].extend(grid_state.outer_prefix)
-                            if self.device_function.cute_state.consume_root_lane_loop_suppression():
-                                self.statements_stack[-1].extend(wrapped_body)
-                            else:
+                    if not self._try_codegen_attention_flash_root():
+                        grid_state = self.current_grid_state
+                        if isinstance(grid_state, DeviceGridState):
+                            # Codegen the body first so synthetic free-``hl.arange``
+                            # lane loops registered *during* body lowering (CuTe
+                            # over-budget chunking) are visible to the wrap below.
+                            wrapped_body: list[ast.AST] = []
+                            with self.set_statements(wrapped_body):
+                                codegen_call_with_graph(self, root, [])
+                            if grid_state.has_lane_loops():
                                 self.statements_stack[-1].extend(
-                                    grid_state.wrap_body(wrapped_body)
+                                    grid_state.outer_prefix
                                 )
-                            self.statements_stack[-1].extend(grid_state.outer_suffix)
+                                if self.device_function.cute_state.consume_root_lane_loop_suppression():
+                                    self.statements_stack[-1].extend(wrapped_body)
+                                else:
+                                    self.statements_stack[-1].extend(
+                                        grid_state.wrap_body(wrapped_body)
+                                    )
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
+                            else:
+                                self.statements_stack[-1].extend(wrapped_body)
                         else:
-                            self.statements_stack[-1].extend(wrapped_body)
-                    else:
-                        codegen_call_with_graph(self, root, [])
+                            codegen_call_with_graph(self, root, [])
                 finally:
                     self.current_root_graph_info = previous_root_graph_info
 
@@ -1151,23 +1174,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function.body = self.device_function.cute_state.move_tcgen05_post_loop_stmts_to_end(
                             list(self.device_function.body)
                         )
-                # Fused tcgen05 flash-attention (HELION_CUTE_FLASH): the
-                # detector set ``attention_flash_block_ids``; replace the
-                # FX-derived scalar body with the dedicated tensor-core flash
-                # kernel that mirrors ``.notes/spikes/fa_tcgen05_spike.py``.
-                if (
-                    self.device_function.cute_state.attention_flash_block_ids
-                    is not None
-                ):
-                    from .cute.cute_flash import codegen_attention_flash
-
-                    if not codegen_attention_flash(self):
-                        # Codegen declined a config the detector could not fully
-                        # vet before the device-function arguments were populated
-                        # (e.g. non-contiguous operands). Clear the flash state so
-                        # the launch override does not force block=(N,1,1) onto
-                        # the scalar fallback body that stays in df.body.
-                        self.device_function.cute_state.attention_flash_block_ids = None
                 # Mark extra params as placeholder args — they appear only in
                 # placeholder strings, not in the AST body, so DCE would
                 # otherwise remove them.

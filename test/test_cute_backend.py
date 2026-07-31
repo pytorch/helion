@@ -2439,7 +2439,13 @@ class TestCuteBackend(TestCase):
         """With the gate default-on, square fp16 attention at [1,128,128] lowers
         to the fused tcgen05 flash kernel and matches SDPA for head_dim 64/128."""
         for head_dim in (64, 128):
-            with self.subTest(head_dim=head_dim):
+            with (
+                self.subTest(head_dim=head_dim),
+                patch(
+                    "helion._compiler.cute.backend._detect_specialized_mma_loop",
+                    return_value=True,
+                ),
+            ):
                 q, k, v = (
                     torch.randn(2, 8, 256, head_dim, dtype=torch.float16, device=DEVICE)
                     for _ in range(3)
@@ -2705,6 +2711,22 @@ class TestCuteBackend(TestCase):
         self.assertIn("problem_shape_ntile_mnl=(32, 64, 1)", code)
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_late_rejection_is_safe(self) -> None:
+        q, k, v = (
+            torch.randn(2, 8, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        with (
+            patch(
+                "helion._compiler.cute.backend._detect_specialized_mma_loop",
+                return_value=True,
+            ),
+            patch.object(_cute_flash, "codegen_attention_flash", return_value=False),
+            self.assertRaisesRegex(BackendUnsupported, "failed late validation"),
+        ):
+            bound = cute_dense_attention.bind((q, k, v))
+            bound.to_triton_code(helion.Config(block_sizes=[1, 128, 128]))
 
     def test_flash_attention_bfloat16_fires_and_matches_sdpa(self) -> None:
         q, k, v = (
