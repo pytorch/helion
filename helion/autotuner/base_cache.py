@@ -21,6 +21,10 @@ from torch._inductor.codecache import torch_key
 from .. import exc
 from .._utils import counters
 from .base_search import BaseAutotuner
+from .benchmark_provider import _format_selected_multi_shape_measurement
+from .benchmark_provider import _has_valid_multi_shape_measurement
+from .benchmark_provider import _materialize_multi_shape_config
+from .benchmark_provider import _MultiShapeAutotuneArgs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -215,6 +219,26 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             )
         self.kernel: BoundKernel = kernel  # type: ignore[assignment]
         self.args = self.autotuner.args
+        if isinstance(self.args, _MultiShapeAutotuneArgs):
+            self.args.defer_selected_log = True
+
+    def _format_performance(self, value: float) -> str:
+        suffix = (
+            "x"
+            if isinstance(self.args, _MultiShapeAutotuneArgs)
+            and self.args.relative_to is not None
+            else "ms"
+        )
+        return f"{value:.4f}{suffix}"
+
+    def _log_selected_multi_shape(self, summary: str) -> None:
+        if self.autotuner.settings.autotune_log:
+            # The inner search's structured-log context is closed by the time
+            # the cache layer selects its final winner.
+            with self.autotuner.log.autotune_logging():
+                self.autotuner.log(summary)
+        else:
+            self.autotuner.log(summary)
 
     @abc.abstractmethod
     def get(self) -> Config | None:
@@ -311,6 +335,19 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         self.autotuner.log("Starting autotuning process, this may take a while...")
 
         config = self._run_autotune_trials()
+        if isinstance(self.args, _MultiShapeAutotuneArgs):
+            if self.args.search_started and not self.args.found_valid_config:
+                raise exc.NoConfigFound
+            config = _materialize_multi_shape_config(self.autotuner.config_spec, config)
+            if self.args.search_started and not _has_valid_multi_shape_measurement(
+                self.args,
+                self.autotuner.config_spec,
+                config,
+            ):
+                raise exc.NoConfigFound
+            summary = _format_selected_multi_shape_measurement(self.args, config)
+            if summary is not None:
+                self._log_selected_multi_shape(summary)
 
         if not skip_cache_env:
             self.put(config)
@@ -357,7 +394,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         trial_low_water_perf = trial_autotuner.best_perf_so_far
         self.autotuner.log(
             f"Best-of-K trial {i + 1}/{k} complete: "
-            f"low-water perf={trial_low_water_perf:.4f}ms "
+            f"low-water perf={self._format_performance(trial_low_water_perf)} "
             f"config={trial_config}"
         )
         return trial_config, trial_low_water_perf
@@ -420,15 +457,29 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         )
 
         trial_results: list[tuple[int, Config, float]] = []
+        is_multi_shape = isinstance(self.args, _MultiShapeAutotuneArgs)
         try:
             for i in range(k):
                 trial_seed = base_seed + i
                 try:
                     settings.autotune_random_seed = trial_seed
                     settings.autotune_compile_timeout = base_compile_timeout
-                    trial_config, trial_low_water_perf = self._run_one_trial(
-                        i, k, trial_seed
-                    )
+                    try:
+                        trial_config, trial_low_water_perf = self._run_one_trial(
+                            i, k, trial_seed
+                        )
+                    except exc.NoConfigFound:
+                        if not is_multi_shape:
+                            raise
+                        self.autotuner.log(
+                            f"Best-of-K trial {i + 1}/{k} found no valid config"
+                        )
+                        continue
+                    if is_multi_shape and not math.isfinite(trial_low_water_perf):
+                        self.autotuner.log(
+                            f"Best-of-K trial {i + 1}/{k} returned no finite timing"
+                        )
+                        continue
                     trial_results.append((i, trial_config, trial_low_water_perf))
                 finally:
                     settings.autotune_random_seed = base_seed
@@ -447,12 +498,17 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         finally:
             self.autotuner = original_autotuner
 
+        if not trial_results:
+            raise exc.NoConfigFound
+
         # Final rebench: time each trial's returned config in a single fresh
         # benchmark round so we pick by an apples-to-apples measurement
         # rather than each trial's optimistic low-water mark.
         rebench_perfs = self._rebench_trial_configs(
             [config for (_, config, _) in trial_results]
         )
+        if is_multi_shape and not any(math.isfinite(perf) for perf in rebench_perfs):
+            raise exc.NoConfigFound
 
         best_idx = min(
             range(len(trial_results)),
@@ -463,20 +519,24 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         best_trial_idx, best_config, _ = trial_results[best_idx]
         best_perf = rebench_perfs[best_idx]
 
-        low_water_summary = ", ".join(f"{p:.4f}" for (_, _, p) in trial_results)
-        rebench_summary = ", ".join(f"{p:.4f}" for p in rebench_perfs)
+        low_water_summary = ", ".join(
+            self._format_performance(perf) for _, _, perf in trial_results
+        )
+        rebench_summary = ", ".join(
+            self._format_performance(perf) for perf in rebench_perfs
+        )
         self.autotuner.log(
             f"Best-of-K complete: picked trial {best_trial_idx + 1}/{k} "
-            f"(rebench perf={best_perf:.4f}ms); "
-            f"per-trial low-water perfs (ms): [{low_water_summary}]; "
-            f"per-trial rebench perfs (ms): [{rebench_summary}]"
+            f"(rebench perf={self._format_performance(best_perf)}); "
+            f"per-trial low-water objectives: [{low_water_summary}]; "
+            f"per-trial rebench objectives: [{rebench_summary}]"
         )
         return best_config
 
     def _rebench_trial_configs(self, configs: list[Config]) -> list[float]:
         """Benchmark K candidate configs in a single fresh autotuner round.
 
-        Returns one perf (ms) per input config, in input order. Used to pick
+        Returns one scalar objective per input config, in input order. Used to pick
         the best-of-K winner without trusting each trial's own optimistic
         ``best_perf_so_far`` low-water mark, which can be inflated by a
         single fast outlier timing during the search.
