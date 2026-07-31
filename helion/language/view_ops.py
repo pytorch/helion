@@ -69,10 +69,14 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         - Used for reshaping kernel tensors by adding dimensions
         - Prefer direct indexing syntax when possible: ``tensor[None, :]``
         - On the Pallas backend one index may additionally narrow a single
-          dimension: an integer, a bounded ``start:stop`` slice, a tile's
-          ``.begin`` offset, or a tile's ``.index`` run.  A bounded slice must
-          stay inside the dimension it narrows, which for a tile of a device
-          value depends on the configured block size.
+          dimension: a non-negative integer, a non-negative bounded
+          ``start:stop`` slice, a tile's ``.begin`` offset, or a tile's
+          ``.index`` run.  Narrowing is lowered by reading out of the resident
+          block the value was loaded into, so it is only available when that
+          block can stay resident; whether it can depends on the configured
+          block sizes and on how else the block is used, and is reported per
+          config with the reason.  This fake only checks what is decidable from
+          shapes -- it cannot tell a tile run from any other rank-one index.
     """
     raise NotInsideKernel
 
@@ -89,9 +93,9 @@ def _is_full_slice(val: object) -> bool:
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     env = CompileEnvironment.current()
     # Pallas additionally accepts one narrowing entry, which lets a kernel read
-    # a single token or a small run out of an already-loaded tile.  Every form
-    # below has a materializing lowering, so accepting it here never depends on
-    # an optimization firing later.
+    # a single token or a small run out of an already-loaded tile.  Whether a
+    # given narrowing can be lowered is decided per config during planning;
+    # this only rejects what is undecidable from shapes alone.
     allow_narrowing = env.backend_name == "pallas"
     input_size = collections.deque(tensor.size())
     output_size = []
@@ -106,9 +110,11 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         if not allow_narrowing:
             raise exc.InvalidIndexingType(repr(val))
         if isinstance(val, int):
-            # A constant index drops the dimension.  Negative indices would
-            # count from the end at codegen while the shape recorded here
-            # cannot see the dimension's size, so they are rejected.
+            # A constant index drops the dimension, so its output rank is known
+            # whatever the sign.  Negatives are a deliberate language
+            # restriction rather than a shape limit: on a partly live tile
+            # ``block[-1]`` would name the last row of the *block*, which may be
+            # padding rather than the last row the kernel wrote.
             if val < 0:
                 raise exc.InvalidIndexingType(repr(val))
             input_size.popleft()
@@ -117,8 +123,10 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
                 raise exc.InvalidIndexingType(repr(val))
             if not isinstance(val.stop, int) or val.stop <= val.start:
                 raise exc.InvalidIndexingType(repr(val))
-            # A negative bound is clipped against the dimension at codegen,
-            # which would not match ``stop - start`` recorded here.
+            # Unlike a negative scalar, a negative bound leaves the length
+            # undecidable here: it depends on the dimension's size, which is a
+            # block-size symbol at trace time, so ``stop - start`` would be a
+            # shape this op cannot honour.
             if val.start < 0 or val.stop < 0:
                 raise exc.InvalidIndexingType(repr(val))
             input_size.popleft()
