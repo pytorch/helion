@@ -982,7 +982,7 @@ _STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL: frozenset[Tcgen05Strategy] = frozens
 # cross-fragment validator so a user config can't reach a
 # hanging runtime.
 _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
-    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
+    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2, 4}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
     Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({1}),
 }
