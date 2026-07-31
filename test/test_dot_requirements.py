@@ -1448,11 +1448,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # is narrowed to num_epi_warps=4 so the autotuner does not
         # converge on a wrong-output config.
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
-        # The validated narrowing leaves cluster_m=2 still accepted as a
-        # legal value for an explicit user-supplied helion.Config
+        # The validated narrowing leaves cluster_m=2 and cluster_m=4 accepted
+        # as legal values for an explicit user-supplied helion.Config
         # (CUDA-launch-failure is loud and won't silently miscompute).
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
-        self.assertEqual(validation_fragments["tcgen05_cluster_m"].choices, (1, 2))
+        self.assertEqual(validation_fragments["tcgen05_cluster_m"].choices, (1, 2, 4))
         # num_epi_warps is the exception: validation is also tightened
         # to (4,) because non-4 values silently produce wrong output, so
         # an explicit user-supplied helion.Config must be rejected

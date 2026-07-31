@@ -1697,7 +1697,11 @@ def _codegen_cute_store_tcgen05_tile(
             "cute",
             "tcgen05 N,M-oriented worklist path requires a fixed BF16 store",
         )
-    tcgen05_d_store_layout = tcgen05_value.d_store_layout
+    tcgen05_d_store_layout = (
+        "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+        if tcgen05_value.output_column_major
+        else tcgen05_value.d_store_layout
+    )
     tcgen05_nm_store = tcgen05_value.orientation is Tcgen05Orientation.NM
     if (
         tcgen05_nm_store
@@ -3118,6 +3122,8 @@ def _codegen_cute_store_tcgen05_tile(
         }
         if leading_passthrough_output:
             d_tma_plan["d_leading_passthrough"] = True
+        if tcgen05_value.output_column_major:
+            d_tma_plan["d_column_major"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
         if d_tma_uses_tail_rank3_mnl_tensor:
             tail_d_tma_plan = {

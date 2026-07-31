@@ -62,9 +62,11 @@ from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
 from helion._compiler.cute.cute_mma import _mma_loop_is_exclusive
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
+from helion._compiler.cute.cute_mma import _MmaOperandInfo
 from helion._compiler.cute.cute_mma import _MmaRoleCoordinatePlan
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
 from helion._compiler.cute.cute_mma import _new_tcgen05_sched_pipeline_plan
+from helion._compiler.cute.cute_mma import _operand_infos_exclusive_for_mma
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
@@ -684,6 +686,63 @@ class TestCuteLowerings(unittest.TestCase):
                 repaired = {key: value}
                 config_spec.normalize(repaired, _fix_invalid=True)
                 self.assertNotIn(key, repaired)
+
+    def test_mma_operand_matrix_major_tracks_trailing_transpose(self) -> None:
+        graph = Graph()
+        load = graph.placeholder("load")
+        row_major = torch.empty_strided((4, 8), (8, 1))
+
+        direct = _MmaOperandInfo(
+            load=load,
+            terminal=load,
+            source_fake=row_major,
+            logical_fake=row_major,
+            block_ids=(0, 1),
+        )
+        transposed = dataclasses.replace(
+            direct,
+            logical_fake=row_major.permute(1, 0),
+            block_ids=(1, 0),
+            trailing_transpose=True,
+        )
+
+        self.assertEqual(direct.matrix_major, "row")
+        self.assertEqual(transposed.matrix_major, "col")
+        self.assertEqual((transposed.matrix_rows, transposed.matrix_cols), (8, 4))
+
+    def test_mma_operand_exclusivity_tracks_trailing_transpose(self) -> None:
+        graph = Graph()
+        lhs_load = graph.placeholder("lhs_load")
+        rhs_load = graph.placeholder("rhs_load")
+        lhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (lhs_load, (1, 0))
+        )
+        rhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (rhs_load, (1, 0))
+        )
+        mma = graph.call_function(
+            torch.ops.aten.mm.default, (lhs_transpose, rhs_transpose)
+        )
+        source = torch.empty(4, 8)
+        lhs = _MmaOperandInfo(
+            load=lhs_load,
+            terminal=lhs_transpose,
+            source_fake=source,
+            logical_fake=source.mT,
+            trailing_transpose=True,
+        )
+        rhs = dataclasses.replace(
+            lhs,
+            load=rhs_load,
+            terminal=rhs_transpose,
+        )
+
+        self.assertTrue(_operand_infos_exclusive_for_mma(lhs, rhs, mma))
+        self.assertFalse(
+            _operand_infos_exclusive_for_mma(
+                dataclasses.replace(lhs, terminal=lhs_load), rhs, mma
+            )
+        )
 
     def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
         return SimpleNamespace(
@@ -13593,8 +13652,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(
             (
                 "compute_epilogue_tile_shape((128, 8), False, "
-                "tcgen05_c_layout_1, cutlass.Float16, "
-                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float16)"
+                "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.Float16, "
+                "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                "elem_ty_c=cutlass.Float16)"
             ),
             emitted,
         )
@@ -13713,8 +13773,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(
             (
                 "compute_epilogue_tile_shape((128, 8), False, "
-                "tcgen05_c_layout_1, cutlass.Float32, "
-                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float32)"
+                "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.Float32, "
+                "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                "elem_ty_c=cutlass.Float32)"
             ),
             emitted,
         )
@@ -18419,6 +18480,98 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertEqual(reads, {"value", "increment"})
         self.assertEqual(writes, {"value"})
 
+    def test_tcgen05_cluster_m4_smem_matches_two_cta_pair(self) -> None:
+        from helion._compiler.cute.tcgen05_config import (
+            Tcgen05AbStagesThreeSearchConstraints,
+        )
+        from helion._compiler.cute.tcgen05_constants import (
+            tcgen05_ab_smem_bytes_per_cta,
+        )
+
+        kwargs = {"bm": 128, "bn": 128, "bk": 128, "dtype_bytes": 1, "ab_stages": 3}
+        one_cta = tcgen05_ab_smem_bytes_per_cta(cluster_m=1, **kwargs)
+        two_cta = tcgen05_ab_smem_bytes_per_cta(cluster_m=2, **kwargs)
+        four_cta = tcgen05_ab_smem_bytes_per_cta(cluster_m=4, **kwargs)
+
+        self.assertEqual(four_cta, two_cta)
+        self.assertEqual(one_cta, two_cta * 2)
+
+        tcgen_config = ConfigSpec(backend=CuteBackend())._cute_tcgen05_config
+        tcgen_config.ab_stages_three_search_constraints = (
+            Tcgen05AbStagesThreeSearchConstraints(
+                dtype_bytes=1,
+                per_cta_smem_budget_bytes=232 * 1024,
+            )
+        )
+        ab_fits = {
+            cluster_m: tcgen_config.ab_stages_three_fits(
+                bm=128,
+                bn=128,
+                bk=128,
+                cluster_m=cluster_m,
+            )
+            for cluster_m in (2, 4)
+        }
+        c_fits = {
+            cluster_m: tcgen_config.c_stages_fits(
+                bm=128,
+                bn=128,
+                bk=128,
+                cluster_m=cluster_m,
+                ab_stages=3,
+                c_stages=3,
+                has_source_c=True,
+            )
+            for cluster_m in (2, 4)
+        }
+        max_ab_stages = {
+            cluster_m: tcgen_config.max_ab_stages_that_fit(
+                bm=128,
+                bn=128,
+                bk=128,
+                cluster_m=cluster_m,
+            )
+            for cluster_m in (2, 4)
+        }
+        self.assertEqual(ab_fits, {2: True, 4: True})
+        self.assertEqual(c_fits, {2: True, 4: True})
+        self.assertEqual(max_ab_stages[4], max_ab_stages[2])
+
+    def test_tcgen05_cluster_m4_strategy_and_scheduler_coordinates(self) -> None:
+        from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
+        from helion._compiler.cute.strategies import Tcgen05PersistenceModel
+        from helion._compiler.cute.strategies import (
+            validate_tcgen05_strategy_invariants,
+        )
+
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=4,
+        )
+        self.assertEqual(errors, [])
+
+        _, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        plan = SimpleNamespace(cluster_m=4, cluster_n=1, is_two_cta=True)
+        splitter._tcgen05_plan = lambda: plan  # type: ignore[method-assign]
+
+        self.assertEqual(
+            splitter._tcgen05_scheduler_tile_dims_expr(is_device=True),
+            ["(16) * 2", "16", "1"],
+        )
+        self.assertEqual(
+            splitter._tcgen05_logical_m_coord_expr("tile_m"),
+            "(tile_m) // cutlass.Int32(2)",
+        )
+        self.assertEqual(
+            splitter._tcgen05_num_work_clusters_expr(is_device=True),
+            "((((16) * 2) + 4 - 1) // 4) * (16) * (1)",
+        )
+
     def test_tcgen05_grid_work_clusters_uses_configured_cap(self) -> None:
         from helion._compiler.cute.tcgen05_constants import (
             TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY,
@@ -19791,6 +19944,19 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertIsInstance(producer, ast.If)
         self.assertEqual(ast.unparse(producer.test), "tma_warp and next_full_tile")
 
+        current_tile_producer = _build_kloop_pipeline_producer_if(
+            args,
+            gate_tma_warp=False,
+            load_current_tile=True,
+        )
+        self.assertEqual(ast.unparse(current_tile_producer.test), "True")
+        current_tile_src = ast.unparse(
+            ast.Module(body=current_tile_producer.body, type_ignores=[])
+        )
+        self.assertIn("gA[None, tma_k_tile]", current_tile_src)
+        self.assertIn("gB[None, tma_k_tile]", current_tile_src)
+        self.assertNotIn("tma_k_tile +", current_tile_src)
+
         consumer = _build_kloop_pipeline_consumer_if(
             args,
             include_scalar_fallback=False,
@@ -19811,19 +19977,30 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             _build_kloop_pipeline_release_if(args)
 
         two_cta_args = self._make_args(is_two_cta=True, static_full_tiles=True)
-        for builder in (
-            _build_kloop_pipeline_producer_if,
-            _build_kloop_pipeline_consumer_if,
-            _build_kloop_pipeline_release_if,
-        ):
-            with (
-                self.subTest(builder=builder.__name__),
-                self.assertRaisesRegex(AssertionError, "one-CTA"),
-            ):
-                if builder is _build_kloop_pipeline_producer_if:
-                    builder(two_cta_args)
-                else:
-                    builder(two_cta_args, include_scalar_fallback=False)
+        two_cta_producer = _build_kloop_pipeline_producer_if(two_cta_args)
+        self.assertEqual(
+            ast.unparse(two_cta_producer.test), "tma_warp and next_full_tile"
+        )
+
+        two_cta_consumer = _build_kloop_pipeline_consumer_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(
+            ast.unparse(two_cta_consumer.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+
+        two_cta_release = _build_kloop_pipeline_release_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(ast.unparse(two_cta_release.test), "exec_active")
+        self.assertEqual(self._stmt_kinds(two_cta_release.body), ["If", "advance"])
+        release_gate = two_cta_release.body[0]
+        self.assertIsInstance(release_gate, ast.If)
+        self.assertEqual(
+            ast.unparse(release_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE
+        )
+        self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
 
     def test_non_pipeline_builders_reject_static_full_fast_path(self) -> None:
         args = self._make_args(static_full_tiles=True)
