@@ -989,13 +989,14 @@ class TestCuteLowerings(unittest.TestCase):
         )
         # 4 epi + 1 exec + 1 ab_load = 6 warps, no power-of-2 round-up.
         self.assertIn("block=(64, 6, 1)", code)
-        self.assertIn("'kind': 'tcgen05_d_tma'", code)
-        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertNotIn("cutlass.pipeline.PipelineTmaStore.create", code)
         self.assertIn(
-            "tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (64, 8),",
+            "tcgen05_gC = cute.local_tile(out, (64, 8),",
             code,
         )
         self.assertIn("partition_C(tcgen05_gC)", code)
+        self.assertIn("cute.copy(tcgen05_simt_atom", code)
         self.assertNotIn("for _tcgen05_store_i in range(", code)
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
@@ -2032,8 +2033,8 @@ class TestCuteLowerings(unittest.TestCase):
 
     def test_tcgen05_persistent_post_loop_stmts_appear_after_while(self) -> None:
         """Compiling a persistent_blocked kernel must emit the cleanup
-        block (producer_tail / TMEM allocator setup / free) AFTER the
-        ``while tcgen05_work_tile_valid`` loop.
+        block (producer_tail / TMEM allocator setup / free) AFTER all
+        persistent work-tile loops.
 
         Before the post-loop split landed, those statements stayed inside
         the persistent loop and were yielded back as scf.while carries,
@@ -2074,42 +2075,38 @@ class TestCuteLowerings(unittest.TestCase):
             )
             code = bound.to_triton_code(cfg)
 
-        # Locate the persistent while loop and verify post-loop
-        # statements live OUTSIDE its body. The cleanest check is to find
-        # the line of ``while tcgen05_work_tile_valid`` and the first
-        # following dedented statement (= post-loop boundary), then
-        # confirm producer_tail / free fall on the post-loop side.
-        lines = code.splitlines()
-        while_line_idx = next(
-            i for i, line in enumerate(lines) if "while tcgen05_work_tile_valid" in line
+        # Role-local codegen emits one work-tile loop per warp role. Verify
+        # one-shot cleanup follows the last of those loops, rather than being
+        # replayed in any role's per-tile body.
+        tree = ast.parse(code)
+        work_tile_loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.While)
+            and (
+                "tcgen05_role_local_" in ast.unparse(node.test)
+                or ast.unparse(node.test) == "tcgen05_work_tile_valid"
+            )
+        ]
+        self.assertTrue(
+            work_tile_loops, "expected at least one persistent work-tile loop"
         )
-        while_indent = len(lines[while_line_idx]) - len(
-            lines[while_line_idx].lstrip(" ")
+        last_work_tile_line = max(
+            node.end_lineno or node.lineno for node in work_tile_loops
         )
-        post_loop_line_idx = None
-        for i in range(while_line_idx + 1, len(lines)):
-            line = lines[i]
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            indent = len(line) - len(line.lstrip(" "))
-            if indent <= while_indent:
-                post_loop_line_idx = i
-                break
-        self.assertIsNotNone(
-            post_loop_line_idx, "post-loop statements should follow the while"
-        )
-        post_loop_block = "\n".join(lines[post_loop_line_idx:])
-        in_loop_block = "\n".join(lines[while_line_idx + 1 : post_loop_line_idx])
-        # Cleanup statements must be in the post-loop block, not the
-        # work-tile body.
         for tag in (
             "tcgen05_acc_pipeline.producer_tail",
             "tcgen05_tmem_allocator.free",
         ):
-            self.assertIn(tag, post_loop_block, f"{tag} must follow the while loop")
-            self.assertNotIn(
-                tag, in_loop_block, f"{tag} must not appear inside the while loop"
+            cleanup_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and tag in ast.unparse(node.func)
+            ]
+            self.assertTrue(cleanup_calls, f"expected cleanup call {tag}")
+            self.assertTrue(
+                all(node.lineno > last_work_tile_line for node in cleanup_calls),
+                f"{tag} must follow all work-tile loops",
             )
 
     def test_tcgen05_persistent_path_compiles(self) -> None:
@@ -2155,7 +2152,7 @@ class TestCuteLowerings(unittest.TestCase):
             # z-seeded and tile-advance scheduler paths lives in
             # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
             code = bound.to_triton_code(cfg)
-            self.assertIn("while tcgen05_work_tile_valid", code)
+            self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
             self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
             from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -2772,6 +2769,68 @@ class TestCuteLowerings(unittest.TestCase):
             out = bound(*args)
 
         torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fp8_m64_explicit_epilogue_tile_codegen(self) -> None:
+        """Scaled FP8 M64 kernels may drain up to 64 columns per subtile."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                scale = scale_a[tile_m, tile_n] * scale_b[tile_n]
+                out[tile_m, tile_n] = (acc * scale).to(torch.bfloat16)
+            return out
+
+        torch.manual_seed(0)
+        scale_a_base = torch.rand([64, 1], device=DEVICE) + 0.5
+        args = (
+            (0.1 * torch.randn([64, 128], device=DEVICE)).to(torch.float8_e4m3fn),
+            (0.1 * torch.randn([128, 64], device=DEVICE)).to(torch.float8_e4m3fn),
+            scale_a_base.expand(64, 64),
+            torch.rand([64], device=DEVICE) + 0.5,
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[64, 64, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_layout_strategy="explicit_epi_tile",
+            tcgen05_layout_overrides_epi_tile_m=64,
+            tcgen05_layout_overrides_epi_tile_n=64,
+            tcgen05_layout_overrides_d_store_box_n=64,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn(
+            "tcgen05_epi_tile = (cute.make_layout(64), cute.make_layout(64))",
+            code,
+        )
+        if get_cute_mma_support().tcgen05_f8:
+            bound.set_config(cfg)
+            actual = bound(*args)
+            expected = ((args[0].float() @ args[1].float()) * args[2] * args[3]).to(
+                torch.bfloat16
+            )
+            torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
 
     def test_tcgen05_smem_swizzle_override_runtime_correctness(self) -> None:
         """Explicit ``smem_swizzle_*`` overrides produce numerically-
@@ -4755,10 +4814,8 @@ class TestCuteLowerings(unittest.TestCase):
         found_role_local_producer_loop = False
         found_role_local_exec_loop = False
         found_role_local_epi_loop = False
+        found_shared_loop = False
         shared_loop_has_tma_producer = False
-        shared_loop_preserves_barriers = False
-        shared_scheduler_retargeted_to_exec = False
-        shared_loop_excludes_tma = False
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.If)
@@ -4776,7 +4833,8 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("tile_offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
                 self.assertIn("for tile_offset_2 in range", role_src)
                 self.assertIn(
-                    "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
+                    "if tcgen05_tma_initial_full_tile and "
+                    "tcgen05_tma_initial_next_full_tile",
                     role_src,
                 )
                 self.assertNotIn(
@@ -4856,6 +4914,7 @@ class TestCuteLowerings(unittest.TestCase):
                 and ast.unparse(node.test) == "tcgen05_work_tile_valid"
             ):
                 continue
+            found_shared_loop = True
             shared_src = ast.unparse(node)
             shared_loop_has_tma_producer = (
                 "producer_try_acquire(tcgen05_ab_producer_state)" in shared_src
@@ -4876,23 +4935,6 @@ class TestCuteLowerings(unittest.TestCase):
             )
             self.assertNotIn("cute.nvgpu.CopyUniversalOp()", shared_src)
             self.assertNotIn("PipelineTmaStore.create", shared_src)
-            shared_loop_preserves_barriers = "cute.arch.sync_threads()" in shared_src
-            shared_scheduler_retargeted_to_exec = (
-                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
-                in shared_src
-                and "tcgen05_tile_sched.advance_to_next_work()" in shared_src
-            )
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.If):
-                continue
-            test_src = ast.unparse(node.test)
-            if not (test_src.startswith("not ") and "cutlass.Int32(5)" in test_src):
-                continue
-            shared_loop_excludes_tma = any(
-                isinstance(child, ast.While)
-                and ast.unparse(child.test) == "tcgen05_work_tile_valid"
-                for child in node.body
-            )
         self.assertTrue(
             found_role_local_producer_loop,
             "Expected a role-local TMA producer while containing the "
@@ -4911,22 +4953,10 @@ class TestCuteLowerings(unittest.TestCase):
         self._assert_role_local_c_store_pipeline_lifetime(
             code, tree, epi_role_predicate
         )
-        self.assertTrue(
-            shared_loop_preserves_barriers,
-            "Shared persistent while must preserve CTA barriers so the "
-            "role-local warps can rejoin as barrier participants. Generated code:\n"
-            + code,
-        )
-        self.assertTrue(
-            shared_scheduler_retargeted_to_exec,
-            "Shared scheduler advance should be owned by the exec warp in "
-            "the role-local mainloop path. Generated code:\n" + code,
-        )
         self.assertFalse(
-            shared_loop_excludes_tma,
-            "The TMA warp must still enter the shared while after its "
-            "role-local producer loop so existing sync_threads barriers "
-            "remain valid. Generated code:\n" + code,
+            found_shared_loop,
+            "A dependency-only shared loop should be omitted after all work "
+            "moves into role-local schedulers. Generated code:\n" + code,
         )
         self.assertFalse(
             shared_loop_has_tma_producer,
@@ -6128,6 +6158,7 @@ class TestCuteLowerings(unittest.TestCase):
                         code = bound.to_triton_code(cfg)
                         self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
                         self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+                        self.assertNotIn("while tcgen05_work_tile_valid", code)
                         self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
                         self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
                         out = bound(*args)
@@ -6586,6 +6617,169 @@ class TestCuteLowerings(unittest.TestCase):
             "accumulator load must stay after the aux load so the fused "
             "epilogue has its aux operands",
         )
+
+    def test_tcgen05_fp8_m128_aux_load_precedes_acc_wait(self) -> None:
+        """The small-grid two-CTA path overlaps scale loads with the acc wait."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                tile_scale = scale_a[tile_m, tile_n] * scale_b[tile_n]
+                out[tile_m, tile_n] = (acc * tile_scale).to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([512, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([512, 1], device=DEVICE).expand(512, 128),
+            torch.empty([128], device=DEVICE),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        loop_pos = code.find("for _tcgen05_subtile in cutlass.range")
+        self.assertGreaterEqual(loop_pos, 0)
+        acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+        aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
+        aux_product_pos = code.find("tcgen05_aux_product", loop_pos)
+        acc_load_pos = code.find("tcgen05_acc_loaded", loop_pos)
+        chain_step_pos = code.find("tcgen05_chain_step", loop_pos)
+        self.assertGreater(aux_load_pos, loop_pos)
+        self.assertGreater(aux_product_pos, aux_load_pos)
+        self.assertGreater(acc_wait_pos, aux_load_pos)
+        self.assertGreater(acc_load_pos, acc_wait_pos)
+        self.assertGreater(aux_product_pos, acc_load_pos)
+        self.assertGreater(chain_step_pos, acc_load_pos)
+        self.assertIn("tcgen05_aux_rmem_0_coord0", code)
+        self.assertIn("tcgen05_aux_rmem_0_scale1", code)
+        self.assertIn("tcgen05_tTR_cC_subtile[1][0]", code)
+        self.assertIn("if _colvec_i % 2 == 0", code)
+        self.assertNotIn(
+            "cute.autovec_copy(tcgen05_tTR_gAux_subtile_0, tcgen05_aux_rmem_0)",
+            code,
+        )
+
+    def test_tcgen05_fp8_narrow_simt_aux_load_precedes_acc_wait(self) -> None:
+        """A narrow SIMT epilogue overlaps scale loads with the MMA wait."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = (
+                    acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
+                ).to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([64, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 16], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([64, 1], device=DEVICE).expand(64, 16),
+            torch.empty([16], device=DEVICE),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[64, 16, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        loop_pos = code.find("for _tcgen05_subtile in cutlass.range")
+        aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
+        acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+        t2r_copy_pos = code.find("cute.copy(tcgen05_tiled_copy_t2r,", loop_pos)
+        self.assertGreater(loop_pos, 0)
+        self.assertGreater(aux_load_pos, loop_pos)
+        self.assertGreater(acc_wait_pos, aux_load_pos)
+        self.assertGreater(t2r_copy_pos, acc_wait_pos)
+
+    def test_tcgen05_fp8_small_n_tma_runtime_correctness(self) -> None:
+        """TMA zero-fills an FP8 N edge smaller than the tcgen05 tile."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def small_n_fp8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            out_t = out.T
+            for tile_n, tile_m in hl.tile([n, m]):
+                acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        y[tile_k, tile_n].T,
+                        x[tile_m, tile_k].T,
+                        acc=acc,
+                    )
+                out_t[tile_n, tile_m] = acc.to(torch.bfloat16)
+            return out
+
+        x = torch.randn([2, 128], device=DEVICE).to(torch.float8_e4m3fn)
+        y = torch.randn([128, 64], device=DEVICE).to(torch.float8_e4m3fn)
+        y = y.T.contiguous().T
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[64, 16, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_one_shot_role_scheduler=True,
+            indexing=["tensor_descriptor"] * 3,
+        )
+        with patch_cute_mma_support():
+            bound = small_n_fp8.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            actual = bound(x, y)
+        expected = (x.float() @ y.float()).to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.05)
 
     def test_tcgen05_fused_bias_broadcast_runtime_correctness(self) -> None:
         """``out[tile] = (acc + bias[tile_n]).to(x.dtype)`` after a
@@ -8892,6 +9086,63 @@ class TestCuteLowerings(unittest.TestCase):
                 }
             )
 
+    def test_tcgen05_c_stages_three_config_validation(self) -> None:
+        """C-stage 3 is explicit-only and restricted to measured tile shapes."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        config_spec.cute_tcgen05_search_enabled = True
+        for block_id in range(3):
+            config_spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=4096,
+                    max_size=4096,
+                )
+            )
+
+        validation_fragment = config_spec._cute_tcgen05_config.optional_fragments()[
+            "tcgen05_c_stages"
+        ]
+        search_fragment = config_spec._cute_tcgen05_config.optional_fragments(
+            for_search=True
+        )["tcgen05_c_stages"]
+        self.assertEqual(validation_fragment.choices, (2, 3, 4))
+        self.assertEqual(search_fragment.choices, (2, 4))
+
+        allowed_block_sizes = (
+            [64, 32, 256],
+            [64, 32, 512],
+            [64, 64, 128],
+            [128, 64, 256],
+            [128, 128, 128],
+            [256, 128, 128],
+        )
+        for block_sizes in allowed_block_sizes:
+            with self.subTest(block_sizes=block_sizes):
+                config: dict[str, object] = {
+                    "block_sizes": block_sizes,
+                    "tcgen05_c_stages": 3,
+                }
+                config_spec.normalize(config)
+                self.assertEqual(config["tcgen05_c_stages"], 3)
+
+        invalid_config: dict[str, object] = {
+            "block_sizes": [64, 64, 256],
+            "tcgen05_c_stages": 3,
+        }
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_c_stages=3 is validated only for block_sizes",
+        ):
+            config_spec.normalize(invalid_config)
+
+        repaired_config: dict[str, object] = {
+            "block_sizes": [64, 64, 256],
+            "tcgen05_c_stages": 3,
+        }
+        config_spec.normalize(repaired_config, _fix_invalid=True)
+        self.assertEqual(repaired_config["tcgen05_c_stages"], 2)
+
     def test_tcgen05_ab_initial_producer_acquire_mode_config_validation(
         self,
     ) -> None:
@@ -9578,12 +9829,18 @@ class TestCuteLowerings(unittest.TestCase):
                     self.assertIn("tcgen05_ab_consumer_state.advance()", role_src)
                     release_pos = role_src.index("tcgen05_ab_pipeline.consumer_release")
                     advance_pos = role_src.index("tcgen05_ab_consumer_state.advance()")
-                    next_ab_peek_blocks = [
+                    self.assertLess(release_pos, advance_pos)
+                    leader_blocks = [
                         ast.unparse(child)
                         for child in ast.walk(node)
                         if isinstance(child, ast.If)
-                        and "tcgen05_tma_next_consumer_tile" in ast.unparse(child.test)
                         and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                    ]
+                    next_ab_peek_blocks = [
+                        block
+                        for block in leader_blocks
+                        if "tcgen05_tma_next_consumer_tile" in block
+                        and "tcgen05_ab_pipeline.consumer_try_wait" in block
                     ]
                     self.assertTrue(
                         next_ab_peek_blocks,
@@ -9597,15 +9854,8 @@ class TestCuteLowerings(unittest.TestCase):
                         "tcgen05_ab_pipeline.consumer_try_wait",
                         next_ab_peek_pos,
                     )
-                    self.assertLess(release_pos, advance_pos)
                     self.assertLess(advance_pos, next_ab_peek_pos)
                     self.assertLess(next_ab_peek_pos, next_ab_try_pos)
-                    leader_blocks = [
-                        ast.unparse(child)
-                        for child in ast.walk(node)
-                        if isinstance(child, ast.If)
-                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
-                    ]
                     self.assertTrue(
                         any(
                             "tcgen05_acc_pipeline.producer_acquire("
@@ -13570,8 +13820,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(
             (
                 "compute_epilogue_tile_shape((128, 8), False, "
-                "tcgen05_c_layout_1, cutlass.Float16, "
-                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float16)"
+                "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.Float16, "
+                "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                "elem_ty_c=cutlass.Float16)"
             ),
             emitted,
         )
@@ -13690,8 +13941,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(
             (
                 "compute_epilogue_tile_shape((128, 8), False, "
-                "tcgen05_c_layout_1, cutlass.Float32, "
-                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float32)"
+                "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.Float32, "
+                "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                "elem_ty_c=cutlass.Float32)"
             ),
             emitted,
         )
@@ -18404,6 +18656,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         class _StubDeviceFunction:
             def __init__(self) -> None:
                 self._counter = 0
+                self.config: dict[str, object] = {}
                 self.cute_state = CuteDeviceFunctionState()
 
             def new_var(self, name: str) -> str:
@@ -19306,6 +19559,29 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 ):
                     splitter._assert_tcgen05_omit_shared_loop_safe(partition)
 
+    def test_omit_shared_loop_rejects_post_loop_dependency(self) -> None:
+        """A residual assignment cannot be dropped when cleanup reads it."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        splitter, _ = self._make_helper()
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[],
+            shared_body_extracted=[self._stmt("final_state = current_state")],
+        )
+
+        self.assertTrue(splitter._tcgen05_shared_loop_safe_to_omit(partition, []))
+        self.assertFalse(
+            splitter._tcgen05_shared_loop_safe_to_omit(
+                partition, [self._stmt("cleanup_state = final_state")]
+            )
+        )
+        self.assertFalse(
+            splitter._tcgen05_shared_loop_safe_to_omit(
+                partition, [self._stmt("final_state += 1")]
+            )
+        )
+
     def test_role_local_tile_body_can_skip_shared_body_build(self) -> None:
         """When the caller omits the residual shared loop, the role-local
         builder should not construct and discard that body. Dependency-only
@@ -19718,19 +19994,30 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             _build_kloop_pipeline_release_if(args)
 
         two_cta_args = self._make_args(is_two_cta=True, static_full_tiles=True)
-        for builder in (
-            _build_kloop_pipeline_producer_if,
-            _build_kloop_pipeline_consumer_if,
-            _build_kloop_pipeline_release_if,
-        ):
-            with (
-                self.subTest(builder=builder.__name__),
-                self.assertRaisesRegex(AssertionError, "one-CTA"),
-            ):
-                if builder is _build_kloop_pipeline_producer_if:
-                    builder(two_cta_args)
-                else:
-                    builder(two_cta_args, include_scalar_fallback=False)
+        two_cta_producer = _build_kloop_pipeline_producer_if(two_cta_args)
+        self.assertEqual(
+            ast.unparse(two_cta_producer.test), "tma_warp and next_full_tile"
+        )
+
+        two_cta_consumer = _build_kloop_pipeline_consumer_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(
+            ast.unparse(two_cta_consumer.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+
+        two_cta_release = _build_kloop_pipeline_release_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(ast.unparse(two_cta_release.test), "exec_active")
+        self.assertEqual(self._stmt_kinds(two_cta_release.body), ["If", "advance"])
+        release_gate = two_cta_release.body[0]
+        self.assertIsInstance(release_gate, ast.If)
+        self.assertEqual(
+            ast.unparse(release_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE
+        )
+        self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
 
     def test_non_pipeline_builders_reject_static_full_fast_path(self) -> None:
         args = self._make_args(static_full_tiles=True)

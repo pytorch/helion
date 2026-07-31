@@ -93,7 +93,10 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
+from .tcgen05_constants import TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CHOICES
+from .tcgen05_constants import TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
@@ -191,6 +194,8 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
         TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
+        TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY,
+        TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
         TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
@@ -944,7 +949,7 @@ class CuteTcgen05Config:
         constraints = self.ab_stages_three_search_constraints
         if constraints is None:
             return False
-        if cluster_m not in (1, 2):
+        if cluster_m not in (1, 2, 4):
             return False
         if bm <= 0 or bn <= 0 or bk <= 0:
             return False
@@ -954,7 +959,7 @@ class CuteTcgen05Config:
             bk=bk,
             dtype_bytes=constraints.dtype_bytes,
             ab_stages=ab_stages,
-            cluster_m=cluster_m,
+            cluster_m=min(cluster_m, 2),
         )
         return bytes_per_cta <= constraints.per_cta_smem_budget_bytes
 
@@ -985,7 +990,7 @@ class CuteTcgen05Config:
         constraints = self.ab_stages_three_search_constraints
         if constraints is None:
             return False
-        if cluster_m not in (1, 2):
+        if cluster_m not in (1, 2, 4):
             return False
         if bm <= 0 or bn <= 0 or bk <= 0:
             return False
@@ -997,7 +1002,7 @@ class CuteTcgen05Config:
             bk=bk,
             dtype_bytes=constraints.dtype_bytes,
             ab_stages=ab_stages,
-            cluster_m=cluster_m,
+            cluster_m=min(cluster_m, 2),
         )
         # The epilogue processes the full per-CTA output tile (bm, bn); unlike
         # the AB operands it is NOT split across the cluster, so the C-ring
@@ -1022,7 +1027,7 @@ class CuteTcgen05Config:
 
     def _fix_c_stages_search_config(self, config: dict[str, object]) -> None:
         # Workstream A Stage 2 (cycle 90): true admission gate for the deeper C
-        # ring. ``tcgen05_c_stages`` is an ``EnumFragment((2, 4))`` knob, so the
+        # ring. ``tcgen05_c_stages`` is an ``EnumFragment((2, 3, 4))`` knob, so the
         # autotuner can SAMPLE c=4 independently of any projection — a directly
         # sampled 256x256 cluster_m=2 ab=3 + c=4 reaches ptxas and fails with a
         # raw ``too much shared`` error (verified cycle-90). Mirror
@@ -1155,7 +1160,7 @@ class CuteTcgen05Config:
         constraints = self.ab_stages_three_search_constraints
         if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
             return 0
-        if cluster_m not in (1, 2):
+        if cluster_m not in (1, 2, 4):
             return 0
 
         # Calculate SMEM cost for ab_stages=1 (baseline)
@@ -1165,7 +1170,7 @@ class CuteTcgen05Config:
             bk=bk,
             dtype_bytes=constraints.dtype_bytes,
             ab_stages=1,
-            cluster_m=cluster_m,
+            cluster_m=min(cluster_m, 2),
         )
 
         # Edge cases: invalid calculation or even ab_stages=1 doesn't fit
@@ -1946,7 +1951,7 @@ class CuteTcgen05Config:
         if for_search and self.cluster_m_search_choices is not None:
             cluster_m_choices = self.cluster_m_search_choices
         else:
-            cluster_m_choices = (1, 2)
+            cluster_m_choices = (1, 2, 4)
         cluster_n_choices: tuple[int, ...] = (1,) if for_search else (1, 2)
         if for_search and self.num_epi_warps_search_choices is not None:
             num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(
@@ -2008,7 +2013,7 @@ class CuteTcgen05Config:
             "tcgen05_cluster_n": EnumFragment(cluster_n_choices),
             "tcgen05_ab_stages": IntegerFragment(1, ab_stages_max, 2),
             "tcgen05_acc_stages": IntegerFragment(1, 2, 2),
-            "tcgen05_c_stages": EnumFragment((2, 4)),
+            "tcgen05_c_stages": EnumFragment((2, 4) if for_search else (2, 3, 4)),
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
@@ -2363,6 +2368,24 @@ class CuteTcgen05Config:
             self._validate_direct_entry_ab_stage_envelope(
                 config, fix_invalid=fix_invalid
             )
+            if config.get("tcgen05_c_stages") == 3 and config.get(
+                "block_sizes"
+            ) not in (
+                [64, 32, 256],
+                [64, 32, 512],
+                [64, 64, 128],
+                [128, 64, 256],
+                [128, 128, 128],
+                [256, 128, 128],
+            ):
+                if fix_invalid:
+                    config["tcgen05_c_stages"] = 2
+                else:
+                    raise InvalidConfig(
+                        "tcgen05_c_stages=3 is validated only for block_sizes "
+                        "in {[64,32,256], [64,32,512], [64,64,128], [128,64,256], "
+                        "[128,128,128], [256,128,128]}"
+                    )
         else:
             for key in optional_fragments:
                 if key not in config:
@@ -2479,6 +2502,17 @@ class CuteTcgen05Config:
         )
         self._validate_bool_config(
             config, TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, fix_invalid=fix_invalid
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY,
+            fix_invalid=fix_invalid,
+        )
+        self._validate_int_enum_config(
+            config,
+            TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY,
+            TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CHOICES,
+            fix_invalid=fix_invalid,
         )
         self._validate_bool_config(
             config,

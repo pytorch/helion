@@ -1,5 +1,5 @@
 """
-Auto-generated heuristic for kernels: scale_mm_cute, scale_mm_cute_skinny_m
+Auto-generated heuristic for kernels: scale_mm_cute, scale_mm_cute_skinny_m, scale_mm_cute_swap_ab
 Backend: explicit per-shape table (exact (M, K, N) -> tuned config)
 
 RowWise-scaled FP8 GEMM pretuned on NVIDIA B200 (sm100) for the Helion CuTe
@@ -35,6 +35,7 @@ Provides, for each kernel <k>:
 """
 
 import math
+from typing import Any
 
 import torch
 
@@ -81,6 +82,162 @@ def key_scale_mm_cute_skinny_m(*args) -> int:
 def autotune_scale_mm_cute_skinny_m(*args) -> dict:
     """Config dict for the given args."""
     return _CONFIGS_scale_mm_cute_skinny_m[key_scale_mm_cute_skinny_m(*args)]
+
+
+# === Kernel: scale_mm_cute_swap_ab ===
+_SMALL_M_SWAP_KEYS = [
+    (m, k, n)
+    for m in (2, 8, 16, 32)
+    for k, n in (
+        (4096, 4096),
+        (4096, 256),
+        (2048, 4096),
+        (4096, 6144),
+    )
+]
+_SMALL_M_SWAP_KEYS.extend(
+    (m, k, n)
+    for m in (2, 8, 16, 32)
+    for k, n in (
+        (2048, 12288),
+        (5120, 5120),
+        (6144, 2048),
+    )
+)
+
+
+def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
+    if m == 32 and (k, n) in {
+        (2048, 12288),
+        (5120, 5120),
+        (6144, 2048),
+    }:
+        block_sizes = [64, 32, 256]
+        ab_stages = 7
+        acc_stages = 1
+    elif m == 32:
+        block_sizes = [64, 32, 128]
+        ab_stages = 12
+        acc_stages = 1
+    else:
+        block_sizes = [64, 16, 256]
+        ab_stages = 7 if k == 2048 else 9
+        acc_stages = 1
+    pid_type = (
+        "persistent_interleaved"
+        if (m, k, n) == (2, 4096, 256)
+        else "persistent_blocked"
+    )
+    return {
+        "block_sizes": block_sizes,
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": pid_type,
+        "tcgen05_cluster_m": 1,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": ab_stages,
+        "tcgen05_acc_stages": acc_stages,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 1,
+        "tcgen05_persistence_model": "static_persistent",
+        "tcgen05_one_shot_role_scheduler": n <= block_sizes[0] * 148,
+    }
+
+
+_KEYS_scale_mm_cute_swap_ab = [
+    *_SMALL_M_SWAP_KEYS,
+    (64, 4096, 6144),
+    (64, 4096, 24576),
+    (64, 5120, 5120),
+    (64, 5120, 51200),
+    (64, 25600, 5120),
+]
+
+_CONFIGS_scale_mm_cute_swap_ab = [
+    *[_small_m_swap_config(*key) for key in _SMALL_M_SWAP_KEYS],
+    {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_blocked",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 2,
+        "tcgen05_persistence_model": "static_persistent",
+        "tcgen05_one_shot_role_scheduler": True,
+    },
+    {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 2,
+        "tcgen05_persistence_model": "static_persistent",
+        "tcgen05_role_scheduler_cluster_cap": 65,
+    },
+    {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 3,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 8,
+        "tcgen05_persistence_model": "static_persistent",
+    },
+    {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_blocked",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 4,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 8,
+        "tcgen05_persistence_model": "static_persistent",
+        "tcgen05_role_scheduler_cluster_cap": 67,
+    },
+    {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 4,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 1,
+        "tcgen05_persistence_model": "static_persistent",
+    },
+]
+
+
+def key_scale_mm_cute_swap_ab(*args) -> int:
+    return _select(_KEYS_scale_mm_cute_swap_ab, _mkn(args))
+
+
+def autotune_scale_mm_cute_swap_ab(*args) -> dict:
+    return _CONFIGS_scale_mm_cute_swap_ab[key_scale_mm_cute_swap_ab(*args)]
 
 
 # === Kernel: scale_mm_cute ===
@@ -145,7 +302,7 @@ _CONFIGS_scale_mm_cute = [
     # (M, K, N) = (64, 4096, 6144) -- persistent bn=64 bk=128 ab=12; 0.86x vs cutlass (was 0.81).
     {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 12, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (64, 4096, 4096) -- persistent bn=32 bk=256; 0.94x vs cutlass (was 0.91).
-    {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
+    {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 3, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (64, 4096, 24576) -- persistent bn=64 bk=128 ab=12; 0.89x vs cutlass (was 0.75).
     {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 12, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (64, 12288, 4096) -- persistent bn=32 bk=256; 1.02x vs cutlass (was 0.99).
@@ -160,6 +317,66 @@ _CONFIGS_scale_mm_cute = [
     {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 12, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
 ]
 
+# Keep adjacent work tiles on the same persistent cluster for the 512x2048x4096
+# shape; swizzle 4 was the best cold-L2 schedule for its two-wave grid.
+_CONFIGS_scale_mm_cute[1].update(
+    {"pid_type": "persistent_blocked", "tcgen05_l2_swizzle_size": 4}
+)
+
+_CONFIGS_scale_mm_cute[0].update(
+    {
+        "block_sizes": [256, 256, 256],
+        "l2_groupings": [64],
+        "tcgen05_ab_stages": 3,
+        "tcgen05_l2_swizzle_size": 2,
+        "tcgen05_role_scheduler_cluster_cap": 64,
+    }
+)
+
+for _key, _config in zip(_KEYS_scale_mm_cute, _CONFIGS_scale_mm_cute):
+    if _key == (64, 2048, 2048):
+        _config.update(
+            {
+                "block_sizes": [64, 32, 256],
+                "indexing": ["tensor_descriptor"] * 5,
+                "pid_type": "persistent_blocked",
+                "tcgen05_ab_stages": 8,
+                "tcgen05_acc_stages": 2,
+                "tcgen05_persistence_model": "static_persistent",
+                "tcgen05_layout_strategy": "explicit_epi_tile",
+                "tcgen05_layout_overrides_epi_tile_m": 64,
+                "tcgen05_layout_overrides_epi_tile_n": 32,
+                "tcgen05_layout_overrides_d_store_box_n": 32,
+            }
+        )
+    elif _key == (64, 4096, 4096):
+        _config.update(
+            {
+                "block_sizes": [64, 32, 512],
+                "tcgen05_ab_stages": 4,
+                "tcgen05_one_shot_role_scheduler": True,
+            }
+        )
+
+# Use the widest validated M=64 epilogue subtile for the selected N tile. This
+# drains bn<=64 in one iteration and halves the bn=128 store loop from four
+# 32-column subtiles to two 64-column subtiles.
+for _config in _CONFIGS_scale_mm_cute:
+    if _config["block_sizes"][0] == 64 and _config["block_sizes"][1] in (
+        16,
+        64,
+        128,
+    ):
+        _epi_n = min(_config["block_sizes"][1], 64)
+        _config.update(
+            {
+                "tcgen05_layout_strategy": "explicit_epi_tile",
+                "tcgen05_layout_overrides_epi_tile_m": 64,
+                "tcgen05_layout_overrides_epi_tile_n": _epi_n,
+                "tcgen05_layout_overrides_d_store_box_n": _epi_n,
+            }
+        )
+
 
 def key_scale_mm_cute(*args) -> int:
     """Config index for the given args (also the cache key)."""
@@ -169,3 +386,37 @@ def key_scale_mm_cute(*args) -> int:
 def autotune_scale_mm_cute(*args) -> dict:
     """Config dict for the given args."""
     return _CONFIGS_scale_mm_cute[key_scale_mm_cute(*args)]
+
+
+# === Kernel: scale_mm_cute_m512 ===
+_KEYS_scale_mm_cute_m512 = [
+    (512, 2048, 4096),
+    (512, 2048, 2048),
+]
+
+_CONFIGS_scale_mm_cute_m512 = [
+    dict(_CONFIGS_scale_mm_cute[_KEYS_scale_mm_cute.index(key)])
+    for key in _KEYS_scale_mm_cute_m512
+]
+for _config in _CONFIGS_scale_mm_cute_m512:
+    _config["tcgen05_c_stages"] = 4
+_CONFIGS_scale_mm_cute_m512[0].update(
+    {
+        "block_sizes": [256, 128, 128],
+        "tcgen05_cluster_n": 2,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 1,
+        "tcgen05_c_stages": 3,
+        "tcgen05_l2_swizzle_size": 4,
+        "tcgen05_acc_wait_placement": "before_subtile_loop",
+        "tcgen05_one_shot_role_scheduler": True,
+    }
+)
+
+
+def key_scale_mm_cute_m512(*args) -> int:
+    return _select(_KEYS_scale_mm_cute_m512, _mkn(args))
+
+
+def autotune_scale_mm_cute_m512(*args) -> dict:
+    return _CONFIGS_scale_mm_cute_m512[key_scale_mm_cute_m512(*args)]

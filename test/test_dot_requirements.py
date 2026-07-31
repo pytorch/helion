@@ -1448,11 +1448,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # is narrowed to num_epi_warps=4 so the autotuner does not
         # converge on a wrong-output config.
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
-        # The validated narrowing leaves cluster_m=2 still accepted as a
-        # legal value for an explicit user-supplied helion.Config
+        # The validated narrowing leaves cluster_m=2 and cluster_m=4 accepted
+        # as legal values for an explicit user-supplied helion.Config
         # (CUDA-launch-failure is loud and won't silently miscompute).
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
-        self.assertEqual(validation_fragments["tcgen05_cluster_m"].choices, (1, 2))
+        self.assertEqual(validation_fragments["tcgen05_cluster_m"].choices, (1, 2, 4))
         # num_epi_warps is the exception: validation is also tightened
         # to (4,) because non-4 values silently produce wrong output, so
         # an explicit user-supplied helion.Config must be rejected
@@ -1494,6 +1494,38 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_fp8_small_n_admits_persistent_search(self) -> None:
+        """FP8 N smaller than the MMA tile can use persistent TMA zero-fill."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            out_t = out.T
+            for tile_n, tile_m in hl.tile([n, m]):
+                acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        y[tile_k, tile_n].T,
+                        x[tile_m, tile_k].T,
+                        acc=acc,
+                    )
+                out_t[tile_n, tile_m] = acc.to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([2, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.float8_e4m3fn),
+        )
+        with patch_cute_mma_support():
+            spec = cute_matmul_mma.bind(args).config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 8, 128])
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_double_edge_no_divisor_keeps_flat_search(self) -> None:

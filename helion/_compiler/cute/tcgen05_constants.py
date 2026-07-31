@@ -107,9 +107,10 @@ def tcgen05_ab_smem_bytes_per_cta(
     The role-local lowering allocates the tcgen05 A/B SMEM staging via
     ``cutlass.utils.blackwell_helpers.make_smem_layout_a/b`` whose per-CTA
     ``cosize`` is the partitioned tile-shape times ``num_stages``. For
-    ``cluster_m=2`` (CtaGroup.TWO) the tiled MMA partitions A and B across
-    the two cluster CTAs so each CTA holds half of each operand. For
-    ``cluster_m=1`` (CtaGroup.ONE) each CTA holds the full A/B operand.
+    ``cluster_m in (2, 4)`` (one or two CtaGroup.TWO pairs) the tiled MMA
+    partitions A and B across each pair, so every CTA holds half of each
+    operand. For ``cluster_m=1`` (CtaGroup.ONE) each CTA holds the full A/B
+    operand.
 
     The autotune search-space gate uses this helper to admit
     ``tcgen05_ab_stages=3`` candidates only when the per-CTA cost fits
@@ -120,10 +121,10 @@ def tcgen05_ab_smem_bytes_per_cta(
     CtaGroup.ONE ab=3 = 294 912 bytes / overflows the 232 KB optin cap).
     """
     assert ab_stages >= 1
-    assert cluster_m in (1, 2)
+    assert cluster_m in (1, 2, 4)
     a_per_stage = bm * bk * dtype_bytes
     b_per_stage = bn * bk * dtype_bytes
-    if cluster_m == 2:
+    if cluster_m > 1:
         # CtaGroup.TWO: tiled MMA partitions both operands across the two
         # cluster CTAs. Each CTA's SMEM holds half of A and half of B.
         a_per_stage //= 2
@@ -270,6 +271,14 @@ TCGEN05_C_STORE_MODES = (
     TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE,
 )
 TCGEN05_AUX_LOAD_MODE_CONFIG_KEY = "tcgen05_aux_load_mode"
+TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY = "tcgen05_one_shot_role_scheduler"
+TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS = 148
+TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY = "tcgen05_role_scheduler_cluster_cap"
+TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CHOICES = (
+    64,
+    65,
+    67,
+)
 TCGEN05_AUX_LOAD_MODE_SIMT = "simt"
 TCGEN05_AUX_LOAD_MODE_TMA = "tma"
 TCGEN05_AUX_LOAD_MODES = (

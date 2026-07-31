@@ -277,9 +277,15 @@ def _append_cute_wrapper_plan(
         d_store_box_n: int | None = None,
         epi_tile_raw_expr: str | None = None,
         tensor_name: str | None = None,
+        column_major: bool = False,
     ) -> None:
         assert len(kernel_args) == 2
         tensor_expr = tensor_name if tensor_name is not None else f"arg{tensor_idx}"
+        c_layout = (
+            "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+            if column_major
+            else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
+        )
         explicit_epi_tile = any(
             value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
         )
@@ -304,7 +310,7 @@ def _append_cute_wrapper_plan(
                 bm,
                 bn,
                 dtype,
-                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+                c_layout=c_layout,
             )
         tma_atom, tma_tensor = kernel_args
         epi_tile = f"{tma_atom}_epi_tile"
@@ -319,7 +325,7 @@ def _append_cute_wrapper_plan(
                 (
                     f"    {smem_layout} = cutlass.utils.blackwell_helpers."
                     "make_smem_layout_epi("
-                    f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{dtype}, {c_layout}, "
                     f"{epi_tile}, {stage_count})"
                 ),
                 (
@@ -620,6 +626,7 @@ def _append_cute_wrapper_plan(
             d_store_box_n=plan_optional_int("d_store_box_n"),
             epi_tile_raw_expr=plan_optional_str("epi_tile_raw_expr"),
             tensor_name=d_tensor_name,
+            column_major=bool(plan.get("d_column_major")),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -672,6 +679,10 @@ def _append_cute_wrapper_plan(
     b_k_major = bool(plan.get("b_k_major"))
     lhs_leading_passthrough = bool(plan.get("lhs_leading_passthrough"))
     rhs_leading_passthrough = bool(plan.get("rhs_leading_passthrough"))
+    lhs_trailing_transpose = bool(plan.get("lhs_trailing_transpose"))
+    rhs_trailing_transpose = bool(plan.get("rhs_trailing_transpose"))
+    assert not (lhs_leading_passthrough and lhs_trailing_transpose)
+    assert not (rhs_leading_passthrough and rhs_trailing_transpose)
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -706,7 +717,11 @@ def _append_cute_wrapper_plan(
     smem_b_layout = f"{tma_atom_b}_smem_layout"
     lhs_tma = f"{tma_atom_a}_lhs_tma"
     rhs_tma = f"{tma_atom_b}_rhs_tma"
-    lhs_tma_operand = lhs_tma if lhs_leading_passthrough else f"arg{lhs_idx}"
+    lhs_tma_operand = (
+        lhs_tma
+        if lhs_leading_passthrough or lhs_trailing_transpose
+        else f"arg{lhs_idx}"
+    )
     smem_a_layout_expr = tcgen05_smem_layout_expr(
         tiled_mma=tiled_mma,
         bm=bm,
@@ -730,6 +745,8 @@ def _append_cute_wrapper_plan(
     )
     if lhs_leading_passthrough:
         append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 2, 0))
+    elif lhs_trailing_transpose:
+        append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 0))
     if rhs_leading_passthrough:
         append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (2, 1, 0))
     ab_tma_lines = [
@@ -755,7 +772,15 @@ def _append_cute_wrapper_plan(
         f"    {smem_a_layout} = {smem_a_layout_expr}",
         f"    {smem_b_layout} = {smem_b_layout_expr}",
     ]
-    if not rhs_leading_passthrough:
+    if rhs_trailing_transpose:
+        ab_tma_lines.append(
+            f"    {rhs_tma} = cute.make_tensor("
+            f"arg{rhs_idx}.iterator, "
+            "layout=cute.make_layout("
+            f"(arg{rhs_idx}_shape0, arg{rhs_idx}_shape1), "
+            f"stride=(arg{rhs_idx}_stride0, arg{rhs_idx}_stride1)))"
+        )
+    elif not rhs_leading_passthrough:
         ab_tma_lines.append(
             f"    {rhs_tma} = cute.make_tensor("
             f"arg{rhs_idx}.iterator, "
