@@ -1482,6 +1482,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    @skipIfRefEager("inspects generated code; ref eager never lowers a kernel")
     @skipIfNotTriton(
         "asserts on Triton's rendered bound; Pallas lowers a dependent tile "
         "bound through its own loop codegen and never reaches this path"
