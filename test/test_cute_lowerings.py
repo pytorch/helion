@@ -2916,6 +2916,68 @@ class TestCuteLowerings(unittest.TestCase):
 
         torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_fp8_m64_explicit_epilogue_tile_codegen(self) -> None:
+        """Scaled FP8 M64 kernels may drain up to 64 columns per subtile."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                scale = scale_a[tile_m, tile_n] * scale_b[tile_n]
+                out[tile_m, tile_n] = (acc * scale).to(torch.bfloat16)
+            return out
+
+        torch.manual_seed(0)
+        scale_a_base = torch.rand([64, 1], device=DEVICE) + 0.5
+        args = (
+            (0.1 * torch.randn([64, 128], device=DEVICE)).to(torch.float8_e4m3fn),
+            (0.1 * torch.randn([128, 64], device=DEVICE)).to(torch.float8_e4m3fn),
+            scale_a_base.expand(64, 64),
+            torch.rand([64], device=DEVICE) + 0.5,
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[64, 64, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_layout_strategy="explicit_epi_tile",
+            tcgen05_layout_overrides_epi_tile_m=64,
+            tcgen05_layout_overrides_epi_tile_n=64,
+            tcgen05_layout_overrides_d_store_box_n=64,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn(
+            "tcgen05_epi_tile = (cute.make_layout(64), cute.make_layout(64))",
+            code,
+        )
+        if get_cute_mma_support().tcgen05_f8:
+            bound.set_config(cfg)
+            actual = bound(*args)
+            expected = ((args[0].float() @ args[1].float()) * args[2] * args[3]).to(
+                torch.bfloat16
+            )
+            torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+
     def test_tcgen05_smem_swizzle_override_runtime_correctness(self) -> None:
         """Explicit ``smem_swizzle_*`` overrides produce numerically-
         correct output.
@@ -6212,6 +6274,7 @@ class TestCuteLowerings(unittest.TestCase):
                         code = bound.to_triton_code(cfg)
                         self.assertNotIn("_helion_tcgen05_persistent_total_tiles", code)
                         self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+                        self.assertNotIn("while tcgen05_work_tile_valid", code)
                         self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
                         self.assertNotIn("cute.nvgpu.CopyUniversalOp()", code)
                         out = bound(*args)
@@ -6669,6 +6732,70 @@ class TestCuteLowerings(unittest.TestCase):
             aux_load_pos,
             "accumulator load must stay after the aux load so the fused "
             "epilogue has its aux operands",
+        )
+
+    def test_tcgen05_fp8_m128_aux_load_precedes_acc_wait(self) -> None:
+        """The small-grid two-CTA path overlaps scale loads with the acc wait."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                tile_scale = scale_a[tile_m, tile_n] * scale_b[tile_n]
+                out[tile_m, tile_n] = (acc * tile_scale).to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([512, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([512, 1], device=DEVICE).expand(512, 128),
+            torch.empty([128], device=DEVICE),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        loop_pos = code.find("for _tcgen05_subtile in cutlass.range")
+        self.assertGreaterEqual(loop_pos, 0)
+        acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+        aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
+        aux_product_pos = code.find("tcgen05_aux_product", loop_pos)
+        acc_load_pos = code.find("tcgen05_acc_loaded", loop_pos)
+        chain_step_pos = code.find("tcgen05_chain_step", loop_pos)
+        self.assertGreater(aux_load_pos, loop_pos)
+        self.assertGreater(aux_product_pos, aux_load_pos)
+        self.assertGreater(acc_wait_pos, aux_load_pos)
+        self.assertGreater(acc_load_pos, acc_wait_pos)
+        self.assertGreater(aux_product_pos, acc_load_pos)
+        self.assertGreater(chain_step_pos, acc_load_pos)
+        self.assertIn("tcgen05_aux_rmem_0_coord0", code)
+        self.assertIn("tcgen05_aux_rmem_0_scale1", code)
+        self.assertIn("tcgen05_tTR_cC_subtile[1][0]", code)
+        self.assertIn("if _colvec_i % 2 == 0", code)
+        self.assertNotIn(
+            "cute.autovec_copy(tcgen05_tTR_gAux_subtile_0, tcgen05_aux_rmem_0)",
+            code,
         )
 
     def test_tcgen05_fused_bias_broadcast_runtime_correctness(self) -> None:
