@@ -6751,7 +6751,10 @@ class TestCuteBackend(TestCase):
             created.append("wrapper")
             return f"wrapper-{len(created)}"
 
-        with patch("helion.runtime._create_cute_wrapper", side_effect=make_wrapper):
+        with patch(
+            "helion.runtime.cute.launcher._create_cute_wrapper",
+            side_effect=make_wrapper,
+        ):
             wrapper_default = _get_compiled_cute_launcher(
                 cute_kernel,
                 schema_key,
@@ -6787,7 +6790,10 @@ class TestCuteBackend(TestCase):
             return FakeCompiled()
 
         with (
-            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
+            patch(
+                "helion.runtime.cute.launcher._create_cute_wrapper",
+                return_value="jit-wrapper",
+            ),
             patch("cutlass.cute.compile", side_effect=fake_compile),
         ):
             launcher = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
@@ -6820,7 +6826,10 @@ class TestCuteBackend(TestCase):
             return FakeCompiled()
 
         with (
-            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
+            patch(
+                "helion.runtime.cute.launcher._create_cute_wrapper",
+                return_value="jit-wrapper",
+            ),
             patch("cutlass.cute.compile", side_effect=fake_compile),
         ):
             launcher = _get_compiled_cute_launcher(
@@ -6862,10 +6871,16 @@ class TestCuteBackend(TestCase):
             return _launch_entry((("scalar", "int"),), ("launch-arg", *args, *grid))
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
-                "helion.runtime._get_compiled_cute_launcher",
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
+            ),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
         ):
@@ -6916,15 +6931,21 @@ class TestCuteBackend(TestCase):
             return _launch_entry((("scalar", "int"),), ("launch-arg",), owned_tensors)
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
             patch(
-                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
             ),
             patch(
-                "helion.runtime._get_compiled_cute_launcher",
+                "helion.runtime.cute.launcher._cute_current_stream",
+                side_effect=lambda: next(streams),
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
-            patch("helion.runtime._record_cute_owned_launch_tensors") as record_owned,
+            patch(
+                "helion.runtime.cute.launcher._record_cute_owned_launch_tensors"
+            ) as record_owned,
         ):
             first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
             second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
@@ -7071,7 +7092,7 @@ class TestCuteBackend(TestCase):
 
         with (
             patch(
-                "helion.runtime._cuda_stream_capture_context",
+                "helion.runtime.cute.launcher._cuda_stream_capture_context",
                 side_effect=BackendUnsupported("cute", "capture query failed"),
             ),
             self.assertRaisesRegex(BackendUnsupported, "capture query failed"),
@@ -7200,19 +7221,23 @@ class TestCuteBackend(TestCase):
 
         with (
             patch(
-                "helion.runtime._cute_dynamic_tensormap_contexts",
+                "helion.runtime.cute.launcher._cute_dynamic_tensormap_contexts",
                 side_effect=fake_contexts,
             ),
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
             patch(
-                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
             ),
             patch(
-                "helion.runtime._get_compiled_cute_launcher",
+                "helion.runtime.cute.launcher._cute_current_stream",
+                side_effect=lambda: next(streams),
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
             patch(
-                "helion.runtime._cute_last_launch_cache_entry",
+                "helion.runtime.cute.launcher._cute_last_launch_cache_entry",
                 wraps=generic_matcher,
             ) as generic_match,
         ):
@@ -7301,9 +7326,12 @@ class TestCuteBackend(TestCase):
         capture_stream = torch.cuda.Stream(device=DEVICE)
         with (
             patch(
-                "helion.runtime._get_cute_launcher_imports", side_effect=fake_imports
+                "helion.runtime.cute.launcher._get_cute_launcher_imports",
+                side_effect=fake_imports,
             ),
-            patch("helion.runtime._torch_dtype_to_cutlass", side_effect=str),
+            patch(
+                "helion.runtime.cute.launcher._torch_dtype_to_cutlass", side_effect=str
+            ),
         ):
             with runtime_mod.cute_cuda_graph(stream=capture_stream) as graph:
                 runtime_mod._build_cached_cute_schema_and_args(
@@ -7516,7 +7544,7 @@ class TestCuteBackend(TestCase):
         )
         with (
             patch(
-                "helion.runtime._cuda_stream_capture_context",
+                "helion.runtime.cute.launcher._cuda_stream_capture_context",
                 return_value=(123, 456),
             ),
             self.assertRaisesRegex(BackendUnsupported, "inference tensor.*capture"),
@@ -7562,10 +7590,12 @@ class TestCuteBackend(TestCase):
 
         with (
             patch(
-                "helion.runtime._get_cute_launcher_imports", side_effect=fake_imports
+                "helion.runtime.cute.launcher._get_cute_launcher_imports",
+                side_effect=fake_imports,
             ),
             patch(
-                "helion.runtime._cute_kernel_param_is_constexpr", return_value=(False,)
+                "helion.runtime.cute.launcher._cute_kernel_param_is_constexpr",
+                return_value=(False,),
             ),
         ):
             launch = helion_runtime._build_cute_schema_and_args(
@@ -7598,10 +7628,16 @@ class TestCuteBackend(TestCase):
             return _launch_entry((("scalar", "float"),), (f"float-{len(build_calls)}",))
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
-                "helion.runtime._get_compiled_cute_launcher",
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
+            ),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
         ):
@@ -7635,10 +7671,16 @@ class TestCuteBackend(TestCase):
             )
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
-                "helion.runtime._get_compiled_cute_launcher",
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
+            ),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
         ):
@@ -7670,12 +7712,20 @@ class TestCuteBackend(TestCase):
 
         with (
             patch(
-                "helion.runtime._build_cute_schema_and_args",
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
                 return_value=_launch_entry((("scalar", "int"),), ("launch-arg",)),
             ),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
-            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
-            patch("helion.runtime._ensure_cute_dsl_arch_env") as ensure_arch,
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._create_cute_wrapper",
+                return_value="jit-wrapper",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._ensure_cute_dsl_arch_env"
+            ) as ensure_arch,
             patch("cutlass.cute.compile", return_value=FakeCompiled()),
         ):
             first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
@@ -7708,10 +7758,14 @@ class TestCuteBackend(TestCase):
 
         with (
             patch(
-                "helion.runtime._create_cute_wrapper", side_effect=fake_create_wrapper
+                "helion.runtime.cute.launcher._create_cute_wrapper",
+                side_effect=fake_create_wrapper,
             ),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
-            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch("helion.runtime.cute.launcher._ensure_cute_dsl_arch_env"),
             patch("cutlass.cute.compile", return_value=FakeCompiled()),
         ):
             positive = default_cute_launcher(cute_kernel, (1,), 0.0)
@@ -7751,10 +7805,16 @@ class TestCuteBackend(TestCase):
             )
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
-                "helion.runtime._get_compiled_cute_launcher",
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
+            ),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
         ):
@@ -7805,9 +7865,18 @@ class TestCuteBackend(TestCase):
             return FakeCompiled(len(compiled_calls))
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
-            patch("helion.runtime._get_compiled_cute_launcher", side_effect=fake_get),
+            patch(
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
+            ),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
+                side_effect=fake_get,
+            ),
         ):
             first = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
             second = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
@@ -7894,9 +7963,18 @@ class TestCuteBackend(TestCase):
             return FakeCompiled()
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
-            patch("helion.runtime._get_compiled_cute_launcher", side_effect=fake_get),
+            patch(
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
+            ),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
+                side_effect=fake_get,
+            ),
         ):
             first = default_cute_launcher(cute_kernel, (1,), tensor)
             second = default_cute_launcher(cute_kernel, (1,), tensor)
@@ -7951,10 +8029,16 @@ class TestCuteBackend(TestCase):
             )
 
         with (
-            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
-            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
-                "helion.runtime._get_compiled_cute_launcher",
+                "helion.runtime.cute.launcher._build_cute_schema_and_args",
+                side_effect=fake_build,
+            ),
+            patch(
+                "helion.runtime.cute.launcher._cute_current_stream",
+                return_value="stream",
+            ),
+            patch(
+                "helion.runtime.cute.launcher._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
             ),
         ):
