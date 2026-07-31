@@ -1128,9 +1128,7 @@ class TestWorklistConfig(unittest.TestCase):
         bound = kernel.bind(args)
         for grouping in (1, 2):
             with self.subTest(grouping=grouping):
-                code = bound.to_triton_code(
-                    _worklist_config([16, 16], grouping=grouping)
-                )
+                code = bound.to_code(_worklist_config([16, 16], grouping=grouping))
                 self.assertNotIn("_compact_build_worklist=", code)
                 self.assertNotIn("def _build_worklist(", code)
 
