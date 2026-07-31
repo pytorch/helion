@@ -591,6 +591,28 @@ def cute_matmul_mma_fp8_rowwise_colwise_scale(
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_fp8_swapped(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Transpose the GEMM and output so a four-CTA cluster spans N."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    out_t = out.T
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                y[tile_k, tile_n].T,
+                x[tile_m, tile_k].T,
+                acc=acc,
+            )
+        out_t[tile_n, tile_m] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def cute_matmul_mma_epilogue_f32_bias(
     x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
@@ -6256,6 +6278,35 @@ class TestCuteBackend(TestCase):
         # Verify deep staging is used
         self.assertIn("cutlass.Float8E4M3FN", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_mma_tcgen05_fp8_swapped_cluster_m4(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        m, k, n = 64, 256, 512
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = y.T.contiguous().T
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_swapped,
+            (x, y),
+            block_sizes=[128, 64, 256],
+            tcgen05_cluster_m=4,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_persistence_model="static_persistent",
+            pid_type="persistent_interleaved",
+        )
+
+        torch.testing.assert_close(
+            out.float(), x.float() @ y.float(), atol=2.0, rtol=5e-2
+        )
+        self.assertIn("_helion_cute_cluster_shape = (4, 1, 1)", code)
+        self.assertIn("cutlass.utils.layout.LayoutEnum.COL_MAJOR", code)
+        self.assertIn("'d_column_major': True", code)
 
     def test_matmul_mma_tcgen05_one_shot_rejects_cluster_cap(self) -> None:
         support = get_cute_mma_support()

@@ -212,6 +212,9 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     assert "TensorMapManager" in code
     assert "update_tensormap" in code
     assert "cute.nvgpu.tcgen05.CtaGroup.TWO" in code
+    assert "cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K" in code
+    assert "make_smem_layout_b(tiled_mma, (256, 224, 64), " in code
+    assert "cutlass.BFloat16, 7, is_k_major=True)" in code
     assert "(256, 224)" in code
     assert "cute.local_tile(tma_tensor_a, (256, 64)" in code
     assert "cute.local_tile(tma_tensor_b, (224, 64)" in code
@@ -234,6 +237,10 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
         "dynamic_ab_tensormaps": True,
         "dynamic_d_tensormap": True,
     }
+    ab_plan = next(
+        plan for plan in _wrapper_plans(code) if plan["kind"] == "tcgen05_ab_tma"
+    )
+    assert ab_plan["b_k_major"] is True
 
 
 @pytest.mark.parametrize(

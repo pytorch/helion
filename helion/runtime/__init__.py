@@ -313,13 +313,14 @@ def _append_cute_wrapper_plan(
         tensor_name: str | None = None,
         rank3_mnl_tensor: bool = False,
         orientation: str = "mn",
+        column_major: bool = False,
     ) -> None:
         assert len(kernel_args) == 2
         assert orientation in ("mn", "nm")
         worklist_nm_store = orientation == "nm"
         d_store_layout = (
             "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
-            if worklist_nm_store
+            if worklist_nm_store or column_major
             else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
         )
         tensor_expr = tensor_name if tensor_name is not None else f"arg{tensor_idx}"
@@ -697,6 +698,7 @@ def _append_cute_wrapper_plan(
             tensor_name=d_tensor_name,
             rank3_mnl_tensor=bool(plan.get("rank3_mnl_tensor")),
             orientation=_tcgen05_plan_orientation(plan),
+            column_major=bool(plan.get("d_column_major")),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -790,6 +792,10 @@ def _append_cute_wrapper_plan(
             "TensorMaps are unsupported",
         )
     dynamic_ab_tensormap_rank2 = _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
+    lhs_trailing_transpose = bool(plan.get("lhs_trailing_transpose"))
+    rhs_trailing_transpose = bool(plan.get("rhs_trailing_transpose"))
+    assert not (lhs_leading_passthrough and lhs_trailing_transpose)
+    assert not (rhs_leading_passthrough and rhs_trailing_transpose)
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -825,7 +831,12 @@ def _append_cute_wrapper_plan(
     lhs_tma = f"{tma_atom_a}_lhs_tma"
     lhs_tma_arg = (
         lhs_tma
-        if dynamic_ab_tensormaps or swapped_nm or lhs_leading_passthrough
+        if (
+            dynamic_ab_tensormaps
+            or swapped_nm
+            or lhs_leading_passthrough
+            or lhs_trailing_transpose
+        )
         else f"arg{lhs_idx}"
     )
     rhs_tma = f"{tma_atom_b}_rhs_tma"
@@ -947,12 +958,18 @@ def _append_cute_wrapper_plan(
     )
     if lhs_leading_passthrough:
         append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 2, 0))
+    elif lhs_trailing_transpose:
+        append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 0))
     if rhs_leading_passthrough:
         append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (2, 1, 0))
-    lhs_tma_setup_lines = () if lhs_leading_passthrough else lhs_tma_setup
+    elif rhs_trailing_transpose:
+        append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (0, 1))
+    lhs_tma_setup_lines = (
+        () if lhs_leading_passthrough or lhs_trailing_transpose else lhs_tma_setup
+    )
     rhs_tma_setup_lines = (
         (f"    {rhs_tma}.mark_layout_dynamic(leading_dim={1 if b_k_major else 0})",)
-        if rhs_leading_passthrough
+        if rhs_leading_passthrough or rhs_trailing_transpose
         else rhs_tma_setup
     )
     body.extend(

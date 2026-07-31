@@ -1028,7 +1028,7 @@ class CuteTcgen05Config:
     ) -> bool:
         if constraints is None:
             return False
-        if cluster_m not in (1, 2):
+        if cluster_m not in (1, 2, 4):
             return False
         if bm <= 0 or bn <= 0 or bk <= 0:
             return False
@@ -1038,7 +1038,7 @@ class CuteTcgen05Config:
             bk=bk,
             dtype_bytes=constraints.dtype_bytes,
             ab_stages=ab_stages,
-            cluster_m=cluster_m,
+            cluster_m=min(cluster_m, 2),
         )
         return bytes_per_cta <= constraints.per_cta_smem_budget_bytes
 
@@ -1069,7 +1069,7 @@ class CuteTcgen05Config:
         constraints = self.ab_stages_three_search_constraints
         if constraints is None:
             return False
-        if cluster_m not in (1, 2):
+        if cluster_m not in (1, 2, 4):
             return False
         if bm <= 0 or bn <= 0 or bk <= 0:
             return False
@@ -1081,7 +1081,7 @@ class CuteTcgen05Config:
             bk=bk,
             dtype_bytes=constraints.dtype_bytes,
             ab_stages=ab_stages,
-            cluster_m=cluster_m,
+            cluster_m=min(cluster_m, 2),
         )
         # The epilogue processes the full per-CTA output tile (bm, bn); unlike
         # the AB operands it is NOT split across the cluster, so the C-ring
@@ -1346,7 +1346,7 @@ class CuteTcgen05Config:
         constraints = self.ab_stages_three_search_constraints
         if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
             return 0
-        if cluster_m not in (1, 2):
+        if cluster_m not in (1, 2, 4):
             return 0
 
         # Calculate SMEM cost for ab_stages=1 (baseline)
@@ -1356,7 +1356,7 @@ class CuteTcgen05Config:
             bk=bk,
             dtype_bytes=constraints.dtype_bytes,
             ab_stages=1,
-            cluster_m=cluster_m,
+            cluster_m=min(cluster_m, 2),
         )
 
         # Edge cases: invalid calculation or even ab_stages=1 doesn't fit
@@ -2144,7 +2144,7 @@ class CuteTcgen05Config:
         if for_search and self.cluster_m_search_choices is not None:
             cluster_m_choices = self.cluster_m_search_choices
         else:
-            cluster_m_choices = (1, 2)
+            cluster_m_choices = (1, 2, 4)
         cluster_n_choices: tuple[int, ...] = (1,) if for_search else (1, 2)
         if for_search and self.num_epi_warps_search_choices is not None:
             num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(

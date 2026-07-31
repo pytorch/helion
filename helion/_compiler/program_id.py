@@ -1315,7 +1315,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # CtaGroup.TWO uses two CTAs to produce one logical M tile. Model
             # scheduler M as CTA slots, then collapse back to logical M when
             # binding virtual_pid for PID decomposition.
-            dims[0] = f"({dims[0]}) * {self._tcgen05_cluster_m()}"
+            dims[0] = f"({dims[0]}) * 2"
         # cluster_n>1 leaves the scheduler N dim equal to the logical N
         # tile count; the cluster_shape ``(cluster_m, cluster_n, 1)``
         # passed to ``PersistentTileSchedulerParams`` allocates one
@@ -1408,7 +1408,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
         if self._tcgen05_is_two_cta():
-            return f"({coord}) // cutlass.Int32({self._tcgen05_cluster_m()})"
+            return f"({coord}) // cutlass.Int32(2)"
         if self._tcgen05_uses_cluster_m2_one_cta_role_local_bridge():
             # The shared clustered scheduler publishes ``base_m + peer_rank``
             # into each CTA's SMEM slot. The guarded role-local bridge omits
@@ -2116,7 +2116,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
         use_validated_two_cta_role_local_body = (
             full_role_local_body
-            and layout.cluster_m == 2
+            and layout.cluster_m in (2, 4)
             and self._tcgen05_has_validated_role_local_two_cta_runtime()
             and not is_multi_root
         )
