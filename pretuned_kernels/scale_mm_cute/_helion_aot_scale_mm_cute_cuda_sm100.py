@@ -107,17 +107,26 @@ _CONFIGS_scale_mm_cute = [
     # (M, K, N) = (4096, 4096, 4096)
     {'block_sizes': [256, 256, 128], 'l2_groupings': [4], 'indexing': ['pointer', 'pointer', 'pointer', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 8, 'tcgen05_strategy': 'role_local_monolithic', 'tcgen05_layout_strategy': 'default', 'tcgen05_warp_spec_mma_warps': 1, 'tcgen05_warp_spec_ab_load_warps': 1, 'tcgen05_warp_spec_epi_load_warps': 0, 'tcgen05_warp_spec_scheduler_warps': 0, 'tcgen05_warp_spec_c_input_warps': 0, 'tcgen05_warp_spec_store_warps': 0, 'tcgen05_warp_spec_register_decrease': 120, 'tcgen05_warp_spec_register_increase': 256, 'cute_vector_widths': [1, 1, 1], 'tcgen05_persistence_model': 'static_persistent', 'tcgen05_layout_overrides_epi_tile_m': None, 'tcgen05_layout_overrides_epi_tile_n': None, 'tcgen05_layout_overrides_smem_swizzle_a': None, 'tcgen05_layout_overrides_smem_swizzle_b': None, 'tcgen05_layout_overrides_d_store_box_n': None},
     # (M, K, N) = (512, 2048, 4096)
-    # Re-tuned to the fp8 small-grid 2-CTA cluster (bm=128, cluster_m=2, per-CTA
-    # 64xbn) with a deep ab=12 prefetch. cluster_m=2 doubles the CTA count to 256
-    # (fills the 148-SM B200; the old cluster_m=1 bm=128 tile ran at 0.86 waves)
-    # and multicasts A across the CTA pair, halving its cold DRAM read. Cold-L2
-    # cudagraph vs best baseline (cutlass): 0.73x -> 0.80x on B200.
-    {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'num_warps': 8, 'num_stages': 4, 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 12, 'tcgen05_num_epi_warps': 4, 'tcgen05_persistence_model': 'static_persistent'},
+    # Re-tuned to a 1-CTA bm=128 bn=128 persistent tile with a moderate ab=5
+    # prefetch. ncu on the old cluster_m=2 bm=128 ab=12 config (0.82x) showed the
+    # gap to cutlass was pure instruction count (1823 vs 1149 instr/warp, +59%) at
+    # matched stall ratios and DRAM bytes -- overhead-bound, not latency-bound. The
+    # cluster_m=2 grid is 148 tiles (1.00 wave) with 2-CTA sync overhead; the 1-CTA
+    # bm=128 bn=128 grid is 128 tiles (0.86 waves, matching cutlass's geometry) and
+    # drops the cluster sync. ab=5 is the SMEM sweet spot here (ab=6 measured slower,
+    # ab>=8 exceeds the fp8 per-CTA AB budget); l2_groupings=[8] adds ~1% (M-major
+    # pid grouping improves B reuse across the 4 M-tiles sharing a column band).
+    # Cold-L2 cudagraph vs cutlass: the old cluster_m=2 0.73x -> 0.80x retune, now
+    # 0.82x -> 0.87x on B200 (with the rolled TMA producer codegen).
+    {'block_sizes': [128, 128, 128], 'l2_groupings': [8], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 5, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (512, 2048, 2048)
-    # Same fp8 small-grid 2-CTA cluster as (512, 2048, 4096): device-filling
-    # cluster_m=2 + A-multicast + deep ab=12 beats the old cluster_m=1 bn=64 tile.
-    # Cold-L2 cudagraph vs best baseline (torch): 0.86x -> 0.91x on B200.
-    {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'num_warps': 8, 'num_stages': 4, 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 12, 'tcgen05_num_epi_warps': 4, 'tcgen05_persistence_model': 'static_persistent'},
+    # Retuned to a 1-CTA bm=128 bn=64 acc=1 persistent tile after the epilogue
+    # scale-load pre-wait hoist: grid = 4 M-tiles x 32 N-tiles = 128 (0.86 waves,
+    # cutlass's geometry) and drops the 2-CTA cluster sync. ab=8 is the SMEM cap
+    # at this tile. Cold-L2 cudagraph vs best baseline (torch): the old
+    # cluster_m=2 config measured 0.90x this session; this one 7.81 -> 7.08us,
+    # 0.99x vs torch (and beats cutlass 7.45us outright).
+    {'block_sizes': [128, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 8, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # M=64 decode / small-batch shapes (vLLM Qwen3 FP8 (K, N) weight sweep). With
     # M=64 there is only one M-tile, so the N-tile count == the grid; the cluster_m=2
     # 512-M configs (bm>=128) waste most of the tile (nearest-neighbor fallback
@@ -136,13 +145,21 @@ _CONFIGS_scale_mm_cute = [
     # bn=64/bk=128/ab=12 for large-K or very-wide-N (deepest prefetch that fits SMEM).
     # (M, K, N) = (64, 2048, 4096) -- persistent bn=32 bk=256; 0.97x vs cutlass.
     {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
-    # (M, K, N) = (64, 2048, 2048) -- non-persistent bn=16 bk=256 still wins here; 0.97x.
-    {'block_sizes': [64, 16, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
-    # (M, K, N) = (64, 2048, 12288) -- persistent bn=32 bk=256; 0.92x vs cutlass (was 0.82).
+    # (M, K, N) = (64, 2048, 2048) -- persistent bn=32 bk=256; 1.05x vs cutlass.
+    # Retuned after the epilogue scale-load pre-wait register hoist landed: the
+    # hoist cheapened the persistent path's epilogue enough that the standard
+    # persistent bn=32 config (same family as the other M=64 shapes) now beats
+    # the old flat bn=16 config 5.96us -> 5.54us (0.97x -> 1.05x, 3-run stable).
     {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
+    # (M, K, N) = (64, 2048, 12288) -- persistent bn=32 bk=256 l2sw=2; 0.98x vs cutlass.
+    {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 2, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (64, 6144, 2048) -- persistent bn=32 bk=256; 1.00x vs cutlass (was 0.96).
     {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
-    # (M, K, N) = (64, 4096, 6144) -- persistent bn=64 bk=128 ab=12; 0.86x vs cutlass (was 0.81).
+    # (M, K, N) = (64, 4096, 6144) -- persistent bn=64 bk=128 ab=12; 0.96x vs cutlass
+    # (was 0.86) after the epilogue scale-load pre-wait register hoist landed in
+    # codegen (memory_ops.py): both the rowvec scale_b and colvec scale_a whole-tile
+    # fragments now load into registers BEFORE the accumulator consumer_wait, hiding
+    # their GMEM latency under the MMA wait instead of paying it per subtile.
     {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 12, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (64, 4096, 4096) -- persistent bn=32 bk=256; 0.94x vs cutlass (was 0.91).
     {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
@@ -152,7 +169,8 @@ _CONFIGS_scale_mm_cute = [
     {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (64, 5120, 10240) -- persistent bn=128 bk=128 ab=8; 0.92x vs cutlass (was 0.91).
     {'block_sizes': [64, 128, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
-    # (M, K, N) = (64, 5120, 5120) -- persistent bn=64 bk=128 ab=12; 0.86x vs cutlass (was 0.80).
+    # (M, K, N) = (64, 5120, 5120) -- persistent bn=64 bk=128 ab=12; 0.94x vs cutlass
+    # (was 0.86) via the same epilogue scale-load pre-wait hoist as (64, 4096, 6144).
     {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 12, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (64, 5120, 51200) -- persistent bn=64 bk=128 ab=12; 0.97x vs cutlass (was 0.85).
     {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 12, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
