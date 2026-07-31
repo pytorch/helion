@@ -408,6 +408,29 @@ def _bounded_by_block(value: torch.SymInt, block_id: int) -> bool:
     return _detect_outer_block_bound(value, env) == block_id
 
 
+def _tile_run(index: torch.fx.Node) -> int | None:
+    """Return the block id of a whole, unshifted tile run, else None.
+
+    ``tile.index`` may reach the subscript as an arithmetic node -- ``tile.index
+    + 0`` traces to an ``add`` -- so the run is recognized from the
+    ``tile_with_offset`` provenance the device IR already records rather than
+    from the node's target.  A *shifted* run is refused: the loop's mask marks
+    which of ``offset + arange(width)`` are live, which is not the right mask
+    for rows read at ``offset + shift + arange(width)``.
+    """
+    from ..indexing_strategy import subscript_tile_info
+
+    env = CompileEnvironment.current()
+    info = subscript_tile_info(env, index)
+    if info is not None:
+        return info.block_id if env.known_equal(info.offset, 0) else None
+    # ``subscript_tile_info`` resolves a block id from an index's value, which
+    # a bare ``tile_index`` node does not carry -- its value is the run itself.
+    if index.target is tile_index and index.args:
+        return env.resolve_block_id(_node_value(index.args[0]))
+    return None
+
+
 def _tile_driven_selector(
     index: torch.fx.Node,
     graph_info: GraphInfo,
@@ -432,13 +455,11 @@ def _tile_driven_selector(
         if origin is None or not isinstance(origin.origin, TileBeginOrigin):
             return None
         inner_block_id = origin.origin.block_id
-    elif index.target is tile_index and index.args:
-        resolved = env.resolve_block_id(_node_value(index.args[0]))
-        if resolved is None:
-            return None
-        inner_block_id = resolved
     else:
-        return None
+        run = _tile_run(index)
+        if run is None:
+            return None
+        inner_block_id = run
 
     bounds = _loop_bounds(graph_info, parent, inner_block_id)
     if bounds is None:
@@ -656,10 +677,10 @@ def _mask_expr(
 def _dynamic_begin_expr(state: CodegenState, selector: _Selector) -> str:
     """Clamped start of a data-dependent run, matching ``lax.dynamic_slice``."""
     assert state.fx_node is not None
-    indices = state.fx_node.args[1]
-    assert isinstance(indices, (list, tuple))
-    iota = indices[selector.dim]
-    assert isinstance(iota, torch.fx.Node)
+    # Read the resolved definition: an index that crossed a scope boundary
+    # arrives as a rename or a placeholder, which carries no ``start``.
+    iota = _index_source(state.fx_node)
+    assert iota is not None and iota.target is torch.ops.prims.iota.default
     start = state.device_function.literal_expr(_node_value(iota.kwargs.get("start")))
     return f"jnp.clip({start}, 0, {selector.block_extent - selector.width})"
 
@@ -698,7 +719,7 @@ def _contiguous_narrowing(
     ``tile.begin`` selects a single row and drops the dimension; ``tile.index``
     selects a whole inner block and keeps it, masked at the tail; an ``iota``
     selects a constant-width run at a data-dependent start.  Returns None for
-    an index this cannot prove contiguous, which the caller gathers instead.
+    an index this cannot prove contiguous.
     """
     assert state.fx_node is not None
     ast_args = state.ast_args[1]
@@ -714,15 +735,10 @@ def _contiguous_narrowing(
     source = _index_source(state.fx_node)
     if source is None:
         return None
-    env = CompileEnvironment.current()
-    if source.target is tile_index and source.args:
-        block_id = env.resolve_block_id(_node_value(source.args[0]))
-        width = (
-            state.device_function.resolved_block_size(block_id)
-            if block_id is not None
-            else None
-        )
-        if block_id is not None and isinstance(width, int):
+    block_id = _tile_run(source)
+    if block_id is not None:
+        width = state.device_function.resolved_block_size(block_id)
+        if isinstance(width, int):
             return (
                 expr_from_string(state.codegen.offset_var(block_id)),
                 width,
@@ -795,29 +811,22 @@ def _codegen_value_subscript(state: CodegenState) -> ast.AST:
         position = dynamic[0]
         run = _contiguous_narrowing(state, position)
         if run is None:
-            # An index this cannot prove contiguous -- an offset tile run, or
-            # any other computed row vector -- is an ordinary gather.
-            index_ast = state.ast_args[1]
-            assert isinstance(index_ast, (list, tuple))
-            rows = index_ast[position]
-            assert isinstance(rows, ast.AST)
-            base = expr_from_string(
-                f"jnp.take({{base}}, {{rows}}, axis={axis_of[position]})",
-                base=base,
-                rows=rows,
-            )
-        else:
-            offset, width, squeeze, block_id = run
-            base = expr_from_string(
-                f"jax.lax.dynamic_slice_in_dim({{base}}, {{offset}}, {width}, "
-                f"{axis_of[position]})",
-                base=base,
-                offset=offset,
-            )
-            if squeeze:
-                squeeze_position = position
-            elif block_id >= 0:
-                mask = (block_id, axis_of[position])
+            # A shifted tile run or any other computed row vector is a genuine
+            # gather.  Lowering one needs the backend's indirect-load machinery
+            # and its own bounds and mask semantics, so it is refused rather
+            # than approximated.
+            raise exc.InvalidIndexingType(repr(index[position]))
+        offset, width, squeeze, block_id = run
+        base = expr_from_string(
+            f"jax.lax.dynamic_slice_in_dim({{base}}, {{offset}}, {width}, "
+            f"{axis_of[position]})",
+            base=base,
+            offset=offset,
+        )
+        if squeeze:
+            squeeze_position = position
+        elif block_id >= 0:
+            mask = (block_id, axis_of[position])
 
     keys: list[str] = []
     for position, value in enumerate(index):

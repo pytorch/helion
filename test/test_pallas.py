@@ -1664,26 +1664,109 @@ class TestPallas(TestCase):
         self.assertNotIn("jnp.take", code)
         torch.testing.assert_close(out[0], x.sum(dim=0), rtol=1e-4, atol=1e-4)
 
-    def test_subview_computed_index_gathers(self) -> None:
-        """A computed row vector is an ordinary gather, not a contiguous run."""
+    def test_subview_offset_tile_run_keeps_its_mask(self) -> None:
+        """A tile run that arrives as arithmetic is still a masked tile run.
+
+        ``tile.index + 0`` traces to an ``add``, so the run has to be
+        recognized from its ``tile_with_offset`` provenance; treating it as an
+        arbitrary gather would drop the tail mask and read padding rows.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def offset_index(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(3, block_size=3):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=2):
+                        acc = acc + x_block[local.index + 0, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(offset_index, (x, out), pallas_loop_type="fori_loop")
+        self.assertNotIn("jnp.take", code)
+        # Three live rows over a loop tiled by two: the tail row must be masked.
+        torch.testing.assert_close(out, torch.full_like(out, 3.0))
+
+    def test_subview_rejects_arbitrary_gather(self) -> None:
+        """A shifted tile run is refused rather than approximated.
+
+        The loop mask marks which of ``offset + arange(width)`` are live, which
+        is the wrong mask for rows read at ``offset + shift + arange(width)``.
+        """
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def shifted_index(x: torch.Tensor, out: torch.Tensor) -> None:
-            tokens, _heads, _width = x.size()
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)
-                for outer in hl.tile(tokens, block_size=4):
+                for outer in hl.tile(x.size(0), block_size=4):
                     x_block = x[outer, :, :]
                     for local in hl.tile(2, block_size=2):
                         acc = acc + x_block[local.index + 1, :, :].float().sum(dim=0)
                 out[0, :, :] = acc.to(out.dtype)
 
-        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
         out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        expected = x[1:3].sum(dim=0) + x[5:7].sum(dim=0)
-        code, _ = code_and_output(shifted_index, (x, out), pallas_loop_type="fori_loop")
-        self.assertIn("jnp.take", code)
-        torch.testing.assert_close(out[0], expected, rtol=1e-4, atol=1e-4)
+        with self.assertRaises(helion.exc.InvalidIndexingType):
+            code_and_output(shifted_index, (x, out), pallas_loop_type="fori_loop")
+
+    def test_subview_rejects_negative_bounds(self) -> None:
+        """A negative index or slice bound is refused at trace time.
+
+        Codegen clips a negative bound against the dimension while the traced
+        shape cannot see that dimension's size, so the two would disagree.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def negative_slice(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    acc = acc + x_block[-3:2, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(helion.exc.InvalidIndexingType):
+            code_and_output(negative_slice, (x, out), pallas_loop_type="fori_loop")
+
+    def test_subview_fold_captured_dynamic_run(self) -> None:
+        """A dynamic run bound to a name before a branch still folds correctly.
+
+        The clamp has to read the ``iota``'s start through the resolved index,
+        not through the placeholder the branch captured.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def captured_run(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    rows = hl.arange(live - 3, live)
+                    if live >= 3:
+                        acc = acc + x_block[rows, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        expected = torch.full((1, 2, 128), 6.0, device=DEVICE, dtype=torch.float32)
+        results = {}
+        for folded in (True, False):
+            out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+            code, _ = code_and_output(
+                captured_run,
+                (x, out),
+                pallas_loop_type="fori_loop",
+                pallas_resident_subviews=folded,
+            )
+            self.assertEqual("jnp.clip(" in code, folded)
+            results[folded] = out
+        torch.testing.assert_close(results[True], expected)
+        torch.testing.assert_close(results[False], expected)
 
     def test_tile_count_inside_fori_loop(self) -> None:
         """``tile.count`` has to honour a non-zero loop begin.
