@@ -599,6 +599,17 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def test_tcgen05_store_value_lifecycle_tracks_simt_fanout(self) -> None:
+        from helion._compiler.cute.device_state import CuteTcgen05StoreValue
+
+        state = CuteDeviceFunctionState()
+        first = cast("CuteTcgen05StoreValue", object())
+        second = cast("CuteTcgen05StoreValue", object())
+
+        self.assertFalse(state.tcgen05_store_value_already_emitted(first))
+        self.assertTrue(state.tcgen05_store_value_already_emitted(first))
+        self.assertFalse(state.tcgen05_store_value_already_emitted(second))
+
     def test_tcgen05_c_stages_three_config_validation(self) -> None:
         """C-stage 3 is explicit-only and restricted to measured tile shapes."""
 
@@ -1143,6 +1154,7 @@ class TestCuteLowerings(unittest.TestCase):
             code,
         )
         self.assertIn("partition_C(tcgen05_gC)", code)
+        self.assertNotIn("cute.copy(tcgen05_simt_atom", code)
         self.assertNotIn("for _tcgen05_store_i in range(", code)
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
