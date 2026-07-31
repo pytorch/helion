@@ -683,42 +683,23 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         import re
 
         # Look for _launcher(_kernel_name, (grid_size), ...) pattern
-        # Use a pattern that handles nested parentheses in grid expressions
         grid_pattern = r"_launcher\([^,]+,\s*\((.+?)\)\s*,"
         flat_grid_match = re.search(grid_pattern, code_flat)
-        persistent_blocked_grid_match = re.search(grid_pattern, code_persistent_blocked)
-        persistent_interleaved_grid_match = re.search(
-            grid_pattern, code_persistent_interleaved
-        )
 
         self.assertIsNotNone(flat_grid_match, "Could not find grid size in flat code")
-        self.assertIsNotNone(
-            persistent_blocked_grid_match,
-            "Could not find grid size in persistent blocked code",
-        )
-        self.assertIsNotNone(
-            persistent_interleaved_grid_match,
-            "Could not find grid size in persistent interleaved code",
-        )
 
         flat_grid = flat_grid_match.group(1).rstrip(",")  # Remove trailing comma
-        persistent_blocked_grid = persistent_blocked_grid_match.group(1).rstrip(",")
-        persistent_interleaved_grid = persistent_interleaved_grid_match.group(1).rstrip(
-            ","
-        )
 
         # Flat should use the full grid size calculation (ceiling division)
         self.assertIn("//", flat_grid)
 
-        # Persistent kernels should use NUM_SMS
-        self.assertEqual(
-            persistent_blocked_grid,
-            "_NUM_SM",
+        # Persistent kernels cap the SM-derived grid at the logical PID count.
+        self.assertIn("_launcher(_helion_test_kernel, (min(", code_persistent_blocked)
+        self.assertIn("_NUM_SM", code_persistent_blocked)
+        self.assertIn(
+            "_launcher(_helion_test_kernel, (min(", code_persistent_interleaved
         )
-        self.assertEqual(
-            persistent_interleaved_grid,
-            "_NUM_SM",
-        )
+        self.assertIn("_NUM_SM", code_persistent_interleaved)
 
     def test_persistent_loop_variable_names(self):
         """Test that persistent kernels use correct virtual_pid variable names."""
@@ -1204,6 +1185,39 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("total_pids", code)
         self.assertIn("virtual_pid", code)
 
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_mixed_static_and_data_dependent_bounds_use_uncapped_grid(self):
+        """An unknown aggregate PID count must not cap to the static first loop."""
+
+        @helion.kernel(
+            autotune_effort="none",
+            config=helion.Config(pid_type="persistent_interleaved"),
+        )
+        def mixed_bounds_kernel(
+            x: torch.Tensor, num_elements: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            static_result = x.new_zeros(x.size())
+            dynamic_result = x.new_zeros(x.size())
+            for tile in hl.tile(32, block_size=32):
+                static_result[tile] = x[tile] + 1
+            for tile in hl.tile(num_elements, block_size=32):
+                dynamic_result[tile] = x[tile] + 2
+            return static_result, dynamic_result
+
+        x = torch.randn([128], device=DEVICE)
+        num_elements = torch.tensor(64, device=DEVICE)
+        code, (static_result, dynamic_result) = code_and_output(
+            mixed_bounds_kernel, (x, num_elements)
+        )
+
+        expected_static = torch.zeros_like(x)
+        expected_static[:32] = x[:32] + 1
+        expected_dynamic = torch.zeros_like(x)
+        expected_dynamic[:64] = x[:64] + 2
+        torch.testing.assert_close(static_result, expected_static)
+        torch.testing.assert_close(dynamic_result, expected_dynamic)
+        self.assertIn("_launcher(_helion_mixed_bounds_kernel, (_NUM_SM,)", code)
+
 
 @onlyBackends(["triton"])
 class TestNumSmMultiplier(RefEagerTestBase, TestCase):
@@ -1221,21 +1235,24 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         code_m1, result_m1 = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=1
         )
-        self.assertIn("(_NUM_SM,)", code_m1)
+        self.assertIn("min(", code_m1)
+        self.assertIn("_NUM_SM", code_m1)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM)", code_m1)
 
         # Test with multiplier=2
         code_m2, result_m2 = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=2
         )
-        self.assertIn("(_NUM_SM * 2,)", code_m2)
+        self.assertIn("min(", code_m2)
+        self.assertIn("_NUM_SM * 2", code_m2)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM * 2)", code_m2)
 
         # Test with multiplier=4
         code_m4, result_m4 = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=4
         )
-        self.assertIn("(_NUM_SM * 4,)", code_m4)
+        self.assertIn("min(", code_m4)
+        self.assertIn("_NUM_SM * 4", code_m4)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM * 4)", code_m4)
 
         # All should produce the same result
@@ -1256,28 +1273,32 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         code_m1, result_m1 = code_and_output(
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=1
         )
-        self.assertIn("(_NUM_SM,)", code_m1)
+        self.assertIn("min(", code_m1)
+        self.assertIn("_NUM_SM", code_m1)
         self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM", code_m1)
 
         # Test with multiplier=2
         code_m2, result_m2 = code_and_output(
             add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=2
         )
-        self.assertIn("(_NUM_SM * 2,)", code_m2)
+        self.assertIn("min(", code_m2)
+        self.assertIn("_NUM_SM * 2", code_m2)
         self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 2", code_m2)
 
-        # Test with multiplier=8
-        code_m8, result_m8 = code_and_output(
-            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=8
+        # Test with multiplier=16. The host grid is capped at total_pids while
+        # the device loop retains the full persistent stride.
+        code_m16, result_m16 = code_and_output(
+            add_kernel, args, pid_type="persistent_interleaved", num_sm_multiplier=16
         )
-        self.assertIn("(_NUM_SM * 8,)", code_m8)
-        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 8", code_m8)
+        self.assertIn("min(", code_m16)
+        self.assertIn("_NUM_SM * 16", code_m16)
+        self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 16", code_m16)
 
         # All should produce the same result
         expected = args[0] + args[1]
         torch.testing.assert_close(result_m1, expected)
         torch.testing.assert_close(result_m2, expected)
-        torch.testing.assert_close(result_m8, expected)
+        torch.testing.assert_close(result_m16, expected)
 
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_matmul_correctness(self):
