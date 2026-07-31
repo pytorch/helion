@@ -1268,6 +1268,321 @@ class TestPallas(TestCase):
                 pallas_loop_type="fori_loop",
             )
 
+    def test_resident_ref_scalar_subview(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def resident_scalar(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            tokens, _heads, _width = x.size()
+            block_t = hl.register_block_size(2, tokens)
+            out = torch.empty_like(x)
+            for request in hl.grid(1):
+                state = initial[request, :, :].to(torch.float32)
+                for outer in hl.tile(tokens, block_size=block_t):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        token = x_block[local.begin, :, :].to(torch.float32)
+                        token = token * torch.rsqrt(
+                            torch.sum(token * token, dim=-1, keepdim=True) + 1e-6
+                        )
+                        state = state + token
+                        out[outer.begin + local.begin, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(9, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        x_float = x.float()
+        normalized = x_float * torch.rsqrt(
+            torch.sum(x_float * x_float, dim=-1, keepdim=True) + 1e-6
+        )
+        expected = (initial.float() + normalized.cumsum(dim=0)).bfloat16()
+        for loop_type in ("fori_loop", "emit_pipeline"):
+            with self.subTest(loop_type=loop_type):
+                code, actual = code_and_output(
+                    resident_scalar,
+                    (x, initial),
+                    block_sizes=[4],
+                    pallas_loop_type=loop_type,
+                )
+                self.assertRegex(
+                    code,
+                    r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
+                )
+                torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+    def test_resident_ref_short_conv_recurrence(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def short_conv(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            initial: torch.Tensor,
+            starts: torch.Tensor,
+            ends: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            tokens, _heads, _width = x.size()
+            block_t = hl.register_block_size(4, tokens)
+            out = torch.empty_like(x)
+            final = torch.empty_like(initial)
+            for request in hl.grid(1):
+                start = hl.load(starts, [request])
+                end = hl.load(ends, [request])
+                state_0 = initial[request, 0, :, :].float()
+                state_1 = initial[request, 1, :, :].float()
+                state_2 = initial[request, 2, :, :].float()
+                weight_0 = weight[0, :, :].float()
+                weight_1 = weight[1, :, :].float()
+                weight_2 = weight[2, :, :].float()
+                weight_3 = weight[3, :, :].float()
+                for outer in hl.tile(start, end, block_size=block_t):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        token = x_block[local.begin, :, :].float()
+                        acc = state_0 * weight_0 + state_1 * weight_1
+                        acc += state_2 * weight_2 + token * weight_3
+                        out[outer.begin + local.begin, :, :] = acc.to(out.dtype)
+                        state_0 = state_1
+                        state_1 = state_2
+                        state_2 = token
+                final[request, 0, :, :] = state_0.to(final.dtype)
+                final[request, 1, :, :] = state_1.to(final.dtype)
+                final[request, 2, :, :] = state_2.to(final.dtype)
+            return out, final
+
+        x = torch.randn(9, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn(4, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.randn(1, 3, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        starts = torch.tensor([0], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([9], dtype=torch.int32, device=DEVICE)
+        stream = torch.cat((initial[0].float(), x.float()), dim=0)
+        expected = sum(
+            stream[offset : offset + x.size(0)] * weight[offset].float()
+            for offset in range(4)
+        ).bfloat16()
+        code, (actual, final) = code_and_output(
+            short_conv,
+            (x, weight, initial, starts, ends),
+            block_sizes=[4],
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2, 1, 1, 1, 1],
+        )
+        self.assertIn("pltpu.make_async_copy(x.at[pl.ds(", code)
+        self.assertRegex(
+            code,
+            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(final, x[-3:].unsqueeze(0))
+
+    def test_resident_ref_static_unroll(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_unroll(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(initial)
+            state = initial[0, :, :].float()
+            for outer in hl.tile(x.size(0), block_size=4):
+                x_block = x[outer, :, :]
+                for local in hl.tile(4, block_size=1):
+                    state += x_block[local.begin, :, :].float()
+            out[0, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        expected = (initial.float() + x.float().sum(dim=0, keepdim=True)).bfloat16()
+        code, actual = code_and_output(
+            static_unroll,
+            (x, initial),
+            block_sizes=[],
+            pallas_loop_type="unroll",
+        )
+        self.assertRegex(
+            code,
+            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+    def test_resident_ref_fixed_and_guarded_subviews(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def resident_windows(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            tokens, _heads, _width = x.size()
+            block_t = hl.register_block_size(4, tokens)
+            out = torch.empty_like(initial)
+            for request in hl.grid(1):
+                state = initial[request, :, :].to(torch.float32)
+                for outer in hl.tile(tokens, block_size=block_t):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=2):
+                        state = state + x_block[local.index, :, :].float().sum(dim=0)
+                    if live >= 3:
+                        state = state + x_block[live - 3 : live, :, :].float().sum(
+                            dim=0
+                        )
+                out[request, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(9, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        expected = initial.float() + x.float().sum(dim=0, keepdim=True)
+        expected += x[1:4].float().sum(dim=0, keepdim=True)
+        expected += x[5:8].float().sum(dim=0, keepdim=True)
+        code, actual = code_and_output(
+            resident_windows,
+            (x, initial),
+            block_sizes=[4],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertRegex(code, r"\.at\[pl\.ds\(offset_\d+, 2\), :, :\]\[\.\.\.\]")
+        self.assertRegex(code, r"\.at\[pl\.ds\([^,]+, 3\), :, :\]\[\.\.\.\]")
+        self.assertIn(".astype(jnp.bfloat16)[:, None, None]", code)
+        torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
+
+    def test_resident_ref_flatten_worklist_grouping_two(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def grouped_worklist(
+            q: torch.Tensor, k: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(q)
+            for sequence in hl.grid(offsets.size(0) - 1):
+                begin = offsets[sequence]
+                end = offsets[sequence + 1]
+                for tile_q in hl.tile(begin, end):
+                    q_block = q[tile_q, :, :]
+                    live = tile_q.end - tile_q.begin
+                    seed = hl.zeros([1, q.size(1), q.size(2)], dtype=torch.float32)
+                    if live >= 1:
+                        seed = q_block[live - 1 : live, :, :].float()
+                    state = hl.zeros(
+                        [tile_q, q.size(1), q.size(2)], dtype=torch.float32
+                    )
+                    state += seed
+                    for tile_k in hl.tile(begin, end):
+                        state += k[tile_k, :, :].float().sum(dim=0, keepdim=True)
+                    out[tile_q, :, :] = state.to(out.dtype)
+            return out
+
+        q = torch.arange(24 * 2 * 128, device=DEVICE, dtype=torch.float32).reshape(
+            24, 2, 128
+        )
+        offsets = torch.tensor([0, 8, 24], device=DEVICE, dtype=torch.int32)
+        expected = torch.empty_like(q)
+        for begin, end in ((0, 8), (8, 24)):
+            total = q[begin:end].sum(dim=0, keepdim=True)
+            for tile_begin in range(begin, end, 8):
+                expected[tile_begin : tile_begin + 8] = (
+                    total + q[tile_begin + 7 : tile_begin + 8]
+                )
+
+        code, actual = code_and_output(
+            grouped_worklist,
+            (q, q, offsets),
+            block_sizes=[4, 4],
+            pallas_loop_type="fori_loop",
+            pallas_worklist_grouping=2,
+        )
+        self.assertIn("def _compact_group_1", code)
+        self.assertIn("def _compact_group_2", code)
+        self.assertEqual(
+            len(re.findall(r"\.at\[pl\.ds\([^,]+, 1\), :, :\]\[\.\.\.\]", code)),
+            2,
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_resident_ref_does_not_miscompile_cross_dim_read(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def cross_dim_read(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([1, 2, 128], device=x.device, dtype=x.dtype)
+            state = hl.zeros([2, 128], dtype=torch.float32)
+            for outer in hl.tile(x.size(0), block_size=4):
+                x_block = x[outer, :, :, :]
+                state += x_block[:, 0, :, :].float().sum(dim=0)
+            out[0, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.ones(7, 2, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        try:
+            _code, actual = code_and_output(
+                cross_dim_read,
+                (x,),
+                block_sizes=[4],
+                pallas_loop_type="fori_loop",
+            )
+        except helion.exc.InvalidIndexingType:
+            return
+        torch.testing.assert_close(
+            actual,
+            torch.full_like(actual, 7),
+        )
+
+    def test_resident_ref_composed_views(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def composed_views(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            tokens, chunks, heads, width = x.size()
+            assert chunks == 4 and heads == 2 and width == 128
+            block_t = hl.register_block_size(2, tokens)
+            out = torch.empty_like(initial)
+            for request in hl.grid(1):
+                state = initial[request, :, :, :].float()
+                for outer in hl.tile(tokens, block_size=block_t):
+                    x_block = x[outer, :, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        token = x_block[local.begin, :, :, :]
+                        matrix = token.reshape(2, 2, 2, 128)
+                        state += matrix[0:1, :, :, :].float().sum(dim=0)
+                out[request, :, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(9, 4, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.zeros(1, 2, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        expected = x.float().reshape(9, 2, 2, 2, 128)[:, 0].sum(0, keepdim=True)
+        code, actual = code_and_output(
+            composed_views,
+            (x, initial),
+            block_sizes=[4],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertRegex(
+            code,
+            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :, :\]",
+        )
+        self.assertIn(".reshape((2, 2, 2, 128))", code)
+        self.assertIn(".at[pl.ds(0, 1), :, :, :][...]", code)
+        torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
+
+    def test_resident_ref_reshape_fallback(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def reshape_fallback(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            tokens, _channels, _width = x.size()
+            block_t = hl.register_block_size(2, tokens)
+            out = torch.empty_like(initial)
+            for request in hl.grid(1):
+                state = initial[request, :, :].float()
+                for outer in hl.tile(tokens, block_size=block_t):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        token = x_block[local.begin, :, :]
+                        state += token.reshape(2, 2, 64).float().sum(dim=0)
+                out[request, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(9, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.zeros(1, 2, 64, device=DEVICE, dtype=torch.bfloat16)
+        expected = x.float().reshape(9, 2, 2, 64).sum((0, 1)).unsqueeze(0)
+        code, actual = code_and_output(
+            reshape_fallback,
+            (x, initial),
+            block_sizes=[4],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertRegex(
+            code,
+            r"\.at\[pl\.ds\(offset_\d+, 1\), :, :\]\[\.\.\.\]\[0, :, :\]",
+        )
+        self.assertIn("jnp.reshape(", code)
+        self.assertNotIn(".reshape((2, 2, 64))", code)
+        torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
+
     @unittest.expectedFailure  # nested-scratch resolution bug; see _find_dma_scratch_loop TODO
     def test_fori_loop_nested_same_tensor_scratch_miscompiles(self) -> None:
         """Nested fori_loops that scratch-route the same tensor miscompile.

@@ -75,6 +75,16 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
+    env = CompileEnvironment.current()
+    if env.backend_name == "pallas":
+        from .._compiler.indexing_strategy import SubscriptIndexing
+
+        # Resident Ref discovery needs shapes for selectors that ordinary
+        # device-value subscript lowering may still reject.
+        return env.new_index_result(
+            tensor, SubscriptIndexing.compute_shape(tensor, index)
+        )
+
     input_size = collections.deque(tensor.size())
     output_size = []
     for val in index:
@@ -85,7 +95,6 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
-    env = CompileEnvironment.current()
     return env.new_index_result(tensor, output_size)
 
 

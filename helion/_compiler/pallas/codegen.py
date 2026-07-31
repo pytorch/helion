@@ -22,6 +22,18 @@ if TYPE_CHECKING:
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
 
+def _load_route(
+    state: CodegenState, tensor: torch.Tensor
+) -> tuple[str, str, list[object]]:
+    arg_name = state.device_function.tensor_arg(tensor).name
+    name = vmem_name(state, arg_name)
+    state.device_function.device_load_index += 1
+    state.device_function.device_memory_op_index += 1
+    assert state.fx_node is not None
+    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
+    return arg_name, name, patterns
+
+
 def load_expr(
     state: CodegenState,
     subscript: list[object],
@@ -32,14 +44,9 @@ def load_expr(
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
-    name = state.device_function.tensor_arg(tensor).name
-    active_name = vmem_name(state, name)
+    name, active_name, patterns = _load_route(state, tensor)
     device_fn = state.device_function
-    device_fn.device_load_index += 1
-    device_fn.device_memory_op_index += 1
-
     assert state.fx_node is not None
-    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
     if isinstance(plan, OneHotGatherPlan):
         return emit_gather(state, plan.plan, active_name)
@@ -133,6 +140,31 @@ def _remote_hbm_load_expr(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def resident_ref_load_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+) -> ast.AST:
+    """Keep a proven direct VMEM load as a Pallas Ref."""
+    from helion import exc
+    from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+
+    arg_name, name, patterns = _load_route(state, tensor)
+    device_fn = state.device_function
+
+    if any(isinstance(pattern, IndirectGatherPattern) for pattern in patterns):
+        raise exc.InvalidConfig("resident Ref cannot follow an indirect gather")
+    parts, none_dims = index_parts(state, subscript, tensor)
+    if none_dims or len(parts) != tensor.ndim:
+        raise exc.InvalidConfig("resident Ref producer must preserve rank")
+    if name == arg_name and (
+        device_fn.pallas_memory_space.get(id(tensor)) is not PallasMemorySpace.VMEM
+    ):
+        raise exc.InvalidConfig("resident Ref producer did not resolve to VMEM")
+    return expr_from_string(f"{name}.at[{', '.join(parts)}]")
 
 
 def maybe_codegen_resident_prep_cache_read(

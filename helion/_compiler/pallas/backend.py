@@ -1510,6 +1510,10 @@ class PallasBackend(Backend):
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
 
+        from .view_ops import discover_resident_ref_subviews
+
+        discover_resident_ref_subviews(graphs, config)
+
     def _setup_compact_worklist(self, graphs: list[GraphInfo], config: Config) -> None:
         """Detect + stash the compact-worklist plan before device codegen.
 
