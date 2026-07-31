@@ -1771,9 +1771,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_jsd(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1799,9 +1796,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_kl_div(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
