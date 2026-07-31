@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import unittest
+from unittest import mock
 
 import pytest
 import torch
@@ -238,6 +239,51 @@ class ExpectedPerf:
     total: int
     geomean: float
     wins_slack: int | None
+
+
+@dataclass(frozen=True)
+class _FakeShapeTensor:
+    shape: tuple[int, ...]
+
+    def size(self, dim: int | None = None):
+        return self.shape if dim is None else self.shape[dim]
+
+    def __getitem__(self, index: object) -> _FakeShapeTensor:
+        return self
+
+
+class TestPretunedKernelMetadata(unittest.TestCase):
+    def test_scale_mm_cute_dispatch(self) -> None:
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        kernel_names = (
+            "scale_mm_cute",
+            "scale_mm_cute_m512",
+            "scale_mm_cute_skinny_m",
+            "scale_mm_cute_swap_ab",
+        )
+        kernels = {name: mock.Mock(return_value=name) for name in kernel_names}
+        scale = _FakeShapeTensor((1,))
+        cases = (
+            ((1, 4096, 4096), "scale_mm_cute_skinny_m"),
+            ((512, 2048, 4096), "scale_mm_cute_m512"),
+            ((64, 4096, 6144), "scale_mm_cute_swap_ab"),
+            ((128, 4096, 4096), "scale_mm_cute"),
+        )
+
+        with mock.patch.multiple(module, **kernels):
+            for (m, k, n), expected in cases:
+                with self.subTest(shape=(m, k, n)):
+                    x = _FakeShapeTensor((m, k))
+                    y = _FakeShapeTensor((k, n))
+                    self.assertEqual(
+                        module._scale_mm_cute(x, y, scale, scale), expected
+                    )
+                    kernels[expected].assert_called_once()
+                    for name, kernel in kernels.items():
+                        if name != expected:
+                            kernel.assert_not_called()
+                    for kernel in kernels.values():
+                        kernel.reset_mock()
 
 
 # helion-vs-best-baseline targets. Every kernel's baselines now include
