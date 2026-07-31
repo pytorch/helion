@@ -43,6 +43,9 @@ if TYPE_CHECKING:
 _LOAD_AS_REF = "pallas_load_as_ref"
 # Set on a ``subscript`` node that reads out of such a Ref.
 _SUBVIEW = "pallas_subview"
+# Set on a ``subscript`` node whose index is a node: the node that defines it,
+# after following renames and loop captures, or None if it is not a node.
+_INDEX_SOURCE = "pallas_index_source"
 
 CONFIG_KEY = "pallas_resident_subviews"
 
@@ -233,6 +236,57 @@ def _effective_users(
                 seen.add(placeholder)
                 stack.append(placeholder)
     return results
+
+
+def _resolve_index_source(
+    node: object, placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node]
+) -> torch.fx.Node | None:
+    """Follow renames and loop captures back to the node defining an index.
+
+    An index written in one scope and used in another arrives as a chain of
+    ``_new_var`` renames and capture placeholders.  Both lowerings need the
+    node underneath to tell a tile run apart from an arbitrary gather.
+    """
+    seen: set[torch.fx.Node] = set()
+    while isinstance(node, torch.fx.Node) and node not in seen:
+        seen.add(node)
+        if node.target is _tracing_ops._new_var and node.args:
+            node = node.args[0]
+        elif node.op == "placeholder" and node in placeholder_to_outer:
+            node = placeholder_to_outer[node]
+        else:
+            return node
+    return None
+
+
+def _record_index_sources(
+    graphs: list[GraphInfo],
+    captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
+) -> None:
+    """Resolve every ``subscript``'s node-valued index once, for both lowerings."""
+    placeholder_to_outer = {
+        placeholder: outer
+        for outer, edges in captures.items()
+        for placeholder, _parent in edges
+    }
+    for info in graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target is not subscript:
+                continue
+            indices = node.args[1]
+            if not isinstance(indices, (list, tuple)):
+                continue
+            for index in indices:
+                if isinstance(index, torch.fx.Node):
+                    node.meta[_INDEX_SOURCE] = _resolve_index_source(
+                        index, placeholder_to_outer
+                    )
+                    break
+
+
+def _index_source(node: torch.fx.Node) -> torch.fx.Node | None:
+    source = node.meta.get(_INDEX_SOURCE)
+    return source if isinstance(source, torch.fx.Node) else None
 
 
 def _mutated_tensor_ids(graphs: list[GraphInfo]) -> set[int]:
@@ -506,9 +560,12 @@ def _selector(
         )
 
     if isinstance(index, torch.fx.Node):
-        if index.target is torch.ops.prims.iota.default:
-            return _iota_selector(index, block)
-        return _tile_driven_selector(index, graph_info, parent, config, block)
+        # Use the resolved definition, so an index that crossed a loop or
+        # branch boundary still folds.
+        source = _index_source(node) or index
+        if source.target is torch.ops.prims.iota.default:
+            return _iota_selector(source, block)
+        return _tile_driven_selector(source, graph_info, parent, config, block)
     return None
 
 
@@ -518,11 +575,20 @@ def plan_subview_folding(graphs: list[GraphInfo], config: Config) -> None:
         for node in info.graph.nodes:
             node.meta.pop(_LOAD_AS_REF, None)
             node.meta.pop(_SUBVIEW, None)
-    if not config.get(CONFIG_KEY, True):
-        return
+            node.meta.pop(_INDEX_SOURCE, None)
 
     parents = _control_flow_parents(graphs)
     captures = _capture_map(graphs, parents)
+    # Recorded even when folding is off: the materializing lowering needs it
+    # too, to tell a tile run apart from an arbitrary gather.
+    _record_index_sources(graphs, captures)
+
+    enabled = config.get(CONFIG_KEY, True)
+    if not isinstance(enabled, bool):
+        raise exc.InvalidConfig(f"{CONFIG_KEY} must be True or False, got {enabled!r}.")
+    if not enabled:
+        return
+
     graph_infos = {info.graph: info for info in graphs}
     mutated = _mutated_tensor_ids(graphs)
 
@@ -624,52 +690,70 @@ def _codegen_subview_read(state: CodegenState, plan: _Subview) -> ast.AST:
     return result
 
 
-def _dynamic_narrowing(
+def _contiguous_narrowing(
     state: CodegenState, position: int
-) -> tuple[ast.AST, int, bool, int]:
-    """Return ``(offset, width, squeeze, block_id)`` for a narrowing entry.
+) -> tuple[ast.AST, int, bool, int] | None:
+    """Return ``(offset, width, squeeze, block_id)`` for a contiguous run.
 
     ``tile.begin`` selects a single row and drops the dimension; ``tile.index``
     selects a whole inner block and keeps it, masked at the tail; an ``iota``
-    selects a constant-width run at a data-dependent start.
+    selects a constant-width run at a data-dependent start.  Returns None for
+    an index this cannot prove contiguous, which the caller gathers instead.
     """
     assert state.fx_node is not None
-    index_args = state.fx_node.args[1]
-    assert isinstance(index_args, (list, tuple))
-    index_node = index_args[position]
     ast_args = state.ast_args[1]
     assert isinstance(ast_args, (list, tuple))
-
     proxy = state.proxy_arg(1)
     assert isinstance(proxy, (list, tuple))
+
     if isinstance(proxy[position], torch.SymInt):
         offset = ast_args[position]
         assert isinstance(offset, ast.AST)
         return offset, 1, True, -1
 
+    source = _index_source(state.fx_node)
+    if source is None:
+        return None
     env = CompileEnvironment.current()
-    if isinstance(index_node, torch.fx.Node):
-        if index_node.target is tile_index and index_node.args:
-            block_id = env.resolve_block_id(_node_value(index_node.args[0]))
-            width = (
-                state.device_function.resolved_block_size(block_id)
-                if block_id is not None
-                else None
+    if source.target is tile_index and source.args:
+        block_id = env.resolve_block_id(_node_value(source.args[0]))
+        width = (
+            state.device_function.resolved_block_size(block_id)
+            if block_id is not None
+            else None
+        )
+        if block_id is not None and isinstance(width, int):
+            return (
+                expr_from_string(state.codegen.offset_var(block_id)),
+                width,
+                False,
+                block_id,
             )
-            if block_id is not None and isinstance(width, int):
-                return (
-                    expr_from_string(state.codegen.offset_var(block_id)),
-                    width,
-                    False,
-                    block_id,
-                )
-        elif index_node.target is torch.ops.prims.iota.default and index_node.args:
-            width = _node_value(index_node.args[0])
-            start = _node_value(index_node.kwargs.get("start"))
-            if isinstance(width, int) and isinstance(start, (int, torch.SymInt)):
-                offset = expr_from_string(state.device_function.literal_expr(start))
-                return offset, width, False, -1
-    raise exc.InvalidIndexingType(repr(proxy[position]))
+    elif source.target is torch.ops.prims.iota.default and source.args:
+        width = _node_value(source.args[0])
+        start = _node_value(source.kwargs.get("start"))
+        if isinstance(width, int) and isinstance(start, (int, torch.SymInt)):
+            offset = expr_from_string(state.device_function.literal_expr(start))
+            return offset, width, False, -1
+    return None
+
+
+def _axis_extent(state: CodegenState, axis: int) -> int | None:
+    """Resolved size of the indexed value along ``axis`` for this config."""
+    assert state.fx_node is not None
+    value = _node_value(state.fx_node.args[0])
+    if not isinstance(value, torch.Tensor):
+        return None
+    size = value.shape[axis]
+    if isinstance(size, int):
+        return size
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(size)
+    if block_id is not None:
+        resolved = state.device_function.resolved_block_size(block_id)
+        return resolved if isinstance(resolved, int) else None
+    concrete = env.try_concretize_symint(size)
+    return concrete if isinstance(concrete, int) else None
 
 
 def _codegen_value_subscript(state: CodegenState) -> ast.AST:
@@ -709,17 +793,31 @@ def _codegen_value_subscript(state: CodegenState) -> ast.AST:
     mask: tuple[int, int] | None = None
     if dynamic:
         position = dynamic[0]
-        offset, width, squeeze, block_id = _dynamic_narrowing(state, position)
-        base = expr_from_string(
-            f"jax.lax.dynamic_slice_in_dim({{base}}, {{offset}}, {width}, "
-            f"{axis_of[position]})",
-            base=base,
-            offset=offset,
-        )
-        if squeeze:
-            squeeze_position = position
-        elif block_id >= 0:
-            mask = (block_id, axis_of[position])
+        run = _contiguous_narrowing(state, position)
+        if run is None:
+            # An index this cannot prove contiguous -- an offset tile run, or
+            # any other computed row vector -- is an ordinary gather.
+            index_ast = state.ast_args[1]
+            assert isinstance(index_ast, (list, tuple))
+            rows = index_ast[position]
+            assert isinstance(rows, ast.AST)
+            base = expr_from_string(
+                f"jnp.take({{base}}, {{rows}}, axis={axis_of[position]})",
+                base=base,
+                rows=rows,
+            )
+        else:
+            offset, width, squeeze, block_id = run
+            base = expr_from_string(
+                f"jax.lax.dynamic_slice_in_dim({{base}}, {{offset}}, {width}, "
+                f"{axis_of[position]})",
+                base=base,
+                offset=offset,
+            )
+            if squeeze:
+                squeeze_position = position
+            elif block_id >= 0:
+                mask = (block_id, axis_of[position])
 
     keys: list[str] = []
     for position, value in enumerate(index):
@@ -730,6 +828,19 @@ def _codegen_value_subscript(state: CodegenState) -> ast.AST:
         elif position in dynamic or is_full_slice(value):
             keys.append(":")
         elif isinstance(value, slice):
+            # Python clips a slice to the dimension but the traced shape does
+            # not, so a run reaching past the end would give the value a
+            # different shape than the rest of the graph was built for.
+            extent = _axis_extent(state, axis_of[position])
+            if (
+                isinstance(value.stop, int)
+                and extent is not None
+                and value.stop > extent
+            ):
+                raise exc.InvalidConfig(
+                    f"hl.subscript slice {value.start}:{value.stop} reaches past "
+                    f"the {extent}-element dimension it narrows."
+                )
             if value.step not in (None, 1):
                 raise exc.InvalidIndexingType(repr(value))
             start = "" if value.start is None else str(value.start)
