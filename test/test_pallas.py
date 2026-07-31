@@ -1268,7 +1268,16 @@ class TestPallas(TestCase):
                 pallas_loop_type="fori_loop",
             )
 
-    def test_subview_fold_scalar(self) -> None:
+    def assertNarrowingIsResident(self, code: str) -> None:
+        """No narrowing may lower to a materialized dynamic index.
+
+        Mosaic has neither, so their presence would mean a kernel that only
+        runs under the Pallas interpreter.
+        """
+        self.assertNotIn("dynamic_slice_in_dim", code)
+        self.assertNotIn("jnp.take", code)
+
+    def test_resident_subview_scalar(self) -> None:
         """One token at a time out of a tile: the shape both target kernels use."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1283,20 +1292,13 @@ class TestPallas(TestCase):
                     live = outer.end - outer.begin
                     for local in hl.tile(live, block_size=1):
                         token = x_block[local.begin, :, :].to(torch.float32)
-                        token = token * torch.rsqrt(
-                            torch.sum(token * token, dim=-1, keepdim=True) + 1e-6
-                        )
                         state = state + token
                         out[outer.begin + local.begin, :, :] = state.to(out.dtype)
             return out
 
         x = torch.randn(9, 2, 128, device=DEVICE, dtype=torch.bfloat16)
         initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        x_float = x.float()
-        normalized = x_float * torch.rsqrt(
-            torch.sum(x_float * x_float, dim=-1, keepdim=True) + 1e-6
-        )
-        expected = (initial.float() + normalized.cumsum(dim=0)).bfloat16()
+        expected = (initial.float() + x.float().cumsum(dim=0)).bfloat16()
         for loop_type in ("fori_loop", "emit_pipeline"):
             with self.subTest(loop_type=loop_type):
                 code, actual = code_and_output(
@@ -1305,14 +1307,13 @@ class TestPallas(TestCase):
                     block_sizes=[4],
                     pallas_loop_type=loop_type,
                 )
-                # The block stays a Ref and the inner loop reads one row of it.
                 self.assertRegex(code, r"x_block = x\.at\[pl\.ds\(")
                 self.assertRegex(code, r"\[pl\.ds\(offset_\d+, 1\), :, :\]\[0, :, :\]")
-                self.assertNotIn("dynamic_slice_in_dim", code)
+                self.assertNarrowingIsResident(code)
                 torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
-    def test_subview_fold_keeps_dma_prefetch(self) -> None:
-        """Folding must not move the load out of the outer loop.
+    def test_resident_subview_keeps_dma_prefetch(self) -> None:
+        """Making the block resident must not move the load out of its loop.
 
         The block is still staged and double-buffered once per outer tile; only
         the read of a single row moves into the inner loop.
@@ -1373,16 +1374,14 @@ class TestPallas(TestCase):
             pallas_loop_type="fori_loop",
             pallas_load_buffer_count=[2, 1, 1, 1, 1],
         )
-        # The block is DMA'd into a double-buffered scratch once per tile, and
-        # the folded read indexes that scratch rather than re-addressing x.
         self.assertIn("pltpu.make_async_copy(x.at[pl.ds(", code)
         self.assertRegex(code, r"x_block = x_buf\.at\[_j % 2\]")
-        self.assertRegex(code, r"\[pl\.ds\(offset_\d+, 1\), :, :\]\[0, :, :\]")
+        self.assertNarrowingIsResident(code)
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
         torch.testing.assert_close(final, x[-3:].unsqueeze(0))
 
-    def test_subview_fold_tile_and_dynamic_runs(self) -> None:
-        """A masked inner tile and a data-dependent run out of the same block."""
+    def test_resident_subview_tile_and_dynamic_runs(self) -> None:
+        """A masked inner tile and a data-dependent run out of one block."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def windows(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
@@ -1419,48 +1418,164 @@ class TestPallas(TestCase):
         # jax.lax.dynamic_slice does with an out-of-range start.
         self.assertRegex(code, r"\[pl\.ds\(jnp\.clip\([^)]+, 0, 1\), 3\), :, :\]")
         self.assertIn(".astype(jnp.bfloat16)[:, None, None]", code)
+        self.assertNarrowingIsResident(code)
         torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
 
-    def test_subview_fold_matches_unfolded(self) -> None:
-        """Folding is an optimization: the knob must not change results."""
+    def test_resident_subview_nonuniform_tail_is_masked(self) -> None:
+        """A loop whose extent does not fill the block must mask its last run.
+
+        Three live rows tiled by two: the second run reads a padding row that
+        has to be zeroed, and it must be the right row.
+        """
 
         @helion.kernel(backend="pallas", static_shapes=True)
-        def windows(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-            tokens, _heads, _width = x.size()
-            block_t = hl.register_block_size(4, tokens)
-            out = torch.empty_like(initial)
-            for request in hl.grid(1):
-                state = initial[request, :, :].to(torch.float32)
-                for outer in hl.tile(tokens, block_size=block_t):
+        def ragged_tail(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(3, block_size=4):
                     x_block = x[outer, :, :]
                     live = outer.end - outer.begin
                     for local in hl.tile(live, block_size=2):
-                        state = state + x_block[local.index, :, :].float().sum(dim=0)
-                    state = state + x_block[1, :, :].float()
-                out[request, :, :] = state.to(out.dtype)
-            return out
+                        acc = acc + x_block[local.index, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
 
-        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        results = {}
-        for folded in (True, False):
-            code, actual = code_and_output(
-                windows,
-                (x, initial),
-                block_sizes=[4],
-                pallas_loop_type="fori_loop",
-                pallas_resident_subviews=folded,
+        rows = torch.tensor([1.0, 2.0, 4.0, 8.0], device=DEVICE)
+        x = rows[:, None, None].expand(4, 2, 128).contiguous()
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(ragged_tail, (x, out), pallas_loop_type="fori_loop")
+        self.assertNarrowingIsResident(code)
+        # Rows 0..2 only: the fourth row is outside the live extent.
+        torch.testing.assert_close(out, torch.full_like(out, 7.0))
+
+    def test_resident_subview_offset_tile_run(self) -> None:
+        """A tile run that arrives as arithmetic is still a tile run.
+
+        ``tile.index + 0`` traces to an ``add``, so the run is recognized from
+        its ``tile_with_offset`` provenance rather than the node's target.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def offset_index(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(3, block_size=4):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=2):
+                        acc = acc + x_block[local.index + 0, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        rows = torch.tensor([1.0, 2.0, 4.0, 8.0], device=DEVICE)
+        x = rows[:, None, None].expand(4, 2, 128).contiguous()
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(offset_index, (x, out), pallas_loop_type="fori_loop")
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(out, torch.full_like(out, 7.0))
+
+    def test_resident_subview_constant_runs(self) -> None:
+        """Constant positions read out of the resident block like any other."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def constants(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    acc = acc + x_block[1, :, :].float()
+                    acc = acc + x_block[1:3, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        rows = torch.tensor([1.0, 2.0, 4.0, 8.0], device=DEVICE)
+        x = rows[:, None, None].expand(4, 2, 128).contiguous()
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(constants, (x, out), pallas_loop_type="fori_loop")
+        self.assertNarrowingIsResident(code)
+        self.assertIn("[pl.ds(1, 1), :, :]", code)
+        self.assertIn("[pl.ds(1, 2), :, :]", code)
+        torch.testing.assert_close(out, torch.full_like(out, 8.0))
+
+    def test_resident_subview_index_through_control_flow(self) -> None:
+        """An index bound to a name and used across a branch still resolves."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def named_index(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=2):
+                        rows = local.index
+                        if live >= 2:
+                            acc = acc + x_block[rows, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(named_index, (x, out), pallas_loop_type="fori_loop")
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(out[0], x.sum(dim=0), rtol=1e-4, atol=1e-4)
+
+    def test_resident_subview_config_dependent_eligibility(self) -> None:
+        """A run must divide the block, which depends on the block size."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def divisible(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            block_t = hl.register_block_size(2, tokens)
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=block_t):
+                    x_block = x[outer, :, :]
+                    for local in hl.tile(4, block_size=4):
+                        acc = acc + x_block[local.index, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        # A 4-wide run fits a 4-row block.
+        code, _ = code_and_output(
+            divisible, (x, out), block_sizes=[4], pallas_loop_type="fori_loop"
+        )
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(out, torch.full_like(out, 8.0))
+        # It does not fit a 2-row block, so the same kernel is rejected.  Block
+        # sizes are powers of two, so a run that fits always divides; the width
+        # check is the gate that actually varies with config.
+        with self.assertRaisesRegex(
+            Exception, "block holds only 2 rows for this config"
+        ):
+            code_and_output(
+                divisible, (x, out), block_sizes=[2], pallas_loop_type="fori_loop"
             )
-            self.assertEqual("x_block = x.at[" in code, folded)
-            self.assertEqual("dynamic_slice_in_dim" in code, not folded)
-            results[folded] = actual
-        torch.testing.assert_close(results[True], results[False])
 
-    def test_subview_fold_declines_when_source_is_written(self) -> None:
-        """A store to the loaded tensor must keep the load materializing.
+    def test_resident_subview_names_the_blocking_consumer(self) -> None:
+        """Consuming the block whole defeats residency, so say where."""
 
-        A folded load reads its Ref where the consumer runs, so it would
-        otherwise observe a write issued after the load.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def whole_and_part(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :]
+                    acc = acc + x_block.float().sum(dim=0)
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        acc = acc + x_block[local.begin, :, :].float()
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(Exception, "consumed whole at .*test_pallas.py:"):
+            code_and_output(whole_and_part, (x, out), pallas_loop_type="fori_loop")
+
+    def test_resident_subview_declines_when_source_is_written(self) -> None:
+        """A store to the loaded tensor defeats residency.
+
+        A resident block is read where the consumer runs, so it would otherwise
+        observe a write issued after the load.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1481,224 +1596,23 @@ class TestPallas(TestCase):
         x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
         y = torch.zeros(8, 2, 128, device=DEVICE, dtype=torch.float32)
         out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(
-            read_then_write, (x, y, out), pallas_loop_type="fori_loop"
-        )
-        self.assertNotIn("x_block = x.at[", code)
-        self.assertIn("dynamic_slice_in_dim", code)
-        # Every row read predates the overwrite, so the sum is the input's.
-        torch.testing.assert_close(out, torch.full_like(out, 8.0))
+        with self.assertRaisesRegex(Exception, "also written on device"):
+            code_and_output(read_then_write, (x, y, out), pallas_loop_type="fori_loop")
 
-    def test_subview_value_fallback_index_forms(self) -> None:
-        """Every index form the fake accepts lowers without folding.
+    def test_resident_subview_rejects_unsupported_selections(self) -> None:
+        """Selections with no resident lowering are refused with a reason."""
 
-        Consuming the block whole blocks folding, so each subscript here takes
-        the materializing path.
-        """
+        def build(body: Callable[..., object]) -> Any:
+            return helion.kernel(body, backend="pallas", static_shapes=True)
 
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def all_forms(x: torch.Tensor, out: torch.Tensor) -> None:
-            tokens, _heads, _width = x.size()
-            for _request in hl.grid(1):
-                acc = hl.zeros([2, 128], dtype=torch.float32)
-                for outer in hl.tile(tokens, block_size=4):
-                    x_block = x[outer, :, :]
-                    # Whole-block use: nothing below can be folded.
-                    acc = acc + x_block.float().sum(dim=0)
-                    acc = acc + x_block[1, :, :].float()
-                    acc = acc + x_block[1:3, :, :].float().sum(dim=0)
-                    for local in hl.tile(4, block_size=2):
-                        acc = acc + x_block[local.begin, :, :].float()
-                        acc = acc + x_block[local.index, :, :].float().sum(dim=0)
-                out[0, :, :] = acc.to(out.dtype)
-
-        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        expected = torch.zeros(2, 128, device=DEVICE, dtype=torch.float32)
-        for begin in (0, 4):
-            block = x[begin : begin + 4]
-            expected = expected + block.sum(dim=0)
-            expected = expected + block[1]
-            expected = expected + block[1:3].sum(dim=0)
-            for local_begin in (0, 2):
-                expected = expected + block[local_begin]
-                expected = expected + block[local_begin : local_begin + 2].sum(dim=0)
-        code, _ = code_and_output(all_forms, (x, out), pallas_loop_type="fori_loop")
-        self.assertNotIn("x_block = x.at[", code)
-        torch.testing.assert_close(out[0], expected, rtol=1e-4, atol=1e-4)
-
-    def test_subview_fold_then_view(self) -> None:
-        """A view of the folded result is an ordinary value reshape."""
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def folded_then_viewed(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
-            tokens, _channels, _width = x.size()
-            block_t = hl.register_block_size(2, tokens)
-            out = torch.empty_like(initial)
-            for request in hl.grid(1):
-                state = initial[request, :, :, :].float()
-                for outer in hl.tile(tokens, block_size=block_t):
-                    x_block = x[outer, :, :]
-                    live = outer.end - outer.begin
-                    for local in hl.tile(live, block_size=1):
-                        token = x_block[local.begin, :, :]
-                        state += token.reshape(2, 2, 64).float()
-                out[request, :, :, :] = state.to(out.dtype)
-            return out
-
-        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
-        initial = torch.zeros(1, 2, 2, 64, device=DEVICE, dtype=torch.bfloat16)
-        expected = x.float().reshape(8, 2, 2, 64).sum(dim=0, keepdim=True)
-        code, actual = code_and_output(
-            folded_then_viewed,
-            (x, initial),
-            block_sizes=[4],
-            pallas_loop_type="fori_loop",
-        )
-        self.assertRegex(code, r"x_block = x\.at\[pl\.ds\(")
-        self.assertIn("jnp.reshape(", code)
-        torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
-
-    def test_subview_fold_declines_on_untiled_dim(self) -> None:
-        """Only the tiled dimension folds; anything else materializes.
-
-        Narrowing a dimension the load did not tile would need the block's
-        layout rather than a slice of it, so the load stays materialized.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
         def untiled_dim(x: torch.Tensor, out: torch.Tensor) -> None:
-            tokens, _heads, _channels, _width = x.size()
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)
-                for outer in hl.tile(tokens, block_size=4):
-                    x_block = x[outer, :, :, :]
-                    acc = acc + x_block[:, 0, :, :].float().sum(dim=0)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    acc = acc + x[outer, :, :, :][:, 0, :, :].float().sum(dim=0)
                 out[0, :, :] = acc.to(out.dtype)
 
-        x = torch.randn(8, 2, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(untiled_dim, (x, out), pallas_loop_type="fori_loop")
-        self.assertNotIn("x_block = x.at[", code)
-        torch.testing.assert_close(
-            out[0], x[:, 0, :, :].sum(dim=0), rtol=1e-4, atol=1e-4
-        )
-
-    def test_subview_fold_declines_through_view(self) -> None:
-        """A view between the load and the subview is out of scope for folding.
-
-        The narrowing runs against the viewed shape, which the Ref lowering
-        does not track, so the load materializes and both subscripts index the
-        value.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def viewed_then_narrowed(x: torch.Tensor, out: torch.Tensor) -> None:
-            tokens, _heads, _width = x.size()
-            for _request in hl.grid(1):
-                acc = hl.zeros([2, 1, 128], dtype=torch.float32)
-                for outer in hl.tile(tokens, block_size=4):
-                    x_block = x[outer, :, :][:, :, None, :]
-                    live = outer.end - outer.begin
-                    for local in hl.tile(live, block_size=1):
-                        acc = acc + x_block[local.begin, :, :, :].float()
-                out[0, :, :] = acc[:, 0, :].to(out.dtype)
-
-        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(
-            viewed_then_narrowed, (x, out), pallas_loop_type="fori_loop"
-        )
-        self.assertNotIn("x_block = x.at[", code)
-        torch.testing.assert_close(out[0], x.sum(dim=0), rtol=1e-4, atol=1e-4)
-
-    def test_subview_slice_past_dimension_is_rejected(self) -> None:
-        """A bounded slice reaching past its dimension must not compile.
-
-        Python would clip the run while the traced shape would not, so the
-        value would silently disagree with the shape the graph expects.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def past_the_end(x: torch.Tensor, out: torch.Tensor) -> None:
-            tokens, _heads, _width = x.size()
-            for _request in hl.grid(1):
-                acc = hl.zeros([2, 128], dtype=torch.float32)
-                for outer in hl.tile(tokens, block_size=4):
-                    x_block = x[outer, :, :]
-                    acc = acc + x_block.float().sum(dim=0)
-                    acc = acc + x_block[1:10, :, :].float().sum(dim=0)
-                out[0, :, :] = acc.to(out.dtype)
-
-        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(Exception, "reaches past the 4-element"):
-            code_and_output(past_the_end, (x, out), pallas_loop_type="fori_loop")
-
-    def test_subview_index_through_transports(self) -> None:
-        """An index that crosses a scope boundary keeps its provenance.
-
-        Binding ``tile.index`` to a name before the branch renames it, and the
-        lowering has to see through that to emit a contiguous run rather than
-        a gather.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def named_index(x: torch.Tensor, out: torch.Tensor) -> None:
-            tokens, _heads, _width = x.size()
-            for _request in hl.grid(1):
-                acc = hl.zeros([2, 128], dtype=torch.float32)
-                for outer in hl.tile(tokens, block_size=4):
-                    x_block = x[outer, :, :]
-                    live = outer.end - outer.begin
-                    for local in hl.tile(live, block_size=2):
-                        rows = local.index
-                        if live >= 2:
-                            acc = acc + x_block[rows, :, :].float().sum(dim=0)
-                out[0, :, :] = acc.to(out.dtype)
-
-        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(named_index, (x, out), pallas_loop_type="fori_loop")
-        self.assertIn("dynamic_slice_in_dim", code)
-        self.assertNotIn("jnp.take", code)
-        torch.testing.assert_close(out[0], x.sum(dim=0), rtol=1e-4, atol=1e-4)
-
-    def test_subview_offset_tile_run_keeps_its_mask(self) -> None:
-        """A tile run that arrives as arithmetic is still a masked tile run.
-
-        ``tile.index + 0`` traces to an ``add``, so the run has to be
-        recognized from its ``tile_with_offset`` provenance; treating it as an
-        arbitrary gather would drop the tail mask and read padding rows.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def offset_index(x: torch.Tensor, out: torch.Tensor) -> None:
-            for _request in hl.grid(1):
-                acc = hl.zeros([2, 128], dtype=torch.float32)
-                for outer in hl.tile(3, block_size=3):
-                    x_block = x[outer, :, :]
-                    live = outer.end - outer.begin
-                    for local in hl.tile(live, block_size=2):
-                        acc = acc + x_block[local.index + 0, :, :].float().sum(dim=0)
-                out[0, :, :] = acc.to(out.dtype)
-
-        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(offset_index, (x, out), pallas_loop_type="fori_loop")
-        self.assertNotIn("jnp.take", code)
-        # Three live rows over a loop tiled by two: the tail row must be masked.
-        torch.testing.assert_close(out, torch.full_like(out, 3.0))
-
-    def test_subview_rejects_arbitrary_gather(self) -> None:
-        """A shifted tile run is refused rather than approximated.
-
-        The loop mask marks which of ``offset + arange(width)`` are live, which
-        is the wrong mask for rows read at ``offset + shift + arange(width)``.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def shifted_index(x: torch.Tensor, out: torch.Tensor) -> None:
+        def shifted_run(x: torch.Tensor, out: torch.Tensor) -> None:
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)
                 for outer in hl.tile(x.size(0), block_size=4):
@@ -1707,66 +1621,98 @@ class TestPallas(TestCase):
                         acc = acc + x_block[local.index + 1, :, :].float().sum(dim=0)
                 out[0, :, :] = acc.to(out.dtype)
 
-        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        with self.assertRaises(helion.exc.InvalidIndexingType):
-            code_and_output(shifted_index, (x, out), pallas_loop_type="fori_loop")
-
-    def test_subview_rejects_negative_bounds(self) -> None:
-        """A negative index or slice bound is refused at trace time.
-
-        Codegen clips a negative bound against the dimension while the traced
-        shape cannot see that dimension's size, so the two would disagree.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def negative_slice(x: torch.Tensor, out: torch.Tensor) -> None:
+        def strided_run(x: torch.Tensor, out: torch.Tensor) -> None:
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)
                 for outer in hl.tile(x.size(0), block_size=4):
                     x_block = x[outer, :, :]
-                    acc = acc + x_block[-3:2, :, :].float().sum(dim=0)
+                    acc = acc + x_block[hl.arange(0, 4, 2), :, :].float().sum(dim=0)
                 out[0, :, :] = acc.to(out.dtype)
 
-        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-        with self.assertRaises(helion.exc.InvalidIndexingType):
-            code_and_output(negative_slice, (x, out), pallas_loop_type="fori_loop")
+        def past_the_end(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    acc = acc + x[outer, :, :][7, :, :].float()
+                out[0, :, :] = acc.to(out.dtype)
 
-    def test_subview_fold_captured_dynamic_run(self) -> None:
-        """A dynamic run bound to a name before a branch still folds correctly.
-
-        The clamp has to read the ``iota``'s start through the resolved index,
-        not through the placeholder the branch captured.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def captured_run(x: torch.Tensor, out: torch.Tensor) -> None:
+        def adds_a_dimension(x: torch.Tensor, out: torch.Tensor) -> None:
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)
                 for outer in hl.tile(x.size(0), block_size=4):
                     x_block = x[outer, :, :]
                     live = outer.end - outer.begin
-                    rows = hl.arange(live - 3, live)
-                    if live >= 3:
-                        acc = acc + x_block[rows, :, :].float().sum(dim=0)
+                    for local in hl.tile(live, block_size=2):
+                        acc = acc + x_block[None, local.index, :, :].float().sum(
+                            dim=(0, 1)
+                        )
+                out[0, :, :] = acc.to(out.dtype)
+
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        cases = [
+            ("untiled dim", untiled_dim, torch.ones(8, 2, 2, 128, device=DEVICE)),
+            ("shifted run", shifted_run, torch.ones(8, 2, 128, device=DEVICE)),
+            ("strided run", strided_run, torch.ones(8, 2, 128, device=DEVICE)),
+            ("index past block", past_the_end, torch.ones(8, 2, 128, device=DEVICE)),
+            ("adds a dim", adds_a_dimension, torch.ones(8, 2, 128, device=DEVICE)),
+        ]
+        for name, body, tensor in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(Exception) as caught:
+                    code_and_output(
+                        build(body), (tensor, out), pallas_loop_type="fori_loop"
+                    )
+                self.assertRegex(
+                    str(caught.exception), r"resident block|dimension|run|index"
+                )
+
+    def test_resident_subview_rejects_negative_bounds(self) -> None:
+        """Negative positions are refused at trace time.
+
+        A negative slice bound is shape-undecidable here; a negative scalar has
+        a decidable shape and is a deliberate language restriction, because on a
+        partly live tile it would name a padding row.
+        """
+
+        def negative_slice(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    acc = acc + x[outer, :, :][-3:2, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        def negative_index(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    acc = acc + x[outer, :, :][-1, :, :].float()
                 out[0, :, :] = acc.to(out.dtype)
 
         x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
-        expected = torch.full((1, 2, 128), 6.0, device=DEVICE, dtype=torch.float32)
-        results = {}
-        for folded in (True, False):
-            out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
-            code, _ = code_and_output(
-                captured_run,
-                (x, out),
-                pallas_loop_type="fori_loop",
-                pallas_resident_subviews=folded,
-            )
-            self.assertEqual("jnp.clip(" in code, folded)
-            results[folded] = out
-        torch.testing.assert_close(results[True], expected)
-        torch.testing.assert_close(results[False], expected)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        for name, body in (("slice", negative_slice), ("index", negative_index)):
+            with self.subTest(case=name):
+                kernel = helion.kernel(body, backend="pallas", static_shapes=True)
+                with self.assertRaises(helion.exc.InvalidIndexingType):
+                    code_and_output(kernel, (x, out), pallas_loop_type="fori_loop")
+
+    def test_resident_subview_plain_subscripts_unchanged(self) -> None:
+        """``None``/``:`` do not narrow and keep their ordinary lowering."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def broadcast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            (m,) = x.size()
+            (n,) = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_i, tile_j in hl.tile([m, n]):
+                out[tile_i, tile_j] = x[tile_i][:, None] * y[tile_j][None, :]
+            return out
+
+        x = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, actual = code_and_output(broadcast, (x, y), block_sizes=[16, 32])
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(actual, x[:, None] * y[None, :])
 
     def test_tile_count_inside_fori_loop(self) -> None:
         """``tile.count`` has to honour a non-zero loop begin.

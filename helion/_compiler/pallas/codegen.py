@@ -29,9 +29,9 @@ def load_expr(
 ) -> ast.AST:
     """Emit a normal load, selected TensorCore gather, or folded resident Ref.
 
-    A load that subview folding marked (and that resolves to a VMEM ref) is
-    emitted as a Pallas Ref instead, so its consumers can read individual
-    slices out of it without materializing the whole block.
+    A load whose block planning made resident is emitted as a Pallas Ref
+    instead, so its subview consumers can read individual runs out of it
+    without materializing the whole block.
     """
     from helion._compiler.pallas.gather import emit_gather
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
@@ -152,29 +152,35 @@ def _maybe_block_ref_expr(
     parts: list[str],
     none_dims: list[int],
 ) -> ast.AST | None:
-    """Emit this load as a Pallas Ref when subview folding asked for one.
+    """Emit this load as a Pallas Ref when planning made its block resident.
 
-    Records the outcome on the device function so the folded consumers know
-    whether they got a Ref or a materialized array; when anything here does not
-    line up the load stays materialized and the consumers fall back to indexing
-    the value, which is always correct.
+    Planning has already rejected every subview it could not cover, so the Ref
+    is required here rather than preferred: there is no materializing lowering
+    to fall back to.  A block that cannot address as a Ref raises instead, so
+    the failure names the config rather than silently changing the lowering.
     """
+    from helion import exc
     from helion._compiler.device_function import PallasMemorySpace
     from helion._compiler.pallas.view_ops import load_is_ref
 
     assert state.fx_node is not None
     if not load_is_ref(state.fx_node):
         return None
+    if none_dims or len(parts) != tensor.ndim:
+        raise exc.InvalidConfig(
+            f"{arg_name} must stay a resident block for a subview to read it, "
+            "but this load does not preserve its rank."
+        )
     # A tensor left on its own ref (rather than routed through a VMEM scratch)
     # has to already live in VMEM: an HBM ref cannot be read element-wise.
-    resolves_to_vmem = name != arg_name or (
+    if name == arg_name and (
         state.device_function.pallas_memory_space.get(id(tensor))
-        is PallasMemorySpace.VMEM
-    )
-    if none_dims or len(parts) != tensor.ndim or not resolves_to_vmem:
-        state.device_function.pallas_ref_loads[state.fx_node] = False
-        return None
-    state.device_function.pallas_ref_loads[state.fx_node] = True
+        is not PallasMemorySpace.VMEM
+    ):
+        raise exc.InvalidConfig(
+            f"{arg_name} must stay a resident block for a subview to read it, "
+            "but under this config it did not resolve to VMEM."
+        )
     if all(part == ":" for part in parts):
         # The block already is the whole ref, e.g. a pipelined tensor whose DMA
         # scratch holds exactly this tile.

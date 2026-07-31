@@ -354,10 +354,6 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
-        # Pallas subview folding: load node -> whether that load actually got
-        # emitted as a Pallas Ref.  Its folded consumers read this to choose
-        # between slicing the Ref and indexing a materialized array.
-        self.pallas_ref_loads: dict[torch.fx.Node, bool] = {}
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
