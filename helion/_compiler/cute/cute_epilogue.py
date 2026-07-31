@@ -164,6 +164,13 @@ class Tcgen05GroupedTailEpilogueMatch:
     has_n_tail_mask: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class _AuxiliaryTensorProductStep:
+    """A carrier multiplied by an explicitly parenthesized pair of aux loads."""
+
+    operands: tuple[_AuxiliaryTensorStep, _AuxiliaryTensorStep]
+
+
 # The cute DSL surface for whitelisted unary operations. Renderings are
 # inline Python expressions on a TensorSSA value. All renderings
 # preserve dtype (we only operate on float accumulators here), so the
@@ -496,7 +503,7 @@ class Tcgen05UnaryEpilogueChain:
     and the partitioned tile, neither of which this module knows about.
     """
 
-    steps: tuple[_UnaryStep | _AuxiliaryTensorStep, ...]
+    steps: tuple[_UnaryStep | _AuxiliaryTensorStep | _AuxiliaryTensorProductStep, ...]
 
     @property
     def auxiliary_tensor_steps(self) -> tuple[_AuxiliaryTensorStep, ...]:
@@ -507,7 +514,13 @@ class Tcgen05UnaryEpilogueChain:
         per-thread aux load setup runs once per output tile (outside
         the per-subtile chain rendering).
         """
-        return tuple(s for s in self.steps if isinstance(s, _AuxiliaryTensorStep))
+        result: list[_AuxiliaryTensorStep] = []
+        for step in self.steps:
+            if isinstance(step, _AuxiliaryTensorStep):
+                result.append(step)
+            elif isinstance(step, _AuxiliaryTensorProductStep):
+                result.extend(step.operands)
+        return tuple(result)
 
     def render_prelude_and_expr(
         self,
@@ -562,6 +575,18 @@ class Tcgen05UnaryEpilogueChain:
         cur_expr = carrier_name
         local = carrier_name
         for step in self.steps:
+            if isinstance(step, _AuxiliaryTensorProductStep):
+                lhs_aux = next(aux_local_iter)
+                rhs_aux = next(aux_local_iter)
+                local = local_name_factory(  # type: ignore[operator]
+                    "tcgen05_chain_step"
+                )
+                assert isinstance(local, str)
+                prelude_lines.append(
+                    f"{prelude_indent}{local} = {cur_expr} * ({lhs_aux} * {rhs_aux})\n"
+                )
+                cur_expr = local
+                continue
             if isinstance(step, _AuxiliaryTensorStep):
                 # Auxiliary-tensor binary op. The splice site has
                 # already bound the per-thread aux load to a local
@@ -737,7 +762,13 @@ def _classify_binary(
     carrier_tile_shape: tuple[object, ...] | None,
     carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None = None,
     carrier_global_shape: tuple[object, ...] | None = None,
-) -> tuple[_UnaryStep | _AuxiliaryTensorStep, torch.fx.Node] | None:
+) -> (
+    tuple[
+        _UnaryStep | _AuxiliaryTensorStep | _AuxiliaryTensorProductStep,
+        torch.fx.Node,
+    ]
+    | None
+):
     """Classify ``cur`` (a ``call_function`` node whose target is on the
     binary whitelist) as a single chain step plus its FX carrier node.
 
@@ -775,6 +806,15 @@ def _classify_binary(
     rhs_is_node = isinstance(rhs, torch.fx.Node)
     if lhs_is_node and rhs_is_node:
         assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
+        if target is torch.ops.aten.mul.Tensor:
+            product_operands = _classify_auxiliary_product(
+                rhs,
+                carrier_tile_shape=carrier_tile_shape,
+                carrier_tile_index_nodes=carrier_tile_index_nodes,
+                carrier_global_shape=carrier_global_shape,
+            )
+            if product_operands is not None:
+                return _AuxiliaryTensorProductStep(product_operands), lhs
         # Both args are FX nodes. One must be a recognized auxiliary
         # tensor load; the other is the chain carrier. If both look
         # like aux loads or neither does, bail — the chain has no
@@ -877,6 +917,48 @@ def _classify_binary(
         )
         return _UnaryStep(op_name="div", template=template), scalar_carrier
     return None
+
+
+def _classify_auxiliary_product(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+) -> tuple[_AuxiliaryTensorStep, _AuxiliaryTensorStep] | None:
+    """Recognize ``aux_load * aux_load`` without changing FP association."""
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.aten.mul.Tensor
+        or node.kwargs
+        or len(node.args) != 2
+    ):
+        return None
+    result: list[_AuxiliaryTensorStep] = []
+    for operand in node.args[:2]:
+        if not isinstance(operand, torch.fx.Node):
+            return None
+        load_node, aux_template = _aux_load_operand(operand)
+        if aux_template != "{aux}":
+            return None
+        kind = aux_tensor_load_kind(
+            load_node,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+        )
+        if kind is None:
+            return None
+        broadcast_axis = kind[1] if kind[0] == "broadcast" else None
+        result.append(
+            _AuxiliaryTensorStep(
+                op_name="mul",
+                op_template="{carrier} * {aux}",
+                load_node=load_node,
+                broadcast_axis=broadcast_axis,
+            )
+        )
+    return result[0], result[1]
 
 
 def _carrier_tile_shape(node: torch.fx.Node) -> tuple[object, ...] | None:
@@ -1082,7 +1164,7 @@ def analyze_tcgen05_unary_epilogue_chain(
     carrier_tile_shape = _carrier_tile_shape(chain_input)
     carrier_tile_index_nodes = _carrier_tile_index_nodes(chain_input)
 
-    steps: list[_UnaryStep | _AuxiliaryTensorStep] = []
+    steps: list[_UnaryStep | _AuxiliaryTensorStep | _AuxiliaryTensorProductStep] = []
     cur: torch.fx.Node = chain_input
     # Bound the walk so a pathological FX graph cannot loop forever.
     # 32 unary ops between the matmul and the store is an absurd upper

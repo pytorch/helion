@@ -658,7 +658,8 @@ def test_rank3_rhs_grouped_static_dynamic_bk64_mixed_tail_direct_codegen() -> No
         "tile_offset_2 < tcgen05_grouped_problem_k",
     ):
         assert marker in code
-    assert code.count("cute.nvgpu.cpasync.prefetch_descriptor(") == 3
+    # A, B, the full-tile D descriptor, and the tail D descriptor.
+    assert code.count("cute.nvgpu.cpasync.prefetch_descriptor(") == 4
     assert "tcgen05_tiled_copy_r2g" not in code
     assert "tcgen05_store_mask" not in code
     assert _wrapper_plan(code, "tcgen05_ab_tma")["dynamic_ab_tensormaps"] is True
