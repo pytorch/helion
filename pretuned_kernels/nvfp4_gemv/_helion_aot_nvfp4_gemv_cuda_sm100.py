@@ -7,9 +7,10 @@ FP16-decode multi-row bodies from pytorch/helion#3079 that tile over both M
 (out[tile_m]) and the K scale-group dim, accumulating K tiles into a per-row
 fp32 acc. Packed FP4 groups are loaded through
 hl.load_float4_e2m1fn_x16_to_float16. The sweep-wide defaults match the PR's
-tuned Triton configs. Full AOT searches added exact-shape overrides for the
-three shapes where those defaults lost to CUTLASS. All configs were validated
-against the dequant reference and remeasured under cold-L2 cudagraph.
+tuned Triton configs. Full AOT searches produced exact-shape configs for four
+shapes where those defaults lost to CUTLASS; three overrides are currently
+enabled. All configs were validated against the dequant reference and
+remeasured under cold-L2 cudagraph.
 
 Provides, for each kernel <k>:
 - key_<k>(*args): config index (also the runtime cache key)
@@ -89,6 +90,33 @@ _CONFIG_BF16IN_28672_4096 = {
     "pid_type": "flat",
 }
 
+# N=15360, K=5120: 19.27us vs 23.15us default and 19.79us CUTLASS.
+_CONFIG_BF16IN_15360_5120 = {
+    "block_sizes": [16, 128],
+    "range_unroll_factors": [0, 3],
+    "range_warp_specializes": [True, None],
+    "range_multi_buffers": [None, False],
+    "range_flattens": [True, None],
+    "load_eviction_policies": [
+        "", "first", "first", "first", "last", "", "last", "last", "first",
+        "", "first", "first", "", "", "last", "first", "first", "", "last",
+        "last", "last",
+    ],
+    "num_warps": 2,
+    "num_stages": 1,
+    "indexing": [
+        "pointer", "pointer", "tensor_descriptor", "tensor_descriptor",
+        "pointer", "pointer", "pointer", "tensor_descriptor", "pointer",
+        "tensor_descriptor", "tensor_descriptor", "tensor_descriptor",
+        "tensor_descriptor", "tensor_descriptor", "pointer", "pointer",
+        "pointer", "tensor_descriptor", "tensor_descriptor",
+        "tensor_descriptor", "pointer", "pointer",
+    ],
+    "atomic_indexing": [],
+    "pid_type": "persistent_blocked",
+    "num_sm_multiplier": 8,
+}
+
 # N=8192, K=28672: 58.04us vs 59.13us default and 58.16us CUTLASS.
 _CONFIG_BF16IN_8192_28672 = {
     "block_sizes": [16, 128],
@@ -115,16 +143,18 @@ _CONFIG_BF16IN_8192_28672 = {
     "num_sm_multiplier": 64,
 }
 
-# N=15360, K=5120 uses the default config because its warp-specialized override
-# triggers triton-lang/triton#10901.
 _BF16IN_EXACT = {
     (28672, 4096): 1,
-    (8192, 28672): 2,
+    # Re-enable after triton-lang/triton#10901 is fixed in the benchmark's
+    # Triton build.
+    # (15360, 5120): 2,
+    (8192, 28672): 3,
 }
 
 _BF16IN_CONFIGS = [
     _CONFIG_BF16IN_DEFAULT,
     _CONFIG_BF16IN_28672_4096,
+    _CONFIG_BF16IN_15360_5120,
     _CONFIG_BF16IN_8192_28672,
 ]
 
