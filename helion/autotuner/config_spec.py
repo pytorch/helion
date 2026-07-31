@@ -430,6 +430,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "pallas_loop_type",
         "pallas_load_buffer_count",
         "pallas_pre_broadcast",
+        "pallas_resident_subviews",
         "xcd_remap",
     }
 )
@@ -460,6 +461,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_loop_type",
         "pallas_load_buffer_count",
         "pallas_pre_broadcast",
+        "pallas_resident_subviews",
         "cute_vector_widths",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
