@@ -95,6 +95,9 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS
+from .tcgen05_constants import TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -437,6 +440,23 @@ def _trace_to_load(node: Node) -> Node | None:
     return cur
 
 
+def _load_exclusively_feeds_operand(
+    load_node: Node, operand_node: Node, mma_node: Node
+) -> bool:
+    """Whether a load reaches one MMA through an exclusive wrapper chain."""
+    current = load_node
+    while current is not operand_node:
+        if len(current.users) != 1:
+            return False
+        (current,) = current.users
+        if current.op != "call_function" or current.target not in (
+            *_TRACE_THROUGH_TARGETS,
+            torch.ops.aten.permute.default,
+        ):
+            return False
+    return set(current.users) == {mma_node}
+
+
 def _trace_to_load_tensor(node: Node) -> tuple[Node, str, torch.Tensor] | None:
     """Trace through dtype casts to find the underlying load tensor."""
     load_node = _trace_to_load(node)
@@ -489,15 +509,26 @@ class _MmaOperandInfo:
     # (N leading axes is a possible future generalization).
     load: Node
     source_fake: torch.Tensor
+    logical_fake: torch.Tensor
     block_ids: tuple[int, ...]
+    trailing_transpose: bool = False
+
+    @property
+    def matrix_major(self) -> str | None:
+        major = _tcgen05_tma_matrix_major(self.source_fake)
+        if not self.trailing_transpose or major is None:
+            return major
+        return "col" if major == "row" else "row"
 
     @property
     def matrix_rows(self) -> int | torch.SymInt:
-        return self.source_fake.size(-2)
+        axis = -1 if self.trailing_transpose else -2
+        return self.source_fake.size(axis)
 
     @property
     def matrix_cols(self) -> int | torch.SymInt:
-        return self.source_fake.size(-1)
+        axis = -2 if self.trailing_transpose else -1
+        return self.source_fake.size(axis)
 
     @property
     def matrix_row_block_id(self) -> int:
@@ -559,6 +590,7 @@ class _MmaOperandAnalysis:
 @dataclass(frozen=True)
 class _MmaOutputStoreAnalysis:
     explicit_epi_tile_compatible: bool
+    output_column_major: bool
 
 
 def _mma_tiles_are_static_full(
@@ -576,7 +608,27 @@ def _analyze_mma_operand(
     node: Node,
     env: CompileEnvironment,
 ) -> _MmaOperandInfo | None:
-    info = _direct_load_tensor(node)
+    trailing_transpose = False
+    load_value = node
+    if node.op == "call_function" and node.target is torch.ops.aten.permute.default:
+        if len(node.args) != 2 or not isinstance(node.args[0], Node):
+            return None
+        value_fake = node.meta.get("val")
+        order = node.args[1]
+        if not isinstance(value_fake, torch.Tensor) or not isinstance(
+            order, (list, tuple)
+        ):
+            return None
+        normalized = tuple(int(dim) % value_fake.ndim for dim in order)
+        if normalized != (
+            *range(value_fake.ndim - 2),
+            value_fake.ndim - 1,
+            value_fake.ndim - 2,
+        ):
+            return None
+        load_value = node.args[0]
+        trailing_transpose = True
+    info = _direct_load_tensor(load_value)
     if info is None:
         return None
     load_node, _, source_fake = info
@@ -597,14 +649,20 @@ def _analyze_mma_operand(
             block_size, source_fake.size(dim)
         ):
             return None
+    if trailing_transpose:
+        block_ids = (*block_ids[:-2], block_ids[-1], block_ids[-2])
     if source_fake.ndim not in (2, 3):
+        return None
+    if trailing_transpose and source_fake.ndim == 3:
         return None
     if value_fake.ndim not in (2, source_fake.ndim):
         return None
     return _MmaOperandInfo(
         load=load_node,
         source_fake=source_fake,
+        logical_fake=value_fake,
         block_ids=block_ids,
+        trailing_transpose=trailing_transpose,
     )
 
 
@@ -637,7 +695,7 @@ def _analyze_mma_operands(
     # matrices. Keep other layouts out of the shared search/planning/codegen
     # capability until their rank-3 descriptor mapping is supported.
     if leading_passthrough_block_id is not None and any(
-        operand.source_fake.stride(-1) != 1
+        operand.matrix_major != "row"
         for operand in (lhs, rhs)
         if operand.is_leading_passthrough
     ):
@@ -664,6 +722,7 @@ class _CuteMmaNode(_CuteMmaTarget):
 
     operands: _MmaOperandAnalysis
     explicit_epi_tile_compatible: bool
+    output_column_major: bool
 
     @property
     def requires_scalar_fallback(self) -> bool:
@@ -769,7 +828,10 @@ def analyze_cute_mma_node(
     if not _mma_result_can_be_deferred(node) or not _mma_loop_is_exclusive(node):
         return None
     output_store_analysis: _MmaOutputStoreAnalysis | None = None
-    if operands.has_leading_passthrough:
+    needs_output_store_analysis = operands.has_leading_passthrough or (
+        operands.lhs.trailing_transpose and operands.rhs.trailing_transpose
+    )
+    if needs_output_store_analysis:
         cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
         if isinstance(cached, _MmaOutputStoreAnalysis):
             output_store_analysis = cached
@@ -806,13 +868,18 @@ def analyze_cute_mma_node(
         out_dtype=target.out_dtype,
         operands=operands,
         explicit_epi_tile_compatible=(
-            _tcgen05_tma_matrix_major(operands.lhs.source_fake) == "row"
-            and _tcgen05_tma_matrix_major(operands.rhs.source_fake) in ("row", "col")
+            operands.lhs.matrix_major == "row"
+            and operands.rhs.matrix_major in ("row", "col")
             and (
                 output_store_analysis.explicit_epi_tile_compatible
                 if output_store_analysis is not None
                 else True
             )
+        ),
+        output_column_major=(
+            output_store_analysis.output_column_major
+            if output_store_analysis is not None
+            else False
         ),
         with_acc=target.with_acc,
         is_dot=target.is_dot,
@@ -1258,12 +1325,9 @@ def prepare_cute_collective_lane_loop_suppression(
             analysis, bm=bm, bn=bn, bk=bk
         ):
             continue
-        if (
-            len(lhs_load.users) != 1
-            or len(rhs_load.users) != 1
-            or next(iter(lhs_load.users)) is not node
-            or next(iter(rhs_load.users)) is not node
-        ):
+        if not _load_exclusively_feeds_operand(
+            lhs_load, candidate.lhs, node
+        ) or not _load_exclusively_feeds_operand(rhs_load, candidate.rhs, node):
             continue
 
         # Mirror the real codegen bailout in ``_emit_mma_pipeline`` (it returns
@@ -1340,6 +1404,7 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
+    cluster_m: int = 2
     # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
     # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
     # TMA paths must keep the guarded fallback path.
@@ -1387,6 +1452,7 @@ def _tcgen05_two_cta_owner_predicate(
     is_two_cta: bool,
     gate_exec_warp: bool,
     cluster_n: int = 1,
+    cluster_m: int = 2,
 ) -> str | None:
     """Owner-of-the-V-pair predicate for AB consumer release / MMA issuance.
 
@@ -1404,7 +1470,7 @@ def _tcgen05_two_cta_owner_predicate(
     if gate_exec_warp:
         predicate_terms.append(exec_active)
     if is_two_cta:
-        if cluster_n > 1:
+        if cluster_n > 1 or cluster_m > 2:
             predicate_terms.append(_TCGEN05_V_LEADER_PREDICATE)
         else:
             predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
@@ -1431,9 +1497,6 @@ def _build_kloop_pipeline_producer_if(
     """
     assert args.use_tma_a and args.use_tma_b, (
         "pipelined branch requires both A and B to be TMA-loaded"
-    )
-    assert not (args.static_full_tiles and args.is_two_cta), (
-        "static-full fast path is only valid for one-CTA pipelined TMA loops"
     )
     k_offset = f"{args.tma_k_tile} + cutlass.Int32({args.ab_stage_count})"
     predicate_terms = []
@@ -1477,13 +1540,13 @@ def _build_kloop_pipeline_consumer_if(
     include_scalar_fallback: bool = True,
     use_existing_try_token: bool = False,
     sync_before_scalar_fallback: bool = False,
+    owner_already_gated: bool = False,
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
+        assert gate_exec_warp or owner_already_gated, (
+            "static-full fast path requires an exec-warp or outer-owner gate"
         )
-        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
         )
@@ -1503,14 +1566,18 @@ def _build_kloop_pipeline_consumer_if(
             f"{args.tma_pipeline}.consumer_wait("
             f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
         )
-    full_tile_src = _tcgen05_emit_optional_gate(
-        consumer_src,
-        _tcgen05_two_cta_owner_predicate(
+    owner_predicate = None
+    if not owner_already_gated:
+        owner_predicate = _tcgen05_two_cta_owner_predicate(
             args.exec_active,
             is_two_cta=args.is_two_cta,
             gate_exec_warp=gate_exec_warp,
             cluster_n=args.cluster_n,
-        ),
+            cluster_m=args.cluster_m,
+        )
+    full_tile_src = _tcgen05_emit_optional_gate(
+        consumer_src,
+        owner_predicate,
         indent="" if args.static_full_tiles else "    ",
     )
     if args.static_full_tiles:
@@ -1537,16 +1604,20 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
     args: _PerKiterTmaArgs,
     *,
     gate_exec_warp: bool = True,
+    owner_already_gated: bool = False,
 ) -> list[ast.stmt]:
     """Peek the next AB full barrier after advancing the consumer state."""
     assert args.is_two_cta, "AB consumer prefetch is validated for CtaGroup.TWO"
     predicate = args.tma_next_consumer_tile
-    owner_predicate = _tcgen05_two_cta_owner_predicate(
-        args.exec_active,
-        is_two_cta=args.is_two_cta,
-        gate_exec_warp=gate_exec_warp,
-        cluster_n=args.cluster_n,
-    )
+    owner_predicate = None
+    if not owner_already_gated:
+        owner_predicate = _tcgen05_two_cta_owner_predicate(
+            args.exec_active,
+            is_two_cta=args.is_two_cta,
+            gate_exec_warp=gate_exec_warp,
+            cluster_n=args.cluster_n,
+            cluster_m=args.cluster_m,
+        )
     if owner_predicate is not None:
         predicate = f"{predicate} and {owner_predicate}"
     return [
@@ -1564,6 +1635,7 @@ def _build_kloop_pipeline_release_if(
     *,
     gate_exec_warp: bool = True,
     include_scalar_fallback: bool = True,
+    owner_already_gated: bool = False,
 ) -> ast.stmt:
     """Per-K-iter consumer release ``if`` for the pipelined branch.
 
@@ -1575,23 +1647,25 @@ def _build_kloop_pipeline_release_if(
     multicast mask; separate peer arrivals over-count the empty barrier.
     """
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
+        assert gate_exec_warp or owner_already_gated, (
+            "static-full fast path requires an exec-warp or outer-owner gate"
         )
-        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
         )
     release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
-    release_gate = _tcgen05_two_cta_owner_predicate(
-        args.exec_active,
-        is_two_cta=args.is_two_cta,
-        gate_exec_warp=gate_exec_warp,
-        cluster_n=args.cluster_n,
-    )
+    release_gate = None
+    if not owner_already_gated:
+        release_gate = _tcgen05_two_cta_owner_predicate(
+            args.exec_active,
+            is_two_cta=args.is_two_cta,
+            gate_exec_warp=gate_exec_warp,
+            cluster_n=args.cluster_n,
+            cluster_m=args.cluster_m,
+        )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
     indent = "" if args.static_full_tiles else "    "
-    if args.is_two_cta:
+    if args.is_two_cta and not owner_already_gated:
         # With gate_exec_warp=False the caller is already inside the
         # role-local exec loop, so every iteration can advance local state.
         advance_gate = args.exec_active if gate_exec_warp else None
@@ -1605,6 +1679,25 @@ def _build_kloop_pipeline_release_if(
             release_src + "\n" + advance_src, release_gate, indent=indent
         )
     if args.static_full_tiles:
+        if args.is_two_cta and gate_exec_warp and not owner_already_gated:
+            owner_gate = _tcgen05_two_cta_owner_predicate(
+                args.exec_active,
+                is_two_cta=True,
+                gate_exec_warp=False,
+                cluster_n=args.cluster_n,
+                cluster_m=args.cluster_m,
+            )
+            assert owner_gate is not None
+            full_tile_src = (
+                f"if {args.exec_active}:\n"
+                f"    if {owner_gate}:\n"
+                f"        {release_src}\n" + textwrap.indent(advance_src, "    ")
+            )
+        elif owner_already_gated:
+            # Keep the release and state advance in one AST statement. The
+            # compile-time-true wrapper disappears during CuTe lowering.
+            full_tile_src = textwrap.indent(release_src + "\n" + advance_src, "    ")
+            full_tile_src = f"if True:\n{full_tile_src}"
         return statement_from_string(full_tile_src)
     fallback_src = (
         "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
@@ -1620,6 +1713,7 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    cluster_m: int = 2,
 ) -> ast.stmt:
     reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
     predicate = _tcgen05_two_cta_owner_predicate(
@@ -1627,6 +1721,7 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
         is_two_cta=is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=cluster_n,
+        cluster_m=cluster_m,
     )
     if predicate is None:
         return statement_from_string(reset_src)
@@ -1644,6 +1739,8 @@ def _build_tcgen05_mma_issue_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    cluster_m: int = 2,
+    owner_already_gated: bool = False,
 ) -> ast.stmt:
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
@@ -1656,12 +1753,15 @@ def _build_tcgen05_mma_issue_stmt(
         "    )\n"
         f"    {tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)"
     )
-    predicate = _tcgen05_two_cta_owner_predicate(
-        exec_active,
-        is_two_cta=is_two_cta,
-        gate_exec_warp=gate_exec_warp,
-        cluster_n=cluster_n,
-    )
+    predicate = None
+    if not owner_already_gated:
+        predicate = _tcgen05_two_cta_owner_predicate(
+            exec_active,
+            is_two_cta=is_two_cta,
+            gate_exec_warp=gate_exec_warp,
+            cluster_n=cluster_n,
+            cluster_m=cluster_m,
+        )
     if predicate is not None:
         issue_src = f"if {predicate}:\n{textwrap.indent(issue_src, '    ')}"
     return statement_from_string(issue_src)
@@ -2055,6 +2155,7 @@ def _analyze_mma_output_stores(
         return None
     env = CompileEnvironment.current()
     explicit_epi_tile_compatible = True
+    output_column_major: bool | None = None
     for store, chain in analyzed_stores:
         tensor_node = store.args[0] if store.args else None
         tensor_fake = (
@@ -2076,8 +2177,18 @@ def _analyze_mma_output_stores(
             tensor_fake.dtype == analysis.lhs.source_fake.dtype
             and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_steps)
         )
+        strides = tensor_fake.stride()
+        shape = tensor_fake.shape
+        store_column_major = (
+            tensor_fake.ndim >= 2 and strides[-2] == 1 and strides[-1] == shape[-2]
+        )
+        if output_column_major is None:
+            output_column_major = store_column_major
+        elif output_column_major != store_column_major:
+            return None
     return _MmaOutputStoreAnalysis(
-        explicit_epi_tile_compatible=explicit_epi_tile_compatible
+        explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        output_column_major=bool(output_column_major),
     )
 
 
@@ -2153,8 +2264,8 @@ def _emit_mma_pipeline(
         torch.bfloat16,
         torch.float8_e4m3fn,
     )
-    _lhs_major = _tcgen05_tma_matrix_major(lhs_fake)
-    _rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
+    _lhs_major = lhs_operand.matrix_major
+    _rhs_major = rhs_operand.matrix_major
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
     # layout Helion emits expects the standard row-major A. Only B's major
     # mode is made layout-aware here.
@@ -2494,6 +2605,12 @@ def _emit_mma_pipeline(
             not tcgen05_requested_two_cta and m_size // bm < tcgen05_cluster_m
         ):
             tcgen05_cluster_m = 1
+        elif (
+            tcgen05_requested_two_cta
+            and tcgen05_cluster_m == 4
+            and ((m_size + bm - 1) // bm) % 2 != 0
+        ):
+            tcgen05_cluster_m = 2
     assert tcgen05_cluster_m == 1 or bm >= 128
     tcgen05_is_two_cta = tcgen05_requested_two_cta and tcgen05_cluster_m > 1
     # ``tcgen05_cluster_n`` is the multicast factor along the cluster's N
@@ -2519,6 +2636,53 @@ def _emit_mma_pipeline(
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    role_scheduler_cluster_cap = df.config.get(
+        TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY
+    )
+    if df.config.get(TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY, False):
+        one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
+        one_shot_n_slots = n_size // bn
+        one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
+        if not (
+            tcgen05_pid_is_persistent
+            and tcgen05_static_full_tiles
+            and input_dtype == torch.float8_e4m3fn
+            and not analysis.has_leading_passthrough
+            and role_scheduler_cluster_cap is None
+            and one_shot_work_ctas <= TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS
+            and one_shot_m_slots % tcgen05_cluster_m == 0
+            and one_shot_n_slots % tcgen05_cluster_n == 0
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY}=True requires a "
+                "static-full, unbatched persistent FP8 grid without a role "
+                "scheduler cluster cap and with at most "
+                f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS} work CTAs",
+            )
+    if role_scheduler_cluster_cap is not None:
+        role_scheduler_cluster_cap = int(role_scheduler_cluster_cap)
+        scheduler_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
+        scheduler_n_slots = n_size // bn
+        scheduler_cluster_size = tcgen05_cluster_m * tcgen05_cluster_n
+        scheduler_work_clusters = (scheduler_m_slots // tcgen05_cluster_m) * (
+            scheduler_n_slots // tcgen05_cluster_n
+        )
+        if not (
+            tcgen05_pid_is_persistent
+            and tcgen05_static_full_tiles
+            and input_dtype == torch.float8_e4m3fn
+            and scheduler_m_slots % tcgen05_cluster_m == 0
+            and scheduler_n_slots % tcgen05_cluster_n == 0
+            and role_scheduler_cluster_cap <= scheduler_work_clusters
+            and role_scheduler_cluster_cap * scheduler_cluster_size
+            <= TCGEN05_ONE_SHOT_ROLE_SCHEDULER_MAX_CTAS
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY} requires an "
+                "static-full persistent FP8 cluster grid within residency",
+            )
     tcgen05_role_local_k_tail_tma = (
         tcgen05_preserve_tma_for_two_cta_k_tail
         and tcgen05_is_two_cta
@@ -2623,10 +2787,7 @@ def _emit_mma_pipeline(
         else "cutlass.pipeline"
     )
     tcgen05_static_full_tma_fast_path = (
-        tcgen05_static_full_tiles
-        and tcgen05_use_tma_pipeline
-        and not tcgen05_is_two_cta
-        and not tcgen05_use_role_local_mma_exec
+        tcgen05_static_full_tiles and tcgen05_use_tma_pipeline
     )
     tcgen05_acc_producer_mode = df.config.get(
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
@@ -2817,10 +2978,8 @@ def _emit_mma_pipeline(
         mma_impl == "tcgen05"
         and fx_node is not None
         and cg.current_grid_state is not None
-        and len(lhs_load.users) == 1
-        and len(rhs_load.users) == 1
-        and next(iter(lhs_load.users)) is fx_node
-        and next(iter(rhs_load.users)) is fx_node
+        and _load_exclusively_feeds_operand(lhs_load, candidate.lhs, fx_node)
+        and _load_exclusively_feeds_operand(rhs_load, candidate.rhs, fx_node)
     )
     if tcgen05_collective_handles_operand_loads:
         cute_state = df.cute_state
@@ -2983,6 +3142,7 @@ def _emit_mma_pipeline(
                 is_two_cta=tcgen05_is_two_cta,
                 gate_exec_warp=False,
                 cluster_n=tcgen05_cluster_n,
+                cluster_m=tcgen05_cluster_m,
             )
             assert ab_consumer_prefetch_owner_predicate is not None
             _emit_per_tile(
@@ -3018,6 +3178,7 @@ def _emit_mma_pipeline(
             tiled_mma=tiled_mma,
             is_two_cta=tcgen05_is_two_cta,
             cluster_n=tcgen05_cluster_n,
+            cluster_m=tcgen05_cluster_m,
         )
         prefix.append(reset_accumulate_stmt)
         per_tile_stmts.append(reset_accumulate_stmt)
@@ -3058,7 +3219,7 @@ def _emit_mma_pipeline(
     #   - cluster_m=2 cluster_n=2 V=2: 2 + 1 - 1 = 2 (the cluster_n=2 fix)
     #   - cluster_m=1 cluster_n=1 V=1 (no use_2cta): 1 (collapses to single
     #     CTA; no multicast)
-    if tcgen05_is_two_cta and tcgen05_cluster_n > 1:
+    if tcgen05_is_two_cta and (tcgen05_cluster_m > 2 or tcgen05_cluster_n > 1):
         # V=2 absorbs cluster_m into the cluster_layout_vmnk V dim; the
         # post-V CTAs along M (= cluster_m // V) carry the B multicast,
         # while cluster_n CTAs along N carry the A multicast.
@@ -3297,27 +3458,48 @@ def _emit_mma_pipeline(
         explicit_epi_tile_dtype_ok = (
             input_dtype == torch.bfloat16 and epi_elem_dtype_str == "cutlass.BFloat16"
         ) or (input_dtype == torch.float16 and epi_elem_dtype_str == "cutlass.Float16")
+        fp8_m64_explicit_epi_tile = (
+            tcgen05_static_full_tiles
+            and not tcgen05_is_two_cta
+            and input_dtype == torch.float8_e4m3fn
+            and epi_elem_dtype_str == "cutlass.BFloat16"
+            and (m_size, bm) == (64, 64)
+            and bn in (16, 32, 64, 128)
+            and (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+            == (64, min(bn, 64), min(bn, 64))
+            and all(d.broadcast_axis in (1, 2) for d in aux_tensor_descriptors_value)
+        )
         if explicit_epi_tile_requested:
             if not (
-                tcgen05_static_full_tiles
-                and tcgen05_is_two_cta
-                and bm == TCGEN05_TWO_CTA_BLOCK_M
-                and bn == TCGEN05_TWO_CTA_BLOCK_N
-                and explicit_epi_tile_dtype_ok
-                and aux_descriptors_compatible_with_explicit_epi_tile
+                fp8_m64_explicit_epi_tile
+                or (
+                    tcgen05_static_full_tiles
+                    and tcgen05_is_two_cta
+                    and bm == TCGEN05_TWO_CTA_BLOCK_M
+                    and bn == TCGEN05_TWO_CTA_BLOCK_N
+                    and explicit_epi_tile_dtype_ok
+                    and aux_descriptors_compatible_with_explicit_epi_tile
+                )
             ):
                 raise exc.BackendUnsupported(
                     "cute",
                     "explicit tcgen05 epilogue tile overrides are validated only "
-                    "for static-full 16-bit (bf16/fp16) pure matmul CtaGroup.TWO "
-                    "kernels (rank-1 rowvec aux tensors admitted for the bias "
-                    "envelope)",
+                    "for the static-full 16-bit (bf16/fp16) CtaGroup.TWO "
+                    "envelope or the scaled FP8 M64 CtaGroup.ONE envelope",
                 )
             if (
-                tcgen05_explicit_epi_tile_m,
-                tcgen05_explicit_epi_tile_n,
-                tcgen05_explicit_d_store_box_n,
-            ) != _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE:
+                not fp8_m64_explicit_epi_tile
+                and (
+                    tcgen05_explicit_epi_tile_m,
+                    tcgen05_explicit_epi_tile_n,
+                    tcgen05_explicit_d_store_box_n,
+                )
+                != _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE
+            ):
                 raise exc.BackendUnsupported(
                     "cute",
                     "explicit tcgen05 epilogue tile is currently validated only "
@@ -3410,6 +3592,7 @@ def _emit_mma_pipeline(
             is_two_cta=tcgen05_is_two_cta,
             gate_exec_warp=True,
             cluster_n=tcgen05_cluster_n,
+            cluster_m=tcgen05_cluster_m,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.cute_state.register_tcgen05_matmul_plan(tcgen05_matmul_plan)
@@ -3664,7 +3847,7 @@ def _emit_mma_pipeline(
                     f"{mma_slice_linear} = "
                     + (
                         "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
-                        f"% cutlass.Int32({tcgen05_cluster_m})"
+                        "% cutlass.Int32(2)"
                         if tcgen05_cluster_m > 1
                         else "cutlass.Int32(0)"
                     )
@@ -3731,6 +3914,7 @@ def _emit_mma_pipeline(
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
                 b_k_major=tcgen05_b_k_major,
+                output_column_major=candidate.output_column_major,
             )
         )
         prefix.append(
@@ -4264,14 +4448,13 @@ def _emit_mma_pipeline(
     def _tcgen05_tma_tile_predicate(
         *, k_tile_start_expr: str, full_tile_end_expr: str
     ) -> str:
-        return (
-            _tcgen05_tma_output_tile_predicate()
-            + "and "
-            + _tcgen05_tma_k_tile_predicate(
-                k_tile_start_expr=k_tile_start_expr,
-                full_tile_end_expr=full_tile_end_expr,
-            )
+        k_predicate = _tcgen05_tma_k_tile_predicate(
+            k_tile_start_expr=k_tile_start_expr,
+            full_tile_end_expr=full_tile_end_expr,
         )
+        if tcgen05_static_full_tma_fast_path:
+            return k_predicate
+        return _tcgen05_tma_output_tile_predicate() + "and " + k_predicate
 
     tma_k_tile = df.new_var("tcgen05_tma_k_tile")
     tma_barrier_ptr = df.new_var("tcgen05_tma_barrier")
@@ -4351,6 +4534,10 @@ def _emit_mma_pipeline(
             # to the golden.
             if tcgen05_b_k_major:
                 ab_tma_plan["b_k_major"] = True
+            if lhs_operand.trailing_transpose:
+                ab_tma_plan["lhs_trailing_transpose"] = True
+            if rhs_operand.trailing_transpose:
+                ab_tma_plan["rhs_trailing_transpose"] = True
             if lhs_operand.is_leading_passthrough:
                 ab_tma_plan["lhs_leading_passthrough"] = True
             if rhs_operand.is_leading_passthrough:
@@ -4381,6 +4568,13 @@ def _emit_mma_pipeline(
             if tcgen05_matmul_plan.is_clc_persistent:
                 ab_tma_plan["use_pdl"] = True
             cg.cute_wrapper_plans.append(ab_tma_plan)
+            prefix.append(
+                statement_from_string(
+                    f"if {tma_warp}:\n"
+                    f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_a})\n"
+                    f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_b})"
+                )
+            )
         prefix.append(
             statement_from_string(
                 f"{smem_a_ptr} = cute.arch.alloc_smem("
@@ -5010,6 +5204,7 @@ def _emit_mma_pipeline(
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
+                cluster_m=tcgen05_cluster_m,
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
             )
             if tcgen05_use_tma_pipeline:
@@ -5065,6 +5260,12 @@ def _emit_mma_pipeline(
                     assert mma_stage_stmt is not None
                     assert smem_a_mma_stmt is not None
                     assert smem_b_mma_stmt is not None
+                    outer_owner_gated_exec = (
+                        tcgen05_static_full_tma_fast_path
+                        and tcgen05_is_two_cta
+                        and tcgen05_cluster_m == 2
+                        and tcgen05_cluster_n == 1
+                    )
                     exec_loop_body: list[ast.stmt] = [
                         mma_stage_stmt,
                         smem_a_mma_stmt,
@@ -5092,13 +5293,10 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
-                            # Static-full pipeline builders require their
-                            # internal exec gate to keep emitting a single
-                            # statement. The outer wrapper below makes the
-                            # cloned loop's role ownership explicit.
                             gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                             use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
+                            owner_already_gated=outer_owner_gated_exec,
                         )
                     )
                     if not diagnose_skip_umma_issue:
@@ -5116,20 +5314,19 @@ def _emit_mma_pipeline(
                                 tcgen05_frag_a=tcgen05_frag_a,
                                 tcgen05_frag_b=tcgen05_frag_b,
                                 mma_stage=mma_stage,
-                                # See the consumer wait comment above: pure
-                                # lifecycle has an outer exec-active role
-                                # wrapper plus the static-full builder gate.
                                 gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
+                                cluster_m=tcgen05_cluster_m,
+                                owner_already_gated=outer_owner_gated_exec,
                             )
                         )
                     exec_loop_body.append(
                         _build_kloop_pipeline_release_if(
                             tma_kloop_args,
-                            # See the consumer wait comment above.
                             gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
+                            owner_already_gated=outer_owner_gated_exec,
                         )
                     )
                     if tcgen05_use_role_local_ab_consumer_prefetch:
@@ -5137,6 +5334,7 @@ def _emit_mma_pipeline(
                             _build_kloop_pipeline_consumer_prefetch_stmts(
                                 tma_kloop_args,
                                 gate_exec_warp=False,
+                                owner_already_gated=outer_owner_gated_exec,
                             )
                         )
                     exec_loop = _clone_k_loop_with_body(
@@ -5148,15 +5346,23 @@ def _emit_mma_pipeline(
                             else None
                         ),
                     )
-                    exec_stmt: ast.stmt = exec_loop
+                    exec_role_stmt: ast.stmt = exec_loop
+                    if outer_owner_gated_exec:
+                        # Only the V-leader consumes AB stages and issues UMMA.
+                        # Keep the follower out of the cloned K loop entirely;
+                        # its per-tile accumulator state still advances below.
+                        exec_role_stmt = _wrap_stmt_in_if(
+                            exec_loop, _TCGEN05_CLUSTER_LEADER_PREDICATE
+                        )
+                    exec_stmt = exec_role_stmt
                     if tcgen05_use_pure_matmul_role_lifecycle:
                         exec_stmt = _wrap_stmt_in_if(
-                            exec_loop, tcgen05_plan.exec_active
+                            exec_role_stmt, tcgen05_plan.exec_active
                         )
                     prefix.append(exec_stmt)
                     per_tile_stmts.append(exec_stmt)
                     if tcgen05_use_role_local_mma_exec:
-                        mma_exec_role_stmts.append(exec_loop)
+                        mma_exec_role_stmts.append(exec_role_stmt)
                 else:
                     cg.add_statement(
                         statement_from_string(
@@ -5297,6 +5503,7 @@ def _emit_mma_pipeline(
                             mma_stage=mma_stage,
                             is_two_cta=tcgen05_is_two_cta,
                             cluster_n=tcgen05_cluster_n,
+                            cluster_m=tcgen05_cluster_m,
                         )
                     )
                 if tcgen05_use_tma:
@@ -5476,6 +5683,7 @@ def _emit_mma_pipeline(
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
                 explicit_d_store_box_n=tcgen05_explicit_d_store_box_n,
+                output_column_major=candidate.output_column_major,
             ),
         )
         if tcgen05_pure_matmul_object is not None:
@@ -5574,7 +5782,7 @@ def _tcgen05_config_int(config: object, key: str, default: int) -> int:
 
 
 def _tcgen05_cluster_m(config: object) -> int:
-    return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
+    return max(1, min(4, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
 
 
 def _tcgen05_cluster_n(config: object) -> int:
@@ -5616,7 +5824,7 @@ def _tcgen05_use_2cta_instrs(
     # the f16/bf16 bm=128 + cluster_m=2 config point is owned by the legacy
     # clustered CTA-local CtaGroup.ONE family (guarded diagnostic bridge and
     # multi-tile runtime guard).
-    if cluster_m != 2:
+    if cluster_m not in (2, 4):
         return False
     if bm == TCGEN05_TWO_CTA_BLOCK_M:
         return True
@@ -5700,7 +5908,7 @@ def _mma_impl_matches_problem_shape(
         # budget sane; the explicit G4 proof key admits only the smallest
         # 512-N candidate.
         mma_k = 32 if is_fp8 else 16
-        if bk < mma_k or bk > 256 or bk % mma_k != 0:
+        if bk < mma_k or bk > 512 or bk % mma_k != 0:
             return False
         if bm in (64, 128):
             return True
@@ -5981,6 +6189,7 @@ def _make_tcgen05_layout_plan_setup(
     explicit_epi_tile_m: int | None = None,
     explicit_epi_tile_n: int | None = None,
     b_k_major: bool = False,
+    output_column_major: bool = False,
 ) -> list[ast.AST]:
     # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
     # equal to the eventual D-output dtype so the helper takes the
@@ -6016,7 +6225,11 @@ def _make_tcgen05_layout_plan_setup(
         bn=bn,
         is_two_cta=is_two_cta,
         elem_dtype=epi_elem_dtype_str,
-        c_layout=plan.c_layout,
+        c_layout=(
+            "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+            if output_column_major
+            else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
+        ),
         explicit_expr=explicit_epi_tile_expr,
     )
     return [
@@ -6029,7 +6242,8 @@ def _make_tcgen05_layout_plan_setup(
             f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='b', swizzle_override=smem_swizzle_b, b_k_major=b_k_major)}"
         ),
         statement_from_string(
-            f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
+            f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum."
+            f"{'COL_MAJOR' if output_column_major else 'ROW_MAJOR'}"
         ),
         statement_from_string(f"{plan.epi_tile} = {epi_tile_expr}"),
         statement_from_string(

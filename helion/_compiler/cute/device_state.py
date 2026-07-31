@@ -53,6 +53,7 @@ class CuteTcgen05StoreValue:
     explicit_epi_tile_m: int | None = None
     explicit_epi_tile_n: int | None = None
     explicit_d_store_box_n: int | None = None
+    output_column_major: bool = False
 
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:
