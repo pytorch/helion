@@ -3,9 +3,10 @@
 ## Summary
 
 Improve Blackwell CuTe scaled-FP8 matmul code generation and extend the
-production benchmark from 17 to 33 shapes. The added `M=2/8/16/32` shapes now
-use tensor cores instead of the scalar skinny-M fallback, and Helion is faster
-than CUTLASS on every shape in the complete GB200 sweep.
+production benchmark from 17 to 45 shapes. The added `M=2/8/16/32` shapes now
+use tensor cores instead of the scalar skinny-M fallback. The latest 12 shapes
+use FP8 `(K, N)` pairs from vLLM's H100 `scaled_mm` configuration in
+vllm-project/vllm#46522.
 
 ## Codegen optimizations
 
@@ -57,8 +58,12 @@ than CUTLASS on every shape in the complete GB200 sweep.
   `M=32`.
 - Use persistent-interleaved scheduling for `(2, 4096, 256)` and
   persistent-blocked scheduling for the other new shapes.
-- Add exact AOT table entries for all 16 new shapes while preserving the
+- Add exact AOT table entries for all 28 new shapes while preserving the
   existing M64, M512, and 4096-square configurations.
+- Add `(2048, 12288)`, `(5120, 5120)`, and `(6144, 2048)` vLLM weight shapes
+  at each of `M=2/8/16/32`.
+- Use `64x32x256` with a seven-stage A/B pipeline for the new M=32 rows; this
+  improves that subset from 0.96-1.00x to 1.02-1.04x versus CUTLASS.
 
 ## Performance
 
@@ -68,26 +73,30 @@ Tested on NVIDIA GB200 with cold-L2 CUDA-graph timing:
 python pretuned_kernels/scale_mm_cute/scale_mm_cute.py
 ```
 
-Final complete sweep:
+Latest complete 45-shape sweep:
 
-- Helion vs CUTLASS: **33/33 wins**, 1.036x geomean
-- Helion vs torch: **33/33 wins**, 1.446x geomean
-- Helion vs best baseline: **33/33 wins**, 1.034x geomean
+- Helion vs CUTLASS: **44/45 wins**, 1.040x geomean
+- Helion vs torch: **45/45 wins**, 1.434x geomean
+- Helion vs best baseline: **44/45 wins**, 1.039x geomean
+
+The 12 vLLM-derived additions are **12/12 wins** versus CUTLASS with a 1.060x
+geomean. The only full-sweep miss is the pre-existing `(2, 4096, 256)` row at
+0.99x in that run; five isolated reruns ranged from 0.999x to 1.015x.
 
 Representative new shapes:
 
 | M | K | N | Helion (us) | CUTLASS (us) | Speedup |
 |---:|---:|---:|---:|---:|---:|
-| 2 | 4096 | 256 | 4.84 | 4.87 | 1.01x |
-| 8 | 4096 | 4096 | 6.78 | 6.99 | 1.03x |
-| 16 | 2048 | 4096 | 5.05 | 5.30 | 1.05x |
-| 32 | 4096 | 256 | 5.15 | 5.43 | 1.05x |
+| 2 | 2048 | 12288 | 8.16 | 8.40 | 1.03x |
+| 8 | 6144 | 2048 | 7.24 | 7.86 | 1.09x |
+| 16 | 5120 | 5120 | 8.02 | 8.45 | 1.05x |
+| 32 | 2048 | 12288 | 8.21 | 9.10 | 1.11x |
 
 ## Verification
 
-- Explicit correctness checks passed against `torch._scaled_mm` for all 16 new
+- Explicit correctness checks passed against `torch._scaled_mm` for all 28 new
   shapes (`rtol=0.03`, `atol=0.03`).
-- The complete 33-shape performance sweep completed successfully.
+- The complete 45-shape performance sweep completed successfully.
 - Added regression coverage for FP8 small-N persistent search and narrow SIMT
   epilogue load/wait ordering.
 - Six focused planner, codegen-ordering, and GPU edge-correctness tests pass.
