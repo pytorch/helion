@@ -22,6 +22,7 @@ from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .config import Config as Config
 from .kernel import Kernel as Kernel
+from .kernel import OutputCodeOptions as OutputCodeOptions
 from .kernel import kernel as kernel
 from .pallas.launcher import default_pallas_launcher as default_pallas_launcher
 from .settings import is_pallas_interpret as _module_is_pallas_interpret
