@@ -106,12 +106,20 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         if not allow_narrowing:
             raise exc.InvalidIndexingType(repr(val))
         if isinstance(val, int):
-            # A constant index drops the dimension.
+            # A constant index drops the dimension.  Negative indices would
+            # count from the end at codegen while the shape recorded here
+            # cannot see the dimension's size, so they are rejected.
+            if val < 0:
+                raise exc.InvalidIndexingType(repr(val))
             input_size.popleft()
         elif isinstance(val, slice):
             if val.step not in (None, 1) or not isinstance(val.start, int):
                 raise exc.InvalidIndexingType(repr(val))
             if not isinstance(val.stop, int) or val.stop <= val.start:
+                raise exc.InvalidIndexingType(repr(val))
+            # A negative bound is clipped against the dimension at codegen,
+            # which would not match ``stop - start`` recorded here.
+            if val.start < 0 or val.stop < 0:
                 raise exc.InvalidIndexingType(repr(val))
             input_size.popleft()
             output_size.append(val.stop - val.start)
