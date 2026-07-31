@@ -8,6 +8,12 @@ name: Benchmark Pretuned Dispatch
 # dispatches this workflow with run_h100/run_b200 set.
 
 on:
+  # TEMP (PR #3000 debug): run the b200 pretuned sweep on every push to the
+  # debug branch so we can iterate on the scale_mm_cute SMEM failure without a
+  # manual dispatch. Remove before merge.
+  push:
+    branches:
+      - fix_pretuned_bench
   workflow_dispatch:
     inputs:
       run_h100:
@@ -33,7 +39,9 @@ on:
 
 jobs:
   run-h100:
-    if: ${{ github.event.inputs.run_h100 == 'true' }}
+    # Skip H100 on the debug push (only b200 reproduces the scale_mm_cute SMEM
+    # failure); still honor the manual dispatch input otherwise.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_h100 == 'true' }}
     uses: ./.github/workflows/benchmark_pretuned.yml
     permissions:
       id-token: write
@@ -49,7 +57,8 @@ jobs:
       env-vars: ${{ github.event.inputs.env_vars || '' }}
 
   run-b200:
-    if: ${{ github.event.inputs.run_b200 == 'true' }}
+    # Runs on the debug push (event_name==push) OR when dispatched with run_b200.
+    if: ${{ github.event_name == 'push' || github.event.inputs.run_b200 == 'true' }}
     uses: ./.github/workflows/benchmark_pretuned.yml
     permissions:
       id-token: write
@@ -58,11 +67,23 @@ jobs:
       runner: linux.dgx.b200
       python-version: "3.12"
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
-      runtime-version: cu130
+      # On the debug push, pull the cu132 torch 2.12 wheel (CUDA 13.2
+      # nvjitlink/nvrtc) to test whether the newer toolkit fixes the
+      # scale_mm_cute static-SMEM ptxas rejection; else keep the cu130/2.11
+      # baseline the nightly/dispatch path uses.
+      runtime-version: ${{ github.event_name == 'push' && 'cu132' || 'cu130' }}
+      torch-spec: ${{ github.event_name == 'push' && 'torch==2.12.*' || 'torch==2.11.*' }}
+      # Skip vLLM on the debug push: its nightly wheel pins torch 2.11 and would
+      # downgrade the cu132/2.12 toolkit we're testing back to cu130. But vLLM
+      # is also what transitively pulls in nvidia-cutlass-dsl, so install the
+      # pinned DSL explicitly when vLLM is skipped.
+      install-vllm: ${{ github.event_name != 'push' }}
+      install-cute: ${{ github.event_name == 'push' }}
       container-options: --gpus all
       alias: b200
-      kernels: ${{ github.event.inputs.kernels || '' }}
-      env-vars: ${{ github.event.inputs.env_vars || '' }}
+      # On the debug push, scope to just scale_mm_cute for a fast iteration loop.
+      kernels: ${{ github.event_name == 'push' && 'scale_mm_cute' || github.event.inputs.kernels || '' }}
+      env-vars: ${{ github.event_name == 'push' && '' || github.event.inputs.env_vars || '' }}
 
   trigger-docs-deploy:
     if: always()

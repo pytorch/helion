@@ -21,6 +21,28 @@ on:
       runtime-version:
         required: true
         type: string
+      torch-spec:
+        # pip/uv spec for torch. Default pins 2.11 (the version vLLM nightly
+        # expects). Overridable so the b200 debug path can pull a newer CUDA
+        # toolkit wheel (e.g. cu132 -> torch 2.12), which fixes the cute
+        # dynamic-opt-in-SMEM lowering that CUDA 13.0 mis-emits as static.
+        required: false
+        type: string
+        default: "torch==2.11.*"
+      install-vllm:
+        # vLLM nightly pins torch==2.11.0, so it downgrades a non-default
+        # torch-spec (e.g. cu132/2.12) out from under us. Set false to keep the
+        # requested torch toolkit (baselines then fall back to torch-native).
+        required: false
+        type: boolean
+        default: true
+      install-cute:
+        # Explicitly install the pinned nvidia-cutlass-dsl ([cute] extra) via
+        # scripts/install_cute.sh. Needed when vLLM (which otherwise pulls it in
+        # transitively) is skipped. Default false to preserve the normal path.
+        required: false
+        type: boolean
+        default: false
       container-options:
         required: true
         type: string
@@ -93,7 +115,7 @@ jobs:
 
           # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
           PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "${{ inputs.torch-spec }}" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
@@ -102,13 +124,24 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
+      - name: Install CuTe DSL
+        # The cute backend's nvidia-cutlass-dsl lives in the [cute] extra, not
+        # [dev]. The normal path gets it transitively via vLLM; when vLLM is
+        # skipped (e.g. testing a non-2.11 torch toolkit) install the pinned DSL
+        # explicitly so the cute kernels can compile.
+        if: ${{ startsWith(inputs.image, 'nvidia') && inputs.install-cute }}
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh cu13
+          python -c "import cutlass; print('cutlass dsl', cutlass.__version__)"
+
       - name: Install vLLM (optional baseline)
         # vLLM supplies the production baselines the pretuned kernels compare
         # against (torch.ops._C.* quant ops, cutlass_scaled_mm). vLLM's nightly
         # wheel pins torch==2.11.0, matching the torch installed above. This is
         # non-fatal: if it fails, pretuned_kernels/run.py falls back to the
         # torch-native baselines.
-        if: startsWith(inputs.image, 'nvidia')
+        if: ${{ startsWith(inputs.image, 'nvidia') && inputs.install-vllm }}
         continue-on-error: true
         run: |
           source .venv/bin/activate
