@@ -19,6 +19,7 @@ from torch.testing._internal.common_utils import parametrize
 import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import _bound_test_config
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasInterpret
@@ -900,6 +901,23 @@ class TestPallas(TestCase):
         # (1) the lowering emits the divide-and-filter helper, not jax.lax.top_k
         self.assertIn("_helion_divide_filter_topk", code)
         self.assertNotIn("lax.top_k", code)
+        # (1b) regular output imports the helper from helion; the module parses.
+        self.assertIn(
+            "from helion._compiler.pallas.topk_impl import divide_filter_topk", code
+        )
+        ast.parse(code)
+        # (1c) the dependency-free output embeds the helper source instead (no helion
+        # import) so the standalone is self-contained, and the embed still parses.
+        bound = _topk_pallas_kernel.bind((x, _TOPK_TEST_K))
+        free = bound.to_code(
+            _bound_test_config(bound, block_sizes=[8]),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+        self.assertIn("def divide_filter_topk(", free)
+        self.assertIn("_helion_divide_filter_topk = divide_filter_topk", free)
+        self.assertNotIn("from helion._compiler.pallas.topk_impl import", free)
+        self.assertNotIn("import helion", free)
+        ast.parse(free)
         # (2) correctness vs the exact top-k
         ref_v, ref_i = torch.topk(x, _TOPK_TEST_K, dim=-1, largest=True)
         idx_c = idx.cpu()
