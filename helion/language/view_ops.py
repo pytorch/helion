@@ -65,10 +65,14 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         - :func:`~helion.language.store`: For storing tensor values
 
     Note:
-        - Only supports None and : (slice(None)) indexing
+        - Supports None and : (slice(None)) indexing on every backend
         - Used for reshaping kernel tensors by adding dimensions
         - Prefer direct indexing syntax when possible: ``tensor[None, :]``
-        - Does not support integer indexing or slicing with start/stop
+        - On the Pallas backend one index may additionally narrow a single
+          dimension: an integer, a bounded ``start:stop`` slice, a tile's
+          ``.begin`` offset, or a tile's ``.index`` run.  A bounded slice must
+          stay inside the dimension it narrows, which for a tile of a device
+          value depends on the configured block size.
     """
     raise NotInsideKernel
 

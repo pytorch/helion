@@ -1446,6 +1446,107 @@ class TestPallas(TestCase):
             out[0], x[:, 0, :, :].sum(dim=0), rtol=1e-4, atol=1e-4
         )
 
+    def test_subview_fold_declines_through_view(self) -> None:
+        """A view between the load and the subview is out of scope for folding.
+
+        The narrowing runs against the viewed shape, which the Ref lowering
+        does not track, so the load materializes and both subscripts index the
+        value.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def viewed_then_narrowed(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 1, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :][:, :, None, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        acc = acc + x_block[local.begin, :, :, :].float()
+                out[0, :, :] = acc[:, 0, :].to(out.dtype)
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(
+            viewed_then_narrowed, (x, out), pallas_loop_type="fori_loop"
+        )
+        self.assertNotIn("x_block = x.at[", code)
+        torch.testing.assert_close(out[0], x.sum(dim=0), rtol=1e-4, atol=1e-4)
+
+    def test_subview_slice_past_dimension_is_rejected(self) -> None:
+        """A bounded slice reaching past its dimension must not compile.
+
+        Python would clip the run while the traced shape would not, so the
+        value would silently disagree with the shape the graph expects.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def past_the_end(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :]
+                    acc = acc + x_block.float().sum(dim=0)
+                    acc = acc + x_block[1:10, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(Exception, "reaches past the 4-element"):
+            code_and_output(past_the_end, (x, out), pallas_loop_type="fori_loop")
+
+    def test_subview_index_through_transports(self) -> None:
+        """An index that crosses a scope boundary keeps its provenance.
+
+        Binding ``tile.index`` to a name before the branch renames it, and the
+        lowering has to see through that to emit a contiguous run rather than
+        a gather.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def named_index(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=2):
+                        rows = local.index
+                        if live >= 2:
+                            acc = acc + x_block[rows, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(named_index, (x, out), pallas_loop_type="fori_loop")
+        self.assertIn("dynamic_slice_in_dim", code)
+        self.assertNotIn("jnp.take", code)
+        torch.testing.assert_close(out[0], x.sum(dim=0), rtol=1e-4, atol=1e-4)
+
+    def test_subview_computed_index_gathers(self) -> None:
+        """A computed row vector is an ordinary gather, not a contiguous run."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def shifted_index(x: torch.Tensor, out: torch.Tensor) -> None:
+            tokens, _heads, _width = x.size()
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :]
+                    for local in hl.tile(2, block_size=2):
+                        acc = acc + x_block[local.index + 1, :, :].float().sum(dim=0)
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        expected = x[1:3].sum(dim=0) + x[5:7].sum(dim=0)
+        code, _ = code_and_output(shifted_index, (x, out), pallas_loop_type="fori_loop")
+        self.assertIn("jnp.take", code)
+        torch.testing.assert_close(out[0], expected, rtol=1e-4, atol=1e-4)
+
     def test_tile_count_inside_fori_loop(self) -> None:
         """``tile.count`` has to honour a non-zero loop begin.
 
