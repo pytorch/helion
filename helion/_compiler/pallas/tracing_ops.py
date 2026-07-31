@@ -2378,12 +2378,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size = env.block_sizes[block_id]
         # when the block_size.size is None, we cannot form a SymPy expr for the numel
         sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
-            end_var_name=None,
+            end_var_name=_get_loop_begin_and_end(state, i)[1],
             end_expr=sympy_end_expr,
         )
 
@@ -2971,12 +2971,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size = env.block_sizes[block_id]
         # when the block_size.size is None, we cannot form a SymPy expr for the numel
         sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
-            end_var_name=None,
+            end_var_name=_get_loop_begin_and_end(state, i)[1],
             end_expr=sympy_end_expr,
         )
 
