@@ -222,9 +222,15 @@ class OutputCodeOptions:
             not import ``helion`` at runtime -- the dependency-free launcher is
             inlined (and any in-kernel runtime helpers are embedded) so the only
             deps are ``torch`` + the backend DSL.
+        jax_fn: Pallas only. When ``True``, emit a module whose entrypoint operates
+            on ``jax.Array`` inputs instead of TorchTPU tensors. Orthogonal to
+            ``allow_helion_deps``: combine with ``allow_helion_deps=False`` for a
+            pure-JAX module (launch core inlined), or leave ``allow_helion_deps=True``
+            to import the launch core from helion.
     """
 
     allow_helion_deps: bool = True
+    jax_fn: bool = False
 
 
 class Kernel(Generic[_R]):
@@ -1231,36 +1237,46 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self._register_cute_grouped_static_tail_specializations()
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
-            with measure("BoundKernel.unparse"):
-                import_lines: list[str] = []
-                body_start = 0
-                for i, stmt in enumerate(root.body):
-                    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                        if not (
-                            isinstance(stmt, ast.ImportFrom)
-                            and stmt.module == "__future__"
-                        ):
-                            import_lines.append(ast.unparse(stmt))
-                        continue
-                    body_start = i
-                    break
-                else:
-                    body_start = len(root.body)
-                body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
-                ast.fix_missing_locations(body_root)
-                if options is not None and not options.allow_helion_deps:
-                    # Optional AST step: rewrite body_root (+ import_lines) into a
-                    # self-contained, helion-free module before it is unparsed.
-                    from .._compiler.output_code_utils import build_dependency_free_code
+            import_lines: list[str] = []
+            body_start = 0
+            for i, stmt in enumerate(root.body):
+                if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                    if not (
+                        isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
+                    ):
+                        import_lines.append(ast.unparse(stmt))
+                    continue
+                body_start = i
+                break
+            else:
+                body_start = len(root.body)
+            body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
+            ast.fix_missing_locations(body_root)
+        # One optional AST processing step, then the single unparse. Both rewrites run
+        # after generate_ast and outside the fake-tensor env above: jax_fn's launch
+        # capture runs the compiled kernel on *real* tensors (which specializes
+        # fake_args, so codegen must already be done); dep-free is pure-AST and
+        # unaffected by placement. jax_fn is checked first -- it spans both dep modes.
+        if options is not None and options.jax_fn:
+            from .._compiler.output_code_utils import build_jax_fn_module
+            from .._compiler.output_code_utils import capture_jax_launch_metadata
 
-                    body_root = build_dependency_free_code(
-                        self, options, import_lines, body_root
-                    )
-                body = unparse(body_root, output_origin_lines=output_origin_lines)
-                imports = "\n".join(import_lines)
-                if imports:
-                    return f"from __future__ import annotations\n\n{imports}\n\n{body}"
-                return f"from __future__ import annotations\n\n{body}"
+            jax_meta = capture_jax_launch_metadata(self, config)
+            body_root = build_jax_fn_module(
+                self, options, import_lines, body_root, jax_meta
+            )
+        elif options is not None and not options.allow_helion_deps:
+            from .._compiler.output_code_utils import build_dependency_free_code
+
+            body_root = build_dependency_free_code(
+                self, options, import_lines, body_root
+            )
+        with measure("BoundKernel.unparse"):
+            body = unparse(body_root, output_origin_lines=output_origin_lines)
+        imports = "\n".join(import_lines)
+        if imports:
+            return f"from __future__ import annotations\n\n{imports}\n\n{body}"
+        return f"from __future__ import annotations\n\n{body}"
 
     def to_triton_code(
         self,
