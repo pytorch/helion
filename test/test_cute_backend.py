@@ -5088,10 +5088,10 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.gemm(", code)
         self.assertIn("'lhs_leading_passthrough': True", code)
         self.assertIn("'rhs_leading_passthrough': True", code)
-        self.assertIn("'d_leading_passthrough': True", code)
+        self.assertNotIn("'d_leading_passthrough': True", code)
         self.assertIn("cpasync.tma_partition", code)
-        self.assertIn("tcgen05_tma_store_atom", code)
-        self.assertNotIn("cute.copy(tcgen05_simt_atom", code)
+        self.assertNotIn("tcgen05_tma_store_atom", code)
+        self.assertIn("cute.copy(tcgen05_simt_atom", code)
 
     def test_batched_baddbmm_mma_tcgen05_two_cta(self) -> None:
         # A leading-batch matmul composes with the CtaGroup.TWO cluster

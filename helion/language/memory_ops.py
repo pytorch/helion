@@ -1544,11 +1544,10 @@ def _codegen_cute_store_tcgen05_tile(
     # (those would hang waiting on a producer that has already drained) and
     # without re-emitting the matmul drain / TMEM-free teardown.
     is_secondary_store = (
-        tcgen05_value.use_tma_store_epilogue
-        and not tcgen05_value.pure_matmul_role_lifecycle
-        and df.cute_state.tcgen05_tma_store_names_already_emitted(tcgen05_value)
+        not tcgen05_value.pure_matmul_role_lifecycle
+        and df.cute_state.tcgen05_store_value_already_emitted(tcgen05_value)
     )
-    if is_secondary_store:
+    if is_secondary_store and tcgen05_value.use_tma_store_epilogue:
         tcgen05_value = dataclasses.replace(
             tcgen05_value,
             tma_store_atom=df.new_var("tcgen05_tma_store_atom"),

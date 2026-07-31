@@ -989,13 +989,14 @@ class TestCuteLowerings(unittest.TestCase):
         )
         # 4 epi + 1 exec + 1 ab_load = 6 warps, no power-of-2 round-up.
         self.assertIn("block=(64, 6, 1)", code)
-        self.assertIn("'kind': 'tcgen05_d_tma'", code)
-        self.assertIn("cutlass.pipeline.PipelineTmaStore.create", code)
+        self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
+        self.assertNotIn("cutlass.pipeline.PipelineTmaStore.create", code)
         self.assertIn(
-            "tcgen05_gC = cute.local_tile(tcgen05_tma_store_tensor, (64, 8),",
+            "tcgen05_gC = cute.local_tile(out, (64, 8),",
             code,
         )
         self.assertIn("partition_C(tcgen05_gC)", code)
+        self.assertIn("cute.copy(tcgen05_simt_atom", code)
         self.assertNotIn("for _tcgen05_store_i in range(", code)
         self.assertNotIn("cute.arch.warp_reduction_sum", code)
 
@@ -2032,8 +2033,8 @@ class TestCuteLowerings(unittest.TestCase):
 
     def test_tcgen05_persistent_post_loop_stmts_appear_after_while(self) -> None:
         """Compiling a persistent_blocked kernel must emit the cleanup
-        block (producer_tail / TMEM allocator setup / free) AFTER the
-        ``while tcgen05_work_tile_valid`` loop.
+        block (producer_tail / TMEM allocator setup / free) AFTER all
+        persistent work-tile loops.
 
         Before the post-loop split landed, those statements stayed inside
         the persistent loop and were yielded back as scf.while carries,
@@ -2074,42 +2075,38 @@ class TestCuteLowerings(unittest.TestCase):
             )
             code = bound.to_triton_code(cfg)
 
-        # Locate the persistent while loop and verify post-loop
-        # statements live OUTSIDE its body. The cleanest check is to find
-        # the line of ``while tcgen05_work_tile_valid`` and the first
-        # following dedented statement (= post-loop boundary), then
-        # confirm producer_tail / free fall on the post-loop side.
-        lines = code.splitlines()
-        while_line_idx = next(
-            i for i, line in enumerate(lines) if "while tcgen05_work_tile_valid" in line
+        # Role-local codegen emits one work-tile loop per warp role. Verify
+        # one-shot cleanup follows the last of those loops, rather than being
+        # replayed in any role's per-tile body.
+        tree = ast.parse(code)
+        work_tile_loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.While)
+            and (
+                "tcgen05_role_local_" in ast.unparse(node.test)
+                or ast.unparse(node.test) == "tcgen05_work_tile_valid"
+            )
+        ]
+        self.assertTrue(
+            work_tile_loops, "expected at least one persistent work-tile loop"
         )
-        while_indent = len(lines[while_line_idx]) - len(
-            lines[while_line_idx].lstrip(" ")
+        last_work_tile_line = max(
+            node.end_lineno or node.lineno for node in work_tile_loops
         )
-        post_loop_line_idx = None
-        for i in range(while_line_idx + 1, len(lines)):
-            line = lines[i]
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            indent = len(line) - len(line.lstrip(" "))
-            if indent <= while_indent:
-                post_loop_line_idx = i
-                break
-        self.assertIsNotNone(
-            post_loop_line_idx, "post-loop statements should follow the while"
-        )
-        post_loop_block = "\n".join(lines[post_loop_line_idx:])
-        in_loop_block = "\n".join(lines[while_line_idx + 1 : post_loop_line_idx])
-        # Cleanup statements must be in the post-loop block, not the
-        # work-tile body.
         for tag in (
             "tcgen05_acc_pipeline.producer_tail",
             "tcgen05_tmem_allocator.free",
         ):
-            self.assertIn(tag, post_loop_block, f"{tag} must follow the while loop")
-            self.assertNotIn(
-                tag, in_loop_block, f"{tag} must not appear inside the while loop"
+            cleanup_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and tag in ast.unparse(node.func)
+            ]
+            self.assertTrue(cleanup_calls, f"expected cleanup call {tag}")
+            self.assertTrue(
+                all(node.lineno > last_work_tile_line for node in cleanup_calls),
+                f"{tag} must follow all work-tile loops",
             )
 
     def test_tcgen05_persistent_path_compiles(self) -> None:
@@ -2155,7 +2152,7 @@ class TestCuteLowerings(unittest.TestCase):
             # z-seeded and tile-advance scheduler paths lives in
             # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
             code = bound.to_triton_code(cfg)
-            self.assertIn("while tcgen05_work_tile_valid", code)
+            self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
             self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
             from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -4836,7 +4833,8 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("tile_offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
                 self.assertIn("for tile_offset_2 in range", role_src)
                 self.assertIn(
-                    "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
+                    "if tcgen05_tma_initial_full_tile and "
+                    "tcgen05_tma_initial_next_full_tile",
                     role_src,
                 )
                 self.assertNotIn(
@@ -9831,12 +9829,18 @@ class TestCuteLowerings(unittest.TestCase):
                     self.assertIn("tcgen05_ab_consumer_state.advance()", role_src)
                     release_pos = role_src.index("tcgen05_ab_pipeline.consumer_release")
                     advance_pos = role_src.index("tcgen05_ab_consumer_state.advance()")
-                    next_ab_peek_blocks = [
+                    self.assertLess(release_pos, advance_pos)
+                    leader_blocks = [
                         ast.unparse(child)
                         for child in ast.walk(node)
                         if isinstance(child, ast.If)
-                        and "tcgen05_tma_next_consumer_tile" in ast.unparse(child.test)
                         and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                    ]
+                    next_ab_peek_blocks = [
+                        block
+                        for block in leader_blocks
+                        if "tcgen05_tma_next_consumer_tile" in block
+                        and "tcgen05_ab_pipeline.consumer_try_wait" in block
                     ]
                     self.assertTrue(
                         next_ab_peek_blocks,
@@ -9850,15 +9854,8 @@ class TestCuteLowerings(unittest.TestCase):
                         "tcgen05_ab_pipeline.consumer_try_wait",
                         next_ab_peek_pos,
                     )
-                    self.assertLess(release_pos, advance_pos)
                     self.assertLess(advance_pos, next_ab_peek_pos)
                     self.assertLess(next_ab_peek_pos, next_ab_try_pos)
-                    leader_blocks = [
-                        ast.unparse(child)
-                        for child in ast.walk(node)
-                        if isinstance(child, ast.If)
-                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
-                    ]
                     self.assertTrue(
                         any(
                             "tcgen05_acc_pipeline.producer_acquire("
@@ -13823,8 +13820,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(
             (
                 "compute_epilogue_tile_shape((128, 8), False, "
-                "tcgen05_c_layout_1, cutlass.Float16, "
-                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float16)"
+                "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.Float16, "
+                "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                "elem_ty_c=cutlass.Float16)"
             ),
             emitted,
         )
@@ -13943,8 +13941,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(
             (
                 "compute_epilogue_tile_shape((128, 8), False, "
-                "tcgen05_c_layout_1, cutlass.Float32, "
-                "layout_c=tcgen05_c_layout_1, elem_ty_c=cutlass.Float32)"
+                "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, cutlass.Float32, "
+                "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                "elem_ty_c=cutlass.Float32)"
             ),
             emitted,
         )
@@ -18657,6 +18656,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         class _StubDeviceFunction:
             def __init__(self) -> None:
                 self._counter = 0
+                self.config: dict[str, object] = {}
                 self.cute_state = CuteDeviceFunctionState()
 
             def new_var(self, name: str) -> str:
