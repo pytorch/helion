@@ -300,6 +300,22 @@ class TestPretunedKernelMetadata(unittest.TestCase):
         self.assertLessEqual(vllm_shapes, set(module.SHAPES))
         self.assertLessEqual(vllm_shapes, module._SWAP_AB_SHAPES)
 
+    def test_scale_mm_cute_all_swap_shapes_dispatch(self) -> None:
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        swapped = mock.Mock(return_value="swapped")
+        scale = _FakeShapeTensor((1,))
+
+        with mock.patch.object(module, "scale_mm_cute_swap_ab", swapped):
+            for m, k, n in sorted(module._SWAP_AB_SHAPES):
+                with self.subTest(shape=(m, k, n)):
+                    x = _FakeShapeTensor((m, k))
+                    y = _FakeShapeTensor((k, n))
+                    self.assertEqual(
+                        module._scale_mm_cute(x, y, scale, scale), "swapped"
+                    )
+
+        self.assertEqual(swapped.call_count, len(module._SWAP_AB_SHAPES))
+
 
 # helion-vs-best-baseline targets. Every kernel's baselines now include
 # ``torch_compile`` (torch.compile of the torch reference), which competes to be
