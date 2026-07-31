@@ -982,42 +982,33 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.host_function.device_ir,
                 )
 
-                # Post-compile FX-graph scan to detect kernels
-                # whose tcgen05 matmul is followed by an
-                # aux-fused store
-                # (``out[tile] = (acc + residual[tile]).to(...)``
-                # and variants — see
-                # ``host_function_has_tcgen05_aux_kernel_pattern``
-                # for the accepted shapes). When detected, the
-                # autotune surface widens to admit
+                # Generic post-compile dependency facts widen the tcgen05
+                # autotune surface when an MMA-backed store reads auxiliary
+                # tensors. This makes
                 # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
                 # + ``tcgen05_warp_spec_c_input_warps=1`` so the
                 # productive C-input warp lift is reachable from
-                # the normal autotune path. For pure-matmul
-                # kernels the detector returns False and the
-                # autotune surface keeps the narrow
+                # the normal autotune path. Pure matmuls keep the narrow
                 # ``MONOLITHIC + c_input_warps=0`` shape so
                 # autotune cannot sample the strictly-worse
                 # inert C-input warp configuration.
-                # The exact-shape detector is narrower: it gates the
+                # The exact-shape fact is narrower: it gates the
                 # ``tcgen05_aux_load_mode=tma`` seed/search axis.
                 from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_aux_kernel_pattern,
+                    host_function_has_tcgen05_aux_loads,
                 )
                 from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
+                    host_function_has_tcgen05_exact_shape_aux_loads,
                 )
                 from .._compiler.cute.aux_tensor import (
                     host_function_matmul_has_non_tcgen05_operand,
                 )
 
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
-                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                    host_function_has_tcgen05_aux_loads(self.host_function)
                 )
                 self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
-                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
-                        self.host_function
-                    )
+                    host_function_has_tcgen05_exact_shape_aux_loads(self.host_function)
                 )
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
                     host_function_matmul_has_non_tcgen05_operand(self.host_function)

@@ -38,8 +38,12 @@ from ..dtype_utils import cast_ast
 from ..indexing_strategy import exact_tile_block_ids
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
-from .aux_tensor import analyze_tcgen05_matmul_store_chains
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
+from .cute_epilogue import Tcgen05PairLocalCapability
+from .cute_epilogue import Tcgen05PairTraversal
+from .cute_epilogue import analyze_tcgen05_epilogue_candidate
+from .cute_epilogue import analyze_tcgen05_epilogue_plan
+from .cute_epilogue import finalize_tcgen05_pair_local_plan
 from .cutedsl_compat import emit_pipeline_advance
 from .device_state import CuteDeviceFunctionState
 from .device_state import CuteTcgen05MatmulPlan
@@ -89,7 +93,10 @@ from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_FRAGMENT_PAIR_WIDTH
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -123,20 +130,6 @@ _TRACE_THROUGH_TARGETS = {
     # data shuffle.  Permuted operands fall back to scalar codegen.
 }
 
-# Extra forward-trace targets used ONLY for *output dtype* inference
-# (``_trace_mma_to_store_dtype``). These are the whitelisted fused-epilogue
-# aux-binary ops (e.g. the rowwise scale ``acc * scale[...]``). Tracing
-# through them only follows the chain to the store node and reads the store
-# *target tensor's* dtype, so it never changes the inferred dtype; it just
-# lets inference reach the store past a fused scale/bias step. This is needed
-# for fp8 inputs (whose ``input_dtype`` is never a valid epilogue output
-# dtype) so the plan picks up the real bf16/f16/f32 store dtype.
-_DTYPE_TRACE_EXTRA_TARGETS = {
-    torch.ops.aten.mul.Tensor,
-    torch.ops.aten.add.Tensor,
-    torch.ops.aten.sub.Tensor,
-    torch.ops.aten.div.Tensor,
-}
 _MMA_OUTPUT_STORE_ANALYSIS_META_KEY = "cute_mma_output_store_analysis"
 _MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY = "cute_mma_requires_accumulator_seed"
 
@@ -669,6 +662,13 @@ class _CuteMmaNode(_CuteMmaTarget):
     def requires_scalar_fallback(self) -> bool:
         """Whether the incoming accumulator cannot seed a collective fragment."""
         return self.requires_accumulator_seed and self.operands.has_leading_passthrough
+
+
+@dataclass(frozen=True)
+class _Tcgen05ScalarFragmentCapability:
+    """Physical fragment facts required by scalar epilogue execution."""
+
+    pair_local: Tcgen05PairLocalCapability
 
 
 def _decode_cute_mma_target(
@@ -1206,7 +1206,23 @@ def prepare_cute_collective_lane_loop_suppression(
     if env.backend_name != "cute":
         return
 
+    cute_state = cg.device_function.cute_state
+    mma_anchors = [
+        candidate_node
+        for graph_info in cg.codegen_graphs
+        for candidate_node in graph_info.graph.nodes
+        if _decode_cute_mma_target(candidate_node) is not None
+    ]
+    # Root-lane suppression is a function-wide mutation. Until multiple
+    # collective anchors are planned as one transaction, require one
+    # unambiguous anchor so no later MMA can observe a partially committed
+    # cutover.
+    if len(mma_anchors) != 1:
+        return
+    (sole_anchor,) = mma_anchors
     for node in graph.nodes:
+        if node is not sole_anchor:
+            continue
         candidate = analyze_cute_mma_node(node)
         if candidate is None or candidate.requires_accumulator_seed:
             continue
@@ -1266,17 +1282,9 @@ def prepare_cute_collective_lane_loop_suppression(
         ):
             continue
 
-        # Mirror the real codegen bailout in ``_emit_mma_pipeline`` (it returns
-        # ``None`` and falls back to the scalar matmul path when non-root lane
-        # loops are active, see the ``_has_non_root_lane_loops`` guard there).
-        # If we predicted the collective tcgen05 path here but codegen actually
-        # takes the scalar fallback, requesting root lane-loop suppression would
-        # drop the synthetic-lane index/mask definitions for the grid axis and
-        # produce a ``NameError`` at runtime. Only register the loads / request
-        # suppression when the collective path will truly be taken. The K
-        # device-loop's lane loops are only tolerated for a *batched* matmul (it
-        # must exactly match the ``_emit_mma_pipeline`` guard); a non-batched
-        # config with device-loop lane loops takes the scalar fallback.
+        # This mirrors the last collective-path bailout in
+        # ``_emit_mma_pipeline``. The K loop's lane loops are tolerated only for
+        # a batched matmul; any other non-root lane loop keeps scalar lowering.
         allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
             (k_loop_info[0],)
             if analysis.leading_passthrough_block_id is not None
@@ -1285,10 +1293,86 @@ def prepare_cute_collective_lane_loop_suppression(
         if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
             continue
 
-        cute_state = cg.device_function.cute_state
+        plan = cute_state.tcgen05_epilogue_plan_for_anchor(node)
+        if plan is None:
+            plan = analyze_tcgen05_epilogue_plan(
+                cg.codegen_graphs,
+                node,
+                expected_output_block_ids=analysis.output_block_ids,
+                config=cg.device_function.config,
+            )
+            if plan is None:
+                continue
+            # Deferral is only valid before every owned lowering. This rejects
+            # source orderings that hoist an auxiliary load ahead of the K loop
+            # rather than leaving a partially lowered plan behind.
+            if any("codegen" in owned.meta for owned in plan.owned_nodes):
+                continue
+            scalar_capability: _Tcgen05ScalarFragmentCapability | None = None
+            if any(store.requires_scalar_fragment for store in plan.stores):
+                scalar_capability = _tcgen05_scalar_fragment_capability(
+                    cg,
+                    analysis=analysis,
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                )
+                if scalar_capability is None:
+                    continue
+            required_pair_widths = {
+                store.required_pair_width
+                for store in plan.stores
+                if store.required_pair_width is not None
+            }
+            if required_pair_widths:
+                if scalar_capability is None or required_pair_widths != {
+                    scalar_capability.pair_local.width
+                }:
+                    continue
+                plan = finalize_tcgen05_pair_local_plan(
+                    plan,
+                    scalar_capability.pair_local,
+                )
+            cute_state.register_tcgen05_epilogue_plan(plan)
+
         _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
         if grid_state.has_lane_loops():
             cute_state.request_root_lane_loop_suppression()
+
+
+def _tcgen05_scalar_fragment_capability(
+    cg: GenerateAST,
+    *,
+    analysis: _MmaOperandAnalysis,
+    bm: int,
+    bn: int,
+    bk: int,
+) -> _Tcgen05ScalarFragmentCapability | None:
+    """Whether scalar coordinates and direct loads are safe for this fragment."""
+    config = cg.device_function.config
+    if (
+        bm == 128
+        and bn in (64, 128)
+        and _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
+        and _tcgen05_cluster_m(config) == 1
+        and _tcgen05_cluster_n(config) == 1
+        and config.get(
+            TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, TCGEN05_EPILOGUE_LAYOUT_NORMAL
+        )
+        == TCGEN05_EPILOGUE_LAYOUT_NORMAL
+        and not is_pure_matmul_role_lifecycle_config(config)
+        and analysis.lhs.source_fake.dtype
+        in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        and _tcgen05_tma_matrix_major(analysis.lhs.source_fake) == "row"
+        and _tcgen05_tma_matrix_major(analysis.rhs.source_fake) in ("row", "col")
+    ):
+        return _Tcgen05ScalarFragmentCapability(
+            pair_local=Tcgen05PairLocalCapability(
+                width=TCGEN05_FRAGMENT_PAIR_WIDTH,
+                traversal=Tcgen05PairTraversal.CONTIGUOUS_EVEN_ODD_N_R2S,
+            )
+        )
+    return None
 
 
 def _mma_result_can_be_deferred(node: Node) -> bool:
@@ -1949,76 +2033,30 @@ def _trace_mma_to_stores(
     mma_node: Node,
     graphs: list[GraphInfo],
 ) -> tuple[Node, ...] | None:
-    """Forward-trace ``mma_node`` to all reachable supported stores."""
-    import operator
-
-    from ...language import _tracing_ops
+    """Return stores whose value generically depends on ``mma_node``."""
     from ...language import memory_ops
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import reach_matmul_anchors
 
-    graph_id_of: dict[torch.fx.Graph, int] = {}
-    for_loop_calls_by_graph_id: dict[int, list[Node]] = {}
-    for graph_info in graphs:
-        graph_id_of[graph_info.graph] = graph_info.graph_id
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if not _tracing_ops.is_for_loop_target(node.target):
-                continue
-            graph_id_arg = node.args[0] if node.args else None
-            if not isinstance(graph_id_arg, int):
-                continue
-            for_loop_calls_by_graph_id.setdefault(graph_id_arg, []).append(node)
-
-    if mma_node.graph not in graph_id_of:
+    if not any(mma_node.graph is graph_info.graph for graph_info in graphs):
         return None
-
-    stores: set[Node] = set()
-    visited: set[Node] = set()
-    stack: list[Node] = [mma_node]
-    while stack:
-        cur = stack.pop()
-        if cur in visited:
-            continue
-        visited.add(cur)
-        for user in cur.users:
-            if user.op == "output":
-                graph_id = graph_id_of.get(cur.graph)
-                if graph_id is None:
-                    return None
-                output_args = user.args[0] if user.args else None
-                if not isinstance(output_args, (list, tuple)):
-                    return None
-                out_indices = [i for i, arg in enumerate(output_args) if arg is cur]
-                if not out_indices:
-                    return None
-                for outer_call in for_loop_calls_by_graph_id.get(graph_id, []):
-                    for outer_user in outer_call.users:
-                        if (
-                            outer_user.op == "call_function"
-                            and outer_user.target is operator.getitem
-                            and len(outer_user.args) >= 2
-                            and outer_user.args[1] in out_indices
-                            and outer_user not in visited
-                        ):
-                            stack.append(outer_user)
-                continue
-            if user.op != "call_function":
-                continue
-            target = user.target
-            if target is memory_ops.store:
-                stores.add(user)
-                continue
+    inner_outputs = build_inner_outputs_index_from_graphs(graphs)
+    stores: list[Node] = []
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            value = node.args[2] if len(node.args) > 2 else None
             if (
-                target is _tracing_ops._phi
-                or target is _tracing_ops._new_var
-                or target is operator.getitem
-                or target in _TRACE_THROUGH_TARGETS
-                or target in _DTYPE_TRACE_EXTRA_TARGETS
+                node.op == "call_function"
+                and node.target is memory_ops.store
+                and isinstance(value, Node)
+                and mma_node
+                in reach_matmul_anchors(
+                    value,
+                    target_fx_nodes={mma_node},
+                    inner_outputs_by_graph_id=inner_outputs,
+                )
             ):
-                stack.append(user)
-                continue
-            return None
-
+                stores.append(node)
     return tuple(stores) if stores else None
 
 
@@ -2048,36 +2086,19 @@ def _analyze_mma_output_stores(
     *,
     graphs: list[GraphInfo],
 ) -> _MmaOutputStoreAnalysis | None:
-    from ..compile_environment import CompileEnvironment
-
-    analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
-    if analyzed_stores is None:
+    candidate = analyze_tcgen05_epilogue_candidate(
+        graphs,
+        mma_node,
+        expected_output_block_ids=analysis.output_block_ids,
+    )
+    if candidate is None:
         return None
-    env = CompileEnvironment.current()
-    explicit_epi_tile_compatible = True
-    for store, chain in analyzed_stores:
-        tensor_node = store.args[0] if store.args else None
-        tensor_fake = (
-            tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
-        )
-        if (
-            not isinstance(tensor_fake, torch.Tensor)
-            or tensor_fake.dtype not in _MMA_SUPPORTED_DTYPES
-        ):
-            return None
-        subscripts = store.args[1] if len(store.args) > 1 else None
-        if not isinstance(subscripts, (list, tuple)):
-            return None
-        if exact_tile_block_ids(env, subscripts) != analysis.output_block_ids:
-            return None
-        if len(store.args) > 3 and store.args[3] is not None:
-            return None
-        explicit_epi_tile_compatible &= (
-            tensor_fake.dtype == analysis.lhs.source_fake.dtype
-            and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_steps)
-        )
     return _MmaOutputStoreAnalysis(
-        explicit_epi_tile_compatible=explicit_epi_tile_compatible
+        explicit_epi_tile_compatible=(
+            candidate.explicit_epi_tile_loads_compatible
+            and _trace_mma_to_store_dtype(mma_node, graphs)
+            == analysis.lhs.source_fake.dtype
+        )
     )
 
 
@@ -2110,6 +2131,19 @@ def _emit_mma_pipeline(
     rhs_n_size = rhs_operand.matrix_cols
 
     df = cg.device_function
+
+    def scalar_fallback(reason: str) -> None:
+        if (
+            fx_node is not None
+            and df.cute_state.tcgen05_epilogue_plan_for_anchor(fx_node) is not None
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 epilogue cutover was finalized before root graph "
+                f"lowering, but MMA codegen later failed: {reason}",
+            )
+        return None
+
     lhs_arg = df.tensor_arg(lhs_fake)
     rhs_arg = df.tensor_arg(rhs_fake)
     lhs_arg_name = lhs_arg.name
@@ -2181,10 +2215,10 @@ def _emit_mma_pipeline(
         rhs_k_size=rhs_k_size,
     )
     if k_loop_info is None:
-        return None
+        return scalar_fallback("missing active K loop")
     device_loop, k_block_id, k_offset_var, bk = k_loop_info
     if k_block_id != analysis.k_block_id:
-        return None
+        return scalar_fallback("K-loop block id changed")
     k_loop_begin_expr = _device_loop_begin_expr(device_loop)
 
     # Get M, N offsets and block sizes from grid state
@@ -2216,7 +2250,7 @@ def _emit_mma_pipeline(
         or m_block_id is None
         or n_block_id is None
     ):
-        return None
+        return scalar_fallback("output tile coordinates are unavailable")
     # tcgen05 epilogues are emitted by `_codegen_cute_store_tcgen05_tile` in
     # `helion/language/memory_ops.py`. Static-full flat kernels and validated
     # role-local persistent kernels use the SMEM-staged TMA-store epilogue;
@@ -2229,9 +2263,9 @@ def _emit_mma_pipeline(
     lp_block_id = analysis.leading_passthrough_block_id
     if lp_block_id is not None:
         if grid_state is None or lp_block_id not in grid_state.block_ids:
-            return None
+            return scalar_fallback("leading output axis is inactive")
         if df.resolved_block_size(lp_block_id) != 1:
-            return None
+            return scalar_fallback("leading output tile is not one")
         leading_index_var = cg.index_var(lp_block_id)
     # Use thread_idx directly for local indices within the tile.
     # indices_0 - offset_0 SHOULD equal thread_idx[0], but the CuTe DSL
@@ -2308,7 +2342,7 @@ def _emit_mma_pipeline(
         analysis, bm=bm, bn=bn, bk=bk
     )
     if analysis.has_leading_passthrough and not mma_tiles_are_static_full:
-        return None
+        return scalar_fallback("batched tcgen05 tile is partial")
     # A leading-passthrough collective absorbs its serialized K loop. Other
     # non-root lane loops must already have been suppressed by MMA planning;
     # reusing one fragment across their logical iterations is wrong.
@@ -2316,7 +2350,12 @@ def _emit_mma_pipeline(
         (device_loop,) if analysis.has_leading_passthrough else ()
     )
     if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
-        return None
+        return scalar_fallback("a non-root lane loop is active")
+    if mma_impl == "tcgen05" and (
+        fx_node is None
+        or df.cute_state.tcgen05_epilogue_plan_for_anchor(fx_node) is None
+    ):
+        return scalar_fallback("no finalized generic epilogue plan")
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
     if acc_expr is not None and mma_impl != "universal" and not zero_acc_expr:
         mma_impl = "universal"
@@ -2333,7 +2372,7 @@ def _emit_mma_pipeline(
             config=df.config,
         )
     ):
-        return None
+        return scalar_fallback("universal MMA fallback is required")
     # Non-tcgen05 paths inspect runtime layouts. tcgen05 wrapper schemas are
     # specialized by shape and stride, so they can keep tensor layouts baked.
     if mma_impl != "tcgen05":
@@ -5481,11 +5520,8 @@ def _emit_mma_pipeline(
         if tcgen05_pure_matmul_object is not None:
             tcgen05_pure_matmul_object.register_pending_store(df.cute_state)
         if fx_node is not None:
-            # Map the matmul fx_node -> result_var so the G3.1.1 fused
-            # epilogue splice path can reuse the existing
-            # `CuteTcgen05StoreValue` registration via a backward FX
-            # walk from the user's store value through a whitelisted
-            # unary chain to this matmul fx_node.
+            # The committed store plan resolves this anchor to the existing
+            # ``CuteTcgen05StoreValue`` registration.
             df.cute_state.matmul_fx_node_result_vars[fx_node] = result_var
     else:
         # Each thread reads its own (m, n) element from shared memory.

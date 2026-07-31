@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# Scalar fragment addressing relies on the normal T2R layout keeping one
+# adjacent N pair in each lane.
+TCGEN05_FRAGMENT_PAIR_WIDTH = 2
+
 # Validated CtaGroup.TWO autotune/runtime envelope for the B200 CuTe path.
 # Re-verify the K-cap runtime and guard-boundary tests before raising the
 # K-tile threshold or broadening the tile shape.

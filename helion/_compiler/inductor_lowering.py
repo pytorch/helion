@@ -452,7 +452,10 @@ class InductorLowering(Lowering):
 
 @contextlib.contextmanager
 def install_inductor_kernel_handlers(
-    cg: CodegenInterface, args: dict[str, ast.AST]
+    cg: CodegenInterface,
+    args: dict[str, ast.AST],
+    *,
+    preserve_tensor_container: bool = False,
 ) -> Iterator[None]:
     with (
         _patched_inductor_config(),
@@ -461,6 +464,7 @@ def install_inductor_kernel_handlers(
             GenerateASTFromInductor(
                 cg,
                 args,
+                preserve_tensor_container=preserve_tensor_container,
             )
         ),
         V.set_kernel_handler(
@@ -485,19 +489,45 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
+
+    def codegen_from_input_asts(
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        input_asts: list[ast.AST],
+        *,
+        preserve_tensor_container: bool = False,
+    ) -> object:
+        """Lower this pointwise node with an explicit set of tensor inputs.
+
+        The tcgen05 fragment epilogue evaluates the same FX pointwise nodes at
+        register coordinates rather than through ``GraphInterpreter.env``.
+        Keeping the alternate input binding here makes Inductor's ``inner_fn``
+        the single source of truth for kwargs, casts, and operation semantics.
+        """
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
-        with self.install_kernel_handlers(ctx, node):
+        assert len(input_asts) == len(self.input_names)
+        with install_inductor_kernel_handlers(
+            ctx.cg,
+            dict(zip(self.input_names, input_asts, strict=True)),
+            preserve_tensor_container=preserve_tensor_container,
+        ):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
 
-        return self._reshape_for_size1_reduction(ctx, node, result)
+        return self._reshape_for_size1_reduction(ctx, node, result, input_asts)
 
     def _reshape_for_size1_reduction(
-        self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        result: ast.AST,
+        input_asts: list[ast.AST] | None = None,
     ) -> ast.AST:
         # When Inductor converts a size-1 reduction to a Pointwise op, the
         # buffer has fewer ranges than the inputs.  This happens when the
@@ -515,7 +545,9 @@ class PointwiseLowering(InductorLowering):
             # Cute lowers one element per thread, so synthetic size-1 view dims
             # (from unsqueeze/keepdim paths rewritten to pointwise) must collapse
             # back to the underlying scalar expression.
-            inputs = self.input_asts(ctx, node)
+            inputs = (
+                input_asts if input_asts is not None else self.input_asts(ctx, node)
+            )
             if len(inputs) == 1:
                 return inputs[0]
 
@@ -1002,7 +1034,37 @@ class APIFuncLowering(Lowering):
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         assert not node.kwargs
-        ast_args = [*map_arg(node.args, lambda arg: ctx.env[arg])]
+        ast_args = cast("list[object]", [*map_arg(node.args, lambda arg: ctx.env[arg])])
+        return self._codegen_from_ast_args(ctx, node, ast_args)
+
+    def codegen_from_input_asts(
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        input_asts: list[ast.AST],
+    ) -> object:
+        assert not node.kwargs
+        input_nodes: list[torch.fx.Node] = []
+        map_arg(node.args, lambda arg: input_nodes.append(arg) or arg)
+        assert len(input_nodes) == len(input_asts)
+        replacements = dict(zip(input_nodes, input_asts, strict=True))
+        ast_args = cast(
+            "list[object]",
+            [
+                *map_arg(
+                    node.args,
+                    lambda arg: cast("Argument", replacements[arg]),
+                )
+            ],
+        )
+        return self._codegen_from_ast_args(ctx, node, ast_args)
+
+    def _codegen_from_ast_args(
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        ast_args: list[object],
+    ) -> object:
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
@@ -1063,7 +1125,11 @@ class SympyExprLowering(Lowering):
 
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
-        self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
+        self,
+        cg: CodegenInterface,
+        input_name_lookup: dict[str, ast.AST],
+        *,
+        preserve_tensor_container: bool = False,
     ) -> None:
         super().__init__()
         self.parent_handler: InductorOpOverrides = (
@@ -1071,9 +1137,53 @@ class GenerateASTFromInductor(DefaultHandler):
         )
         self.cg = cg
         self.input_name_lookup = input_name_lookup
+        self.preserve_tensor_container = preserve_tensor_container
+        self.tensor_container_names = {
+            value.id
+            for value in input_name_lookup.values()
+            if isinstance(value, ast.Name)
+        }
+
+    def _tensor_container_template(self, value: ast.AST) -> ast.Name | None:
+        if not self.preserve_tensor_container:
+            return None
+        return next(
+            (
+                node
+                for node in ast.walk(value)
+                if isinstance(node, ast.Name) and node.id in self.tensor_container_names
+            ),
+            None,
+        )
+
+    def _is_tensor_container(self, value: ast.AST) -> bool:
+        return self._tensor_container_template(value) is not None
+
+    def _container_operands(self, *values: ast.AST) -> tuple[ast.AST, ...] | None:
+        template = next(
+            (value for value in values if self._is_tensor_container(value)), None
+        )
+        if template is None:
+            return None
+        return tuple(
+            value
+            if self._is_tensor_container(value)
+            else expr_from_string(
+                "cute.full_like({container}, {value})",
+                container=template,
+                value=value,
+            )
+            for value in values
+        )
 
     def _cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         backend = CompileEnvironment.current().backend
+        if self._is_tensor_container(x):
+            return expr_from_string(
+                "{value}.to({dtype})",
+                value=x,
+                dtype=expr_from_string(backend.dtype_str(target_dtype)),
+            )
         return backend.cast_ast(x, target_dtype)
 
     def _to_ast(self, x: object) -> ast.AST:
@@ -1082,7 +1192,17 @@ class GenerateASTFromInductor(DefaultHandler):
         return expr_from_string(_unpack_opsvalue(x))
 
     def _lift(self, expr: ast.AST) -> str:
-        return self.cg.lift(expr).id
+        template = self._tensor_container_template(expr)
+        if template is not None:
+            expr = expr_from_string(
+                "_cute_ensure_tensor_ssa({value}, {container})",
+                value=expr,
+                container=template,
+            )
+        name = self.cg.lift(expr).id
+        if template is not None:
+            self.tensor_container_names.add(name)
+        return name
 
     def _expected_tensor_dtype(self) -> torch.dtype | None:
         """Best-effort retrieval of the current FX node's tensor dtype."""
@@ -1179,6 +1299,98 @@ class GenerateASTFromInductor(DefaultHandler):
         if expected_dtype is not None and expected_dtype != torch.float32:
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
+
+    def _nan_propagating_extrema(
+        self, name: str, a: object, b: object, comparison: str
+    ) -> str:
+        env = CompileEnvironment.current()
+        if not self.preserve_tensor_container and env.backend_name != "cute":
+            return self._default(name, (a, b), {})
+        a_expr = self._to_ast(a)
+        b_expr = self._to_ast(b)
+        container_operands = self._container_operands(a_expr, b_expr)
+        if container_operands is not None:
+            a_expr, b_expr = container_operands
+            result = expr_from_string(
+                "cute.where({a} != {a}, {a}, "
+                "cute.where({b} != {b}, {b}, "
+                "cute.where({a} " + comparison + " {b}, {a}, {b})))",
+                a=a_expr,
+                b=b_expr,
+            )
+            return self._lift(result)
+        if not self.preserve_tensor_container:
+            expected_dtype = self._expected_tensor_dtype()
+            if expected_dtype is not None:
+                a_expr = self._create_cast_expr(a_expr, expected_dtype)
+                b_expr = self._create_cast_expr(b_expr, expected_dtype)
+        result = expr_from_string(
+            "({a} if {a} != {a} else "
+            "({b} if {b} != {b} else ({a} if {a} " + comparison + " {b} else {b})))",
+            a=a_expr,
+            b=b_expr,
+        )
+        return self._lift(result)
+
+    def maximum(self, x0: object, x1: object) -> str:
+        return self._nan_propagating_extrema("maximum", x0, x1, ">")
+
+    def minimum(self, x0: object, x1: object) -> str:
+        return self._nan_propagating_extrema("minimum", x0, x1, "<")
+
+    def where(
+        self,
+        condition: object,
+        input: object,  # noqa: A002
+        other: object,
+    ) -> str:
+        condition_expr = self._to_ast(condition)
+        input_expr = self._to_ast(input)
+        other_expr = self._to_ast(other)
+        value_template = next(
+            (
+                value
+                for value in (input_expr, other_expr)
+                if self._is_tensor_container(value)
+            ),
+            condition_expr if self._is_tensor_container(condition_expr) else None,
+        )
+        if value_template is None:
+            return self._default("where", (condition, input, other), {})
+        backend = CompileEnvironment.current().backend
+        output_dtype = self._expected_tensor_dtype()
+        if not self._is_tensor_container(condition_expr):
+            condition_expr = expr_from_string(
+                "cute.full_like({container}, {condition}).to(cutlass.Boolean)",
+                container=value_template,
+                condition=condition_expr,
+            )
+        for name, value in (("input", input_expr), ("other", other_expr)):
+            if self._is_tensor_container(value):
+                continue
+            value = expr_from_string(
+                "cute.full_like({container}, {value})",
+                container=value_template,
+                value=value,
+            )
+            if output_dtype is not None and value_template is condition_expr:
+                value = expr_from_string(
+                    "{value}.to({dtype})",
+                    value=value,
+                    dtype=expr_from_string(backend.dtype_str(output_dtype)),
+                )
+            if name == "input":
+                input_expr = value
+            else:
+                other_expr = value
+        return self._lift(
+            expr_from_string(
+                "cute.where({condition}, {input}, {other})",
+                condition=condition_expr,
+                input=input_expr,
+                other=other_expr,
+            )
+        )
 
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
         backend_name = CompileEnvironment.current().backend_name
@@ -1419,6 +1631,28 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
+                    if self.cg.device_function.cute_state.is_deferred_tcgen05_epilogue_node(
+                        n
+                    ):
+                        result = _DEFERRED_EPILOGUE_VALUE
+                        n.meta["codegen"] = result
+                        return result
+                    deferred_inputs = [
+                        input_node
+                        for input_node in n.all_input_nodes
+                        if self.env.get(input_node) is _DEFERRED_EPILOGUE_VALUE
+                    ]
+                    if deferred_inputs and (
+                        self.cg.device_function.cute_state.tcgen05_epilogue_store_plan(
+                            n
+                        )
+                        is None
+                    ):
+                        raise exc.BackendUnsupported(
+                            "cute",
+                            "deferred tcgen05 epilogue value escaped its committed "
+                            f"store at {n.name}; source={deferred_inputs[0].name}",
+                        )
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result
@@ -1473,6 +1707,14 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
         return super().run_node(n)
+
+
+_DEFERRED_EPILOGUE_VALUE = object()
+
+
+def is_deferred_epilogue_value(value: object) -> bool:
+    """Whether ``value`` is the private committed-epilogue placeholder."""
+    return value is _DEFERRED_EPILOGUE_VALUE
 
 
 def codegen_call_with_graph(

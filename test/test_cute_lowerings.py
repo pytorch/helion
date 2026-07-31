@@ -595,6 +595,374 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
     )
 
 
+def _generic_epilogue_config(block_sizes: list[int]) -> helion.Config:
+    return _make_tcgen05_persistent_config(
+        block_sizes=block_sizes,
+        loop_orders=[list(range(len(block_sizes) - 1))],
+        pid_type="persistent_interleaved",
+    )
+
+
+@helion.kernel(backend="cute")
+def _generic_pointwise_epilogue(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        shifted = torch.add(acc, 1.0, alpha=2.0)
+        out[tile_m, tile_n] = (shifted * torch.sigmoid(shifted)).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_gelu_epilogue(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = torch.nn.functional.gelu(acc, approximate="tanh").to(
+            x.dtype
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_masked_aux_epilogue(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        aux = hl.load(
+            residual,
+            [tile_m, tile_n],
+            extra_mask=mask[tile_m, tile_n],
+        )
+        out[tile_m, tile_n] = (acc + aux).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_random_epilogue(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = (acc + torch.rand_like(acc)).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_pair_swap_epilogue(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        pairs = acc.view(tile_m.block_size, tile_n.block_size // 2, 2)
+        first, second = hl.split(pairs)
+        swapped = hl.join(second, first).view(tile_m.block_size, tile_n.block_size)
+        out[tile_m, tile_n] = swapped.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_swapped_aux_indices(
+    x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = (acc + residual[tile_n, tile_m]).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_nonlocal_advanced_index(
+    x: torch.Tensor, weight: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        row = (acc.T > 0).to(torch.int64)
+        column = torch.zeros_like(row)
+        out[tile_m, tile_n] = (acc + source[row, column]).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_projection_rotary(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    table: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_h, tile_k, tile_d],
+                acc=acc,
+            )
+        bias_tile = bias[tile_h.index[:, None], tile_d.index[None, :]]
+        acc = acc + bias_tile[:, None, :]
+        table_tile = table[tile_m, tile_d]
+        table_pairs = table_tile.view(
+            tile_m.block_size, 2, tile_d.block_size // 2
+        ).permute(0, 2, 1)
+        left, right = hl.split(table_pairs)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        x0, x1 = hl.split(pairs)
+        perpendicular = hl.join(-x1, x0)
+        result = (
+            pairs * right[None, :, :, None] + perpendicular * left[None, :, :, None]
+        )
+        out[tile_h, tile_m, tile_d] = result.view(
+            tile_h.block_size, tile_m.block_size, tile_d.block_size
+        ).to(x.dtype)
+    return out
+
+
+def _generic_epilogue_code(
+    kernel: helion.Kernel, args: tuple[torch.Tensor, ...], config: helion.Config
+) -> str:
+    with patch_cute_mma_support():
+        bound = kernel.bind(args)
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        return bound.to_triton_code(config)
+
+
+@onlyBackends(["cute"])
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
+    def test_generic_pointwise_uses_inductor_semantics(self) -> None:
+        x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        code = _generic_epilogue_code(
+            _generic_pointwise_epilogue,
+            (x, x),
+            _generic_epilogue_config([128, 128, 32]),
+        )
+        self.assertIn("cute.gemm", code)
+        self.assertIn("tcgen05_epi_value", code)
+        self.assertNotIn("tcgen05_chain_step", code)
+
+    def test_generic_api_elementwise_uses_existing_codegen(self) -> None:
+        x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        code = _generic_epilogue_code(
+            _generic_gelu_epilogue,
+            (x, x),
+            _generic_epilogue_config([128, 128, 32]),
+        )
+        self.assertIn("cute.gemm", code)
+        self.assertIn("cute.math.tanh", code)
+        self.assertNotIn("tcgen05_chain_step", code)
+
+    def test_generic_elementwise_runtime(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        acc = x.float() @ weight.float()
+        for kernel, expected in (
+            (_generic_pointwise_epilogue, (acc + 2.0) * torch.sigmoid(acc + 2.0)),
+            (
+                _generic_gelu_epilogue,
+                torch.nn.functional.gelu(acc, approximate="tanh"),
+            ),
+        ):
+            with self.subTest(kernel=kernel):
+                bound = kernel.bind((x, weight))
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.set_config(_generic_epilogue_config([128, 128, 32]))
+                torch.testing.assert_close(
+                    bound(x, weight), expected.to(x.dtype), atol=0.5, rtol=2e-2
+                )
+
+    def test_rejected_masked_load_plan_fails_cleanly(self) -> None:
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn_like(x)
+        mask = torch.ones_like(x, dtype=torch.bool)
+        config = _generic_epilogue_config([128, 128, 32])
+        bound = _generic_masked_aux_epilogue.bind((x, weight, residual, mask))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+            bound.to_triton_code(config)
+
+    def test_inputless_pointwise_plan_fails_cleanly(self) -> None:
+        x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        config = _generic_epilogue_config([128, 128, 32])
+        bound = _generic_random_epilogue.bind((x, x))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+            bound.to_triton_code(config)
+
+    def test_generic_pair_transform_uses_coordinate_fragment(self) -> None:
+        x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        code = _generic_epilogue_code(
+            _generic_pair_swap_epilogue,
+            (x, x),
+            _generic_epilogue_config([128, 128, 32]),
+        )
+        self.assertIn("cute.gemm", code)
+        self.assertIn("tcgen05_epi_scan", code)
+        self.assertNotIn("split_smem", code)
+        self.assertNotIn("reshape_smem", code)
+
+    def test_generic_pair_transform_runtime(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        bound = _generic_pair_swap_epilogue.bind((x, weight))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(_generic_epilogue_config([128, 128, 32]))
+        actual = bound(x, weight)
+        expected = (x @ weight).view(128, 64, 2).flip(-1).view(128, 128)
+        torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-2)
+
+    def test_mismatched_aux_provenance_uses_direct_load(self) -> None:
+        x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        code = _generic_epilogue_code(
+            _generic_swapped_aux_indices,
+            (x, x, x),
+            _generic_epilogue_config([128, 128, 32]),
+        )
+        self.assertIn("cute.gemm", code)
+        self.assertIn("tcgen05_epi_load", code)
+        self.assertNotIn("tcgen05_aux_tile", code)
+
+    def test_mismatched_aux_provenance_runtime(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        x = torch.randn([256, 128], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn([128, 256], device=DEVICE, dtype=torch.bfloat16)
+        bound = _generic_swapped_aux_indices.bind((x, weight, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(_generic_epilogue_config([128, 128, 32]))
+        expected = (x.float() @ weight.float() + residual.T.float()).to(x.dtype)
+        torch.testing.assert_close(
+            bound(x, weight, residual), expected, atol=0.5, rtol=2e-2
+        )
+
+    def test_direct_load_with_smaller_source_rejected_before_commit(self) -> None:
+        x = torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.empty([64, 256], device=DEVICE, dtype=torch.bfloat16)
+        config = _generic_epilogue_config([128, 128, 32])
+        bound = _generic_swapped_aux_indices.bind((x, weight, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+            bound.to_triton_code(config)
+
+    def test_nonlocal_advanced_index_rejected_before_commit(self) -> None:
+        x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        source = torch.randn([2, 1], device=DEVICE, dtype=torch.bfloat16)
+        config = _generic_epilogue_config([128, 128, 32])
+        bound = _generic_nonlocal_advanced_index.bind((x, x, source))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+            bound.to_triton_code(config)
+
+    def test_projection_rotary_is_generic_fragment_epilogue(self) -> None:
+        dtype = torch.bfloat16
+        x = torch.empty([128, 128], device=DEVICE, dtype=dtype)
+        for head_dim in (64, 128):
+            with self.subTest(head_dim=head_dim):
+                weight = torch.empty([1, 128, head_dim], device=DEVICE, dtype=dtype)
+                table = torch.empty([128, head_dim], device=DEVICE, dtype=dtype)
+                bias = torch.empty([1, head_dim], device=DEVICE, dtype=dtype)
+                code = _generic_epilogue_code(
+                    _generic_projection_rotary,
+                    (x, weight, table, bias),
+                    _generic_epilogue_config([1, 128, head_dim, 32]),
+                )
+                self.assertIn("cute.gemm", code)
+                self.assertIn("tcgen05_epi_scan", code)
+                self.assertIn("tcgen05_epi_load", code)
+                self.assertNotIn("split_smem", code)
+                self.assertNotIn("permute_smem", code)
+                self.assertLess(len(code), 100_000)
+
+    def test_projection_rotary_runtime(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        dtype = torch.bfloat16
+        heads = 2
+        m = 256
+        k = 128
+        x = torch.randn([m, k], device=DEVICE, dtype=dtype)
+        for head_dim in (64, 128):
+            with self.subTest(head_dim=head_dim):
+                weight = torch.randn([heads, k, head_dim], device=DEVICE, dtype=dtype)
+                table = torch.randn([m, head_dim], device=DEVICE, dtype=dtype)
+                bias = torch.randn([heads, head_dim], device=DEVICE, dtype=dtype)
+                bound = _generic_projection_rotary.bind((x, weight, table, bias))
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.set_config(_generic_epilogue_config([1, 128, head_dim, 32]))
+                actual = bound(x, weight, table, bias)
+
+                acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
+                pairs = (acc + bias.float()[:, None, :]).view(
+                    heads, m, head_dim // 2, 2
+                )
+                table_pairs = table.float().view(m, 2, head_dim // 2).permute(0, 2, 1)
+                left, right = table_pairs.unbind(-1)
+                perpendicular = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1)
+                expected = (
+                    pairs * right[None, :, :, None]
+                    + perpendicular * left[None, :, :, None]
+                ).view(heads, m, head_dim)
+                torch.testing.assert_close(
+                    actual, expected.to(dtype), atol=1.0, rtol=2e-2
+                )
+
+
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
     def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
@@ -6268,91 +6636,6 @@ class TestCuteLowerings(unittest.TestCase):
                 expected = x @ y
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_fused_epilogue_store_raises_backend_unsupported(self) -> None:
-        """A user-level epilogue lambda whose op chain is *not* on the
-        chain-analyzer whitelist (e.g., reads an auxiliary tensor
-        with a non-whitelisted indexing shape, or uses ops the
-        analyzer rejects) bails with a structured
-        ``BackendUnsupported`` instead of falling through to the
-        cute SIMT-store path that crashes inside the cute DSL on
-        undefined ``mask_<n>`` / ``indices_<n>`` names.
-
-        The two ``test_examples.py`` xfail tests
-        (``test_epilogue_subtiling_residual_gelu`` and
-        ``test_epilogue_subtiling_gelu_aux``) catch the same shape
-        via ``xfailIfCute(...)``, but they only verify the kernel
-        fails — not that it fails *cleanly*. This test asserts the
-        cute backend produces a clear ``BackendUnsupported`` so a
-        future epilogue-fusion implementer sees the actionable
-        message rather than a cute-DSL crash on an undefined name.
-
-        Exercises a still-rejected path — a 2-D aux tensor whose
-        load index reorders the carrier tile-id symbols
-        (``residual[tile_n, tile_m]`` against carrier
-        ``[tile_m, tile_n]``). The aux *shape* matches the carrier
-        but the index symbols are out of order, so the classifier
-        rejects it. The 1-D broadcast aux load (``bias[tile_n]``)
-        and exact-shape 2-D aux load
-        (``residual[tile_m, tile_n]``) shapes are both supported
-        by the splice path; the still-rejected forms cover index
-        reorderings, 3-D static collapses, and non-whitelisted
-        op chains.
-        """
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_transposed(
-            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # 2-D aux with the index symbols reordered relative
-                # to the carrier (``[tile_n, tile_m]`` rather than
-                # ``[tile_m, tile_n]``). The shape happens to match
-                # the carrier when M == N, but the indices do not,
-                # so the classifier rejects this.
-                out[tile_m, tile_n] = (acc + residual[tile_n, tile_m]).to(x.dtype)
-            return out
-
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_residual_transposed.bind((x, y, residual)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
-            )
-            cute_matmul_residual_transposed(x, y, residual)
-        # The diagnostic message points at the right invariant and
-        # specifically calls out the index-reordering rejection so
-        # the test pins which classifier branch fired (the input
-        # uses M == N == 128, so a non-square shape mismatch could
-        # not have triggered the rejection — without this message
-        # text assertion, a future change that flipped the rejection
-        # to "rank mismatch" or another path would silently pass).
-        message = str(cm.exception)
-        self.assertIn("tcgen05 MMA path", message)
-        self.assertIn("indices and masks", message)
-        self.assertIn("Identity stores", message)
-        self.assertIn(
-            "loads whose index expression is not exactly the carrier tile-id symbol",
-            message,
-        )
-
     def test_tcgen05_fused_residual_epilogue_runtime_correctness(self) -> None:
         """``out[tile] = (acc + residual[tile_m, tile_n]).to(x.dtype)``
         after a tcgen05 matmul splices the residual load inline at the
@@ -6361,7 +6644,7 @@ class TestCuteLowerings(unittest.TestCase):
         shape.
 
         Entrance test for the auxiliary-tensor fused-epilogue path.
-        The chain analyzer accepts the ``add`` op with a 2-D
+        The generic fragment planner accepts the ``add`` op with a 2-D
         residual load (matching the carrier tile shape) and renders
         a per-thread aux read inline; the diagnostic backstop in
         ``test_tcgen05_fused_epilogue_store_raises_backend_unsupported``
@@ -6471,13 +6754,13 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("tcgen05_tCgAux_base_0", code)
         self.assertIn("tcgen05_tTR_gAux_0", code)
         self.assertIn("tcgen05_aux_loaded_0", code)
-        self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("tcgen05_epi_value", code)
         # The chain renderer must produce
         # ``aux_loaded ... chain_step ... acc_vec`` in that order
         # (inside the per-subtile loop body).
         first_aux_loaded = code.find("tcgen05_aux_loaded_0")
         self.assertGreaterEqual(first_aux_loaded, 0)
-        first_step = code.find("tcgen05_chain_step", first_aux_loaded)
+        first_step = code.find("tcgen05_epi_value", first_aux_loaded)
         first_vec = code.find("tcgen05_acc_vec", first_step)
         self.assertGreater(first_step, first_aux_loaded)
         self.assertGreater(first_vec, first_step)
@@ -6574,7 +6857,7 @@ class TestCuteLowerings(unittest.TestCase):
             "aux load must follow the t2r copy to keep aux fragments out of "
             "the store-prefix live range",
         )
-        acc_load_pos = code.find("tcgen05_acc_loaded_", loop_pos)
+        acc_load_pos = code.find("tcgen05_epi_acc_", loop_pos)
         self.assertGreater(
             acc_load_pos,
             loop_pos,
@@ -6642,7 +6925,7 @@ class TestCuteLowerings(unittest.TestCase):
         """Compose the rank-1 bias broadcast with a unary relu step:
         ``out[tile] = relu(acc + bias[tile_n]).to(x.dtype)``.
 
-        Pins that the chain analyzer accepts a broadcast aux step
+        Pins that the generic fragment planner accepts a broadcast aux step
         followed by a whitelisted unary op, and the output matches
         eager ``relu(x @ y + bias).to(...)``. This is the canonical
         bias+relu pattern referenced by the 2026-05-09 user
@@ -6688,7 +6971,7 @@ class TestCuteLowerings(unittest.TestCase):
     ) -> None:
         """``out[tile] = (bias[tile_n] + acc).to(x.dtype)`` (reverse-
         form add: aux load on the *left*, carrier on the right) is
-        accepted by the chain analyzer and produces output bit-exact
+        accepted by the generic fragment planner and produces output bit-exact
         with eager ``(bias + x @ y).to(...)``.
 
         Pins the ``_carrier_tile_index_nodes`` walker's reverse-form
@@ -6779,110 +7062,6 @@ class TestCuteLowerings(unittest.TestCase):
         expected = ((x @ y).float() + 0.5 * residual.float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_fused_scaled_aux_reverse_form_rejects_swapped_indices(
-        self,
-    ) -> None:
-        """A scaled/wrapped aux operand on the left still pins exact
-        aux indices to the carrier order; square shapes cannot fall
-        back to shape-only acceptance."""
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_scaled_residual_swapped(
-            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = (
-                    0.5 * residual[tile_n, tile_m].to(torch.float32) + acc
-                ).to(x.dtype)
-            return out
-
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        residual = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            bound = cute_matmul_scaled_residual_swapped.bind((x, y, residual))
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 32],
-                pid_type="persistent_interleaved",
-            )
-            bound.to_triton_code(cfg)
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
-
-    def test_tcgen05_fused_colvec_broadcast_rejected_at_classify_time(
-        self,
-    ) -> None:
-        """``out[tile] = (acc + colvec[tile_m]).to(x.dtype)`` is
-        rejected at classify time and bails to the loud-failure
-        backstop with a ``BackendUnsupported`` raise.
-
-        A bare rank-1 RHS aligns to the *last* dimension under
-        PyTorch broadcasting rules: ``(BM, BN) + (BM,)`` is either
-        a shape error (BM != BN) or a *rowvec* broadcast on the
-        trailing axis (BM == BN), never a column-vector broadcast.
-        Accepting ``bias[tile_m]`` would silently rewrite the
-        user's broadcast direction. Classifier rejection lands at
-        ``aux_tensor_load_kind`` (``cute_fx_walk.py``) where the
-        single load index symbol must equal
-        ``carrier_tile_index_nodes[1]`` (the trailing axis).
-
-        Users wanting an explicit colvec broadcast must spell it
-        out (``bias[tile_m][:, None]`` / ``.unsqueeze(-1)`` /
-        ``.expand(...)``); that is a separate, deferred pattern
-        handler.
-        """
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_colvec(
-            x: torch.Tensor, y: torch.Tensor, colvec: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = (acc + colvec[tile_m]).to(x.dtype)
-            return out
-
-        # BM == BN == 128 is the only square case where PyTorch
-        # would not error on the broadcast; the classifier still
-        # rejects the leading-axis index pattern.
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        colvec = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_colvec.bind((x, y, colvec)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
-            )
-            cute_matmul_colvec(x, y, colvec)
-        # The diagnostic message points at the loud-failure backstop
-        # for non-whitelisted fused epilogues.
-        message = str(cm.exception)
-        self.assertIn("tcgen05 MMA path", message)
-        self.assertIn("rowvec", message)
-
     def test_tcgen05_fused_bias_broadcast_codegen_marker(self) -> None:
         """The spliced rowvec broadcast emits an ``aux_view2d`` local
         bound to ``cute.make_tensor(bias.iterator,
@@ -6948,56 +7127,6 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertGreaterEqual(view_pos, 0)
         self.assertGreater(load_pos, view_pos)
 
-    def test_tcgen05_fused_bias_broadcast_rejects_non_contiguous(self) -> None:
-        """Reject rank-1 broadcast aux loads whose underlying tensor
-        is non-contiguous (stride != 1).
-
-        The splice site emits ``cute.make_layout((m, n), stride=(0, 1))``
-        / ``stride=(1, 0)`` with stride 1 hard-coded on the data axis.
-        A non-contiguous bias (e.g. ``bias[::2]``) would otherwise be
-        silently read as if it were contiguous, producing wrong output.
-        The classifier rejects non-stride-1 broadcast aux at compile
-        time and the loud-failure backstop fires.
-        """
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_bias_strided(
-            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
-            return out
-
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        # Build a non-contiguous bias by slicing every other element
-        # of a length-256 tensor; the resulting view has stride 2.
-        bias_full = torch.randn(256, dtype=torch.bfloat16, device=DEVICE)
-        bias = bias_full[::2]  # shape (128,), stride (2,)
-        assert bias.stride() == (2,), f"unexpected stride: {bias.stride()}"
-        with (
-            self.assertRaises(exc.BackendUnsupported),
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_bias_strided.bind((x, y, bias)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
-            )
-            cute_matmul_bias_strided(x, y, bias)
-
     def test_tcgen05_fused_aux_rejects_extra_mask(self) -> None:
         """Reject auxiliary loads with non-default ``extra_mask``
         arguments. ``hl.load(aux, [...], extra_mask=...)`` carries
@@ -7054,56 +7183,7 @@ class TestCuteLowerings(unittest.TestCase):
             cute_matmul_residual_masked(x, y, residual, mask)
         # The diagnostic must point at the cute MMA path (the
         # loud-failure backstop message).
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
-
-    def test_tcgen05_fused_aux_rejects_rank_mismatch(self) -> None:
-        """Reject 2-D aux loads whose underlying tensor is rank-3
-        with a static collapse (``aux3d[tile_m, tile_n, 0]``). The
-        load result shape is 2-D and would pass the result-shape
-        check, but ``cute.local_tile(aux_tensor, (bm, bn),
-        (coord_m, coord_n))`` would receive a rank-3 tensor with a
-        rank-2 tile shape — invalid codegen. The classifier also
-        requires the underlying tensor rank to match the carrier
-        rank, so the loud-failure backstop fires.
-        """
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_3d(
-            x: torch.Tensor, y: torch.Tensor, residual3d: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # 3-D underlying tensor with a static collapse on
-                # the trailing axis. The 2-D result shape matches
-                # the carrier, but the underlying rank does not.
-                out[tile_m, tile_n] = (acc + residual3d[tile_m, tile_n, 0]).to(x.dtype)
-            return out
-
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        residual3d = torch.randn(128, 128, 1, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_residual_3d.bind((x, y, residual3d)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
-            )
-            cute_matmul_residual_3d(x, y, residual3d)
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
+        self.assertIn("atomic viability check", str(cm.exception))
 
     def test_tcgen05_fused_aux_partial_single_edge_runtime_correctness(self) -> None:
         """Aux fusion on the SIMT-store fallback predicates aux loads too.
@@ -7293,7 +7373,7 @@ class TestCuteLowerings(unittest.TestCase):
         if a future refactor accidentally skips the splice, this test
         catches the regression by checking the ``cute.where`` marker
         plus the hoisted load and per-step chain locals
-        (``tcgen05_acc_loaded``, ``tcgen05_chain_step*``) introduced
+        (``tcgen05_epi_acc``, ``tcgen05_epi_value*``) introduced
         by the per-step-binding renderer.
 
         Anchors on a single splice-site block (the ``tcgen05_acc_vec``
@@ -7318,194 +7398,26 @@ class TestCuteLowerings(unittest.TestCase):
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
-        # Structural pins: the chain analyzer accepted relu, the splice
+        # Structural pins: the generic fragment planner accepted relu, the splice
         # site emitted the rendered template, the load-binding local,
         # and a per-step chain local.
         self.assertIn("cute.where", code)
-        self.assertIn("tcgen05_acc_loaded", code)
-        self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("tcgen05_epi_acc", code)
+        self.assertIn("tcgen05_epi_value", code)
         # Anchor ordering on the *first* splice-site block (a single
-        # ``tcgen05_acc_loaded ... tcgen05_chain_step ... tcgen05_acc_vec``
+        # ``tcgen05_epi_acc ... tcgen05_epi_value ... tcgen05_acc_vec``
         # window). Prior version used ``code.find`` first-occurrence
         # which globally compared positions across all three splice
         # sites (SIMT, TMA, helper) and falsely failed if any site
         # emitted them in a different relative order. The single-block
         # anchor avoids that fragility while still pinning the
         # structural ordering.
-        first_load = code.find("tcgen05_acc_loaded")
+        first_load = code.find("tcgen05_epi_acc")
         self.assertGreaterEqual(first_load, 0)
-        first_step = code.find("tcgen05_chain_step", first_load)
+        first_step = code.find("tcgen05_epi_value", first_load)
         first_vec = code.find("tcgen05_acc_vec", first_step)
         self.assertGreater(first_step, first_load)
         self.assertGreater(first_vec, first_step)
-
-    def test_tcgen05_fused_chain_rejects_alpha_kwarg(self) -> None:
-        """G3.1.1 must reject ``aten.add.Tensor(carrier, scalar, alpha=k)``
-        and similar kwarg-bearing scalar binary ops, falling back to
-        the G3.1.0 ``BackendUnsupported`` raise.
-
-        Silently rendering ``carrier + scalar`` when the FX node is
-        ``add(carrier, scalar, alpha=2.0)`` would emit incorrect
-        arithmetic — ``alpha`` scales the second argument, so the
-        correct rendering is ``carrier + 2.0 * scalar``. The
-        conservative response is to bail; an explicit residual-add
-        with alpha is rare enough that requiring the user to express
-        it as ``carrier + alpha_times_scalar`` (a constant fold the
-        user is expected to do at lambda-build time) is acceptable.
-
-        Also assert the FX node the analyzer actually sees has
-        ``kwargs == {'alpha': 2.0}`` so this test exercises the
-        kwarg-reject branch (and not a constant-folded version
-        upstream decomp might produce, which would silently leave the
-        analyzer believing the test passed for the wrong reason).
-        """
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_add_alpha(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # ``torch.add`` with ``alpha`` traces to
-                # ``aten.add.Tensor(acc, 1.0, alpha=2.0)`` -> ``acc + 2.0``.
-                fused = torch.add(acc, 1.0, alpha=2.0)
-                out[tile_m, tile_n] = fused.to(x.dtype)
-            return out
-
-        # Spy on the analyzer to capture the FX node it sees so the
-        # test's pin-on-kwargs is a strict structural check rather
-        # than just a coarse "BackendUnsupported was raised" check.
-        # Without this, an upstream decomp that constant-folded
-        # ``alpha`` into the second arg would leave the analyzer
-        # facing ``add(acc, 2.0)`` with empty kwargs, the splice
-        # would fire, and no ``BackendUnsupported`` would surface;
-        # the test would pass for the wrong reason.
-        from helion._compiler.cute import cute_epilogue
-        from helion._compiler.cute import memory_ops
-
-        seen_fx_kwargs: list[dict[str, object]] = []
-        original = cute_epilogue.analyze_tcgen05_unary_epilogue_chain
-
-        def spy(state, value_node, **kwargs):
-            cur = value_node
-            while cur is not None and cur.op == "call_function":
-                if cur.target is torch.ops.aten.add.Tensor:
-                    seen_fx_kwargs.append(dict(cur.kwargs))
-                    break
-                if cur.args and isinstance(cur.args[0], torch.fx.Node):
-                    cur = cur.args[0]
-                else:
-                    break
-            return original(state, value_node, **kwargs)
-
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-            patch.object(cute_epilogue, "analyze_tcgen05_unary_epilogue_chain", spy),
-            patch.object(memory_ops, "analyze_tcgen05_unary_epilogue_chain", spy),
-        ):
-            cute_matmul_add_alpha.bind((x, y)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
-            )
-            cute_matmul_add_alpha(x, y)
-        self.assertIn("tcgen05 MMA path", str(cm.exception))
-        # The analyzer must have seen at least one `aten.add.Tensor`
-        # node carrying the `alpha` kwarg — otherwise the test is
-        # passing because of some other unrelated rejection (e.g.,
-        # the residual was constant-folded), not because the
-        # kwarg-reject path fired.
-        self.assertTrue(seen_fx_kwargs, "analyzer never saw aten.add.Tensor")
-        self.assertIn("alpha", seen_fx_kwargs[0])
-        self.assertEqual(seen_fx_kwargs[0]["alpha"], 2.0)
-
-    def test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch(
-        self,
-    ) -> None:
-        """G3.1.1 must reject ``out[tile] = chain(acc).to(d_inter)``
-        when the store-target tensor dtype is ``d_target != d_inter``.
-
-        The user's ``.to(d_inter)`` call is an explicit intermediate
-        cast that affects rounding (``fp32 -> d_inter -> d_target``
-        rounds differently from ``fp32 -> d_target``). The splice
-        site only emits the final ``.to(target_dtype)`` cast; if the
-        analyzer accepted the chain anyway, the rendered kernel would
-        silently drop the intermediate cast and change arithmetic.
-
-        At the FX level Helion always wraps the user's store value in
-        an *implicit* ``convert_element_type`` to the store-target
-        tensor's dtype, so the user-explicit ``.to(d_inter)`` shows up
-        as a *second* ``convert_element_type`` *inside* the chain
-        (between the outer Helion-implicit cast and the chain's leaf
-        unary op). The chain step loop rejects any
-        ``convert_element_type`` mid-chain because it's not on the
-        unary whitelist; the G3.1.0 backstop then fires. This test
-        pins that rejection: ``out_fp16[tile] = relu(acc).to(bf16)``
-        would silently change rounding if the analyzer accepted, but
-        the chain-loop reject of the inner ``convert_element_type``
-        keeps it correct.
-        """
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_relu_dtype_mismatch(
-            x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # Intermediate cast to bf16, then store into an fp16
-                # tensor: the analyzer must reject because the
-                # rendered ``.to(target_dtype)`` only handles the
-                # final cast, dropping the intermediate.
-                out[tile_m, tile_n] = torch.relu(acc).to(torch.bfloat16)
-            return out
-
-        x = torch.randn(128, 128, dtype=torch.float16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.float16, device=DEVICE)
-        out = torch.empty(128, 128, dtype=torch.float16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_relu_dtype_mismatch.bind((x, y, out)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
-            )
-            cute_matmul_relu_dtype_mismatch(x, y, out)
-        # The chain analyzer's intermediate-cast-dtype reject fires
-        # before the kernel-side cross-site dtype assertion would.
-        # Pin the diagnostic to the G3.1.0 backstop message
-        # specifically — a generic kernel/store dtype-mismatch
-        # ``BackendUnsupported`` would also pass an
-        # ``assertRaises(BackendUnsupported)`` check, but it would
-        # mean the analyzer's dtype-reject was a no-op and the
-        # rendering proceeded to a kernel that the cross-site
-        # assertion later caught (a different defect class).
-        message = str(cm.exception)
-        self.assertIn("tcgen05 MMA path", message)
-        self.assertIn("indices and masks", message)
 
     def test_tcgen05_fused_relu_epilogue_ieee_edge_cases(self) -> None:
         """G3.1.1 relu must match ``torch.relu`` on the full IEEE
@@ -7621,7 +7533,7 @@ class TestCuteLowerings(unittest.TestCase):
         """G3.1.1: a longer whitelisted unary chain (mul-const, add-const,
         relu) splices into the T2R loop and matches eager.
 
-        Exercises the multi-step branch of the chain analyzer plus the
+        Exercises the multi-step branch of the generic fragment planner plus the
         scalar-binary template renderers for ``mul`` and ``add``.
         """
 
@@ -7717,8 +7629,6 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_fused_gelu_exact_runtime_correctness(self) -> None:
         """Default ``F.gelu`` maps to the exact erf-based CuTe epilogue step."""
 
-        import cutlass.cute as cute
-
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -7745,19 +7655,7 @@ class TestCuteLowerings(unittest.TestCase):
             pid_type="persistent_interleaved",
         )
         bound.set_config(cfg)
-        with (
-            patch(
-                "cutlass.cute.arch.fma_packed_f32x2",
-                wraps=cute.arch.fma_packed_f32x2,
-            ) as fma_packed,
-            patch(
-                "cutlass.cute.arch.mul_packed_f32x2",
-                wraps=cute.arch.mul_packed_f32x2,
-            ) as mul_packed,
-        ):
-            out = bound(x, y)
-        self.assertGreater(fma_packed.call_count, 0)
-        self.assertGreater(mul_packed.call_count, 0)
+        out = bound(x, y)
         expected = torch.nn.functional.gelu((x @ y).float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
@@ -7881,7 +7779,7 @@ class TestCuteLowerings(unittest.TestCase):
         without adding a redundant carrier alias.
 
         Pins that the renderer reuses the already-bound chain carrier
-        rather than creating a no-op ``tcgen05_chain_step_in`` vector
+        rather than creating a no-op ``tcgen05_epi_value_in`` vector
         alias before the GELU polynomial. Also pins that the constants
         are baked in as Python literals (``0.7978845608028654 =
         sqrt(2/pi)`` and ``0.035677408136300125 = sqrt(2/pi) *
@@ -7921,89 +7819,16 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
-        # The chain analyzer must accept the decomp-mapped
+        # The generic fragment planner must accept the decomp-mapped
         # ``_gelu_tanh_approx`` op and the splice site must emit the
         # polynomial without a redundant carrier alias. The
         # constants must appear verbatim in the rendered source.
         self.assertIn("cute.math.tanh", code)
-        self.assertIn("tcgen05_acc_loaded", code)
-        self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("tcgen05_epi_acc", code)
+        self.assertIn("tcgen05_epi_value", code)
         self.assertIn("0.7978845608028654", code)
         self.assertIn("0.035677408136300125", code)
-        self.assertNotIn("tcgen05_chain_step_in", code)
-
-    def test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected(
-        self,
-    ) -> None:
-        """The eager Python form of the tanh-approx GELU polynomial
-        (``0.5 * acc * (1 + torch.tanh(acc * (a + b * acc * acc)))``)
-        is rejected by the chain analyzer's linear-chain assumption
-        and bails to the loud-failure ``BackendUnsupported`` backstop.
-
-        Pins the chain analyzer's reuse limitation: the carrier
-        ``acc`` appears four times in the FX graph for the eager
-        form, but each chain step consumes exactly one tensor input
-        (the previous step's output). Folding the polynomial behind
-        the ``_gelu_tanh_approx`` decomp (driven by
-        ``F.gelu(approximate="tanh")``) is the load-bearing reason
-        this test exists — without it, the user cannot fuse the
-        tanh-approx GELU into a tcgen05 epilogue.
-        """
-
-        from helion._compiler.cute.mma_support import get_cute_mma_support
-
-        if not get_cute_mma_support().tcgen05_f16bf16:
-            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-
-        @helion.kernel(backend="cute")
-        def cute_matmul_gelu_eager(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # Eager polynomial — references ``acc`` 4 times.
-                out[tile_m, tile_n] = (
-                    0.5
-                    * acc
-                    * (
-                        1.0
-                        + torch.tanh(acc * (0.7978845608 + 0.0356774081 * acc * acc))
-                    )
-                ).to(x.dtype)
-            return out
-
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            bound = cute_matmul_gelu_eager.bind((x, y))
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 32],
-                pid_type="persistent_interleaved",
-            )
-            bound.set_config(cfg)
-            bound(x, y)
-        msg = str(cm.exception)
-        # Pin the loud-failure backstop wording so an unrelated
-        # rejection path (e.g. an aux load misclassification) cannot
-        # accidentally satisfy this assertion. The backstop fires
-        # because the eager ``acc * acc`` multiply has two tensor
-        # operands (both reach the matmul carrier), which the
-        # whitelist rejects as a non-scalar binary op.
-        self.assertIn(
-            "non-whitelisted fused epilogues",
-            msg,
-        )
-        self.assertIn(
-            "non-scalar binary ops",
-            msg,
-        )
+        self.assertNotIn("tcgen05_epi_value_in", code)
 
     def test_tcgen05_fused_silu_epilogue_runtime_correctness_bf16(self) -> None:
         """``out[tile] = F.silu(acc).to(x.dtype)`` after a bf16 tcgen05
@@ -8017,7 +7842,7 @@ class TestCuteLowerings(unittest.TestCase):
         ``div(carrier, add(exp(neg(carrier)), 1))`` — a non-scalar
         binary divide whose two operands both walk back to the matmul
         accumulator. The generic binary classifier rejects that
-        shape; ``_classify_silu`` in
+        shape; ``per-node lowering capability`` in
         ``helion/_compiler/cute/cute_epilogue.py`` collapses the
         whole div / add / exp / neg subgraph into a single chain step
         rendered with the same ``cute.math.exp2``-based sigmoid form
@@ -8065,7 +7890,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         Pins that the fp16 LLaMA up-proj silu shape (T26 in
         ``benchmarks/cute/cute_autotune_sweep.py``) fuses through the
-        same ``_classify_silu`` path as the bf16 entry test above.
+        same ``per-node lowering capability`` path as the bf16 entry test above.
         Separate from the bf16 test because tcgen05 picks distinct
         kernel layouts for the two dtypes, so an fp16 regression
         cannot piggyback on a bf16-only test.
@@ -8110,9 +7935,9 @@ class TestCuteLowerings(unittest.TestCase):
         Pins the silu rendering — ``cute.math.exp2`` plus the
         ``LOG2_E`` constant — and that the splice substitutes the
         rendered expression for the multi-node FX subgraph (no
-        ``aten.div`` survives the splice; the chain analyzer
+        ``aten.div`` survives the splice; the generic fragment planner
         collapsed the whole ``div(x, 1 + exp(-x))`` decomposition
-        into one ``tcgen05_chain_step`` local). The constant is
+        into one ``tcgen05_epi_value`` local). The constant is
         spelled as the same literal Inductor's cutedsl sigmoid
         override uses (``torch/_inductor/codegen/cutedsl/cutedsl_op_overrides.py``)
         so a future drift between the two paths is caught here.
@@ -8146,12 +7971,12 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
-        # The chain analyzer accepted the decomposed silu; the splice
+        # The generic fragment planner accepted the decomposed silu; the splice
         # site emitted the sigmoid form (``cute.math.exp2`` + LOG2_E)
         # at the per-thread T2R register.
         self.assertIn("cute.math.exp2", code)
-        self.assertIn("tcgen05_acc_loaded", code)
-        self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("tcgen05_epi_acc", code)
+        self.assertIn("tcgen05_epi_value", code)
         self.assertIn("1.4426950408889634", code)
 
     def test_tcgen05_fused_sigmoid_epilogue_runtime_correctness_bf16(self) -> None:
@@ -8160,14 +7985,14 @@ class TestCuteLowerings(unittest.TestCase):
         register and matches eager ``torch.sigmoid(x @ y).to(x.dtype)``.
 
         Exercises the ``aten.sigmoid.default`` registration in
-        ``_ZERO_ARG_TARGETS`` (``cute_epilogue.py``) — neither
+        ``PointwiseLowering`` (``cute_epilogue.py``) — neither
         ``aten.sigmoid`` nor ``aten.sigmoid.default`` has a registered
         decomposition (only ``aten.sigmoid_backward`` and the hard
         variants do), so the user-side ``torch.sigmoid(acc)`` traces
         through as a single FX node and lands on the standalone
         sigmoid whitelist row directly — distinct from the silu chain
-        steps below, which are matched by ``_classify_silu`` and
-        never reach the ``_ZERO_ARG_TARGETS`` lookup. Pinning the
+        steps below, which are matched by ``per-node lowering capability`` and
+        never reach the ``PointwiseLowering`` lookup. Pinning the
         standalone path keeps a future refactor from accidentally
         deleting the sigmoid row on the assumption that silu fusion
         renders the row redundant.
@@ -8200,43 +8025,20 @@ class TestCuteLowerings(unittest.TestCase):
         )
         bound.set_config(cfg)
         # Capture the generated code first so the assertions confirm
-        # the splice routed through the ``_ZERO_ARG_TARGETS`` sigmoid
+        # the splice routed through the ``PointwiseLowering`` sigmoid
         # row (``cute.math.exp2`` + ``LOG2_E``) before running the
         # kernel for numerical correctness.
         with patch_cute_mma_support():
             code = bound.to_triton_code(cfg)
         self.assertIn("cute.math.exp2", code)
         self.assertIn("1.4426950408889634", code)
-        self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("tcgen05_epi_value", code)
         out = bound(x, y)
         expected = torch.sigmoid((x @ y).float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_fused_silu_mul_form_runtime_correctness_bf16(self) -> None:
-        """``out[tile] = (acc * torch.sigmoid(acc)).to(x.dtype)`` fuses
-        through the ``_classify_silu`` mul-form branch.
-
-        Validates the second ``_classify_silu`` arm
-        (``mul(carrier, sigmoid(carrier))`` / ``mul(sigmoid(carrier),
-        carrier)``) which the inductor-decomp-driven silu tests above
-        never exercise: those tests trace through
-        ``torch/_inductor/decomposition.py``::``silu`` which expands
-        ``aten.silu`` as ``x / (1 + x.neg().exp())``, so they hit the
-        ``div`` arm of ``_classify_silu`` only. Hand-written silu
-        spelled as ``acc * torch.sigmoid(acc)`` is a real user
-        pattern (the ``examples/swiglu.py`` reference path constructs
-        it this way), and the mul arm fuses it as a single step
-        rather than tripping the loud-failure backstop with a
-        non-scalar binary multiply rejection.
-
-        Confirms the chain step lands at the splice site by reading
-        the generated code: the rendered silu form (``cute.math.exp2``
-        + the carrier appearing twice — once for the outer ``x *``
-        and once inside the exp2 argument) survives only if the mul
-        arm of ``_classify_silu`` matched; otherwise the splice
-        falls through to the loud-failure path and ``to_triton_code``
-        raises ``BackendUnsupported`` before returning.
-        """
+        """A hand-written SiLU graph runs in the generic fragment epilogue."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -8254,11 +8056,6 @@ class TestCuteLowerings(unittest.TestCase):
                 acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
                     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # Hand-written silu — should trace as
-                # ``mul(carrier, sigmoid(carrier))`` (one FX mul
-                # plus one FX sigmoid) and fuse via ``_classify_silu``'s
-                # mul arm, not via the ``div(x, 1 + exp(-x))`` arm
-                # that the F.silu decomposition produces.
                 out[tile_m, tile_n] = (acc * torch.sigmoid(acc)).to(x.dtype)
             return out
 
@@ -8273,36 +8070,9 @@ class TestCuteLowerings(unittest.TestCase):
         bound.set_config(cfg)
         with patch_cute_mma_support():
             code = bound.to_triton_code(cfg)
-        # The splice site emitted the silu form. If the mul arm of
-        # ``_classify_silu`` had not matched, the chain analyzer
-        # would have returned ``None`` and the store would have
-        # raised ``BackendUnsupported`` before producing this code.
         self.assertIn("cute.math.exp2", code)
         self.assertIn("1.4426950408889634", code)
-        self.assertIn("tcgen05_chain_step", code)
-        # The standalone sigmoid template renders the bare
-        # ``1.0 / (1.0 + ...)`` without an outer ``x *`` factor; the
-        # silu template wraps it in ``(carrier) * (1.0 / ...)``. A
-        # successful mul-arm match emits the silu template, which
-        # references the carrier-local twice in one rendered chain
-        # step (once for the outer mul, once inside the exp2
-        # argument). Reject any rendering that lacks both
-        # occurrences inside a single chain-step block — that would
-        # indicate the splice degenerated to the plain sigmoid
-        # template plus a free-standing outer mul.
-        chain_step_index = code.find("tcgen05_chain_step")
-        # The renderer emits ``<chain_step_var> = (carrier) * (1.0 / (1.0 +
-        # cute.math.exp2(...)))`` on a single line; the assignment line
-        # must reference both the outer ``*`` and the ``exp2`` call
-        # ahead of the next chain-step assignment.
-        next_chain_step = code.find("tcgen05_chain_step", chain_step_index + 1)
-        chain_step_line_end = code.find("\n", chain_step_index)
-        if next_chain_step == -1 or next_chain_step > chain_step_line_end:
-            single_step = code[chain_step_index:chain_step_line_end]
-        else:
-            single_step = code[chain_step_index:next_chain_step]
-        self.assertIn("*", single_step)
-        self.assertIn("cute.math.exp2", single_step)
+        self.assertIn("tcgen05_epi_value", code)
         out = bound(x, y)
         ref = x @ y
         expected = (ref * torch.sigmoid(ref)).to(x.dtype)
@@ -13976,236 +13746,6 @@ class TestCuteLowerings(unittest.TestCase):
         assert copied_analysis is not None
         self.assertFalse(copied_analysis.requires_accumulator_seed)
 
-    def _build_aux_load_node(
-        self,
-        *,
-        aux_tensor: torch.Tensor,
-        load_shape: tuple[int, ...],
-        index_nodes: tuple[torch.fx.Node, ...],
-        extra_mask: object = None,
-        eviction_policy: object = None,
-        kwargs: dict[str, object] | None = None,
-    ) -> tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]:
-        """Build a synthetic ``helion.language.memory_ops.load`` FX node for
-        the aux-tensor classifier (``aux_tensor_load_kind``).
-
-        ``aux_tensor`` is the underlying tensor whose ``.shape`` / ``.stride()``
-        drive classification (use ``.expand(...)`` to get the stride-0
-        broadcast axes). ``load_shape`` is the per-tile load result shape.
-        ``index_nodes`` is the index list passed to ``load`` — pass the same
-        carrier tile-id nodes to mimic ``aux[tile_m, tile_n]``. Returns the
-        load node and the carrier tile-id index nodes.
-        """
-        from helion.language import memory_ops
-
-        graph = Graph()
-        tensor_node = graph.call_function(_tracing_ops._new_var, args=())
-        tensor_node.meta["val"] = aux_tensor
-        args: tuple[object, ...] = (
-            tensor_node,
-            list(index_nodes),
-            extra_mask,
-            eviction_policy,
-        )
-        load_node = graph.call_function(memory_ops.load, args=args, kwargs=kwargs or {})
-        load_node.meta["val"] = torch.empty(load_shape, dtype=aux_tensor.dtype)
-        return load_node, index_nodes
-
-    def _carrier_index_nodes(self, rank: int = 2) -> tuple[torch.fx.Node, ...]:
-        """Distinct FX nodes standing in for a carrier's tile-id symbols."""
-        g = Graph()
-        return tuple(
-            g.call_function(_tracing_ops._new_var, args=()) for _ in range(rank)
-        )
-
-    def test_aux_load_kind_rank3_exact_leading_passthrough(self) -> None:
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes(3)
-        exact = torch.empty(2, 4, 4, dtype=torch.float32)
-        load_node, _ = self._build_aux_load_node(
-            aux_tensor=exact,
-            load_shape=(1, 4, 4),
-            index_nodes=idx,
-        )
-        self.assertEqual(
-            aux_tensor_load_kind(
-                load_node,
-                carrier_tile_shape=(1, 4, 4),
-                carrier_tile_index_nodes=idx,
-                carrier_global_shape=(2, 4, 4),
-            ),
-            ("exact", None),
-        )
-
-    def test_aux_load_kind_rank3_rejects_foreign_leading_index(self) -> None:
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes(3)
-        foreign_leading = self._carrier_index_nodes(1)[0]
-        exact = torch.empty(2, 4, 4, dtype=torch.float32)
-        load_node, _ = self._build_aux_load_node(
-            aux_tensor=exact,
-            load_shape=(1, 4, 4),
-            index_nodes=(foreign_leading, *idx[1:]),
-        )
-        self.assertIsNone(
-            aux_tensor_load_kind(
-                load_node,
-                carrier_tile_shape=(1, 4, 4),
-                carrier_tile_index_nodes=idx,
-                carrier_global_shape=(2, 4, 4),
-            )
-        )
-
-    def test_aux_load_kind_colvec_stride_1_0_is_broadcast_2(self) -> None:
-        """A full ``(M, N)`` aux with trailing stride 0 (the
-        ``unsqueeze(1).expand(M, N)`` per-row column vector) classifies as
-        ``("broadcast", 2)`` so the epilogue reads it as a scalar per
-        subtile instead of a redundant N-wide vector load."""
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes()
-        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
-        self.assertEqual(colvec.stride(), (1, 0))
-        load_node, _ = self._build_aux_load_node(
-            aux_tensor=colvec,
-            load_shape=(4, 4),
-            index_nodes=idx,
-        )
-        self.assertEqual(
-            aux_tensor_load_kind(
-                load_node,
-                carrier_tile_shape=(4, 4),
-                carrier_tile_index_nodes=idx,
-                carrier_global_shape=(4, 4),
-            ),
-            ("broadcast", 2),
-        )
-
-    def test_aux_load_kind_exact_tensor_is_not_colvec(self) -> None:
-        """A genuine dense ``(M, N)`` aux (trailing stride 1) must fall
-        through the colvec matcher to ``("exact", None)`` — the colvec
-        path only claims trailing-stride-0 views."""
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes()
-        exact = torch.empty(4, 4, dtype=torch.float32)
-        self.assertEqual(exact.stride(), (4, 1))
-        load_node, _ = self._build_aux_load_node(
-            aux_tensor=exact,
-            load_shape=(4, 4),
-            index_nodes=idx,
-        )
-        self.assertEqual(
-            aux_tensor_load_kind(
-                load_node,
-                carrier_tile_shape=(4, 4),
-                carrier_tile_index_nodes=idx,
-                carrier_global_shape=(4, 4),
-            ),
-            ("exact", None),
-        )
-
-    def test_aux_load_kind_rowvec_1n_is_not_colvec(self) -> None:
-        """The explicit ``(1, N)`` leading-broadcast row vector (unit
-        leading axis, contiguous trailing) is ``("broadcast", 0)``, never
-        the colvec form — colvec requires a full ``(M, N)`` view with
-        trailing stride 0 and non-zero leading stride."""
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes()
-        # Underlying ``(1, N)`` tensor; the per-tile load result is (M, N).
-        rowvec = torch.empty(1, 4, dtype=torch.float32)
-        self.assertEqual(rowvec.stride(), (4, 1))
-        load_node, _ = self._build_aux_load_node(
-            aux_tensor=rowvec,
-            load_shape=(4, 4),
-            index_nodes=idx,
-        )
-        self.assertEqual(
-            aux_tensor_load_kind(
-                load_node,
-                carrier_tile_shape=(4, 4),
-                carrier_tile_index_nodes=idx,
-                carrier_global_shape=(4, 4),
-            ),
-            ("broadcast", 0),
-        )
-
-    def test_aux_load_kind_colvec_rejected_when_index_order_mismatches(
-        self,
-    ) -> None:
-        """The colvec matcher requires the load index list to be the
-        carrier tile-id nodes in order; a swapped/foreign index must not
-        be claimed as ``("broadcast", 2)``."""
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes()
-        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
-        # Swap the index order so it no longer matches the carrier nodes.
-        load_node, _ = self._build_aux_load_node(
-            aux_tensor=colvec,
-            load_shape=(4, 4),
-            index_nodes=(idx[1], idx[0]),
-        )
-        self.assertNotEqual(
-            aux_tensor_load_kind(
-                load_node,
-                carrier_tile_shape=(4, 4),
-                carrier_tile_index_nodes=idx,
-                carrier_global_shape=(4, 4),
-            ),
-            ("broadcast", 2),
-        )
-
-    def test_aux_load_kind_colvec_rejected_when_global_shape_mismatches(
-        self,
-    ) -> None:
-        """When the underlying ``(M, N)`` view does not match the carrier's
-        global output shape, the colvec matcher bails (returns ``None``
-        rather than ``("broadcast", 2)``)."""
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes()
-        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
-        result = aux_tensor_load_kind(
-            self._build_aux_load_node(
-                aux_tensor=colvec,
-                load_shape=(4, 4),
-                index_nodes=idx,
-            )[0],
-            carrier_tile_shape=(4, 4),
-            carrier_tile_index_nodes=idx,
-            carrier_global_shape=(8, 8),  # mismatched global shape
-        )
-        self.assertNotEqual(result, ("broadcast", 2))
-
-    def test_aux_load_kind_colvec_rejected_with_extra_mask(self) -> None:
-        """A present ``extra_mask`` arg disqualifies the load entirely
-        (the splice emits a plain ``.load()`` with no mask), so even a
-        colvec-shaped aux returns ``None``."""
-        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
-
-        idx = self._carrier_index_nodes()
-        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
-        mask_graph = Graph()
-        mask_node = mask_graph.call_function(_tracing_ops._new_var, args=())
-        load_node, _ = self._build_aux_load_node(
-            aux_tensor=colvec,
-            load_shape=(4, 4),
-            index_nodes=idx,
-            extra_mask=mask_node,
-        )
-        self.assertIsNone(
-            aux_tensor_load_kind(
-                load_node,
-                carrier_tile_shape=(4, 4),
-                carrier_tile_index_nodes=idx,
-                carrier_global_shape=(4, 4),
-            )
-        )
-
     def test_emit_sched_pipeline_setup_round_trips_pipeline_async(self) -> None:
         """``_emit_sched_pipeline_setup`` emits the
         ``cutlass.pipeline.PipelineAsync.create`` wrapper used to
@@ -14606,12 +14146,10 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
         ``test_tcgen05_codegen_consumes_warp_spec``.
         """
         from helion._compiler.cute import cute_mma as cute_mma_module
-        from helion._compiler.cute.aux_tensor import (
-            _store_value_pairs_from_graph as _aux_store_value_pairs_from_graph,
-        )
         from helion._compiler.cute.device_state import (
             CuteTcgen05MatmulPlan as _CuteTcgen05MatmulPlan,
         )
+        from helion.language import memory_ops as language_memory_ops
 
         observed_plans: list[_CuteTcgen05MatmulPlan] = []
         store_value_nodes: set[torch.fx.Node] = set()
@@ -14634,9 +14172,13 @@ class TestCuteTcgen05AuxTensorWalker(unittest.TestCase):
 
         def sniffing_discover(cg, matmul_fx_node):  # type: ignore[no-untyped-def]
             store_value_nodes.update(
-                value
+                node.args[2]
                 for graph_info in cg.codegen_graphs
-                for _, value in _aux_store_value_pairs_from_graph(graph_info.graph)
+                for node in graph_info.graph.nodes
+                if node.op == "call_function"
+                and node.target is language_memory_ops.store
+                and len(node.args) > 2
+                and isinstance(node.args[2], torch.fx.Node)
             )
             return original_discover(cg, matmul_fx_node)
 
@@ -15482,7 +15024,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertRegex(
             code,
-            r"tcgen05_acc_loaded_\d+ = tcgen05_tRS_rAcc\.load\(\)",
+            r"tcgen05_epi_acc_\d+ = tcgen05_tRS_rAcc\.load\(\)",
         )
         self.assertIn("tcgen05_tRS_rD.store(tcgen05_acc_vec)", code)
         self.assertNotIn("tcgen05_tTR_rD.store(tcgen05_acc_vec)", code)
@@ -15506,7 +15048,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             subtile_loop,
             "aux TMA store must wait for the aux stage inside the loop",
         )
-        acc_load = code.find("tcgen05_acc_loaded_", subtile_loop)
+        acc_load = code.find("tcgen05_epi_acc_", subtile_loop)
         self.assertGreater(
             acc_load,
             subtile_loop,

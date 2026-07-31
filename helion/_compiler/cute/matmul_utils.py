@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
     from ..aten_lowering import LoweringContext
     from ..helper_function import CodegenInterface
+    from ..inductor_lowering import CodegenState
 
 
 @dataclass(frozen=True)
@@ -788,6 +789,60 @@ def cute_underlying_load_node(node: torch.fx.Node) -> torch.fx.Node | None:
     return None
 
 
+def cute_rematerialize_scalar_load(
+    state: CodegenState,
+    load_node: torch.fx.Node,
+    *,
+    index_overrides: Mapping[int, str],
+    env_overrides: Mapping[torch.fx.Node, ast.AST] | None = None,
+) -> tuple[list[ast.AST], ast.AST] | None:
+    """Run canonical CuTe load codegen at explicit logical coordinates."""
+    from ..inductor_lowering import CodegenState
+
+    def env_arg(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            if env_overrides is not None and arg in env_overrides:
+                return env_overrides[arg]
+            return state.env[arg]
+        if isinstance(arg, (list, tuple)):
+            return type(arg)(env_arg(value) for value in arg)
+        return arg
+
+    def proxy_arg(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return arg.meta["val"]
+        if isinstance(arg, (list, tuple)):
+            return type(arg)(proxy_arg(value) for value in arg)
+        return arg
+
+    rematerialized_state = CodegenState(
+        state.codegen,
+        fx_node=load_node,
+        env=state.env,
+        proxy_args=[proxy_arg(arg) for arg in load_node.args],
+        ast_args=[env_arg(arg) for arg in load_node.args],
+    )
+    cute_state = state.device_function.cute_state
+    previous_overrides = dict(cute_state.load_index_override)
+    previous_rematerializing = cute_state.rematerializing_scalar_load
+    statements: list[ast.AST] = []
+    cute_state.load_index_override = {
+        **previous_overrides,
+        **index_overrides,
+    }
+    cute_state.rematerializing_scalar_load = True
+    load_codegen = load._codegen["cute"]  # pyrefly: ignore[missing-attribute]
+    try:
+        with state.codegen.set_statements(statements):
+            result = load_codegen(rematerialized_state)
+    finally:
+        cute_state.load_index_override = previous_overrides
+        cute_state.rematerializing_scalar_load = previous_rematerializing
+    if not isinstance(result, ast.AST):
+        return None
+    return statements, result
+
+
 def cute_rematerialize_rhs_at_index_override(
     ctx: LoweringContext,
     rhs_node: torch.fx.Node,
@@ -836,13 +891,13 @@ def cute_rematerialize_rhs_at_index_override(
         proxy_args=list(proxy_args),
         ast_args=list(ast_args),
     )
-    previous = dict(cute_state.matmul_operand_index_override)
-    cute_state.matmul_operand_index_override = {n_block_id: index_expr}
+    previous = dict(cute_state.load_index_override)
+    cute_state.load_index_override = {n_block_id: index_expr}
     load_codegen = load._codegen["cute"]  # pyrefly: ignore[missing-attribute]
     try:
         result = load_codegen(state)
     finally:
-        cute_state.matmul_operand_index_override = previous
+        cute_state.load_index_override = previous
     if isinstance(result, ast.AST):
         return result
     return None

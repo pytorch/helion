@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopState
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
+    from .cute_epilogue import Tcgen05EpiloguePlan
+    from .cute_epilogue import Tcgen05EpilogueStorePlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -295,6 +297,11 @@ class CuteDeviceFunctionState:
         # registered under this result var, even when user-visible names were
         # renamed through casts or epilogue nodes.
         self.matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
+        self._epilogue_plans_by_anchor: dict[torch.fx.Node, Tcgen05EpiloguePlan] = {}
+        self._epilogue_store_plans: dict[
+            torch.fx.Node, tuple[Tcgen05EpiloguePlan, Tcgen05EpilogueStorePlan]
+        ] = {}
+        self._deferred_epilogue_nodes: set[torch.fx.Node] = set()
         self.matmul_plan: CuteTcgen05MatmulPlan | None = None
         # Variable-name containers allocated in cute_mma and consumed by
         # program_id / memory_ops role builders. They live here so CuTe pipeline
@@ -336,7 +343,8 @@ class CuteDeviceFunctionState:
         # makes its N axis read a serial N-loop variable instead, and suppresses
         # masking for that axis (the serial loop already covers exactly [0, C)).
         # Empty except while re-materializing such an operand load.
-        self.matmul_operand_index_override: dict[int, str] = {}
+        self.load_index_override: dict[int, str] = {}
+        self.rematerializing_scalar_load = False
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the
@@ -347,6 +355,31 @@ class CuteDeviceFunctionState:
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
+
+    def register_tcgen05_epilogue_plan(self, plan: Tcgen05EpiloguePlan) -> None:
+        """Atomically install one finalized live-FX epilogue plan."""
+        assert plan.anchor not in self._epilogue_plans_by_anchor
+        for store in plan.stores:
+            assert store.store_node not in self._epilogue_store_plans
+        self._epilogue_plans_by_anchor[plan.anchor] = plan
+        self._deferred_epilogue_nodes.update(plan.owned_nodes)
+        for store in plan.stores:
+            self._epilogue_store_plans[store.store_node] = (plan, store)
+
+    def tcgen05_epilogue_plan_for_anchor(
+        self, anchor: torch.fx.Node
+    ) -> Tcgen05EpiloguePlan | None:
+        return self._epilogue_plans_by_anchor.get(anchor)
+
+    def tcgen05_epilogue_store_plan(
+        self, store_node: torch.fx.Node | None
+    ) -> tuple[Tcgen05EpiloguePlan, Tcgen05EpilogueStorePlan] | None:
+        if store_node is None:
+            return None
+        return self._epilogue_store_plans.get(store_node)
+
+    def is_deferred_tcgen05_epilogue_node(self, node: torch.fx.Node) -> bool:
+        return node in self._deferred_epilogue_nodes
 
     def register_tcgen05_store_value(
         self, name: str, value: CuteTcgen05StoreValue

@@ -5131,4 +5131,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
+        if device_function.cute_state.matmul_plan is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 persistent scheduling requires the collective MMA and "
+                "epilogue plan to pass one atomic viability check",
+            )
         return self._setup_tcgen05_persistent_kernel(device_function)

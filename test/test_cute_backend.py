@@ -862,7 +862,7 @@ def cute_casted_batched_dot_tcgen05(x: torch.Tensor, y: torch.Tensor) -> torch.T
 
 
 @helion.kernel(backend="cute")
-def cute_batched_dot_unsupported_epilogue_tcgen05(
+def cute_batched_dot_sine_epilogue_tcgen05(
     x: torch.Tensor,
     y: torch.Tensor,
     residual: torch.Tensor,
@@ -5536,7 +5536,7 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("cute.gemm(", code)
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
 
-    def test_unsupported_batched_epilogue_falls_back_correctly(self) -> None:
+    def test_generic_batched_sine_epilogue_uses_collective(self) -> None:
         args = (
             torch.randn(2, 128, 64, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(2, 64, 8, device=DEVICE, dtype=HALF_DTYPE),
@@ -5544,12 +5544,12 @@ class TestCuteBackend(TestCase):
         )
         config = helion.Config(block_sizes=[1, 128, 8, 64], pid_type="flat")
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-            bound = cute_batched_dot_unsupported_epilogue_tcgen05.bind(args)
-            self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+            bound = cute_batched_dot_sine_epilogue_tcgen05.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
             code = bound.to_triton_code(config)
             out = bound.compile_config(config)(*args)
         expected = torch.bmm(args[0].float(), args[1].float()) + torch.sin(args[2])
-        self.assertNotIn("cute.gemm(", code)
+        self.assertIn("cute.gemm(", code)
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
 
     def test_batched_dot_codegen_rejected_does_not_shape_search(self) -> None:

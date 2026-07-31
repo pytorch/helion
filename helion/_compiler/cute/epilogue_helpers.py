@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from typing import cast
 
 from cutlass import Float32
 from cutlass import const_expr
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import vector
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 
 from helion.language._gelu_tanh_approx import GELU_ERF_INV_SQRT2
-
-if TYPE_CHECKING:
-    from cutlass._mlir import ir
 
 # Heuristic compile-time cap: the target tcgen05 epilogue fragments are
 # well below this, while larger pointwise tiles should avoid thousands
@@ -23,6 +20,22 @@ _GELU_ERF_PACKED_MAX_UNROLLED_ELEMENTS = 512
 
 def _gelu_erf_exact_expr(x: Float32 | cute.TensorSSA) -> Float32 | cute.TensorSSA:
     return 0.5 * x * (1.0 + cute.math.erf(x * GELU_ERF_INV_SQRT2))
+
+
+@dsl_user_op
+def ensure_tensor_ssa(
+    value: cute.TensorSSA | ir.Value,
+    template: cute.TensorSSA,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cute.TensorSSA:
+    """Preserve TensorSSA across raw-vector CuTe operation lowerings."""
+    if const_expr(isinstance(value, cute.TensorSSA)):
+        return cast("cute.TensorSSA", value)
+    if const_expr(isinstance(value, ir.Value)):
+        return cute.TensorSSA(cast("ir.Value", value), template.shape, loc=loc, ip=ip)
+    return cute.full_like(template, value)
 
 
 @dsl_user_op
