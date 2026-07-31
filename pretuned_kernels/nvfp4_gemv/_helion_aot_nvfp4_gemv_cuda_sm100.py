@@ -8,8 +8,9 @@ FP16-decode multi-row bodies from pytorch/helion#3079 that tile over both M
 fp32 acc. Packed FP4 groups are loaded through
 hl.load_float4_e2m1fn_x16_to_float16. The sweep-wide defaults match the PR's
 tuned Triton configs. Full AOT searches produced exact-shape configs for four
-shapes where those defaults lost to CUTLASS; three overrides are currently
-enabled. All configs were validated against the dequant reference and
+shapes where those defaults lost to CUTLASS; all four overrides are enabled.
+The superseded warp-specialized config for N=15360, K=5120 is retained but
+unselected. All configs were validated against the dequant reference and
 remeasured under cold-L2 cudagraph.
 
 Provides, for each kernel <k>:
@@ -90,8 +91,9 @@ _CONFIG_BF16IN_28672_4096 = {
     "pid_type": "flat",
 }
 
-# N=15360, K=5120: 19.27us vs 23.15us default and 19.79us CUTLASS.
-_CONFIG_BF16IN_15360_5120 = {
+# Disabled on Triton 3.7: 19.27us vs 23.15us default and 19.79us CUTLASS.
+# Re-enable after triton-lang/triton#10901 is fixed in the benchmark's build.
+_CONFIG_BF16IN_15360_5120_WARP_SPECIALIZED = {
     "block_sizes": [16, 128],
     "range_unroll_factors": [0, 3],
     "range_warp_specializes": [True, None],
@@ -114,6 +116,17 @@ _CONFIG_BF16IN_15360_5120 = {
     ],
     "atomic_indexing": [],
     "pid_type": "persistent_blocked",
+    "num_sm_multiplier": 8,
+}
+
+# N=15360, K=5120: 17.70us vs 22.96us default and 19.79us CUTLASS.
+_CONFIG_BF16IN_15360_5120 = {
+    "block_sizes": [32, 64],
+    "range_unroll_factors": [0, 3],
+    "range_multi_buffers": [None, False],
+    "num_warps": 4,
+    "num_stages": 1,
+    "pid_type": "persistent_interleaved",
     "num_sm_multiplier": 8,
 }
 
@@ -145,15 +158,14 @@ _CONFIG_BF16IN_8192_28672 = {
 
 _BF16IN_EXACT = {
     (28672, 4096): 1,
-    # Re-enable after triton-lang/triton#10901 is fixed in the benchmark's
-    # Triton build.
-    # (15360, 5120): 2,
-    (8192, 28672): 3,
+    (15360, 5120): 3,
+    (8192, 28672): 4,
 }
 
 _BF16IN_CONFIGS = [
     _CONFIG_BF16IN_DEFAULT,
     _CONFIG_BF16IN_28672_4096,
+    _CONFIG_BF16IN_15360_5120_WARP_SPECIALIZED,
     _CONFIG_BF16IN_15360_5120,
     _CONFIG_BF16IN_8192_28672,
 ]
