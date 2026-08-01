@@ -6836,9 +6836,8 @@ class TestCuteLowerings(unittest.TestCase):
         ``carrier_tile_index_nodes[1]`` (the trailing axis).
 
         Users wanting an explicit colvec broadcast must spell it
-        out (``bias[tile_m][:, None]`` / ``.unsqueeze(-1)`` /
-        ``.expand(...)``); that is a separate, deferred pattern
-        handler.
+        with ``.unsqueeze(-1)``; the adjacent positive test covers
+        that distinct, unambiguous expression.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -6882,6 +6881,42 @@ class TestCuteLowerings(unittest.TestCase):
         message = str(cm.exception)
         self.assertIn("tcgen05 MMA path", message)
         self.assertIn("rowvec", message)
+
+    def test_tcgen05_fused_rank1_colvec_unsqueeze_runtime_correctness(self) -> None:
+        """An explicit rank-1 ``unsqueeze(-1)`` uses the colvec epilogue."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_colvec(
+            x: torch.Tensor, y: torch.Tensor, colvec: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + colvec[tile_m].unsqueeze(-1)).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 64, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(64, 64, dtype=torch.bfloat16, device=DEVICE)
+        colvec = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_colvec.bind((x, y, colvec))
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 64, 32],
+            pid_type="persistent_interleaved",
+        )
+        code = bound.to_triton_code(config)
+        out = bound.compile_config(config)(x, y, colvec)
+        expected = (x.float() @ y.float() + colvec.float()[:, None]).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+        self.assertIn("stride=(1, 0)", code)
 
     def test_tcgen05_fused_bias_broadcast_codegen_marker(self) -> None:
         """The spliced rowvec broadcast emits an ``aux_view2d`` local
@@ -14126,6 +14161,29 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             ("broadcast", 2),
         )
+
+    def test_aux_load_kind_explicit_rank1_broadcast_axes(self) -> None:
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes()
+        vector = torch.empty(4, dtype=torch.float32)
+        for data_axis, expected_kind in ((0, ("broadcast", 2)), (1, ("broadcast", 1))):
+            with self.subTest(data_axis=data_axis):
+                load_node, _ = self._build_aux_load_node(
+                    aux_tensor=vector,
+                    load_shape=(4,),
+                    index_nodes=(idx[data_axis],),
+                )
+                self.assertEqual(
+                    aux_tensor_load_kind(
+                        load_node,
+                        carrier_tile_shape=(4, 4),
+                        carrier_tile_index_nodes=idx,
+                        carrier_global_shape=(4, 4),
+                        explicit_rank1_data_axis=data_axis,
+                    ),
+                    expected_kind,
+                )
 
     def test_aux_load_kind_exact_tensor_is_not_colvec(self) -> None:
         """A genuine dense ``(M, N)`` aux (trailing stride 1) must fall
