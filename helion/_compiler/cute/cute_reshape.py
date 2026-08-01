@@ -214,6 +214,21 @@ def _bounded_semantic_choices(
     if len(structural) == 1:
         return frozenset(structural)
 
+    # Provable equality subsumes structural equality and costs a few sympy
+    # simplifications, where the enumeration below costs the whole coordinate
+    # product. Both are exact; this one just terminates sooner.
+    provable = tuple(
+        index
+        for index, choice in enumerate(choices)
+        if all(
+            _simplify_coordinate_semantic(target_expression - choice_expression, bounds)
+            == 0
+            for target_expression, choice_expression in zip(target, choice, strict=True)
+        )
+    )
+    if len(provable) == 1:
+        return frozenset(provable)
+
     symbols = tuple(symbol for symbol, _lower, _upper in bounds)
     selected: set[int] = set()
     assignments = itertools.product(
@@ -301,6 +316,90 @@ def _render_coordinate_semantic(
 
 _Coordinate = int | str | CuteLogicalCoordinate
 _ResolvedCoordinate = TypeVar("_ResolvedCoordinate")
+
+
+def as_logical_coordinate(coordinate: _Coordinate) -> CuteLogicalCoordinate | None:
+    """Return ``coordinate`` as a typed coordinate, or ``None`` if untyped."""
+    if isinstance(coordinate, CuteLogicalCoordinate):
+        return coordinate
+    if isinstance(coordinate, int):
+        return CuteLogicalCoordinate(
+            f"cutlass.Int32({coordinate})", sympy.Integer(coordinate)
+        )
+    return None
+
+
+def logical_coordinates_equal(left: _Coordinate, right: _Coordinate) -> bool:
+    """Whether two coordinates are equal under every in-bounds assignment."""
+    typed_left = as_logical_coordinate(left)
+    typed_right = as_logical_coordinate(right)
+    if typed_left is None or typed_right is None:
+        return False
+    bounds = _merge_coordinate_bounds([typed_left, typed_right])
+    difference = _simplify_coordinate_semantic(
+        typed_left.semantic - typed_right.semantic, bounds
+    )
+    return bool(difference == 0)
+
+
+def pair_local_target_coordinates(
+    output_shape: Sequence[int],
+    *,
+    width: int,
+    row_expression: str,
+    column_expression: str,
+) -> tuple[tuple[CuteLogicalCoordinate, ...], ...] | None:
+    """Symbolic output coordinates covering one physical register pair.
+
+    The epilogue planner and the fragment renderer both walk the graph at these
+    coordinates, so what the planner proves is by construction what the renderer
+    relies on. Returns one coordinate tuple per register slot.
+
+    ``None`` for rank below two, or for a tile spanning more than one leading
+    position. The latter is the renderer's limit -- the coordinate tensor it
+    walks covers only the trailing matrix -- and it costs no generality: the
+    collective path is only taken when the leading block size is one, which
+    ``prepare_cute_collective_lane_loop_suppression`` requires before any
+    epilogue is planned.
+    """
+    if len(output_shape) < 2 or any(extent != 1 for extent in output_shape[:-2]):
+        return None
+    rows, columns = output_shape[-2], output_shape[-1]
+    paired = width > 1 and columns % width == 0
+    row: Any = sympy.Symbol("tcgen05_pair_m", integer=True, nonnegative=True)
+    column: Any = sympy.Symbol("tcgen05_pair_n", integer=True, nonnegative=True)
+    bounds = (
+        (row, 0, rows - 1),
+        (column, 0, (columns // width if paired else columns) - 1),
+    )
+    symbol_expressions = (
+        (row, row_expression),
+        (
+            column,
+            f"{column_expression} // cutlass.Int32({width})"
+            if paired
+            else column_expression,
+        ),
+    )
+    leading = tuple(
+        CuteLogicalCoordinate("cutlass.Int32(0)", sympy.Integer(0))
+        for _ in output_shape[:-2]
+    )
+    return tuple(
+        (
+            *leading,
+            CuteLogicalCoordinate(row_expression, row, bounds, symbol_expressions),
+            CuteLogicalCoordinate(
+                column_expression
+                if slot == 0
+                else f"{column_expression} + cutlass.Int32({slot})",
+                width * column + slot if paired else column,
+                bounds,
+                symbol_expressions,
+            ),
+        )
+        for slot in range(width if paired else 1)
+    )
 
 
 def _env_arg(ctx: LoweringContext, node: Node) -> object:

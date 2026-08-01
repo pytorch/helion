@@ -27,6 +27,7 @@ from .cute_reshape import bounded_logical_coordinate_choices
 from .cute_reshape import broadcast_logical_flat_index
 from .cute_reshape import logical_coords_from_flat
 from .cute_reshape import logical_flat_from_coords
+from .cute_reshape import pair_local_target_coordinates
 from .cute_reshape import resolve_cute_logical_coordinate
 
 if TYPE_CHECKING:
@@ -215,11 +216,13 @@ def _whole_fragment(
         return result
 
     expression = evaluate(store.value_node)
-    value = store.value_node.meta.get("val")
-    rendered = ast.unparse(expression)
-    if not isinstance(value, torch.Tensor) or value.dtype != store.output_tensor.dtype:
-        rendered = f"({rendered}).to({target_dtype})"
-    return FragmentEpilogueCode("".join(lines), rendered)
+    # The carrier is the f32 TMEM accumulator whatever the FX value's dtype
+    # says, so the target conversion is unconditional. A same-dtype ``to`` is a
+    # no-op; keying it off ``value.dtype`` instead drops the cast whenever the
+    # user seeds the accumulator at the output dtype (``hl.zeros(..., x.dtype)``).
+    return FragmentEpilogueCode(
+        "".join(lines), f"({ast.unparse(expression)}).to({target_dtype})"
+    )
 
 
 class _ScalarEvaluator:
@@ -229,14 +232,14 @@ class _ScalarEvaluator:
         store: Tcgen05EpilogueStorePlan,
         *,
         carrier_name: str,
-        coordinate_name: str,
+        index_name: str,
         body_indent: str,
         pair_slot: _PairSlot | None = None,
         terminal_cache: dict[_TerminalKey, ast.AST] | None = None,
     ) -> None:
         self.state = state
         self.carrier_name = carrier_name
-        self.coordinate_name = coordinate_name
+        self.index_name = index_name
         self.body_indent = body_indent
         self.pair_slot = pair_slot
         self.terminal_cache = terminal_cache
@@ -259,11 +262,14 @@ class _ScalarEvaluator:
     def _index(self, expression: _FragmentCoordinate) -> _FragmentCoordinate:
         if expression in self.index_memo:
             return self.index_memo[expression]
+        rendered = _coordinate_expression(expression)
+        if rendered.isidentifier():
+            # Already an ``Int32`` local this evaluator bound; rebinding it just
+            # chains ``flat_n = cutlass.Int32(flat_n-1)`` down the recursion.
+            self.index_memo[expression] = expression
+            return expression
         name = self.state.device_function.new_var("tcgen05_epi_flat")
-        self.lines.append(
-            f"{self.body_indent}{name} = "
-            f"cutlass.Int32({_coordinate_expression(expression)})\n"
-        )
+        self.lines.append(f"{self.body_indent}{name} = cutlass.Int32({rendered})\n")
         result: _FragmentCoordinate = name
         if isinstance(expression, CuteLogicalCoordinate):
             result = CuteLogicalCoordinate(
@@ -392,35 +398,12 @@ class _ScalarEvaluator:
                     value,
                 ),
             )
-        result = self.state.device_function.new_var("tcgen05_epi_acc_scalar")
-        matches = self.state.device_function.new_var("tcgen05_epi_matches")
-        scan = self.state.device_function.new_var("tcgen05_epi_scan")
-        coord = self.state.device_function.new_var("tcgen05_epi_scan_coord")
-        is_match = self.state.device_function.new_var("tcgen05_epi_is_match")
-        indent = self.body_indent
-        self.lines.extend(
-            [
-                f"{indent}{result} = {self.carrier_name}[0]\n",
-                f"{indent}{matches} = cutlass.Int32(0)\n",
-                f"{indent}for {scan} in range(cute.size({self.carrier_name}.shape)):\n",
-                f"{indent}    {coord} = {self.coordinate_name}[{scan}]\n",
-                (
-                    f"{indent}    {is_match} = {coord}[0] == "
-                    f"{_coordinate_expression(target_m)} and "
-                    f"{coord}[1] == {_coordinate_expression(target_n)}\n"
-                ),
-                (
-                    f"{indent}    {result} = {self.carrier_name}[{scan}] if "
-                    f"{is_match} else {result}\n"
-                ),
-                f"{indent}    {matches} = {matches} + cutlass.Int32({is_match})\n",
-                (
-                    f"{indent}cute.testing.assert_({matches} == cutlass.Int32(1), "
-                    '"tcgen05 fragment coordinate must have exactly one local owner")\n'
-                ),
-            ]
+        # Without a pair slot the plan carries ``boundary_identity``: every
+        # boundary demand resolves to the coordinate the loop is already
+        # standing on, which is this register.
+        return self._remember_terminal(
+            terminal_key, expr_from_string(f"{self.carrier_name}[{self.index_name}]")
         )
-        return self._remember_terminal(terminal_key, expr_from_string(result))
 
     def _tile_index(self, node: Node, flat: _FragmentCoordinate) -> ast.AST:
         from ...language.memory_ops import _cute_tile_begin_expr
@@ -693,7 +676,7 @@ class _ScalarEvaluator:
         return result
 
 
-def _scanned_scalar_fragment(
+def _identity_scalar_fragment(
     state: CodegenState,
     store: Tcgen05EpilogueStorePlan,
     *,
@@ -702,6 +685,12 @@ def _scanned_scalar_fragment(
     target_dtype: str,
     indent: str,
 ) -> FragmentEpilogueCode:
+    """Render a scalar fragment whose accumulator reads stay register-local.
+
+    Reached when the plan proved ``boundary_identity`` but at least one load
+    could not be staged output-aligned, so the tile is walked one register at a
+    time to rematerialize that load at its own coordinate.
+    """
     df = state.device_function
     output = df.new_var("tcgen05_epi_output")
     index = df.new_var("tcgen05_epi_index")
@@ -716,7 +705,7 @@ def _scanned_scalar_fragment(
         state,
         store,
         carrier_name=carrier_name,
-        coordinate_name=coordinate_name,
+        index_name=index,
         body_indent=body_indent,
     )
     value = evaluator.evaluate(store.value_node, evaluator._index(matrix_flat))
@@ -726,7 +715,7 @@ def _scanned_scalar_fragment(
         f"{indent}for {index} in range(cute.size({carrier_name}.shape)):\n"
         f"{body_indent}{coord} = {coordinate_name}[{index}]\n"
         f"{''.join(evaluator.lines)}"
-        f"{body_indent}{output}[{index}] = {ast.unparse(value)}\n"
+        f"{body_indent}{output}[{index}] = {target_dtype}({ast.unparse(value)})\n"
     )
     return FragmentEpilogueCode(prelude, f"{output}.load()")
 
@@ -759,41 +748,17 @@ def _pair_scalar_fragment(
     if len(output_shape) == 3 and output_shape[0] != 1:
         raise RuntimeError("tcgen05 pair fragment requires one leading tile")
     matrix_shape = output_shape[-2:]
-    if matrix_shape[-1] % capability.width:
+    # Same construction the planner proved the epilogue against; see
+    # cute_reshape.pair_local_target_coordinates.
+    targets = pair_local_target_coordinates(
+        matrix_shape,
+        width=capability.width,
+        row_expression=f"{coord}[0]",
+        column_expression=f"{coord}[1]",
+    )
+    if targets is None or len(targets) != capability.width:
         raise RuntimeError("tcgen05 pair fragment requires complete register pairs")
-
-    pair_m: Any = sympy.Symbol("tcgen05_pair_m", integer=True, nonnegative=True)
-    pair_n: Any = sympy.Symbol("tcgen05_pair_n", integer=True, nonnegative=True)
-    pair_bounds = (
-        (pair_m, 0, matrix_shape[0] - 1),
-        (pair_n, 0, matrix_shape[1] // capability.width - 1),
-    )
-    pair_symbol_expressions = (
-        (pair_m, f"{coord}[0]"),
-        (pair_n, f"{coord}[1] // cutlass.Int32({capability.width})"),
-    )
-    current_coordinates = (
-        CuteLogicalCoordinate(
-            f"{coord}[0]", pair_m, pair_bounds, pair_symbol_expressions
-        ),
-        CuteLogicalCoordinate(
-            f"{coord}[1]",
-            capability.width * pair_n,
-            pair_bounds,
-            pair_symbol_expressions,
-        ),
-    )
-    partner_coordinates = (
-        CuteLogicalCoordinate(
-            f"{coord}[0]", pair_m, pair_bounds, pair_symbol_expressions
-        ),
-        CuteLogicalCoordinate(
-            f"{coord}[1] + cutlass.Int32(1)",
-            capability.width * pair_n + 1,
-            pair_bounds,
-            pair_symbol_expressions,
-        ),
-    )
+    current_coordinates, partner_coordinates = targets
     current_flat = logical_flat_from_coords(current_coordinates, matrix_shape)
     partner_flat = logical_flat_from_coords(partner_coordinates, matrix_shape)
     if not isinstance(current_flat, CuteLogicalCoordinate) or not isinstance(
@@ -806,7 +771,7 @@ def _pair_scalar_fragment(
         state,
         store,
         carrier_name=carrier_name,
-        coordinate_name=coordinate_name,
+        index_name=index,
         body_indent=body_indent,
         pair_slot=_PairSlot(
             index,
@@ -820,7 +785,7 @@ def _pair_scalar_fragment(
         state,
         store,
         carrier_name=carrier_name,
-        coordinate_name=coordinate_name,
+        index_name=partner_index,
         body_indent=body_indent,
         pair_slot=_PairSlot(
             partner_index,
@@ -834,6 +799,12 @@ def _pair_scalar_fragment(
     partner_value = partner_evaluator.evaluate(
         store.value_node, partner_evaluator._index(partner_flat)
     )
+    # ``CONTIGUOUS_EVEN_ODD_N_R2S`` -- register ``2k`` holds an even N and
+    # register ``2k + 1`` its odd partner -- is established by the MMA-side
+    # config gate and covered by the pair-swap layout tests over that gate's
+    # envelope. It is deliberately not re-checked per iteration: the loop is
+    # unrolled over the whole fragment, so a device assertion here would cost
+    # one comparison per register in every gated kernel.
     prelude = (
         f"{indent}assert cute.size({carrier_name}.shape) % "
         f'{capability.width} == 0, "tcgen05 pair carrier must be complete"\n'
@@ -844,9 +815,10 @@ def _pair_scalar_fragment(
         f"{body_indent}{partner_index} = {index} + 1\n"
         f"{body_indent}{coord} = {coordinate_name}[{index}]\n"
         f"{''.join(evaluator.lines)}"
-        f"{body_indent}{output}[{index}] = {ast.unparse(value)}\n"
+        f"{body_indent}{output}[{index}] = {target_dtype}({ast.unparse(value)})\n"
         f"{''.join(partner_evaluator.lines)}"
-        f"{body_indent}{output}[{partner_index}] = {ast.unparse(partner_value)}\n"
+        f"{body_indent}{output}[{partner_index}] = "
+        f"{target_dtype}({ast.unparse(partner_value)})\n"
     )
     return FragmentEpilogueCode(prelude, f"{output}.load()")
 
@@ -873,7 +845,7 @@ def _scalar_fragment(
             target_dtype=target_dtype,
             indent=indent,
         )
-    return _scanned_scalar_fragment(
+    return _identity_scalar_fragment(
         state,
         store,
         carrier_name=carrier_name,

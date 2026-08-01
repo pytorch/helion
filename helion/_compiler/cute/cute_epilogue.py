@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from itertools import starmap
 import operator
 from typing import TYPE_CHECKING
 
@@ -26,10 +27,16 @@ from ..indexing_strategy import exact_tile_block_ids
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
 from .cute_fx_walk import resolve_tcgen05_accumulator_boundary
+from .cute_reshape import CuteLogicalCoordinate
+from .cute_reshape import _Coordinate
 from .cute_reshape import _get_tile_shape
+from .cute_reshape import as_logical_coordinate
+from .cute_reshape import bounded_logical_coordinate_choices
 from .cute_reshape import broadcast_logical_flat_index
+from .cute_reshape import logical_coordinates_equal
 from .cute_reshape import logical_coords_from_flat
 from .cute_reshape import logical_flat_from_coords
+from .cute_reshape import pair_local_target_coordinates
 from .cute_reshape import resolve_cute_logical_coordinate
 from .tcgen05_constants import TCGEN05_FRAGMENT_PAIR_WIDTH
 
@@ -38,7 +45,12 @@ if TYPE_CHECKING:
 
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
-    from .cute_reshape import _Coordinate
+
+# The planner never emits source, so its target coordinates only need renderings
+# that are stable and obviously not device code. The renderer supplies the real
+# ones; only the symbolic identities have to agree between the two.
+_PLANNED_ROW_EXPRESSION = "<planned row>"
+_PLANNED_COLUMN_EXPRESSION = "<planned column>"
 
 
 class Tcgen05EpilogueLoadScope(enum.Enum):
@@ -526,28 +538,36 @@ def _shape(node: Node, config: Config) -> list[int]:
     return _get_tile_shape(value, CompileEnvironment.current(), config)
 
 
-def _coords(flat: int, shape: list[int]) -> tuple[int, ...]:
-    result: list[int] = []
-    for dim, extent in enumerate(shape):
-        stride = 1
-        for trailing in shape[dim + 1 :]:
-            stride *= trailing
-        result.append((flat // stride) % extent)
-    return tuple(result)
+_Request = tuple[str, Node, CuteLogicalCoordinate]
+_RequestKey = tuple[Node, _Coordinate, int | None]
 
 
-_Request = tuple[str, Node, int]
+def _typed(coordinate: _Coordinate) -> CuteLogicalCoordinate:
+    typed = as_logical_coordinate(coordinate)
+    if typed is None:
+        raise _UnsupportedEpilogue
+    return typed
+
+
+def _is_zero(coordinate: _Coordinate) -> bool:
+    return _typed(coordinate).semantic == 0
 
 
 def _coordinate_requests(
     node: Node,
-    flat: int,
+    flat: _Coordinate,
     *,
     boundaries: set[Node],
     config: Config,
     projection: int | None = None,
-    memo: dict[tuple[Node, int, int | None], frozenset[_Request]],
+    memo: dict[_RequestKey, frozenset[_Request]],
 ) -> frozenset[_Request]:
+    """Collect the terminal reads one output coordinate resolves to.
+
+    The coordinate is symbolic, so a single walk describes the whole tile. Where
+    a ``join`` selector is not statically known both branches are collected,
+    which is exactly the demand the renderer emits for that selector.
+    """
     key = (node, flat, projection)
     if key in memo:
         return memo[key]
@@ -555,13 +575,11 @@ def _coordinate_requests(
     def leaf(
         current: Node, current_flat: _Coordinate, current_projection: int | None
     ) -> frozenset[_Request]:
-        if not isinstance(current_flat, int):
-            raise _UnsupportedEpilogue
         leaf_key = (current, current_flat, current_projection)
         if leaf_key != key and leaf_key in memo:
             return memo[leaf_key]
         if current in boundaries:
-            return frozenset({("boundary", current, current_flat)})
+            return frozenset({("boundary", current, _typed(current_flat))})
         output_shape = _shape(current, config) if current_projection is None else None
         if _is_pointwise(current):
             if output_shape is None:
@@ -573,7 +591,7 @@ def _coordinate_requests(
                     output_shape=output_shape,
                     source_shape=_shape(dependency, config),
                 )
-                if not isinstance(dependency_flat, int):
+                if dependency_flat is None:
                     raise _UnsupportedEpilogue
                 requests.update(
                     _coordinate_requests(
@@ -590,7 +608,7 @@ def _coordinate_requests(
             if isinstance(source, Node) and _is_host_tensor_node(source):
                 if output_shape is None:
                     raise _UnsupportedEpilogue
-                requests = {("load", current, current_flat)}
+                requests = {("load", current, _typed(current_flat))}
                 indices = current.args[1] if len(current.args) > 1 else ()
                 if not isinstance(indices, (list, tuple)):
                     raise _UnsupportedEpilogue
@@ -605,7 +623,7 @@ def _coordinate_requests(
                         output_shape=output_shape,
                         source_shape=_shape(index, config),
                     )
-                    if not isinstance(index_flat, int):
+                    if index_flat is None:
                         raise _UnsupportedEpilogue
                     requests.update(
                         _coordinate_requests(
@@ -624,26 +642,19 @@ def _coordinate_requests(
                 output_coords = iter(
                     logical_coords_from_flat(current_flat, output_shape)
                 )
-                source_coords: list[int] = []
+                source_coords: list[_Coordinate] = []
                 for index in indices:
                     coord = next(output_coords)
-                    if not isinstance(coord, int):
-                        raise _UnsupportedEpilogue
                     if index is None:
-                        if coord != 0:
+                        if not _is_zero(coord):
                             raise _UnsupportedEpilogue
                     elif isinstance(index, slice) and index == slice(None):
                         source_coords.append(coord)
                     else:
                         raise _UnsupportedEpilogue
-                source_flat = logical_flat_from_coords(
-                    source_coords, _shape(source, config)
-                )
-                if not isinstance(source_flat, int):
-                    raise _UnsupportedEpilogue
                 return _coordinate_requests(
                     source,
-                    source_flat,
+                    logical_flat_from_coords(source_coords, _shape(source, config)),
                     boundaries=boundaries,
                     config=config,
                     memo=memo,
@@ -664,13 +675,24 @@ def _coordinate_requests(
     return result
 
 
-def _trailing_matrix_coords(shape: list[int], flat: int) -> tuple[int, int, int]:
-    coords = _coords(flat, shape)
-    if len(coords) == 2:
-        return (0, coords[0], coords[1])
-    if len(coords) == 3:
-        return coords
-    raise _UnsupportedEpilogue
+def _aligned_with_target(
+    coordinate: CuteLogicalCoordinate,
+    shape: list[int],
+    target: tuple[CuteLogicalCoordinate, ...],
+) -> tuple[CuteLogicalCoordinate, ...]:
+    """Line a boundary read's coordinate up with a target's rank.
+
+    A boundary tensor carrying fewer leading axes than the output is the same
+    tile at every leading position, so those axes agree with the target by
+    construction and are filled in from it.
+    """
+    coords = logical_coords_from_flat(coordinate, shape)
+    if len(coords) < 2 or len(coords) > len(target):
+        raise _UnsupportedEpilogue
+    return (
+        *target[: len(target) - len(coords)],
+        *(_typed(coord) for coord in coords),
+    )
 
 
 def _load_plan(
@@ -680,7 +702,9 @@ def _load_plan(
     output_shape: list[int],
     output_tensor: torch.Tensor,
     expected_output_block_ids: tuple[int, ...],
-    requests_by_output: list[frozenset[_Request]],
+    targets: tuple[tuple[CuteLogicalCoordinate, ...], ...],
+    target_flats: tuple[_Coordinate, ...],
+    requests_by_target: list[frozenset[_Request]],
     config: Config,
 ) -> Tcgen05EpilogueLoadPlan:
     source = load.args[0] if load.args else None
@@ -690,11 +714,14 @@ def _load_plan(
     if not isinstance(source_val, torch.Tensor):
         raise _UnsupportedEpilogue
     load_shape = _shape(load, config)
-    demanded: list[set[int]] = []
-    for requests in requests_by_output:
-        demanded.append(
-            {flat for kind, node, flat in requests if kind == "load" and node is load}
-        )
+    demanded = [
+        {
+            coordinate
+            for kind, node, coordinate in requests
+            if kind == "load" and node is load
+        }
+        for requests in requests_by_target
+    ]
     scope = Tcgen05EpilogueLoadScope.DIRECT
     broadcast_axis: int | None = None
     indices = load.args[1] if len(load.args) > 1 else None
@@ -703,14 +730,16 @@ def _load_plan(
         if isinstance(indices, (list, tuple))
         else None
     )
-    if all(len(flats) == 1 for flats in demanded):
-        flats = [next(iter(items)) for items in demanded]
+    if all(len(coordinates) == 1 for coordinates in demanded):
+        reads = [next(iter(coordinates)) for coordinates in demanded]
         if (
             load_shape == output_shape
             and load_block_ids == expected_output_block_ids
             and tuple(source_val.shape) == tuple(output_tensor.shape)
             and all(
-                load_flat == output_flat for output_flat, load_flat in enumerate(flats)
+                starmap(
+                    logical_coordinates_equal, zip(reads, target_flats, strict=True)
+                )
             )
         ):
             scope = Tcgen05EpilogueLoadScope.OUTPUT_ALIGNED_SUBTILE
@@ -727,8 +756,8 @@ def _load_plan(
                 load, output_tensor, expected_output_block_ids
             )
             and all(
-                load_flat == _coords(output_flat, output_shape)[-1]
-                for output_flat, load_flat in enumerate(flats)
+                logical_coordinates_equal(read, target[-1])
+                for read, target in zip(reads, targets, strict=True)
             )
         ):
             scope = Tcgen05EpilogueLoadScope.OUTPUT_ALIGNED_SUBTILE
@@ -766,11 +795,19 @@ def analyze_tcgen05_epilogue_plan(
             owned = set(entry.owned)
             boundaries = set(entry.boundaries)
             output_shape = _shape(value, config)
-            output_numel = 1
-            for extent in output_shape:
-                output_numel *= extent
-            memo: dict[tuple[Node, int, int | None], frozenset[_Request]] = {}
-            requests_by_output = [
+            targets = pair_local_target_coordinates(
+                output_shape,
+                width=TCGEN05_FRAGMENT_PAIR_WIDTH,
+                row_expression=_PLANNED_ROW_EXPRESSION,
+                column_expression=_PLANNED_COLUMN_EXPRESSION,
+            )
+            if targets is None:
+                raise _UnsupportedEpilogue
+            target_flats = tuple(
+                logical_flat_from_coords(target, output_shape) for target in targets
+            )
+            memo: dict[_RequestKey, frozenset[_Request]] = {}
+            requests_by_target = [
                 _coordinate_requests(
                     value,
                     flat,
@@ -778,23 +815,27 @@ def analyze_tcgen05_epilogue_plan(
                     config=config,
                     memo=memo,
                 )
-                for flat in range(output_numel)
+                for flat in target_flats
             ]
-            for output_flat, requests in enumerate(requests_by_output):
-                output_hmn = _trailing_matrix_coords(output_shape, output_flat)
-                for kind, request_node, request_flat in requests:
+            # Every accumulator read must land on one of the registers this
+            # slot's thread already holds. ``bounded_logical_coordinate_choices``
+            # raises when it lands elsewhere, and returning a slot other than
+            # the one being evaluated means the epilogue permutes within the
+            # pair, which the vectorized whole-fragment path cannot express.
+            boundary_identity = True
+            for slot, requests in enumerate(requests_by_target):
+                for kind, request_node, request_coordinate in requests:
                     if kind != "boundary":
                         continue
-                    source_hmn = _trailing_matrix_coords(
-                        _shape(request_node, config), request_flat
-                    )
-                    if (
-                        source_hmn[0] != output_hmn[0]
-                        or source_hmn[1] != output_hmn[1]
-                        or source_hmn[2] // TCGEN05_FRAGMENT_PAIR_WIDTH
-                        != output_hmn[2] // TCGEN05_FRAGMENT_PAIR_WIDTH
-                    ):
-                        raise _UnsupportedEpilogue
+                    if bounded_logical_coordinate_choices(
+                        _aligned_with_target(
+                            request_coordinate,
+                            _shape(request_node, config),
+                            targets[slot],
+                        ),
+                        targets,
+                    ) != frozenset({slot}):
+                        boundary_identity = False
             host_loads_list: list[Node] = []
             for graph_info in graphs:
                 for owned_node in graph_info.graph.nodes:
@@ -814,19 +855,12 @@ def analyze_tcgen05_epilogue_plan(
                     output_shape=output_shape,
                     output_tensor=output,
                     expected_output_block_ids=expected_output_block_ids,
-                    requests_by_output=requests_by_output,
+                    targets=targets,
+                    target_flats=target_flats,
+                    requests_by_target=requests_by_target,
                     config=config,
                 )
                 for load in host_loads
-            )
-            boundary_identity = all(
-                all(
-                    kind != "boundary"
-                    or _trailing_matrix_coords(_shape(node, config), request_flat)
-                    == _trailing_matrix_coords(output_shape, output_flat)
-                    for kind, node, request_flat in requests
-                )
-                for output_flat, requests in enumerate(requests_by_output)
             )
             whole_fragment_nodes_supported = all(
                 _is_pointwise(node)
@@ -843,11 +877,7 @@ def analyze_tcgen05_epilogue_plan(
             required_pair_width = (
                 TCGEN05_FRAGMENT_PAIR_WIDTH if not boundary_identity else None
             )
-            if (
-                required_pair_width is not None
-                and len(output_shape) == 3
-                and output_shape[0] != 1
-            ):
+            if required_pair_width is not None and len(targets) != required_pair_width:
                 raise _UnsupportedEpilogue
             store_plans.append(
                 Tcgen05EpilogueStorePlan(

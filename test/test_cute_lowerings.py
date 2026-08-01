@@ -78,6 +78,7 @@ from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
 from helion._compiler.cute.cute_reshape import logical_coords_from_flat
 from helion._compiler.cute.cute_reshape import logical_flat_from_coords
+from helion._compiler.cute.cute_reshape import pair_local_target_coordinates
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.indexing import CutePackedAffineLoad
 from helion._compiler.cute.indexing import CutePackedTerms
@@ -689,6 +690,106 @@ def _generic_pair_swap_epilogue(x: torch.Tensor, weight: torch.Tensor) -> torch.
 
 
 @helion.kernel(backend="cute")
+def _generic_pair_swap_bf16_out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``_generic_pair_swap_epilogue`` storing bf16 whatever the operand dtype.
+
+    Only for fp8 operands, whose input dtype is not a legal tcgen05 store dtype.
+    Every other dtype uses the natural-output kernel so the sweep exercises the
+    real R2S store dtype rather than collapsing them all onto bf16.
+    """
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        pairs = acc.view(tile_m.block_size, tile_n.block_size // 2, 2)
+        first, second = hl.split(pairs)
+        swapped = hl.join(second, first).view(tile_m.block_size, tile_n.block_size)
+        out[tile_m, tile_n] = swapped.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_pair_swap_f32_out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``_generic_pair_swap_epilogue`` storing f32, the widest R2S store dtype."""
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        pairs = acc.view(tile_m.block_size, tile_n.block_size // 2, 2)
+        first, second = hl.split(pairs)
+        out[tile_m, tile_n] = hl.join(second, first).view(
+            tile_m.block_size, tile_n.block_size
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_pair_butterfly(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Both registers of a pair feed both of its outputs."""
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        pairs = acc.view(tile_m.block_size, tile_n.block_size // 2, 2)
+        low, high = hl.split(pairs)
+        out[tile_m, tile_n] = (
+            hl.join(low + high, low - high)
+            .view(tile_m.block_size, tile_n.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_pair_broadcast(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Both outputs of a pair read the same register."""
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        pairs = acc.view(tile_m.block_size, tile_n.block_size // 2, 2)
+        low, _high = hl.split(pairs)
+        out[tile_m, tile_n] = (
+            hl.join(low, low).view(tile_m.block_size, tile_n.block_size).to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def _generic_mixed_fanout(
+    x: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One accumulator feeding a whole-fragment store and a scalar one."""
+    m, k = x.size()
+    _, n = weight.size()
+    raw = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    swapped = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        raw[tile_m, tile_n] = acc.to(x.dtype)
+        pairs = acc.view(tile_m.block_size, tile_n.block_size // 2, 2)
+        low, high = hl.split(pairs)
+        swapped[tile_m, tile_n] = (
+            hl.join(high, low).view(tile_m.block_size, tile_n.block_size).to(x.dtype)
+        )
+    return raw, swapped
+
+
+@helion.kernel(backend="cute")
 def _generic_swapped_aux_indices(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
 ) -> torch.Tensor:
@@ -861,19 +962,145 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
         with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
             bound.to_triton_code(config)
 
-    def test_generic_pair_transform_runtime(self) -> None:
+    def test_pair_local_register_layout_across_capability_gate(self) -> None:
+        """Register ``2k`` holds an even N and ``2k + 1`` its odd partner.
+
+        ``_pair_scalar_fragment`` walks the fragment two registers at a time and
+        treats slot ``2k + 1`` as the N+1 partner of slot ``2k``. Nothing in the
+        emitted kernel checks that; it is asserted by
+        ``_tcgen05_scalar_fragment_capability``, which concludes
+        ``CONTIGUOUS_EVEN_ODD_N_R2S`` from a config whitelist rather than from
+        the CUTLASS layouts themselves. A device-side check would cost a
+        comparison per register in every gated kernel, so the claim is covered
+        here instead: swapping within each pair is exactly the transform that
+        produces wrong numbers if the pairing is wrong, and the sweep spans the
+        axes the gate admits (operand dtype, store dtype, BN, RHS majorness).
+
+        A regression in the CUTLASS T2R/R2S layouts, or a widening of the gate
+        past what those layouts guarantee, fails here rather than silently
+        transposing values inside every fused epilogue.
+
+        The store dtype is swept alongside the operand dtype because the R2S
+        fragment layout depends on it and the capability gate does not
+        constrain it. Only fp8 needs the bf16-output helper -- its input dtype
+        is not a legal store dtype -- so the other cases store their natural
+        output and one case stores f32.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        cases = [
+            (torch.bfloat16, _generic_pair_swap_epilogue, torch.bfloat16),
+            (torch.float16, _generic_pair_swap_epilogue, torch.float16),
+            (torch.bfloat16, _generic_pair_swap_f32_out, torch.float32),
+        ]
+        if support.tcgen05_f8:
+            cases.append(
+                (torch.float8_e4m3fn, _generic_pair_swap_bf16_out, torch.bfloat16)
+            )
+        # Pairwise rather than the full product: each dtype case is seen at both
+        # BN values and both majornesses, and every (BN, majorness) combination
+        # appears, in half the compilations. Each one is a full CuTe compile and
+        # launch, so the cross product is the expensive part, not the coverage.
+        tile_pairs = (
+            ((64, "row"), (128, "col")),
+            ((64, "col"), (128, "row")),
+        )
+        for index, (operand_dtype, kernel, store_dtype) in enumerate(cases):
+            for bn, rhs_major in tile_pairs[index % 2]:
+                with self.subTest(
+                    operand=operand_dtype,
+                    store=store_dtype,
+                    bn=bn,
+                    rhs_major=rhs_major,
+                ):
+                    x = torch.randn([128, 128], device=DEVICE).to(operand_dtype)
+                    weight = torch.randn(
+                        [128, bn] if rhs_major == "row" else [bn, 128],
+                        device=DEVICE,
+                    ).to(operand_dtype)
+                    if rhs_major == "col":
+                        weight = weight.T
+                    bound = kernel.bind((x, weight))
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    config = _generic_epilogue_config([128, bn, 32])
+                    bound.set_config(config)
+                    # The property only means anything if this config really
+                    # took the pair-local path.
+                    self.assertIn(
+                        "tcgen05_epi_partner_index", bound.to_triton_code(config)
+                    )
+                    actual = bound(x, weight)
+                    self.assertEqual(actual.dtype, store_dtype)
+                    product = x.float() @ weight.float()
+                    expected = product.view(128, bn // 2, 2).flip(-1).view(128, bn)
+                    torch.testing.assert_close(
+                        actual.float(), expected, atol=2e-1, rtol=2e-2
+                    )
+
+    def test_pair_fragments_are_not_shaped_like_the_rotary_kernel(self) -> None:
+        """Pair-local planning generalizes past the epilogue that motivated it.
+
+        The rotary kernel reads each register's partner exactly once, so a
+        planner narrowed to that shape would still satisfy every other pair
+        test here. These three read the pair differently: both registers into
+        both outputs, one register into both outputs, and -- for the fan-out --
+        one accumulator feeding a whole-fragment store alongside a scalar one,
+        which is the only case where a single plan carries stores with and
+        without a pair-local capability.
+        """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
         x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
         weight = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
-        bound = _generic_pair_swap_epilogue.bind((x, weight))
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
-        bound.set_config(_generic_epilogue_config([128, 128, 32]))
-        actual = bound(x, weight)
-        expected = (x @ weight).view(128, 64, 2).flip(-1).view(128, 128)
-        torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-2)
+        config = _generic_epilogue_config([128, 128, 32])
+        reference = (x.float() @ weight.float()).view(128, 64, 2)
+
+        def run(kernel: helion.Kernel) -> tuple[str, object]:
+            bound = kernel.bind((x, weight))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(config)
+            return bound.to_triton_code(config), bound(x, weight)
+
+        with self.subTest(shape="butterfly"):
+            code, actual = run(_generic_pair_butterfly)
+            self.assertIn("tcgen05_epi_partner_index", code)
+            expected = torch.stack(
+                (
+                    reference[..., 0] + reference[..., 1],
+                    reference[..., 0] - reference[..., 1],
+                ),
+                dim=-1,
+            ).view(128, 128)
+            torch.testing.assert_close(
+                cast("torch.Tensor", actual).float(), expected, atol=4e-1, rtol=2e-2
+            )
+
+        with self.subTest(shape="broadcast"):
+            code, actual = run(_generic_pair_broadcast)
+            self.assertIn("tcgen05_epi_partner_index", code)
+            expected = reference[..., 0:1].expand(128, 64, 2).reshape(128, 128)
+            torch.testing.assert_close(
+                cast("torch.Tensor", actual).float(), expected, atol=2e-1, rtol=2e-2
+            )
+
+        with self.subTest(shape="mixed_fanout"):
+            code, outputs = run(_generic_mixed_fanout)
+            self.assertIn("tcgen05_epi_partner_index", code)
+            raw, swapped = cast("tuple[torch.Tensor, torch.Tensor]", outputs)
+            torch.testing.assert_close(
+                raw.float(), reference.view(128, 128), atol=2e-1, rtol=2e-2
+            )
+            torch.testing.assert_close(
+                swapped.float(),
+                reference.flip(-1).view(128, 128),
+                atol=2e-1,
+                rtol=2e-2,
+            )
 
     def test_mismatched_aux_provenance_uses_direct_load(self) -> None:
         x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
@@ -981,6 +1208,51 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
 
 
 class TestCuteLogicalCoordinates(unittest.TestCase):
+    def test_pair_targets_cover_one_register_pair(self) -> None:
+        """The shared planner/renderer target construction.
+
+        Both sides call this, so the shape of what it returns is the interface
+        between what the planner proves and what the renderer assumes: one tuple
+        per register slot, adjacent in the trailing axis, over a single leading
+        position. A tile spanning several leading positions is refused here
+        because the renderer's coordinate tensor is only the trailing matrix.
+        """
+        keywords = {"width": 2, "row_expression": "r", "column_expression": "c"}
+
+        targets = pair_local_target_coordinates([1, 8, 8], **keywords)
+        assert targets is not None
+        self.assertEqual(len(targets), 2)
+        # A single leading position is a constant, not a free coordinate.
+        self.assertEqual([target[0].semantic for target in targets], [0, 0])
+        # Adjacent columns, same row, and each slot identifies as itself.
+        self.assertEqual(targets[0][1], targets[1][1])
+        self.assertEqual(targets[1][2].semantic - targets[0][2].semantic, 1)
+        self.assertEqual(
+            bounded_logical_coordinate_choices(targets[0], targets), frozenset({0})
+        )
+        self.assertEqual(
+            bounded_logical_coordinate_choices(targets[1], targets), frozenset({1})
+        )
+        # A read outside the pair is a hard rejection, not a wrong slot.
+        outside = (
+            targets[0][0],
+            targets[0][1],
+            dataclasses.replace(
+                targets[0][2],
+                expression="c + 2",
+                semantic=targets[0][2].semantic + 2,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "outside or ambiguous"):
+            bounded_logical_coordinate_choices(outside, targets)
+
+        # An odd trailing extent has no complete pairs, so there is one slot.
+        odd = pair_local_target_coordinates([1, 8, 7], **keywords)
+        assert odd is not None
+        self.assertEqual(len(odd), 1)
+        # More than one leading position: the renderer cannot address it.
+        self.assertIsNone(pair_local_target_coordinates([3, 8, 8], **keywords))
+
     def test_bounded_pair_relation_survives_shape_roundtrips(self) -> None:
         pair_m = sympy.Symbol("pair_m", integer=True, nonnegative=True)
         pair_n = sympy.Symbol("pair_n", integer=True, nonnegative=True)
@@ -7612,6 +7884,67 @@ class TestCuteLowerings(unittest.TestCase):
         out_clean = torch.where(out_nan, torch.zeros_like(out), out)
         exp_clean = torch.where(exp_nan, torch.zeros_like(expected), expected)
         torch.testing.assert_close(out_clean, exp_clean, atol=2e-1, rtol=1e-2)
+
+    def test_cute_extrema_propagate_nan_outside_epilogues(self) -> None:
+        """``maximum`` / ``minimum`` must match torch on NaN everywhere.
+
+        ``GenerateASTFromInductor`` overrides these for the whole cute backend,
+        not only for tcgen05 fragment epilogues, because the generic planner
+        lowers ``relu`` through ``ops.maximum`` instead of a hand-written
+        template. The epilogue tests only reach the override via ``relu`` on a
+        register fragment; pin the plain pointwise path too, so a future change
+        that narrows the override to fragments cannot silently regress
+        ``torch.maximum`` semantics for every other cute kernel.
+
+        Upstream's ``CuteDSLOpOverrides._minmax`` renders ``a if a > b else b``,
+        which returns ``b`` for ``a = NaN`` and disagrees with eager.
+        """
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+        @helion.kernel(backend="cute")
+        def cute_maximum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = torch.maximum(x[tile], y[tile])
+            return out
+
+        @helion.kernel(backend="cute")
+        def cute_minimum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = torch.minimum(x[tile], y[tile])
+            return out
+
+        specials = [float("nan"), float("inf"), float("-inf"), 0.0, -0.0, 2.0, -2.0]
+        # Every ordered pair of special values, so NaN appears on each side.
+        left = torch.tensor(
+            [value for value in specials for _ in specials],
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+        right = torch.tensor(
+            specials * len(specials), device=DEVICE, dtype=torch.float32
+        )
+        config = helion.Config(block_sizes=[16])
+        for kernel, reference in (
+            (cute_maximum, torch.maximum),
+            (cute_minimum, torch.minimum),
+        ):
+            with self.subTest(op=kernel.name):
+                bound = kernel.bind((left, right))
+                bound.set_config(config)
+                actual = bound.compile_config(config)(left, right)
+                expected = reference(left, right)
+                self.assertTrue(
+                    torch.equal(torch.isnan(actual), torch.isnan(expected)),
+                    f"NaN propagation mismatch: {actual} vs {expected}",
+                )
+                finite = ~torch.isnan(expected)
+                torch.testing.assert_close(actual[finite], expected[finite])
+                # Structural backstop: both operands are self-compared for NaN
+                # before the ordering compare picks the result.
+                self.assertEqual(bound.to_triton_code(config).count("!="), 2)
 
     def test_tcgen05_fused_unary_chain_runtime_correctness(self) -> None:
         """G3.1.1: a longer whitelisted unary chain (mul-const, add-const,
