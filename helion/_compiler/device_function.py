@@ -43,6 +43,7 @@ from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -595,9 +596,26 @@ class DeviceFunction:
             assert result is not None
             return result
         if isinstance(origin.origin, GridOrigin):
-            return self.codegen.offset_var(
-                env.resolve_codegen_block_id(origin.origin.block_id, self.codegen)
+            # Only the tile's begin is the loop offset.  The other tile edges
+            # render as compound expressions (``tile.end`` clamps to the loop
+            # end, ``tile.count`` divides, ``tile.id`` shifts), so returning the
+            # offset for them would silently substitute the begin.  This path is
+            # reached whenever such a symbol survives into a sympy expression
+            # rather than its own op -- e.g. ``min(n, tile.end)``, which
+            # ``_builtin_min`` folds into ``sympy.Min`` at trace time.  The
+            # result becomes a sympy Symbol name, so parenthesize it to keep
+            # precedence intact inside the enclosing expression.
+            resolved = env.resolve_codegen_block_id(
+                origin.origin.block_id, self.codegen
             )
+            if type(origin.origin) in (GridOrigin, TileBeginOrigin):
+                return self.codegen.offset_var(resolved)
+            # Render through the origin so each derived edge keeps its own
+            # formula, but on the resolved live loop: host_str() reads
+            # offset_var and active_device_loops by block_id, and an aliased
+            # symbol's own block may have no active loop.
+            derived = dataclasses.replace(origin.origin, block_id=resolved)
+            return f"({derived.host_str()})"
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:

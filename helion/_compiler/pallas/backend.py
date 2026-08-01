@@ -1402,15 +1402,6 @@ class PallasBackend(Backend):
             )
 
         env = CompileEnvironment.current()
-        if (
-            grouping == 0
-            and config.get("pallas_loop_type", "unroll") == "unroll"
-            and env.config_spec.has_symbolic_or_data_dependent_bounds
-        ):
-            raise exc.InvalidConfig(
-                "pallas_loop_type='unroll' requires static inner-loop bounds or "
-                "pallas_worklist_grouping in (1, 2)."
-            )
 
         plan_tiling(graphs, config, tile_strategy)
 
