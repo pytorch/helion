@@ -5,13 +5,13 @@ import torch
 
 from helion import exc
 from helion._compiler.pallas import sparsecore_program
-from helion._compiler.pallas.access import ACCESS_SITE_META
-from helion._compiler.pallas.access import make_access_site
+from helion._compiler.pallas.memory_access import MEMORY_ACCESS_META
+from helion._compiler.pallas.memory_access import build_memory_access
 from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
 from helion._compiler.pallas.plan_tiling import TensorIndexPattern
 from helion._compiler.pallas.plan_tiling import TilePattern
-from helion._compiler.pallas.sparsecore_access import AccessLoweringContext
-from helion._compiler.pallas.sparsecore_access import lower_sparsecore_access
+from helion._compiler.pallas.sparsecore_plan import SparseCorePlanContext
+from helion._compiler.pallas.sparsecore_plan import build_sparsecore_memory_plan
 from helion._compiler.pallas.sparsecore_program import SparseCoreGeometry
 from helion._compiler.pallas.sparsecore_program import SparseCoreProgram
 from helion._compiler.pallas.sparsecore_program import TaskKind
@@ -43,7 +43,7 @@ def _load(
         if indirect
         else [TilePattern(0), ArbitrarySlicePattern(slice(None))]
     )
-    node.meta[ACCESS_SITE_META] = make_access_site(
+    node.meta[MEMORY_ACCESS_META] = build_memory_access(
         node, source_value, list(node.args[1]), patterns
     )
     return node
@@ -51,15 +51,16 @@ def _load(
 
 def _program(graph: torch.fx.Graph, nodes: list[torch.fx.Node]) -> SparseCoreProgram:
     geometry = SparseCoreGeometry(0, 1024, 256, 2, 16)
-    context = AccessLoweringContext(
+    context = SparseCorePlanContext(
         {0: 256},
         item_block_id=0,
         items_per_subcore=geometry.items_per_subcore,
     )
-    accesses = tuple(
-        lower_sparsecore_access(node.meta[ACCESS_SITE_META], context) for node in nodes
+    memory_plans = tuple(
+        build_sparsecore_memory_plan(node.meta[MEMORY_ACCESS_META], context)
+        for node in nodes
     )
-    return SparseCoreProgram(graph, geometry, accesses)
+    return SparseCoreProgram(graph, geometry, memory_plans)
 
 
 def test_independent_gathers_share_stages_without_topology_rules() -> None:
