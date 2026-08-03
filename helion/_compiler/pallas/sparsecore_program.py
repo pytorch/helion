@@ -107,17 +107,13 @@ class SparseCoreProgram:
     schedule: SparseCoreSchedule | None = None
 
     def __post_init__(self) -> None:
-        self.plan_by_node = {
-            plan.access.node: plan for plan in self.memory_plans
-        }
+        self.plan_by_node = {plan.access.node: plan for plan in self.memory_plans}
         if len(self.plan_by_node) != len(self.memory_plans):
             raise AssertionError("duplicate SparseCore memory plan")
         self.index_nodes = frozenset(
             plan.index_node
             for plan in self.memory_plans
-            if isinstance(
-                plan, (IndirectLoadPlan, IndirectStorePlan, AtomicAddPlan)
-            )
+            if isinstance(plan, (IndirectLoadPlan, IndirectStorePlan, AtomicAddPlan))
         )
         offset_loads = [
             plan
@@ -241,8 +237,7 @@ class _ScheduleBuilder:
         if isinstance(plan, CachedLoadPlan):
             available = self.add(TaskKind.ONCE_TRANSFER, node, dependencies)
         elif isinstance(plan, IndirectLoadPlan) or (
-            isinstance(plan, DirectLoadPlan)
-            and node not in self.program.index_nodes
+            isinstance(plan, DirectLoadPlan) and node not in self.program.index_nodes
         ):
             start = self.add(TaskKind.ASYNC_START, node, dependencies)
             available = self.add(TaskKind.ASYNC_WAIT, node, (start,))
@@ -318,8 +313,7 @@ def _verify_resources(program: SparseCoreProgram, schedule: SparseCoreSchedule) 
         if not isinstance(plan, CachedLoadPlan)
     )
     cached_bytes = sum(
-        math.prod(load_buffer_shape(program, plan))
-        * plan.layout.storage_dtype.itemsize
+        math.prod(load_buffer_shape(program, plan)) * plan.layout.storage_dtype.itemsize
         for plan in program.loads
         if isinstance(plan, CachedLoadPlan)
     )
@@ -341,9 +335,7 @@ def _verify_resources(program: SparseCoreProgram, schedule: SparseCoreSchedule) 
             f"limit is {limit}",
         )
     shared_bytes = sum(
-        shared_acc_bytes(
-            int(plan.access.tensor.shape[0]), plan.layout.value_size
-        )
+        shared_acc_bytes(int(plan.access.tensor.shape[0]), plan.layout.value_size)
         for plan in program.stores
         if isinstance(plan, AtomicAddPlan)
     )
