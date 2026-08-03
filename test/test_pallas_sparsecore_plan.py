@@ -82,9 +82,7 @@ def test_several_indirect_accesses_do_not_require_a_stack() -> None:
     graph = torch.fx.Graph()
     index = torch.empty(32, dtype=torch.int32)
     index_node = _placeholder(graph, "index", index)
-    context = SparseCorePlanContext(
-        {0: 256}, item_block_id=0, items_per_subcore=8
-    )
+    context = SparseCorePlanContext({0: 256}, item_block_id=0, items_per_subcore=8)
     plans = []
     for number in range(3):
         table = torch.empty(4096, 64)

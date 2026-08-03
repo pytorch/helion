@@ -77,9 +77,7 @@ def _shape(tensor: torch.Tensor) -> list[int]:
 def _index_padding(program: SparseCoreProgram) -> dict[torch.fx.Node, int]:
     fills: dict[torch.fx.Node, int] = {}
     for plan in program.memory_plans:
-        if not isinstance(
-            plan, (IndirectLoadPlan, IndirectStorePlan, AtomicAddPlan)
-        ):
+        if not isinstance(plan, (IndirectLoadPlan, IndirectStorePlan, AtomicAddPlan)):
             continue
         fill = (
             0
