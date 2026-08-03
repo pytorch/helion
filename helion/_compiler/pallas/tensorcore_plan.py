@@ -45,9 +45,7 @@ class ProjectionScatterPlan(TensorCorePlan):
 TensorCorePlanCandidate = Callable[
     ["MemoryAccess", list[int], "Config"], TensorCorePlan | None
 ]
-TensorCorePlanBuilder = Callable[
-    ["MemoryAccess", list[int], "Config"], TensorCorePlan
-]
+TensorCorePlanBuilder = Callable[["MemoryAccess", list[int], "Config"], TensorCorePlan]
 
 
 def _one_hot_gather(
@@ -114,7 +112,7 @@ def select_tensorcore_plan(
     op = access.node.target
     op_name = getattr(op, "__name__", str(op))
     raise NotImplementedError(
-        f"Pallas TensorCore does not support tensor-indexed operation {op_name}"
+        f"Pallas: tensor-indexed memory op is not supported for op={op_name}."
     )
 
 
