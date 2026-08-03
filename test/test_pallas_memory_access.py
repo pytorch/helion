@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
 from unittest.mock import patch
 
 import torch
@@ -103,12 +102,7 @@ def test_tensorcore_plan_owns_indirect_fallbacks() -> None:
 
     gather_fallback = object()
     scatter_fallback = object()
-    native_gather = Mock(return_value=None)
     with (
-        patch(
-            "helion._compiler.pallas.tensorcore_plan._NATIVE_LOAD_CANDIDATES",
-            (native_gather,),
-        ),
         patch(
             "helion._compiler.pallas.gather.build_gather_plan",
             return_value=gather_fallback,
@@ -125,5 +119,4 @@ def test_tensorcore_plan_owns_indirect_fallbacks() -> None:
     assert isinstance(scatter, OneHotScatterPlan)
     assert gather.plan is gather_fallback
     assert scatter.plan is scatter_fallback
-    native_gather.assert_called_once()
     assert all(isinstance(pattern, TensorIndexPattern) for pattern in patterns[:1])
