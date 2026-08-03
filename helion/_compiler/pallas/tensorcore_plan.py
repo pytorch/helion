@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from typing import Callable
 
 from .memory_access import MemoryAccessKind
 from .plan_tiling import TensorIndexPattern
@@ -42,12 +41,6 @@ class OneHotScatterPlan(TensorCorePlan):
     plan: ScatterPlan
 
 
-TensorCorePlanCandidate = Callable[
-    ["MemoryAccess", list[int], "Config"], TensorCorePlan | None
-]
-TensorCorePlanBuilder = Callable[["MemoryAccess", list[int], "Config"], TensorCorePlan]
-
-
 def _one_hot_gather(
     access: MemoryAccess, positions: list[int], config: Config
 ) -> OneHotGatherPlan:
@@ -72,24 +65,6 @@ def _one_hot_scatter(
     return OneHotScatterPlan(access, tuple(positions), plan)
 
 
-_NATIVE_LOAD_CANDIDATES: tuple[TensorCorePlanCandidate, ...] = ()
-_NATIVE_STORE_CANDIDATES: tuple[TensorCorePlanCandidate, ...] = ()
-
-
-def _select_plan(
-    candidates: tuple[TensorCorePlanCandidate, ...],
-    fallback: TensorCorePlanBuilder,
-    access: MemoryAccess,
-    positions: list[int],
-    config: Config,
-) -> TensorCorePlan:
-    for candidate in candidates:
-        plan = candidate(access, positions, config)
-        if plan is not None:
-            return plan
-    return fallback(access, positions, config)
-
-
 def select_tensorcore_plan(
     access: MemoryAccess, config: Config
 ) -> TensorCorePlan | None:
@@ -101,14 +76,11 @@ def select_tensorcore_plan(
     ]
     if not positions:
         return None
+    # One-hot is the fallback while Pallas has no native TensorCore indirect access.
     if access.kind is MemoryAccessKind.LOAD:
-        return _select_plan(
-            _NATIVE_LOAD_CANDIDATES, _one_hot_gather, access, positions, config
-        )
+        return _one_hot_gather(access, positions, config)
     if access.kind is MemoryAccessKind.STORE:
-        return _select_plan(
-            _NATIVE_STORE_CANDIDATES, _one_hot_scatter, access, positions, config
-        )
+        return _one_hot_scatter(access, positions, config)
     op = access.node.target
     op_name = getattr(op, "__name__", str(op))
     raise NotImplementedError(
