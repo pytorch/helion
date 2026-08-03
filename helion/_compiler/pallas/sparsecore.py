@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING
 from ..program_id import ProgramIDs
 from ..tile_strategy import DeviceGridState
 from ..tile_strategy import NDTileStrategy
-from .access import ACCESS_SITE_META
-from .access import AccessSite
+from .memory_access import MEMORY_ACCESS_META
+from .memory_access import MemoryAccess
 from .sc_base import SC_SLICE_MULTIPLE
 from .sc_base import _reject
 from .sc_base import sc_hardware_info
-from .sparsecore_access import AccessLoweringContext
-from .sparsecore_access import lower_sparsecore_access
+from .sparsecore_plan import SparseCorePlanContext
+from .sparsecore_plan import build_sparsecore_memory_plan
 from .sparsecore_program import SparseCoreGeometry
 from .sparsecore_program import SparseCoreProgram
 from .sparsecore_program import schedule_sparsecore_program
@@ -82,12 +82,14 @@ def build_sparsecore_program(
     if tile_size is None:
         _reject("dynamic_shape", "SparseCore item block size must be static")
 
-    access_sites = [
-        site
+    memory_accesses = [
+        access
         for node in root_graph.nodes
-        if isinstance((site := node.meta.get(ACCESS_SITE_META)), AccessSite)
+        if isinstance(
+            (access := node.meta.get(MEMORY_ACCESS_META)), MemoryAccess
+        )
     ]
-    if not access_sites:
+    if not memory_accesses:
         _reject("access_pattern", "SparseCore kernel has no memory accesses")
     item_count = CompileEnvironment.current().block_sizes[item_block_id].size_hint()
     mesh = sc_hardware_info()
@@ -101,24 +103,31 @@ def build_sparsecore_program(
             f"item tile {tile_size} must be divisible by {total_subcores} subcores",
         )
     items_per_subcore = tile_size // total_subcores
-    context = AccessLoweringContext(
+    context = SparseCorePlanContext(
         block_sizes=block_sizes,
         item_block_id=item_block_id,
         items_per_subcore=items_per_subcore,
     )
-    accesses = tuple(lower_sparsecore_access(site, context) for site in access_sites)
-    for access in accesses:
+    memory_plans = tuple(
+        build_sparsecore_memory_plan(access, context)
+        for access in memory_accesses
+    )
+    for plan in memory_plans:
         if (
-            access.stream is not None
-            and access.stream.elements_per_item * items_per_subcore % SC_SLICE_MULTIPLE
+            plan.stream is not None
+            and plan.stream.elements_per_item
+            * items_per_subcore
+            % SC_SLICE_MULTIPLE
         ):
             _reject(
                 "layout",
-                f"stream has {access.stream.elements_per_item * items_per_subcore} "
+                f"stream has {plan.stream.elements_per_item * items_per_subcore} "
                 f"values per subcore; expected a multiple of {SC_SLICE_MULTIPLE}",
-                node=access.site.node,
+                node=plan.access.node,
             )
-    _validate_compute(root_graph, {site.node for site in access_sites})
+    _validate_compute(
+        root_graph, {access.node for access in memory_accesses}
+    )
     program = SparseCoreProgram(
         root_graph,
         SparseCoreGeometry(
@@ -128,7 +137,7 @@ def build_sparsecore_program(
             num_cores,
             num_subcores,
         ),
-        accesses,
+        memory_plans,
     )
     schedule_sparsecore_program(program)
     return program

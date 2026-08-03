@@ -8,19 +8,19 @@ from enum import Enum
 import math
 from typing import TYPE_CHECKING
 
-from .access import AccessKind
+from .memory_access import MemoryAccessKind
 from .sc_base import SC_LANES
 from .sc_base import SC_SHARED_BYTES
 from .sc_base import SC_VMEM_BYTES
 from .sc_base import SC_VMEM_MARGIN
 from .sc_base import _reject
 from .sc_base import shared_acc_bytes
-from .sparsecore_access import AtomicAddAccess
-from .sparsecore_access import CachedLoadAccess
-from .sparsecore_access import DirectLoadAccess
-from .sparsecore_access import IndirectLoadAccess
-from .sparsecore_access import IndirectStoreAccess
-from .sparsecore_access import SparseCoreAccess
+from .sparsecore_plan import AtomicAddPlan
+from .sparsecore_plan import CachedLoadPlan
+from .sparsecore_plan import DirectLoadPlan
+from .sparsecore_plan import IndirectLoadPlan
+from .sparsecore_plan import IndirectStorePlan
+from .sparsecore_plan import SparseCoreMemoryPlan
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -101,87 +101,91 @@ class SparseCoreSchedule:
 class SparseCoreProgram:
     graph: torch.fx.Graph
     geometry: SparseCoreGeometry
-    accesses: tuple[SparseCoreAccess, ...]
-    access_by_node: dict[torch.fx.Node, SparseCoreAccess] = field(init=False)
+    memory_plans: tuple[SparseCoreMemoryPlan, ...]
+    plan_by_node: dict[torch.fx.Node, SparseCoreMemoryPlan] = field(init=False)
     index_nodes: frozenset[torch.fx.Node] = field(init=False)
     schedule: SparseCoreSchedule | None = None
 
     def __post_init__(self) -> None:
-        self.access_by_node = {access.site.node: access for access in self.accesses}
-        if len(self.access_by_node) != len(self.accesses):
-            raise AssertionError("duplicate SparseCore access node")
+        self.plan_by_node = {
+            plan.access.node: plan for plan in self.memory_plans
+        }
+        if len(self.plan_by_node) != len(self.memory_plans):
+            raise AssertionError("duplicate SparseCore memory plan")
         self.index_nodes = frozenset(
-            access.index_node
-            for access in self.accesses
+            plan.index_node
+            for plan in self.memory_plans
             if isinstance(
-                access, (IndirectLoadAccess, IndirectStoreAccess, AtomicAddAccess)
+                plan, (IndirectLoadPlan, IndirectStorePlan, AtomicAddPlan)
             )
         )
         offset_loads = [
-            access
-            for access in self.accesses
-            if isinstance(access, IndirectLoadAccess) and access.index_offset
+            plan
+            for plan in self.memory_plans
+            if isinstance(plan, IndirectLoadPlan) and plan.index_offset
         ]
-        for access in offset_loads:
-            index_access = self.access_by_node.get(access.index_node)
-            if isinstance(index_access, IndirectLoadAccess):
+        for plan in offset_loads:
+            index_plan = self.plan_by_node.get(plan.index_node)
+            if isinstance(index_plan, IndirectLoadPlan):
                 _reject(
                     "schedule",
                     "static offsets on dependent indices are not implemented",
-                    node=access.site.node,
+                    node=plan.access.node,
                 )
             users = [
                 candidate
-                for candidate in self.accesses
-                if isinstance(candidate, IndirectLoadAccess)
-                and candidate.index_node is access.index_node
+                for candidate in self.memory_plans
+                if isinstance(candidate, IndirectLoadPlan)
+                and candidate.index_node is plan.index_node
             ]
             if len(users) > 1:
                 _reject(
                     "schedule",
                     "an index adjusted by a static offset cannot be shared",
-                    node=access.site.node,
+                    node=plan.access.node,
                 )
 
     @property
-    def loads(self) -> tuple[SparseCoreAccess, ...]:
+    def loads(self) -> tuple[SparseCoreMemoryPlan, ...]:
         return tuple(
-            access for access in self.accesses if access.site.kind is AccessKind.LOAD
+            plan
+            for plan in self.memory_plans
+            if plan.access.kind is MemoryAccessKind.LOAD
         )
 
     @property
-    def stores(self) -> tuple[SparseCoreAccess, ...]:
+    def stores(self) -> tuple[SparseCoreMemoryPlan, ...]:
         return tuple(
-            access
-            for access in self.accesses
-            if access.site.kind is not AccessKind.LOAD
+            plan
+            for plan in self.memory_plans
+            if plan.access.kind is not MemoryAccessKind.LOAD
         )
 
     @property
     def rebuilt_outputs(self) -> tuple[torch.Tensor, ...]:
         """Logical outputs whose SC implementation does not preserve input data."""
         return tuple(
-            access.site.tensor
-            for access in self.stores
-            if isinstance(access, AtomicAddAccess)
+            plan.access.tensor
+            for plan in self.stores
+            if isinstance(plan, AtomicAddPlan)
         )
 
 
 def load_buffer_shape(
-    program: SparseCoreProgram, access: SparseCoreAccess
+    program: SparseCoreProgram, plan: SparseCoreMemoryPlan
 ) -> tuple[int, ...]:
     """Scratch shape for one load and one pipeline slot."""
-    if isinstance(access, CachedLoadAccess):
-        return access.layout.storage_shape
-    if isinstance(access, IndirectLoadAccess):
-        assert access.stream is not None
-        entries = access.stream.elements_per_item
-        entry_size = access.layout.value_size // entries
+    if isinstance(plan, CachedLoadPlan):
+        return plan.layout.storage_shape
+    if isinstance(plan, IndirectLoadPlan):
+        assert plan.stream is not None
+        entries = plan.stream.elements_per_item
+        entry_size = plan.layout.value_size // entries
         return (program.geometry.items_per_subcore * entries, entry_size)
-    if isinstance(access, DirectLoadAccess) and access.site.node in program.index_nodes:
-        assert access.stream is not None
-        return (program.geometry.items_per_subcore * access.stream.elements_per_item,)
-    return access.layout.storage_shape
+    if isinstance(plan, DirectLoadPlan) and plan.access.node in program.index_nodes:
+        assert plan.stream is not None
+        return (program.geometry.items_per_subcore * plan.stream.elements_per_item,)
+    return plan.layout.storage_shape
 
 
 class _ScheduleBuilder:
@@ -209,9 +213,9 @@ class _ScheduleBuilder:
     def value(self, node: torch.fx.Node) -> int | None:
         if node in self.value_task:
             return self.value_task[node]
-        access = self.program.access_by_node.get(node)
-        if access is not None and access.site.kind is AccessKind.LOAD:
-            return self.load(access)
+        plan = self.program.plan_by_node.get(node)
+        if plan is not None and plan.access.kind is MemoryAccessKind.LOAD:
+            return self.load(plan)
         if node.op in ("placeholder", "output"):
             self.value_task[node] = None
             return None
@@ -228,16 +232,16 @@ class _ScheduleBuilder:
         self.value_task[node] = task_id
         return task_id
 
-    def load(self, access: SparseCoreAccess) -> int:
-        node = access.site.node
+    def load(self, plan: SparseCoreMemoryPlan) -> int:
+        node = plan.access.node
         prior = self.value_task.get(node)
         if prior is not None:
             return prior
-        dependencies = [self.value(dep) for dep in access.dependencies]
-        if isinstance(access, CachedLoadAccess):
+        dependencies = [self.value(dep) for dep in plan.dependencies]
+        if isinstance(plan, CachedLoadPlan):
             available = self.add(TaskKind.ONCE_TRANSFER, node, dependencies)
-        elif isinstance(access, IndirectLoadAccess) or (
-            isinstance(access, DirectLoadAccess)
+        elif isinstance(plan, IndirectLoadPlan) or (
+            isinstance(plan, DirectLoadPlan)
             and node not in self.program.index_nodes
         ):
             start = self.add(TaskKind.ASYNC_START, node, dependencies)
@@ -247,20 +251,20 @@ class _ScheduleBuilder:
         self.value_task[node] = available
         return available
 
-    def store(self, access: SparseCoreAccess) -> None:
-        dependencies = [self.value(dep) for dep in access.dependencies]
-        if isinstance(access, AtomicAddAccess):
-            dependencies.append(self.add(TaskKind.INITIALIZE, access.site.node))
-        store = self.add(TaskKind.STORE, access.site.node, dependencies)
-        if isinstance(access, AtomicAddAccess):
-            self.add(TaskKind.FINALIZE, access.site.node, (store,))
+    def store(self, plan: SparseCoreMemoryPlan) -> None:
+        dependencies = [self.value(dep) for dep in plan.dependencies]
+        if isinstance(plan, AtomicAddPlan):
+            dependencies.append(self.add(TaskKind.INITIALIZE, plan.access.node))
+        store = self.add(TaskKind.STORE, plan.access.node, dependencies)
+        if isinstance(plan, AtomicAddPlan):
+            self.add(TaskKind.FINALIZE, plan.access.node, (store,))
 
     def build(self) -> SparseCoreSchedule:
         # Stable task order keeps generated code and errors deterministic.
-        for access in self.program.loads:
-            self.load(access)
-        for access in self.program.stores:
-            self.store(access)
+        for plan in self.program.loads:
+            self.load(plan)
+        for plan in self.program.stores:
+            self.store(plan)
 
         lags: dict[int, int] = {}
         for task in self.tasks:
@@ -307,26 +311,26 @@ class _ScheduleBuilder:
 
 def _verify_resources(program: SparseCoreProgram, schedule: SparseCoreSchedule) -> None:
     ring_bytes = sum(
-        math.prod(load_buffer_shape(program, access))
-        * access.layout.storage_dtype.itemsize
+        math.prod(load_buffer_shape(program, plan))
+        * plan.layout.storage_dtype.itemsize
         * schedule.depth
-        for access in program.loads
-        if not isinstance(access, CachedLoadAccess)
+        for plan in program.loads
+        if not isinstance(plan, CachedLoadPlan)
     )
     cached_bytes = sum(
-        math.prod(load_buffer_shape(program, access))
-        * access.layout.storage_dtype.itemsize
-        for access in program.loads
-        if isinstance(access, CachedLoadAccess)
+        math.prod(load_buffer_shape(program, plan))
+        * plan.layout.storage_dtype.itemsize
+        for plan in program.loads
+        if isinstance(plan, CachedLoadPlan)
     )
     output_bytes = sum(
-        math.prod(access.layout.storage_shape) * access.layout.storage_dtype.itemsize
-        for access in program.stores
+        math.prod(plan.layout.storage_shape) * plan.layout.storage_dtype.itemsize
+        for plan in program.stores
     )
     output_bytes += sum(
-        SC_LANES * access.layout.value_size * access.layout.storage_dtype.itemsize
-        for access in program.stores
-        if isinstance(access, AtomicAddAccess)
+        SC_LANES * plan.layout.value_size * plan.layout.storage_dtype.itemsize
+        for plan in program.stores
+        if isinstance(plan, AtomicAddPlan)
     )
     used = ring_bytes + cached_bytes + output_bytes
     limit = SC_VMEM_BYTES - SC_VMEM_MARGIN
@@ -337,9 +341,11 @@ def _verify_resources(program: SparseCoreProgram, schedule: SparseCoreSchedule) 
             f"limit is {limit}",
         )
     shared_bytes = sum(
-        shared_acc_bytes(int(access.site.tensor.shape[0]), access.layout.value_size)
-        for access in program.stores
-        if isinstance(access, AtomicAddAccess)
+        shared_acc_bytes(
+            int(plan.access.tensor.shape[0]), plan.layout.value_size
+        )
+        for plan in program.stores
+        if isinstance(plan, AtomicAddPlan)
     )
     if shared_bytes > SC_SHARED_BYTES:
         _reject(

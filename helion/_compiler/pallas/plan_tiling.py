@@ -126,19 +126,11 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
     )
-    from .access import ACCESS_SITE_META
-    from .access import make_access_site
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import build_memory_access
 
-    node.meta[ACCESS_SITE_META] = make_access_site(
+    node.meta[MEMORY_ACCESS_META] = build_memory_access(
         node, tensor_val, list(subscript), indexing_patterns
-    )
-    from .tensorcore_access import TENSORCORE_ACCESS_META
-    from .tensorcore_access import select_tensorcore_access
-
-    node.meta[TENSORCORE_ACCESS_META] = (
-        None
-        if config.get("core_type", "tensorcore") == "sparsecore"
-        else select_tensorcore_access(node.meta[ACCESS_SITE_META], config)
     )
     node.meta["indexing_patterns"] = indexing_patterns
 

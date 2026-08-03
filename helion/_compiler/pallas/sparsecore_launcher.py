@@ -13,13 +13,13 @@ from .sc_base import SC_DMA_GRANULE_BYTES
 from .sc_base import SC_LANES
 from .sc_base import _reject
 from .sc_base import shared_acc_items
-from .sparsecore_access import AtomicAddAccess
-from .sparsecore_access import CachedLoadAccess
-from .sparsecore_access import DirectLoadAccess
-from .sparsecore_access import DirectStoreAccess
-from .sparsecore_access import IndirectLoadAccess
-from .sparsecore_access import IndirectStoreAccess
-from .sparsecore_access import SparseCoreAccess
+from .sparsecore_plan import AtomicAddPlan
+from .sparsecore_plan import CachedLoadPlan
+from .sparsecore_plan import DirectLoadPlan
+from .sparsecore_plan import DirectStorePlan
+from .sparsecore_plan import IndirectLoadPlan
+from .sparsecore_plan import IndirectStorePlan
+from .sparsecore_plan import SparseCoreMemoryPlan
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -76,23 +76,23 @@ def _shape(tensor: torch.Tensor) -> list[int]:
 
 def _index_padding(program: SparseCoreProgram) -> dict[torch.fx.Node, int]:
     fills: dict[torch.fx.Node, int] = {}
-    for access in program.accesses:
+    for plan in program.memory_plans:
         if not isinstance(
-            access, (IndirectLoadAccess, IndirectStoreAccess, AtomicAddAccess)
+            plan, (IndirectLoadPlan, IndirectStorePlan, AtomicAddPlan)
         ):
             continue
         fill = (
             0
-            if isinstance(access, IndirectLoadAccess)
-            else int(access.site.tensor.shape[0])
+            if isinstance(plan, IndirectLoadPlan)
+            else int(plan.access.tensor.shape[0])
         )
-        prior = fills.setdefault(access.index_node, fill)
+        prior = fills.setdefault(plan.index_node, fill)
         if prior != fill:
             _reject(
                 "launcher",
                 "one index needs different gather and scatter padding; "
                 "load it separately for each use",
-                node=access.site.node,
+                node=plan.access.node,
             )
     return fills
 
@@ -109,36 +109,38 @@ def build_sparsecore_launcher_spec(
     emitted_inputs: set[int] = set()
 
     def record_input(
-        position: int, transform: tuple[object, ...], access: SparseCoreAccess
+        position: int,
+        transform: tuple[object, ...],
+        plan: SparseCoreMemoryPlan,
     ) -> bool:
         prior = seen_inputs.setdefault(position, transform)
         if prior != transform:
             _reject(
                 "launcher",
                 "one input needs incompatible launcher transforms",
-                node=access.site.node,
+                node=plan.access.node,
             )
         if position in emitted_inputs:
             return False
         emitted_inputs.add(position)
         return True
 
-    for access in program.loads:
-        position = arg_position(access.site.tensor)
+    for plan in program.loads:
+        position = arg_position(plan.access.tensor)
         if position is None:
             continue
-        if isinstance(access, DirectLoadAccess):
-            stream = access.stream
+        if isinstance(plan, DirectLoadPlan):
+            stream = plan.stream
             assert stream is not None
-            if access.site.node in index_padding:
-                fill = index_padding.get(access.site.node, 0)
+            if plan.access.node in index_padding:
+                fill = index_padding.get(plan.access.node, 0)
                 transform = (
                     "flat",
                     stream.group_count,
                     geometry.padded_items * stream.elements_per_item,
                     fill,
                 )
-                if record_input(position, transform, access):
+                if record_input(position, transform, plan):
                     pad_inputs.append(
                         [
                             position,
@@ -150,7 +152,7 @@ def build_sparsecore_launcher_spec(
                     )
             else:
                 value_size = stream.elements_per_item
-                stored_size = access.layout.storage_shape[1]
+                stored_size = plan.layout.storage_shape[1]
                 transform = (
                     "window",
                     stream.group_count,
@@ -158,7 +160,7 @@ def build_sparsecore_launcher_spec(
                     value_size,
                     stored_size,
                 )
-                if record_input(position, transform, access):
+                if record_input(position, transform, plan):
                     stream_inputs.append(
                         [
                             position,
@@ -168,42 +170,42 @@ def build_sparsecore_launcher_spec(
                             stored_size,
                         ]
                     )
-        elif isinstance(access, CachedLoadAccess):
-            record_input(position, ("raw",), access)
+        elif isinstance(plan, CachedLoadPlan):
+            record_input(position, ("raw",), plan)
         else:
-            record_input(position, ("raw",), access)
+            record_input(position, ("raw",), plan)
 
     pad_outputs: list[list[object]] = []
     reshape_outputs: list[list[object]] = []
     scalar_outputs: list[list[object]] = []
     kernel_output_dtypes: list[list[object]] = []
     combine_outputs: list[list[object]] = []
-    for access in program.stores:
-        position = arg_position(access.site.tensor)
+    for plan in program.stores:
+        position = arg_position(plan.access.tensor)
         if position is None:
             raise AssertionError("SparseCore output is absent from launcher arguments")
-        logical = _shape(access.site.tensor)
+        logical = _shape(plan.access.tensor)
         value_size = math.prod(logical[1:]) if len(logical) > 1 else 1
-        if access.layout.logical_dtype in _CAST_STORE_DTYPES:
+        if plan.layout.logical_dtype in _CAST_STORE_DTYPES:
             kernel_output_dtypes.append([position, "int32"])
-        if isinstance(access, DirectStoreAccess):
+        if isinstance(plan, DirectStorePlan):
             if value_size == 1:
                 pad_outputs.append([position, [geometry.padded_items, SC_LANES]])
                 scalar_outputs.append([position, logical])
             else:
                 pad_outputs.append([position, [geometry.padded_items, value_size]])
                 reshape_outputs.append([position, logical])
-        elif isinstance(access, IndirectStoreAccess):
+        elif isinstance(plan, IndirectStorePlan):
             pad_outputs.append([position, [logical[0] + 1, *logical[1:]]])
-        elif isinstance(access, AtomicAddAccess):
-            initialization = _allocation_kind(access.site.node, access.site.tensor)
+        elif isinstance(plan, AtomicAddPlan):
+            initialization = _allocation_kind(plan.access.node, plan.access.tensor)
             if initialization != "zeros":
                 _reject(
                     "atomic_init",
                     "SparseCore atomic add rebuilds its target from zero; "
                     f"the output must be allocated with torch.zeros (got "
                     f"{initialization})",
-                    node=access.site.node,
+                    node=plan.access.node,
                 )
             pad_outputs.append(
                 [

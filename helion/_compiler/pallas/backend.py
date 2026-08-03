@@ -1330,6 +1330,7 @@ class PallasBackend(Backend):
         from ...autotuner.config_spec import VALID_PALLAS_WORKLIST_GROUPINGS
         from ..compile_environment import CompileEnvironment
         from .plan_tiling import plan_tiling
+        from .tensorcore_plan import build_tensorcore_plans
 
         # Validate pallas_loop_type before any codegen setup.
         self.build_launcher_name(config)
@@ -1369,11 +1370,16 @@ class PallasBackend(Backend):
         env.compact_worklist_offset_params = []
         env.sparsecore_program = None
 
-        if config.get("core_type") == "sparsecore":
+        core_type = config.get("core_type", "tensorcore")
+        if core_type == "sparsecore":
             from .sparsecore import build_sparsecore_program
 
             env.sparsecore_program = build_sparsecore_program(graphs, config)
             return
+        if core_type != "tensorcore":
+            raise exc.InvalidConfig(f"unknown Pallas core type {core_type!r}")
+
+        build_tensorcore_plans(graphs, config)
 
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
