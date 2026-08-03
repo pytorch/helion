@@ -28,7 +28,8 @@ def load_expr(
 ) -> ast.AST:
     """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it."""
     from helion._compiler.pallas.gather import emit_gather
-    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+    from helion._compiler.pallas.tensorcore_access import TENSORCORE_ACCESS_META
+    from helion._compiler.pallas.tensorcore_access import OneHotGatherAccess
 
     name = state.device_function.tensor_arg(tensor).name
     name = vmem_name(state, name)
@@ -38,9 +39,9 @@ def load_expr(
 
     assert state.fx_node is not None
     patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
-    for pattern in patterns:
-        if isinstance(pattern, IndirectGatherPattern):
-            return emit_gather(state, pattern.plan, name)
+    access = state.fx_node.meta.get(TENSORCORE_ACCESS_META)
+    if isinstance(access, OneHotGatherAccess):
+        return emit_gather(state, access.fallback, name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
@@ -517,8 +518,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
-    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
-    from helion._compiler.pallas.plan_tiling import IndirectScatterPattern
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -546,17 +546,17 @@ def _generated_index_code(
             pattern, idx, state, subscript_index, in_pipeline
         )
 
-    if isinstance(pattern, IndirectGatherPattern):
-        # The gather emitter consumes the tensor index and projects the full
-        # resident table axis through one-hot, so normal load codegen must
-        # expose that axis instead of indexing it a second time.
-        return ":"
+    if isinstance(pattern, TensorIndexPattern):
+        from helion._compiler.pallas.tensorcore_access import TENSORCORE_ACCESS_META
+        from helion._compiler.pallas.tensorcore_access import TensorCoreAccess
 
-    if isinstance(pattern, IndirectScatterPattern):
-        # The scatter emitter consumes the tensor index and projects source lanes
-        # through one-hot matrices, so normal store codegen must expose the full
-        # resident target axis instead of indexing it a second time.
-        return ":"
+        assert state.fx_node is not None
+        access = state.fx_node.meta.get(TENSORCORE_ACCESS_META)
+        if (
+            isinstance(access, TensorCoreAccess)
+            and subscript_index in access.indirect_positions
+        ):
+            return ":"
 
     raise RuntimeError(
         f"Unhandled indexing pattern type: {type(pattern).__name__}. "
