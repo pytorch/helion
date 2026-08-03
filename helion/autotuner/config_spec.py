@@ -429,6 +429,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "num_threads",
         "cute_vector_widths",
+        "constexpr_range",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
@@ -465,6 +466,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_load_buffer_count",
         "pallas_pre_broadcast",
         "cute_vector_widths",
+        # FlyDSL: emit range_constexpr for small reduction tile counts so the
+        # loaded input vectors can be register-cached across two passes (2-read HBM).
+        "constexpr_range",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -2499,6 +2503,13 @@ class ConfigSpec:
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
+        # FlyDSL register-caching: emit range_constexpr (in_local[] pattern, 2-read
+        # HBM) when the tile count is small enough.  Registering as a BooleanFragment
+        # lets the beam-search neighbor generator flip it True↔False so autotune can
+        # reliably discover the faster variant rather than depending on whether the
+        # initial candidate list happened to include a constexpr_range=True entry.
+        if self.supports_config_key("constexpr_range"):
+            fields["constexpr_range"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)

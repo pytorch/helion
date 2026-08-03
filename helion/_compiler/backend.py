@@ -3165,6 +3165,12 @@ class FlyDSLBackend(Backend):
             # count W = thread_count // 64 comes from thread_count = chunk // V,
             # so V and W are independent autotune knobs (mirrors cute).
             "cute_vector_widths",
+            # When True, emit range_constexpr for the reduction loop instead of a
+            # runtime scf.for.  Enables in_local[] register caching across passes
+            # (2-read HBM vs 3-read), but only valid when the tile count is small
+            # (≤16 tiles) so unrolling stays cheap.  Autotune offers both variants
+            # for small-N whole-row reductions and picks the faster one.
+            "constexpr_range",
         }
     )
 
@@ -3399,12 +3405,18 @@ class FlyDSLBackend(Backend):
             for i in range(1, ndim):
                 block_sizes[i] = 256
 
-        def _add(bs: list[int], rl: int | None, v: int | None) -> None:
+        # Constexpr-range threshold: offer range_constexpr for small tile counts
+        # where unrolling is cheap (≤ threshold tiles → ≤ threshold register vecs).
+        _CONSTEXPR_THRESHOLD = 16
+
+        def _add(
+            bs: list[int], rl: int | None, v: int | None, cr: bool = False
+        ) -> None:
             # Safety: for user-tiled reductions all column dims must be multiples
             # of 256 (one warp-pass = 64 lanes x 4 elems).  Reject bad configs.
             if _user_tiled and any(b % 256 != 0 for b in bs[1:]):
                 return
-            key = (tuple(bs), rl, v)
+            key = (tuple(bs), rl, v, cr)
             if key in seen:
                 return
             seen.add(key)
@@ -3413,7 +3425,27 @@ class FlyDSLBackend(Backend):
                 kw["reduction_loops"] = [rl] * n_rl
                 if v is not None:
                     kw["cute_vector_widths"] = [v] * n_rl
+            if cr:
+                kw["constexpr_range"] = True
             candidates.append(Config(**kw))
+
+        # Compute tile count for the first reduction dim to decide constexpr eligibility.
+        # The reduction-loop block_id gives us the numel via the reduction_loops spec.
+        def _tile_count(chunk: int) -> int | None:
+            if not rl_ids or chunk <= 0:
+                return None
+            rl_spec_list = spec.reduction_loops._data  # list of ReductionLoopSpec
+            if not rl_spec_list:
+                return None
+            numel = rl_spec_list[0].size_hint
+            if numel is None:
+                return None
+            import contextlib
+
+            result: list[int] = []
+            with contextlib.suppress(TypeError, ValueError):
+                result.append((int(numel) + chunk - 1) // chunk)
+            return result[0] if result else None
 
         for bm in (1, 2, 4, 8, 16):
             if bm > max(row_hint, 1):
@@ -3442,6 +3474,11 @@ class FlyDSLBackend(Backend):
                     c = 64 * v
                     while c <= _hi_loop and (c // v) <= 1024:
                         _add(bs, c, v)
+                        # Also offer constexpr_range for small tile counts (enables
+                        # in_local[] register caching; 2-read HBM vs 3-read).
+                        tc = _tile_count(c)
+                        if tc is not None and tc <= _CONSTEXPR_THRESHOLD:
+                            _add(bs, c, v, cr=True)
                         c *= 2
             else:
                 # bm>1: one warp/row (thread_count 64), V = chunk // 64 derived
@@ -3451,6 +3488,9 @@ class FlyDSLBackend(Backend):
                     c = 64 * v
                     if c <= _hi_loop:
                         _add(bs, c, None)
+                        tc = _tile_count(c)
+                        if tc is not None and tc <= _CONSTEXPR_THRESHOLD:
+                            _add(bs, c, None, cr=True)
 
         if len(candidates) <= 1:
             return candidates[0] if candidates else default
@@ -3541,6 +3581,7 @@ class FlyDSLBackend(Backend):
 
         # Reset per-compilation state so helpers are re-emitted on each compile.
         self._flydsl_helpers_emitted = False
+        self._flydsl_use_constexpr_range = False  # set below for small-N
         # Two regimes, encoded in block_sizes:
         #   W=1 (small-N): [bm, 256] -> bm rows/block, 1 warp/row, block = 64*bm threads.
         #   W>1 (large-N): [1, W*256] -> 1 row/block, W warps cooperate, block = 64*W threads.
@@ -3582,6 +3623,28 @@ class FlyDSLBackend(Backend):
         # before the _flydsl_b{max,min,sum} helpers, so the guard is unnecessary.
         self._flydsl_bm = bm
         self._flydsl_num_threads = 64 * W if W > 1 else 64 * bm
+
+        # Hybrid range strategy: use range_constexpr (unrolled, enables in_local[]
+        # register caching across two passes) when the tile count is small enough
+        # that unrolling is cheap.  For whole-row rolled reductions the chunk size
+        # comes from the reduction_loops config; tile_count = ceil(N / chunk).
+        # Threshold = 16 tiles: at V=8, BT=256 that's N≤32768, ~64 fp16/thread =
+        # ~32 VGPRs.  Above the threshold the runtime scf.for avoids unroll blowup.
+        # Activated when the config carries the "constexpr_range" flag (see autotune).
+        _use_cr = bool(config.config.get("constexpr_range", False))
+        if _use_cr:
+            rl = getattr(config, "reduction_loops", None) or []
+            chunk = int(rl[0]) if rl and rl[0] is not None else 0
+            rl_data = _spec.reduction_loops._data
+            if chunk > 0 and rl_data:
+                _numel = rl_data[0].size_hint  # static N from the ReductionLoopSpec
+                # Fall back to scf.for if numel is dynamic (can't compute tile count).
+                if isinstance(_numel, int):
+                    tile_count = (_numel + chunk - 1) // chunk
+                    _CONSTEXPR_THRESHOLD = 16
+                    if tile_count <= _CONSTEXPR_THRESHOLD:
+                        self._flydsl_use_constexpr_range = True
+                        self._flydsl_constexpr_chunk = chunk
         self._tensor_use_buffer: dict[int, bool] = {}
         self._tensor_vec_width: dict[int, int] = {}
 
@@ -3603,6 +3666,25 @@ class FlyDSLBackend(Backend):
                 self._tensor_use_buffer[tid] = True  # always vectorized buffer path
                 bits = _BITS.get(tensor.dtype, 32)
                 self._tensor_vec_width[tid] = 128 // bits
+
+        # Identify which tensor NAMES appear in reduce-loop graphs (those WITHOUT
+        # a store node). Only these tensors are slot-cached; weight/bias appear
+        # only in normalize-loop graphs (which have store nodes) and are excluded.
+        self._flydsl_cr_reduce_tensors: set[str] = set()
+        if self._flydsl_use_constexpr_range:
+            for graph_info in graphs:
+                has_store = any(
+                    n.op == "call_function" and n.target == memory_ops.store
+                    for n in graph_info.graph.nodes
+                )
+                if has_store:
+                    continue  # normalize-loop graph — skip
+                for node in graph_info.graph.nodes:
+                    if node.op != "call_function" or node.target != memory_ops.load:
+                        continue
+                    t_node = node.args[0]
+                    if isinstance(t_node, torch.fx.Node):
+                        self._flydsl_cr_reduce_tensors.add(t_node.name)
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
@@ -3645,10 +3727,22 @@ class FlyDSLBackend(Backend):
         return f"{offsets_var} = ({lid}) // 4 + fx.thread_idx.x % 64"
 
     def range_str(self, begin: str | None, end: str, step: str | None) -> str | None:
-        # Emit a plain range() so flydsl lowers a runtime scf.for: the step may be
-        # dynamic (constexpr kernel param) and the body is emitted once instead of
-        # unrolled N/step times, so large N no longer blows up compile time.
-        # chunk_idx = element_offset // vec_width + tid covers all chunks.
+        # Hybrid range strategy: emit range_constexpr when the tile count is small
+        # (enables in_local[] register caching across reduction passes; 2-read HBM)
+        # and range() otherwise (runtime scf.for; avoids large-N unroll blowup).
+        if getattr(self, "_flydsl_use_constexpr_range", False):
+            chunk = getattr(self, "_flydsl_constexpr_chunk", None)
+            if chunk is not None:
+                # range_constexpr requires a Python-int literal step, not a variable.
+                # The chunk is known at compile time (per-config constant).  Do NOT
+                # guard on ``step is not None`` — callers pass step=None when step=1
+                # (a legal omission), and silently falling through to range() would
+                # emit scf.for instead, making cache.append() produce one SSA value
+                # instead of N distinct ones → wrong read-phase index or IndexError.
+                b = begin or "0"
+                return f"range_constexpr({b}, {end}, {chunk})"
+        # Default: runtime scf.for. The step may be a module-level literal variable
+        # (e.g. _REDUCTION_BLOCK_1) which scf.for can materialise as an SSA value.
         args = [a for a in [begin, end] if a is not None]
         if step and step != "1":
             args.append(step)  # keep step as-is

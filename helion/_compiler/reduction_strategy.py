@@ -1452,7 +1452,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         tracker = ThreadAxisTracker()
         if self._thread_count > 0:
             tracker.record(block_index, self._get_thread_axis(), self._thread_count)
-        return DeviceLoopState(
+        device_loop_state = DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=inner_body,
@@ -1460,6 +1460,47 @@ class LoopedReductionStrategy(ReductionStrategy):
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
         )
+
+        # Register-slot metadata for in_local[] register caching.
+        # When constexpr_range is active and the tile count is small, record
+        # (chunk, num_tiles, outer_prefix) on device_fn so the load codegen
+        # (memory_ops.py) can emit per-tile slot arrays there.  The load codegen
+        # knows vec_width and dtype (needed for make_rmem_tensor) so it does the
+        # actual emission; the strategy only provides the loop geometry.
+        _numel_int: int | None = None
+        import contextlib
+
+        with contextlib.suppress(TypeError, ValueError):
+            _numel_int = int(numel)
+        if (
+            getattr(env.backend, "_flydsl_use_constexpr_range", False)
+            and _numel_int is not None
+        ):
+            chunk = getattr(env.backend, "_flydsl_constexpr_chunk", 0) or 0
+            if chunk > 0:
+                num_tiles = (_numel_int + chunk - 1) // chunk
+                _CONSTEXPR_THRESHOLD = 16
+                if num_tiles <= _CONSTEXPR_THRESHOLD:
+                    fn = state.device_function
+                    if not hasattr(fn, "_flydsl_cr_meta"):
+                        fn._flydsl_cr_meta: dict = {}  # block_index -> (chunk, num_tiles, outer_prefix)
+                    if block_index not in fn._flydsl_cr_meta:
+                        # Record the outer_prefix of the FIRST reduce-loop graph for
+                        # this block_index.  Later graphs (normalize-loop, etc.) for
+                        # the same block_index are skipped intentionally: only the
+                        # first reduce-loop's outer_prefix is the correct insertion
+                        # point (it precedes both the reduce and normalize loops in
+                        # the generated function body).  Invariant: this is only
+                        # reached during the first codegen pass over this block_index,
+                        # so outer_prefix is still live (not yet flushed by
+                        # add_device_loop) when memory_ops.py later appends to it.
+                        fn._flydsl_cr_meta[block_index] = (
+                            chunk,
+                            num_tiles,
+                            device_loop_state.outer_prefix,  # the hoistable scope
+                        )
+
+        return device_loop_state
 
     def codegen_reduction(
         self,
