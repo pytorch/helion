@@ -370,6 +370,9 @@ def default_pallas_jax_launcher(
         compact=compact,
         orig_shapes=orig_shapes,
         ds_pad_dims=_ds_pad_dims,
+        sc_launcher_spec=cast(
+            "dict[str, object] | None", kwargs.get("_sc_launcher_spec")
+        ),
     )
 
     if len(output_results) == 1:
