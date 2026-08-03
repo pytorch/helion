@@ -44,13 +44,13 @@ def _(state: CodegenState) -> None:
     )
     idx_str = ", ".join(parts)
     from .gather import emit_scatter_store
-    from .tensorcore_access import TENSORCORE_ACCESS_META
-    from .tensorcore_access import ProjectionScatterAccess
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+    from .tensorcore_plan import ProjectionScatterPlan
 
-    access = state.fx_node.meta.get(TENSORCORE_ACCESS_META) if state.fx_node else None
-    is_scatter = isinstance(access, ProjectionScatterAccess)
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
+    is_scatter = isinstance(plan, ProjectionScatterPlan)
     if is_scatter:
-        value = emit_scatter_store(state, access.fallback, name, idx_str, value)
+        value = emit_scatter_store(state, plan.plan, name, idx_str, value)
     from .ordered_carry import emit_carry_store
 
     if not is_scatter and state.device_function.carry_tiles:

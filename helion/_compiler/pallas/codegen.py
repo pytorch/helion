@@ -26,10 +26,10 @@ def load_expr(
     subscript: list[object],
     tensor: torch.Tensor,
 ) -> ast.AST:
-    """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it."""
+    """Emit a normal load or a selected TensorCore gather plan."""
     from helion._compiler.pallas.gather import emit_gather
-    from helion._compiler.pallas.tensorcore_access import TENSORCORE_ACCESS_META
-    from helion._compiler.pallas.tensorcore_access import OneHotGatherAccess
+    from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
     name = state.device_function.tensor_arg(tensor).name
     name = vmem_name(state, name)
@@ -39,9 +39,9 @@ def load_expr(
 
     assert state.fx_node is not None
     patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
-    access = state.fx_node.meta.get(TENSORCORE_ACCESS_META)
-    if isinstance(access, OneHotGatherAccess):
-        return emit_gather(state, access.fallback, name)
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, OneHotGatherPlan):
+        return emit_gather(state, plan.plan, name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
@@ -547,16 +547,18 @@ def _generated_index_code(
         )
 
     if isinstance(pattern, TensorIndexPattern):
-        from helion._compiler.pallas.tensorcore_access import TENSORCORE_ACCESS_META
-        from helion._compiler.pallas.tensorcore_access import TensorCoreAccess
+        from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+        from helion._compiler.pallas.tensorcore_plan import TensorCorePlan
 
         assert state.fx_node is not None
-        access = state.fx_node.meta.get(TENSORCORE_ACCESS_META)
-        if (
-            isinstance(access, TensorCoreAccess)
-            and subscript_index in access.indirect_positions
-        ):
-            return ":"
+        plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+        assert (
+            isinstance(plan, TensorCorePlan)
+            and subscript_index in plan.indirect_positions
+        ), "TensorCore plan does not handle a tensor-valued index"
+        # The plan consumes the tensor index, so ordinary indexing must expose
+        # the full tensor axis instead of applying the index a second time.
+        return ":"
 
     raise RuntimeError(
         f"Unhandled indexing pattern type: {type(pattern).__name__}. "
