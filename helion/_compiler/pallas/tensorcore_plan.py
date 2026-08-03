@@ -36,8 +36,8 @@ class OneHotGatherPlan(TensorCorePlan):
 
 
 @dataclass(frozen=True)
-class ProjectionScatterPlan(TensorCorePlan):
-    """One-hot projection fallback for an indirect store."""
+class OneHotScatterPlan(TensorCorePlan):
+    """One-hot fallback for an indirect store."""
 
     plan: ScatterPlan
 
@@ -63,13 +63,13 @@ def _one_hot_gather(
     return OneHotGatherPlan(access, tuple(positions), plan)
 
 
-def _projection_scatter(
+def _one_hot_scatter(
     access: MemoryAccess, positions: list[int], _config: Config
-) -> ProjectionScatterPlan:
+) -> OneHotScatterPlan:
     from .gather import build_scatter_plan
 
     plan = build_scatter_plan(access.tensor, list(access.subscript), positions)
-    return ProjectionScatterPlan(access, tuple(positions), plan)
+    return OneHotScatterPlan(access, tuple(positions), plan)
 
 
 _NATIVE_LOAD_CANDIDATES: tuple[TensorCorePlanCandidate, ...] = ()
@@ -107,7 +107,7 @@ def select_tensorcore_plan(
         )
     if access.kind is MemoryAccessKind.STORE:
         return _select_plan(
-            _NATIVE_STORE_CANDIDATES, _projection_scatter, access, positions, config
+            _NATIVE_STORE_CANDIDATES, _one_hot_scatter, access, positions, config
         )
     op = access.node.target
     op_name = getattr(op, "__name__", str(op))
