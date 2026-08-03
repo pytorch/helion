@@ -1380,8 +1380,8 @@ def _pallas_build_scratch_shapes(
 
     Each entry is either ``(shape, dtype_str, scratch_type)`` or the
     legacy 2-tuple ``(shape, dtype_str)`` form (``scratch_type``
-    defaults to ``"vmem"``).  Supported scratch types: ``"vmem"`` and
-    ``"dma_semaphore"``.
+    defaults to ``"vmem"``).  Supported scratch types: ``"vmem"``,
+    ``"vmem_shared"`` (per-core shared memory) and ``"dma_semaphore"``.
     """
     _jnp_dtype_map = _pallas_jnp_dtype_map()
     scratch_shapes: list[object] = []
@@ -1393,6 +1393,12 @@ def _pallas_build_scratch_shapes(
             scratch_type = "vmem"
         if scratch_type == "dma_semaphore":
             scratch_shapes.append(pltpu.SemaphoreType.DMA(shape))  # type: ignore[union-attr]
+        elif scratch_type == "vmem_shared":
+            assert dtype_str is not None
+            jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
+            scratch_shapes.append(
+                pltpu.MemorySpace.VMEM_SHARED(shape, jnp_dtype)  # type: ignore[union-attr]
+            )
         else:
             assert dtype_str is not None
             jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
@@ -1751,6 +1757,257 @@ def _pallas_compile_jit_fn(
     )
 
 
+def _pallas_compile_sc_jit_fn(
+    pallas_kernel: object,
+    args: tuple[object, ...],
+    *,
+    _output_indices: list[int],
+    _inplace_indices: list[int] | None,
+    _scratch_shapes: list[object] | None,
+    _sc_launcher_spec: dict[str, object],
+    interpret: bool,
+) -> _PallasCompileResult:
+    """Build a SparseCore ``pl.kernel`` and its argument transforms."""
+    if interpret:
+        raise NotImplementedError(
+            "core_type='sparsecore' has no interpret mode; run on a TPU"
+        )
+    import inspect
+
+    import jax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.experimental.pallas import tpu_sc as plsc
+    import jax.numpy as jnp
+
+    sparse_core = getattr(pltpu.get_tpu_info(), "sparse_core", None)
+    if sparse_core is None:
+        raise RuntimeError(
+            "core_type='sparsecore' requires a TPU with a SparseCore mesh"
+        )
+    if (
+        int(sparse_core.num_cores) != int(_sc_launcher_spec["num_cores"])  # type: ignore[arg-type]
+        or int(sparse_core.num_subcores) != int(_sc_launcher_spec["num_subcores"])  # type: ignore[arg-type]
+    ):
+        raise RuntimeError(
+            "sparsecore kernel was compiled for a "
+            f"{_sc_launcher_spec['num_cores']}x"
+            f"{_sc_launcher_spec['num_subcores']} mesh but the "
+            f"active target is {sparse_core.num_cores}x{sparse_core.num_subcores}"
+        )
+    plan_granule = cast("int", _sc_launcher_spec.get("dma_granule", 32))
+    if int(sparse_core.dma_granule_size_bytes) > plan_granule:
+        raise RuntimeError(
+            f"sparsecore plan assumes a {plan_granule}-byte DMA granule but the "
+            f"active target requires {sparse_core.dma_granule_size_bytes} bytes"
+        )
+
+    # SC rebuilds scatter-add outputs from zero.
+    combine_positions = {
+        int(entry[0])  # pyrefly: ignore [bad-argument-type]
+        for entry in cast(
+            "list[list[object]]",
+            _sc_launcher_spec.get("combine_outputs") or [],
+        )
+    }
+    if combine_positions:
+        _inplace_indices = [
+            i for i in (_inplace_indices or []) if i not in combine_positions
+        ]
+    (
+        tensor_arg_indices,
+        output_only_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        arg_to_tensor_pos,
+        inplace_positions,
+        out_shapes,
+        _pallas_aliases,
+    ) = _pallas_prepare_args(
+        args, _output_indices, _inplace_indices, interpret=interpret
+    )
+    assert not inplace_positions, "sparsecore kernels do not support in-place outputs"
+
+    scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
+    reordered_kernel = _pallas_make_reordered_kernel(
+        pallas_kernel,
+        args,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        _output_indices,
+        inplace_positions,
+        arg_to_tensor_pos,
+        n_extra_refs=len(scratch_shapes),
+    )
+
+    pad_outputs = {
+        int(pos): tuple(shape)  # pyrefly: ignore [bad-argument-type]
+        # pyrefly: ignore [not-iterable]
+        for pos, shape in cast(
+            "list[list[object]]", _sc_launcher_spec.get("pad_outputs") or []
+        )
+    }
+    kernel_output_dtypes = {
+        int(pos): str(dt)  # pyrefly: ignore [bad-argument-type]
+        for pos, dt in cast(
+            "list[list[object]]",
+            _sc_launcher_spec.get("kernel_output_dtypes") or [],
+        )
+    }
+    out_types = []
+    for out_idx, orig_pos in enumerate(_output_indices):
+        placeholder = out_shapes[out_idx]
+        shape = pad_outputs.get(orig_pos, tuple(placeholder.shape))  # type: ignore[union-attr]
+        dtype = placeholder.dtype  # type: ignore[union-attr]
+        if orig_pos in kernel_output_dtypes:
+            dtype = jnp.dtype(kernel_output_dtypes[orig_pos])  # pyrefly: ignore [bad-argument-type]
+        out_types.append(jax.ShapeDtypeStruct(shape, dtype))
+    out_type_arg = out_types if len(out_types) > 1 else out_types[0]
+
+    mesh = plsc.VectorSubcoreMesh(
+        core_axis_name="_sc_core_axis",
+        subcore_axis_name="_sc_sub_axis",
+        num_cores=int(_sc_launcher_spec["num_cores"]),  # type: ignore[arg-type]
+        num_subcores=int(_sc_launcher_spec["num_subcores"]),  # type: ignore[arg-type]
+    )
+    cp_fields = set(inspect.signature(pltpu.CompilerParams).parameters)
+    cp_kwargs: dict[str, object] = {"disable_bounds_checks": True}
+    for opt in ("use_tc_tiling_on_sc", "needs_layout_passes"):
+        if opt in cp_fields:
+            cp_kwargs[opt] = False
+    kernel_params = set(inspect.signature(pl.kernel).parameters)
+    scratch_kw = (
+        "scratch_types" if "scratch_types" in kernel_params else "scratch_shapes"
+    )
+    kern = pl.kernel(  # pyrefly: ignore [bad-argument-type]
+        cast("Callable[..., None]", reordered_kernel),
+        out_type_arg,
+        mesh=mesh,
+        compiler_params=pltpu.CompilerParams(**cp_kwargs),  # pyrefly: ignore [bad-argument-type]
+        **{scratch_kw: scratch_shapes},  # pyrefly: ignore [bad-argument-type]
+    )
+
+    pad_inputs = [
+        (
+            int(entry[0]),
+            int(entry[1]),
+            int(entry[2]),
+            bool(entry[3]) if len(entry) > 3 else True,
+            int(entry[4]) if len(entry) > 4 else 0,
+        )
+        for entry in cast("list[list[int]]", _sc_launcher_spec.get("pad_inputs") or [])
+    ]
+    stream_inputs = [
+        (
+            int(entry[0]),
+            int(entry[1]),
+            int(entry[2]),
+            int(entry[3]),
+            int(entry[4]) if len(entry) > 4 else int(entry[3]),
+        )
+        for entry in cast(
+            "list[list[int]]", _sc_launcher_spec.get("stream_inputs") or []
+        )
+    ]
+    reshape_outputs = {
+        int(pos): tuple(int(s) for s in shape)  # type: ignore[union-attr]
+        for pos, shape in cast(
+            "list[list[object]]", _sc_launcher_spec.get("reshape_outputs") or []
+        )
+    }
+    scalar_outputs = {
+        int(pos): tuple(int(s) for s in shape)  # type: ignore[union-attr]
+        for pos, shape in cast(
+            "list[list[object]]", _sc_launcher_spec.get("scalar_outputs") or []
+        )
+    }
+    combine_outputs = {
+        int(pos): tuple(int(s) for s in shape)  # type: ignore[union-attr]
+        for pos, shape in cast(
+            "list[list[object]]", _sc_launcher_spec.get("combine_outputs") or []
+        )
+    }
+    logical_out_shapes = [
+        tuple(cast("torch.Tensor", args[orig_pos]).shape)
+        for orig_pos in _output_indices
+    ]
+
+    def jit_fn(*jax_args: object) -> object:
+        xs = list(jax_args)
+        for orig_pos, group_count, padded_values, to_int32, fill in pad_inputs:
+            tpos = arg_to_tensor_pos[orig_pos]
+            x = jnp.reshape(xs[tpos], (group_count, -1))  # type: ignore[arg-type]
+            if to_int32 and x.dtype != jnp.int32:
+                x = x.astype(jnp.int32)
+            if padded_values > x.shape[1]:
+                x = jnp.pad(
+                    x,
+                    ((0, 0), (0, padded_values - x.shape[1])),
+                    constant_values=fill,
+                )
+            xs[tpos] = jnp.reshape(x, (-1,))
+        for (
+            orig_pos,
+            group_count,
+            padded_items,
+            value_size,
+            stored_size,
+        ) in stream_inputs:
+            tpos = arg_to_tensor_pos[orig_pos]
+            x = jnp.reshape(xs[tpos], (group_count, -1))  # type: ignore[arg-type]
+            if padded_items * value_size > x.shape[1]:
+                x = jnp.pad(
+                    x,
+                    ((0, 0), (0, padded_items * value_size - x.shape[1])),
+                )
+            x = jnp.reshape(x, (-1, value_size))
+            if stored_size > value_size:
+                x = jnp.pad(x, ((0, 0), (0, stored_size - value_size)))
+            xs[tpos] = x
+        result = kern(*xs)
+        outs: list[Any] = (
+            list(result) if isinstance(result, (tuple, list)) else [result]
+        )
+        for out_idx, logical in enumerate(logical_out_shapes):
+            orig_pos = _output_indices[out_idx]
+            scalar_shape = scalar_outputs.get(orig_pos)
+            combine_shape = combine_outputs.get(orig_pos)
+            reshape_to = reshape_outputs.get(orig_pos)
+            if combine_shape is not None:
+                o = outs[out_idx]
+                # pyrefly: ignore [missing-attribute]
+                o = o.sum(axis=0)
+                outs[out_idx] = jnp.reshape(o[: combine_shape[0]], combine_shape)
+            elif scalar_shape is not None:
+                o = outs[out_idx]
+                # pyrefly: ignore [unsupported-operation]
+                outs[out_idx] = jnp.reshape(o[: scalar_shape[0], 0], scalar_shape)
+            elif reshape_to is not None:
+                o = outs[out_idx]
+                # pyrefly: ignore [unsupported-operation]
+                outs[out_idx] = jnp.reshape(o[: reshape_to[0]], reshape_to)
+            # pyrefly: ignore [missing-attribute]
+            elif tuple(outs[out_idx].shape) != logical:
+                # pyrefly: ignore [unsupported-operation]
+                outs[out_idx] = outs[out_idx][tuple(slice(0, s) for s in logical)]
+            placeholder = out_shapes[out_idx]
+            # pyrefly: ignore [missing-attribute]
+            if outs[out_idx].dtype != placeholder.dtype:  # type: ignore[union-attr]
+                # pyrefly: ignore [missing-attribute]
+                outs[out_idx] = outs[out_idx].astype(placeholder.dtype)  # type: ignore[union-attr]
+        return tuple(outs) if len(outs) > 1 else outs[0]
+
+    return _PallasCompileResult(
+        jit_fn=jit_fn,
+        tensor_arg_indices=tensor_arg_indices,
+        output_only_indices=output_only_indices,
+        arg_to_tensor_pos=arg_to_tensor_pos,
+        inplace_positions=inplace_positions,
+        pallas_aliases={},
+    )
+
+
 _PALLAS_CACHE_ATTR = "_pallas_cache"
 
 
@@ -1768,6 +2025,7 @@ def _pallas_install_launcher_cache(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _sc_launcher_spec: dict[str, object] | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
 
@@ -1796,19 +2054,30 @@ def _pallas_install_launcher_cache(
 
     _pallas_check_dtypes(spec_args)
 
-    result = _pallas_compile_jit_fn(
-        pallas_kernel,
-        grid,
-        spec_args,
-        _output_indices=output_indices,
-        _inplace_indices=_inplace_indices,
-        _block_spec_info=_block_spec_info,
-        _smem_arg_indices=_smem_arg_indices,
-        _scratch_shapes=_scratch_shapes,
-        _hbm_arg_indices=_hbm_arg_indices,
-        _matmul_dot_general=_matmul_dot_general,
-        interpret=interpret,
-    )
+    if _sc_launcher_spec is not None:
+        result = _pallas_compile_sc_jit_fn(
+            pallas_kernel,
+            spec_args,
+            _output_indices=output_indices,
+            _inplace_indices=_inplace_indices,
+            _scratch_shapes=_scratch_shapes,
+            _sc_launcher_spec=_sc_launcher_spec,
+            interpret=interpret,
+        )
+    else:
+        result = _pallas_compile_jit_fn(
+            pallas_kernel,
+            grid,
+            spec_args,
+            _output_indices=output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=_scratch_shapes,
+            _hbm_arg_indices=_hbm_arg_indices,
+            _matmul_dot_general=_matmul_dot_general,
+            interpret=interpret,
+        )
 
     jax_callable = _pallas_build_callable(
         pallas_kernel,
@@ -1896,6 +2165,7 @@ def default_pallas_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _sc_launcher_spec: dict[str, object] | None = None,
     _compact_build_worklist: Callable[..., object] | None = None,
     _compact_offset_arg_indices: list[int] | None = None,
     _compact_metadata_fields: list[str] | None = None,
@@ -1989,6 +2259,7 @@ def default_pallas_launcher(
                 _ds_pad_dims=_ds_pad_dims,
                 _pallas_interpret=_pallas_interpret,
                 _matmul_dot_general=_matmul_dot_general,
+                _sc_launcher_spec=_sc_launcher_spec,
             )
 
     return _pallas_invoke_cached_launcher(

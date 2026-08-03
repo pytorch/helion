@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from .generate_ast import GenerateAST
     from .inductor_lowering import CodegenState
 
     _T = TypeVar("_T")
@@ -1892,6 +1893,12 @@ class DeviceGridState(DeviceLoopOrGridState):
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+
+    def codegen_graph(self, codegen: GenerateAST, graph: torch.fx.Graph) -> None:
+        """Lower the logical graph under this grid execution strategy."""
+        from .inductor_lowering import codegen_call_with_graph
+
+        codegen_call_with_graph(codegen, graph, [])
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
