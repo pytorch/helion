@@ -159,10 +159,7 @@ def _index_plan(
     plan: IndirectLoadPlan | IndirectStorePlan | AtomicAddPlan,
 ) -> SparseCoreMemoryPlan:
     index_plan = program.plan_by_node.get(plan.index_node)
-    if (
-        index_plan is None
-        or index_plan.access.kind is not MemoryAccessKind.LOAD
-    ):
+    if index_plan is None or index_plan.access.kind is not MemoryAccessKind.LOAD:
         raise NotImplementedError(
             "SparseCore indirect index must be produced by a lowered load"
         )
@@ -218,9 +215,7 @@ def _indirect_copy_lines(
     semaphore = resources.semaphore
     semaphore_index = resources.semaphore_index[plan.access.node]
     prefix = (
-        _offset_lines(program, plan, index_plan, resources)
-        if method == "start"
-        else []
+        _offset_lines(program, plan, index_plan, resources) if method == "start" else []
     )
     if not isinstance(index_plan, IndirectLoadPlan):
         expression = (
@@ -443,9 +438,7 @@ def render_sparsecore_program(
                 method = "start" if task.kind is TaskKind.ASYNC_START else "wait"
                 if isinstance(plan, IndirectLoadPlan):
                     lines.extend(
-                        _indirect_copy_lines(
-                            program, plan, resources, codegen, method
-                        )
+                        _indirect_copy_lines(program, plan, resources, codegen, method)
                     )
                 elif isinstance(plan, DirectLoadPlan):
                     lines.extend(
