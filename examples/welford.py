@@ -42,12 +42,18 @@ def welford(
 
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
+    # Share one autotuned block size across both passes over n. This keeps the
+    # reduction config space one-dimensional (instead of tuning the two n-loops
+    # independently), which shrinks the search and avoids the fragile large-n
+    # configs that fail to autotune on AMD (gfx950) for wide reduction dims.
+    block_size_n = hl.register_block_size(n)
+
     for tile_m in hl.tile(m):
         acc_cnt = torch.zeros_like(x[tile_m, 0], dtype=torch.float32)
         acc_mean = torch.zeros_like(acc_cnt)
         acc_m2 = torch.zeros_like(acc_cnt)
 
-        for tile_n in hl.tile(n):
+        for tile_n in hl.tile(n, block_size=block_size_n):
             chunk = x[tile_m, tile_n]
             # Count of VALID columns (the divisor): use the true valid count, not the constexpr
             # tile width (over-counts last-tile padding). Cast the mask to int32 BEFORE summing —
@@ -69,7 +75,7 @@ def welford(
         mean_col = acc_mean[:, None]
         rstd_col = rstd_tile[:, None]
 
-        for tile_n in hl.tile(n):
+        for tile_n in hl.tile(n, block_size=block_size_n):
             xi_chuck = x[tile_m, tile_n]
             w_chuck = weight[tile_n][None, :]
             b_chuck = bias[tile_n][None, :]
