@@ -25,12 +25,12 @@ from typing import Callable
 
 import torch
 
-from .._compiler._dynamo.variables import _detect_mutated_inputs
-from .._compiler._dynamo.variables import infer_output_spec
-from ..language import constexpr
+from ..._compiler._dynamo.variables import _detect_mutated_inputs
+from ..._compiler._dynamo.variables import infer_output_spec
+from ...language import constexpr
 
 if TYPE_CHECKING:
-    from .kernel import Kernel
+    from ..kernel import Kernel
 
 _capture_lib = torch.library.Library("helion_capture", "FRAGMENT")
 _op_counter = 0

@@ -2,7 +2,7 @@
 
 Holds `default_pallas_launcher` (the torch-tensor / TorchTPU launcher that
 generated Pallas code invokes) plus the shared block-spec / compile / caching
-helpers it and the pure-JAX export path (`helion.runtime.pallas_jax_export`)
+helpers it and the pure-JAX export path (`helion.runtime.pallas.jax_export`)
 build on.
 
 Depends only on ``torch`` and ``jax`` -- no other ``helion`` module -- so the
@@ -13,11 +13,14 @@ kernel with zero Helion runtime dependency.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import inspect
 import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
+from typing import Protocol
+from typing import TypeGuard
 from typing import cast
 
 import torch
@@ -27,6 +30,19 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import jax
+
+
+class _TorchTensorOrJaxArray(Protocol):
+    """Structural type for a Pallas tensor arg -- a ``torch.Tensor`` or a
+    ``jax.Array``. The shared compile core reads only ``shape``/``ndim``/``dtype``
+    so it works with either, regardless of which launcher/mode drives it."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def ndim(self) -> int: ...
+    @property
+    def dtype(self) -> object: ...
 
 
 # Dtypes Mosaic/Pallas cannot lower. Kept here (rather than imported from the
@@ -51,11 +67,22 @@ def _pallas_interpret_enabled() -> bool:
     return value.lower() in ("1", "true", "yes", "on", "y", "t")
 
 
+def _is_torch_tensor_or_jax_array(x: object) -> TypeGuard[_TorchTensorOrJaxArray]:
+    """True for a tensor-like kernel arg -- a ``torch.Tensor`` or a ``jax.Array``
+    -- and False for Python scalars / other non-array args.
+
+    Duck-typed so the shared compile core classifies args identically whether it
+    is driven with torch tensors (torch launcher), ``_JaxExportTensor`` adapters
+    (jax_fn runtime), or raw ``jax.Array``s (jax_fn precompiled standalone).
+    """
+    return hasattr(x, "shape") and hasattr(x, "dtype")
+
+
 def _pallas_make_block_spec(
     pl: object,
     jnp: object,
     pltpu: object,
-    tensor: torch.Tensor,
+    tensor: _TorchTensorOrJaxArray,
     entry: tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
     | None,
     should_use_smem: bool = False,
@@ -310,19 +337,11 @@ def _estimate_pallas_vmem_bytes(
     out_spec_bytes = [0] * len(output_indices)
 
     def _bytes_per_element(t: object) -> int:
-        import torch
-
-        if isinstance(t, torch.Tensor):
-            return t.element_size()
-
-        dtype = getattr(t, "dtype", None)
-        if dtype is not None:
-            # Works for torch.dtype and np.dtype/jnp.dtype
-            itemsize = getattr(dtype, "itemsize", None)
-            if itemsize is not None:
-                return itemsize
-
-        return 4
+        # ``dtype.itemsize`` works for torch.dtype, jnp.dtype and np.dtype, so
+        # this stays torch-free -- letting the jax-only standalone inline the
+        # VMEM check unchanged.
+        itemsize = getattr(getattr(t, "dtype", None), "itemsize", None)
+        return itemsize if itemsize is not None else 4
 
     if in_specs:
         for i, idx in enumerate(tensor_arg_indices):
@@ -485,7 +504,7 @@ def _pallas_build_block_specs(
     in_specs = []
     for idx in tensor_arg_indices:
         t = args[idx]
-        assert isinstance(t, torch.Tensor)
+        assert _is_torch_tensor_or_jax_array(t)
         tensor_pos = all_arg_to_tensor_pos[idx]
         should_use_smem = tensor_pos in (_smem_arg_indices or [])
         in_specs.append(
@@ -497,7 +516,7 @@ def _pallas_build_block_specs(
     out_specs_list = []
     for idx in output_indices:
         t = args[idx]
-        assert isinstance(t, torch.Tensor)
+        assert _is_torch_tensor_or_jax_array(t)
         tensor_pos = all_arg_to_tensor_pos[idx]
         should_use_smem = tensor_pos in (_smem_arg_indices or [])
         out_specs_list.append(
@@ -549,7 +568,7 @@ def _pallas_build_pipeline_specs(
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
         tpos = arg_to_tpos[idx]
         t = args[idx]
-        assert isinstance(t, torch.Tensor)
+        assert _is_torch_tensor_or_jax_array(t)
         return _pallas_make_block_spec(
             pl, jnp, pltpu, t, block_spec_info[tpos], tpos in smem_set
         )
@@ -571,6 +590,38 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
 
     jax_dtype = torch_dtype_to_jax_runtime(t.dtype)
     return jax.ShapeDtypeStruct(tuple(t.shape), jax_dtype)
+
+
+def _pallas_jax_placeholder(a: object) -> object:
+    """A ``jax.ShapeDtypeStruct`` output placeholder from a ``jax.Array``'s
+    shape/dtype.
+
+    Torch-free -- the default placeholder for the compile core, used by the
+    jax_fn runtime and the jax_fn precompiled standalone. Typed ``object`` so it
+    unifies with ``_pallas_torch_placeholder`` under one placeholder callable.
+    """
+    import jax
+
+    arr = cast("_TorchTensorOrJaxArray", a)
+    return jax.ShapeDtypeStruct(tuple(int(s) for s in arr.shape), arr.dtype)
+
+
+def _pallas_torch_placeholder(a: object, *, interpret: bool) -> object:
+    """Output placeholder for the torch launcher: ``torch_tpu``'s
+    ``jax_placeholder`` on TPU (the exact layout its JaxCallable dispatch needs),
+    else a dtype-mapped ``ShapeDtypeStruct`` fallback (interpret / no torch_tpu).
+    """
+    t = cast("torch.Tensor", a)
+    if not interpret:
+        try:
+            from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+                jax_placeholder,
+            )
+
+            return jax_placeholder(t)
+        except ImportError:
+            pass
+    return _jax_placeholder_for_tensor(t)
 
 
 def _pallas_jnp_dtype_map() -> dict[str, object]:
@@ -1005,6 +1056,7 @@ def _pallas_prepare_args(
     _inplace_indices: list[int] | None = None,
     *,
     interpret: bool = False,
+    placeholder_fn: Callable[[object], object] | None = None,
 ) -> tuple[
     list[int],
     list[int],
@@ -1026,41 +1078,30 @@ def _pallas_prepare_args(
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
     """
-    if interpret:
-        placeholder_fn = _jax_placeholder_for_tensor
-    else:
-        try:
-            from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
-                jax_placeholder,
-            )
-
-            placeholder_fn = jax_placeholder
-        except ImportError:
-            # torch_tpu is only required for the torch-tensor entry path (its
-            # JaxCallable dispatch). The jax_fn export builds a native
-            # pl.pallas_call and only needs a jax placeholder (shape/dtype) per
-            # output -- the interpret path already uses the native factory below.
-            # Fall back to it so jax_fn works on a JAX-native TPU serve that does
-            # not ship the torch_tpu wheel.
-            placeholder_fn = _jax_placeholder_for_tensor
+    # Default to the torch-free jax placeholder; the torch launcher injects its
+    # torch_tpu placeholder. ``interpret`` is retained for signature stability.
+    if placeholder_fn is None:
+        placeholder_fn = _pallas_jax_placeholder
 
     output_set = set(_output_indices)
     inplace_set = set(_inplace_indices) if _inplace_indices is not None else output_set
     output_only = output_set - inplace_set
 
     all_tensor_positions = [
-        i for i in range(len(args)) if isinstance(args[i], torch.Tensor)
+        i for i in range(len(args)) if _is_torch_tensor_or_jax_array(args[i])
     ]
     output_only_indices = [i for i in all_tensor_positions if i in output_only]
     tensor_arg_indices = [i for i in all_tensor_positions if i not in output_only]
 
     non_tensor_args: dict[int, object] = {
-        i: args[i] for i in range(len(args)) if not isinstance(args[i], torch.Tensor)
+        i: args[i]
+        for i in range(len(args))
+        if not _is_torch_tensor_or_jax_array(args[i])
     }
     n_tensor_inputs = len(tensor_arg_indices)
     arg_to_tensor_pos = {orig: tpos for tpos, orig in enumerate(tensor_arg_indices)}
     inplace_positions = output_set & set(tensor_arg_indices)
-    out_shapes = tuple(placeholder_fn(args[i]) for i in _output_indices)  # type: ignore[arg-type]
+    out_shapes = tuple(placeholder_fn(args[i]) for i in _output_indices)
 
     pallas_aliases = {
         arg_to_tensor_pos[orig_pos]: out_idx
@@ -1558,6 +1599,7 @@ def _pallas_compile_jit_fn(
     _hbm_arg_indices: list[int] | None,
     _matmul_dot_general: dict[str, object] | None,
     interpret: bool,
+    placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
     """Build the ``pl.kernel`` jit_fn used by the Pallas launcher.
 
@@ -1601,7 +1643,11 @@ def _pallas_compile_jit_fn(
         out_shapes,
         pallas_aliases,
     ) = _pallas_prepare_args(
-        args, _output_indices, _inplace_indices, interpret=interpret
+        args,
+        _output_indices,
+        _inplace_indices,
+        interpret=interpret,
+        placeholder_fn=placeholder_fn,
     )
 
     # Only the copy guards are consumed; the dimension semantics are implied
@@ -1711,7 +1757,7 @@ def _pallas_compile_jit_fn(
 
             def _full_spec(idx: int) -> object:
                 t = args[idx]
-                assert isinstance(t, torch.Tensor)
+                assert _is_torch_tensor_or_jax_array(t)
                 return _pallas_make_block_spec(
                     pl, jnp, pltpu, t, None, all_arg_to_tpos[idx] in smem_set
                 )
@@ -1752,6 +1798,94 @@ def _pallas_compile_jit_fn(
 
 
 _PALLAS_CACHE_ATTR = "_pallas_cache"
+
+
+def _pallas_jax_call(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    jax_args: tuple[object, ...],
+    *,
+    output_indices: list[int],
+    inplace_indices: list[int] | None,
+    block_spec_info: _BlockSpecInfo | None,
+    scratch_shapes: list[object] | None,
+    hbm_arg_indices: list[int] | None,
+    smem_arg_indices: list[int] | None,
+    interpret: bool,
+    compact: dict[str, object] | None = None,
+    orig_shapes: dict[int, tuple[int, ...]] | None = None,
+    ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+) -> list[object]:
+    """Drive the shared compile core (``pl.kernel``) + jit_fn on raw ``jax.Array``s
+    and return the output JAX array(s).
+
+    The single JAX launch path shared by the jax_fn runtime launcher
+    (``default_pallas_jax_launcher``, which wraps this with adapter unwrap/rewrap)
+    and the jax_fn precompiled standalone -- neither touches torch. ``compact``
+    carries the compact-worklist kwargs when the kernel uses that lowering.
+    """
+    if compact is not None:
+        result = _pallas_compile_compact_jit_fn(
+            pallas_kernel,
+            jax_args,
+            _output_indices=output_indices,
+            _inplace_indices=inplace_indices,
+            _block_spec_info=block_spec_info,
+            _scratch_shapes=scratch_shapes,
+            _smem_arg_indices=smem_arg_indices,
+            _hbm_arg_indices=hbm_arg_indices,
+            interpret=interpret,
+            **cast("dict[str, Any]", compact),
+        )
+    else:
+        result = _pallas_compile_jit_fn(
+            pallas_kernel,
+            grid,
+            jax_args,
+            _output_indices=output_indices,
+            _inplace_indices=inplace_indices,
+            _block_spec_info=block_spec_info,
+            _smem_arg_indices=smem_arg_indices,
+            _scratch_shapes=scratch_shapes,
+            _hbm_arg_indices=hbm_arg_indices,
+            _matmul_dot_general=None,
+            interpret=interpret,
+        )
+
+    jax_inputs = [jax_args[i] for i in result.tensor_arg_indices]
+    jax_results = result.jit_fn(*jax_inputs)  # type: ignore[operator]
+    if not isinstance(jax_results, (tuple, list)):
+        jax_results = (jax_results,)
+
+    # In-place positions alias back into the caller's buffer on the torch path,
+    # but JAX has no in-place mutation -- when every output is in-place, surface
+    # them as fresh values (mirrors the torch fast-path descriptor list).
+    descriptors = _pallas_output_only_descriptors(
+        output_indices, result.arg_to_tensor_pos
+    )
+    if not descriptors:
+        descriptors = tuple(enumerate(output_indices))
+
+    output_results: list[object] = [jax_results[out_idx] for out_idx, _ in descriptors]
+    output_orig_pos: list[int] = [orig_pos for _, orig_pos in descriptors]
+
+    # Slice padded outputs back to their original shapes (ds-pad), reusing the
+    # torch fast-path's arg->padded-dims grouping; JAX arrays index identically.
+    if ds_pad_dims and orig_shapes:
+        padded_dims_by_arg = _pallas_padded_output_dims_by_arg(
+            ds_pad_dims, set(orig_shapes.keys())
+        )
+        for i, orig_pos in enumerate(output_orig_pos):
+            dims = padded_dims_by_arg.get(orig_pos)
+            orig_shape = orig_shapes.get(orig_pos)
+            if dims and orig_shape is not None:
+                output_results[i] = _pallas_slice_to_orig(
+                    cast("torch.Tensor", output_results[i]),
+                    dims,
+                    cast("torch.Size", orig_shape),
+                )
+
+    return output_results
 
 
 def _pallas_install_launcher_cache(
@@ -1808,6 +1942,9 @@ def _pallas_install_launcher_cache(
         _hbm_arg_indices=_hbm_arg_indices,
         _matmul_dot_general=_matmul_dot_general,
         interpret=interpret,
+        placeholder_fn=functools.partial(
+            _pallas_torch_placeholder, interpret=interpret
+        ),
     )
 
     jax_callable = _pallas_build_callable(
@@ -2039,7 +2176,7 @@ def _pallas_compact_in_out_specs(
         if idx in hbm_set:
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
         t = args[idx]
-        assert isinstance(t, torch.Tensor)
+        assert _is_torch_tensor_or_jax_array(t)
         if idx in aligned_set:
             # compact_aligned_load: slice dim 0 to one tile at tile_start via
             # pl.Element so Pallas prefetches/double-buffers it; other dims full.
@@ -2179,6 +2316,7 @@ def _pallas_compile_compact_jit_fn(
     range_start_ref_pos: int = -1,
     ordered_window: int = 0,
     interpret: bool = False,
+    placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
     """Build the compact-worklist jit_fn: build metadata in-jit -> dynamic grid."""
     from jax.experimental import pallas as pl
@@ -2195,7 +2333,11 @@ def _pallas_compile_compact_jit_fn(
         out_shapes,
         pallas_aliases,
     ) = _pallas_prepare_args(
-        args, _output_indices, _inplace_indices, interpret=interpret
+        args,
+        _output_indices,
+        _inplace_indices,
+        interpret=interpret,
+        placeholder_fn=placeholder_fn,
     )
 
     scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
@@ -2409,6 +2551,9 @@ def _pallas_install_compact_launcher_cache(
         range_start_ref_pos=_compact_range_start_ref_pos,
         ordered_window=_compact_ordered_window,
         interpret=interpret,
+        placeholder_fn=functools.partial(
+            _pallas_torch_placeholder, interpret=interpret
+        ),
     )
 
     jax_callable = _pallas_build_callable(

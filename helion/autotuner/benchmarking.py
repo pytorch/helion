@@ -67,15 +67,16 @@ def _cudagraph_unavailable_reason() -> str | None:
 
 
 def _make_cudagraph_replay(fn: Callable[[], T]) -> Callable[[], T]:
+    from ..runtime import cute_cuda_graph
+
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         fn()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
 
-    graph = torch.cuda.CUDAGraph()
     static_output: list[T] = []
-    with torch.cuda.graph(graph):
+    with cute_cuda_graph() as graph:
         static_output.append(fn())
     torch.cuda.synchronize()
 
