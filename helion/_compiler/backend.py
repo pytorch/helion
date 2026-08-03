@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .host_function import HostFunction
     from .tile_dispatch import TileStrategyDispatch
+    from .tile_strategy import SymIntLike
     from .tile_strategy import TileStrategy
 
     InductorOpOverrides = OpsHandler[Any]
@@ -971,7 +972,6 @@ class Backend(abc.ABC):
     ) -> TileStrategy:
         from .compile_environment import CompileEnvironment
         from .tile_strategy import FlattenedTileStrategy
-        from .tile_strategy import NDTileStrategy
 
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_ids]
@@ -994,13 +994,26 @@ class Backend(abc.ABC):
                 loop_order=loop_order,
             )
 
-        return NDTileStrategy(
+        return self.create_nd_tile_strategy(
             fn,
             block_ids,
             block_size=[bs.from_config_assert(config) for bs in block_size_infos],
             loop_order=loop_order,
             l2_grouping=l2_grouping,
         )
+
+    def create_nd_tile_strategy(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        block_size: list[SymIntLike] | SymIntLike,
+        loop_order: list[int],
+        l2_grouping: int,
+    ) -> TileStrategy:
+        """Construct the execution strategy for a non-flattened tiled loop."""
+        from .tile_strategy import NDTileStrategy
+
+        return NDTileStrategy(fn, block_ids, block_size, loop_order, l2_grouping)
 
     def create_reduction_strategy(
         self,
