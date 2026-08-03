@@ -64,9 +64,9 @@ def codegen_argmin_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
 @view_lowering.register_codegen("pallas")
 @reshape_lowering.register_codegen("pallas")
 def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
-    from .view_ops import _resident_info
+    from .view_ops import _resident_plan
 
-    if _resident_info(node) is not None:
+    if _resident_plan(node) is not None:
         return codegen_view_pallas_ref(ctx, node)
 
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
@@ -104,9 +104,9 @@ def _pad_fill_literal(value: object) -> str:
 
 @unsqueeze_lowering.register_codegen("pallas")
 def codegen_unsqueeze_pallas(ctx: LoweringContext, node: Node) -> object:
-    from .view_ops import _resident_info
+    from .view_ops import _resident_plan
 
-    if _resident_info(node) is not None:
+    if _resident_plan(node) is not None:
         return codegen_view_pallas_ref(ctx, node)
     return unsqueeze_lowering.codegen_impls["common"](ctx, node)
 

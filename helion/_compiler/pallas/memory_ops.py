@@ -63,10 +63,10 @@ def _(state: CodegenState) -> None:
 
 @_decorators.codegen(load, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    from .view_ops import _resident_info
+    from .view_ops import _resident_plan
 
     assert state.fx_node is not None
-    if _resident_info(state.fx_node) is not None:
+    if _resident_plan(state.fx_node) is not None:
         # pyrefly: ignore [missing-attribute]
         return load._codegen["pallas_ref"](state)
 
