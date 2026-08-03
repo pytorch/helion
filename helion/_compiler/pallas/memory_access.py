@@ -1,4 +1,4 @@
-"""Backend-neutral memory access sites for Pallas lowering."""
+"""Backend-neutral Pallas memory operations."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ if TYPE_CHECKING:
     from .plan_tiling import IndexingPattern
 
 
-ACCESS_SITE_META = "pallas_access_site"
+MEMORY_ACCESS_META = "pallas_memory_access"
 
 
-class AccessKind(Enum):
+class MemoryAccessKind(Enum):
     """Logical effect of one Helion memory operation."""
 
     LOAD = "load"
@@ -24,50 +24,48 @@ class AccessKind(Enum):
 
 
 @dataclass(frozen=True)
-class AccessSite:
+class MemoryAccess:
     """One memory operation after shared Pallas indexing analysis."""
 
     node: torch.fx.Node
-    kind: AccessKind
-    target: object
+    kind: MemoryAccessKind
     tensor_node: torch.fx.Node
     tensor: torch.Tensor
-    subscripts: tuple[object, ...]
+    subscript: tuple[object, ...]
     patterns: tuple[IndexingPattern, ...]
     value_node: torch.fx.Node | None
 
 
-def make_access_site(
+def build_memory_access(
     node: torch.fx.Node,
     tensor: torch.Tensor,
     subscript: list[object],
     patterns: list[IndexingPattern],
-) -> AccessSite:
-    """Create target-independent access metadata for a memory FX node."""
+) -> MemoryAccess:
+    """Build target-independent metadata for one memory operation."""
     from ...language import memory_ops
     from ...language.atomic_ops import ATOMIC_OPS
 
     tensor_node = node.args[0]
     assert isinstance(tensor_node, torch.fx.Node)
     if node.target is memory_ops.load:
-        kind = AccessKind.LOAD
+        kind = MemoryAccessKind.LOAD
         value_node = None
     elif node.target is memory_ops.store:
-        kind = AccessKind.STORE
+        kind = MemoryAccessKind.STORE
         value_node = node.args[2]
     elif node.target in ATOMIC_OPS:
-        kind = AccessKind.ATOMIC
+        kind = MemoryAccessKind.ATOMIC
         value_node = node.args[2]
     else:
         raise AssertionError(f"not a memory access target: {node.target}")
 
-    return AccessSite(
+    return MemoryAccess(
         node=node,
         kind=kind,
-        target=node.target,
         tensor_node=tensor_node,
         tensor=tensor,
-        subscripts=tuple(subscript),
+        subscript=tuple(subscript),
         patterns=tuple(patterns),
         value_node=value_node if isinstance(value_node, torch.fx.Node) else None,
     )
