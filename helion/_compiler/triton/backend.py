@@ -17,6 +17,7 @@ import torch
 
 from ... import exc
 from ..backend import Backend
+from ..backend import LauncherInfo
 from ..backend import log
 
 if TYPE_CHECKING:
@@ -353,6 +354,19 @@ class TritonBackend(Backend):
     @property
     def default_launcher_name(self) -> str:
         return "_default_launcher"
+
+    @property
+    def dependency_free_launcher_info(self) -> LauncherInfo:
+        # get_num_sm / get_num_xcd / set_triton_allocator are launcher functions
+        # the generated host wrapper calls as ``helion.runtime.<fn>(``; the shim
+        # re-exports them (with the launcher) so those verbatim calls resolve.
+        return LauncherInfo(
+            launcher_module="helion.runtime.triton.launcher",
+            launcher_symbol="default_launcher",
+            launcher_alias="_default_launcher",
+            deps="torch + triton",
+            runtime_helper_names=("get_num_sm", "get_num_xcd", "set_triton_allocator"),
+        )
 
     @property
     def library_imports(self) -> dict[str, str]:

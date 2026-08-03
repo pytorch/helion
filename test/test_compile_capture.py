@@ -20,14 +20,14 @@ from helion._compiler._dynamo.variables import _detect_mutated_inputs
 from helion._testing import DEVICE
 from helion._testing import skipUnlessPallas
 import helion.language as hl
-from helion.runtime._tpu_compile_capture import _const_scalar
-from helion.runtime._tpu_compile_capture import _decoration_schema
-from helion.runtime._tpu_compile_capture import _freeze
-from helion.runtime._tpu_compile_capture import _is_functional
-from helion.runtime._tpu_compile_capture import _resolves_without_benchmark
-from helion.runtime._tpu_compile_capture import _signature
-from helion.runtime._tpu_compile_capture import _tensors
-from helion.runtime._tpu_compile_capture import register_decoration_op
+from helion.runtime.pallas._tpu_compile_capture import _const_scalar
+from helion.runtime.pallas._tpu_compile_capture import _decoration_schema
+from helion.runtime.pallas._tpu_compile_capture import _freeze
+from helion.runtime.pallas._tpu_compile_capture import _is_functional
+from helion.runtime.pallas._tpu_compile_capture import _resolves_without_benchmark
+from helion.runtime.pallas._tpu_compile_capture import _signature
+from helion.runtime.pallas._tpu_compile_capture import _tensors
+from helion.runtime.pallas._tpu_compile_capture import register_decoration_op
 
 
 @helion.kernel(

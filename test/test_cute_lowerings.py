@@ -8800,7 +8800,6 @@ class TestCuteLowerings(unittest.TestCase):
             if (
                 "tcgen05_tma_initial_full_tile" in test_src
                 and "tcgen05_tma_initial_next_full_tile" not in test_src
-                and "tcgen05_tma_warp" in test_src
             ):
                 stage0_blocks.append(node)
         self.assertEqual(len(stage0_blocks), 1, code)
@@ -14432,9 +14431,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn(f"if {_TCGEN05_CLUSTER_LEADER_PREDICATE}:", code)
         self.assertIn("cute.copy(tma_atom_a", code)
         self.assertIn(
-            "if tcgen05_exec_active and "
-            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
-            "== cutlass.Int32(0):",
+            "if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4):",
             code,
         )
         self.assertIn("'kind': 'tcgen05_d_tma'", code)

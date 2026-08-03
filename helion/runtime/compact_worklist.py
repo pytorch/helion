@@ -27,6 +27,12 @@ from typing import NamedTuple
 if TYPE_CHECKING:
     from jax import Array
 
+# NOTE: this module is embedded verbatim into helion-free `to_code(allow_helion_deps=False)` output (via
+# PallasBackend.embedded_helper_source), so its non-docstring code must not import
+# anything from the `helion` package (nor mention such an import in a comment) --
+# the precompiler's helion-free guard is a substring check and would reject any
+# compact-worklist kernel.
+
 
 class CompactWorkMetadata(NamedTuple):
     """Scalar-prefetch metadata describing one compact worklist.

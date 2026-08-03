@@ -26,6 +26,7 @@ from ..backend import _active_loop_block_ids
 from ..backend import _attention_flash_gate_enabled
 from ..backend import _attention_flash_supported
 from ..backend import _attention_softmax_pattern_head_dim
+from ..backend import _grouped_rank3_specialized_mma_plan
 from ..backend import _kernel_specialized_mma_impl
 from ..backend import _kernel_specialized_mma_plan
 from ..backend import _largest_divisor_at_most
@@ -119,7 +120,71 @@ def _detect_mma_loop(
     return False
 
 
-def _detect_specialized_mma_loop(
+def _specialized_mma_root_thread_layout(
+    root_block_ids: Sequence[int], config: Config
+) -> tuple[int, int, int, int] | None:
+    from ..compile_environment import CompileEnvironment
+
+    if len(root_block_ids) != 2:
+        return None
+    env = CompileEnvironment.current()
+    root_block_sizes: list[int] = []
+    root_thread_counts: list[int] = []
+    root_thread_auto: list[bool] = []
+    for block_id in root_block_ids:
+        block_size = env.block_sizes[block_id].from_config(config)
+        if not isinstance(block_size, int):
+            return None
+        root_block_sizes.append(block_size)
+        threads = env.config_spec.num_threads.config_get(
+            config.num_threads, block_id, 0
+        )
+        root_thread_counts.append(threads if threads > 0 else block_size)
+        root_thread_auto.append(threads == 0)
+    if functools.reduce(operator.mul, root_thread_counts, 1) > 1024:
+        for idx in (1, 0):
+            if not root_thread_auto[idx]:
+                continue
+            other_threads = root_thread_counts[1 - idx]
+            next_threads = _largest_divisor_at_most(
+                root_block_sizes[idx], max(1024 // max(other_threads, 1), 1)
+            )
+            root_thread_counts[idx] = next_threads
+            if functools.reduce(operator.mul, root_thread_counts, 1) <= 1024:
+                break
+    return (
+        root_block_sizes[0],
+        root_block_sizes[1],
+        root_thread_counts[0],
+        root_thread_counts[1],
+    )
+
+
+def _specialized_mma_root_threads_support_impl(
+    mma_impl: str,
+    *,
+    bm: int,
+    bn: int,
+    root_m_threads: int,
+    root_n_threads: int,
+) -> bool:
+    from .cute_mma import _mma_active_n_threads
+    from .cute_mma import _tcgen05_root_m_threads
+
+    if mma_impl == "tcgen05":
+        return (
+            _tcgen05_root_m_threads(bm, bn) <= root_m_threads <= bm
+            and bm % root_m_threads == 0
+            and _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
+            and bn % root_n_threads == 0
+            and root_m_threads * root_n_threads <= 1024
+        )
+    return mma_impl in ("warp", "universal") and (
+        root_m_threads == bm and root_n_threads == bn
+    )
+
+
+def _detect_grouped_rank3_specialized_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
     *,
@@ -128,11 +193,84 @@ def _detect_specialized_mma_loop(
 ) -> bool:
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1 or len(block_ids) != 1:
+        return False
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if any(block_id in root_grid_ids for block_id in block_ids):
+        return False
+    if len(root_grid_ids) == 2:
+        segment_root_grid_id = None
+        mn_root_grid_ids = root_grid_ids
+    elif len(root_grid_ids) == 3:
+        segment_root_grid_id = root_grid_ids[0]
+        mn_root_grid_ids = root_grid_ids[1:]
+    else:
+        return False
+
+    env = CompileEnvironment.current()
+    if segment_root_grid_id is not None:
+        segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
+        segment_threads = env.config_spec.num_threads.config_get(
+            config.num_threads, segment_root_grid_id, 0
+        )
+        if segment_block != 1 or segment_threads not in (0, 1):
+            return False
+    root_layout = _specialized_mma_root_thread_layout(mn_root_grid_ids, config)
+    if root_layout is None:
+        return False
+    bm, bn, root_m_threads, root_n_threads = root_layout
+    (bk,) = block_sizes
+    if not isinstance(bk, int):
+        return False
+    if not _specialized_mma_root_threads_support_impl(
+        "tcgen05",
+        bm=bm,
+        bn=bn,
+        root_m_threads=root_m_threads,
+        root_n_threads=root_n_threads,
+    ):
+        return False
+
+    for graph_info in fn.codegen.codegen_graphs:
+        if getattr(graph_info, "block_ids", None) != block_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if (
+                _grouped_rank3_specialized_mma_plan(
+                    node,
+                    fn=fn,
+                    k_block_id=block_ids[0],
+                    bk=bk,
+                    config=config,
+                    env=env,
+                )
+                is not None
+            ):
+                return True
+    return False
+
+
+def _detect_specialized_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    block_sizes: Sequence[int | torch.SymInt],
+    config: Config,
+) -> bool:
+    from ..host_function import HostFunction
     from .cute_mma import _choose_mma_impl
-    from .cute_mma import _mma_active_n_threads
     from .cute_mma import _mma_tiles_are_static_full
-    from .cute_mma import _tcgen05_root_m_threads
     from .cute_mma import analyze_cute_mma_node
+
+    if _detect_grouped_rank3_specialized_mma_loop(
+        fn,
+        block_ids,
+        block_sizes=block_sizes,
+        config=config,
+    ):
+        return True
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1:
@@ -159,52 +297,13 @@ def _detect_specialized_mma_loop(
 
     root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0], config)
     assert root_mn_block_ids is not None
-
-    env = CompileEnvironment.current()
-    root_block_sizes: list[int] = []
-    root_thread_counts: list[int] = []
-    root_thread_auto: list[bool] = []
-    for block_id in root_mn_block_ids:
-        block_size = env.block_sizes[block_id].from_config(config)
-        if not isinstance(block_size, int):
-            return False
-        root_block_sizes.append(block_size)
-        threads = env.config_spec.num_threads.config_get(
-            config.num_threads, block_id, 0
-        )
-        resolved_threads = threads if threads > 0 else block_size
-        root_thread_counts.append(resolved_threads)
-        root_thread_auto.append(threads == 0)
-
-    if functools.reduce(operator.mul, root_thread_counts, 1) > 1024:
-        for idx in sorted(
-            (i for i, is_auto in enumerate(root_thread_auto) if is_auto),
-            reverse=True,
-        ):
-            other_threads = functools.reduce(
-                operator.mul,
-                (
-                    root_thread_counts[j]
-                    for j in range(len(root_thread_counts))
-                    if j != idx
-                ),
-                1,
-            )
-            if other_threads <= 0:
-                continue
-            thread_budget = max(1024 // other_threads, 1)
-            next_threads = _largest_divisor_at_most(
-                root_block_sizes[idx], thread_budget
-            )
-            root_thread_counts[idx] = next_threads
-            if functools.reduce(operator.mul, root_thread_counts, 1) <= 1024:
-                break
-
+    root_layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
+    if root_layout is None:
+        return False
+    bm, bn, root_m_threads, root_n_threads = root_layout
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
-    bm, bn = root_block_sizes
-    root_m_threads, root_n_threads = root_thread_counts
     candidates = [
         candidate
         for candidate in candidates
@@ -212,27 +311,6 @@ def _detect_specialized_mma_loop(
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
     ]
     if not candidates:
-        return False
-
-    def root_threads_support_impl(mma_impl: str) -> bool:
-        if mma_impl == "tcgen05":
-            mma_n_threads = _mma_active_n_threads("tcgen05")
-            min_root_m_threads = _tcgen05_root_m_threads(bm, bn)
-            if (
-                root_m_threads < min_root_m_threads
-                or root_m_threads > bm
-                or bm % root_m_threads != 0
-            ):
-                return False
-            if root_n_threads < mma_n_threads or root_n_threads > bn:
-                return False
-            if bn % root_n_threads != 0:
-                return False
-            return root_m_threads * root_n_threads <= 1024
-        if mma_impl == "warp":
-            return root_m_threads == bm and root_n_threads == bn
-        if mma_impl == "universal":
-            return root_m_threads == bm and root_n_threads == bn
         return False
 
     for candidate in candidates:
@@ -246,10 +324,22 @@ def _detect_specialized_mma_loop(
             input_device=lhs_val.device,
         )
         if candidate.requires_accumulator_seed:
-            if root_threads_support_impl("universal"):
+            if _specialized_mma_root_threads_support_impl(
+                "universal",
+                bm=bm,
+                bn=bn,
+                root_m_threads=root_m_threads,
+                root_n_threads=root_n_threads,
+            ):
                 return True
             continue
-        if mma_impl != "universal" and root_threads_support_impl(mma_impl):
+        if mma_impl != "universal" and _specialized_mma_root_threads_support_impl(
+            mma_impl,
+            bm=bm,
+            bn=bn,
+            root_m_threads=root_m_threads,
+            root_n_threads=root_n_threads,
+        ):
             return True
     return False
 
@@ -1687,14 +1777,15 @@ class CuteBackend(Backend):
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
-        specialized_root_tcgen05 = (
+        recorded_tcgen05_block_shape = device_function.cute_state.block_shape
+        specialized_root_tcgen05 = recorded_tcgen05_block_shape is not None or (
             _kernel_specialized_mma_impl(device_function, config=device_function.config)
             == "tcgen05"
             and root_static_dims != (1, 1, 1)
             and root_static_threads <= MAX_THREADS_PER_BLOCK
         )
         tcgen05_compact_dims = (
-            device_function.cute_state.block_shape if specialized_root_tcgen05 else None
+            recorded_tcgen05_block_shape if specialized_root_tcgen05 else None
         )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims
@@ -2173,13 +2264,7 @@ class CuteBackend(Backend):
             # addmm/mm with float16/bfloat16 operands.
             mma_mode = False
             if is_device_loop:
-                mma_mode = _detect_specialized_mma_loop(
-                    fn,
-                    block_ids,
-                    block_sizes=nd_block_size,
-                    config=config,
-                )
-                if not mma_mode and _detect_attention_mma_loop(
+                if _detect_attention_mma_loop(
                     fn,
                     block_ids,
                     config=config,
@@ -2190,6 +2275,13 @@ class CuteBackend(Backend):
                     # whole device body; the FX-graph statement walk is bypassed.
                     mma_mode = True
                     fn.cute_state.attention_flash_block_ids = list(block_ids)
+                else:
+                    mma_mode = _detect_specialized_mma_loop(
+                        fn,
+                        block_ids,
+                        block_sizes=nd_block_size,
+                        config=config,
+                    )
             elif (
                 len(device_ir.grid_block_ids) == 1
                 and block_ids == device_ir.grid_block_ids[0]

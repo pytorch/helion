@@ -20,6 +20,7 @@ import torch
 from torch._inductor.codegen.simd import constant_repr
 
 from ...exc import BackendUnsupported
+from ...exc import InvalidConfig
 from ...language import _decorators
 from ...language._tracing_ops import _and
 from ...language._tracing_ops import _for_loop
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..generate_ast import ResidentPrepLowering
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import LoopDimInfo
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
 
@@ -91,6 +93,93 @@ def _loop_carried_indices(state: CodegenState, n_args: int) -> set[int]:
         if hasattr(arg, "name") and arg.name in carried_names:
             carried.add(i)
     return carried
+
+
+def _proxy_loop_parts(value: object) -> list[object]:
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _dependent_tile_end_expr(state: CodegenState, loop_dim_index: int) -> str | None:
+    """Render a supported enclosing-``Tile.end`` bound from its provenance.
+
+    Accepts ``tile.end`` and ``min(<host expr>, tile.end)`` on the traced
+    SymInt, for kernels with no worklist plan.  Returns ``None`` for any other
+    bound, leaving the caller to fall back.
+    ``compact_worklist._ordered_source_end`` recognizes the same two forms on
+    the source AST; extend the two together.
+    """
+    from ..variable_origin import TileEndOrigin
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    block_ids = getattr(graph_info, "block_ids", ())
+    if loop_dim_index >= len(block_ids):
+        return None
+
+    ends = _proxy_loop_parts(state.proxy_arg(2))
+    if loop_dim_index >= len(ends):
+        return None
+    end = ends[loop_dim_index]
+    if not isinstance(end, torch.SymInt):
+        return None
+    expr = _symint_sympy_expr(end)
+
+    tile_ends: list[tuple[sympy.Symbol, TileEndOrigin]] = []
+    for symbol in expr.free_symbols:
+        if not isinstance(symbol, sympy.Symbol):
+            return None
+        origin_info = HostFunction.current().expr_to_origin.get(symbol)
+        if origin_info is not None and isinstance(origin_info.origin, TileEndOrigin):
+            tile_ends.append((symbol, origin_info.origin))
+    if len(tile_ends) != 1:
+        return None
+
+    tile_end_symbol, tile_end_origin = tile_ends[0]
+    if (
+        tile_end_origin.block_id in block_ids
+        or not state.codegen.active_device_loops.get(tile_end_origin.block_id)
+    ):
+        return None
+    tile_end_expr = tile_end_origin.host_str()
+    if expr == tile_end_symbol:
+        return tile_end_expr
+    if (
+        expr.func is not sympy.Min
+        or tile_end_symbol not in expr.args
+        or len(expr.args) != 2
+    ):
+        return None
+    source_end = next(arg for arg in expr.args if arg != tile_end_symbol)
+    if not isinstance(source_end, sympy.Expr):
+        return None
+    for symbol in source_end.free_symbols:
+        origin_info = HostFunction.current().expr_to_origin.get(symbol)
+        if origin_info is None or not origin_info.origin.is_host():
+            return None
+    return CompileEnvironment.current().backend.minimum_expr(
+        state.sympy_expr(source_end), tile_end_expr
+    )
+
+
+def _has_supported_dependent_tile_end(state: CodegenState) -> bool:
+    """Whether this loop has one supported enclosing-``Tile.end`` bound."""
+    graph_info = state.get_graph(state.proxy_arg(0))
+    block_ids = getattr(graph_info, "block_ids", ())
+    return len(block_ids) == 1 and _dependent_tile_end_expr(state, 0) is not None
+
+
+def _has_dynamic_unroll_bound(state: CodegenState) -> bool:
+    bounds = [
+        *_proxy_loop_parts(state.proxy_arg(1)),
+        *_proxy_loop_parts(state.proxy_arg(2)),
+    ]
+    return any(isinstance(bound, (torch.SymInt, torch.Tensor)) for bound in bounds)
+
+
+def _raise_unsupported_dynamic_unroll() -> None:
+    raise InvalidConfig(
+        "pallas_loop_type='unroll' requires static inner-loop bounds, an "
+        "enclosing Tile.end bound, or pallas_worklist_grouping in (1, 2)."
+    )
 
 
 def _extract_subscript_vals(subscript: object) -> list[object]:
@@ -137,6 +226,10 @@ def _(state: CodegenState) -> object:
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
+    if _has_supported_dependent_tile_end(state):
+        return _codegen_dynamic_unroll(state)
+    if _has_dynamic_unroll_bound(state):
+        _raise_unsupported_dynamic_unroll()
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -170,6 +263,11 @@ def _(state: CodegenState) -> None:
     if pallas_loop_type == "fori_loop":
         _codegen_fori_loop(state)
         return None
+    if _has_supported_dependent_tile_end(state):
+        _codegen_dynamic_unroll(state)
+        return None
+    if _has_dynamic_unroll_bound(state):
+        _raise_unsupported_dynamic_unroll()
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -179,7 +277,7 @@ def _codegen_resident_cache(state: CodegenState) -> object:
 
     The ordered operand is held in a per-range resident ``pl.Element(C)`` window
     keyed on ``range_start`` (``C`` is the compile-threaded physical window).
-    Optional prep-cache descriptors are handled inside ``_codegen_fori_loop``.
+    Optional prep-cache descriptors are installed by the dynamic resident loop.
 
     Ranges longer than ``C`` are NOT handled in-kernel: the torch launcher raises
     (``runtime.pallas.launcher._compact_raise_if_range_exceeds_window``), while
@@ -188,7 +286,7 @@ def _codegen_resident_cache(state: CodegenState) -> object:
     """
     decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
     assert decision is not None and decision.active
-    return _codegen_fori_loop(state)
+    return _codegen_dynamic_unroll(state)
 
 
 def _resident_prep_fallback(reason: str) -> None:
@@ -319,7 +417,6 @@ def _prepare_resident_prep_lowerings(
 def _emit_resident_prep_refill(
     state: CodegenState,
     block_ids: list[int],
-    grid_parts: list[str],
     lowerings: list[ResidentPrepLowering],
 ) -> None:
     """Emit once-per-prep-key cache refill for active descriptors."""
@@ -344,7 +441,7 @@ def _emit_resident_prep_refill(
         f"({ref}[_wid] != {ref}[jnp.maximum(_wid - 1, 0)])" for ref in prep_key_refs
     )
     range_len_ref = metadata_ref_for_field(plan, "range_len")
-    num_ordered_tiles = grid_parts[0]
+    num_ordered_tiles = f"(({range_len_ref}[_wid] + {blk} - 1) // {blk})"
 
     def _stmt(src: str) -> ast.stmt:
         return cast("ast.stmt", statement_from_string(src))
@@ -424,6 +521,35 @@ def _emit_resident_prep_refill(
         tail_fn,
     ]
     state.add_statement(refill_fn)
+
+
+def _emit_resident_prep_refill_once(
+    state: CodegenState,
+    block_ids: list[int],
+    lowerings: list[ResidentPrepLowering],
+) -> None:
+    if not lowerings:
+        return
+    refill_key = tuple(
+        (
+            lowering.hoist.graph_id,
+            lowering.hoist.prep_node_name,
+            lowering.cache_name,
+        )
+        for lowering in lowerings
+    )
+    common_statements = state.codegen.grouped_compact_common_statements
+    if (
+        common_statements is not None
+        and refill_key in state.codegen.grouped_resident_prep_refill_cache
+    ):
+        return
+    if common_statements is None:
+        _emit_resident_prep_refill(state, block_ids, lowerings)
+        return
+    with state.codegen.set_statements(common_statements):
+        _emit_resident_prep_refill(state, block_ids, lowerings)
+    state.codegen.grouped_resident_prep_refill_cache[refill_key] = "emitted"
 
 
 def _classify_loop_tensors(
@@ -751,7 +877,17 @@ def _compact_worklist_bounds(
     assert plan is not None
     ref_names = compact_ref_names if kind == "compact" else ordered_ref_names
     begin_ref, extent_ref = (f"{n}_ref" for n in ref_names(plan))
-    return f"{begin_ref}[_wid]", f"{begin_ref}[_wid] + {extent_ref}[_wid]"
+    begin = f"{begin_ref}[_wid]"
+    end = f"{begin} + {extent_ref}[_wid]"
+    if kind == "ordered" and plan.ordered_end_clamped_to_compact:
+        # The source range above still spans the whole reused window; this work
+        # item computes only through the compact tile's current end.
+        compact_begin, compact_extent = (
+            f"{name}_ref" for name in compact_ref_names(plan)
+        )
+        compact_end = f"{compact_begin}[_wid] + {compact_extent}[_wid]"
+        end = f"jnp.minimum({end}, {compact_end})"
+    return begin, end
 
 
 def _get_loop_begin_and_end(
@@ -772,6 +908,7 @@ def _get_loop_begin_and_end(
     remap = _compact_worklist_bounds(state, loop_dim_index)
     if remap is not None:
         return remap
+    dependent_end = _dependent_tile_end_expr(state, loop_dim_index)
     ast_begins = state.ast_args[1]
     ast_ends = state.ast_args[2]
     begins = list(ast_begins) if isinstance(ast_begins, (list, tuple)) else [ast_begins]
@@ -782,12 +919,40 @@ def _get_loop_begin_and_end(
             return ast.unparse(value)
         return str(value)
 
-    return _to_str(begins[loop_dim_index]), _to_str(ends[loop_dim_index])
+    return _to_str(begins[loop_dim_index]), (
+        dependent_end if dependent_end is not None else _to_str(ends[loop_dim_index])
+    )
 
 
 def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
     begin, end = _get_loop_begin_and_end(state, loop_dim_index)
     return f"(({end}) - ({begin}))"
+
+
+def _loop_dim_infos(
+    state: CodegenState,
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> dict[int, LoopDimInfo]:
+    """Per-dim bounds for an inner device loop, shared by every loop lowering.
+
+    ``tile.end``/``tile.count`` on an enclosing tile read ``end_var_name`` back
+    out of here, so all three lowerings must publish the same bounds they
+    generate code against; building them in one place keeps them from drifting.
+    """
+    from ..tile_strategy import LoopDimInfo
+
+    infos: dict[int, LoopDimInfo] = {}
+    for i, block_id in enumerate(block_ids):
+        block_size = env.block_sizes[block_id]
+        begin_expr, end_expr = _get_loop_begin_and_end(state, i)
+        infos[block_id] = LoopDimInfo(
+            begin_var_name=begin_expr,
+            end_var_name=end_expr,
+            # No SymPy numel exists when the block size has no static size.
+            end_expr=block_size.numel if block_size.size is not None else None,
+        )
+    return infos
 
 
 def _is_static_int(expr: str) -> bool:
@@ -926,6 +1091,18 @@ def _compute_pipeline_or_dma_extra_pad(
     if alignment is not None and alignment % bs_val == 0:
         return 0
     return bs_val - 1
+
+
+def _active_loop_begin_expr(state: CodegenState, block_id: int) -> str:
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return "0"
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None:
+        return "0"
+    if info.begin_expr is not None:
+        return str(info.begin_expr)
+    return info.begin_var_name or "0"
 
 
 def _scratch_read(state: CodegenState, sname: str) -> str:
@@ -2026,7 +2203,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import EmitPipelineLoopState
-    from ..tile_strategy import LoopDimInfo
 
     graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
@@ -2198,6 +2374,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
+                    from ...language.memory_ops import _record_pad_info
+
+                    extra_pad = _compute_pipeline_or_dma_extra_pad(
+                        _active_loop_begin_expr(state, bid), bid, env, state
+                    )
+                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
@@ -2377,15 +2559,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     ]
 
     # Build block_id_to_info for the pipeline state
-    block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
-        block_size = env.block_sizes[block_id]
-        # when the block_size.size is None, we cannot form a SymPy expr for the numel
-        sympy_end_expr = block_size.numel if block_size.size is not None else None
-        block_id_to_info[block_id] = LoopDimInfo(
-            end_var_name=None,
-            end_expr=sympy_end_expr,
-        )
+    block_id_to_info = _loop_dim_infos(state, block_ids, env)
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -2698,12 +2872,7 @@ def _classify_pipelined_tensors(
 
     outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
 
-    all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
-    for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
-        if key not in stored_tensors:
-            all_tensor_info.append((fake, sub_meta, "load"))
-    for fake, _tensor_node, sub_meta in stored_tensors.values():
-        all_tensor_info.append((fake, sub_meta, "store"))
+    all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
@@ -2756,6 +2925,147 @@ def _classify_pipelined_tensors(
     return all_tensor_info, vmem_shapes, pipelined_ids
 
 
+def _resident_loop_tensor_info(
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+) -> list[tuple[torch.Tensor, list[object], str]]:
+    """Tensor access records needed by optional resident prep lowering."""
+    result = [
+        (fake, sub_meta, "load")
+        for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items()
+        if key not in stored_tensors
+    ]
+    result.extend(
+        (fake, sub_meta, "store")
+        for fake, _tensor_node, sub_meta in stored_tensors.values()
+    )
+    return result
+
+
+def _codegen_dynamic_unroll(state: CodegenState) -> object:
+    """Run the ordinary resident unroll body with a dynamic trip count."""
+    from ..device_ir import ForLoopGraphInfo
+    from ..generate_ast import GenerateAST
+    from ..inductor_lowering import codegen_call_with_graph
+    from ..tile_strategy import ForiLoopState
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    assert isinstance(graph_info, ForLoopGraphInfo)
+    assert isinstance(state.codegen, GenerateAST)
+    block_ids = graph_info.block_ids
+    if len(block_ids) != 1:
+        raise InvalidConfig(
+            "dynamic pallas unroll currently supports one inner tile dimension"
+        )
+
+    args = state.ast_args[-1]
+    assert isinstance(args, list)
+    assert all(isinstance(arg, ast.AST) for arg in args)
+
+    env = CompileEnvironment.current()
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
+    begin_exprs, iter_step_exprs, _ = _pallas_loop_begin_and_step_exprs(
+        state, block_ids, block_size_vars
+    )
+    strategy = _find_strategy(state, block_ids)
+    loop_var = state.device_function.new_var("_j")
+    body_stmts: list[ast.AST] = []
+    _emit_inner_loop_offset_indices(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        begin_exprs,
+        iter_step_exprs,
+        [loop_var],
+        env,
+        body_stmts,
+    )
+    _setup_inner_loop_masks(
+        state,
+        strategy,
+        block_ids,
+        block_size_vars,
+        env,
+        body_stmts,
+        offset_expr_fn=lambda _i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
+    )
+
+    body_fn_name = state.device_function.new_var("_dynamic_unroll_body")
+    fori_state = ForiLoopState(
+        strategy=strategy,  # pyrefly: ignore[bad-argument-type]
+        block_id_to_info=_loop_dim_infos(state, block_ids, env),
+        body_fn_name=body_fn_name,
+        loop_var_name=loop_var,
+        inner_statements=body_stmts,
+    )
+
+    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    resident_prep_lowerings = _prepare_resident_prep_lowerings(
+        state,
+        block_ids,
+        _resident_loop_tensor_info(loaded_tensors, stored_tensors),
+    )
+    _emit_resident_prep_refill_once(state, block_ids, resident_prep_lowerings)
+
+    carried = sorted(_loop_carried_indices(state, len(args)))
+    # Uniquely named: a nested dynamic-unroll body would otherwise shadow the
+    # enclosing loop's carry tuple and silently rebind reads of it.
+    carry_var = state.device_function.new_var("_carry")
+    body_args = [*args]
+    for carry_index, arg_index in enumerate(carried):
+        body_args[arg_index] = expr_from_string(f"{carry_var}[{carry_index}]")
+
+    with state.codegen.add_fori_loop(fori_state):
+        with state.codegen.resident_prep_lowering_scope(resident_prep_lowerings):
+            graph_results = codegen_call_with_graph(
+                state.codegen,
+                graph_info.graph,
+                body_args,
+            )
+        assert len(graph_results) == len(carried)
+        assert all(isinstance(result, ast.AST) for result in graph_results)
+        if graph_results:
+            ast_results = cast("list[ast.AST]", graph_results)
+            return_values = ", ".join(ast.unparse(result) for result in ast_results)
+            if len(graph_results) == 1:
+                return_values += ","
+            state.codegen.add_statement(
+                statement_from_string(f"return ({return_values})")
+            )
+        else:
+            state.codegen.add_statement(statement_from_string(f"return {carry_var}"))
+
+    _emit_nonlocal_scratch_declarations(state, body_stmts)
+    body_fn = statement_from_string(
+        f"def {body_fn_name}({loop_var}, {carry_var}):\n    pass"
+    )
+    assert isinstance(body_fn, ast.FunctionDef)
+    body_fn.body = cast("list[ast.stmt]", body_stmts)
+    state.add_statement(body_fn)
+
+    initial_values = ", ".join(ast.unparse(args[index]) for index in carried)
+    if len(carried) == 1:
+        initial_values += ","
+    initial_carry = f"({initial_values})"
+    if not carried:
+        state.add_statement(
+            statement_from_string(
+                f"jax.lax.fori_loop(0, {grid_parts[0]}, {body_fn_name}, ())"
+            )
+        )
+        return None
+
+    result_var = state.device_function.new_var("_dynamic_unroll_result")
+    state.add_statement(
+        statement_from_string(
+            f"{result_var} = jax.lax.fori_loop(0, {grid_parts[0]}, "
+            f"{body_fn_name}, {initial_carry})"
+        )
+    )
+    return [expr_from_string(f"{result_var}[{i}]") for i in range(len(carried))]
+
+
 def _codegen_fori_loop(state: CodegenState) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
@@ -2768,7 +3078,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import ForiLoopState
-    from ..tile_strategy import LoopDimInfo
 
     graph_info = state.get_graph(state.proxy_arg(0))
     assert isinstance(graph_info, ForLoopGraphInfo)
@@ -2970,15 +3279,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     dim_idx_exprs: list[str] = loop_vars
 
     # Build block_id_to_info
-    block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
-        block_size = env.block_sizes[block_id]
-        # when the block_size.size is None, we cannot form a SymPy expr for the numel
-        sympy_end_expr = block_size.numel if block_size.size is not None else None
-        block_id_to_info[block_id] = LoopDimInfo(
-            end_var_name=None,
-            end_expr=sympy_end_expr,
-        )
+    block_id_to_info = _loop_dim_infos(state, block_ids, env)
 
     # Emit offset_<bid>/indices_<bid> at the body prologue.
     _emit_inner_loop_offset_indices(
@@ -3019,38 +3320,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     )
     if resident_prep_lowerings:
         assert len(grid_parts) == 1
-        refill_key = tuple(
-            (
-                lowering.hoist.graph_id,
-                lowering.hoist.prep_node_name,
-                lowering.cache_name,
-            )
-            for lowering in resident_prep_lowerings
-        )
-        common_statements = state.codegen.grouped_compact_common_statements
-        num_ordered_tiles = (
-            state.codegen.grouped_resident_prep_refill_cache.get(refill_key)
-            if common_statements is not None
-            else None
-        )
-        if num_ordered_tiles is None:
-            num_ordered_tiles = state.device_function.new_var("_rc_num_ordered_tiles")
-            target = common_statements
-            with state.codegen.set_statements(target):
-                state.add_statement(
-                    statement_from_string(f"{num_ordered_tiles} = {grid_parts[0]}")
-                )
-                _emit_resident_prep_refill(
-                    state,
-                    block_ids,
-                    [num_ordered_tiles],
-                    resident_prep_lowerings,
-                )
-            if common_statements is not None:
-                state.codegen.grouped_resident_prep_refill_cache[refill_key] = (
-                    num_ordered_tiles
-                )
-        grid_parts = [num_ordered_tiles]
+        _emit_resident_prep_refill_once(state, block_ids, resident_prep_lowerings)
 
     def _build_dma_slices(
         fake: torch.Tensor,
@@ -3127,6 +3397,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     if bs_var:
                         hbm_parts.append(f"pl.ds({offset}, {bs_var})")
                         hbm_needs_slice = True
+                        from ...language.memory_ops import _record_pad_info
+
+                        extra_pad = _compute_pipeline_or_dma_extra_pad(
+                            _active_loop_begin_expr(state, bid), bid, env, state
+                        )
+                        _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                     else:
                         hbm_parts.append(":")
                 else:

@@ -7,9 +7,10 @@ FP16-decode multi-row bodies from pytorch/helion#3079 that tile over both M
 (out[tile_m]) and the K scale-group dim, accumulating K tiles into a per-row
 fp32 acc. Packed FP4 groups are loaded through
 hl.load_float4_e2m1fn_x16_to_float16. The sweep-wide defaults match the PR's
-tuned Triton configs. Full AOT searches added exact-shape overrides for the
-four shapes where those defaults lost to CUTLASS. All configs were validated
-against the dequant reference and remeasured under cold-L2 cudagraph.
+tuned Triton configs. Full AOT searches produced exact-shape configs for four
+shapes where those defaults lost to CUTLASS; all four overrides are enabled.
+All configs were validated against the dequant reference and remeasured under
+cold-L2 cudagraph.
 
 Provides, for each kernel <k>:
 - key_<k>(*args): config index (also the runtime cache key)
@@ -89,30 +90,14 @@ _CONFIG_BF16IN_28672_4096 = {
     "pid_type": "flat",
 }
 
-# N=15360, K=5120: 19.27us vs 23.15us default and 19.79us CUTLASS.
+# N=15360, K=5120: 17.70us vs 22.96us default and 19.79us CUTLASS.
 _CONFIG_BF16IN_15360_5120 = {
-    "block_sizes": [16, 128],
+    "block_sizes": [32, 64],
     "range_unroll_factors": [0, 3],
-    "range_warp_specializes": [True, None],
     "range_multi_buffers": [None, False],
-    "range_flattens": [True, None],
-    "load_eviction_policies": [
-        "", "first", "first", "first", "last", "", "last", "last", "first",
-        "", "first", "first", "", "", "last", "first", "first", "", "last",
-        "last", "last",
-    ],
-    "num_warps": 2,
+    "num_warps": 4,
     "num_stages": 1,
-    "indexing": [
-        "pointer", "pointer", "tensor_descriptor", "tensor_descriptor",
-        "pointer", "pointer", "pointer", "tensor_descriptor", "pointer",
-        "tensor_descriptor", "tensor_descriptor", "tensor_descriptor",
-        "tensor_descriptor", "tensor_descriptor", "pointer", "pointer",
-        "pointer", "tensor_descriptor", "tensor_descriptor",
-        "tensor_descriptor", "pointer", "pointer",
-    ],
-    "atomic_indexing": [],
-    "pid_type": "persistent_blocked",
+    "pid_type": "persistent_interleaved",
     "num_sm_multiplier": 8,
 }
 

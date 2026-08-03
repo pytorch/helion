@@ -1433,6 +1433,27 @@ class ConfigSpec:
             cluster_m=cluster_m,
         )
 
+    def _tcgen05_grouped_dynamic_ab4_fits_for_target(
+        self,
+        *,
+        dtype_bytes: int,
+        device: torch.device,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        c_stages: int,
+    ) -> bool:
+        return self._cute_tcgen05_config.grouped_dynamic_ab4_fits_for_target(
+            dtype_bytes=dtype_bytes,
+            device=device,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            c_stages=c_stages,
+        )
+
     def _fix_tcgen05_ab_stages_three_search_config(
         self, config: dict[str, object]
     ) -> None:
@@ -1614,6 +1635,10 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
+        if self.backend_name == "cute":
+            self._cute_tcgen05_config.prepare_normalization(
+                config, fix_invalid=_fix_invalid
+            )
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -1930,6 +1955,17 @@ class ConfigSpec:
                 config.pop("pallas_load_buffer_count")
         else:
             config.pop("pallas_load_buffer_count", None)
+
+        if (
+            self.supports_config_key("pallas_pre_broadcast")
+            and self.has_pallas_inner_loops
+            and config.get("pallas_loop_type") not in ("fori_loop", "emit_pipeline")
+        ):
+            # The transform widens loop-carried VMEM scratch, so it only applies
+            # to the streaming lowerings.  "unroll" carries values through the
+            # jax.lax.fori_loop tuple and allocates no scratch to widen; pin the
+            # flag off there so both settings do not autotune as distinct configs.
+            config.pop("pallas_pre_broadcast", None)
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:

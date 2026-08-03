@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import contextvars
 import dataclasses
 import logging
 import sys
@@ -293,6 +294,13 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self._runtime_arg_values_by_name: contextvars.ContextVar[
+            dict[str, object] | None
+        ] = contextvars.ContextVar(
+            f"helion_runtime_arg_values_{id(self)}",
+            default=None,
+        )
+        self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         try:
@@ -394,6 +402,20 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
+
+    @property
+    def runtime_arg_values_by_name(self) -> dict[str, object]:
+        return self._runtime_arg_values_by_name.get() or {}
+
+    @contextlib.contextmanager
+    def use_runtime_arg_values(
+        self, values: dict[str, object]
+    ) -> typing.Iterator[None]:
+        token = self._runtime_arg_values_by_name.set(values)
+        try:
+            yield
+        finally:
+            self._runtime_arg_values_by_name.reset(token)
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -570,23 +592,52 @@ class CompileEnvironment:
             # VMEM byte budget is enforced separately at runtime.
             return None
 
+        uses_triton_codegen = self.codegen_name == "triton"
+        cs_block_sizes = self.config_spec.block_sizes
+        config_block_ids = set(cs_block_sizes.valid_block_ids())
         block_sym_to_id: dict[sympy.Symbol, int] = {}
-        for bs in self.block_sizes:
-            block_sym_to_id[bs.symbol()] = bs.block_id
+        block_sym_to_info: dict[sympy.Symbol, BlockSizeInfo] = {}
+        if uses_triton_codegen:
+            for info in self.block_sizes:
+                symbol = info.symbol()
+                # Reused reduction dimensions deliberately share the original
+                # tile symbol. Preserve the first origin rather than allowing a
+                # later fixed/reduction alias to erase its tunable provenance.
+                block_sym_to_info.setdefault(symbol, info)
+                if info.block_id in config_block_ids:
+                    block_sym_to_id.setdefault(symbol, info.block_id)
+        else:
+            for bs in self.block_sizes:
+                block_sym_to_id[bs.symbol()] = bs.block_id
 
         seen_exprs: set[str] = set()
-        cs_block_sizes = self.config_spec.block_sizes
         for shape in self.kernel_tensor_sizes:
             if not shape:
                 continue
             numel_expr = sympy.Mul(*shape) if len(shape) > 1 else shape[0]
+            if uses_triton_codegen:
+                substitutions: dict[sympy.Basic, sympy.Basic] = {}
+                for symbol in numel_expr.free_symbols:
+                    if (
+                        not isinstance(symbol, sympy.Symbol)
+                        or symbol in block_sym_to_id
+                        or (info := block_sym_to_info.get(symbol)) is None
+                    ):
+                        continue
+                    extent = self._search_invariant_extent_for_numel_constraint(info)
+                    if extent is not None:
+                        substitutions[symbol] = sympy.Integer(extent)
+                if substitutions:
+                    numel_expr = numel_expr.xreplace(substitutions)
+
             all_free = numel_expr.free_symbols
             involved_syms = all_free & block_sym_to_id.keys()
             if not involved_syms:
                 continue
             # Skip expressions with non-block-size free symbols (e.g.,
             # runtime tensor dimensions) — they can't be evaluated at
-            # config generation time.
+            # config generation time. A rollable reduction remains symbolic
+            # here and is skipped by the same rule.
             if all_free - block_sym_to_id.keys():
                 log.debug(
                     "skipping numel constraint for shape %s: expression has "
@@ -628,6 +679,34 @@ class CompileEnvironment:
                     expr_str=expr_str,
                 )
             )
+
+    def _search_invariant_extent_for_numel_constraint(
+        self, block_size: BlockSizeInfo
+    ) -> int | None:
+        """Return an extent fixed across the generated Triton search choices."""
+        source = block_size.block_size_source
+        if isinstance(source, FixedBlockSizeSource):
+            value = source.value
+        elif isinstance(source, ReductionLoopBlockSizeSource):
+            reduction_loops = self.config_spec.reduction_loops
+            if block_size.block_id in reduction_loops.valid_block_ids():
+                loop_spec = reduction_loops.block_id_lookup(block_size.block_id)
+                if loop_spec._flat_fragment(self.config_spec).low < loop_spec.size_hint:
+                    return None
+            value = block_size.size
+        else:
+            return None
+        if not isinstance(value, (int, torch.SymInt)):
+            return None
+        expr = self.specialize_expr(self.shape_env.replace(_to_sympy(value)))
+        if expr.free_symbols or not expr.is_Integer:
+            return None
+        extent = int(expr)
+        if isinstance(source, ReductionLoopBlockSizeSource):
+            # Every fragment-generated choice is persistent, so codegen uses
+            # the full backend-rounded reduction dimension.
+            extent = self.backend.static_rdim_size(extent)
+        return extent
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
