@@ -93,6 +93,21 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Read TritonBench commit
+        if: inputs.suite == 'tritonbench'
+        id: tritonbench-commit
+        run: echo "sha=$(cat .github/ci_commit_pins/tritonbench.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out TritonBench
+        if: inputs.suite == 'tritonbench'
+        uses: actions/checkout@v7
+        with:
+          repository: pytorch-labs/tritonbench
+          ref: ${{ steps.tritonbench-commit.outputs.sha }}
+          path: benchmarks/tritonbench
+          submodules: recursive
+          fetch-depth: 1
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -149,16 +164,11 @@ jobs:
       - name: Install TritonBench Requirements
         if: inputs.suite == 'tritonbench'
         run: |
-          set -x
+          set -euxo pipefail
           source .venv/bin/activate
           uv pip install pip
           uv pip install quack-kernels --no-deps
-          mkdir -p benchmarks/ && pushd benchmarks/
-          git clone https://github.com/pytorch-labs/tritonbench/
-          pushd tritonbench/
-          git checkout $(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/tritonbench.txt)
-          git submodule update --init --recursive
-          uv pip install -r requirements.txt
+          pushd benchmarks/tritonbench/
           python install.py --liger
           if [[ "${{ inputs.runtime-version }}" == cu* ]]; then
             uv pip install einops
@@ -166,7 +176,6 @@ jobs:
             uv pip install "git+https://github.com/sustcsonglin/flash-linear-attention@v0.5.0" --no-deps
           fi
           uv pip install -e . --no-deps
-          popd
           popd
 
       - name: Install Linear-Attention Requirements
