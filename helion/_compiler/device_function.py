@@ -214,14 +214,15 @@ _sort_order: dict[type[Argument], int] = {
 class ScratchArg:
     """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU).
 
-    scratch_type can be "vmem" (default) for VMEM buffers or "dma_semaphore"
-    for DMA semaphores used with pltpu.make_async_copy.
+    scratch_type can be "vmem" (default) for VMEM buffers, "vmem_shared" for
+    memory shared by a SparseCore's subcores, or "dma_semaphore" for DMA
+    semaphores used with pltpu.make_async_copy.
     """
 
     name: str
     shape: tuple[int | torch.SymInt, ...]
     dtype: torch.dtype | None  # None for semaphores
-    scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
+    scratch_type: str = "vmem"  # "vmem", "vmem_shared" or "dma_semaphore"
 
 
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
