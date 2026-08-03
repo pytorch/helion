@@ -112,9 +112,7 @@ def _value_tensor(access: MemoryAccess) -> torch.Tensor:
         value = access.node.meta.get("val")
     else:
         value = (
-            access.value_node.meta.get("val")
-            if access.value_node is not None
-            else None
+            access.value_node.meta.get("val") if access.value_node is not None else None
         )
     if not isinstance(value, torch.Tensor):
         _reject("layout", "memory access value is not a tensor", node=access.node)
@@ -208,9 +206,7 @@ def _stream_group(
             )
         size = access.tensor.shape[tensor_dim]
         if not isinstance(size, int):
-            _reject(
-                "dynamic_shape", "input group has a dynamic size", node=access.node
-            )
+            _reject("dynamic_shape", "input group has a dynamic size", node=access.node)
         group = group * size + index
         count *= size
         tensor_dim += 1
@@ -295,15 +291,9 @@ def _direct_stream(
     )
     assert source is not None
     dependencies = (
-        frozenset()
-        if access.kind is MemoryAccessKind.LOAD
-        else frozenset({source})
+        frozenset() if access.kind is MemoryAccessKind.LOAD else frozenset({source})
     )
-    cls = (
-        DirectLoadPlan
-        if access.kind is MemoryAccessKind.LOAD
-        else DirectStorePlan
-    )
+    cls = DirectLoadPlan if access.kind is MemoryAccessKind.LOAD else DirectStorePlan
     return cls(access, layout, stream, dependencies)
 
 
@@ -341,9 +331,7 @@ def _indirect(
         )
     raw_index = access.subscript[position]
     if not isinstance(raw_index, torch.fx.Node):
-        _reject(
-            "access_pattern", "indirect index is not an FX value", node=access.node
-        )
+        _reject("access_pattern", "indirect index is not an FX value", node=access.node)
     index_node, offset = _normalize_static_offset(raw_index)
     if access.kind is not MemoryAccessKind.LOAD and offset:
         _reject(
@@ -377,10 +365,7 @@ def _indirect(
             "SparseCore shared-memory atomic add requires float32 values",
             node=access.node,
         )
-    if (
-        access.kind is MemoryAccessKind.ATOMIC
-        and context.items_per_subcore % SC_LANES
-    ):
+    if access.kind is MemoryAccessKind.ATOMIC and context.items_per_subcore % SC_LANES:
         _reject(
             "atomic_lanes",
             "SparseCore shared-memory atomic add requires complete "
@@ -388,12 +373,9 @@ def _indirect(
             node=access.node,
         )
     tensor_dim = sum(
-        not isinstance(pattern, NonePattern)
-        for pattern in access.patterns[:position]
+        not isinstance(pattern, NonePattern) for pattern in access.patterns[:position]
     )
-    value_size = math.prod(
-        int(dim) for dim in access.tensor.shape[tensor_dim + 1 :]
-    )
+    value_size = math.prod(int(dim) for dim in access.tensor.shape[tensor_dim + 1 :])
     value_bytes = value_size * access.tensor.dtype.itemsize
     if value_bytes % SC_DMA_GRANULE_BYTES:
         _reject(
@@ -447,9 +429,7 @@ def _cached_load(
         return None
     storage = [
         (pattern, index)
-        for pattern, index in zip(
-            access.patterns, access.subscript, strict=True
-        )
+        for pattern, index in zip(access.patterns, access.subscript, strict=True)
         if not isinstance(pattern, NonePattern)
     ]
     if (
@@ -500,7 +480,5 @@ def build_sparsecore_memory_plan(
         "access_pattern",
         f"no SparseCore {access.kind.value} plan for [{patterns}]",
         node=access.node,
-        operation=getattr(
-            access.node.target, "__name__", str(access.node.target)
-        ),
+        operation=getattr(access.node.target, "__name__", str(access.node.target)),
     )
