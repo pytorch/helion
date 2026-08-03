@@ -1071,7 +1071,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         # over-budget chunking) are visible to the wrap below.
                         wrapped_body: list[ast.AST] = []
                         with self.set_statements(wrapped_body):
-                            codegen_call_with_graph(self, root, [])
+                            grid_state.codegen_graph(self, root)
                         if grid_state.has_lane_loops():
                             self.statements_stack[-1].extend(grid_state.outer_prefix)
                             if self.device_function.cute_state.consume_root_lane_loop_suppression():

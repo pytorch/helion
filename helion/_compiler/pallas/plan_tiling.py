@@ -21,8 +21,6 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..host_function import SymbolOrigin
     from ..tile_dispatch import TileStrategyDispatch
-    from .gather import GatherPlan
-    from .gather import ScatterPlan
 
 
 @dataclass
@@ -71,20 +69,6 @@ class NonePattern(IndexingPattern):
 @dataclass
 class TensorIndexPattern(IndexingPattern):
     """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
-
-
-@dataclass
-class IndirectGatherPattern(IndexingPattern):
-    """Indirect gather load ``table[idx, ...]`` - no tiling on this dim."""
-
-    plan: GatherPlan
-
-
-@dataclass
-class IndirectScatterPattern(IndexingPattern):
-    """Indirect scatter store ``table[idx, ...]`` - no tiling on this dim."""
-
-    plan: ScatterPlan
 
 
 @dataclass
@@ -142,8 +126,19 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
     )
-    _resolve_tensor_index_patterns(
-        node, tensor_val, list(subscript), indexing_patterns, config
+    from .access import ACCESS_SITE_META
+    from .access import make_access_site
+
+    node.meta[ACCESS_SITE_META] = make_access_site(
+        node, tensor_val, list(subscript), indexing_patterns
+    )
+    from .tensorcore_access import TENSORCORE_ACCESS_META
+    from .tensorcore_access import select_tensorcore_access
+
+    node.meta[TENSORCORE_ACCESS_META] = (
+        None
+        if config.get("core_type", "tensorcore") == "sparsecore"
+        else select_tensorcore_access(node.meta[ACCESS_SITE_META], config)
     )
     node.meta["indexing_patterns"] = indexing_patterns
 
@@ -401,42 +396,6 @@ def resident_block_elements(
         # Advance only on patterns that consume a tensor dim; NonePattern doesn't.
         tdim += 1
     return elements
-
-
-def _resolve_tensor_index_patterns(
-    node: torch.fx.Node,
-    tensor: torch.Tensor,
-    subscript: list[object],
-    patterns: list[IndexingPattern],
-    config: Config,
-) -> None:
-    """Replace TensorIndexPattern with Pallas indirect load/store patterns."""
-    positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
-    if not positions:
-        return
-
-    from ...language import memory_ops
-
-    if node.target is memory_ops.load:
-        from .gather import build_gather_plan
-
-        plan = build_gather_plan(tensor, subscript, positions, patterns, config)
-        for i in positions:
-            patterns[i] = IndirectGatherPattern(plan=plan)
-        return
-
-    if node.target is memory_ops.store:
-        from .gather import build_scatter_plan
-
-        plan = build_scatter_plan(tensor, subscript, positions)
-        for i in positions:
-            patterns[i] = IndirectScatterPattern(plan=plan)
-        return
-
-    op_name = getattr(node.target, "__name__", str(node.target))
-    raise NotImplementedError(
-        f"Pallas: tensor-indexed memory op is not supported for op={op_name}."
-    )
 
 
 # Helper functions moved from memory_ops.py
