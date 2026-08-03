@@ -10,8 +10,8 @@ autotune baseline.
 The per-shape numerics comparison is NOT reimplemented here: it is the exact
 check vLLM ships in ``scripts/benchmark_helion_kernels.py``
 (``check_kernel_correctness``), which the CI workflow fetches onto ``PYTHONPATH``
-at the vLLM commit matching the installed wheel. This keeps the tolerances,
-fp8-ULP handling, and mutation comparison identical to vLLM's own kernel tests.
+from the latest vLLM ``main``. This keeps the tolerances, fp8-ULP handling, and
+mutation comparison identical to vLLM's current kernel tests.
 
 This is a correctness gate, not a perf benchmark. Its main job is to catch
 codegen/compile regressions that break a specific config on a specific GPU
@@ -34,10 +34,10 @@ import vllm  # noqa: F401  registers torch.ops._C.* (+ Helion kernels, in curren
 from vllm.kernels.helion import get_registered_kernels
 
 # vLLM's shared per-shape numerics check. The workflow fetches
-# scripts/benchmark_helion_kernels.py (at the installed wheel's commit) onto
-# PYTHONPATH, so this imports as a top-level module. Running it here means the
-# comparison is byte-for-byte what vLLM uses -- no parallel implementation to
-# drift out of sync.
+# scripts/benchmark_helion_kernels.py from the latest main onto PYTHONPATH, so
+# this imports as a top-level module. Running it here means the comparison is
+# byte-for-byte what vLLM uses -- no parallel implementation to drift out of
+# sync.
 from benchmark_helion_kernels import check_kernel_correctness
 
 
@@ -58,19 +58,6 @@ def _force_register() -> None:
         if callable(fn):
             fn()
             return
-
-
-# Known-failing CORRECTNESS cases, keyed by (kernel, platform "sm<cc>"). The
-# kernel must still COMPILE (compile failures are never xfail'd); only a
-# correctness mismatch is downgraded to XFAIL (reported, non-fatal). Keep this
-# list tiny and always paired with a TODO to remove it.
-_XFAIL_CORRECTNESS = {
-    # TODO(shangdiy): investigate on a B200 machine, then remove. On B200
-    # (sm100) ~0.77% of fused_qk_norm_rope elements diverge up to ~2.1 vs the
-    # reference on small-token shapes; H100 (sm90) is clean and this is an
-    # approximate kernel (author tolerance 5e-2). Tracking: <add issue link>.
-    ("fused_qk_norm_rope", "sm100"): "B200 numerical divergence on small-token shapes; under investigation",
-}
 
 
 def _run_compile_only(name, wrapper, inputs_dict, failures):
@@ -109,10 +96,8 @@ def main() -> int:
         return 1
     print(f"Found {len(kernels)} registered Helion kernels: {sorted(kernels)}\n")
 
-    plat = f"sm{cc[0]}{cc[1]}"
     failures: list[tuple[str, str, str]] = []
     skipped: list[tuple[str, str]] = []
-    xfailed: list[tuple[str, str]] = []
     n_cases = 0
 
     for name, wrapper in sorted(kernels.items()):
@@ -150,36 +135,24 @@ def main() -> int:
                 print(f"  OK    {tag}")
                 continue
 
-            # A numerics mismatch (check raised an AssertionError, wrapped as
-            # "Numerics check failed ...") is xfail-able per (kernel, platform);
-            # a compile/run error is never xfail'd.
             error = r.error or ""
             is_numerics = error.startswith("Numerics check failed")
-            xfail_reason = _XFAIL_CORRECTNESS.get((name, plat)) if is_numerics else None
-            if xfail_reason is not None:
-                xfailed.append((name, f"{tag}: {error.splitlines()[0]}"))
-                print(f"  XFAIL {tag}  [{xfail_reason}]")
-            else:
-                where = "correctness" if is_numerics else "compile/run"
-                # Keep the full error (magnitudes/ULP counts live on later lines
-                # of the assert_close message) so a mismatch can be triaged as
-                # tolerance noise vs a real regression from the CI log alone.
-                failures.append((name, f"{where} {tag}", error))
+            where = "correctness" if is_numerics else "compile/run"
+            # Keep the full error (magnitudes/ULP counts live on later lines
+            # of the assert_close message) so a mismatch can be triaged as
+            # tolerance noise vs a real regression from the CI log alone.
+            failures.append((name, f"{where} {tag}", error))
 
     print(f"\nChecked {n_cases} (kernel, shape) cases across {len(kernels)} kernels.")
     for name, why in skipped:
         print(f"  SKIP  {name}: {why}")
-    for name, why in xfailed:
-        print(f"  XFAIL {name}: {why}")
     for name, where, msg in failures:
         print(f"  FAIL  {name} [{where}]: {msg}")
 
     if failures:
-        print(f"\n{len(failures)} failure(s)"
-              + (f", {len(xfailed)} xfail(s)." if xfailed else "."))
+        print(f"\n{len(failures)} failure(s).")
         return 1
-    tail = f" ({len(xfailed)} known xfail(s))" if xfailed else ""
-    print(f"\nAll vLLM Helion kernels compiled and matched their baseline{tail}. OK")
+    print("\nAll vLLM Helion kernels compiled and matched their baseline. OK")
     return 0
 
 
