@@ -261,14 +261,17 @@ class LLMGuidedSearch(PopulationBasedSearch):
             search_state=summarize_search_state_for_llm(
                 self._all_benchmark_results,
                 self._default_config_dict,
+                performance_unit=self.performance_unit,
             ),
             anchor_configs=summarize_anchor_configs_for_llm(
                 self._all_benchmark_results,
                 self._default_config_dict,
+                performance_unit=self.performance_unit,
             ),
             results=format_results_for_llm(
                 self._all_benchmark_results,
                 self._default_config_dict,
+                performance_unit=self.performance_unit,
             ),
             top_patterns=analyze_top_configs(
                 self._all_benchmark_results,

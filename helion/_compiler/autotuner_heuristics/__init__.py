@@ -11,11 +11,14 @@ from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
+from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
+from .cute import CuteTcgen05GroupedStaticCommonKHeuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
+from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MatmulHeuristic
 from .triton import TritonH100MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
@@ -41,6 +44,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFlashAttentionCausalLptHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
+        CuteTcgen05GroupedStaticCommonKHeuristic,
+        CuteTcgen05GroupedDynamicBk64Heuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
         CuteTileVecHeuristic,
@@ -54,6 +59,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonH100MatmulHeuristic,
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
+        # The sm100 formula, promoted; registered after the table so it wins the
+        # last-promote-wins compiler_default_config loop.
+        TritonB200FormulaMatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
         TritonStandardReductionHeuristicSM90,
         TritonStandardReductionHeuristicSM100,

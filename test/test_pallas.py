@@ -19,6 +19,7 @@ from torch.testing._internal.common_utils import parametrize
 import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import _bound_test_config
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasInterpret
@@ -516,6 +517,20 @@ def pallas_row_scale_mul(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_causal_prefix_sum(x: torch.Tensor) -> torch.Tensor:
+    """Sum each row through its causal diagonal using a dependent tile end."""
+    n = x.size(0)
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    for tile_q in hl.tile(n):
+        acc = hl.zeros([tile_q], dtype=torch.float32)
+        for tile_k in hl.tile(0, min(x.size(1), tile_q.end)):
+            causal = tile_k.index[None, :] <= tile_q.index[:, None]
+            acc += torch.where(causal, x[tile_q, tile_k], 0.0).sum(-1)
+        out[tile_q] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
     """Softmax over a non-power-of-2 reduction dim.
 
@@ -900,6 +915,23 @@ class TestPallas(TestCase):
         # (1) the lowering emits the divide-and-filter helper, not jax.lax.top_k
         self.assertIn("_helion_divide_filter_topk", code)
         self.assertNotIn("lax.top_k", code)
+        # (1b) regular output imports the helper from helion; the module parses.
+        self.assertIn(
+            "from helion._compiler.pallas.topk_impl import divide_filter_topk", code
+        )
+        ast.parse(code)
+        # (1c) the dependency-free output embeds the helper source instead (no helion
+        # import) so the standalone is self-contained, and the embed still parses.
+        bound = _topk_pallas_kernel.bind((x, _TOPK_TEST_K))
+        free = bound.to_code(
+            _bound_test_config(bound, block_sizes=[8]),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+        self.assertIn("def divide_filter_topk(", free)
+        self.assertIn("_helion_divide_filter_topk = divide_filter_topk", free)
+        self.assertNotIn("from helion._compiler.pallas.topk_impl import", free)
+        self.assertNotIn("import helion", free)
+        ast.parse(free)
         # (2) correctness vs the exact top-k
         ref_v, ref_i = torch.topk(x, _TOPK_TEST_K, dim=-1, largest=True)
         idx_c = idx.cpu()
@@ -2217,8 +2249,8 @@ class TestPallas(TestCase):
         """
         from unittest.mock import patch
 
-        from helion import runtime as helion_runtime
         from helion.runtime.config import Config
+        from helion.runtime.pallas import launcher as pallas_launcher
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def _matmul_dot_general_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -2246,9 +2278,9 @@ class TestPallas(TestCase):
         no_tiling_cfg = Config(block_sizes=[256, 256, 256])
 
         with patch.object(
-            helion_runtime,
+            pallas_launcher,
             "_build_matmul_dot_general_jit_fn",
-            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+            wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
         ) as build_spy:
             compiled_fn = bound.compile_config(no_tiling_cfg)
             result_no_tiling = compiled_fn(x, y)
@@ -2266,9 +2298,9 @@ class TestPallas(TestCase):
         bound_ref = _matmul_dot_general_pin.bind((x, y))
         tiled_cfg = Config(block_sizes=[128, 128, 128])
         with patch.object(
-            helion_runtime,
+            pallas_launcher,
             "_build_matmul_dot_general_jit_fn",
-            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+            wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
         ) as build_spy_tiled:
             compiled_ref = bound_ref.compile_config(tiled_cfg)
             result_tiled = compiled_ref(x, y)
@@ -2293,7 +2325,7 @@ class TestPallas(TestCase):
         import jax
         import jax.numpy as jnp
 
-        from helion import runtime as helion_runtime
+        from helion.runtime.pallas import launcher as pallas_launcher
 
         spec: dict[str, object] = {
             "lhs_tensor_arg_index": 0,
@@ -2305,7 +2337,7 @@ class TestPallas(TestCase):
             patch.object(jax, "jit", lambda fn: fn),
             patch.object(jax.lax, "dot_general", wraps=jax.lax.dot_general) as dot_spy,
         ):
-            fn = helion_runtime._build_matmul_dot_general_jit_fn(spec)
+            fn = pallas_launcher._build_matmul_dot_general_jit_fn(spec)
             result = cast(
                 "Any",
                 fn(
@@ -3952,6 +3984,53 @@ class TestPallas(TestCase):
         )
         ref = x.view(8, 8, 384).sum(1)
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
+    def test_dependent_tile_end_unroll_uses_resident_value_carry(self) -> None:
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_causal_prefix_sum,
+            (x,),
+            block_sizes=[128, 128],
+            pallas_loop_type="unroll",
+        )
+
+        self.assertIn("def _dynamic_unroll_body", code)
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertNotIn("dma_semaphore", code)
+        self.assertNotIn("scratch_", code)
+        torch.testing.assert_close(result, torch.tril(x).sum(-1))
+
+    def test_direct_tile_end_unroll_handles_partial_outer_tile(self) -> None:
+        x = torch.randn(70, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(70, 1, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_row_scale_mul,
+            (x, r),
+            block_sizes=[8],
+            pallas_loop_type="unroll",
+        )
+
+        self.assertIn("def _dynamic_unroll_body", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        torch.testing.assert_close(result, x * r)
+
+    def test_dependent_tile_end_composes_with_streaming_loop_types(self) -> None:
+        x = torch.randn(192, 192, device=DEVICE, dtype=torch.float32)
+        bound = pallas_causal_prefix_sum.bind((x,))
+        for loop_type, marker in (
+            ("fori_loop", "jax.lax.fori_loop"),
+            ("emit_pipeline", "pltpu.emit_pipeline"),
+        ):
+            with self.subTest(loop_type=loop_type):
+                code = bound.to_triton_code(
+                    helion.Config(
+                        block_sizes=[128, 128],
+                        pallas_loop_type=loop_type,
+                    )
+                )
+                self.assertIn(marker, code)
+                self.assertIn("(0, 0, 128, 0)", code)
 
     @xfailIfPallasInterpret(
         "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"

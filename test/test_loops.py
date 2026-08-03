@@ -1482,6 +1482,84 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    @skipIfRefEager("inspects generated code; ref eager never lowers a kernel")
+    @skipIfNotTriton(
+        "asserts on Triton's rendered bound; Pallas lowers a dependent tile "
+        "bound through its own loop codegen and never reaches this path"
+    )
+    def test_min_max_over_derived_tile_edge_keeps_its_own_formula(self):
+        """A tile edge folded into ``min``/``max`` must keep its own formula.
+
+        ``min``/``max`` are device function replacements, so they fold their
+        operands into one sympy expression at trace time.  That drops the
+        ``tile_end``/``tile_count``/``tile_id`` op and leaves a bare symbol,
+        whose origin then has to be honored when it is rendered.  Emitting the
+        loop offset for all of them substitutes ``tile.begin``: for an end
+        bound that is a zero trip count on the first tile.
+
+        The 200x200 input is deliberately not a multiple of the 128 block, so
+        the final tile is partial and the end has to clamp.
+        """
+        cfg = helion.Config(block_sizes=[128, 128])
+
+        @helion.kernel(config=cfg)
+        def end_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), tile_q.end)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def end_max(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, max(8, tile_q.end)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def count_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), tile_q.count)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def id_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), 2 * tile_q.id + 1)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        x = torch.randn(200, 200, device=DEVICE)
+        # Each edge renders its own formula; the offset alone would mean begin.
+        # The id case also pins the parenthesization: unbracketed, ``2 *
+        # offset_0 // BLOCK`` would floor-divide the product instead.
+        for label, kernel, fragment in (
+            ("end/min", end_min, "offset_0 + _BLOCK_SIZE_0"),
+            ("end/max", end_max, "offset_0 + _BLOCK_SIZE_0"),
+            ("count", count_min, "tl.cdiv("),
+            ("id", id_min, "2 * (offset_0 // _BLOCK_SIZE_0)"),
+        ):
+            with self.subTest(edge=label):
+                # Codegen the declared config, not the spec default: the
+                # partial final tile depends on the 128 block size.
+                code = kernel.bind((x,)).to_triton_code(cfg)
+                rendered = [ln for ln in code.splitlines() if "symnode_0 = " in ln]
+                self.assertTrue(rendered, f"no rendered bound in:\n{code}")
+                self.assertIn(fragment, rendered[0])
+
     @skipIfNotTriton(
         "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
     )

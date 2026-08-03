@@ -73,7 +73,17 @@ def matches_hardware(
 ) -> bool:
     from ..._hardware import get_hardware_info
 
-    hardware = get_hardware_info(env.device)
+    # A device Helion cannot classify raises RuntimeError here (e.g. MTIA, which
+    # presents as cuda via torch.accelerator but whose build leaves both
+    # torch.version.cuda and torch.version.hip unset, so get_hardware_info falls
+    # through every branch). An unclassifiable device matches no target, so the
+    # honest answer is False -- and it must not escape, because should_promote()
+    # is called outside the try/except that guards is_eligible, where an escaping
+    # RuntimeError fails the whole compile.
+    try:
+        hardware = get_hardware_info(env.device)
+    except RuntimeError:
+        return False
     return (hardware.device_kind, hardware.compute_capability) in targets or (
         hardware.device_kind,
         None,

@@ -31,6 +31,7 @@ from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load
 from .memory_ops import store as store
 from .quantized_ops import float4_e2m1fn_x2_to_float32 as float4_e2m1fn_x2_to_float32
+from .quantized_ops import load_bfloat16_x16_to_float16 as load_bfloat16_x16_to_float16
 from .quantized_ops import (
     load_float4_e2m1fn_x16_to_float16 as load_float4_e2m1fn_x16_to_float16,
 )

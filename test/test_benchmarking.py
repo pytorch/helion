@@ -31,6 +31,17 @@ class _FakeGraphContext:
         return False
 
 
+class _FakeCuteGraphContext:
+    def __init__(self, cuda):
+        self.cuda = cuda
+
+    def __enter__(self):
+        return self.cuda.CUDAGraph()
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 class _FakeGraph:
     def __init__(self):
         self.replay_count = 0
@@ -415,8 +426,15 @@ def test_cudagraph_defaults_off(monkeypatch):
 
 
 def test_cudagraph_replay_wraps_callable(monkeypatch):
+    import helion.runtime as helion_runtime
+
     fake_cuda = _FakeCuda()
     monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
+    monkeypatch.setattr(
+        helion_runtime,
+        "cute_cuda_graph",
+        lambda: _FakeCuteGraphContext(fake_cuda),
+    )
     monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "1")
     calls = []
 

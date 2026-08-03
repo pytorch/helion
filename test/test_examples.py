@@ -131,9 +131,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
-    @xfailIfPallas(
-        "Pallas TPU clamps the N block to the lane width (128) which does"
-        " not match the test's N=96 bias dimension"
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
     )
     def test_matmul_bias_epilogue_wrapper(self):
         from typing import Any
@@ -1063,7 +1063,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
+    )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -1771,9 +1774,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_jsd(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1799,9 +1799,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_kl_div(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1911,15 +1908,28 @@ class TestExamples(RefEagerTestBase, TestCase):
         W_packed = mod.pack_fp4(W_quantized).view(torch.float4_e2m1fn_x2)
         weight_scale = mod.make_fp8_scales((N, K // 16), DEVICE)
 
-        result = mod.nvfp4_matmul(A, W_packed, weight_scale)
-        expected = mod.reference_nvfp4_matmul(A, W_packed, weight_scale)
+        result = mod.nvfp4_w4a16_matmul(A, W_packed, weight_scale)
+        expected = mod.reference_nvfp4_w4a16_matmul(A, W_packed, weight_scale)
         torch.testing.assert_close(
             result,
             expected,
             atol=1.0,
             rtol=2e-1,
         )
+        A_quantized = mod.quantize_fp4_e2m1(A)
+        A_packed = mod.pack_fp4_last_dim(A_quantized).view(torch.float4_e2m1fn_x2)
+        act_scale = mod.make_fp8_scales((M, K // 16), DEVICE)
 
+        result = mod.nvfp4_w4a4_matmul(A_packed, W_packed, act_scale, weight_scale)
+        expected = mod.reference_nvfp4_w4a4_matmul(
+            A_packed, W_packed, act_scale, weight_scale
+        )
+        torch.testing.assert_close(
+            result,
+            expected,
+            atol=1.0,
+            rtol=2e-1,
+        )
         M, K, N = 128, 256, 256
         A_packed = mod.make_random_fp4((M, K), DEVICE)
         B_packed = mod.make_random_fp4((N, K), DEVICE)

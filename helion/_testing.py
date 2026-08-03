@@ -356,8 +356,8 @@ def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
     Single-XCD parts and CPX-partitioned devices (which expose one XCD) are
     skipped, since xcd_remap is a no-op there.
     """
-    from helion._compat import get_num_xcd
     from helion._compat import supports_amd_cdna_tunables
+    from helion.runtime.triton.launcher import get_num_xcd
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(
@@ -406,6 +406,21 @@ def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
 def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Skip test when CUTLASS CuTe backend is selected."""
     return skipIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def matchesBackends(backends: Sequence[str]) -> bool:
+    """Return whether `_get_backend() in backends`, matching onlyBackends."""
+    backend = _get_backend()
+    return backend in backends or (backend == "tileir" and "triton" in backends)
+
+
+def skipUnlessBackends(backends: Sequence[str]) -> pytest.MarkDecorator:
+    """Return a pytest mark that skips unless `_get_backend() in backends`."""
+    backend = _get_backend()
+    return pytest.mark.skipif(
+        not matchesBackends(backends),
+        reason=f"disabled for HELION_BACKEND={backend}",
+    )
 
 
 def default_cute_mma_support(
@@ -483,7 +498,7 @@ def onlyBackends(
 
     def wrapper(cls: type[unittest.TestCase]) -> type[unittest.TestCase]:
         backend = _get_backend()
-        if backend in backends or (backend == "tileir" and "triton" in backends):
+        if matchesBackends(backends):
             return cls
         return unittest.skip(f"disabled for HELION_BACKEND={backend}")(cls)
 

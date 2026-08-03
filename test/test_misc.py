@@ -1173,6 +1173,36 @@ class TestTritonExactGelu(RefEagerTestBase, TestCase):
         self.assertIn("tl.bfloat16", code)
 
 
+class TestHelionCutePrinter(TestCase):
+    def test_compound_division_operands_are_parenthesized(self) -> None:
+        import sympy
+        from torch.utils._sympy.functions import CeilDiv
+        from torch.utils._sympy.functions import CleanDiv
+        from torch.utils._sympy.functions import FloorDiv
+        from torch.utils._sympy.functions import PythonMod
+
+        from helion._compiler.cute.printer import cute_texpr
+
+        x = sympy.Symbol("x", integer=True)
+        expressions = (
+            FloorDiv(2 * x + 1, 128),
+            PythonMod(2 * x + 1, 32),
+            sympy.Function.__new__(
+                CleanDiv, 2 * x + 1, sympy.Integer(128), evaluate=False
+            ),
+            sympy.Function.__new__(
+                CeilDiv, 2 * x + 1, sympy.Integer(128), evaluate=False
+            ),
+        )
+        for expression in expressions:
+            rendered = cute_texpr(expression)
+            for value in (0, 31, 64, 129):
+                self.assertEqual(
+                    eval(rendered, {"__builtins__": {}}, {"x": value}),
+                    int(expression.subs(x, value)),
+                )
+
+
 @onlyBackends(["triton"])
 class TestHelionTritonPrinter(TestCase):
     """Tests for the HelionTritonPrinter class."""

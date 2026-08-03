@@ -1127,8 +1127,8 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 // -------- Pretuned Kernels Tab --------
 // Lazily fetches pretuned-dashboard-data.json (built by
 // build_pretuned_dashboard_data.py from the Benchmark Pretuned Dispatch nightly).
-// Aggregate-only: each pretuned kernel reports geomean speedup vs PyTorch eager,
-// win count, and best speedup across its checked-in shape sweep.
+// Each pretuned kernel reports either a failure or aggregate speedup metrics
+// across its checked-in shape sweep.
 let PRETUNED_DATA = null;
 let PRETUNED_LOADED = false;
 let pretunedPlatform = 'all';
@@ -1155,19 +1155,33 @@ function renderPretuned() {
     s.has_nightly_data && (pretunedPlatform === 'all' || s.platform_short === pretunedPlatform)
   );
   entries.sort((a, b) => a.platform_short.localeCompare(b.platform_short) || a.kernel.localeCompare(b.kernel));
-  const gmVals = entries.map(e => e.geomean).filter(v => v > 0);
+  const successfulEntries = entries.filter(e => !e.failed);
+  const failedEntries = entries.filter(e => e.failed);
+  const gmVals = successfulEntries.map(e => e.geomean).filter(v => v > 0);
   const overallGM = geomean(gmVals, null);
-  const wins = entries.filter(e => e.geomean > 1.0).length;
-  const sub = `${entries.length} kernel/platform combos`;
+  const wins = successfulEntries.filter(e => e.geomean > 1.0).length;
+  const sub = `${successfulEntries.length} successful kernel/platform combos`;
+  const lr = D.latest_run || {};
+  const ciPass = failedEntries.length === 0;
   let html = '';
   html += '<h2 style="margin-bottom:4px">Pretuned Kernels vs PyTorch Eager</h2>';
   html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Nightly run of every kernel under <code>pretuned_kernels/</code> against its checked-in heuristic. Speedup is geomean over each kernel\'s shape sweep; higher = faster than eager.</p>';
   html += '<div class="filter-bar"><select id="pt-plat-filter"><option value="all">All Platforms</option>';
   shorts.forEach(p => { html += `<option value="${p}"${p === pretunedPlatform ? ' selected' : ''}>${platName(p)}</option>`; });
   html += '</select></div>';
+  html += '<div class="status-row">';
+  html += statusCard('Latest Commit',
+    lr.sha ? `<a href="${commitUrl(lr.full_sha)}" target="_blank">${escHtml(lr.sha)}</a>` : '--',
+    lr.date ? formatDate(lr.date) : 'No nightly run',
+    { extraHtml: lr.run_id ? `<div class="sub">Run <a href="${runUrl(lr.run_id)}" target="_blank">#${lr.run_id}</a></div>` : '' });
+  html += statusCard('CI Status',
+    ciPass ? 'PASS' : failedEntries.length + ' FAIL',
+    ciPass ? 'All kernels ran successfully' : 'Click for details',
+    { id: 'pt-ci-status-card', clickable: !ciPass, valueColor: ciPass ? 'var(--green)' : 'var(--red)' });
+  html += '</div>';
   html += '<div class="summary-row">';
   html += summaryCard('Geomean Speedup', formatSpeedup(overallGM), sub, { valueColor: 'var(--green)' });
-  html += summaryCard('Helion Wins', wins, `of ${entries.length} combos faster than eager`, { valueColor: 'var(--green)' });
+  html += summaryCard('Helion Wins', wins, `of ${successfulEntries.length} successful combos`, { valueColor: 'var(--green)' });
   html += summaryCard('Kernels', `${new Set(entries.map(e => e.kernel)).size}`, 'pretuned kernels covered');
   html += summaryCard('Platforms', `${new Set(entries.map(e => e.platform_short)).size}`, 'GPU architectures');
   html += '</div>';
@@ -1180,7 +1194,8 @@ function renderPretuned() {
   }
   html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Bench</th><th>Platform</th><th>Commit</th><th>Geomean</th><th>Wins</th><th>Best</th><th>Δ vs prev</th></tr></thead><tbody>';
   entries.forEach(e => {
-    const latest = e.history && e.history.length > 0 ? e.history[e.history.length - 1] : null;
+    const latest = [...(e.history || [])].reverse().find(h =>
+      h.is_nightly && (h.branch || 'main') === 'main');
     const commitLink = latest ? `<a href="${commitUrl(latest.full_sha)}" target="_blank" style="font-family:monospace;font-size:12px">${escHtml(latest.sha)}</a>` : '--';
     const gmColor = e.geomean >= 1.0 ? 'var(--green)' : 'var(--red)';
     const hasBaselines = e.baselines && Object.keys(e.baselines).length > 0;
@@ -1192,10 +1207,9 @@ function renderPretuned() {
       <td>${cudagraphBadge(e.cudagraph)}</td>
       <td>${platBadge(e.platform_short)}</td>
       <td>${commitLink}</td>
-      <td style="color:${gmColor}">${formatSpeedup(e.geomean)}</td>
-      <td>${e.helion_wins}/${e.total}</td>
-      <td style="color:var(--green)">${formatSpeedup(e.best_speedup)}</td>
-      <td>${formatDelta(e.geomean_delta_pct, false)}</td>
+      ${e.failed
+        ? '<td style="color:var(--red);font-weight:700">FAILED</td><td>--</td><td>--</td><td>--</td>'
+        : `<td style="color:${gmColor}">${formatSpeedup(e.geomean)}</td><td>${e.helion_wins}/${e.total}</td><td style="color:var(--green)">${formatSpeedup(e.best_speedup)}</td><td>${formatDelta(e.geomean_delta_pct, false)}</td>`}
     </tr>`;
   });
   html += `</tbody><tfoot><tr>
@@ -1209,7 +1223,24 @@ function renderPretuned() {
     pretunedPlatform = ev.target.value;
     renderPretuned();
   });
+  if (!ciPass) {
+    document.getElementById('pt-ci-status-card').addEventListener('click', () => {
+      showPretunedFailures(failedEntries);
+    });
+  }
   if (runs.length >= 2) setTimeout(renderPretunedTrendChart, 50);
+}
+function showPretunedFailures(failures) {
+  let html = modalHeader(
+    `Pretuned CI Failures — ${failures.length} kernel/platform result(s)`,
+    'Kernels that failed in their latest nightly run');
+  html += '<ul class="fail-list">';
+  failures.forEach(f => {
+    html += `<li><span class="fail-kernel">${escHtml(f.kernel)}</span>${platBadge(f.platform_short)}`
+      + `<span class="fail-shapes">${escHtml(f.error || 'Unknown error')}</span></li>`;
+  });
+  html += '</ul>';
+  openModal(html);
 }
 function showPretunedBaselines(kernel, ps) {
   const e = (PRETUNED_DATA && PRETUNED_DATA.summary || []).find(

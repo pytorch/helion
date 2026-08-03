@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import ast
 import dataclasses
 import functools
 import logging
@@ -41,11 +42,13 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.settings import DotPrecision
+    from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _CuteMmaNode
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import DeviceIR
     from .device_ir import GraphInfo
+    from .generate_ast import GenerateAST
     from .host_function import HostFunction
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
@@ -77,6 +80,42 @@ class AttentionSoftmaxPattern(NamedTuple):
     @property
     def is_causal(self) -> bool:
         return self.score_plan.is_causal
+
+
+@dataclasses.dataclass(frozen=True)
+class LauncherInfo:
+    """Per-backend info for inlining the dependency-free launcher as a local
+    ``helion.runtime`` shim (see :mod:`helion.runtime.precompile`), used by
+    ``BoundKernel.to_code(options=OutputCodeOptions(allow_helion_deps=False))``."""
+
+    launcher_module: str  # dotted path of the dep-free launcher, inlined verbatim
+    launcher_symbol: str  # public launcher name that module defines
+    launcher_alias: str  # underscore alias generated code binds it to
+    deps: str  # runtime deps, for the header comment
+    # ``helion.runtime.<fn>`` runtime helpers the generated host wrapper calls
+    # (besides the launcher); the shim re-exports these so the body runs verbatim.
+    runtime_helper_names: tuple[str, ...] = ()
+
+
+def read_launcher_source(module_name: str) -> str:
+    """Raw source of a dependency-free launcher module."""
+    import importlib
+    from pathlib import Path
+
+    module = importlib.import_module(module_name)
+    assert module.__file__ is not None
+    return Path(module.__file__).read_text()
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    """De-duplicate ``items`` keeping first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 class Backend(abc.ABC):
@@ -703,6 +742,58 @@ class Backend(abc.ABC):
         """
         ...
 
+    def embedded_helper_source(self, body: str) -> str:
+        """Source of in-kernel runtime helpers to inline into the generated module.
+
+        Backends that call a helion-defined helper from inside the generated
+        kernel can return its source here (instead of importing it) so the output
+        is self-contained -- which lets the precompiler produce a helion-free
+        standalone. Only helpers actually referenced in ``body`` should be
+        emitted. Injected between the imports and the kernel body. Default: none.
+        """
+        return ""
+
+    @property
+    def dependency_free_launcher_info(self) -> LauncherInfo:
+        """Info for inlining this backend's dependency-free launcher as a local
+        ``helion.runtime`` shim, used by
+        ``to_code(options=OutputCodeOptions(allow_helion_deps=False))``. Backends
+        that cannot yet emit a helion-free module raise ``NotImplementedError``.
+        """
+        raise NotImplementedError(
+            f"the {self.name!r} backend does not support "
+            "to_code(allow_helion_deps=False) yet"
+        )
+
+    def capture_jax_launch_metadata(
+        self, bound: BoundKernel[Any], config: Config | dict[str, object]
+    ) -> object:
+        """Capture jax_fn launch metadata (Pallas only) by compiling the kernel and
+        running a capturing launch on real tensors -- must run *outside* the
+        fake-tensor env. Consumed by :meth:`build_jax_fn_code`; backends without a
+        JAX launch path raise."""
+        raise NotImplementedError(
+            f"the {self.name!r} backend does not support to_code(jax_fn=True)"
+        )
+
+    def build_jax_fn_code(
+        self,
+        body_root: ast.Module,
+        import_lines: list[str],
+        meta: object,
+        *,
+        allow_helion_deps: bool,
+    ) -> ast.Module:
+        """Rewrite the generated module AST into a jax-native standalone module
+        (Pallas only). The entrypoint operates on ``jax.Array`` inputs;
+        ``allow_helion_deps`` toggles whether the launch core is inlined (helion-free)
+        or imported from helion. ``meta`` is the value from
+        :meth:`capture_jax_launch_metadata`. Backends without a JAX launch path raise.
+        """
+        raise NotImplementedError(
+            f"the {self.name!r} backend does not support to_code(jax_fn=True)"
+        )
+
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
@@ -893,7 +984,8 @@ class Backend(abc.ABC):
 
         if block_size_infos[0].is_flattened(config):
             block_size = functools.reduce(  # pyrefly: ignore[incompatible-overload-residual]
-                operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
+                operator.mul,
+                [bs.from_config_assert(config) for bs in block_size_infos],
             )
             return FlattenedTileStrategy(
                 fn,
@@ -992,15 +1084,77 @@ class Backend(abc.ABC):
         return triton_precision_by_dot_precision.get(precision, "")
 
 
-# TPU does not natively support 64-bit element types.
-_PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
-
-
 def _largest_divisor_at_most(size: int, limit: int) -> int:
     for divisor in range(limit, 0, -1):
         if size % divisor == 0:
             return divisor
     return 1
+
+
+def _cute_rank3_rhs_static_full_tiles(
+    env: CompileEnvironment,
+    *,
+    root_grid_ids: Sequence[int],
+    k_block_id: int,
+    bm: int,
+    bn: int,
+    bk: int,
+) -> bool:
+    for block_id, block_size in (
+        (root_grid_ids[0], bm),
+        (root_grid_ids[1], bn),
+        (k_block_id, bk),
+    ):
+        size = env.block_sizes[block_id].size
+        if not isinstance(size, (int, torch.SymInt)):
+            return False
+        extent = env.size_hint(size)
+        if not env.known_equal(size, extent) or extent % block_size != 0:
+            return False
+    return True
+
+
+def _rank3_rhs_grouped_nt_can_use_specialized_mma(
+    node: torch.fx.Node,
+    *,
+    env: CompileEnvironment,
+    cg: GenerateAST,
+    config: Config,
+    mn_root_grid_ids: Sequence[int],
+    segment_root_grid_id: int | None,
+    k_block_id: int,
+    bm: int,
+    bn: int,
+    bk: int,
+) -> bool:
+    from .cute.cute_mma import _GroupedMmaAxes
+    from .cute.cute_mma import _prove_rank3_rhs_grouped_mma
+    from .cute.cute_mma import _tcgen05_cluster_m
+
+    proof = _prove_rank3_rhs_grouped_mma(
+        cg,
+        node,
+        config=config,
+        axes=_GroupedMmaAxes(
+            m_block_id=mn_root_grid_ids[0],
+            n_block_id=mn_root_grid_ids[1],
+            k_block_id=k_block_id,
+            segment_block_id=segment_root_grid_id,
+        ),
+    )
+    if proof is None:
+        return False
+    return proof.is_worklist or (
+        _tcgen05_cluster_m(config) == 1
+        and _cute_rank3_rhs_static_full_tiles(
+            env,
+            root_grid_ids=mn_root_grid_ids,
+            k_block_id=k_block_id,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+    )
 
 
 def _specialized_mma_root_mn_block_ids(
@@ -2682,15 +2836,122 @@ class _SpecializedMmaPlan(NamedTuple):
     n_block_id: int
 
 
+def _grouped_rank3_specialized_mma_plan(
+    node: torch.fx.Node,
+    *,
+    fn: DeviceFunction,
+    k_block_id: int,
+    bk: int,
+    config: Config,
+    env: CompileEnvironment,
+) -> _SpecializedMmaPlan | None:
+    from .cute.cute_mma import _choose_mma_impl
+    from .host_function import HostFunction
+
+    if node.target is not torch.ops.aten.addmm.default:
+        return None
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if len(root_grid_ids) == 2:
+        segment_root_grid_id = None
+        mn_root_grid_ids = root_grid_ids
+    elif len(root_grid_ids) == 3:
+        segment_root_grid_id = root_grid_ids[0]
+        mn_root_grid_ids = root_grid_ids[1:]
+    else:
+        return None
+    if segment_root_grid_id is not None:
+        segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
+        if segment_block != 1:
+            return None
+    bm = env.block_sizes[mn_root_grid_ids[0]].from_config(config)
+    bn = env.block_sizes[mn_root_grid_ids[1]].from_config(config)
+    if not isinstance(bm, int) or not isinstance(bn, int):
+        return None
+    if not _rank3_rhs_grouped_nt_can_use_specialized_mma(
+        node,
+        env=env,
+        cg=fn.codegen,
+        config=config,
+        mn_root_grid_ids=mn_root_grid_ids,
+        segment_root_grid_id=segment_root_grid_id,
+        k_block_id=k_block_id,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+    ):
+        return None
+    lhs_node = node.args[1] if len(node.args) > 1 else None
+    if not isinstance(lhs_node, torch.fx.Node):
+        return None
+    lhs_val = lhs_node.meta.get("val")
+    if not isinstance(lhs_val, torch.Tensor):
+        return None
+    mma_impl = _choose_mma_impl(
+        lhs_val.dtype,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        config=config,
+        input_device=lhs_val.device,
+    )
+    if mma_impl != "tcgen05":
+        return None
+    return _SpecializedMmaPlan(mma_impl, *mn_root_grid_ids)
+
+
+def _analyzed_specialized_mma_plan(
+    node: torch.fx.Node,
+    *,
+    k_block_id: int,
+    bk: int,
+    config: Config,
+    env: CompileEnvironment,
+) -> _SpecializedMmaPlan | None:
+    from .cute.cute_mma import _choose_mma_impl
+    from .cute.cute_mma import _mma_tiles_are_static_full
+    from .cute.cute_mma import analyze_cute_mma_node
+
+    candidate = analyze_cute_mma_node(node)
+    if (
+        candidate is None
+        or candidate.requires_accumulator_seed
+        or candidate.operands.k_block_id != k_block_id
+    ):
+        return None
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidate, config)
+    if root_mn_block_ids is None:
+        return None
+    bm = env.block_sizes[root_mn_block_ids[0]].from_config(config)
+    bn = env.block_sizes[root_mn_block_ids[1]].from_config(config)
+    if not isinstance(bm, int) or not isinstance(bn, int):
+        return None
+    if candidate.operands.has_leading_passthrough and not _mma_tiles_are_static_full(
+        candidate.operands, bm=bm, bn=bn, bk=bk
+    ):
+        return None
+    lhs_val = candidate.operands.lhs.source_fake
+    mma_impl = _choose_mma_impl(
+        lhs_val.dtype,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        config=config,
+        input_device=lhs_val.device,
+    )
+    if mma_impl == "universal":
+        return None
+    return _SpecializedMmaPlan(mma_impl, *root_mn_block_ids)
+
+
 def _kernel_specialized_mma_plan(
     fn: DeviceFunction,
     *,
     config: Config,
 ) -> _SpecializedMmaPlan | None:
     from .compile_environment import CompileEnvironment
-    from .cute.cute_mma import _choose_mma_impl
-    from .cute.cute_mma import _mma_tiles_are_static_full
-    from .cute.cute_mma import analyze_cute_mma_node
     from .device_ir import ForLoopGraphInfo
     from .host_function import HostFunction
 
@@ -2713,38 +2974,25 @@ def _kernel_specialized_mma_plan(
             continue
         bk = block_sizes[0]
         for node in graph_info.graph.nodes:
-            candidate = analyze_cute_mma_node(node)
-            if (
-                candidate is None
-                or candidate.requires_accumulator_seed
-                or candidate.operands.k_block_id != block_ids[0]
-            ):
-                continue
-            root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidate, config)
-            if root_mn_block_ids is None:
-                continue
-            bm = env.block_sizes[root_mn_block_ids[0]].from_config(config)
-            bn = env.block_sizes[root_mn_block_ids[1]].from_config(config)
-            if not isinstance(bm, int) or not isinstance(bn, int):
-                continue
-            if (
-                candidate.operands.has_leading_passthrough
-                and not _mma_tiles_are_static_full(
-                    candidate.operands, bm=bm, bn=bn, bk=bk
-                )
-            ):
-                continue
-            lhs_val = candidate.operands.lhs.source_fake
-            mma_impl = _choose_mma_impl(
-                lhs_val.dtype,
-                bm=bm,
-                bn=bn,
+            plan = _analyzed_specialized_mma_plan(
+                node,
+                k_block_id=block_ids[0],
                 bk=bk,
                 config=config,
-                input_device=lhs_val.device,
+                env=env,
             )
-            if mma_impl != "universal":
-                return _SpecializedMmaPlan(mma_impl, *root_mn_block_ids)
+            if plan is not None:
+                return plan
+            plan = _grouped_rank3_specialized_mma_plan(
+                node,
+                fn=fn,
+                k_block_id=block_ids[0],
+                bk=bk,
+                config=config,
+                env=env,
+            )
+            if plan is not None:
+                return plan
     return None
 
 

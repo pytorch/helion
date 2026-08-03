@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import enum
+import inspect
 import math
 from typing import TYPE_CHECKING
 from typing import Any
@@ -17,7 +18,10 @@ import torch
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..backend import Backend
+from ..backend import LauncherInfo
 from ..backend import _loop_contains_matmul
+from ..backend import dedupe_preserve_order
+from ..backend import read_launcher_source
 
 if TYPE_CHECKING:
     import sympy
@@ -25,6 +29,7 @@ if TYPE_CHECKING:
 
     from ...autotuner.config_fragment import ConfigSpecFragment
     from ...runtime.config import Config
+    from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
     from ..device_function import Argument
     from ..device_ir import GraphInfo
@@ -33,6 +38,56 @@ if TYPE_CHECKING:
     from .compact_worklist import CompactWorklistPlan
 
     InductorOpOverrides = OpsHandler[Any]
+
+
+def _embedded_helper_source(body: str) -> str:
+    """Source of the in-kernel Pallas helpers referenced by ``body`` (module-level
+    so both ``PallasBackend.embedded_helper_source`` and the jax standalone builder
+    can inline them). Only helpers actually referenced are emitted."""
+    blocks: list[str] = []
+    if "_helion_divide_filter_topk" in body:
+        from . import topk_impl
+
+        blocks.extend(
+            [
+                _embed_source(inspect.getsource(topk_impl)),
+                "_helion_divide_filter_topk = divide_filter_topk",
+            ]
+        )
+    if "flatten_worklist" in body:
+        from ...runtime import compact_worklist
+
+        blocks.append(_embed_source(inspect.getsource(compact_worklist)))
+    return "\n\n\n".join(blocks)
+
+
+def _embed_source(source: str) -> str:
+    """Return a module's source ready to inline: its module docstring and
+    ``from __future__`` lines stripped (leading comments -- e.g. an SPDX header --
+    and everything else preserved), so the docstring prose can't leak into the
+    generated code and the mid-module ``from __future__`` (a SyntaxError) is gone.
+
+    The docstring span is located via ``ast`` (not a quote scan) so a docstring
+    whose prose contains a triple-quote can't corrupt the output, and a module
+    that opens with code rather than a docstring is handled correctly.
+    """
+    lines = source.split("\n")
+    doc_lines: set[int] = set()
+    tree = ast.parse(source)
+    if (
+        tree.body
+        and isinstance(first := tree.body[0], ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        # ast line numbers are 1-based; end_lineno is the closing-quote line.
+        doc_lines = set(range(first.lineno - 1, (first.end_lineno or first.lineno)))
+    kept = [
+        line
+        for idx, line in enumerate(lines)
+        if idx not in doc_lines and not line.strip().startswith("from __future__")
+    ]
+    return "\n".join(kept).strip("\n")
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
@@ -157,6 +212,44 @@ class PallasBackend(Backend):
         return "_default_pallas_launcher"
 
     @property
+    def dependency_free_launcher_info(self) -> LauncherInfo:
+        # Pallas generated code makes no ``helion.runtime.<fn>`` helper calls
+        # beyond the launcher, so the shim need only re-export the launcher itself.
+        return LauncherInfo(
+            launcher_module="helion.runtime.pallas.launcher",
+            launcher_symbol="default_pallas_launcher",
+            launcher_alias="_default_pallas_launcher",
+            deps="torch + jax",
+            runtime_helper_names=(),
+        )
+
+    def capture_jax_launch_metadata(
+        self, bound: BoundKernel[Any], config: Config | dict[str, object]
+    ) -> JaxLaunchMeta:
+        """Capture jax_fn launch metadata via a real-tensor run + two-probe (see
+        :func:`capture_jax_launch_metadata`). Must run outside the fake-tensor env."""
+        return capture_jax_launch_metadata(bound, config)
+
+    def build_jax_fn_code(
+        self,
+        body_root: ast.Module,
+        import_lines: list[str],
+        meta: object,
+        *,
+        allow_helion_deps: bool,
+    ) -> ast.Module:
+        """Rewrite the generated module AST into the jax-native standalone (see
+        :func:`build_jax_fn_ast`). ``meta`` is a :class:`JaxLaunchMeta` from
+        :meth:`capture_jax_launch_metadata`; ``allow_helion_deps`` toggles whether the
+        launch core is inlined (helion-free) or imported from helion."""
+        return build_jax_fn_ast(
+            body_root,
+            import_lines,
+            cast("JaxLaunchMeta", meta),
+            inline_launcher=not allow_helion_deps,
+        )
+
+    @property
     def library_imports(self) -> dict[str, str]:
         return {
             "math": "import math",
@@ -169,8 +262,25 @@ class PallasBackend(Backend):
             "lax": "import jax.lax as lax",
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
+            # In-kernel helpers the generated code calls. Regular output imports
+            # them from helion (conditionally, only when referenced); the
+            # dependency-free path drops these imports and embeds the source instead
+            # (see ``embedded_helper_source`` / ``build_dependency_free_code``).
             "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
+            "flatten_worklist": "from helion.runtime.compact_worklist import flatten_worklist",
         }
+
+    def embedded_helper_source(self, body: str) -> str:
+        """Inline the in-kernel Pallas helpers referenced by ``body``.
+
+        ``divide_filter_topk`` (aten.topk lowering) and ``flatten_worklist``
+        (compact-worklist builder) are pure-``jax`` helpers the generated kernel
+        calls. Regular output imports them from helion (see ``library_imports``);
+        this embeds their source instead, so a dependency-free / jax standalone is
+        self-contained. Called only by the standalone builders (never for regular
+        ``to_code``), which drop the corresponding helion imports.
+        """
+        return _embedded_helper_source(body)
 
     # Config keys that Pallas actually uses.  Everything else
     # (pid_type, num_warps, num_stages, maxnreg, indexing, etc.)
@@ -1292,15 +1402,6 @@ class PallasBackend(Backend):
             )
 
         env = CompileEnvironment.current()
-        if (
-            grouping == 0
-            and config.get("pallas_loop_type", "unroll") == "unroll"
-            and env.config_spec.has_symbolic_or_data_dependent_bounds
-        ):
-            raise exc.InvalidConfig(
-                "pallas_loop_type='unroll' requires static inner-loop bounds or "
-                "pallas_worklist_grouping in (1, 2)."
-            )
 
         plan_tiling(graphs, config, tile_strategy)
 
@@ -1389,7 +1490,7 @@ class PallasBackend(Backend):
         ):
             import jax.experimental.pallas.tpu as pltpu
 
-            from ...runtime import _get_vmem_limit_bytes
+            from ...runtime.pallas.launcher import _get_vmem_limit_bytes
             from .compact_worklist import build_resident_cache_admission
 
             # Choose C from the conservative device-reported VMEM budget. The
@@ -1400,7 +1501,7 @@ class PallasBackend(Backend):
                 plan,
                 host_fn.params.arguments,
                 ordered_block=env.compact_worklist_ordered_block,
-                vmem_bytes=_get_vmem_limit_bytes(pltpu),
+                vmem_bytes=_get_vmem_limit_bytes(pltpu, env.settings.pallas_interpret),
             )
             if not admission.decision.active:
                 raise exc.InvalidConfig(
@@ -1449,3 +1550,634 @@ class PallasBackend(Backend):
         block = CompileEnvironment.current().compact_worklist_block * plan.grouping
         # Single source of the tight megablocks bound (also unit-tested).
         return packed_upper_bound(total, num_owners, block)
+
+
+# Launcher kwargs that mark a kernel using a Pallas feature the pure-JAX
+# module doesn't emit yet (scratch/VMEM buffers, HBM pass-through, SMEM,
+# dynamic-shape padding, in-place aliasing, compact-worklist, matmul dot_general).
+_JAX_UNSUPPORTED_KWARGS = (
+    "_scratch_shapes",
+    "_hbm_arg_indices",
+    "_smem_arg_indices",
+    "_ds_pad_dims",
+    "_inplace_indices",
+    "_compact_build_worklist",
+    "_matmul_dot_general",
+)
+
+# Dtypes the Pallas launcher rejects and that JAX would mishandle under x32
+# (int64/uint64 silently narrow to 32-bit; float64 is unsupported on TPU).
+_JAX_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
+
+
+@dataclasses.dataclass
+class JaxLaunchMeta:
+    """Launch metadata captured by running the compiled host wrapper on real tensors
+    (outside the fake-tensor env), consumed by the AST builder to emit the jax-native
+    entrypoint. Grid / output-shape / scalar-arg values are Python-source expressions
+    over ``inputs[i].shape[d]`` (derived by the two-probe) so one standalone is correct
+    at every dynamic shape; static dims come through as literals."""
+
+    kernel_name: str
+    grid_exprs: list[str]
+    output_indices: list[int]
+    user_positions: list[int]
+    const_slots: dict[int, str]
+    block_spec_info: list[Any]
+    out_shape_exprs: list[list[str]]
+    out_dtypes: list[str]
+    interpret: bool
+    n_args: int
+
+
+def _materialize_args(fake_args: list[object]) -> tuple[object, ...]:
+    """Real, sample-shaped tensors reconstructed from a bound kernel's fake args.
+
+    ``to_code`` has no access to the original inputs, but the jax_fn capture only
+    needs tensors of the right shape/dtype/device (the capturing launcher records
+    metadata without executing the kernel). ``int(sym)`` on a fake dim yields the
+    bind-time sample size, so static and dynamic kernels both round-trip. Must be
+    called outside the fake-tensor env so ``torch.empty`` allocates real tensors.
+    """
+    out: list[object] = []
+    for fake in fake_args:
+        if isinstance(fake, torch.Tensor):
+            shape = [int(s) for s in fake.shape]
+            out.append(torch.empty(shape, dtype=fake.dtype, device=fake.device))
+        else:
+            out.append(fake)
+    return tuple(out)
+
+
+def _torch_dtype_to_jnp_name(dtype: torch.dtype) -> str:
+    """``torch.float32`` -> ``"jnp.float32"`` (``torch.bool`` -> ``"jnp.bool_"``)."""
+    name = str(dtype).rsplit(".", 1)[-1]
+    if name == "bool":
+        name = "bool_"
+    return f"jnp.{name}"
+
+
+# Cap on inlining a host-wrapper-created constant *tensor* launch arg by value.
+# Lifted module scalars (``torch.tensor([_NEG])``) are tiny; a large constant
+# tensor is unexpected here and would bloat the standalone, so reject it clearly.
+_MAX_EMBED_CONST_ELEMS = 256
+
+
+def _embed_jax_const(value: object) -> str:
+    """Python source reconstructing a host-wrapper-created constant launch arg as a
+    JAX value: a lifted scalar-constant tensor -> ``jnp.array(...)``; a
+    specialization scalar -> its int/float/bool literal. These are baked into the
+    standalone, whose entrypoint takes only the user's tensor inputs."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() > _MAX_EMBED_CONST_ELEMS:
+            raise NotImplementedError(
+                "to_code(jax_fn=True) cannot inline a constant tensor "
+                f"launch arg with {value.numel()} elements (limit "
+                f"{_MAX_EMBED_CONST_ELEMS})"
+            )
+        values = value.detach().cpu().tolist()
+        return f"jnp.array({values!r}, dtype={_torch_dtype_to_jnp_name(value.dtype)})"
+    if isinstance(value, bool):
+        return repr(value)
+    if isinstance(value, (int, float)):
+        return repr(value)
+    raise NotImplementedError(
+        "to_code(jax_fn=True) does not support a launch arg of type "
+        f"{type(value).__name__!r}"
+    )
+
+
+# Distinct scale factors for the second shape probe (see
+# ``capture_jax_launch_metadata``):
+# one per symbolic input dim, distinct so each launch value maps unambiguously to
+# the dim it tracks.
+_PROBE_FACTORS = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+
+
+def _scaled_probe_args(
+    args: tuple[object, ...],
+    dim_factor: dict[tuple[int, int], int],
+) -> list[object]:
+    """Second-probe args: each user tensor with its symbolic dims scaled by that
+    dim's factor (``dim_factor[(arg_index, dim)]``; dims sharing a symbol scale
+    together); non-tensor args and concrete (specialized) dims are left unchanged.
+
+    ``dim_factor`` is precomputed from the symbolic dims captured *before* the base
+    capture run, because that run specializes ``bound.fake_args`` to concrete sizes."""
+    probe: list[object] = []
+    for i, a in enumerate(args):
+        if not isinstance(a, torch.Tensor):
+            probe.append(a)
+            continue
+        new_shape = [
+            int(a.shape[d]) * dim_factor.get((i, d), 1) for d in range(a.dim())
+        ]
+        probe.append(torch.empty(new_shape, dtype=a.dtype, device=a.device))
+    return probe
+
+
+def _match_input_dim(
+    v0: int,
+    v1: int,
+    in_shapes0: list[list[int]],
+    in_shapes1: list[list[int]],
+) -> str | None:
+    """``inputs[k].shape[d]`` for a value that scaled ``v0 -> v1`` across the two
+    probes; ``None`` if unchanged (a constant). Raises if it changed but matches no
+    input dim (a value we can't derive, rather than silently baking it wrong)."""
+    if v0 == v1:
+        return None
+    for k, (s0, s1) in enumerate(zip(in_shapes0, in_shapes1, strict=True)):
+        for d in range(len(s0)):
+            if s0[d] == v0 and s1[d] == v1:
+                return f"inputs[{k}].shape[{d}]"
+    raise NotImplementedError(
+        "to_code(jax_fn=True) cannot derive a dynamic launch value "
+        f"({v0} -> {v1}) from the input shapes"
+    )
+
+
+def _grid_axis_expr(
+    g0: int,
+    g1: int,
+    in_shapes0: list[list[int]],
+    in_shapes1: list[list[int]],
+) -> str:
+    """Python expression for one grid axis: a constant literal if it didn't change,
+    else ``cdiv(inputs[k].shape[d], block)`` for the input dim it tracks (the block
+    is recovered from the sample: ``block = dim / grid`` when the sample dim is a
+    whole number of blocks)."""
+    if g0 == g1:
+        return repr(g0)
+    for k, (s0, s1) in enumerate(zip(in_shapes0, in_shapes1, strict=True)):
+        for d in range(len(s0)):
+            a0, a1 = s0[d], s1[d]
+            if a0 == a1 or g0 <= 0 or a0 % g0 != 0:
+                continue
+            block = a0 // g0
+            if block >= 1 and -(-a1 // block) == g1:
+                if block == 1:
+                    return f"inputs[{k}].shape[{d}]"
+                return f"(inputs[{k}].shape[{d}] + {block - 1}) // {block}"
+    raise NotImplementedError(
+        f"to_code(jax_fn=True) cannot derive grid axis ({g0} -> {g1}) "
+        "from the input shapes"
+    )
+
+
+def _const_slot_expr(
+    v0: object,
+    v1: object,
+    in_shapes0: list[list[int]],
+    in_shapes1: list[list[int]],
+) -> str:
+    """Expression filling a host-wrapper-created launch slot: baked by value if it
+    stayed constant across the two probes, else input-derived. Covers lifted module
+    scalars / specialization ints (constant) and shape-derived scalars such as a
+    reduction's row-count ``torch.tensor([t])`` (a ``(1,)`` tensor that tracks a
+    runtime dim)."""
+    if isinstance(v0, torch.Tensor):
+        vals0 = v0.detach().cpu().reshape(-1).tolist()
+        vals1 = cast("torch.Tensor", v1).detach().cpu().reshape(-1).tolist()
+        if vals0 == vals1:
+            return _embed_jax_const(v0)
+        if len(vals0) != 1:
+            raise NotImplementedError(
+                "to_code(jax_fn=True) cannot derive a multi-element "
+                "dynamic constant tensor launch arg"
+            )
+        expr = _match_input_dim(vals0[0], vals1[0], in_shapes0, in_shapes1)
+        return f"jnp.array([{expr}], dtype={_torch_dtype_to_jnp_name(v0.dtype)})"
+    if v0 == v1:
+        return _embed_jax_const(v0)
+    return cast(
+        "str",
+        _match_input_dim(cast("int", v0), cast("int", v1), in_shapes0, in_shapes1),
+    )
+
+
+def capture_jax_launch_metadata(
+    bound: BoundKernel[Any],
+    config: Config | dict[str, object],
+) -> JaxLaunchMeta:
+    """Capture the jax_fn launch metadata by running the compiled host wrapper on
+    real tensors with a capturing launcher, and derive the dynamic-shape expressions.
+
+    This is the one non-AST step of the jax_fn path: it records the grid, per-tensor
+    block specs, output shapes/dtypes, and input/output arg positions, and runs a
+    second probe (each symbolic input dim scaled by a distinct factor) so grid /
+    output-shape / scalar-arg values that track a runtime dim become
+    ``inputs[i].shape[d]`` expressions rather than baked sample constants. The AST
+    builder (:func:`build_jax_fn_ast`) turns this into the emitted entrypoint.
+
+    Kernels using advanced Pallas features (scratch/pipeline/SMEM/ds-pad/in-place/
+    compact-worklist/matmul-dot-general) or int64/uint64/float64 args are not
+    supported yet and raise ``NotImplementedError``.
+
+    Must be called *outside* the fake-tensor env (the capture materializes and runs
+    on real tensors).
+    """
+    kernel = bound.kernel
+    compiled = bound.compile_config(config)
+    # Record which input dims are symbolic (dynamic) BEFORE the capture run below:
+    # running the compiled wrapper once specializes ``bound.fake_args``' symbols to
+    # the concrete sample sizes, which would otherwise erase them before the
+    # two-probe dynamic-shape derivation (further down) can read them. ``sym_dims``
+    # maps each symbol to the ``(arg_index, dim)`` positions that carry it.
+    sym_dims: dict[str, list[tuple[int, int]]] = {}
+    for i, fake in enumerate(bound.fake_args):
+        shape = getattr(fake, "shape", None)
+        if shape is None:
+            continue
+        for d, size in enumerate(shape):
+            if isinstance(size, torch.SymInt) and size.node.expr.is_symbol:
+                sym_dims.setdefault(str(size.node.expr), []).append((i, d))
+    # ``to_code`` has no access to the original inputs; reconstruct real,
+    # sample-shaped tensors from the bound kernel's fake args to drive the capture.
+    args = _materialize_args(bound.fake_args)
+
+    # Capture the launch metadata by running the host wrapper with a launcher
+    # that records its arguments instead of executing the kernel.
+    captured: dict[str, Any] = {}
+
+    def _capture(
+        pallas_kernel: object, grid: object, *launch_args: object, **kw: object
+    ) -> object:
+        captured["grid"] = tuple(int(g) for g in cast("Any", grid))
+        captured["args"] = launch_args
+        captured["kwargs"] = kw
+        out_indices = cast("list[int]", kw.get("_output_indices") or [])
+        # Mirror the real launcher's return convention so the host wrapper's
+        # ``a, b = _launcher(...)`` unpack (multi-output kernels) succeeds: a
+        # tuple for >1 outputs, the bare tensor for one, None for zero.
+        if len(out_indices) > 1:
+            return tuple(launch_args[i] for i in out_indices)
+        return launch_args[out_indices[0]] if out_indices else None
+
+    compiled(*args, _launcher=_capture)
+
+    kw = captured["kwargs"]
+    for name in _JAX_UNSUPPORTED_KWARGS:
+        if kw.get(name):
+            raise NotImplementedError(
+                f"to_code(jax_fn=True) does not support kernels using "
+                f"{name!r} yet (kernel {kernel.name!r})"
+            )
+
+    launch_args = cast("tuple[object, ...]", captured["args"])
+    output_indices = list(cast("list[int]", kw.get("_output_indices") or []))
+    block_spec_info = cast("list[Any] | None", kw.get("_block_spec_info"))
+    if block_spec_info is None:
+        # Emitted only when codegen resolved a grid/tiling; its absence means a
+        # no-tiling / degenerate-grid kernel the launch core can't map.
+        raise NotImplementedError(
+            "to_code(jax_fn=True) does not support kernels without a "
+            "resolved block spec (no-tiling / degenerate grid) yet"
+        )
+    for a in launch_args:
+        if isinstance(a, torch.Tensor) and a.dtype in _JAX_UNSUPPORTED_DTYPES:
+            raise NotImplementedError(
+                f"to_code(jax_fn=True) does not support {a.dtype} tensors "
+                "(unsupported on TPU / narrowed by JAX x32)"
+            )
+    # The host wrapper passes the kernel's own arguments first, then the values it
+    # creates itself: output buffers, lifted module-scalar constants (e.g.
+    # ``torch.tensor([_NEG])``), specialization scalars (e.g. a reduction dim size
+    # as a plain int), and shape-derived scalars (e.g. a reduction's row-count
+    # ``torch.tensor([t])``). The standalone entrypoint takes only the user inputs;
+    # every other launch arg is reconstructed inline.
+    n_user = len(args)
+    user_positions = [p for p in range(n_user) if p not in output_indices]
+    const_positions = [
+        p
+        for p in range(len(launch_args))
+        if p not in user_positions and p not in output_indices
+    ]
+    out_dtypes = [
+        _torch_dtype_to_jnp_name(cast("torch.Tensor", launch_args[p]).dtype)
+        for p in output_indices
+    ]
+    interpret = bool(kw.get("_pallas_interpret") or False)
+
+    # Derive the grid, output shapes, and shape-derived scalar launch args from the
+    # RUNTIME input shapes so a single standalone is correct at every dynamic shape.
+    # One trace can't tell a value that happens to equal the sample size from one
+    # that tracks an input dim -- and a materialized row-count ``torch.tensor([t])``
+    # even specializes that dim during tracing -- so probe a SECOND shape (each
+    # symbolic input dim scaled by a distinct factor) and compare: a launch value
+    # that moved tracks the input dim it moved with (derive it); one that stayed is
+    # a genuine constant (bake it). Static kernels have no symbolic dims, so every
+    # value stays -> all baked (identical standalone as before).
+    grid0 = cast("tuple[int, ...]", captured["grid"])
+    in_shapes0 = [
+        [int(s) for s in cast("torch.Tensor", launch_args[p]).shape]
+        for p in user_positions
+    ]
+
+    if sym_dims:
+        sym_factor = {sym: _PROBE_FACTORS[k] for k, sym in enumerate(sorted(sym_dims))}
+        # (arg_index, dim) -> scale factor, from the pre-run symbolic dims (dims
+        # sharing a symbol scale together).
+        dim_factor: dict[tuple[int, int], int] = {
+            pos: sym_factor[sym]
+            for sym, positions in sym_dims.items()
+            for pos in positions
+        }
+        probe_cap: dict[str, Any] = {}
+
+        def _probe(pk: object, grid: object, *pa: object, **pkw: object) -> object:
+            probe_cap["grid"] = tuple(int(g) for g in cast("Any", grid))
+            probe_cap["args"] = pa
+            poi = cast("list[int]", pkw.get("_output_indices") or [])
+            if len(poi) > 1:
+                return tuple(pa[i] for i in poi)
+            return pa[poi[0]] if poi else None
+
+        probe_args = _scaled_probe_args(args, dim_factor)
+        compiled(*probe_args, _launcher=_probe)
+        grid1 = cast("tuple[int, ...]", probe_cap["grid"])
+        launch1 = cast("tuple[object, ...]", probe_cap["args"])
+        in_shapes1 = [
+            [int(s) for s in cast("torch.Tensor", launch1[p]).shape]
+            for p in user_positions
+        ]
+    else:
+        grid1, launch1, in_shapes1 = grid0, launch_args, in_shapes0
+
+    grid_exprs = [
+        _grid_axis_expr(g0, g1, in_shapes0, in_shapes1)
+        for g0, g1 in zip(grid0, grid1, strict=True)
+    ]
+    out_shape_exprs: list[list[str]] = []
+    for p in output_indices:
+        sh0 = [int(s) for s in cast("torch.Tensor", launch_args[p]).shape]
+        sh1 = [int(s) for s in cast("torch.Tensor", launch1[p]).shape]
+        out_shape_exprs.append(
+            [
+                _match_input_dim(a, b, in_shapes0, in_shapes1) or repr(a)
+                for a, b in zip(sh0, sh1, strict=True)
+            ]
+        )
+    const_slots = {
+        p: _const_slot_expr(launch_args[p], launch1[p], in_shapes0, in_shapes1)
+        for p in const_positions
+    }
+
+    return JaxLaunchMeta(
+        kernel_name=kernel.name,
+        grid_exprs=grid_exprs,
+        output_indices=output_indices,
+        user_positions=user_positions,
+        const_slots=const_slots,
+        block_spec_info=cast("list[Any]", block_spec_info),
+        out_shape_exprs=out_shape_exprs,
+        out_dtypes=out_dtypes,
+        interpret=interpret,
+        n_args=len(launch_args),
+    )
+
+
+def _extract_device_kernel_nodes(
+    body_root: ast.Module, kernel_name: str
+) -> list[ast.stmt]:
+    """The device-kernel statements from the generated module AST: everything except
+    the host-wrapper ``def <kernel_name>`` (i.e. the ``_helion_<name>`` device
+    kernel(s) and any module-level constants). Raises if that code imports helion (an
+    in-kernel helper not inlined yet) or references torch in code (the jax standalone
+    is jax-native; torch in *annotations* stays a lazy string and is fine)."""
+    nodes = [
+        node
+        for node in body_root.body
+        if not (isinstance(node, ast.FunctionDef) and node.name == kernel_name)
+    ]
+    module = ast.Module(body=nodes, type_ignores=[])
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Import)
+            and any("helion" in alias.name for alias in node.names)
+        ) or (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and "helion" in node.module
+        ):
+            raise NotImplementedError(
+                f"cannot export {kernel_name!r} for jax_fn: the device kernel "
+                "references helion (an in-kernel helper is not inlined yet)"
+            )
+    if "torch" in _code_name_refs(module):
+        raise NotImplementedError(
+            f"cannot export {kernel_name!r} for jax_fn: the device kernel "
+            "references torch (only jax-native device code is supported)"
+        )
+    return nodes
+
+
+def _is_torch_import(imp: str) -> bool:
+    """True if ``imp`` is an ``import torch`` / ``from torch ...`` statement."""
+    return imp == "import torch" or imp.startswith(
+        ("import torch.", "import torch ", "from torch.", "from torch ")
+    )
+
+
+def _stmt_def_names(node: ast.stmt) -> list[str]:
+    """Top-level names a statement binds (function/class/assignment targets)."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, ast.Assign):
+        return [t.id for t in node.targets if isinstance(t, ast.Name)]
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return [node.target.id]
+    return []
+
+
+def _code_name_refs(node: ast.AST) -> set[str]:
+    """Names referenced in a node's *code* (calls, attribute bases, values) --
+    ignoring type annotations, which stay lazy strings under
+    ``from __future__ import annotations`` and never execute at runtime."""
+    refs: set[str] = set()
+
+    def visit(n: ast.AST) -> None:
+        if isinstance(n, ast.Name):
+            refs.add(n.id)
+        for field, value in ast.iter_fields(n):
+            if field in ("annotation", "returns"):
+                continue
+            if isinstance(value, ast.AST):
+                visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        visit(item)
+
+    visit(node)
+    return refs
+
+
+def _launcher_jax_slice() -> tuple[list[str], list[ast.stmt]]:
+    """Return ``(import_lines, def_nodes)`` for the JAX-only slice of the Pallas
+    launcher: its jax-relevant import statements (as source lines, matching
+    ``to_code``'s ``import_lines`` convention) and the AST nodes of the transitive
+    *code* closure of ``_pallas_jax_call`` -- the shared compile core
+    (``_pallas_compile_jit_fn`` / block specs / ``pl.kernel`` / the compact variant).
+    Drops everything else (the torch launcher, JaxCallable dispatch, torch<->jax
+    conversions, ``import torch``). torch names left in kept functions' *type
+    annotations* are lazy strings that never execute.
+    """
+    tree = ast.parse(read_launcher_source("helion.runtime.pallas.launcher"))
+    import_nodes: list[ast.stmt] = []
+    defs: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_nodes.append(node)
+        for name in _stmt_def_names(node):
+            defs[name] = node
+
+    keep: set[str] = set()
+    queue = ["_pallas_jax_call"]
+    while queue:
+        name = queue.pop()
+        if name in keep or name not in defs:
+            continue
+        keep.add(name)
+        queue.extend(_code_name_refs(defs[name]))
+
+    kept = [node for node in tree.body if any(n in keep for n in _stmt_def_names(node))]
+    # Torch in annotations is fine (lazy strings); torch in *code* is a bug.
+    if "torch" in _code_name_refs(ast.Module(body=kept, type_ignores=[])):
+        raise AssertionError(
+            "jax_fn launcher slice unexpectedly references torch in code; the "
+            "compile core reachable from _pallas_jax_call must stay torch-free."
+        )
+    import_lines = [
+        line
+        for node in import_nodes
+        if "helion" not in (line := ast.unparse(node)) and not _is_torch_import(line)
+    ]
+    return import_lines, kept
+
+
+def build_jax_fn_ast(
+    body_root: ast.Module,
+    import_lines: list[str],
+    meta: JaxLaunchMeta,
+    *,
+    inline_launcher: bool,
+) -> ast.Module:
+    """Rewrite the generated module AST into the jax-native standalone module.
+
+    Takes the generated ``body_root`` (the ``_helion_<name>`` device kernel + the
+    host wrapper) and the captured ``meta``; returns a new module AST whose
+    entrypoint operates on ``jax.Array`` inputs and drives ``_pallas_jax_call`` (the
+    same launch path the jax_fn runtime uses). ``import_lines`` is mutated in place to
+    the jax import set; the launch core is inlined as AST nodes (``inline_launcher``,
+    pure-jax) or imported from helion. The single ``unparse`` in
+    ``BoundKernel.to_code`` renders the returned module.
+    """
+    device_nodes = _extract_device_kernel_nodes(body_root, meta.kernel_name)
+    device_kernel = f"_helion_{meta.kernel_name}"
+    jax_header = [
+        "import jax",
+        "import jax.numpy as jnp",
+        "from jax.experimental import pallas as pl",
+    ]
+    preamble: list[ast.stmt] = []
+    if inline_launcher:
+        # Pure jax: keep the generated jax imports (drop helion/torch), inline the
+        # jax-only launcher slice, and embed any in-kernel helpers the device uses.
+        gen = [
+            imp
+            for imp in import_lines
+            if "helion" not in imp and not _is_torch_import(imp)
+        ]
+        launcher_imports, launcher_nodes = _launcher_jax_slice()
+        new_imports = dedupe_preserve_order([*jax_header, *gen, *launcher_imports])
+        referenced = _code_name_refs(ast.Module(body=device_nodes, type_ignores=[]))
+        embedded = _embedded_helper_source(" ".join(sorted(referenced)))
+        helper_nodes = ast.parse(embedded).body if embedded else []
+        preamble = [*launcher_nodes, *helper_nodes]
+    else:
+        # jax + helion deps: import the launch core (keep any in-kernel helper
+        # imports); drop torch and the torch launcher import.
+        gen = [
+            imp
+            for imp in import_lines
+            if not _is_torch_import(imp) and "default_pallas_launcher" not in imp
+        ]
+        new_imports = dedupe_preserve_order(
+            [
+                *jax_header,
+                *gen,
+                "from helion.runtime.pallas.launcher import _pallas_jax_call",
+            ]
+        )
+    # Launch metadata + the jax entrypoint, built from generated snippets (ast.parse
+    # constructs each node; no round-trip of the device code, which stays body_root
+    # nodes). block_spec_info's repr is a list of tuples, so it parses cleanly.
+    meta_nodes: list[ast.stmt] = [
+        ast.parse(f"_BLOCK_SPEC_INFO = {meta.block_spec_info!r}").body[0],
+        ast.parse(f"_OUTPUT_INDICES = {meta.output_indices!r}").body[0],
+        ast.parse(f"_USER_POSITIONS = {meta.user_positions!r}").body[0],
+        ast.parse(f"_INTERPRET = {meta.interpret!r}").body[0],
+        ast.parse(f"_N_ARGS = {meta.n_args}").body[0],
+    ]
+    entrypoint = ast.parse(_jax_entrypoint_source(meta, device_kernel)).body[0]
+    import_lines[:] = new_imports
+    module = ast.Module(
+        body=[*preamble, *device_nodes, *meta_nodes, entrypoint],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    return module
+
+
+def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
+    """Source of the jax-native entrypoint: fills the launch slots from the runtime
+    inputs -- grid, output shapes, and shape-derived scalars are all derived from
+    ``inputs[i].shape[d]`` (see the two-probe in ``capture_jax_launch_metadata``), so
+    a single standalone is correct at every dynamic shape -- then drives
+    ``_pallas_jax_call``."""
+    out_lines = [
+        f"    slots[{pos}] = jnp.empty("
+        f"({', '.join(meta.out_shape_exprs[oi])},), {meta.out_dtypes[oi]})"
+        for oi, pos in enumerate(meta.output_indices)
+    ]
+    const_lines = [
+        f"    slots[{p}] = {expr}" for p, expr in sorted(meta.const_slots.items())
+    ]
+    # The explanation goes in the docstring rather than ``#`` comments: this source is
+    # round-tripped through ``ast.parse`` (comments are dropped, the docstring node is
+    # kept). The const-slots sentence is conditional so it appears only when present.
+    doc = (
+        "Standalone jax entrypoint over the user inputs. Grid and output shapes "
+        "derive from the runtime input shapes (two-probe capture), so one module is "
+        "correct at every dynamic input shape."
+    )
+    if meta.const_slots:
+        doc += " Extra slots are constants baked in from the original host wrapper."
+    lines = [
+        f"def {meta.kernel_name}(*inputs):",
+        f'    """{doc}"""',
+        f"    _grid = ({', '.join(meta.grid_exprs)},)",
+        "    slots = [None] * _N_ARGS",
+        "    for pos, inp in zip(_USER_POSITIONS, inputs):",
+        "        slots[pos] = inp",
+        *out_lines,
+        *const_lines,
+        "    results = _pallas_jax_call(",
+        f"        {device_kernel},",
+        "        _grid,",
+        "        tuple(slots),",
+        "        output_indices=_OUTPUT_INDICES,",
+        "        inplace_indices=[],",
+        "        block_spec_info=_BLOCK_SPEC_INFO,",
+        "        scratch_shapes=None,",
+        "        hbm_arg_indices=None,",
+        "        smem_arg_indices=None,",
+        "        interpret=_INTERPRET,",
+        "        compact=None,",
+        "    )",
+        "    return results[0] if len(results) == 1 else tuple(results)",
+    ]
+    return "\n".join(lines)
