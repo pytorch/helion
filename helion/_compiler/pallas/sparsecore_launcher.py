@@ -20,6 +20,7 @@ from .sparsecore_access import DirectStoreAccess
 from .sparsecore_access import IndirectLoadAccess
 from .sparsecore_access import IndirectStoreAccess
 from .sparsecore_access import SparseCoreAccess
+from .sparsecore_compute import classify_cached_loads
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -105,6 +106,7 @@ def build_sparsecore_launcher_spec(
     index_padding = _index_padding(program)
     pad_inputs: list[list[object]] = []
     stream_inputs: list[list[object]] = []
+    packed_inputs: list[list[object]] = []
     seen_inputs: dict[int, tuple[object, ...]] = {}
     emitted_inputs: set[int] = set()
 
@@ -123,6 +125,7 @@ def build_sparsecore_launcher_spec(
         emitted_inputs.add(position)
         return True
 
+    packed_loads, ordinary_loads = classify_cached_loads(program)
     for access in program.loads:
         position = arg_position(access.site.tensor)
         if position is None:
@@ -169,7 +172,21 @@ def build_sparsecore_launcher_spec(
                         ]
                     )
         elif isinstance(access, CachedLoadAccess):
-            record_input(position, ("raw",), access)
+            if access.site.node in packed_loads and access.site.node in ordinary_loads:
+                _reject(
+                    "launcher",
+                    "one cached load is used by packed BF16 and ordinary values",
+                    node=access.site.node,
+                )
+            if access.site.node in packed_loads:
+                transform = (
+                    "packed_cached",
+                    int(access.site.tensor.shape[-1]),
+                )
+                if record_input(position, transform, access):
+                    packed_inputs.append([position, int(access.site.tensor.shape[-1])])
+            else:
+                record_input(position, ("raw",), access)
         else:
             record_input(position, ("raw",), access)
 
@@ -216,6 +233,7 @@ def build_sparsecore_launcher_spec(
     return {
         "pad_inputs": pad_inputs,
         "stream_inputs": stream_inputs,
+        "packed_inputs": packed_inputs,
         "pad_outputs": pad_outputs,
         "reshape_outputs": reshape_outputs,
         "scalar_outputs": scalar_outputs,
