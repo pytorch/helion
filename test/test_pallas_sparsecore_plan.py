@@ -224,9 +224,9 @@ def test_broadcast_store_is_rejected() -> None:
 def test_indirect_load_plan() -> None:
     """Helion: `item_index = index[tile, :]`; `value = table[item_index, :]`."""
     graph = torch.fx.Graph()
-    table = torch.empty(4096, 64)
+    table = torch.empty(4096, 64, dtype=torch.bfloat16)
     index = torch.empty(32, 4, dtype=torch.int32)
-    result = torch.empty(32, 4, 64)
+    result = torch.empty(32, 4, 64, dtype=torch.bfloat16)
     table_node = _placeholder(graph, "table", table)
     index_node = _placeholder(graph, "index", index)
     load = graph.call_function(memory_ops.load, (table_node, (index_node, slice(None))))

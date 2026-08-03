@@ -320,7 +320,7 @@ def _build_indirect_plan(
             f"indirect index dtype must be int32, got {dtype}",
             node=access.node,
         )
-    if access.tensor.dtype not in (torch.float32, torch.int32):
+    if access.tensor.dtype not in (torch.float32, torch.int32, torch.bfloat16):
         _reject(
             "access_dtype",
             f"indirect DMA dtype {access.tensor.dtype} is not implemented",
