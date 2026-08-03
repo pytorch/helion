@@ -159,6 +159,7 @@ def _capture_edges(
         placeholders = list(info.graph.find_nodes(op="placeholder"))
         if not isinstance(outer_args, (list, tuple)):
             continue
+        # Capture arity is a GraphInfo invariant; strict zip surfaces malformed IR.
         for outer, placeholder in zip(outer_args, placeholders, strict=True):
             if isinstance(outer, torch.fx.Node):
                 captures.setdefault(outer, []).append((placeholder, parent))
@@ -174,7 +175,10 @@ def _capture_edges(
 def _resolve_node(
     node: object, placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node]
 ) -> torch.fx.Node | None:
+    seen: set[torch.fx.Node] = set()
     while isinstance(node, torch.fx.Node):
+        assert node not in seen, "cycle while resolving a resident Ref index"
+        seen.add(node)
         if node.target is _tracing_ops._new_var and node.args:
             node = node.args[0]
         elif node.op == "placeholder" and node in placeholder_to_outer:
@@ -280,7 +284,8 @@ def _root_variants(
 ) -> tuple[_ResidentVariant, ...] | None:
     from .backend import SliceAddressing
     from .backend import _slice_addressing
-    from .plan_tiling import IndirectGatherPattern
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+    from .tensorcore_plan import OneHotGatherPlan
 
     tensor = _node_value(producer.args[0])
     value = producer.meta.get("val")
@@ -291,9 +296,9 @@ def _root_variants(
         or tensor.ndim != value.ndim
         or producer.args[2] is not None
         or not isinstance(indices, (list, tuple))
-        or any(
-            isinstance(pattern, IndirectGatherPattern)
-            for pattern in producer.meta.get("indexing_patterns") or ()
+        or isinstance(
+            producer.meta.get(TENSORCORE_PLAN_META),
+            OneHotGatherPlan,
         )
     ):
         return None
