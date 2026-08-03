@@ -377,6 +377,18 @@ def default_pallas_jax_launcher(
             ordered_window=cast("Any", kwargs.get("_compact_ordered_window", 0)),
             interpret=interpret,
         )
+    elif kwargs.get("_sc_launcher_spec") is not None:
+        from .pallas.launcher import _pallas_compile_sc_jit_fn
+
+        result = _pallas_compile_sc_jit_fn(
+            pallas_kernel,
+            args,
+            _output_indices=output_indices,
+            _inplace_indices=_inplace_indices,
+            _scratch_shapes=_scratch_shapes,
+            _sc_launcher_spec=cast("dict[str, object]", kwargs["_sc_launcher_spec"]),
+            interpret=interpret,
+        )
     else:
         result = _pallas_compile_jit_fn(
             pallas_kernel,
