@@ -13,6 +13,7 @@ corresponding checkpoints land.
 from __future__ import annotations
 
 import ast
+import re
 import types
 import unittest
 from unittest.mock import patch
@@ -39,6 +40,7 @@ from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+from helion.runtime.pallas.launcher import _pallas_resolve_ds_pad_amounts
 from helion.runtime.settings import is_pallas_interpret
 
 if _get_backend() == "pallas" and is_pallas_interpret():
@@ -2561,6 +2563,102 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
 
         self.assertEqual(ordered_resident_bound_arg(plan("kvo")), "kvo")
         self.assertIsNone(ordered_resident_bound_arg(plan(None)))
+
+
+class TestCompactWindowPadding(unittest.TestCase):
+    """Row slack the compact-worklist windows request, and how it resolves.
+
+    A compact window is sliced by a BlockSpec at a runtime row offset, so the
+    kernel body never records it as a ``pl.ds`` and the caller's tensor gets no
+    padding unless ``_compute_pad_info`` asks for it.  Without that slack the
+    window DMAs a whole block past a tensor allocated with exactly
+    ``sum(lengths)`` rows, halting the core on a bounds check.
+    """
+
+    def test_fixed_slack_pads_exactly(self):
+        """``block_size == 1`` means "no rounding, pad exactly ``extra_pad``"."""
+        t = torch.zeros(200, 4)
+        self.assertEqual(
+            _pallas_resolve_ds_pad_amounts((t,), [(0, 0, 1, 255)]),
+            {0: {0: 255}},
+        )
+
+    def test_alignment_and_fixed_slack_resolve_to_the_max(self):
+        """Several requirements on one (arg, dim) take the max, never the sum.
+
+        Neither parameter orders them, which is why the winner cannot be chosen
+        where the entries are emitted: at 200 rows the fixed-slack entry
+        dominates one pair and the alignment entry dominates another, and the
+        second pair flips once the row count makes its modulo term vanish.
+        """
+        t200 = torch.zeros(200, 4)
+        # alignment (-200) % 128 == 56 vs fixed 255 -> 255, and NOT 56 + 255.
+        self.assertEqual(
+            _pallas_resolve_ds_pad_amounts((t200,), [(0, 0, 128, 0), (0, 0, 1, 255)]),
+            {0: {0: 255}},
+        )
+        # alignment (-200) % 1024 == 824 dominates the fixed 8 here ...
+        self.assertEqual(
+            _pallas_resolve_ds_pad_amounts((t200,), [(0, 0, 1024, 0), (0, 0, 1, 8)]),
+            {0: {0: 824}},
+        )
+        # ... but at 1024 rows that same pair flips: the modulo term is 0.
+        t1024 = torch.zeros(1024, 4)
+        self.assertEqual(
+            _pallas_resolve_ds_pad_amounts((t1024,), [(0, 0, 1024, 0), (0, 0, 1, 8)]),
+            {0: {0: 8}},
+        )
+
+
+@onlyBackends(["pallas"])
+class TestCompactWindowPadEmission(unittest.TestCase):
+    """The slack ``_compute_pad_info`` actually emits for each window kind."""
+
+    def _emitted(self, block=64):
+        """Launcher kwargs of a jagged ordered kernel, which has both windows."""
+        qo = _offsets([300, 100, 256])
+        lq = int(qo[-1])
+        bk = _noprep_ordered_kernel.bind(
+            (torch.randn(lq, 2, 8), torch.randn(lq, 2, 8), qo)
+        )
+        code = bk.to_triton_code(_worklist_config([block, block]))
+
+        def grab(name):
+            match = re.search(rf"{name}=(\[[^\]]*\]|\d+)", code)
+            self.assertIsNotNone(match, f"expected {name} in the launcher call")
+            return ast.literal_eval(match.group(1))
+
+        return {
+            name: grab(name)
+            for name in (
+                "_ds_pad_dims",
+                "_compact_aligned_arg_indices",
+                "_compact_ordered_aligned_arg_indices",
+                "_compact_block",
+                "_compact_ordered_window",
+            )
+        }
+
+    def test_compact_tile_window_requests_block_minus_one(self):
+        """A per-tile window only exists for a range with rows in it, so it
+        starts no later than ``rows - 1`` and reaches ``rows - 1 + block``."""
+        got = self._emitted()
+        aligned = got["_compact_aligned_arg_indices"]
+        self.assertTrue(aligned, "expected compact-aligned args")
+        for arg in aligned:
+            self.assertIn((arg, 0, 1, got["_compact_block"] - 1), got["_ds_pad_dims"])
+
+    def test_resident_window_requests_a_full_window(self):
+        """A resident window is keyed on a range START, and an owner whose
+        ordered range is empty puts that base at ``rows`` -- so it reaches
+        ``rows + window`` and needs one row more than the per-tile window."""
+        got = self._emitted()
+        ordered = got["_compact_ordered_aligned_arg_indices"]
+        self.assertTrue(ordered, "expected resident (owner-cache) args")
+        for arg in ordered:
+            self.assertIn(
+                (arg, 0, 1, got["_compact_ordered_window"]), got["_ds_pad_dims"]
+            )
 
 
 if __name__ == "__main__":

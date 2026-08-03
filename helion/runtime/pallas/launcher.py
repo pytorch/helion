@@ -831,11 +831,16 @@ def _pallas_padded_output_dims_by_arg(
     whose ``arg_idx`` is in ``output_arg_set`` so callers can slice
     those outputs back to their original shapes.  Both the torch path
     (via ``_LauncherFastPath``) and the JAX-export launcher use this.
+
+    A ``(arg_idx, dim)`` may appear more than once (a tensor reached by several
+    slicing windows), but it is padded once, so each dim is listed once.
     """
     padded_dims_by_arg: dict[int, list[int]] = {}
     for arg_idx, dim, _bs, _extra in _ds_pad_dims:
         if arg_idx in output_arg_set:
-            padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
+            dims = padded_dims_by_arg.setdefault(arg_idx, [])
+            if dim not in dims:
+                dims.append(dim)
     return padded_dims_by_arg
 
 
@@ -958,6 +963,60 @@ def _pallas_collect_outputs(
     return tuple(output_only_results)
 
 
+def _pallas_resolve_ds_pad_amounts(
+    args: tuple[object, ...],
+    _ds_pad_dims: list[tuple[int, int, int, int]],
+) -> dict[int, dict[int, int]]:
+    """Rows of padding each ``(arg, dim)`` needs, as ``{arg_idx: {dim: pad}}``.
+
+    Every ``(arg_index, dim, block_size, extra_pad)`` entry asks for
+    ``(-rows) % block_size + extra_pad`` rows.  That covers two different
+    requirements:
+
+    * ALIGNMENT (``block_size > 1``) -- a ``pl.ds`` loop steps the dim in
+      ``block_size`` chunks, so the tensor rounds up to a block multiple.
+    * FIXED RIGHT SLACK (``block_size == 1``) -- a window opens at an arbitrary
+      runtime row and spans a fixed length, so it needs a set number of rows of
+      headroom past the end and nothing rounded.  ``(-rows) % 1`` is always 0,
+      so the amount is exactly ``extra_pad``.  These entries are DELIBERATE and
+      load-bearing: do not filter them out alongside the ``bs > 1`` test that
+      ``_compute_pad_info`` applies to alignment entries, or a compact-worklist
+      window silently loses its padding and reads past the tensor again.
+
+    ``_ds_pad_dims`` may carry SEVERAL entries for one ``(arg, dim)`` -- a tensor
+    can be reached by more than one window (e.g. a compact-aligned operand that
+    is also resident-cached), and the two kinds mix.  Their amounts are ordered
+    only once ``rows`` is known (an entry with a larger block can need LESS than
+    one with a smaller block and a bigger ``extra_pad``), so they cannot be
+    compared where they are emitted.  Resolve them here and keep the max, so a
+    single pad satisfies every window.
+
+    Every amount is measured against the ORIGINAL shape, so callers must apply
+    at most one pad per ``(arg, dim)``; padding once per entry would compound.
+    Zero-pad entries are dropped, so an empty result means "nothing to do".
+    """
+    amounts: dict[int, dict[int, int]] = {}
+    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+        a = args[arg_idx]
+        if not isinstance(a, torch.Tensor):
+            continue
+        pad_amount = (-a.shape[dim]) % block_size + extra_pad
+        if pad_amount == 0:
+            continue
+        per_dim = amounts.setdefault(arg_idx, {})
+        if pad_amount > per_dim.get(dim, 0):
+            per_dim[dim] = pad_amount
+    return amounts
+
+
+def _pallas_pad_tensor_dims(a: torch.Tensor, dims: dict[int, int]) -> torch.Tensor:
+    """Pad ``a`` at the end of each ``dim`` by ``dims[dim]`` rows, in one call."""
+    pad_widths = [0] * (2 * a.ndim)
+    for dim, pad_amount in dims.items():
+        pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
+    return torch.nn.functional.pad(a, pad_widths)
+
+
 def _pallas_apply_ds_padding_fast(
     args: tuple[object, ...],
     _ds_pad_dims: list[tuple[int, int, int, int]],
@@ -965,33 +1024,22 @@ def _pallas_apply_ds_padding_fast(
     padded_output_arg_indices: frozenset[int],
 ) -> tuple[tuple[object, ...], dict[int, torch.Tensor] | None, bool]:
     """``_pallas_apply_ds_padding`` with a short-circuit when every pad amount is zero."""
-    args_list: list[object] | None = None
-    orig_output_tensors: dict[int, torch.Tensor] | None = None
-    any_padding = False
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
-        a = args[arg_idx] if args_list is None else args_list[arg_idx]
-        if not isinstance(a, torch.Tensor):
-            continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
-            continue
-        any_padding = True
-        if args_list is None:
-            args_list = list(args)
-        if arg_idx in padded_output_arg_indices:
-            if orig_output_tensors is None:
-                orig_output_tensors = {}
-            if arg_idx not in orig_output_tensors:
-                orig_output_tensors[arg_idx] = cast("torch.Tensor", a)
-        pad_widths = [0] * (2 * a.ndim)
-        pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
-        args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
+    amounts = _pallas_resolve_ds_pad_amounts(args, _ds_pad_dims)
     if fast_path.ds_pad_required is None:
         # First-call precomputation: lock in whether any pad amount is
         # non-zero so subsequent calls can elide the iteration outright.
-        fast_path.ds_pad_required = any_padding
-    if args_list is None:
+        fast_path.ds_pad_required = bool(amounts)
+    if not amounts:
         return args, None, False
+    args_list = list(args)
+    orig_output_tensors: dict[int, torch.Tensor] | None = None
+    for arg_idx, dims in amounts.items():
+        a = cast("torch.Tensor", args_list[arg_idx])
+        if arg_idx in padded_output_arg_indices:
+            if orig_output_tensors is None:
+                orig_output_tensors = {}
+            orig_output_tensors[arg_idx] = a
+        args_list[arg_idx] = _pallas_pad_tensor_dims(a, dims)
     return tuple(args_list), orig_output_tensors, True
 
 
@@ -1342,11 +1390,12 @@ def _pallas_apply_ds_padding(
     _output_indices: list[int],
     _ds_pad_dims: list[tuple[int, int, int, int]],
 ) -> tuple[tuple[object, ...], dict[int, torch.Tensor]]:
-    """Pad tensor args so ``pl.ds(offset, block_size)`` never reads OOB.
+    """Pad tensor args so a windowed read never runs past the tensor.
 
     ``_ds_pad_dims`` contains ``(arg_index, dim, block_size, extra_pad)``
-    tuples.  The pad amount is ``(-tensor.shape[dim]) % block_size +
-    extra_pad``, where *extra_pad* accounts for non-zero loop begins.
+    tuples, possibly several for one ``(arg_index, dim)``;
+    :func:`_pallas_resolve_ds_pad_amounts` turns them into the single largest
+    pad each position needs, so every tensor is padded exactly once.
 
     Returns the padded args tuple and a dict mapping output arg indices
     to their original (unpadded) tensors for post-call copy-back.
@@ -1354,18 +1403,11 @@ def _pallas_apply_ds_padding(
     args_list = list(args)
     orig_output_tensors: dict[int, torch.Tensor] = {}
     output_set = set(_output_indices)
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
-        a = args_list[arg_idx]
-        if not isinstance(a, torch.Tensor):
-            continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
-            continue
-        if arg_idx in output_set and arg_idx not in orig_output_tensors:
+    for arg_idx, dims in _pallas_resolve_ds_pad_amounts(args, _ds_pad_dims).items():
+        a = cast("torch.Tensor", args_list[arg_idx])
+        if arg_idx in output_set:
             orig_output_tensors[arg_idx] = a
-        pad_widths = [0] * (2 * a.ndim)
-        pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
-        args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
+        args_list[arg_idx] = _pallas_pad_tensor_dims(a, dims)
     return tuple(args_list), orig_output_tensors
 
 
@@ -2137,6 +2179,57 @@ def default_pallas_launcher(
     )
 
 
+def _compact_window_block_spec(
+    t: object,
+    window: int,
+    ref_pos: int,
+    scalar_refs: tuple[object, ...],
+) -> object:
+    """BlockSpec for one compact-worklist window: ``window`` rows of dim 0 at the
+    runtime row offset in ``scalar_refs[ref_pos]``, other dims full.
+
+    The offset is a RAW compact row (an owner base plus a tile step), never
+    aligned down to a sublane boundary, so the block dim must accept a dynamic,
+    possibly-unaligned start.  ``pl.Element`` is the mechanism that tolerates
+    that: Mosaic lowers an element-indexed block to a dynamic-offset access,
+    where a plain int block dim would require an aligned, fixed-grid block.
+
+    ``pl.Element`` always transfers the FULL window, which runs off the end of a
+    compact/jagged tensor -- normally allocated with exactly ``sum(lengths)``
+    rows -- on the last tile of the final range.  Pallas does not prevent that:
+    it clamps a block dim against the array only when that dim is TILED (jax's
+    Mosaic ``_create_bounded_slice`` returns ``ds(start, window)`` verbatim when
+    the dim has no tiling, which is the case for the leading dim of a
+    ``(rows, ...)`` tensor), and ``Element``'s ``padding=`` never reaches that
+    computation.  Unpadded, the window DMAs whole blocks past the buffer: a
+    BoundsCheck core halt on ``dma.hbm_to_vmem``, plus a matching full-block
+    store past the output.  So the caller's tensor must carry enough rows of
+    slack past the end to cover the last window, which ``_compute_pad_info``
+    requests as a fixed-slack pad -- ``window - 1`` for a per-tile window,
+    whose start is at most ``rows - 1``, and a full ``window`` for a resident
+    one, whose start is a range base that an empty trailing range puts at
+    ``rows``.  ``_compact_window_pad_info`` derives both.
+
+    The kernel body slices ``pl.ds(0, window)`` off a window-sized ref and masks
+    the tail, so rows past a range's end are already ignored.
+    """
+    from jax.experimental import pallas as pl
+    import jax.numpy as jnp
+
+    ndim = int(t.ndim)  # type: ignore[attr-defined]
+    block_shape = (pl.Element(window, padding=(0, window)), *t.shape[1:])  # type: ignore[union-attr,attr-defined]
+
+    def index_map(
+        wid: object,
+        _pos: int = ref_pos,
+        _nd: int = ndim,
+    ) -> tuple[object, ...]:
+        start = scalar_refs[_pos][wid]  # type: ignore[index]
+        return (start, *(jnp.int32(0) for _ in range(_nd - 1)))
+
+    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+
+
 def _pallas_compact_in_out_specs(
     pl: object,
     jnp: object,
@@ -2178,57 +2271,24 @@ def _pallas_compact_in_out_specs(
         t = args[idx]
         assert _is_torch_tensor_or_jax_array(t)
         if idx in aligned_set:
-            # compact_aligned_load: slice dim 0 to one tile at tile_start via
-            # pl.Element so Pallas prefetches/double-buffers it; other dims full.
-            # Use the FULL compact_block (not min with the tensor length): the
-            # body slices ``pl.ds(0, compact_block)``, and the ``padding=(0,
-            # compact_block)`` lets the read overshoot the tensor end (handles a
-            # short compact dimension).  Clamping the block here would mismatch the
-            # body's pl.ds size and slice out of bounds.
-            #
-            # tile_start is the RAW compact offset (base + tile*block), NOT
-            # sublane-aligned-down: packed rows can start at arbitrary
-            # offsets.  pl.Element is exactly the mechanism that tolerates a
-            # dynamic, possibly-unaligned start -- Mosaic lowers an element-indexed
-            # block to a dynamic-offset (un)masked access, where a plain int block
-            # dim would require an aligned, fixed-grid block.  Verified bitwise ==
-            # fori_loop on unaligned/random offsets; this holds for both the load
-            # and the full-block store.
-            # Element only on dim 0: emit_pipeline rejects it on the lane dim.
-            block = compact_block
-            elt = pl.Element(block, padding=(0, block))  # type: ignore[union-attr]
-            block_shape = (elt, *t.shape[1:])
-
-            def aligned_index_map(
-                wid: object,
-                _pos: int = tile_start_ref_pos,
-                _nd: int = t.ndim,
-            ) -> tuple[object, ...]:
-                tile_start = scalar_refs[_pos][wid]  # type: ignore[index]
-                return (tile_start, *(jnp.int32(0) for _ in range(_nd - 1)))  # type: ignore[union-attr]
-
-            return pl.BlockSpec(block_shape, aligned_index_map)  # type: ignore[union-attr]
+            # compact_aligned_load / compact_exact_store: one compact_block-row
+            # window at tile_start, so Pallas prefetches and double-buffers both
+            # the load and the store write-back across work items.  Window
+            # sizing and the tensor-end hazard: _compact_window_block_spec.
+            # Windowed on dim 0 only: emit_pipeline rejects it on the lane dim.
+            return _compact_window_block_spec(
+                t, compact_block, tile_start_ref_pos, scalar_refs
+            )
         if idx in ordered_aligned_set:
-            # Resident caching: per-range resident window sized ``ordered_window`` (C)
-            # at ``range_start`` -- the fori body reads it at the local ordered-tile
-            # offset (offset - range_start).  padding=(0, C) tolerates reads past
-            # the range tail (same as the compact_aligned_load window).  Keying
-            # on range_start lets Pallas dedup the load across same-range tiles.
-            # Element only on dim 0: emit_pipeline rejects it on the lane dim.
+            # Resident caching: per-range resident window sized ``ordered_window``
+            # (C) at ``range_start`` -- the fori body reads it at the local
+            # ordered-tile offset (offset - range_start).  Keying on range_start
+            # lets Pallas dedup the load across same-range tiles.
             assert ordered_window > 0
             assert range_start_ref_pos >= 0
-            oelt = pl.Element(ordered_window, padding=(0, ordered_window))  # type: ignore[union-attr]
-            oblock_shape = (oelt, *t.shape[1:])
-
-            def ordered_index_map(
-                wid: object,
-                _pos: int = range_start_ref_pos,
-                _nd: int = t.ndim,
-            ) -> tuple[object, ...]:
-                start = scalar_refs[_pos][wid]  # type: ignore[index]
-                return (start, *(jnp.int32(0) for _ in range(_nd - 1)))  # type: ignore[union-attr]
-
-            return pl.BlockSpec(oblock_shape, ordered_index_map)  # type: ignore[union-attr]
+            return _compact_window_block_spec(
+                t, ordered_window, range_start_ref_pos, scalar_refs
+            )
         entry = block_spec_info[arg_to_tpos[idx]] if block_spec_info else None
         if entry is not None:
             block_shape_template, grid_dims = entry

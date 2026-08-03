@@ -901,18 +901,31 @@ class PallasBackend(Backend):
         sorted_args: list[Argument] | None,
         config: Config,
     ) -> list[tuple[int, int, int, int]] | None:
-        """Identify pl.ds() dims that may need padding and their block sizes.
+        """Identify dims that may need padding and their block sizes.
 
         Uses ``pallas_pad_info`` recorded during codegen to identify which
-        tensor dimensions use ``pl.ds()`` slicing.
+        tensor dimensions use ``pl.ds()`` slicing, plus the compact-worklist
+        windows (see :meth:`_compact_window_pad_info`), whose slicing lives in a
+        BlockSpec rather than in the kernel body.
 
-        Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
-        or ``None``.  The launcher computes the actual pad amount at runtime
-        as ``(-tensor.shape[dim]) % block_size + extra_pad``.
+        Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]`` or
+        ``None``.  ``_pallas_resolve_ds_pad_amounts`` turns each entry into
+        ``(-rows) % block_size + extra_pad`` rows, which expresses both kinds of
+        requirement:
 
-        ``extra_pad`` is 0 when the tile loop starts at offset 0,
-        ``begin % block_size`` for a constant begin offset, or
-        ``block_size - 1`` for a data-dependent begin.
+        * A ``pl.ds`` tile loop rounds its dim up to a block multiple, so it
+          sets the real ``block_size``, with ``extra_pad`` 0 for a loop starting
+          at offset 0, ``begin % block_size`` for a constant begin, or
+          ``block_size - 1`` for a data-dependent begin.
+        * A compact-worklist window needs a FIXED number of rows past the end
+          and no rounding, so it sets ``block_size = 1`` (making the modulo term
+          vanish) and puts the whole requirement in ``extra_pad`` -- see
+          :meth:`_compact_window_pad_info`.
+
+        One ``(arg_index, dim)`` may appear more than once when a tensor is
+        reached by several windows.  They are NOT merged here: an alignment
+        requirement's size depends on the row count, which this pass does not
+        have, so the largest cannot be identified until launch time.
         """
         if sorted_args is None:
             return None
@@ -923,22 +936,111 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
-        if not device_fn.pallas_pad_info:
-            return None
 
         result: list[tuple[int, int, int, int]] = []
-        for i, arg in enumerate(sorted_args):
-            if not isinstance(arg, TensorArg):
-                continue
-            dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
-            if dims_info is not None:
-                for dim, (block_id, extra_pad) in dims_info.items():
-                    bsi = env.block_sizes[block_id]
-                    bs = bsi.from_config(config)
-                    if isinstance(bs, int) and bs > 1:
-                        result.append((i, dim, bs, extra_pad))
+        if device_fn.pallas_pad_info:
+            for i, arg in enumerate(sorted_args):
+                if not isinstance(arg, TensorArg):
+                    continue
+                dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
+                if dims_info is not None:
+                    for dim, (block_id, extra_pad) in dims_info.items():
+                        bsi = env.block_sizes[block_id]
+                        bs = bsi.from_config(config)
+                        # A 1-wide alignment block never needs rounding, so it is
+                        # dropped.  This test applies ONLY to alignment entries:
+                        # the compact-window entries below deliberately carry
+                        # ``block_size = 1`` to mean "no rounding, pad exactly
+                        # ``extra_pad``", and dropping those would silently
+                        # restore the out-of-bounds window read they prevent.
+                        if isinstance(bs, int) and bs > 1:
+                            result.append((i, dim, bs, extra_pad))
 
+        # Sorted by arg index so the emitted list stays stable across compiles
+        # (the tensor-policy order these come from is insertion order).
+        result.extend(
+            (arg_index, 0, 1, min_slack)
+            for arg_index, min_slack in sorted(
+                self._compact_window_pad_info(sorted_args)
+            )
+        )
         return result or None
+
+    def _compact_window_pad_info(
+        self, sorted_args: list[Argument]
+    ) -> list[tuple[int, int]]:
+        """Rows of slack each compact-worklist window needs past the tensor end.
+
+        Returns ``[(arg_index, slack_rows), ...]`` for dim 0.  These are
+        absolute requirements, not alignment ones: a window opens at a runtime
+        row and spans a fixed length, so rounding the tensor to a block multiple
+        is both unnecessary and insufficient.  The caller emits them with
+        ``block_size = 1`` so the pad formula reduces to exactly ``slack_rows``.
+
+        Compact-worklist operands are sliced by a ``pl.Element`` BlockSpec at a
+        runtime row offset rather than by a ``pl.ds()`` in the kernel body, so
+        codegen never records them in ``pallas_pad_info`` and they would
+        otherwise get no padding at all.  They still need it: Pallas clamps a
+        block dim against the array only when that dim is TILED (jax's Mosaic
+        ``_create_bounded_slice`` returns ``ds(start, block)`` verbatim when the
+        dim has no tiling, which is the case for the leading dim of a
+        ``(rows, ...)`` tensor), and ``Element``'s ``padding=`` never reaches
+        that computation.  A compact/jagged tensor is normally allocated with
+        exactly ``sum(lengths)`` rows, so without slack the window DMAs whole
+        blocks past the buffer: the core halts with a BoundsCheck on
+        ``dma.hbm_to_vmem``, and the matching full-block store writes past the
+        output.
+
+        The two window kinds differ by one row, because their starts differ:
+
+        * A compact tile only exists for a range with rows in it, and its start
+          is that range's base plus a whole number of tile steps, so it begins
+          no later than ``rows - 1`` and reaches ``rows - 1 + block``.  Slack
+          ``block - 1``.
+        * A resident window is keyed on a range START, which is a separate
+          per-owner base: an owner whose compact range is non-empty may still
+          have an EMPTY ordered range, and if it is the trailing one that base
+          equals ``rows``.  The window then reaches ``rows + window``.  Slack
+          ``window``.
+
+        Which range overshoots is runtime data, hence the conservative bounds.
+        """
+        from ..compile_environment import CompileEnvironment
+        from ..device_function import TensorArg
+
+        env = CompileEnvironment.current()
+        plan = env.compact_worklist_plan
+        if plan is None:
+            return []
+
+        name_to_index = {
+            arg.host_str(): i
+            for i, arg in enumerate(sorted_args)
+            if isinstance(arg, TensorArg)
+        }
+
+        entries: list[tuple[int, int]] = []
+        # Compact-tile operands: one ``compact_block``-row window at tile_start.
+        compact_block = env.compact_worklist_block * plan.grouping
+        if compact_block > 0:
+            for policy in plan.tensor_policies:
+                if policy.kind not in ("compact_aligned_load", "compact_exact_store"):
+                    continue
+                arg_index = name_to_index.get(policy.arg_name)
+                if arg_index is not None:
+                    entries.append((arg_index, compact_block - 1))
+
+        # Resident (owner-cache) operands: one ``physical_window``-row window at
+        # range_start, which is likewise an unaligned runtime row offset.
+        decision = env.compact_worklist_resident_cache_decision
+        if decision is not None and decision.active and decision.physical_window > 0:
+            window = decision.physical_window
+            for name in decision.resident_operands:
+                arg_index = name_to_index.get(name)
+                if arg_index is not None:
+                    entries.append((arg_index, window))
+
+        return entries
 
     def _detect_matmul_dot_general_lowering(
         self,
@@ -1278,14 +1380,20 @@ class PallasBackend(Backend):
         # make_async_copy over pl.ds(tile_start, tile_extent) serializes (~1.8x
         # slower: 4.5ms vs 2.5ms) because a straight-line compact tile has no inner
         # loop to overlap; (b) a pl.BoundedSlice store BlockSpec (exact + double-buffered)
-        # is rejected by this JAX's Mosaic lowering ("Unsupported block dimension
-        # type: BoundedSlice" -- it only works inside pltpu.emit_pipeline).  The
-        # full-block write's only hazard is a partial last tile overlapping the
-        # next owner's leading rows; "arbitrary" dimension semantics serialize
-        # that grid-ordered overlap so the later, correct write wins (verified
-        # bitwise == fori_loop across uniform/partial/unaligned/jagged + 5 random
-        # seeds).  Robust+fast exact store == the deferred emit_pipeline +
-        # pl.BoundedSlice path.
+        # was rejected by the Mosaic lowering of the JAX this was written against
+        # ("Unsupported block dimension type: BoundedSlice" -- it only worked inside
+        # pltpu.emit_pipeline).  jax 0.11 DOES lower a BoundedSlice block dim in a
+        # plain pallas_call (measured: same throughput as pl.Element, and its
+        # index_map can clamp the transfer to the tensor so the row padding
+        # _compute_pad_info adds for pl.Element becomes unnecessary -- worth ~8% on
+        # jagged self-attention).  It stays unused because pyproject pins no jax
+        # floor and the older lowering has no fallback within one BlockSpec.
+        # The full-block write's only hazard WITHIN the tensor is a partial last
+        # tile overlapping the next owner's leading rows; "arbitrary" dimension
+        # semantics serialize that grid-ordered overlap so the later, correct write
+        # wins (verified bitwise == fori_loop across uniform/partial/unaligned/jagged
+        # + 5 random seeds).  Running off the END of the tensor is a separate hazard
+        # handled by padding; see _compact_window_pad_info.
         aligned_indices = [
             name_to_index[p.arg_name]
             for p in plan.tensor_policies

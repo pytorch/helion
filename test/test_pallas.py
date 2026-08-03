@@ -4189,8 +4189,11 @@ class TestPallas(TestCase):
             match.group(1)
         )  # [(arg, dim, block_size, extra_pad)]
         self.assertTrue(pad_dims, "expected pl.ds pad dims to be present")
+        # Unpack every field rather than starring: a starred bind silently
+        # follows the tuple's last field if its shape ever changes, which would
+        # stop this from checking extra_pad at all.
         self.assertTrue(
-            all(extra_pad == 0 for *_, extra_pad in pad_dims),
+            all(extra_pad == 0 for _arg, _dim, _bs, extra_pad in pad_dims),
             f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
         )
 
