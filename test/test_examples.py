@@ -38,6 +38,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -638,6 +639,46 @@ class TestExamples(RefEagerTestBase, TestCase):
                 eps=1e-05,
             ),
         )
+
+    @parametrize("reduction_block_size", (32, 1024))
+    @onlyBackends(["triton"])
+    @skipIfNotCUDA()
+    @skipIfRefEager("Test requires compiling a specific reduction config")
+    @skipUnlessTensorDescriptor("Test configs require tensor descriptor support")
+    def test_welford_bfloat16_accuracy(self, reduction_block_size):
+        from examples.welford import eager_layer_norm
+        from examples.welford import welford
+
+        config = helion.Config(
+            atomic_indexing=[],
+            block_sizes=[16, reduction_block_size, 256],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+            ],
+            load_eviction_policies=["last", "first", "", "last"],
+            num_stages=1,
+            num_warps=4,
+            pid_type="flat",
+            range_flattens=[None, None, None],
+            range_multi_buffers=[None, None, None],
+            range_num_stages=[0, 0, 0],
+            range_unroll_factors=[0, 0, 0],
+        )
+
+        torch.manual_seed(1337)
+        rows, columns = 4096, 1024
+        weight = torch.randn(columns, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(columns, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn(rows, columns, device=DEVICE, dtype=torch.bfloat16)
+        expected = eager_layer_norm(weight, bias, x)
+
+        actual = welford.bind((weight, bias, x)).compile_config(config)(weight, bias, x)
+
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
