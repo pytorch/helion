@@ -1557,7 +1557,7 @@ class TestPallas(TestCase):
             code_and_output(whole_and_part, (x, out), pallas_loop_type="fori_loop")
 
     def test_resident_subview_declines_when_source_is_written(self) -> None:
-        """A store to the loaded tensor defeats residency.
+        """A store through an alias of the loaded tensor defeats residency.
 
         A resident block is read where the consumer runs, so it would otherwise
         observe a write issued after the load.
@@ -1568,11 +1568,12 @@ class TestPallas(TestCase):
             x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
         ) -> None:
             tokens, _heads, _width = x.size()
+            x_alias = x.view_as(x)
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)
                 for outer in hl.tile(tokens, block_size=4):
                     x_block = x[outer, :, :]
-                    x[outer, :, :] = y[outer, :, :]
+                    x_alias[outer, :, :] = y[outer, :, :]
                     live = outer.end - outer.begin
                     for local in hl.tile(live, block_size=1):
                         acc = acc + x_block[local.begin, :, :].float()
