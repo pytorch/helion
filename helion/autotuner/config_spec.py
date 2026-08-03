@@ -28,6 +28,9 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
+from .._compiler.ascend.config import _npu_cap_reduction_loops
+from .._compiler.ascend.config import _npu_default_reduction_loop
+from .._compiler.ascend.config import is_npu
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
@@ -609,6 +612,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 # the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
+        if is_npu():
+            return ("",)
         return ("", "first", "last")
     return ("",)
 
@@ -719,6 +724,13 @@ class ConfigSpec:
         # (currently the tcgen05 narrowing applied per matmul), for search-space
         # logging. De-duplicated; ordered by first occurrence.
         self.restriction_reasons: list[tuple[str, str]] = []
+        if is_npu():
+            # NPU: persistent pid for coreDim 65535 limit
+            self.allowed_pid_types = (
+                "flat",
+                "persistent_blocked",
+                "persistent_interleaved",
+            )
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
@@ -859,6 +871,10 @@ class ConfigSpec:
             self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        # NPU backends (e.g. Triton-ascend) may not fully support block_ptr and can
+        # hit device-side faults (e.g. unaligned UUB access). Keep indexing conservative.
+        if is_npu():
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         if not self.backend.supports_block_ptr_indexing():
@@ -870,6 +886,33 @@ class ConfigSpec:
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
+
+    def downgrade_unsupported_indexing(self, config: dict[str, object]) -> None:
+        """Replace ``indexing``/``atomic_indexing`` values this device does not support.
+
+        Examples written for CUDA/Blackwell may pin values such as
+        ``"tensor_descriptor"`` or ``"block_ptr"``. On a device whose valid set
+        is restricted (e.g. NPU only allows ``"pointer"``) those values would
+        otherwise flow into codegen and fault or behave inconsistently. Replace
+        each unsupported value with the first valid type so configs stay
+        portable across devices. On NVIDIA the valid sets already contain the
+        values examples use, so this is a no-op there.
+        """
+        # NPU-only: on CUDA block_ptr is valid, so restrict to NPU.
+        if not is_npu():
+            return
+        for name, valid in (
+            ("indexing", self.valid_indexing_types()),
+            ("atomic_indexing", self.valid_atomic_indexing_types()),
+        ):
+            if name not in config or not self.supports_config_key(name):
+                continue
+            value = config[name]
+            if isinstance(value, str):
+                if value not in valid:
+                    config[name] = valid[0]
+            elif isinstance(value, (list, tuple)):
+                config[name] = type(value)(v if v in valid else valid[0] for v in value)
 
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
@@ -1909,6 +1952,20 @@ class ConfigSpec:
                 if changed:
                     config["reduction_loops"] = new_loops
 
+        # NPU: cap reduction_loops to fit UB budget; convert [None] to looped default.
+        if is_npu() and isinstance(config.get("reduction_loops"), list):
+            capped = _npu_cap_reduction_loops(
+                config["reduction_loops"], config.get("block_sizes")
+            )
+            if capped is not None:
+                config["reduction_loops"] = capped
+        if (
+            is_npu()
+            and isinstance(config.get("block_sizes"), list)
+            and self.tensor_numel_constraints
+        ):
+            self._shrink_for_numel_constraints(config)
+
         # CuTe-specific: persistent reduction whose thread count is shrunk
         # below the reduction extent by adjust_reduction_thread_count would
         # wrap the kernel body in a synthetic lane loop. The lane loop
@@ -2019,7 +2076,12 @@ class ConfigSpec:
             "maxnreg",
         ):
             if not self.supports_config_key(name):
-                config.pop(name, None)
+                # In NPU environment, set num_warps and num_stages to None instead
+                # of removing them (codegen omits them when None).
+                if name in ("num_warps", "num_stages") and is_npu():
+                    config[name] = None
+                else:
+                    config.pop(name, None)
 
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
@@ -2043,6 +2105,8 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
+        # Downgrade unsupported indexing values (e.g. block_ptr on NPU).
+        self.downgrade_unsupported_indexing(config)
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
@@ -2135,8 +2199,11 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"Invalid value for 'pid_type': {config['pid_type']!r} must be one of {list(VALID_PID_TYPES)!r}"
                     )
+                # NPU-only: downgrade for device portability (barrier disallow must raise, not silently upgrade).
+                if is_npu() and config["pid_type"] not in self.allowed_pid_types:
+                    config["pid_type"] = self.allowed_pid_types[0]
             else:
-                config["pid_type"] = VALID_PID_TYPES[0]
+                config["pid_type"] = self.allowed_pid_types[0]
 
         if self.supports_config_key("xcd_remap"):
             if "xcd_remap" in config:
@@ -2355,6 +2422,10 @@ class ConfigSpec:
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
 
+        # Triton-ascend: force ``range_unroll_factors`` off on NPU
+        # (see coerce_npu_tl_range_tunables).
+        self.coerce_npu_tl_range_tunables(config)
+
         if self.backend_name == "cute":
             preserve_keys = self._cute_tcgen05_config.implicit_default_keys_to_preserve(
                 config
@@ -2366,8 +2437,24 @@ class ConfigSpec:
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
         }
+        # In NPU environment, allow num_warps and num_stages keys (set to None).
+        if is_npu():
+            allowed_keys = allowed_keys | {"num_warps", "num_stages"}
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
+
+    def coerce_npu_tl_range_tunables(self, config: dict[str, object]) -> None:
+        """If compiling for NPU, normalize selected ``tl.range`` tunables (in place).
+
+        Force ``range_unroll_factors`` to all zeros so ``tl.range`` does not receive
+        ``loop_unroll_factor``. ``range_num_stages`` and ``range_multi_buffers`` are
+        left to the caller for experimentation.
+        """
+        if not is_npu():
+            return
+        rub = config.get("range_unroll_factors")
+        if isinstance(rub, list) and rub:
+            config["range_unroll_factors"] = [0] * len(rub)
 
     def raise_grid_block_minimums(self) -> None:
         """Raise min_size for grid block dimensions based on problem size.
@@ -2488,11 +2575,17 @@ class ConfigSpec:
         self._shrink_for_numel_constraints(config)
         return config
 
-    def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
+    def _shrink_for_numel_constraints(
+        self, config: helion.Config | dict[str, object]
+    ) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel
         constraint is satisfied.
+
+        Accepts either a ``helion.Config`` (uses its ``.config`` dict) or a raw
+        dict (as passed by ``normalize``).
         """
-        block_sizes = config.config.get("block_sizes")
+        cfg = config if isinstance(config, dict) else config.config
+        block_sizes = cfg.get("block_sizes")
         if (
             not isinstance(block_sizes, list)
             or not block_sizes
@@ -2990,6 +3083,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
         self.max_size: int = self.dim_max_size
+        # Keep NPU autotuning search space conservative. Ascend backends can
+        # degrade or fault with very large block sizes (UUB constraints).
+        if is_npu():
+            self.max_size = min(self.max_size, 128)
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
@@ -3132,6 +3229,16 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             force_threshold = base.reduction_loop_force_threshold
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
+        # Ascend NPU: the default reduction is used as the autotune baseline
+        # config, which must compile (a baseline compile failure aborts
+        # autotuning). Multi-buffer inflation can overflow UB (~192KB) for
+        # large default reductions on multi-pass kernels (layer_norm/rms_norm/
+        # rope), so cap the *default* (baseline) reduction conservatively; the
+        # autotune search range is unaffected (still bounded by the UB budget
+        # cap in normalize, which skips overflowing configs). Tunable via
+        # HELION_NPU_DEFAULT_REDUCTION_LOOP.
+        if is_npu():
+            default = min(default, _npu_default_reduction_loop())
         return BlockSizeFragment(low, high, default)
 
     def _flat_config(

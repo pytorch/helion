@@ -574,6 +574,8 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "CUDA out of memory",  # PyTorch torch.cuda.OutOfMemoryError
                 "[CUDA]: out of memory",  # Triton CUDA OOM
                 "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
+                "ub overflow",  # Ascend NPU Unified Buffer overflow (block/reduction too large)
+                "ConvertLinalgRToBinary",  # Ascend triton-ascend lowering failure (config too large)
             ],
         )
     )
