@@ -10,6 +10,7 @@ imports it at the bottom so registration keeps the same eager timing as before.
 from __future__ import annotations
 
 import ast
+import math
 from operator import getitem
 from typing import TYPE_CHECKING
 from typing import cast
@@ -79,6 +80,21 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(f"jnp.reshape({{tensor}}, {shape_str})", tensor=tensor)
 
 
+def _pad_fill_literal(value: object) -> str:
+    """Render a ``constant_pad_nd`` fill value as valid Python source.
+
+    ``repr()`` is wrong for the non-finite floats: it yields bare ``inf`` /
+    ``-inf`` / ``nan``, which are not names in the generated module (the
+    artifact raises ``NameError: name 'inf' is not defined``). Spell those as
+    ``float('inf')`` etc., which is valid in any module and needs no import.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        # repr() of the value is itself the bare name (``-inf``), so quote the
+        # str() form: float('-inf') / float('inf') / float('nan').
+        return f"float({str(value)!r})"
+    return repr(value)
+
+
 @constant_pad_nd_lowering.register_codegen("pallas")
 def codegen_constant_pad_nd_pallas(ctx: LoweringContext, node: Node) -> object:
     """``F.pad(x, pad, value)`` (aten.constant_pad_nd) -> inline ``jnp.pad``.
@@ -104,7 +120,7 @@ def codegen_constant_pad_nd_pallas(ctx: LoweringContext, node: Node) -> object:
     ]
     pw = "(" + ", ".join(f"({lo}, {hi})" for lo, hi in pad_width) + ")"
     return expr_from_string(
-        f"jnp.pad({{t}}, {pw}, mode='constant', constant_values={value!r})",
+        f"jnp.pad({{t}}, {pw}, mode='constant', constant_values={_pad_fill_literal(value)})",
         t=tensor,
     )
 

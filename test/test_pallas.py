@@ -698,6 +698,19 @@ def _constant_pad_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
+    """F.pad with a non-finite fill. repr(-inf) is the bare name ``-inf``, which
+    is undefined in the generated module, so this must emit ``float('-inf')``."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols + 128], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(rows):
+        out[tile, :] = torch.nn.functional.pad(
+            x[tile, :], (0, 128), value=float("-inf")
+        )
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -1013,6 +1026,25 @@ class TestPallas(TestCase):
         self.assertIn("jnp.pad", code)
         expected = torch.nn.functional.pad(x, (0, 128), value=0.0)
         torch.testing.assert_close(result, expected)
+
+    def test_constant_pad_nd_non_finite_fill(self) -> None:
+        """A non-finite fill must be emitted as ``float('-inf')``.
+
+        ``repr(float('-inf'))`` is ``-inf``, which parses as a negated *name*;
+        emitting it verbatim made the artifact raise ``NameError: name 'inf' is
+        not defined`` at run time.
+        """
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(0)
+                x = torch.randn(16, 128, device=DEVICE, dtype=dtype)
+                code, result = code_and_output(
+                    _constant_pad_neg_inf_pallas_kernel, (x,), block_sizes=[8]
+                )
+                self.assertIn("float('-inf')", code)
+                self.assertNotIn("constant_values=-inf", code)
+                expected = torch.nn.functional.pad(x, (0, 128), value=float("-inf"))
+                torch.testing.assert_close(result, expected)
 
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
