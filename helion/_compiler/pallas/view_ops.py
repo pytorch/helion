@@ -159,6 +159,7 @@ def _capture_edges(
         placeholders = list(info.graph.find_nodes(op="placeholder"))
         if not isinstance(outer_args, (list, tuple)):
             continue
+        # Capture arity is a GraphInfo invariant; strict zip surfaces malformed IR.
         for outer, placeholder in zip(outer_args, placeholders, strict=True):
             if isinstance(outer, torch.fx.Node):
                 captures.setdefault(outer, []).append((placeholder, parent))
@@ -174,7 +175,10 @@ def _capture_edges(
 def _resolve_node(
     node: object, placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node]
 ) -> torch.fx.Node | None:
+    seen: set[torch.fx.Node] = set()
     while isinstance(node, torch.fx.Node):
+        assert node not in seen, "cycle while resolving a resident Ref index"
+        seen.add(node)
         if node.target is _tracing_ops._new_var and node.args:
             node = node.args[0]
         elif node.op == "placeholder" and node in placeholder_to_outer:
