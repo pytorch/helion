@@ -21,34 +21,33 @@ if TYPE_CHECKING:
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
 
-def load_expr(
-    state: CodegenState,
-    subscript: list[object],
-    tensor: torch.Tensor,
-) -> ast.AST:
-    """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it.
-
-    A load whose block planning made resident is emitted as a Pallas Ref
-    instead, so its subview consumers can read individual runs out of it
-    without materializing the whole block.
-    """
-    from helion._compiler.pallas.gather import emit_gather
-    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
-
+def _load_route(
+    state: CodegenState, tensor: torch.Tensor
+) -> tuple[str, str, list[object]]:
     arg_name = state.device_function.tensor_arg(tensor).name
     name = vmem_name(state, arg_name)
     state.device_function.device_load_index += 1
     state.device_function.device_memory_op_index += 1
     assert state.fx_node is not None
     patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
+    return arg_name, name, patterns
+
+
+def load_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+) -> ast.AST:
+    """Emit a normal Pallas load, or a gather selected by ``plan_tiling``."""
+    from helion._compiler.pallas.gather import emit_gather
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+
+    _arg_name, name, patterns = _load_route(state, tensor)
     for pattern in patterns:
         if isinstance(pattern, IndirectGatherPattern):
             return emit_gather(state, pattern.plan, name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
-    ref_expr = _maybe_block_ref_expr(state, tensor, arg_name, name, parts, none_dims)
-    if ref_expr is not None:
-        return ref_expr
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
     if scalar_load is None:
         result = expr_from_string(f"{name}[{', '.join(parts)}]")
@@ -66,47 +65,28 @@ def load_expr(
     return result
 
 
-def _maybe_block_ref_expr(
+def resident_ref_load_expr(
     state: CodegenState,
+    subscript: list[object],
     tensor: torch.Tensor,
-    arg_name: str,
-    name: str,
-    parts: list[str],
-    none_dims: list[int],
-) -> ast.AST | None:
-    """Emit this load as a Pallas Ref when planning made its block resident.
-
-    Planning has already rejected every subview it could not cover, so the Ref
-    is required here rather than preferred: there is no materializing lowering
-    to fall back to.  A block that cannot address as a Ref raises instead, so
-    the failure names the config rather than silently changing the lowering.
-    """
+) -> ast.AST:
+    """Keep a proven direct VMEM load as a Pallas Ref."""
     from helion import exc
     from helion._compiler.device_function import PallasMemorySpace
-    from helion._compiler.pallas.view_ops import load_is_ref
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
 
-    assert state.fx_node is not None
-    if not load_is_ref(state.fx_node):
-        return None
+    arg_name, name, patterns = _load_route(state, tensor)
+    device_fn = state.device_function
+
+    if any(isinstance(pattern, IndirectGatherPattern) for pattern in patterns):
+        raise exc.InvalidConfig("resident Ref cannot follow an indirect gather")
+    parts, none_dims = index_parts(state, subscript, tensor)
     if none_dims or len(parts) != tensor.ndim:
-        raise exc.InvalidConfig(
-            f"{arg_name} must stay a resident block for a subview to read it, "
-            "but this load does not preserve its rank."
-        )
-    # A tensor left on its own ref (rather than routed through a VMEM scratch)
-    # has to already live in VMEM: an HBM ref cannot be read element-wise.
+        raise exc.InvalidConfig("resident Ref producer must preserve rank")
     if name == arg_name and (
-        state.device_function.pallas_memory_space.get(id(tensor))
-        is not PallasMemorySpace.VMEM
+        device_fn.pallas_memory_space.get(id(tensor)) is not PallasMemorySpace.VMEM
     ):
-        raise exc.InvalidConfig(
-            f"{arg_name} must stay a resident block for a subview to read it, "
-            "but under this config it did not resolve to VMEM."
-        )
-    if all(part == ":" for part in parts):
-        # The block already is the whole ref, e.g. a pipelined tensor whose DMA
-        # scratch holds exactly this tile.
-        return expr_from_string(name)
+        raise exc.InvalidConfig("resident Ref producer did not resolve to VMEM")
     return expr_from_string(f"{name}.at[{', '.join(parts)}]")
 
 

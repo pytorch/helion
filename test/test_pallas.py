@@ -1174,6 +1174,30 @@ class TestPallas(TestCase):
                 self.assertNarrowingIsResident(code)
                 torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
+    def test_resident_subview_static_unroll(self) -> None:
+        """Resident Ref transforms are independent of the loop scheduler."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_unroll(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(initial)
+            for _request in hl.grid(1):
+                state = initial[0, :, :].float()
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    for local in hl.tile(4, block_size=1):
+                        state += x_block[local.begin, :, :].float()
+                out[0, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.randn(1, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        expected = (initial.float() + x.float().sum(dim=0, keepdim=True)).bfloat16()
+        code, actual = code_and_output(
+            static_unroll, (x, initial), pallas_loop_type="unroll"
+        )
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
     def test_resident_subview_keeps_dma_prefetch(self) -> None:
         """Making the block resident must not move the load out of its loop.
 
@@ -1356,6 +1380,86 @@ class TestPallas(TestCase):
         self.assertIn("[pl.ds(1, 2), :, :]", code)
         torch.testing.assert_close(out, torch.full_like(out, 8.0))
 
+    def test_resident_subview_of_untiled_dimension(self) -> None:
+        """A direct run may address any aligned dimension of the resident Ref."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_head(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([1, 2, 128], device=x.device, dtype=x.dtype)
+            for _request in hl.grid(1):
+                state = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :, :]
+                    state += x_block[:, 0, :, :].float().sum(dim=0)
+                out[0, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.ones(8, 2, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        code, actual = code_and_output(select_head, (x,), pallas_loop_type="fori_loop")
+        self.assertIn("[:, pl.ds(0, 1), :, :][:, 0, :, :]", code)
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(actual, torch.full_like(actual, 8))
+
+    def test_resident_subview_composed_views(self) -> None:
+        """Subview and reshape registrations compose without materializing."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def composed_views(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            tokens, chunks, heads, width = x.size()
+            assert chunks == 4 and heads == 2 and width == 128
+            out = torch.empty_like(initial)
+            for request in hl.grid(1):
+                state = initial[request, :, :, :].float()
+                for outer in hl.tile(tokens, block_size=4):
+                    x_block = x[outer, :, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        token = x_block[local.begin, :, :, :]
+                        matrix = token.reshape(2, 2, 2, 128)
+                        state += matrix[0:1, :, :, :].float().sum(dim=0)
+                out[request, :, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(8, 4, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.zeros(1, 2, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        expected = x.float().reshape(8, 2, 2, 2, 128)[:, 0].sum(0, keepdim=True)
+        code, actual = code_and_output(
+            composed_views, (x, initial), pallas_loop_type="fori_loop"
+        )
+        self.assertRegex(code, r"\.at\[pl\.ds\(offset_\d+, 1\), :, :, :\]")
+        self.assertIn(".reshape((2, 2, 2, 128))", code)
+        self.assertIn("[pl.ds(0, 1), :, :, :]", code)
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
+
+    def test_resident_subview_materializes_before_incompatible_reshape(self) -> None:
+        """A reshape that changes the lane layout keeps ordinary value codegen."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def reshape_fallback(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(initial)
+            for request in hl.grid(1):
+                state = initial[request, :, :].float()
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        token = x_block[local.begin, :, :]
+                        state += token.reshape(2, 2, 64).float().sum(dim=0)
+                out[request, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(8, 2, 128, device=DEVICE, dtype=torch.bfloat16)
+        initial = torch.zeros(1, 2, 64, device=DEVICE, dtype=torch.bfloat16)
+        expected = x.float().reshape(8, 2, 2, 64).sum((0, 1)).unsqueeze(0)
+        code, actual = code_and_output(
+            reshape_fallback, (x, initial), pallas_loop_type="fori_loop"
+        )
+        self.assertIn("jnp.reshape(", code)
+        self.assertNotIn(".reshape((2, 2, 64))", code)
+        self.assertNarrowingIsResident(code)
+        torch.testing.assert_close(actual, expected.bfloat16(), rtol=1e-2, atol=1e-2)
+
     def test_resident_subview_index_through_control_flow(self) -> None:
         """An index bound to a name and used across a branch still resolves."""
 
@@ -1412,6 +1516,25 @@ class TestPallas(TestCase):
                 divisible, (x, out), block_sizes=[2], pallas_loop_type="fori_loop"
             )
 
+    def test_resident_subview_rejects_shifted_live_extent(self) -> None:
+        """A related symbolic bound is not proof that every row is live."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def shifted_extent(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live + 4, block_size=1):
+                        acc = acc + x_block[local.begin, :, :].float()
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(helion.exc.InvalidIndexingType):
+            code_and_output(shifted_extent, (x, out), pallas_loop_type="fori_loop")
+
     def test_resident_subview_names_the_blocking_consumer(self) -> None:
         """Consuming the block whole defeats residency, so say where."""
 
@@ -1467,13 +1590,6 @@ class TestPallas(TestCase):
         def build(body: Callable[..., object]) -> Any:
             return helion.kernel(body, backend="pallas", static_shapes=True)
 
-        def untiled_dim(x: torch.Tensor, out: torch.Tensor) -> None:
-            for _request in hl.grid(1):
-                acc = hl.zeros([2, 128], dtype=torch.float32)
-                for outer in hl.tile(x.size(0), block_size=4):
-                    acc = acc + x[outer, :, :, :][:, 0, :, :].float().sum(dim=0)
-                out[0, :, :] = acc.to(out.dtype)
-
         def shifted_run(x: torch.Tensor, out: torch.Tensor) -> None:
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)
@@ -1512,7 +1628,6 @@ class TestPallas(TestCase):
 
         out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
         cases = [
-            ("untiled dim", untiled_dim, torch.ones(8, 2, 2, 128, device=DEVICE)),
             ("shifted run", shifted_run, torch.ones(8, 2, 128, device=DEVICE)),
             ("strided run", strided_run, torch.ones(8, 2, 128, device=DEVICE)),
             ("index past block", past_the_end, torch.ones(8, 2, 128, device=DEVICE)),
