@@ -45,10 +45,10 @@ def _(state: CodegenState) -> None:
     idx_str = ", ".join(parts)
     from .gather import emit_scatter_store
     from .tensorcore_plan import TENSORCORE_PLAN_META
-    from .tensorcore_plan import ProjectionScatterPlan
+    from .tensorcore_plan import OneHotScatterPlan
 
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
-    is_scatter = isinstance(plan, ProjectionScatterPlan)
+    is_scatter = isinstance(plan, OneHotScatterPlan)
     if is_scatter:
         value = emit_scatter_store(state, plan.plan, name, idx_str, value)
     from .ordered_carry import emit_carry_store
