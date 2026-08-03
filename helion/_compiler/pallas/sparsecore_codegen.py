@@ -8,19 +8,19 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .access import AccessKind
+from .memory_access import MemoryAccessKind
 from .sc_base import SC_LANES
 from .sc_base import SC_SHARED_ITEM_CHUNK
 from .sc_base import _reject
 from .sc_base import shared_acc_items
-from .sparsecore_access import AtomicAddAccess
-from .sparsecore_access import CachedLoadAccess
-from .sparsecore_access import DirectLoadAccess
-from .sparsecore_access import DirectStoreAccess
-from .sparsecore_access import IndirectLoadAccess
-from .sparsecore_access import IndirectStoreAccess
-from .sparsecore_access import SparseCoreAccess
 from .sparsecore_compute import SparseCoreCompute
+from .sparsecore_plan import AtomicAddPlan
+from .sparsecore_plan import CachedLoadPlan
+from .sparsecore_plan import DirectLoadPlan
+from .sparsecore_plan import DirectStorePlan
+from .sparsecore_plan import IndirectLoadPlan
+from .sparsecore_plan import IndirectStorePlan
+from .sparsecore_plan import SparseCoreMemoryPlan
 from .sparsecore_program import SchedulePhase
 from .sparsecore_program import ScheduleStage
 from .sparsecore_program import SparseCoreProgram
@@ -54,35 +54,35 @@ def allocate_resources(
     atomic_zero_buffers: dict[torch.fx.Node, str] = {}
     semaphore_index: dict[torch.fx.Node, int] = {}
 
-    for access in program.loads:
-        node = access.site.node
-        if isinstance(access, CachedLoadAccess):
+    for plan in program.loads:
+        node = plan.access.node
+        if isinstance(plan, CachedLoadPlan):
             buffers[node] = device_fn.register_scratch(
-                load_buffer_shape(program, access),
-                access.layout.storage_dtype,
+                load_buffer_shape(program, plan),
+                plan.layout.storage_dtype,
                 "sc_cached",
             )
             continue
-        if isinstance(access, IndirectLoadAccess) or node not in program.index_nodes:
+        if isinstance(plan, IndirectLoadPlan) or node not in program.index_nodes:
             semaphore_index[node] = len(semaphore_index)
         buffers[node] = device_fn.register_scratch(
-            (depth, *load_buffer_shape(program, access)),
-            access.layout.storage_dtype,
+            (depth, *load_buffer_shape(program, plan)),
+            plan.layout.storage_dtype,
             "sc_value",
         )
 
-    for access in program.stores:
-        value_size = access.layout.value_size
+    for plan in program.stores:
+        value_size = plan.layout.value_size
         shape = (items, SC_LANES if value_size == 1 else value_size)
-        output_buffers[access.site.node] = device_fn.register_scratch(
-            shape, access.layout.storage_dtype, "sc_output"
+        output_buffers[plan.access.node] = device_fn.register_scratch(
+            shape, plan.layout.storage_dtype, "sc_output"
         )
-        if isinstance(access, AtomicAddAccess):
-            shared_items = shared_acc_items(int(access.site.tensor.shape[0]))
-            atomic_buffers[access.site.node] = device_fn.register_scratch(
+        if isinstance(plan, AtomicAddPlan):
+            shared_items = shared_acc_items(int(plan.access.tensor.shape[0]))
+            atomic_buffers[plan.access.node] = device_fn.register_scratch(
                 (shared_items, value_size), torch.float32, "sc_acc", "vmem_shared"
             )
-            atomic_zero_buffers[access.site.node] = device_fn.register_scratch(
+            atomic_zero_buffers[plan.access.node] = device_fn.register_scratch(
                 (SC_LANES, value_size), torch.float32, "sc_zero"
             )
 
@@ -105,17 +105,17 @@ def _tensor_name(codegen: GenerateAST, tensor: torch.Tensor) -> str:
 
 def _direct_copy_lines(
     program: SparseCoreProgram,
-    access: DirectLoadAccess,
+    plan: DirectLoadPlan,
     resources: CodegenResources,
     codegen: GenerateAST,
     method: str | None,
 ) -> list[str]:
-    stream = access.stream
+    stream = plan.stream
     assert stream is not None
-    source = _tensor_name(codegen, access.site.tensor)
-    destination = resources.buffers[access.site.node]
+    source = _tensor_name(codegen, plan.access.tensor)
+    destination = resources.buffers[plan.access.node]
     items = program.geometry.items_per_subcore
-    if access.site.node in program.index_nodes:
+    if plan.access.node in program.index_nodes:
         if method is not None:
             raise AssertionError("SparseCore index streams must be synchronous")
         count = items * stream.elements_per_item
@@ -138,7 +138,7 @@ def _direct_copy_lines(
     base = stream.group * program.geometry.padded_items
     offset = f"{base} + _sc_o0" if base else "_sc_o0"
     if method is not None:
-        semaphore_index = resources.semaphore_index[access.site.node]
+        semaphore_index = resources.semaphore_index[plan.access.node]
         return [
             (
                 f"        pltpu.make_async_copy({source}.at[pl.ds({offset}, {items})], "
@@ -154,33 +154,36 @@ def _direct_copy_lines(
     ]
 
 
-def _index_access(
+def _index_plan(
     program: SparseCoreProgram,
-    access: IndirectLoadAccess | IndirectStoreAccess | AtomicAddAccess,
-) -> SparseCoreAccess:
-    index_access = program.access_by_node.get(access.index_node)
-    if index_access is None or index_access.site.kind is not AccessKind.LOAD:
+    plan: IndirectLoadPlan | IndirectStorePlan | AtomicAddPlan,
+) -> SparseCoreMemoryPlan:
+    index_plan = program.plan_by_node.get(plan.index_node)
+    if (
+        index_plan is None
+        or index_plan.access.kind is not MemoryAccessKind.LOAD
+    ):
         raise NotImplementedError(
             "SparseCore indirect index must be produced by a lowered load"
         )
-    return index_access
+    return index_plan
 
 
 def _offset_lines(
     program: SparseCoreProgram,
-    access: IndirectLoadAccess,
-    index_access: SparseCoreAccess,
+    plan: IndirectLoadPlan,
+    index_plan: SparseCoreMemoryPlan,
     resources: CodegenResources,
 ) -> list[str]:
-    offset = access.index_offset
+    offset = plan.index_offset
     if not offset:
         return []
-    if isinstance(index_access, IndirectLoadAccess):
+    if isinstance(index_plan, IndirectLoadPlan):
         raise NotImplementedError(
             "SparseCore static offsets on dependent indices are not implemented"
         )
-    index_buffer = resources.buffers[index_access.site.node]
-    stream = index_access.stream
+    index_buffer = resources.buffers[index_plan.access.node]
+    stream = index_plan.stream
     if stream is None:
         raise AssertionError("SparseCore index has no stream")
     count = program.geometry.items_per_subcore * stream.elements_per_item
@@ -189,7 +192,7 @@ def _offset_lines(
             "layout",
             "SparseCore offset index buffer has "
             f"{count} values; it must contain complete {SC_LANES}-lane chunks",
-            node=access.site.node,
+            node=plan.access.node,
         )
     return [
         f"        for _sc_ic in range({count // SC_LANES}):",
@@ -203,23 +206,23 @@ def _offset_lines(
 
 def _indirect_copy_lines(
     program: SparseCoreProgram,
-    access: IndirectLoadAccess,
+    plan: IndirectLoadPlan,
     resources: CodegenResources,
     codegen: GenerateAST,
     method: str,
 ) -> list[str]:
-    index_access = _index_access(program, access)
-    index_buffer = resources.buffers[index_access.site.node]
-    destination = resources.buffers[access.site.node]
-    table = _tensor_name(codegen, access.site.tensor)
+    index_plan = _index_plan(program, plan)
+    index_buffer = resources.buffers[index_plan.access.node]
+    destination = resources.buffers[plan.access.node]
+    table = _tensor_name(codegen, plan.access.tensor)
     semaphore = resources.semaphore
-    semaphore_index = resources.semaphore_index[access.site.node]
+    semaphore_index = resources.semaphore_index[plan.access.node]
     prefix = (
-        _offset_lines(program, access, index_access, resources)
+        _offset_lines(program, plan, index_plan, resources)
         if method == "start"
         else []
     )
-    if not isinstance(index_access, IndirectLoadAccess):
+    if not isinstance(index_plan, IndirectLoadPlan):
         expression = (
             f"pltpu.make_async_copy({table}.at[{index_buffer}.at[_sc_q]], "
             f"{destination}.at[_sc_q], "
@@ -227,8 +230,8 @@ def _indirect_copy_lines(
         )
         return [*prefix, f"        {expression}"]
 
-    parent_entries = index_access.stream.elements_per_item if index_access.stream else 1
-    index_size = index_access.layout.value_size // parent_entries
+    parent_entries = index_plan.stream.elements_per_item if index_plan.stream else 1
+    index_size = index_plan.layout.value_size // parent_entries
     index_items = program.geometry.items_per_subcore * parent_entries
     return [
         *prefix,
@@ -243,27 +246,27 @@ def _indirect_copy_lines(
 
 
 def _cached_lines(
-    access: CachedLoadAccess,
+    plan: CachedLoadPlan,
     resources: CodegenResources,
     codegen: GenerateAST,
 ) -> list[str]:
-    source = _tensor_name(codegen, access.site.tensor)
-    destination = resources.buffers[access.site.node]
+    source = _tensor_name(codegen, plan.access.tensor)
+    destination = resources.buffers[plan.access.node]
     return [f"        pltpu.sync_copy({source}, {destination})"]
 
 
 def _atomic_initialize_lines(
-    access: AtomicAddAccess, resources: CodegenResources
+    plan: AtomicAddPlan, resources: CodegenResources
 ) -> list[str]:
-    accumulator = resources.atomic_buffers[access.site.node]
-    zero = resources.atomic_zero_buffers[access.site.node]
-    shared_items = shared_acc_items(int(access.site.tensor.shape[0]))
+    accumulator = resources.atomic_buffers[plan.access.node]
+    zero = resources.atomic_zero_buffers[plan.access.node]
+    shared_items = shared_acc_items(int(plan.access.tensor.shape[0]))
     chunks_per_subcore = shared_items // SC_SHARED_ITEM_CHUNK
     lines = [
         "        _sc_sub = lax.axis_index('_sc_sub_axis')",
         f"        for _sc_zr in range({SC_LANES}):",
     ]
-    for start in range(0, access.layout.value_size, SC_LANES):
+    for start in range(0, plan.layout.value_size, SC_LANES):
         lines.append(
             f"            {zero}[_sc_zr, pl.ds({start}, {SC_LANES})] = "
             f"jnp.zeros(({SC_LANES},), jnp.float32)"
@@ -283,14 +286,14 @@ def _atomic_initialize_lines(
 
 
 def _atomic_finalize_lines(
-    access: AtomicAddAccess,
+    plan: AtomicAddPlan,
     resources: CodegenResources,
     codegen: GenerateAST,
 ) -> list[str]:
-    accumulator = resources.atomic_buffers[access.site.node]
-    staging = resources.atomic_zero_buffers[access.site.node]
-    destination = _tensor_name(codegen, access.site.tensor)
-    shared_items = shared_acc_items(int(access.site.tensor.shape[0]))
+    accumulator = resources.atomic_buffers[plan.access.node]
+    staging = resources.atomic_zero_buffers[plan.access.node]
+    destination = _tensor_name(codegen, plan.access.tensor)
+    shared_items = shared_acc_items(int(plan.access.tensor.shape[0]))
     chunks_per_subcore = shared_items // SC_SHARED_ITEM_CHUNK
     return [
         "        plsc.subcore_barrier()",
@@ -312,28 +315,28 @@ def _atomic_finalize_lines(
 
 def _store_lines(
     program: SparseCoreProgram,
-    access: SparseCoreAccess,
+    plan: SparseCoreMemoryPlan,
     resources: CodegenResources,
     codegen: GenerateAST,
 ) -> list[str]:
-    source = resources.output_buffers[access.site.node]
-    destination = _tensor_name(codegen, access.site.tensor)
+    source = resources.output_buffers[plan.access.node]
+    destination = _tensor_name(codegen, plan.access.tensor)
     items = program.geometry.items_per_subcore
-    if isinstance(access, DirectStoreAccess):
+    if isinstance(plan, DirectStorePlan):
         return [
             (
                 f"        pltpu.sync_copy({source}, "
                 f"{destination}.at[pl.ds(_sc_o0, {items})])"
             )
         ]
-    if isinstance(access, AtomicAddAccess):
-        index_access = _index_access(program, access)
-        if isinstance(index_access, IndirectLoadAccess):
+    if isinstance(plan, AtomicAddPlan):
+        index_plan = _index_plan(program, plan)
+        if isinstance(index_plan, IndirectLoadPlan):
             raise NotImplementedError(
                 "SparseCore dependent indices for atomic stores are not implemented"
             )
-        index_buffer = resources.buffers[index_access.site.node]
-        accumulator = resources.atomic_buffers[access.site.node]
+        index_buffer = resources.buffers[index_plan.access.node]
+        accumulator = resources.atomic_buffers[plan.access.node]
         if items == SC_LANES:
             return [
                 (
@@ -349,14 +352,14 @@ def _store_lines(
                 f"{accumulator}.at[{index_buffer}.at[_sc_q, _sc_as]], add=True)"
             ),
         ]
-    if not isinstance(access, IndirectStoreAccess):
-        raise AssertionError(f"unexpected SparseCore store {type(access).__name__}")
-    index_access = _index_access(program, access)
-    if isinstance(index_access, IndirectLoadAccess):
+    if not isinstance(plan, IndirectStorePlan):
+        raise AssertionError(f"unexpected SparseCore store {type(plan).__name__}")
+    index_plan = _index_plan(program, plan)
+    if isinstance(index_plan, IndirectLoadPlan):
         raise NotImplementedError(
             "SparseCore dependent indices for indirect stores are not implemented"
         )
-    index_buffer = resources.buffers[index_access.site.node]
+    index_buffer = resources.buffers[index_plan.access.node]
     return [
         f"        pltpu.sync_copy({source}, {destination}.at[{index_buffer}.at[_sc_q]])"
     ]
@@ -424,40 +427,40 @@ def render_sparsecore_program(
 
         stores = []
         for task in stage.tasks:
-            access = program.access_by_node.get(task.node)
+            plan = program.plan_by_node.get(task.node)
             if task.kind is TaskKind.ONCE_TRANSFER:
-                assert isinstance(access, CachedLoadAccess)
-                lines.extend(_cached_lines(access, resources, codegen))
+                assert isinstance(plan, CachedLoadPlan)
+                lines.extend(_cached_lines(plan, resources, codegen))
             elif task.kind is TaskKind.INITIALIZE:
-                assert isinstance(access, AtomicAddAccess)
-                lines.extend(_atomic_initialize_lines(access, resources))
+                assert isinstance(plan, AtomicAddPlan)
+                lines.extend(_atomic_initialize_lines(plan, resources))
             elif task.kind is TaskKind.SYNC_TRANSFER:
-                assert isinstance(access, DirectLoadAccess)
+                assert isinstance(plan, DirectLoadPlan)
                 lines.extend(
-                    _direct_copy_lines(program, access, resources, codegen, None)
+                    _direct_copy_lines(program, plan, resources, codegen, None)
                 )
             elif task.kind in (TaskKind.ASYNC_START, TaskKind.ASYNC_WAIT):
                 method = "start" if task.kind is TaskKind.ASYNC_START else "wait"
-                if isinstance(access, IndirectLoadAccess):
+                if isinstance(plan, IndirectLoadPlan):
                     lines.extend(
                         _indirect_copy_lines(
-                            program, access, resources, codegen, method
+                            program, plan, resources, codegen, method
                         )
                     )
-                elif isinstance(access, DirectLoadAccess):
+                elif isinstance(plan, DirectLoadPlan):
                     lines.extend(
-                        _direct_copy_lines(program, access, resources, codegen, method)
+                        _direct_copy_lines(program, plan, resources, codegen, method)
                     )
                 else:
                     raise AssertionError(
-                        f"unexpected async SparseCore access {type(access).__name__}"
+                        f"unexpected async SparseCore plan {type(plan).__name__}"
                     )
             elif task.kind is TaskKind.STORE:
-                assert access is not None
-                stores.append(access)
+                assert plan is not None
+                stores.append(plan)
             elif task.kind is TaskKind.FINALIZE:
-                assert isinstance(access, AtomicAddAccess)
-                lines.extend(_atomic_finalize_lines(access, resources, codegen))
+                assert isinstance(plan, AtomicAddPlan)
+                lines.extend(_atomic_finalize_lines(plan, resources, codegen))
         if stores:
             lines.extend(
                 (
@@ -465,12 +468,12 @@ def render_sparsecore_program(
                     "        def _sc_item_loop(_sc_item):",
                     *compute.emit_body(
                         " " * 12,
-                        store_nodes={access.site.node for access in stores},
+                        store_nodes={plan.access.node for plan in stores},
                     ),
                 )
             )
-            for access in stores:
-                lines.extend(_store_lines(program, access, resources, codegen))
+            for plan in stores:
+                lines.extend(_store_lines(program, plan, resources, codegen))
         lines.append("")
     lines.append("_sc_pipeline()")
     return lines
@@ -482,8 +485,8 @@ def codegen_sparsecore_program(
     from ..ast_extension import convert
     from ..device_function import PallasMemorySpace
 
-    for access in program.accesses:
-        codegen.device_function.pallas_memory_space[id(access.site.tensor)] = (
+    for plan in program.memory_plans:
+        codegen.device_function.pallas_memory_space[id(plan.access.tensor)] = (
             PallasMemorySpace.HBM
         )
     module = ast.parse("\n".join(render_sparsecore_program(program, codegen)))
