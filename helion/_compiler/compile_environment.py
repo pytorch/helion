@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
+    from .pallas.sparsecore_program import SparseCoreProgram
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -325,6 +326,8 @@ class CompileEnvironment:
         # detect_compact_worklist_plan succeeds; gates the compact-worklist
         # codegen path (see helion/_compiler/pallas/compact_worklist.py).
         self.compact_worklist_plan: CompactWorklistPlan | None = None
+        # Lowered program for an explicit Pallas SparseCore config.
+        self.sparsecore_program: SparseCoreProgram | None = None
         # Final resident-cache decision for this concrete config.  This includes
         # the cached physical window integer; runtime/codegen consumers must read
         # this instead of recomputing resident-cache eligibility.
