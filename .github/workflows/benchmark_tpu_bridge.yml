@@ -143,8 +143,6 @@ jobs:
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
-                --atol 1e-2 \
-                --rtol 1e-2 \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
                 --keep-going

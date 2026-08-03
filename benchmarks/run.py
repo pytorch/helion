@@ -75,6 +75,30 @@ def is_cuda() -> bool:
 
 IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
 
+DEFAULT_ACCURACY_TOLERANCE = 1e-2
+KERNEL_ACCURACY_TOLERANCES = {
+    # TritonBench supplies bf16 inputs for Welford. Different valid reduction
+    # orders can differ by one bf16 ULP.
+    "welford": (2e-2, DEFAULT_ACCURACY_TOLERANCE),
+}
+
+
+def add_default_accuracy_tolerances(
+    kernel_name: str, tritonbench_args: list[str]
+) -> None:
+    atol, rtol = KERNEL_ACCURACY_TOLERANCES.get(
+        kernel_name,
+        (DEFAULT_ACCURACY_TOLERANCE, DEFAULT_ACCURACY_TOLERANCE),
+    )
+    if not any(
+        arg == "--atol" or arg.startswith("--atol=") for arg in tritonbench_args
+    ):
+        tritonbench_args.extend(["--atol", str(atol)])
+    if not any(
+        arg == "--rtol" or arg.startswith("--rtol=") for arg in tritonbench_args
+    ):
+        tritonbench_args.extend(["--rtol", str(rtol)])
+
 
 def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> None:
     structure = (args, kwargs)
@@ -1470,6 +1494,8 @@ def run_kernel_variants(
             file=sys.stderr,
         )
 
+    add_default_accuracy_tolerances(kernel_name, tritonbench_args)
+
     # Apply num_inputs if not specified in command line
     if "--num-inputs" not in tritonbench_args:
         # Get per-kernel num_inputs or use MAX_NUM_INPUTS as default
@@ -2041,12 +2067,6 @@ def main() -> None:
 
     if args.helion_backend:
         os.environ["HELION_BACKEND"] = args.helion_backend
-
-    # Add default tolerance values if not already specified
-    if "--atol" not in tritonbench_args:
-        tritonbench_args.extend(["--atol", "1e-2"])
-    if "--rtol" not in tritonbench_args:
-        tritonbench_args.extend(["--rtol", "1e-2"])
 
     # Check if --bwd flag is used directly and ban it
     if "--bwd" in tritonbench_args:
