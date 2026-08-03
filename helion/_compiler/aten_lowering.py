@@ -5,6 +5,7 @@ from collections.abc import Callable
 import dataclasses
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import torch
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 
 class LoweringContext:
     cg: CodegenInterface
-    env: dict[Node, Argument]
+    env: dict[Node, Any]
 
     def to_ast(self, value: object) -> ast.AST:
         raise NotImplementedError
@@ -49,7 +50,7 @@ CodegenHandler = Callable[[LoweringContext, Node], object]
 
 
 def _env_arg(ctx: LoweringContext, node: Node) -> Argument:
-    return ctx.env[node]
+    return cast("Argument", ctx.env[node])
 
 
 @dataclasses.dataclass
