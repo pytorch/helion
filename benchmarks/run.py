@@ -419,7 +419,7 @@ def patch_fd_diagnostics(operator_name: str, Operator: type[Any]) -> None:
     def do_bench(
         self: object,
         input_id: int,
-        implementation: str,
+        fn_name: str,
         *args: object,
         **kwargs: object,
     ) -> object:
@@ -427,18 +427,16 @@ def patch_fd_diagnostics(operator_name: str, Operator: type[Any]) -> None:
             phase="before",
             operator_name=operator_name,
             input_id=input_id,
-            implementation=implementation,
+            implementation=fn_name,
         )
         try:
-            return original_do_bench(
-                self, input_id, implementation, *args, **kwargs
-            )
+            return original_do_bench(self, input_id, fn_name, *args, **kwargs)
         finally:
             log_fd_diagnostics(
                 phase="after",
                 operator_name=operator_name,
                 input_id=input_id,
-                implementation=implementation,
+                implementation=fn_name,
             )
 
     Operator._do_bench = do_bench
