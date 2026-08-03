@@ -26,6 +26,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._pytree import tree_unflatten
 
 from .. import exc
+from ..runtime.config import Config
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
@@ -64,7 +65,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
-    from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import CompiledConfig
     from ..runtime.settings import Settings
@@ -587,23 +587,37 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )(*new_args)
                 synchronize_device()
             except Exception as e:
-                decorator = self.kernel.format_kernel_decorator(
-                    baseline_config, self.settings
-                )
-                log_generated_triton_code_debug(
-                    self.log,
-                    self.kernel,
-                    baseline_config,
-                    prefix=f"Generated Triton code for {decorator}:",
-                )
-                self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
-                raise exc.InvalidConfig(
-                    "Default config failed while computing baseline.\n"
-                    f"Default config: {decorator}\n"
-                    f"{SUPPRESSED_TRITON_CODE_MSG}\n"
-                    "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
-                    "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
-                ) from e
+                # NPU fallback: Ascend's 192KB UB is often exceeded by the
+                # default config (tuned for CUDA's larger shared memory),
+                # failing at baseline and blocking autotuning.  Try a
+                # compilable smaller config as the baseline so autotuning
+                # can proceed and pick a fast fitting config.
+                baseline_output = None
+                if hasattr(torch, "npu") and torch.npu.is_available():
+                    fallback = self._npu_baseline_fallback(baseline_config)
+                    if fallback is not None:
+                        # Adopt the fresh args the fallback ran on so the
+                        # mutation detection below sees the actually-run args.
+                        baseline_output, new_args, _fallback_cfg = fallback
+                        synchronize_device(baseline_output)
+                if baseline_output is None:
+                    decorator = self.kernel.format_kernel_decorator(
+                        baseline_config, self.settings
+                    )
+                    log_generated_triton_code_debug(
+                        self.log,
+                        self.kernel,
+                        baseline_config,
+                        prefix=f"Generated Triton code for {decorator}:",
+                    )
+                    self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
+                    raise exc.InvalidConfig(
+                        "Default config failed while computing baseline.\n"
+                        f"Default config: {decorator}\n"
+                        f"{SUPPRESSED_TRITON_CODE_MSG}\n"
+                        "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
+                        "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
+                    ) from e
 
         original_args_flat, _ = tree_flatten(self.args)
         new_args_flat, _ = tree_flatten(new_args)
@@ -630,6 +644,79 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             idx_to_clone=mutated_arg_idxs,
         )
         return baseline_output, mutated_arg_idxs, baseline_post_args
+
+    def _npu_baseline_fallback(
+        self, failed_config: Config
+    ) -> tuple[object, object, Config] | None:
+        """NPU-only: find a compilable smaller config to use as the baseline.
+
+        Ascend's 192KB UB is often exceeded by the default config (tuned for
+        CUDA's larger shared memory), failing at baseline and blocking
+        autotuning.  Try progressively halving ``block_sizes`` and
+        ``reduction_loops`` until a config compiles, so autotuning can
+        proceed and pick a fast fitting config.  Returns
+        ``(output, fresh_args, config)`` on success (``fresh_args`` is the
+        clone the fallback ran on, for mutation detection), or ``None`` if
+        no smaller config compiles (caller raises ``InvalidConfig``).
+        """
+        base: dict[str, object] = dict(failed_config)
+        for _ in range(8):
+            changed = False
+            block_sizes = base.get("block_sizes")
+            if isinstance(block_sizes, list):
+                halved = [
+                    max(1, b // 2) if isinstance(b, int) and b > 1 else b
+                    for b in block_sizes
+                ]
+                if halved != block_sizes:
+                    base["block_sizes"] = halved
+                    changed = True
+            reduction_loops = base.get("reduction_loops")
+            if isinstance(reduction_loops, list):
+                halved_rl = [
+                    max(1, r // 2) if isinstance(r, int) and r and r > 1 else r
+                    for r in reduction_loops
+                ]
+                if halved_rl != reduction_loops:
+                    base["reduction_loops"] = halved_rl
+                    changed = True
+            if not changed:
+                break
+            try:
+                cfg = Config.from_dict(base)
+                fresh_args = _clone_args(
+                    self.args, self.kernel.env.process_group_name
+                )
+                out = self.kernel.compile_config(cfg, allow_print=False)(
+                    *fresh_args
+                )
+                synchronize_device(out)
+            except Exception:
+                continue
+            self.log.warning(
+                "NPU baseline fallback: default config failed at baseline, "
+                f"using smaller config {cfg!r} so autotuning can proceed."
+            )
+            # Seed the search with this working config so the autotune initial
+            # population (otherwise rooted at the overflowing default) has a
+            # valid member and does not hit NoConfigFound.  ``self.settings``
+            # is the search's own settings object (the provider is constructed
+            # by BaseSearch._prepare), so this is visible to
+            # ``_autotune_seed_configs`` -> ``_generate_best_available_population_flat``.
+            existing = self.settings.autotune_seed_configs
+            if existing is None:
+                self.settings.autotune_seed_configs = (cfg,)
+            elif isinstance(existing, Config):
+                self.settings.autotune_seed_configs = (existing, cfg)
+            elif isinstance(existing, dict):
+                self.settings.autotune_seed_configs = (
+                    Config.from_dict(existing),
+                    cfg,
+                )
+            else:
+                self.settings.autotune_seed_configs = (*tuple(existing), cfg)
+            return out, fresh_args, cfg
+        return None
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
         """
