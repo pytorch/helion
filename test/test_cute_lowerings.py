@@ -731,7 +731,13 @@ def _generic_pair_swap_f32_out(x: torch.Tensor, weight: torch.Tensor) -> torch.T
 
 @helion.kernel(backend="cute")
 def _generic_pair_butterfly(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Both registers of a pair feed both of its outputs."""
+    """Both registers of a pair feed both of its outputs.
+
+    This is one radix-2 stage, ``H_2 (x) I``: the stride-1 stage of a Hadamard
+    transform, and the only stage of one that is pair-local. Rotation-based
+    quantization (QuaRot, SpinQuant) applies exactly this shape to a GEMM
+    result, so it is a real epilogue and not just a coordinate exercise.
+    """
     m, k = x.size()
     _, n = weight.size()
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
@@ -1091,7 +1097,7 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
             bound.set_config(config)
             return bound.to_triton_code(config), bound(x, weight)
 
-        with self.subTest(shape="butterfly"):
+        with self.subTest(shape="radix2_hadamard_stage"):
             code, actual = run(_generic_pair_butterfly)
             self.assertIn("tcgen05_epi_partner_index", code)
             expected = torch.stack(
