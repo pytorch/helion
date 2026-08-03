@@ -13,7 +13,7 @@ from helion._compiler.pallas.plan_tiling import IndexingPattern
 from helion._compiler.pallas.plan_tiling import TensorIndexPattern
 from helion._compiler.pallas.plan_tiling import TilePattern
 from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
-from helion._compiler.pallas.tensorcore_plan import ProjectionScatterPlan
+from helion._compiler.pallas.tensorcore_plan import OneHotScatterPlan
 from helion._compiler.pallas.tensorcore_plan import select_tensorcore_plan
 from helion.language import memory_ops
 from helion.language.atomic_ops import atomic_add
@@ -122,7 +122,7 @@ def test_tensorcore_plan_owns_indirect_fallbacks() -> None:
         scatter = select_tensorcore_plan(store_access, Config())
 
     assert isinstance(gather, OneHotGatherPlan)
-    assert isinstance(scatter, ProjectionScatterPlan)
+    assert isinstance(scatter, OneHotScatterPlan)
     assert gather.plan is gather_fallback
     assert scatter.plan is scatter_fallback
     native_gather.assert_called_once()
