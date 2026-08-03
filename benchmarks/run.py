@@ -26,6 +26,7 @@ from contextlib import suppress
 import csv
 import dataclasses
 import datetime
+import errno
 import gc
 import importlib.util
 import json
@@ -33,6 +34,7 @@ import logging
 import os
 from pathlib import Path
 from pprint import pformat
+import resource
 import shutil
 import subprocess
 import sys
@@ -109,6 +111,8 @@ MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
 _PATCHED_MAMBA_OPERATOR_CLASSES: set[type[Any]] = set()
 _PATCHED_ROPE_OPERATOR_CLASSES: set[type[Any]] = set()
 _PATCHED_GDN_OPERATOR_CLASSES: set[type[Any]] = set()
+_PATCHED_FD_DIAGNOSTIC_OPERATOR_CLASSES: set[type[Any]] = set()
+_FD_DIAGNOSTIC_RESERVE: int | None = None
 
 _RopeInput = tuple[
     torch.Tensor,
@@ -322,6 +326,123 @@ def patch_gdn_tritonbench(operator_name: str, Operator: type[Any]) -> None:
     Operator.get_shape_iter = get_shape_iter
     Operator.accuracy = accuracy
     _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
+
+
+def _fd_category(target: str) -> str:
+    if target.startswith("pipe:"):
+        return "pipe"
+    if target.startswith("socket:"):
+        return "socket"
+    if target.startswith("anon_inode:"):
+        return "anon_inode"
+    if target.startswith("/dev/"):
+        return "device"
+    if target.startswith("/tmp/"):
+        return "tmp"
+    return "file"
+
+
+def log_fd_diagnostics(
+    *, phase: str, operator_name: str, input_id: int, implementation: str
+) -> None:
+    global _FD_DIAGNOSTIC_RESERVE
+
+    proc_fd = "/proc/self/fd"
+    released_reserve = False
+    try:
+        try:
+            entries = os.listdir(proc_fd)
+        except OSError as exc:
+            if exc.errno != errno.EMFILE or _FD_DIAGNOSTIC_RESERVE is None:
+                raise
+            os.close(_FD_DIAGNOSTIC_RESERVE)
+            _FD_DIAGNOSTIC_RESERVE = None
+            released_reserve = True
+            entries = os.listdir(proc_fd)
+
+        targets: list[str] = []
+        for entry in entries:
+            try:
+                targets.append(os.readlink(f"{proc_fd}/{entry}"))
+            except FileNotFoundError:
+                # The descriptor used by os.listdir disappears before readlink.
+                continue
+
+        categories = collections.Counter(_fd_category(target) for target in targets)
+        samples: dict[str, list[str]] = collections.defaultdict(list)
+        for target in targets:
+            category = _fd_category(target)
+            if len(samples[category]) < 3:
+                samples[category].append(target)
+
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        logger.warning(
+            "FD_DIAGNOSTIC phase=%s operator=%s input_id=%d implementation=%s "
+            "pid=%d open=%d soft_limit=%s hard_limit=%s reserve_released=%s "
+            "categories=%s samples=%s",
+            phase,
+            operator_name,
+            input_id,
+            implementation,
+            os.getpid(),
+            len(entries),
+            soft_limit,
+            hard_limit,
+            released_reserve,
+            dict(sorted(categories.items())),
+            dict(sorted(samples.items())),
+        )
+    except OSError:
+        logger.exception(
+            "FD_DIAGNOSTIC failed phase=%s operator=%s input_id=%d "
+            "implementation=%s pid=%d",
+            phase,
+            operator_name,
+            input_id,
+            implementation,
+            os.getpid(),
+        )
+
+
+def patch_fd_diagnostics(operator_name: str, Operator: type[Any]) -> None:
+    global _FD_DIAGNOSTIC_RESERVE
+
+    if os.getenv("HELION_BENCHMARK_FD_DIAGNOSTICS", "0") != "1":
+        return
+    if Operator in _PATCHED_FD_DIAGNOSTIC_OPERATOR_CLASSES:
+        return
+    if _FD_DIAGNOSTIC_RESERVE is None:
+        _FD_DIAGNOSTIC_RESERVE = os.open("/dev/null", os.O_RDONLY)
+
+    original_do_bench = Operator._do_bench
+
+    def do_bench(
+        self: object,
+        input_id: int,
+        implementation: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        log_fd_diagnostics(
+            phase="before",
+            operator_name=operator_name,
+            input_id=input_id,
+            implementation=implementation,
+        )
+        try:
+            return original_do_bench(
+                self, input_id, implementation, *args, **kwargs
+            )
+        finally:
+            log_fd_diagnostics(
+                phase="after",
+                operator_name=operator_name,
+                input_id=input_id,
+                implementation=implementation,
+            )
+
+    Operator._do_bench = do_bench
+    _PATCHED_FD_DIAGNOSTIC_OPERATOR_CLASSES.add(Operator)
 
 
 def helion_benchmark_method_name(func_name: str) -> str:
@@ -1492,6 +1613,7 @@ def run_kernel_variants(
         patch_rope_tritonbench_inputs(operator_name, Operator)
         patch_mamba2_tritonbench_inputs(operator_name, Operator)
         patch_gdn_tritonbench(operator_name, Operator)
+        patch_fd_diagnostics(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
