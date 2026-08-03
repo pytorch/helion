@@ -1,35 +1,19 @@
-"""Pallas-backend codegen for ops defined in ``helion.language.view_ops``.
+"""Pallas view codegen and resident Ref composition.
 
-This module also implements *resident subviews*.  When a tile load's consumers
-all narrow one dimension to a contiguous run -- ``block = x[outer, :, :]``
-followed by ``block[local.begin, :, :]`` inside a nested loop -- the load is
-emitted as a Pallas Ref rather than a materialized array, and each consumer
-reads a small run out of that Ref.
-
-The load node stays where it is, in the outer loop body, so the block is still
-staged and DMA double-buffered once per outer tile; only the read of an
-individual run moves into the inner loop.
-
-This is a lowering, not an optimization.  Mosaic has no ``dynamic_slice`` and
-no gather, so a run selected out of a value already in vector registers has no
-lowering at all; the Ref is the only way to express one.  A narrowing subscript
-that cannot be planned is therefore rejected with the reason, rather than
-lowered to something that only works under the Pallas interpreter.  Plain
-``None``/``:`` subscripts do not narrow anything and keep their ordinary value
-lowering.
-
-Planning runs once per config, because eligibility depends on the configured
-block sizes.  It normalizes each narrowing subscript into exactly one
-``_Selector`` and attaches it to the node; codegen consumes that and never
-re-derives it.
+Per-config planning keeps a direct VMEM load as a Ref while all of its users
+are registered, address-preserving view operations. A view is materialized only
+at its value boundary. Narrowing subscripts therefore lower to ``pl.ds`` on the
+current Ref, including across nested control-flow captures and static reshapes.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import enum
+from math import prod
 from typing import TYPE_CHECKING
+from typing import NoReturn
+from typing import cast
 
+import sympy
 import torch
 
 from ... import exc
@@ -51,155 +35,92 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
 
-# Set on a ``load`` node whose block must be emitted as a Pallas Ref.
-_LOAD_AS_REF = "pallas_load_as_ref"
-# Set on a narrowing ``subscript`` node: the ``_Subview`` that lowers it.
-_SUBVIEW = "pallas_subview"
-# Set on a narrowing ``subscript`` node that could not be planned: why.
-_REJECTION = "pallas_subview_rejection"
 
+_RESIDENT_REF = "pallas_resident_ref"
+_RESIDENT_REJECTION = "pallas_resident_ref_rejection"
 
-@dataclasses.dataclass(frozen=True)
-class _Block:
-    """The tile of one dimension that a resident load brings into VMEM."""
-
-    dim: int
-    """Dimension of the tensor the load tiles."""
-
-    block_id: int
-    """Tile loop that produced the block."""
-
-    extent: int
-    """Size of the block along ``dim`` under this config."""
-
-    whole_dim: bool
-    """The tile loop sweeps the tensor dimension end to end, so every row of
-    the block holds real data and narrowing reads need no range masking."""
-
-
-class _SelectorKind(enum.Enum):
-    """How a subview picks the run it reads out of a block."""
-
-    CONSTANT = enum.auto()
-    """A literal index or slice."""
-
-    TILE = enum.auto()
-    """An inner tile loop's offset, one block wide."""
-
-    DYNAMIC = enum.auto()
-    """A data-dependent start with a constant width, as written by
-    ``block[live - 3 : live]``."""
-
-
-@dataclasses.dataclass(frozen=True)
-class _Selector:
-    """One contiguous run narrowed out of a single dimension of a block.
-
-    Produced once by ``_normalize`` during planning.  Everything codegen needs
-    is either here or reachable from the block id, so codegen never re-inspects
-    the index.
-    """
-
-    kind: _SelectorKind
-
-    dim: int
-    """Dimension of the block being narrowed."""
-
-    width: int
-    """Length of the run.  For ``TILE`` this is the inner loop's block size."""
-
-    block_extent: int
-    """Size of the block along ``dim``, so a data-dependent start can be
-    clamped to a run that stays inside it."""
-
-    begin: int = 0
-    """Literal start of the run.  Only used by ``CONSTANT``."""
-
-    block_id: int = -1
-    """Inner tile loop driving the run.  Only used by ``TILE``."""
-
-    dynamic_begin: object = None
-    """Start of a ``DYNAMIC`` run, as the traced ``SymInt``.  Codegen renders
-    it; it does not go back to the node to find it."""
-
-    squeeze: bool = False
-    """The narrowed dimension does not appear in the result."""
-
-    masked: bool = False
-    """The run can extend past the rows the tile actually covers, so the read
-    has to be multiplied by the driving loop's mask."""
-
-
-@dataclasses.dataclass(frozen=True)
-class _Subview:
-    """A ``subscript`` that reads a contiguous run out of a resident load."""
-
-    source: torch.fx.Node
-    selector: _Selector
+# Factor, physical shape, hidden singleton dimensions, and outstanding
+# (physical dimension, outer block id) logical-validity obligations.
+_ResidentVariant = tuple[
+    int, tuple[int, ...], tuple[int, ...], tuple[tuple[int, int], ...]
+]
+# kind, logical dim, local block, begin, width, mask
+_ResidentSpec = tuple[str, int, int, int | torch.SymInt, int, bool]
+# Mode ("ref" preserves the Ref; "read" materializes it), worklist variants,
+# and the transform spec.
+_ResidentInfo = tuple[str, tuple[_ResidentVariant, ...], _ResidentSpec | None]
+_PlannedTransform = tuple[
+    torch.fx.Node,
+    tuple[torch.fx.Node, ...],
+    tuple[_ResidentVariant, ...],
+    _ResidentSpec | None,
+    bool,
+]
 
 
 def _node_value(value: object) -> object:
     return value.meta.get("val") if isinstance(value, torch.fx.Node) else value
 
 
-def _input_rank(node: torch.fx.Node) -> int:
-    """Rank of the value a ``subscript`` narrows, or -1 if it is not a tensor."""
-    value = _node_value(node.args[0])
-    return value.ndim if isinstance(value, torch.Tensor) else -1
-
-
-def _where(node: torch.fx.Node) -> str:
-    """Describe where a node came from, for an error the user can act on."""
-    location = node.meta.get("location")
-    filename = getattr(location, "filename", None)
-    lineno = getattr(location, "lineno", None)
-    if filename is None or lineno is None:
-        return f"<{node.name}>"
-    return f"{filename}:{lineno}"
-
-
-def subview_of(node: torch.fx.Node) -> _Subview | None:
-    """Return the plan attached to a narrowing ``subscript``, if it has one."""
-    plan = node.meta.get(_SUBVIEW)
-    return plan if isinstance(plan, _Subview) else None
-
-
-def load_is_ref(node: torch.fx.Node) -> bool:
-    """True when a ``load``'s block must be emitted as a Pallas Ref."""
-    return node.meta.get(_LOAD_AS_REF) is True
-
-
-def narrowing_positions(node: torch.fx.Node) -> list[int]:
-    """Positions of a ``subscript``'s indices that select a subset of a dim.
-
-    ``None`` adds a dimension and ``:`` keeps one whole; everything else picks
-    out part of a dimension and needs a resident block to read from.
-    """
-    indices = node.args[1]
+def _narrowed_dims(indices: object) -> list[int]:
     if not isinstance(indices, (list, tuple)):
         return []
     return [
-        position
-        for position, index in enumerate(indices)
+        dim
+        for dim, index in enumerate(indices)
         if index is not None and index != slice(None)
     ]
 
 
-# ---------------------------------------------------------------------------
-# Planning
-# ---------------------------------------------------------------------------
+def _resident_info(node: torch.fx.Node) -> _ResidentInfo | None:
+    value = node.meta.get(_RESIDENT_REF)
+    return value if isinstance(value, tuple) else None
 
 
-def _control_flow_parents(
+def _where(node: torch.fx.Node) -> str:
+    location = node.meta.get("location")
+    filename = getattr(location, "filename", None)
+    lineno = getattr(location, "lineno", None)
+    return (
+        f"{filename}:{lineno}"
+        if filename is not None and lineno is not None
+        else f"<{node.name}>"
+    )
+
+
+def _current_variant(state: CodegenState, info: _ResidentInfo) -> _ResidentVariant:
+    variants = info[1]
+    if len(variants) == 1:
+        return variants[0]
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    assert plan is not None and plan.grouping == 2
+    block_id = plan.compact_axis.block_id
+    current = state.device_function.resolved_block_size(block_id)
+    assert isinstance(current, int)
+    factor = current // env.compact_worklist_block
+    return next(variant for variant in variants if variant[0] == factor)
+
+
+def maybe_materialize_resident_ref(node: torch.fx.Node, result: ast.AST) -> ast.AST:
+    """Materialize a registered reshape-family Ref at its value boundary."""
+    info = _resident_info(node)
+    assert info is not None
+    if info[0] == "ref":
+        return result
+    assert all(not variant[3] for variant in info[1])
+    return expr_from_string("{result}[...]", result=result)
+
+
+def _capture_edges(
     graphs: list[GraphInfo],
-) -> dict[int, tuple[torch.fx.Node, int]]:
-    """Map each subgraph id to the node that runs it and its capture-arg index.
-
-    ``_for_loop(graph_id, begin, end, args)`` and
-    ``_for_loop_step(graph_id, begin, end, args, step)`` pass captures in
-    ``args[3]``; ``_if(test, if_graph_id, else_graph_id, if_args, else_args)``
-    passes them in ``args[3]`` and ``args[4]``.
-    """
+) -> tuple[
+    dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
+    dict[int, tuple[torch.fx.Node, int]],
+    dict[torch.fx.Node, torch.fx.Node],
+]:
+    """Build parent and capture links on the current per-config graph copies."""
     parents: dict[int, tuple[torch.fx.Node, int]] = {}
     for info in graphs:
         for node in info.graph.nodes:
@@ -214,22 +135,7 @@ def _control_flow_parents(
                     parents[node.args[1]] = (node, 3)
                 if isinstance(node.args[2], int):
                     parents[node.args[2]] = (node, 4)
-    return parents
 
-
-def _capture_map(
-    graphs: list[GraphInfo], parents: dict[int, tuple[torch.fx.Node, int]]
-) -> dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]]:
-    """Map an outer node to the ``(placeholder, parent)`` pairs that bind it.
-
-    A subgraph's placeholders were traced from exactly the list its parent node
-    carries -- ``DeviceIR.add_graph(node_args=inputs.get_node_args(tracer))`` and
-    the parent's capture argument are both built from the same
-    ``inputs.get_tensor_args()`` -- so position ``i`` of one always corresponds
-    to position ``i`` of the other.  This is the correspondence
-    ``NodeArgsGraphInfo.placeholder_to_outer_arg`` relies on, read off the
-    per-config graph copies rather than the originals.
-    """
     captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]] = {}
     for info in graphs:
         entry = parents.get(info.graph_id)
@@ -245,50 +151,17 @@ def _capture_map(
         for outer, placeholder in zip(outer_args, placeholders, strict=True):
             if isinstance(outer, torch.fx.Node):
                 captures.setdefault(outer, []).append((placeholder, parent))
-    return captures
+    placeholder_to_outer = {
+        placeholder: outer
+        for outer, edges in captures.items()
+        for placeholder, _parent in edges
+    }
+    return captures, parents, placeholder_to_outer
 
 
-def _effective_users(
-    node: torch.fx.Node,
-    captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
-) -> list[torch.fx.Node]:
-    """Users of ``node`` after seeing through renames and loop captures.
-
-    ``_new_var`` and capture placeholders only rebind the value to another
-    name, which a Pallas Ref survives unchanged, so they are transparent here.
-    """
-    results: list[torch.fx.Node] = []
-    seen: set[torch.fx.Node] = {node}
-    stack: list[torch.fx.Node] = [node]
-    while stack:
-        current = stack.pop()
-        edges = captures.get(current, ())
-        consumers = {parent for _placeholder, parent in edges}
-        for user in current.users:
-            if user in consumers or user.target is torch.ops.aten.sym_size.int:
-                continue
-            if user.target is _tracing_ops._new_var:
-                if user not in seen:
-                    seen.add(user)
-                    stack.append(user)
-            else:
-                results.append(user)
-        for placeholder, _parent in edges:
-            if placeholder not in seen:
-                seen.add(placeholder)
-                stack.append(placeholder)
-    return results
-
-
-def _resolve_index(
+def _resolve_node(
     node: object, placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node]
 ) -> torch.fx.Node | None:
-    """Follow renames and loop captures back to the node defining an index.
-
-    An index written in one scope and used in another arrives as a chain of
-    ``_new_var`` renames and capture placeholders; the node underneath is what
-    tells a tile run apart from an arbitrary gather.
-    """
     seen: set[torch.fx.Node] = set()
     while isinstance(node, torch.fx.Node) and node not in seen:
         seen.add(node)
@@ -302,21 +175,13 @@ def _resolve_index(
 
 
 def _mutated_tensor_ids(graphs: list[GraphInfo]) -> set[int]:
-    """Ids of fake tensors written by a store or atomic anywhere on device.
-
-    A resident load reads its Ref at the consumer's program point instead of at
-    the load, so a write to the same tensor in between would be seen by reads
-    that must observe the pre-write data.  Ruling out every written tensor is
-    coarse, but it keeps the rule simple to state and cheap to check.
-    """
     from ...language.atomic_ops import ATOMIC_OPS
     from ...language.memory_ops import store
 
-    targets = ATOMIC_OPS | {store}
     mutated: set[int] = set()
     for info in graphs:
         for node in info.graph.nodes:
-            if node.op == "call_function" and node.target in targets and node.args:
+            if node.op == "call_function" and node.target in ATOMIC_OPS | {store}:
                 value = _node_value(node.args[0])
                 if isinstance(value, torch.Tensor):
                     mutated.add(id(value))
@@ -324,18 +189,21 @@ def _mutated_tensor_ids(graphs: list[GraphInfo]) -> set[int]:
 
 
 def _loop_bounds(
-    graph_info: GraphInfo, parent: torch.fx.Node | None, block_id: int
+    info: GraphInfo,
+    parents: dict[int, tuple[torch.fx.Node, int]],
+    block_id: int,
 ) -> tuple[object, object] | None:
-    """Return the ``(begin, end)`` a for-loop graph iterates ``block_id`` over."""
     from ..device_ir import ForLoopGraphInfo
 
+    entry = parents.get(info.graph_id)
     if (
-        not isinstance(graph_info, ForLoopGraphInfo)
-        or parent is None
-        or block_id not in graph_info.block_ids
+        not isinstance(info, ForLoopGraphInfo)
+        or entry is None
+        or block_id not in info.block_ids
     ):
         return None
-    position = graph_info.block_ids.index(block_id)
+    parent = entry[0]
+    position = info.block_ids.index(block_id)
     begins, ends = parent.args[1:3]
     if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
         return None
@@ -343,505 +211,683 @@ def _loop_bounds(
 
 
 def _enclosing_loop_bounds(
-    graph_info: GraphInfo,
+    info: GraphInfo,
     parents: dict[int, tuple[torch.fx.Node, int]],
     graph_infos: dict[torch.fx.Graph, GraphInfo],
     block_id: int,
 ) -> tuple[object, object] | None:
-    """Find the bounds of the tile loop enclosing ``graph_info``.
-
-    The loop need not be the immediately enclosing graph: a subscript inside an
-    ``if`` inside a tile loop is still driven by that loop, so the parent chain
-    is walked until the loop that owns ``block_id`` turns up.
-    """
     seen: set[int] = set()
-    info: GraphInfo | None = graph_info
-    while info is not None and id(info) not in seen:
+    while id(info) not in seen:
         seen.add(id(info))
+        if (bounds := _loop_bounds(info, parents, block_id)) is not None:
+            return bounds
         entry = parents.get(info.graph_id)
         parent = entry[0] if entry is not None else None
-        bounds = _loop_bounds(info, parent, block_id)
-        if bounds is not None:
-            return bounds
-        info = graph_infos.get(parent.graph) if parent is not None else None
+        outer = graph_infos.get(parent.graph) if parent is not None else None
+        if outer is None:
+            return None
+        info = outer
     return None
 
 
-def _resident_block(
-    node: torch.fx.Node,
+def _variant_factors() -> tuple[int, ...]:
+    plan = CompileEnvironment.current().compact_worklist_plan
+    return (1, 2) if plan is not None and plan.grouping == 2 else (1,)
+
+
+def _variant_block_size(block_id: int, config: Config, factor: int) -> int | None:
+    env = CompileEnvironment.current()
+    value = env.block_sizes[block_id].from_config(config)
+    if not isinstance(value, int):
+        return None
+    plan = env.compact_worklist_plan
+    if (
+        factor == 2
+        and plan is not None
+        and plan.grouping == 2
+        and block_id == plan.compact_axis.block_id
+    ):
+        value *= 2
+    return value
+
+
+def _concrete_size(size: object, config: Config, factor: int) -> int | None:
+    if isinstance(size, int):
+        return size
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(size)
+    if block_id is not None:
+        return _variant_block_size(block_id, config, factor)
+    if isinstance(size, torch.SymInt):
+        value = env.try_concretize_symint(size)
+        return value if isinstance(value, int) else None
+    return None
+
+
+def _physical_shape(
+    value: torch.Tensor, config: Config, factor: int
+) -> tuple[int, ...] | None:
+    shape = tuple(_concrete_size(size, config, factor) for size in value.shape)
+    return cast("tuple[int, ...]", shape) if None not in shape else None
+
+
+def _root_variants(
+    producer: torch.fx.Node,
     graph_info: GraphInfo,
-    parent: torch.fx.Node | None,
+    parents: dict[int, tuple[torch.fx.Node, int]],
     config: Config,
     mutated: set[int],
-) -> _Block | str:
-    """Describe the block a ``load`` brings in, or say why it cannot be one.
-
-    A resident load tiles exactly one dimension and passes every other one
-    through, so its result keeps the tensor's rank and a ``pl.ds`` run of the
-    Ref addresses the same elements the materialized array would have held.
-    """
+) -> tuple[_ResidentVariant, ...] | None:
     from .backend import SliceAddressing
     from .backend import _slice_addressing
     from .plan_tiling import IndirectGatherPattern
 
-    tensor = _node_value(node.args[0])
-    value = node.meta.get("val")
-    indices = node.args[1]
+    tensor = _node_value(producer.args[0])
+    value = producer.meta.get("val")
+    indices = producer.args[1]
+    if isinstance(tensor, torch.Tensor) and id(tensor) in mutated:
+        producer.meta[_RESIDENT_REJECTION] = (
+            "the tensor it reads is also written on device"
+        )
+        return None
     if (
         not isinstance(tensor, torch.Tensor)
         or not isinstance(value, torch.Tensor)
+        or tensor.ndim != value.ndim
+        or producer.args[2] is not None
         or not isinstance(indices, (list, tuple))
-        or node.args[2] is not None
+        or any(
+            isinstance(pattern, IndirectGatherPattern)
+            for pattern in producer.meta.get("indexing_patterns") or ()
+        )
     ):
-        return "it is not a plain tile load"
-    if tensor.ndim != value.ndim:
-        return "it does not keep the tensor's rank"
-    if id(tensor) in mutated:
-        return "the tensor it reads is also written on device"
-    if any(
-        isinstance(pattern, IndirectGatherPattern)
-        for pattern in node.meta.get("indexing_patterns") or ()
-    ):
-        return "it is an indirect gather"
+        return None
 
-    tiled = [dim for dim, index in enumerate(indices) if index != slice(None)]
-    if len(tiled) != 1:
-        return f"it tiles {len(tiled)} dimensions, not exactly one"
-    dim = tiled[0]
+    selected = _narrowed_dims(indices)
+    if len(selected) != 1:
+        return None
+    dim = selected[0]
+    outer_block_id = CompileEnvironment.current().resolve_block_id(
+        _node_value(indices[dim])
+    )
+    if outer_block_id is None:
+        return None
 
-    env = CompileEnvironment.current()
-    block_id = env.resolve_block_id(_node_value(indices[dim]))
-    if block_id is None:
-        return f"dimension {dim} is not indexed by a tile"
-    extent = env.block_sizes[block_id].from_config(config)
-    if not isinstance(extent, int):
-        return f"dimension {dim} has no concrete block size"
-    lane_extent = env.size_hint(value.shape[-1])
-    if _slice_addressing(value, dim, lane_extent) is not SliceAddressing.DIRECT:
-        return f"a run on dimension {dim} would need sublane alignment"
-
-    bounds = _loop_bounds(graph_info, parent, block_id)
-    whole_dim = False
+    full_loop = False
+    bounds = _loop_bounds(graph_info, parents, outer_block_id)
     if bounds is not None:
-        begin, end = bounds
-        whole_dim = (
-            isinstance(begin, (int, torch.SymInt))
+        start, end = bounds
+        env = CompileEnvironment.current()
+        full_loop = (
+            isinstance(start, (int, torch.SymInt))
             and isinstance(end, (int, torch.SymInt))
-            and env.known_equal(begin, 0)
+            and env.known_equal(start, 0)
             and env.known_equal(end, tensor.shape[dim])
         )
-    return _Block(dim, block_id, extent, whole_dim)
+
+    variants: list[_ResidentVariant] = []
+    for factor in _variant_factors():
+        shape = _physical_shape(value, config, factor)
+        if (
+            shape is None
+            or _slice_addressing(value, dim, shape[-1]) is not SliceAddressing.DIRECT
+        ):
+            return None
+        backing = _concrete_size(tensor.shape[dim], config, factor)
+        full = full_loop and backing is not None and backing % shape[dim] == 0
+        validity = () if full else ((dim, outer_block_id),)
+        variants.append((factor, shape, (), validity))
+    return tuple(variants)
 
 
-def _bounded_by_block(value: torch.SymInt, block_id: int) -> bool:
-    """True when ``value`` is the live extent of the tile owning ``block_id``.
-
-    A loop running to that extent only visits rows the outer tile really
-    covers, which is what lets a narrowing read skip the range mask the outer
-    load would otherwise have applied.
-    """
-    from ..type_info import _detect_outer_block_bound
-
-    env = CompileEnvironment.current()
-    if env.get_block_id(value) is not None:
-        return False
-    return _detect_outer_block_bound(value, env) == block_id
+def _logical_to_physical(logical_dim: int, hidden: tuple[int, ...], rank: int) -> int:
+    logical = -1
+    for physical in range(rank):
+        if physical in hidden:
+            continue
+        logical += 1
+        if logical == logical_dim:
+            return physical
+    raise AssertionError("logical dimension is outside resident Ref rank")
 
 
 def _tile_run(index: torch.fx.Node) -> int | None:
-    """Return the block id of a whole, unshifted tile run, else None.
-
-    ``tile.index`` may reach the subscript as an arithmetic node -- ``tile.index
-    + 0`` traces to an ``add`` -- so the run is recognized from the
-    ``tile_with_offset`` provenance the device IR already records rather than
-    from the node's target.  A *shifted* run is refused: the loop's mask marks
-    which of ``offset + arange(width)`` are live, which is not the right mask
-    for rows read at ``offset + shift + arange(width)``.
-    """
     from ..indexing_strategy import subscript_tile_info
 
     env = CompileEnvironment.current()
     info = subscript_tile_info(env, index)
     if info is not None:
         return info.block_id if env.known_equal(info.offset, 0) else None
-    # ``subscript_tile_info`` resolves a block id from an index's value, which
-    # a bare ``tile_index`` node does not carry -- its value is the run itself.
     if index.target is tile_index and index.args:
         return env.resolve_block_id(_node_value(index.args[0]))
     return None
 
 
-def _normalize_tile(
-    index: torch.fx.Node,
-    graph_info: GraphInfo,
-    parents: dict[int, tuple[torch.fx.Node, int]],
-    graph_infos: dict[torch.fx.Graph, GraphInfo],
-    config: Config,
-    block: _Block,
-) -> _Selector | str:
-    """Normalize a ``tile.begin`` position or a ``tile.index`` run."""
-    from ..host_function import HostFunction
-    from ..variable_origin import TileBeginOrigin
-
-    env = CompileEnvironment.current()
-    index_value = index.meta.get("val")
-    squeeze = isinstance(index_value, torch.SymInt)
-    if squeeze:
-        expr = _symint_expr(index_value)
-        origin = (
-            HostFunction.current().expr_to_origin.get(expr)
-            if expr is not None
-            else None
-        )
-        if origin is None or not isinstance(origin.origin, TileBeginOrigin):
-            return "the position is not a tile's begin"
-        inner_block_id = origin.origin.block_id
-    else:
-        run = _tile_run(index)
-        if run is None:
-            return (
-                "the index is not a whole, unshifted tile run; a shifted run "
-                "or a computed row vector would be a gather"
-            )
-        inner_block_id = run
-
-    bounds = _enclosing_loop_bounds(graph_info, parents, graph_infos, inner_block_id)
-    if bounds is None:
-        return "no enclosing tile loop drives the index"
-    begin, end = bounds
-    if not isinstance(begin, (int, torch.SymInt)) or not env.known_equal(begin, 0):
-        return "the driving tile loop does not start at zero"
-
-    width = env.block_sizes[inner_block_id].from_config(config)
-    if not isinstance(width, int) or width < 1:
-        return "the driving tile loop has no concrete block size"
-    if squeeze and width != 1:
-        return f"a single position needs block size 1, but the loop uses {width}"
-    if width > block.extent:
-        return (
-            f"the run is {width} wide but the block holds only {block.extent} "
-            "rows for this config"
-        )
-    if block.extent % width != 0:
-        return (
-            f"a {width}-wide run does not divide the {block.extent}-row block "
-            "for this config, so the last one would overrun it"
-        )
-
-    if isinstance(end, int):
-        # A constant trip count only stays within live rows when the whole
-        # block is live and the loop covers exactly it.
-        if not block.whole_dim or end != block.extent:
-            return "the loop's constant trip count does not cover exactly the block"
-    elif isinstance(end, torch.SymInt):
-        if not block.whole_dim and not _bounded_by_block(end, block.block_id):
-            return (
-                "the loop is not bounded by this tile's live extent, so the "
-                "run could read rows the load masked away"
-            )
-    else:
-        return "the driving tile loop has no usable end"
-
-    return _Selector(
-        _SelectorKind.TILE,
-        block.dim,
-        width,
-        block.extent,
-        block_id=inner_block_id,
-        squeeze=squeeze,
-        masked=not squeeze,
-    )
+def _config_error(node: torch.fx.Node, reason: str) -> NoReturn:
+    raise exc.InvalidConfig(f"resident Ref view at {node.name}: {reason}")
 
 
-def _normalize_iota(index: torch.fx.Node, block: _Block) -> _Selector | str:
-    """Normalize a constant-width run at a data-dependent start.
-
-    ``block[live - 3 : live]`` traces to an ``iota`` of a constant length, so
-    the width is static even though the start is not.  The start is clamped
-    into the block at codegen, which is what ``jax.lax.dynamic_slice`` does
-    with an out-of-range start, so a guarded and an unguarded read agree.
-    """
-    width = _node_value(index.args[0]) if index.args else None
-    start = _node_value(index.kwargs.get("start"))
-    if index.kwargs.get("step") != 1:
-        return "the run has a step other than one"
-    if not isinstance(width, int) or width < 1:
-        return "the run has no constant width"
-    if width > block.extent:
-        return (
-            f"the run is {width} wide but the block holds only {block.extent} "
-            "rows for this config"
-        )
-    if not isinstance(start, (int, torch.SymInt)):
-        return "the run has no usable start"
-    if not block.whole_dim:
-        return (
-            "the block is only partly live, so a data-dependent start could "
-            "read rows the load masked away"
-        )
-    return _Selector(
-        _SelectorKind.DYNAMIC, block.dim, width, block.extent, dynamic_begin=start
-    )
-
-
-def _normalize(
+def _selector(
     node: torch.fx.Node,
     graph_info: GraphInfo,
     parents: dict[int, tuple[torch.fx.Node, int]],
     graph_infos: dict[torch.fx.Graph, GraphInfo],
     config: Config,
-    block: _Block,
+    variants: tuple[_ResidentVariant, ...],
     placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node],
-) -> _Selector | str:
-    """Normalize one narrowing ``subscript`` of ``block``, or say why not.
+) -> tuple[tuple[_ResidentVariant, ...], _ResidentSpec, bool] | None:
+    """Validate one contiguous Ref selector and return its output state."""
+    from ..device_ir import IfGraphInfo
+    from ..host_function import HostFunction
+    from ..type_info import _detect_outer_block_bound
+    from ..variable_origin import TileBeginOrigin
+    from .backend import SliceAddressing
+    from .backend import _slice_addressing
 
-    This is the only place an index is recognized.  Codegen consumes the
-    ``_Selector`` this returns and never inspects the index again.
-    """
     indices = node.args[1]
-    assert isinstance(indices, (list, tuple))
+    input_node = node.args[0]
+    input_value = (
+        input_node.meta.get("val") if isinstance(input_node, torch.fx.Node) else None
+    )
+    if not isinstance(indices, (list, tuple)) or not isinstance(
+        input_value, torch.Tensor
+    ):
+        return None
     if any(index is None for index in indices):
-        return "it also adds a dimension, which a resident run cannot do"
-    positions = narrowing_positions(node)
-    if len(positions) != 1:
-        return f"it narrows {len(positions)} dimensions, not exactly one"
-    # With no ``None`` entries the subscript positions are the block's
-    # dimensions, so the narrowed position has to be the tiled one.
-    position = positions[0]
-    if position != block.dim:
-        return (
-            f"it narrows dimension {position}, but the block is resident along "
-            f"dimension {block.dim}"
-        )
-    index = indices[position]
+        return None
+    selected = _narrowed_dims(indices)
+    if len(selected) != 1:
+        return None
+    logical_dim = selected[0]
+    index = indices[logical_dim]
+    env = CompileEnvironment.current()
 
-    if isinstance(index, int):
-        if index >= block.extent:
-            return f"index {index} is past the {block.extent}-row block for this config"
-        if not block.whole_dim:
-            return "the block is only partly live, so a fixed row may be masked away"
-        return _Selector(
-            _SelectorKind.CONSTANT,
-            block.dim,
-            1,
-            block.extent,
-            begin=index,
-            squeeze=True,
-        )
+    kind = ""
+    local_block_id = -1
+    outer_block_id = -1
+    selector_begin: int | torch.SymInt = -1
+    static_width = -1
+    squeeze = False
+    requires_mask = False
+    static_loop_extent = -1
 
-    if isinstance(index, slice):
-        if index.step not in (None, 1):
-            return "the run has a step other than one"
-        if not isinstance(index.start, int) or not isinstance(index.stop, int):
-            return "the run does not have constant bounds"
-        if index.stop > block.extent:
-            return (
-                f"the run reaches row {index.stop} but the block holds only "
-                f"{block.extent} rows for this config"
+    def exact_outer_live(value: torch.SymInt) -> int | None:
+        if env.get_block_id(value) is not None:
+            return None
+        return _detect_outer_block_bound(value, env)
+
+    source = (
+        _resolve_node(index, placeholder_to_outer)
+        if isinstance(index, torch.fx.Node)
+        else None
+    )
+    if source is not None and source.target is torch.ops.prims.iota.default:
+        if not isinstance(graph_info, IfGraphInfo) or not source.args:
+            return None
+        width = _node_value(source.args[0])
+        start = _node_value(source.kwargs.get("start"))
+        entry = parents.get(graph_info.graph_id)
+        parent = entry[0] if entry is not None else None
+        predicate = _node_value(parent.args[0]) if parent is not None else None
+        if (
+            not isinstance(width, int)
+            or width < 1
+            or source.kwargs.get("step") != 1
+            or not isinstance(start, torch.SymInt)
+        ):
+            return None
+        live = start + width
+        detected_outer = exact_outer_live(live)
+        outer_block_id = detected_outer if detected_outer is not None else -1
+        live_expr = _symint_expr(live)
+        if (
+            outer_block_id < 0
+            or not isinstance(predicate, torch.SymBool)
+            or live_expr is None
+            or predicate._sympy_() != sympy.Ge(live_expr, width)
+        ):
+            return None
+        kind = "tail"
+        selector_begin = start
+        static_width = width
+    elif source is not None:
+        value = source.meta.get("val")
+        squeeze = isinstance(value, torch.SymInt)
+        if squeeze:
+            expr = _symint_expr(value)
+            origin = (
+                HostFunction.current().expr_to_origin.get(expr)
+                if expr is not None
+                else None
             )
-        if not block.whole_dim:
-            return "the block is only partly live, so a fixed run may be masked away"
-        return _Selector(
-            _SelectorKind.CONSTANT,
-            block.dim,
-            index.stop - index.start,
-            block.extent,
-            begin=index.start,
+            if origin is None or not isinstance(origin.origin, TileBeginOrigin):
+                return None
+            local_block_id = origin.origin.block_id
+        else:
+            detected_local = _tile_run(source)
+            local_block_id = detected_local if detected_local is not None else -1
+        bounds = _enclosing_loop_bounds(
+            graph_info, parents, graph_infos, local_block_id
         )
+        if bounds is None:
+            return None
+        start, end = bounds
+        if not isinstance(start, (int, torch.SymInt)) or not env.known_equal(start, 0):
+            return None
+        if isinstance(end, int):
+            if end < 1:
+                return None
+            static_loop_extent = end
+        elif not isinstance(end, torch.SymInt):
+            return None
+        else:
+            detected_outer = exact_outer_live(end)
+            outer_block_id = detected_outer if detected_outer is not None else -1
+            if outer_block_id < 0:
+                return None
+        kind = "tile"
+        requires_mask = not squeeze
+    elif isinstance(index, int):
+        if index < 0:
+            return None
+        kind = "static"
+        selector_begin = index
+        static_width = 1
+        squeeze = True
+    elif isinstance(index, slice):
+        if (
+            index.step not in (None, 1)
+            or not isinstance(index.start, int)
+            or not isinstance(index.stop, int)
+            or index.start < 0
+            or index.stop <= index.start
+        ):
+            return None
+        kind = "static"
+        selector_begin = index.start
+        static_width = index.stop - index.start
+    else:
+        return None
 
-    if not isinstance(index, torch.fx.Node):
-        return f"the index type {type(index).__name__} is not supported"
-    source = _resolve_index(index, placeholder_to_outer) or index
-    if source.target is torch.ops.prims.iota.default:
-        return _normalize_iota(source, block)
-    return _normalize_tile(source, graph_info, parents, graph_infos, config, block)
+    output: list[_ResidentVariant] = []
+    for factor, shape, hidden, validity in variants:
+        physical_dim = _logical_to_physical(logical_dim, hidden, len(shape))
+        lane_block = shape[-1]
+        if (
+            _slice_addressing(input_value, logical_dim, lane_block)
+            is not SliceAddressing.DIRECT
+        ):
+            return None
+        width = (
+            _variant_block_size(local_block_id, config, factor)
+            if kind == "tile"
+            else static_width
+        )
+        if not isinstance(width, int) or width < 1:
+            _config_error(node, "the selector has no concrete positive width")
+        if squeeze and width != 1:
+            _config_error(node, f"a scalar selector cannot use width {width}")
+        if width > shape[physical_dim]:
+            _config_error(
+                node,
+                f"the run is {width} wide but the block holds only "
+                f"{shape[physical_dim]} rows for this config",
+            )
+        if kind == "static":
+            assert isinstance(selector_begin, int)
+            if selector_begin + width > shape[physical_dim]:
+                _config_error(node, "the static run reaches past the resident Ref")
+            if any(dim == physical_dim for dim, _block in validity):
+                return None
+        elif kind == "tile":
+            if shape[physical_dim] % width != 0:
+                _config_error(node, "the selector width does not divide the Ref")
+            if static_loop_extent >= 0 and static_loop_extent != shape[physical_dim]:
+                _config_error(node, "the inner loop does not cover exactly the Ref")
+
+        remaining = tuple(
+            guard
+            for guard in validity
+            if not (guard[0] == physical_dim and guard[1] == outer_block_id)
+        )
+        new_shape = list(shape)
+        new_shape[physical_dim] = width
+        new_hidden = tuple(sorted((*hidden, physical_dim))) if squeeze else hidden
+        output.append((factor, tuple(new_shape), new_hidden, remaining))
+
+    spec: _ResidentSpec = (
+        kind,
+        logical_dim,
+        local_block_id,
+        selector_begin,
+        static_width,
+        requires_mask,
+    )
+    return tuple(output), spec, requires_mask
 
 
-def plan_resident_subviews(graphs: list[GraphInfo], config: Config) -> None:
-    """Plan resident loads and their subviews, then reject what did not plan.
+def _reshape_variants(
+    node: torch.fx.Node,
+    config: Config,
+    variants: tuple[_ResidentVariant, ...],
+) -> tuple[_ResidentVariant, ...] | None:
+    value = node.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.dtype is torch.bool:
+        return None
+    output: list[_ResidentVariant] = []
+    for factor, shape, _hidden, validity in variants:
+        new_shape = _physical_shape(value, config, factor)
+        if (
+            validity
+            or len(shape) < 2
+            or new_shape is None
+            or prod(shape) != prod(new_shape)
+            or shape[-2:] != new_shape[-2:]
+        ):
+            return None
+        output.append((factor, new_shape, (), ()))
+    return tuple(output)
 
-    Runs per config: eligibility depends on the configured block sizes, so a
-    subscript can plan under one config and not another.
-    """
-    for info in graphs:
-        for node in info.graph.nodes:
-            node.meta.pop(_LOAD_AS_REF, None)
-            node.meta.pop(_SUBVIEW, None)
-            node.meta.pop(_REJECTION, None)
 
-    parents = _control_flow_parents(graphs)
-    captures = _capture_map(graphs, parents)
-    placeholder_to_outer = {
-        placeholder: outer
-        for outer, edges in captures.items()
-        for placeholder, _parent in edges
-    }
+def _registered_transform(
+    node: torch.fx.Node,
+    graph_info: GraphInfo,
+    parents: dict[int, tuple[torch.fx.Node, int]],
+    graph_infos: dict[torch.fx.Graph, GraphInfo],
+    config: Config,
+    variants: tuple[_ResidentVariant, ...],
+    placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node],
+) -> tuple[tuple[_ResidentVariant, ...], _ResidentSpec | None, bool] | None:
+    from ..aten_lowering import AtenLowering
+    from ..aten_lowering import reshape_lowering
+    from ..aten_lowering import squeeze_lowering
+    from ..aten_lowering import unsqueeze_lowering
+    from ..aten_lowering import view_lowering
+    from ..inductor_lowering import APIFuncLowering
+
+    lowering = node.meta.get("lowering")
+    if (
+        isinstance(lowering, APIFuncLowering)
+        and lowering.api_func is subscript
+        and "pallas_ref" in lowering.api_func._codegen
+    ):
+        indices = node.args[1]
+        if not isinstance(indices, (list, tuple)):
+            return None
+        if not _narrowed_dims(indices):
+            output = _reshape_variants(node, config, variants)
+            return (output, None, False) if output is not None else None
+        return _selector(
+            node,
+            graph_info,
+            parents,
+            graph_infos,
+            config,
+            variants,
+            placeholder_to_outer,
+        )
+    if isinstance(lowering, AtenLowering) and "pallas_ref" in lowering.codegen_impls:
+        if not any(
+            lowering is candidate
+            for candidate in (
+                reshape_lowering,
+                squeeze_lowering,
+                unsqueeze_lowering,
+                view_lowering,
+            )
+        ):
+            return None
+        output = _reshape_variants(node, config, variants)
+        return (output, None, False) if output is not None else None
+    return None
+
+
+def _effective_users(
+    node: torch.fx.Node,
+    captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
+) -> list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]]:
+    results: list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]] = []
+    seen: set[torch.fx.Node] = set()
+    stack: list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]] = [(node, ())]
+    while stack:
+        current, transports = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        edges = captures.get(current, ())
+        parent_calls = {parent for _placeholder, parent in edges}
+        for user in current.users:
+            if user in parent_calls or user.target == torch.ops.aten.sym_size.int:
+                continue
+            if user.target is _tracing_ops._new_var:
+                stack.append((user, (*transports, user)))
+            else:
+                results.append((user, transports))
+        for placeholder, _parent in edges:
+            stack.append((placeholder, (*transports, placeholder)))
+    return results
+
+
+def _mark_rejected_descendants(
+    producer: torch.fx.Node,
+    captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
+    reason: str,
+) -> None:
+    seen: set[torch.fx.Node] = set()
+    stack = [producer]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        for user, _transports in _effective_users(node, captures):
+            if user.target is subscript and _narrowed_dims(user.args[1]):
+                user.meta.setdefault(_RESIDENT_REJECTION, reason)
+            stack.append(user)
+
+
+def _analyze_resident_chain(
+    node: torch.fx.Node,
+    node_variants: tuple[_ResidentVariant, ...],
+    spec: _ResidentSpec | None,
+    *,
+    captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
+    parents: dict[int, tuple[torch.fx.Node, int]],
+    graph_infos: dict[torch.fx.Graph, GraphInfo],
+    config: Config,
+    placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node],
+    annotations: dict[torch.fx.Node, _ResidentInfo],
+    root: bool = False,
+    must_read: bool = False,
+) -> bool:
+    users = _effective_users(node, captures)
+    planned: list[_PlannedTransform] = []
+    unsupported = False
+    for user, transports in users:
+        user_info = graph_infos.get(user.graph)
+        if user_info is None:
+            unsupported = True
+            continue
+        result = _registered_transform(
+            user,
+            user_info,
+            parents,
+            graph_infos,
+            config,
+            node_variants,
+            placeholder_to_outer,
+        )
+        if result is None:
+            unsupported = True
+        else:
+            planned.append((user, transports, *result))
+
+    if root and (unsupported or not planned):
+        if planned and unsupported:
+            blockers = [
+                _where(user)
+                for user, _transports in users
+                if all(user is not item[0] for item in planned)
+            ]
+            reason = "the block is also consumed whole at " + ", ".join(blockers[:3])
+            for user, _transports, *_rest in planned:
+                user.meta.setdefault(_RESIDENT_REJECTION, reason)
+        return False
+    if not root and (must_read or unsupported or not planned):
+        if any(variant[3] for variant in node_variants):
+            return False
+        annotations[node] = ("read", node_variants, spec)
+        return True
+
+    annotations[node] = ("ref", node_variants, spec)
+    for user, transports, output, user_spec, user_must_read in planned:
+        transport_info: _ResidentInfo = ("ref", node_variants, None)
+        for transport in transports:
+            annotations[transport] = transport_info
+        if not _analyze_resident_chain(
+            user,
+            output,
+            user_spec,
+            captures=captures,
+            parents=parents,
+            graph_infos=graph_infos,
+            config=config,
+            placeholder_to_outer=placeholder_to_outer,
+            annotations=annotations,
+            must_read=user_must_read,
+        ):
+            return False
+    return True
+
+
+def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
+    """Mark conservative resident Ref transform chains on config graph copies."""
+    captures, parents, placeholder_to_outer = _capture_edges(graphs)
     graph_infos = {info.graph: info for info in graphs}
     mutated = _mutated_tensor_ids(graphs)
-
-    def parent_of(info: GraphInfo) -> torch.fx.Node | None:
-        entry = parents.get(info.graph_id)
-        return entry[0] if entry is not None else None
-
     for info in graphs:
         for node in info.graph.nodes:
-            if node.op != "call_function" or node.target is not load:
-                continue
-            users = _effective_users(node, captures)
-            narrowing = [
-                user
-                for user in users
-                if user.op == "call_function"
-                and user.target is subscript
-                and narrowing_positions(user)
-            ]
-            if not narrowing:
-                continue
+            node.meta.pop(_RESIDENT_REF, None)
+            node.meta.pop(_RESIDENT_REJECTION, None)
 
-            block = _resident_block(node, info, parent_of(info), config, mutated)
-            if isinstance(block, str):
-                for user in narrowing:
-                    user.meta[_REJECTION] = (
-                        f"the block it reads cannot stay resident because {block}"
-                    )
+    for info in graphs:
+        for producer in info.graph.nodes:
+            if producer.op != "call_function" or producer.target is not load:
+                continue
+            variants = _root_variants(producer, info, parents, config, mutated)
+            if variants is None:
+                reason = producer.meta.get(_RESIDENT_REJECTION)
+                if isinstance(reason, str):
+                    _mark_rejected_descendants(producer, captures, reason)
                 continue
 
-            # A consumer that takes the whole block forces it to materialize,
-            # which leaves no Ref for the narrowing consumers to read.
-            blockers = [
-                user
-                for user in users
-                if user not in narrowing or _input_rank(user) != node.meta["val"].ndim
-            ]
-            if blockers:
-                where = ", ".join(sorted({_where(user) for user in blockers[:3]}))
-                for user in narrowing:
-                    user.meta[_REJECTION] = (
-                        "the block it reads is also consumed whole at "
-                        f"{where}, so it cannot stay resident"
-                    )
-                continue
+            annotations: dict[torch.fx.Node, _ResidentInfo] = {}
+            if _analyze_resident_chain(
+                producer,
+                variants,
+                None,
+                captures=captures,
+                parents=parents,
+                graph_infos=graph_infos,
+                config=config,
+                placeholder_to_outer=placeholder_to_outer,
+                annotations=annotations,
+                root=True,
+            ):
+                for node, resident_info in annotations.items():
+                    node.meta[_RESIDENT_REF] = resident_info
 
-            plans: list[tuple[torch.fx.Node, _Selector]] = []
-            failure: tuple[torch.fx.Node, str] | None = None
-            for user in narrowing:
-                user_info = graph_infos.get(user.graph)
-                if user_info is None:
-                    failure = (user, "it is not in a graph being compiled")
-                    break
-                selector = _normalize(
-                    user,
-                    user_info,
-                    parents,
-                    graph_infos,
-                    config,
-                    block,
-                    placeholder_to_outer,
-                )
-                if isinstance(selector, str):
-                    failure = (user, selector)
-                    break
-                plans.append((user, selector))
-
-            if failure is not None:
-                culprit, reason = failure
-                culprit.meta[_REJECTION] = reason
-                for user in narrowing:
-                    user.meta.setdefault(
-                        _REJECTION,
-                        "another run out of the same block could not be planned "
-                        f"at {_where(culprit)}, so the block cannot stay resident",
-                    )
-                continue
-
-            node.meta[_LOAD_AS_REF] = True
-            for user, selector in plans:
-                user.meta[_SUBVIEW] = _Subview(node, selector)
-
-    _reject_unplanned(graphs)
-
-
-def _reject_unplanned(graphs: list[GraphInfo]) -> None:
-    """Fail on every narrowing subscript that planning did not cover.
-
-    There is no materializing lowering for a run: Mosaic has neither
-    ``dynamic_slice`` nor a gather, so a run selected out of a value in vector
-    registers cannot be expressed at all.
-    """
     for info in graphs:
         for node in info.graph.nodes:
             if (
                 node.op != "call_function"
                 or node.target is not subscript
-                or not narrowing_positions(node)
-                or subview_of(node) is not None
+                or _resident_info(node) is not None
             ):
                 continue
-            reason = node.meta.get(_REJECTION) or "it could not be planned"
+            if not _narrowed_dims(node.args[1]):
+                continue
+            reason = node.meta.get(_RESIDENT_REJECTION, "it could not be planned")
             raise exc.InvalidIndexingType(
-                f"hl.subscript at {_where(node)} selects part of a dimension, "
-                f"which the Pallas backend can only read out of a resident "
-                f"block, but {reason}."
+                f"Pallas narrowing subscript {node.name} requires a resident Ref, "
+                f"but {str(reason).rstrip('.')}."
             )
 
 
-# ---------------------------------------------------------------------------
-# Codegen
-# ---------------------------------------------------------------------------
-
-
-def _mask_expr(
-    state: CodegenState, block_id: int, dim: int, result: ast.AST
-) -> ast.AST:
-    """Zero the positions a tile-driven read takes past its loop's extent."""
-    mask_var = state.codegen.mask_var(block_id)
-    if mask_var is None:
-        return result
+@_decorators.codegen(subscript, "pallas_ref")
+def _resident_subscript(state: CodegenState) -> ast.AST:
     assert state.fx_node is not None
-    value = state.fx_node.meta["val"]
-    assert isinstance(value, torch.Tensor)
-    dtype = CompileEnvironment.current().backend.dtype_str(value.dtype)
-    expand = state.tile_strategy.expand_str([*value.shape], dim)
-    return expr_from_string(
-        f"{{result}} * ({mask_var}.astype({dtype}){expand})", result=result
+    info = _resident_info(state.fx_node)
+    assert info is not None
+    variant = _current_variant(state, info)
+    if info[2] is None:
+        shape = ", ".join(str(size) for size in variant[1])
+        result = expr_from_string(
+            f"{{base}}.reshape(({shape},))", base=state.ast_arg(0)
+        )
+        return maybe_materialize_resident_ref(state.fx_node, result)
+
+    kind, logical_dim, local_block_id, begin, width, mask = info[2]
+    input_node = state.fx_node.args[0]
+    assert isinstance(input_node, torch.fx.Node)
+    input_info = _resident_info(input_node)
+    assert input_info is not None
+    input_variant = _current_variant(state, input_info)
+    physical_dim = _logical_to_physical(
+        logical_dim, input_variant[2], len(input_variant[1])
     )
-
-
-def _codegen_subview_read(state: CodegenState, plan: _Subview) -> ast.AST:
-    """Read one contiguous run out of a block emitted as a Pallas Ref."""
-    selector = plan.selector
-    assert state.fx_node is not None
-    rank = _input_rank(state.fx_node)
-    width = selector.width
-    if selector.kind is _SelectorKind.TILE:
-        resolved = state.device_function.resolved_block_size(selector.block_id)
-        assert isinstance(resolved, int)
-        begin, width = state.codegen.offset_var(selector.block_id), resolved
-    elif selector.kind is _SelectorKind.DYNAMIC:
-        start = state.device_function.literal_expr(selector.dynamic_begin)
-        begin = f"jnp.clip({start}, 0, {selector.block_extent - width})"
+    if kind == "tile":
+        begin_expr = state.codegen.offset_var(local_block_id)
+        width_value = state.device_function.resolved_block_size(local_block_id)
+        assert isinstance(width_value, int)
+    elif kind == "tail":
+        dynamic_begin = state.device_function.literal_expr(begin)
+        begin_expr = (
+            f"jnp.clip({dynamic_begin}, 0, {input_variant[1][physical_dim] - width})"
+        )
+        width_value = width
     else:
-        begin = str(selector.begin)
+        begin_expr = str(begin)
+        width_value = width
 
-    parts = [":"] * rank
-    parts[selector.dim] = f"pl.ds({begin}, {width})"
-    result = expr_from_string(f"{{base}}[{', '.join(parts)}]", base=state.ast_arg(0))
-    if selector.squeeze:
-        keys = ["0" if dim == selector.dim else ":" for dim in range(rank)]
-        result = expr_from_string(f"{{result}}[{', '.join(keys)}]", result=result)
-    if selector.masked:
-        result = _mask_expr(state, selector.block_id, selector.dim, result)
+    parts = [":" for _ in input_variant[1]]
+    parts[physical_dim] = f"pl.ds({begin_expr}, {width_value})"
+    accessor = ".at" if info[0] == "ref" else ""
+    result = expr_from_string(
+        f"{{base}}{accessor}[{', '.join(parts)}]", base=state.ast_arg(0)
+    )
+    if info[0] == "ref":
+        return result
+
+    assert not variant[3]
+    hidden = variant[2]
+    if hidden:
+        squeeze_parts = [
+            "0" if dim in hidden else ":" for dim in range(len(variant[1]))
+        ]
+        result = expr_from_string(
+            f"{{result}}[{', '.join(squeeze_parts)}]", result=result
+        )
+    if mask:
+        mask_var = state.codegen.mask_var(local_block_id)
+        if mask_var is None:
+            return result
+        value = state.fx_node.meta.get("val")
+        assert isinstance(value, torch.Tensor)
+        expand = state.tile_strategy.expand_str([*value.shape], logical_dim)
+        dtype = CompileEnvironment.current().backend.dtype_str(value.dtype)
+        result = expr_from_string(
+            f"{{result}} * ({mask_var}.astype({dtype}){expand})", result=result
+        )
     return result
 
 
 @_decorators.codegen(subscript, "pallas")
 def _(state: CodegenState) -> ast.AST:
     assert state.fx_node is not None
-    plan = subview_of(state.fx_node)
-    if plan is not None:
-        return _codegen_subview_read(state, plan)
-    # Planning rejected every narrowing subscript it could not cover, so what
-    # is left only adds or keeps whole dimensions.
+    if _resident_info(state.fx_node) is not None:
+        # pyrefly: ignore [missing-attribute]
+        return subscript._codegen["pallas_ref"](state)
     # pyrefly: ignore [missing-attribute]
     return subscript._codegen["common"](state)
 

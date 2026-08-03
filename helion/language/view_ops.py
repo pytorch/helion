@@ -68,80 +68,59 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         - Supports None and : (slice(None)) indexing on every backend
         - Used for reshaping kernel tensors by adding dimensions
         - Prefer direct indexing syntax when possible: ``tensor[None, :]``
-        - On the Pallas backend one index may additionally narrow a single
-          dimension: a non-negative integer, a non-negative bounded
-          ``start:stop`` slice, a tile's ``.begin`` offset, or a tile's
-          ``.index`` run.  Narrowing is lowered by reading out of the resident
-          block the value was loaded into, so it is only available when that
-          block can stay resident; whether it can depends on the configured
-          block sizes and on how else the block is used, and is reported per
-          config with the reason.  This fake only checks what is decidable from
-          shapes -- it cannot tell a tile run from any other rank-one index.
+        - Pallas also supports one contiguous narrowing index when compiler
+          planning can keep the source block resident in VMEM
     """
     raise NotInsideKernel
-
-
-def _is_full_slice(val: object) -> bool:
-    return isinstance(val, slice) and (val.start, val.stop, val.step) == (
-        None,
-        None,
-        None,
-    )
 
 
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     env = CompileEnvironment.current()
-    # Pallas additionally accepts one narrowing entry, which lets a kernel read
-    # a single token or a small run out of an already-loaded tile.  Whether a
-    # given narrowing can be lowered is decided per config during planning;
-    # this only rejects what is undecidable from shapes alone.
-    allow_narrowing = env.backend_name == "pallas"
+    if env.backend_name == "pallas":
+        from .._compiler.indexing_strategy import SubscriptIndexing
+
+        narrowed = 0
+        for val in index:
+            if val is None or (
+                isinstance(val, slice)
+                and (val.start, val.stop, val.step) == (None, None, None)
+            ):
+                continue
+            if isinstance(val, int):
+                valid = val >= 0
+            elif isinstance(val, slice):
+                valid = (
+                    val.step in (None, 1)
+                    and isinstance(val.start, int)
+                    and isinstance(val.stop, int)
+                    and val.start >= 0
+                    and val.stop > val.start
+                )
+            else:
+                valid = isinstance(val, torch.SymInt) or (
+                    isinstance(val, torch.Tensor) and val.ndim == 1
+                )
+            if not valid:
+                raise exc.InvalidIndexingType(repr(val))
+            narrowed += 1
+        if narrowed > 1:
+            raise exc.InvalidIndexingType(repr(index))
+
+        # Lowerability depends on block sizes and Ref provenance, so the fake
+        # only validates forms whose output shape is well-defined.
+        return env.new_index_result(
+            tensor, SubscriptIndexing.compute_shape(tensor, index)
+        )
+
     input_size = collections.deque(tensor.size())
     output_size = []
-    narrowed = 0
     for val in index:
         if val is None:
             output_size.append(1)
-            continue
-        if _is_full_slice(val):
+        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
             output_size.append(input_size.popleft())
-            continue
-        if not allow_narrowing:
-            raise exc.InvalidIndexingType(repr(val))
-        if isinstance(val, int):
-            # A constant index drops the dimension, so its output rank is known
-            # whatever the sign.  Negatives are a deliberate language
-            # restriction rather than a shape limit: on a partly live tile
-            # ``block[-1]`` would name the last row of the *block*, which may be
-            # padding rather than the last row the kernel wrote.
-            if val < 0:
-                raise exc.InvalidIndexingType(repr(val))
-            input_size.popleft()
-        elif isinstance(val, slice):
-            if val.step not in (None, 1) or not isinstance(val.start, int):
-                raise exc.InvalidIndexingType(repr(val))
-            if not isinstance(val.stop, int) or val.stop <= val.start:
-                raise exc.InvalidIndexingType(repr(val))
-            # Unlike a negative scalar, a negative bound leaves the length
-            # undecidable here: it depends on the dimension's size, which is a
-            # block-size symbol at trace time, so ``stop - start`` would be a
-            # shape this op cannot honour.
-            if val.start < 0 or val.stop < 0:
-                raise exc.InvalidIndexingType(repr(val))
-            input_size.popleft()
-            output_size.append(val.stop - val.start)
-        elif isinstance(val, torch.SymInt):
-            # ``tile.begin`` selects one position and drops the dimension.
-            input_size.popleft()
-        elif isinstance(val, torch.Tensor) and val.ndim == 1:
-            # ``tile.index`` selects a whole inner block.
-            input_size.popleft()
-            output_size.append(val.size(0))
         else:
-            raise exc.InvalidIndexingType(repr(val))
-        narrowed += 1
-        if narrowed > 1:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
     return env.new_index_result(tensor, output_size)

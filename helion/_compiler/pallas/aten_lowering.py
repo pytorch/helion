@@ -40,6 +40,7 @@ from ..aten_lowering import reshape_lowering
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import topk_lowering
+from ..aten_lowering import unsqueeze_lowering
 from ..aten_lowering import view_lowering
 from ..compile_environment import CompileEnvironment
 from ..matmul_utils import _emit_pallas_matmul
@@ -63,6 +64,11 @@ def codegen_argmin_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
 @view_lowering.register_codegen("pallas")
 @reshape_lowering.register_codegen("pallas")
 def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
+    from .view_ops import _resident_info
+
+    if _resident_info(node) is not None:
+        return codegen_view_pallas_ref(ctx, node)
+
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(
@@ -94,6 +100,34 @@ def _pad_fill_literal(value: object) -> str:
         # str() form: float('-inf') / float('inf') / float('nan').
         return f"float({str(value)!r})"
     return repr(value)
+
+
+@unsqueeze_lowering.register_codegen("pallas")
+def codegen_unsqueeze_pallas(ctx: LoweringContext, node: Node) -> object:
+    from .view_ops import _resident_info
+
+    if _resident_info(node) is not None:
+        return codegen_view_pallas_ref(ctx, node)
+    return unsqueeze_lowering.codegen_impls["common"](ctx, node)
+
+
+@unsqueeze_lowering.register_codegen("pallas_ref")
+@squeeze_lowering.register_codegen("pallas_ref")
+@view_lowering.register_codegen("pallas_ref")
+@reshape_lowering.register_codegen("pallas_ref")
+def codegen_view_pallas_ref(ctx: LoweringContext, node: Node) -> object:
+    from .view_ops import maybe_materialize_resident_ref
+
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    shape_dims = ctx.cg.device_function.tile_strategy.shape_dims(
+        [*node.meta["val"].size()]
+    )
+    shape_str = f"({', '.join(shape_dims)},)"
+    result = expr_from_string(f"{{tensor}}.reshape({shape_str})", tensor=tensor)
+    return maybe_materialize_resident_ref(node, result)
+
+
 @constant_pad_nd_lowering.register_codegen("pallas")
 def codegen_constant_pad_nd_pallas(ctx: LoweringContext, node: Node) -> object:
     """``F.pad(x, pad, value)`` (aten.constant_pad_nd) -> inline ``jnp.pad``.
