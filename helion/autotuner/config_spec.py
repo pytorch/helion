@@ -397,6 +397,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "pallas_worklist_grouping",
         "pallas_loop_type",
         "pallas_pre_broadcast",
+        "core_type",
         *CUTE_TCGEN05_TUNABLE_KEYS,
     }
 )
@@ -474,6 +475,8 @@ VALID_KEYS: frozenset[str] = frozenset(
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
 VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+# TPU engine used by the Pallas backend.
+VALID_CORE_TYPES = ("tensorcore", "sparsecore")
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -634,6 +637,8 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        # Whether Pallas autotuning should compare TensorCore and SparseCore.
+        self.sparsecore_search_enabled: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating (Tasks #25 + #28).
         # Default False so the flash knobs never appear in the search surface
@@ -1557,6 +1562,19 @@ class ConfigSpec:
                 name, config.get(name, ()), flatten=flatten
             )
 
+        # Apply block-size floors required by the selected execution target.
+        core_type_value = config.get("core_type", "tensorcore")
+        floored_block_sizes = config.get("block_sizes")
+        if isinstance(core_type_value, str) and isinstance(floored_block_sizes, list):
+            config["block_sizes"] = [
+                spec.apply_target_minimum(value, core_type_value)
+                if isinstance(spec, BlockSizeSpec)
+                else value
+                for spec, value in zip(
+                    self.block_sizes, floored_block_sizes, strict=False
+                )
+            ]
+
         # Clamp inner block sizes that are bounded by an outer block
         # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
         # outer's concrete block size for this config is known, and the
@@ -1818,6 +1836,14 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        if "core_type" in config:
+            if config["core_type"] not in VALID_CORE_TYPES:
+                raise InvalidConfig(
+                    f"Invalid value for 'core_type': {config['core_type']!r} "
+                    f"must be one of {list(VALID_CORE_TYPES)!r}"
+                )
+        elif self.sparsecore_search_enabled and self.supports_config_key("core_type"):
+            config.setdefault("core_type", VALID_CORE_TYPES[0])
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
@@ -2353,6 +2379,8 @@ class ConfigSpec:
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
+        if self.sparsecore_search_enabled and self.supports_config_key("core_type"):
+            fields["core_type"] = EnumFragment(choices=VALID_CORE_TYPES)
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
@@ -2517,6 +2545,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
         self.autotuner_min: int = min_size
+        # Block-size floors that apply to one execution target.
+        self.target_min_sizes: dict[str, int] = {}
         # Largest power-of-two block that fits inside the dimension. allow_overshoot
         # may raise max_size above this for matmul dims, but the default block size
         # stays clamped to dim_max_size (see _fragment).
@@ -2549,6 +2579,19 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         if isinstance(result, int) and result < self.min_size:
             result = self.min_size
         return result
+
+    def update_target_minimum(self, target: str, value: int) -> None:
+        """Record a tile floor that applies only to one execution target."""
+        current = self.target_min_sizes.get(target, 1)
+        self.target_min_sizes[target] = assert_integer_power_of_two(max(value, current))
+
+    def target_minimum(self, target: str) -> int:
+        return max(self.min_size, self.target_min_sizes.get(target, 1))
+
+    def apply_target_minimum(self, value: int | None, target: str) -> int | None:
+        if isinstance(value, int):
+            return max(value, self.target_minimum(target))
+        return value
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
