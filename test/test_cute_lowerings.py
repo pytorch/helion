@@ -790,6 +790,31 @@ def _generic_mixed_fanout(
 
 
 @helion.kernel(backend="cute")
+def _generic_row_half_gate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """SwiGLU's usual layout: gate is the low half of a row, up the high half.
+
+    Each output reads two accumulator elements BN/2 apart, so no register pair
+    contains both. The planner has to refuse this.
+    """
+    m, k = x.size()
+    _, n = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_k, tile_n], acc=acc)
+        halves = acc.view(tile_m.block_size, 2, tile_n.block_size // 2).permute(0, 2, 1)
+        gate, up = hl.split(halves)
+        activated = gate * torch.sigmoid(gate) * up
+        out[tile_m, tile_n] = (
+            hl.join(activated, activated)
+            .view(tile_m.block_size, tile_n.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
 def _generic_swapped_aux_indices(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
 ) -> torch.Tensor:
@@ -1101,6 +1126,53 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
                 atol=2e-1,
                 rtol=2e-2,
             )
+
+    def test_row_half_gating_is_refused_not_miscompiled(self) -> None:
+        """A read outside the register pair must lose the fused path, not lie.
+
+        Every other pair test here checks that an accepted epilogue computes the
+        right thing. This checks the other side: an epilogue whose accumulator
+        reads land BN/2 apart cannot be rendered pair-locally, and if the
+        planner ever accepted it the pair renderer would read whichever element
+        happened to be adjacent and quietly return wrong numbers.
+
+        SwiGLU's usual gate/up layout is exactly that shape, so this is the
+        realistic way to reach it rather than a synthetic one. (The interleaved
+        layout -- gate and up in adjacent lanes -- is pair-local and does fuse.)
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        scale = 0.05
+        x = (torch.randn([128, 128], device=DEVICE) * scale).to(torch.bfloat16)
+        weight = (torch.randn([128, 128], device=DEVICE) * scale).to(torch.bfloat16)
+
+        config = helion.Config(block_sizes=[128, 128, 32], pid_type="flat")
+        bound = _generic_row_half_gate.bind((x, weight))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        self.assertNotIn("cute.gemm(", code, "must drop off the collective path")
+        self.assertNotIn("tcgen05_epi_partner_index", code)
+
+        product = x.float() @ weight.float()
+        gate, up = product[:, :64], product[:, 64:]
+        activated = gate * torch.sigmoid(gate) * up
+        torch.testing.assert_close(
+            bound.compile_config(config)(x, weight).float(),
+            torch.cat((activated, activated), dim=1),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+        # Persistent scheduling has no scalar fallback to drop to, so the same
+        # epilogue has to fail loudly there rather than pick a wrong register.
+        persistent = _generic_epilogue_config([128, 128, 32])
+        persistent_bound = _generic_row_half_gate.bind((x, weight))
+        persistent_bound.env.config_spec.cute_tcgen05_search_enabled = True
+        with self.assertRaises(exc.BackendUnsupported):
+            persistent_bound.to_triton_code(persistent)
 
     def test_mismatched_aux_provenance_uses_direct_load(self) -> None:
         x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
