@@ -104,7 +104,7 @@ def _reject(
     )
 
 
-_INDIRECT_DTYPES = (torch.float32, torch.int32)
+_INDIRECT_DTYPES = (torch.float32, torch.int32, torch.bfloat16)
 _CAST_STORE_DTYPES = (torch.int8, torch.int32, torch.bool)
 
 

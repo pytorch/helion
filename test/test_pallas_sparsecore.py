@@ -198,6 +198,25 @@ def _grouped_scale(
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def _bf16_gather_with_side_output(
+    table: torch.Tensor,
+    index: torch.Tensor,
+    scale: torch.Tensor,
+    side: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty(
+        (index.size(0), table.size(1)), dtype=table.dtype, device=table.device
+    )
+    side_out = torch.empty(
+        (index.size(0), side.size(0)), dtype=side.dtype, device=side.device
+    )
+    for tile in hl.tile(index.size(0)):
+        out[tile, :] = table[index[tile], :] * scale[None, :]
+        side_out[tile, :] = side[None, :] + 1
+    return out, side_out
+
+
 def _code(kernel: object, args: tuple[object, ...], block: int = 256) -> str:
     with patch.dict("os.environ", {"HELION_SC_ASSUME_MESH": "2x16"}):
         bound = kernel.bind(args)  # type: ignore[attr-defined]
@@ -251,6 +270,21 @@ class TestPallasSparseCoreCodegen(TestCase):
                 block=256,
             )
 
+    def test_packed_bf16_rearranges_only_its_cached_inputs(self) -> None:
+        code = _code(
+            _bf16_gather_with_side_output,
+            (
+                torch.randn(512, 64, dtype=torch.bfloat16),
+                torch.randint(0, 512, (513,), dtype=torch.int32),
+                torch.randn(64),
+                torch.randn(16),
+            ),
+            block=512,
+        )
+
+        self.assertIn("'packed_inputs': [[0, 64]]", code)
+        self.assertNotIn("[1, 16]", code.split("'packed_inputs':", 1)[1])
+
     def test_atomic_add_uses_shared_accumulator_phases(self) -> None:
         source = torch.randn(1024, 64)
         index = torch.randint(0, 128, (1024,), dtype=torch.int32)
@@ -270,6 +304,25 @@ class TestPallasSparseCoreCodegen(TestCase):
 
         with self.assertRaisesRegex(exc.InvalidConfig, "code: atomic_init"):
             _code(_scatter_add_onto_ones, (source, index, 128), block=512)
+
+    def test_bf16_chunks_compose_across_stack_boundaries(self) -> None:
+        index = torch.randint(0, 512, (2, 513), dtype=torch.int32)
+        code = _code(
+            _grouped_layer_norm,
+            (
+                torch.randn(1024, 48, dtype=torch.bfloat16),
+                index,
+                torch.randn(2, 48),
+                torch.randn(2, 48),
+            ),
+            block=512,
+        )
+
+        self.assertIn("plsc.unpack", code)
+        self.assertIn("plsc.pack", code)
+        self.assertIn("sc_output[_sc_item, pl.ds(48, 32)]", code)
+        self.assertNotIn("jnp.concatenate", code)
+        self.assertNotIn("one_hot", code)
 
     def test_indirect_store_uses_layout_derived_tail_row(self) -> None:
         source = torch.randn(513, 64)
@@ -471,11 +524,12 @@ class TestPallasSparseCoreNumerics(TestCase):
 
         torch.testing.assert_close(result.cpu(), source.cpu().amax(dim=1) > 0.5)
 
-    def test_stock_embedding(self) -> None:
+    def test_stock_embedding_and_bf16_gather(self) -> None:
         from examples.embedding import embedding
 
         index = torch.randint(0, 2048, (4, 129), dtype=torch.int32, device=DEVICE)
         table = torch.randn(2048, 64, device=DEVICE)
+        bf16_table = table.to(torch.bfloat16)
 
         _, stock = code_and_output(
             embedding,
@@ -483,8 +537,17 @@ class TestPallasSparseCoreNumerics(TestCase):
             block_sizes=[256, 64],
             core_type="sparsecore",
         )
+        _, bf16 = code_and_output(
+            _embedding,
+            (index.reshape(-1), bf16_table),
+            block_sizes=[256],
+            core_type="sparsecore",
+        )
 
         torch.testing.assert_close(stock.cpu(), table.cpu()[index.cpu().long()])
+        torch.testing.assert_close(
+            bf16.cpu(), bf16_table.cpu()[index.cpu().reshape(-1).long()]
+        )
 
     def test_weighted_and_masked_gather_reductions(self) -> None:
         from examples.sparsecore_ops import masked_gather_sum
@@ -660,3 +723,37 @@ class TestPallasSparseCoreNumerics(TestCase):
         expected = torch.zeros(output_rows, width)
         expected.index_add_(0, index.cpu().long(), source.cpu() * 1.25)
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+    def test_grouped_layer_norm_bf16(self) -> None:
+        groups, table_rows, width, rows = 2, 512, 48, 513
+        tables = torch.randn(
+            groups * table_rows, width, dtype=torch.bfloat16, device=DEVICE
+        )
+        index = torch.randint(
+            0, table_rows, (groups, rows), dtype=torch.int32, device=DEVICE
+        )
+        weight = torch.randn(groups, width, device=DEVICE)
+        bias = torch.randn(groups, width, device=DEVICE)
+
+        _, result = code_and_output(
+            _grouped_layer_norm,
+            (tables, index, weight, bias),
+            block_sizes=[512],
+            core_type="sparsecore",
+        )
+
+        gathered = torch.stack(
+            [
+                tables.cpu().float()[index.cpu()[group].long() + group * table_rows]
+                for group in range(groups)
+            ],
+            dim=1,
+        )
+        flat = gathered.reshape(rows, groups * width)
+        mean = flat.mean(dim=1, keepdim=True)
+        variance = ((flat - mean) ** 2).mean(dim=1, keepdim=True)
+        expected = ((flat - mean) * torch.rsqrt(variance + 1e-5)).reshape(
+            rows, groups, width
+        )
+        expected = expected * weight.cpu()[None] + bias.cpu()[None]
+        self.assertLess((result.cpu().float() - expected).abs().max().item(), 0.11)

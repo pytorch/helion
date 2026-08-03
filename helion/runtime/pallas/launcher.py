@@ -1910,6 +1910,13 @@ def _pallas_compile_sc_jit_fn(
             "list[list[int]]", _sc_launcher_spec.get("stream_inputs") or []
         )
     ]
+    packed_inputs = [
+        (int(pos), int(value_size))
+        for pos, value_size in cast(
+            "list[list[int]]",
+            _sc_launcher_spec.get("packed_inputs") or [],
+        )
+    ]
     reshape_outputs = {
         int(pos): tuple(int(s) for s in shape)  # type: ignore[union-attr]
         for pos, shape in cast(
@@ -1965,6 +1972,14 @@ def _pallas_compile_sc_jit_fn(
             if stored_size > value_size:
                 x = jnp.pad(x, ((0, 0), (0, stored_size - value_size)))
             xs[tpos] = x
+        for orig_pos, value_size in packed_inputs:
+            tpos = arg_to_tensor_pos[orig_pos]
+            x = xs[tpos]
+            values = jnp.reshape(x, (-1, value_size))  # type: ignore[arg-type]
+            xs[tpos] = jnp.reshape(
+                jnp.concatenate([values[:, 0::2], values[:, 1::2]], axis=1),
+                x.shape,  # type: ignore[union-attr]
+            )
         result = kern(*xs)
         outs: list[Any] = (
             list(result) if isinstance(result, (tuple, list)) else [result]
