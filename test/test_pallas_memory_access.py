@@ -68,9 +68,7 @@ def test_store_and_atomic_memory_accesses_record_values() -> None:
     store = graph.call_function(
         memory_ops.store, (output_node, fx_subscript, value_node)
     )
-    atomic = graph.call_function(
-        atomic_add, (output_node, fx_subscript, value_node)
-    )
+    atomic = graph.call_function(atomic_add, (output_node, fx_subscript, value_node))
 
     store_access = build_memory_access(store, output, subscript, patterns)
     atomic_access = build_memory_access(atomic, output, subscript, patterns)

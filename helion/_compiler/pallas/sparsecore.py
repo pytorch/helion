@@ -85,9 +85,7 @@ def build_sparsecore_program(
     memory_accesses = [
         access
         for node in root_graph.nodes
-        if isinstance(
-            (access := node.meta.get(MEMORY_ACCESS_META)), MemoryAccess
-        )
+        if isinstance((access := node.meta.get(MEMORY_ACCESS_META)), MemoryAccess)
     ]
     if not memory_accesses:
         _reject("access_pattern", "SparseCore kernel has no memory accesses")
@@ -109,15 +107,12 @@ def build_sparsecore_program(
         items_per_subcore=items_per_subcore,
     )
     memory_plans = tuple(
-        build_sparsecore_memory_plan(access, context)
-        for access in memory_accesses
+        build_sparsecore_memory_plan(access, context) for access in memory_accesses
     )
     for plan in memory_plans:
         if (
             plan.stream is not None
-            and plan.stream.elements_per_item
-            * items_per_subcore
-            % SC_SLICE_MULTIPLE
+            and plan.stream.elements_per_item * items_per_subcore % SC_SLICE_MULTIPLE
         ):
             _reject(
                 "layout",
@@ -125,9 +120,7 @@ def build_sparsecore_program(
                 f"values per subcore; expected a multiple of {SC_SLICE_MULTIPLE}",
                 node=plan.access.node,
             )
-    _validate_compute(
-        root_graph, {access.node for access in memory_accesses}
-    )
+    _validate_compute(root_graph, {access.node for access in memory_accesses})
     program = SparseCoreProgram(
         root_graph,
         SparseCoreGeometry(
