@@ -19,8 +19,8 @@ from ..inductor_lowering import PointwiseLowering
 from ..inductor_lowering import ReductionLowering
 from .sc_base import _CAST_STORE_DTYPES
 from .sc_base import SC_LANES
-from .sparsecore_access import CachedLoadAccess
-from .sparsecore_access import IndirectLoadAccess
+from .sparsecore_plan import CachedLoadPlan
+from .sparsecore_plan import IndirectLoadPlan
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
@@ -405,18 +405,18 @@ class SparseCoreCompute:
         chunk: LaneChunk,
         entry: int | None,
     ) -> ast.AST:
-        access = self.program.access_by_node[node]
+        plan = self.program.plan_by_node[node]
         buffer = self.buffers[node]
         value = node.meta.get("val")
         if not isinstance(value, torch.Tensor):
             raise NotImplementedError("SparseCore load has no tensor value")
         value_size = _value_size(value)
 
-        if isinstance(access, CachedLoadAccess):
-            return self._cached_expr(access.site.tensor, buffer, chunk)
+        if isinstance(plan, CachedLoadPlan):
+            return self._cached_expr(plan.access.tensor, buffer, chunk)
 
-        entries = access.stream.elements_per_item if access.stream is not None else 1
-        if isinstance(access, IndirectLoadAccess):
+        entries = plan.stream.elements_per_item if plan.stream is not None else 1
+        if isinstance(plan, IndirectLoadPlan):
             entry_size = value_size // entries
             if entry is None and entries != 1:
                 raise NotImplementedError(
@@ -528,8 +528,8 @@ class SparseCoreCompute:
         store_node: torch.fx.Node,
         reduction_values: dict[torch.fx.Node, ast.AST],
     ) -> None:
-        access = self.program.access_by_node[store_node]
-        value_node = access.site.value_node
+        plan = self.program.plan_by_node[store_node]
+        value_node = plan.access.value_node
         if value_node is None:
             raise AssertionError("SparseCore store has no value")
         buffer = self.output_buffers[store_node]
@@ -540,11 +540,11 @@ class SparseCoreCompute:
         if value_size == 1:
             chunk = LaneChunk(0, SC_LANES)
             expression = self._value(value_node, chunk, reduction_values)
-            if access.layout.logical_dtype in _CAST_STORE_DTYPES:
+            if plan.layout.logical_dtype in _CAST_STORE_DTYPES:
                 expression = f"({expression}).astype(jnp.int32)"
             self.lines.append(f"{self.indent}{buffer}[_sc_item] = {expression}")
             return
-        cast_output = access.layout.logical_dtype in _CAST_STORE_DTYPES
+        cast_output = plan.layout.logical_dtype in _CAST_STORE_DTYPES
         for chunk in chunk_schedule(value_size):
             dst = f"{buffer}[_sc_item, pl.ds({chunk.start}, {chunk.size})]"
             expression = self._value(value_node, chunk, reduction_values)
@@ -569,11 +569,11 @@ class SparseCoreCompute:
                 visit(parent)
 
         for store_node in store_nodes:
-            value_node = self.program.access_by_node[store_node].site.value_node
+            value_node = self.program.plan_by_node[store_node].access.value_node
             if value_node is not None:
                 visit(value_node)
         self.emit_scalar_reductions(reduction_values, active_nodes)
-        for access in self.program.stores:
-            if access.site.node in store_nodes:
-                self.emit_store(access.site.node, reduction_values)
+        for plan in self.program.stores:
+            if plan.access.node in store_nodes:
+                self.emit_store(plan.access.node, reduction_values)
         return self.lines
