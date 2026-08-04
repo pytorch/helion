@@ -27,9 +27,12 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.settings import DotPrecision
     from ..device_function import Argument
+    from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
     from ..tile_dispatch import TileStrategyDispatch
+    from ..tile_strategy import SymIntLike
+    from ..tile_strategy import TileStrategy
     from .compact_worklist import CompactWorklistPlan
 
     InductorOpOverrides = OpsHandler[Any]
@@ -132,6 +135,24 @@ class PallasBackend(Backend):
     def max_reduction_threads(self) -> int | None:
         return None
 
+    def create_nd_tile_strategy(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        block_size: list[SymIntLike] | SymIntLike,
+        loop_order: list[int],
+        l2_grouping: int,
+    ) -> TileStrategy:
+        if fn.config.get("core_type", "tensorcore") == "sparsecore":
+            from .sparsecore import SparseCoreTileStrategy
+
+            return SparseCoreTileStrategy(
+                fn, block_ids, block_size, loop_order, l2_grouping
+            )
+        return super().create_nd_tile_strategy(
+            fn, block_ids, block_size, loop_order, l2_grouping
+        )
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
         if key not in _TORCH_TO_JAX_DTYPE:
@@ -168,6 +189,8 @@ class PallasBackend(Backend):
             "pl": "from jax.experimental import pallas as pl",
             "lax": "import jax.lax as lax",
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
+            "plsc": "from jax.experimental.pallas import tpu_sc as plsc",
+            "functools": "import functools",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
         }
@@ -184,6 +207,7 @@ class PallasBackend(Backend):
             "pallas_loop_type",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
+            "core_type",
         }
     )
 
@@ -1016,6 +1040,11 @@ class PallasBackend(Backend):
             read_names, write_names = device_fn.get_tensor_read_write_names()
             mutated_params = write_names & {a.arg for a in host_fn.args.args}
             input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+            rebuilt_outputs = (
+                env.sparsecore_program.rebuilt_outputs
+                if env.sparsecore_program is not None
+                else ()
+            )
             # Only tensors allocated with torch.empty/empty_like/new_empty can be
             # output-only — their initial values are undefined, so it's safe
             # to use HBM BlockSpecs.  Tensors allocated with torch.zeros_like,
@@ -1032,7 +1061,12 @@ class PallasBackend(Backend):
                 ):
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
-                    if arg_name in read_names or arg_name not in empty_vars:
+                    rebuilt = any(
+                        arg.fake_value is output for output in rebuilt_outputs
+                    )
+                    if not rebuilt and (
+                        arg_name in read_names or arg_name not in empty_vars
+                    ):
                         # Also read by the kernel (e.g. broadcast result)
                         inplace_indices.append(i)
                 elif arg_name in mutated_params:
@@ -1134,6 +1168,21 @@ class PallasBackend(Backend):
             and sorted_args is not None
         ):
             launcher_args.extend(self._compact_worklist_launcher_args(sorted_args))
+
+        program = CompileEnvironment.current().sparsecore_program
+        if program is not None and sorted_args is not None:
+            from .sparsecore_launcher import build_sparsecore_launcher_spec
+
+            def arg_position(fake: torch.Tensor) -> int | None:
+                for index, arg in enumerate(sorted_args):
+                    if isinstance(arg, TensorArg) and arg.fake_value is fake:
+                        return index
+                return None
+
+            launcher_args.append(
+                "_sc_launcher_spec="
+                f"{build_sparsecore_launcher_spec(program, arg_position)!r}"
+            )
 
         return launcher_args
 
@@ -1304,7 +1353,6 @@ class PallasBackend(Backend):
             )
 
         plan_tiling(graphs, config, tile_strategy)
-        build_tensorcore_plans(graphs, config)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
         # reused across all configs of a BoundKernel (see CompileEnvironment's
@@ -1320,6 +1368,18 @@ class PallasBackend(Backend):
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
         env.compact_worklist_offset_params = []
+        env.sparsecore_program = None
+
+        core_type = config.get("core_type", "tensorcore")
+        if core_type == "sparsecore":
+            from .sparsecore import build_sparsecore_program
+
+            env.sparsecore_program = build_sparsecore_program(graphs, config)
+            return
+        if core_type != "tensorcore":
+            raise exc.InvalidConfig(f"unknown Pallas core type {core_type!r}")
+
+        build_tensorcore_plans(graphs, config)
 
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
