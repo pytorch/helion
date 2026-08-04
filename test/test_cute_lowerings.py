@@ -600,6 +600,22 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
     )
 
 
+COLLECTIVE_PATH_REFUSED = "laid out for a collective MMA"
+"""The gate that refuses a kernel laid out for the collective tcgen05 path.
+
+Once ``_detect_specialized_mma_loop`` puts the K loop in mma_mode its lane loop
+is gone, so a kernel that then declines the collective path cannot be lowered at
+all -- the scalar path would sum a single element per K block.
+
+Every site below reaches this gate, inside the MMA cutover. The persistent
+scheduler carries a second check for the same situation
+(``Tcgen05PersistentProgramIDs`` on a null ``matmul_plan``) that no test in
+either suite now reaches, because the cutover always refuses first. Pinning the
+exact message rather than accepting either keeps that ordering visible: a change
+that reverses it fails here instead of passing quietly.
+"""
+
+
 def _generic_epilogue_config(block_sizes: list[int]) -> helion.Config:
     return _make_tcgen05_persistent_config(
         block_sizes=block_sizes,
@@ -960,7 +976,7 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
         config = _generic_epilogue_config([128, 128, 32])
         bound = _generic_masked_aux_epilogue.bind((x, weight, residual, mask))
         bound.env.config_spec.cute_tcgen05_search_enabled = True
-        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+        with self.assertRaisesRegex(exc.BackendUnsupported, COLLECTIVE_PATH_REFUSED):
             bound.to_triton_code(config)
 
     def test_inputless_pointwise_plan_fails_cleanly(self) -> None:
@@ -968,7 +984,7 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
         config = _generic_epilogue_config([128, 128, 32])
         bound = _generic_random_epilogue.bind((x, x))
         bound.env.config_spec.cute_tcgen05_search_enabled = True
-        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+        with self.assertRaisesRegex(exc.BackendUnsupported, COLLECTIVE_PATH_REFUSED):
             bound.to_triton_code(config)
 
     def test_generic_pair_transform_uses_coordinate_fragment(self) -> None:
@@ -990,7 +1006,7 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
         config = _generic_epilogue_config([128, 128, 32])
         bound = _generic_pair_swap_epilogue.bind((x.T, x))
         bound.env.config_spec.cute_tcgen05_search_enabled = True
-        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+        with self.assertRaisesRegex(exc.BackendUnsupported, COLLECTIVE_PATH_REFUSED):
             bound.to_triton_code(config)
 
     def test_pair_local_register_layout_across_capability_gate(self) -> None:
@@ -1150,34 +1166,30 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
 
         if not get_cute_mma_support().tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
-        scale = 0.05
-        x = (torch.randn([128, 128], device=DEVICE) * scale).to(torch.bfloat16)
-        weight = (torch.randn([128, 128], device=DEVICE) * scale).to(torch.bfloat16)
+        # Only shapes and dtypes are read; the kernel never runs.
+        x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
 
+        # Refusal, not a fallback: once the K loop is in mma_mode its lane loop
+        # is gone, so the scalar path would sum one element per K block. An
+        # earlier version asserted the flat schedule fell back and still
+        # computed the right answer, and passed while the kernel returned
+        # garbage -- inputs scaled to ~4e-3 against atol=2e-2, so an output of
+        # roughly zero sat inside the tolerance. At scale 1.0 the error was
+        # 827.5 against a reference maximum of 827.5.
         config = helion.Config(block_sizes=[128, 128, 32], pid_type="flat")
         bound = _generic_row_half_gate.bind((x, weight))
         bound.env.config_spec.cute_tcgen05_search_enabled = True
-        bound.set_config(config)
-        code = bound.to_triton_code(config)
-        self.assertNotIn("cute.gemm(", code, "must drop off the collective path")
-        self.assertNotIn("tcgen05_epi_partner_index", code)
+        with self.assertRaisesRegex(exc.BackendUnsupported, COLLECTIVE_PATH_REFUSED):
+            bound.to_triton_code(config)
 
-        product = x.float() @ weight.float()
-        gate, up = product[:, :64], product[:, 64:]
-        activated = gate * torch.sigmoid(gate) * up
-        torch.testing.assert_close(
-            bound.compile_config(config)(x, weight).float(),
-            torch.cat((activated, activated), dim=1),
-            atol=2e-2,
-            rtol=2e-2,
-        )
-
-        # Persistent scheduling has no scalar fallback to drop to, so the same
-        # epilogue has to fail loudly there rather than pick a wrong register.
+        # Persistent scheduling reaches the same gate, so it is not a second
+        # case; what it does pin is that no config-dependent path lets this
+        # epilogue through to a kernel.
         persistent = _generic_epilogue_config([128, 128, 32])
         persistent_bound = _generic_row_half_gate.bind((x, weight))
         persistent_bound.env.config_spec.cute_tcgen05_search_enabled = True
-        with self.assertRaises(exc.BackendUnsupported):
+        with self.assertRaisesRegex(exc.BackendUnsupported, COLLECTIVE_PATH_REFUSED):
             persistent_bound.to_triton_code(persistent)
 
     def test_mismatched_aux_provenance_uses_direct_load(self) -> None:
@@ -1214,7 +1226,7 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
         config = _generic_epilogue_config([128, 128, 32])
         bound = _generic_swapped_aux_indices.bind((x, weight, residual))
         bound.env.config_spec.cute_tcgen05_search_enabled = True
-        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+        with self.assertRaisesRegex(exc.BackendUnsupported, COLLECTIVE_PATH_REFUSED):
             bound.to_triton_code(config)
 
     def test_nonlocal_advanced_index_rejected_before_commit(self) -> None:
@@ -1223,7 +1235,7 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
         config = _generic_epilogue_config([128, 128, 32])
         bound = _generic_nonlocal_advanced_index.bind((x, x, source))
         bound.env.config_spec.cute_tcgen05_search_enabled = True
-        with self.assertRaisesRegex(exc.BackendUnsupported, "atomic viability check"):
+        with self.assertRaisesRegex(exc.BackendUnsupported, COLLECTIVE_PATH_REFUSED):
             bound.to_triton_code(config)
 
     def test_projection_rotary_is_generic_fragment_epilogue(self) -> None:
@@ -7617,7 +7629,7 @@ class TestCuteLowerings(unittest.TestCase):
             cute_matmul_residual_masked(x, y, residual, mask)
         # The diagnostic must point at the cute MMA path (the
         # loud-failure backstop message).
-        self.assertIn("atomic viability check", str(cm.exception))
+        self.assertRegex(str(cm.exception), COLLECTIVE_PATH_REFUSED)
 
     def test_tcgen05_fused_aux_partial_single_edge_runtime_correctness(self) -> None:
         """Aux fusion on the SIMT-store fallback predicates aux loads too.

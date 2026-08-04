@@ -37,6 +37,7 @@ from ..ast_extension import statement_from_string
 from ..dtype_utils import cast_ast
 from ..indexing_strategy import exact_tile_block_ids
 from ..matmul_utils import _needs_f32_accumulator
+from ..tile_strategy import CuteNDTileStrategy
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
 from .cute_epilogue import Tcgen05PairLocalCapability
@@ -113,6 +114,7 @@ from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from ...runtime.config import Config
     from ..aten_lowering import LoweringContext
     from ..compile_environment import CompileEnvironment
     from ..device_function import DeviceFunction
@@ -120,6 +122,7 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
+    from .cute_epilogue import Tcgen05EpiloguePlan
     from .strategies import Tcgen05WarpSpec
 
 
@@ -1295,44 +1298,17 @@ def prepare_cute_collective_lane_loop_suppression(
 
         plan = cute_state.tcgen05_epilogue_plan_for_anchor(node)
         if plan is None:
-            plan = analyze_tcgen05_epilogue_plan(
+            plan = collective_tcgen05_epilogue_plan(
                 cg.codegen_graphs,
                 node,
-                expected_output_block_ids=analysis.output_block_ids,
+                analysis=analysis,
+                bm=bm,
+                bn=bn,
+                bk=bk,
                 config=cg.device_function.config,
             )
             if plan is None:
                 continue
-            # Deferral is only valid before every owned lowering. This rejects
-            # source orderings that hoist an auxiliary load ahead of the K loop
-            # rather than leaving a partially lowered plan behind.
-            if any("codegen" in owned.meta for owned in plan.owned_nodes):
-                continue
-            scalar_capability: _Tcgen05ScalarFragmentCapability | None = None
-            if any(store.requires_scalar_fragment for store in plan.stores):
-                scalar_capability = _tcgen05_scalar_fragment_capability(
-                    cg,
-                    analysis=analysis,
-                    bm=bm,
-                    bn=bn,
-                    bk=bk,
-                )
-                if scalar_capability is None:
-                    continue
-            required_pair_widths = {
-                store.required_pair_width
-                for store in plan.stores
-                if store.required_pair_width is not None
-            }
-            if required_pair_widths:
-                if scalar_capability is None or required_pair_widths != {
-                    scalar_capability.pair_local.width
-                }:
-                    continue
-                plan = finalize_tcgen05_pair_local_plan(
-                    plan,
-                    scalar_capability.pair_local,
-                )
             cute_state.register_tcgen05_epilogue_plan(plan)
 
         _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
@@ -1340,16 +1316,82 @@ def prepare_cute_collective_lane_loop_suppression(
             cute_state.request_root_lane_loop_suppression()
 
 
-def _tcgen05_scalar_fragment_capability(
-    cg: GenerateAST,
+def _k_loop_elides_lane_loop(df: DeviceFunction, k_block_id: int) -> bool:
+    """Whether the K loop's lane loop was dropped in favour of a collective MMA.
+
+    ``mma_mode`` both forces the axis to thread extent 1 and skips its lane-var
+    creation, so a K axis carrying it has no way to walk the block.
+    """
+    strategy = df.tile_strategy.block_id_to_strategy.get_any(k_block_id)
+    return isinstance(strategy, CuteNDTileStrategy) and strategy.mma_mode
+
+
+def collective_tcgen05_epilogue_plan(
+    codegen_graphs: list[GraphInfo],
+    node: Node,
     *,
     analysis: _MmaOperandAnalysis,
     bm: int,
     bn: int,
     bk: int,
+    config: Config,
+) -> Tcgen05EpiloguePlan | None:
+    """The finalized epilogue plan for the collective path, or None.
+
+    Groundwork, with one caller today. ``_detect_specialized_mma_loop`` decides
+    mma_mode for the K loop before codegen and has to reach the same verdict
+    this does; when the two disagree the K loop loses its lane loop to a
+    collective MMA that codegen then declines to emit. Gating that predictor on
+    this sequence is the eventual fix, and it needs a callable predicate to gate
+    on -- see the commit that added this for why it cannot land yet.
+    """
+    plan = analyze_tcgen05_epilogue_plan(
+        codegen_graphs,
+        node,
+        expected_output_block_ids=analysis.output_block_ids,
+        config=config,
+    )
+    if plan is None:
+        return None
+    # Deferral is only valid before every owned lowering. This rejects source
+    # orderings that hoist an auxiliary load ahead of the K loop rather than
+    # leaving a partially lowered plan behind.
+    if any("codegen" in owned.meta for owned in plan.owned_nodes):
+        return None
+    scalar_capability: _Tcgen05ScalarFragmentCapability | None = None
+    if any(store.requires_scalar_fragment for store in plan.stores):
+        scalar_capability = _tcgen05_scalar_fragment_capability(
+            analysis=analysis,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            config=config,
+        )
+        if scalar_capability is None:
+            return None
+    required_pair_widths = {
+        store.required_pair_width
+        for store in plan.stores
+        if store.required_pair_width is not None
+    }
+    if required_pair_widths:
+        if scalar_capability is None or required_pair_widths != {
+            scalar_capability.pair_local.width
+        }:
+            return None
+        plan = finalize_tcgen05_pair_local_plan(plan, scalar_capability.pair_local)
+    return plan
+
+
+def _tcgen05_scalar_fragment_capability(
+    *,
+    analysis: _MmaOperandAnalysis,
+    bm: int,
+    bn: int,
+    bk: int,
+    config: Config,
 ) -> _Tcgen05ScalarFragmentCapability | None:
     """Whether scalar coordinates and direct loads are safe for this fragment."""
-    config = cg.device_function.config
     if (
         bm == 128
         and bn in (64, 128)
@@ -2141,6 +2183,20 @@ def _emit_mma_pipeline(
                 "cute",
                 "tcgen05 epilogue cutover was finalized before root graph "
                 f"lowering, but MMA codegen later failed: {reason}",
+            )
+        # ``_detect_specialized_mma_loop`` decides mma_mode for the K loop
+        # before codegen runs, and mma_mode elides that loop's lane loop on the
+        # promise that the collective MMA will distribute K itself. Returning
+        # None here would hand the scalar path a K axis of thread extent 1,
+        # which sums a single element per K block and answers wrong with no
+        # diagnostic.
+        if _k_loop_elides_lane_loop(df, analysis.k_block_id):
+            raise exc.BackendUnsupported(
+                "cute",
+                "the K loop was laid out for a collective MMA -- mma_mode "
+                "elides its lane loop because the MMA was expected to "
+                "distribute K -- but MMA codegen fell back to scalar "
+                f"lowering: {reason}",
             )
         return None
 
