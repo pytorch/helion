@@ -34,10 +34,10 @@ SHAPES: list[tuple[str, int, int, int, int]] = [
     # ("B8_T1024_H8_D64", 8, 1024, 8, 64),
 ]
 
-# variant name -> example module under examples.linear. Each module's
+# Variants with their own examples.linear.example_<name> module, whose
 # benchmark(configs) returns (cfg, helion_fwd_ms, fla_fwd_ms, helion_fb_ms,
-# fla_fb_ms) rows.
-VARIANTS = [
+# fla_fb_ms) rows. Each emits a forward and a forward+backward ("<variant>-bwd") row.
+DENSE_VARIANTS = [
     "vanilla_linear_attn",
     "simple_gla",
     "retention",
@@ -45,12 +45,28 @@ VARIANTS = [
     "delta_rule",
     "gated_delta_rule",
     "kda",
-    "kda_fused",
 ]
 
-# Variants run with fused_preamble, mapped to the example module they share. These
-# are forward-only, so they emit no "-bwd" row.
+# Variants that re-run another variant's module with a flag, mapped to the module
+# they borrow. Both take pre-activation inputs and so are forward-only, emitting no
+# "-bwd" row; kda_varlen additionally passes cu_seqlens.
 FUSED_PREAMBLE_VARIANTS = {"kda_fused": "kda"}
+VARLEN_VARIANTS = {"kda_varlen": "kda"}
+
+VARIANTS = [*DENSE_VARIANTS, *FUSED_PREAMBLE_VARIANTS, *VARLEN_VARIANTS]
+
+# (name, sequence lengths, H, D) for the varlen variants. The lengths are FlashKDA's
+# three cases from its benchmarks/bench_fwd.py, verbatim, each holding 8192 tokens. As
+# with SHAPES the full sweep times out CI, so all but the ragged pair are commented
+# out: ragged is the case no dense shape can express.
+VARLEN_SHAPES: list[tuple[str, list[int], int, int]] = [
+    # ("fixed_T8192_H96_D128", [8192], 96, 128),
+    # ("fixed_T8192_H64_D128", [8192], 64, 128),
+    ("ragged_T8192_H96_D128", [1300, 547, 2048, 963, 271, 3063], 96, 128),
+    ("ragged_T8192_H64_D128", [1300, 547, 2048, 963, 271, 3063], 64, 128),
+    # ("uniform_T8192_H96_D128", [1024] * 8, 96, 128),
+    # ("uniform_T8192_H64_D128", [1024] * 8, 64, 128),
+]
 
 # benchmark() takes (B, H, T, D, DV); our shapes use D == DV.
 _CONFIGS = [(name, b, h, t, d, d) for (name, b, t, h, d) in SHAPES]
@@ -97,7 +113,8 @@ def write_results_json(
     for variant, rows in results.items():
         if not rows:
             continue
-        labels = [s[0] for s in SHAPES[: len(rows)]]
+        shapes = VARLEN_SHAPES if variant in VARLEN_VARIANTS else SHAPES
+        labels = [s[0] for s in shapes[: len(rows)]]
         vrd = verdicts.get(variant, [])
         # ok / REF-ERR -> 1.0; FAIL / HEL-ERR -> 0.0.
         fwd_ok = [0.0 if v[0] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
@@ -110,7 +127,7 @@ def write_results_json(
             labels,
             [r[2] / r[1] if r[1] else 0.0 for r in rows],
         )
-        if variant in FUSED_PREAMBLE_VARIANTS:
+        if variant in FUSED_PREAMBLE_VARIANTS or variant in VARLEN_VARIANTS:
             # Forward-only: no backward to time, and no verdict to report.
             continue
         # Forward+backward as a separate "<variant>-bwd" row.
@@ -158,17 +175,30 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"unknown kernels: {unknown}; choose from {VARIANTS}")
 
-    configs = _CONFIGS if args.num_shapes is None else _CONFIGS[: args.num_shapes]
-    bench_configs = [c[1:] for c in configs]  # drop the label for benchmark()
-
     results: dict[str, list[tuple[Any, ...]]] = {}
     verdicts: dict[str, list[tuple[str, str]]] = {}
     for name in names:
         print(f"=== {name} ===")
-        base = FUSED_PREAMBLE_VARIANTS.get(name, name)
+        base = FUSED_PREAMBLE_VARIANTS.get(name) or VARLEN_VARIANTS.get(name, name)
         mod = importlib.import_module(f"examples.linear.example_{base}")
         harness = mod.HARNESS
+        if name in VARLEN_VARIANTS:
+            # Each varlen row carries its own sequence lengths, so the rows run one at
+            # a time and their results concatenate.
+            shapes = VARLEN_SHAPES
+            if args.num_shapes is not None:
+                shapes = shapes[: args.num_shapes]
+            verdicts[name], results[name] = [], []
+            for _, lens, h, d in shapes:
+                cfg = [(len(lens), h, sum(lens), d, d)]
+                kw = {"varlen": True, "varlen_lengths": lens}
+                verdicts[name] += harness.accuracy(cfg, **kw)
+                results[name] += harness.benchmark(cfg, **kw)
+            continue
+
         kw = {"fused_preamble": True} if name in FUSED_PREAMBLE_VARIANTS else {}
+        configs = _CONFIGS if args.num_shapes is None else _CONFIGS[: args.num_shapes]
+        bench_configs = [c[1:] for c in configs]
         verdicts[name] = harness.accuracy(bench_configs, **kw)
         results[name] = harness.benchmark(bench_configs, **kw)
 
