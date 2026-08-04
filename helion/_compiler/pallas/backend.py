@@ -904,7 +904,8 @@ class PallasBackend(Backend):
         """Identify pl.ds() dims that may need padding and their block sizes.
 
         Uses ``pallas_pad_info`` recorded during codegen to identify which
-        tensor dimensions use ``pl.ds()`` slicing.
+        tensor dimensions use ``pl.ds()`` slicing, plus the one dummy row an
+        empty resident operand needs (see :meth:`_zero_row_resident_pad_info`).
 
         Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
         or ``None``.  The launcher computes the actual pad amount at runtime
@@ -923,22 +924,61 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
-        if not device_fn.pallas_pad_info:
-            return None
 
         result: list[tuple[int, int, int, int]] = []
-        for i, arg in enumerate(sorted_args):
-            if not isinstance(arg, TensorArg):
-                continue
-            dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
-            if dims_info is not None:
-                for dim, (block_id, extra_pad) in dims_info.items():
-                    bsi = env.block_sizes[block_id]
-                    bs = bsi.from_config(config)
-                    if isinstance(bs, int) and bs > 1:
-                        result.append((i, dim, bs, extra_pad))
+        if device_fn.pallas_pad_info:
+            for i, arg in enumerate(sorted_args):
+                if not isinstance(arg, TensorArg):
+                    continue
+                dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
+                if dims_info is not None:
+                    for dim, (block_id, extra_pad) in dims_info.items():
+                        bsi = env.block_sizes[block_id]
+                        bs = bsi.from_config(config)
+                        if isinstance(bs, int) and bs > 1:
+                            result.append((i, dim, bs, extra_pad))
 
+        result.extend(self._zero_row_resident_pad_info(sorted_args))
         return result or None
+
+    def _zero_row_resident_pad_info(
+        self, sorted_args: list[Argument]
+    ) -> list[tuple[int, int, int, int]]:
+        """One dummy row for each resident operand that has NO rows.
+
+        A resident window is opened on the operand whether or not any ordered
+        range is non-empty, so an operand with zero rows leaves the window with
+        no in-bounds row to slice.  Giving it a single row makes the window's
+        clamped slice ``pl.ds(0, 1)`` -- a legal, one-row transfer.  The row is
+        never read: an operand is only empty when every ordered range is empty,
+        so the reduction is zero-trip.
+
+        Emitting the pad rather than declining to cache keeps the resident
+        decision ACTIVE, which matters because ``pallas_loop_type='unroll'``
+        rejects an inactive decision outright and a legal all-empty ordered
+        reduction would otherwise stop compiling.
+
+        ``block_size = 1`` makes ``(-rows) % block_size`` vanish, so the pad is
+        exactly ``extra_pad`` (one row).  That formula pads unconditionally, so
+        this must only ever fire for a CONCRETELY empty operand -- otherwise a
+        real tensor would take a full copy.  Every non-degenerate kernel gets an
+        empty list from this helper (ordinary ``pallas_pad_info`` entries are
+        unaffected and can still request padding of their own).
+        """
+        from ..compile_environment import CompileEnvironment
+        from ..device_function import TensorArg
+
+        decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
+        if decision is None or not decision.active:
+            return []
+        resident = set(decision.resident_operands)
+        return [
+            (i, 0, 1, 1)
+            for i, arg in enumerate(sorted_args)
+            if isinstance(arg, TensorArg)
+            and arg.host_str() in resident
+            and int(arg.fake_value.size(0)) == 0
+        ]
 
     def _detect_matmul_dot_general_lowering(
         self,
@@ -1270,16 +1310,19 @@ class PallasBackend(Backend):
         offset_indices = [name_to_index[n] for n in env.compact_worklist_offset_params]
         fields = metadata_field_names(plan)
         # Compact-tile tensors (aligned load + exact store) both get a max-sized
-        # pl.Element BlockSpec sliced at tile_start, so Pallas double-buffers BOTH
-        # the load prefetch and the store write-back across work items.
+        # compact window sliced at tile_start, so Pallas double-buffers BOTH the
+        # load prefetch and the store write-back across work items.
         #
         # The store is a masked full-block write.  The two robust EXACT-store
         # alternatives were both worse/unavailable here: (a) staging VMEM +
         # make_async_copy over pl.ds(tile_start, tile_extent) serializes (~1.8x
         # slower: 4.5ms vs 2.5ms) because a straight-line compact tile has no inner
-        # loop to overlap; (b) a pl.BoundedSlice store BlockSpec (exact + double-buffered)
-        # is rejected by this JAX's Mosaic lowering ("Unsupported block dimension
-        # type: BoundedSlice" -- it only works inside pltpu.emit_pipeline).  The
+        # loop to overlap; (b) a pl.BoundedSlice store BlockSpec was once rejected by
+        # Mosaic ("Unsupported block dimension type: BoundedSlice"), but that is a
+        # LOWERING-PATH difference, not a version one: pl.pallas_call and
+        # emit_pipeline's compute_slice still reject it while the pl.kernel pipeline
+        # this launcher uses lowers it on jax 0.10.1 and 0.11.0 alike, so the window
+        # IS a BoundedSlice now (see _compact_window_block_spec).  The
         # full-block write's only hazard is a partial last tile overlapping the
         # next owner's leading rows; "arbitrary" dimension semantics serialize
         # that grid-ordered overlap so the later, correct write wins (verified
