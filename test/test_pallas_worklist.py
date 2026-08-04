@@ -2586,6 +2586,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertIsNone(ordered_resident_bound_arg(plan(None)))
 
 
+@onlyBackends(["pallas"])
 class TestCompactWindowSpec(unittest.TestCase):
     """The BlockSpec a compact-worklist window is built from.
 
