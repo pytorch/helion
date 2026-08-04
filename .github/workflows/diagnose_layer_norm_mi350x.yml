@@ -48,6 +48,7 @@ jobs:
           mkdir -p diagnostics/system
           rocminfo 2>&1 | tee diagnostics/system/rocminfo.txt
           rocm-smi --showdriverversion --showuniqueid --showserial --showbus --showproductname 2>&1 | tee diagnostics/system/rocm-smi.txt || true
+          rocm-smi --showrasinfo --showpagesinfo --showreplaycount --showxgmierr --showuse --showmemuse 2>&1 | tee diagnostics/system/rocm-health-before.txt || true
           amd-smi version 2>&1 | tee diagnostics/system/amd-smi-version.txt || true
           cat /opt/rocm/.info/version 2>&1 | tee diagnostics/system/rocm-version.txt || true
           uname -a 2>&1 | tee diagnostics/system/uname.txt
@@ -105,11 +106,18 @@ jobs:
           TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor-layer-norm-autotune \
           python scripts/diagnose_layer_norm_mi350x.py \
             --mode autotune \
+            --precondition-autotune \
             --iterations 250 \
             --graph-repeats 128 \
             --graph-replays 10 \
             --output-dir diagnostics/autotune-sequence \
             2>&1 | tee diagnostics/autotune-sequence.log
+
+      - name: Record final ROCm health
+        if: always()
+        run: |
+          set -euo pipefail
+          rocm-smi --showrasinfo --showpagesinfo --showreplaycount --showxgmierr --showuse --showmemuse 2>&1 | tee diagnostics/system/rocm-health-after.txt || true
 
       - name: Print diagnostic summaries
         if: always()

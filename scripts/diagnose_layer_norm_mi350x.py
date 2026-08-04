@@ -22,6 +22,7 @@ import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
 
     from helion.runtime.kernel import BoundKernel
 
@@ -109,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-repeats", type=int, default=128)
     parser.add_argument("--graph-replays", type=int, default=10)
     parser.add_argument("--skip-graph", action="store_true")
+    parser.add_argument("--precondition-autotune", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--fail-on-mismatch", action="store_true")
     return parser.parse_args()
@@ -129,7 +131,7 @@ def make_config(variant: str) -> helion.Config:
     return helion.Config.from_dict(values)
 
 
-def make_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def iter_inputs() -> Iterator[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]:
     torch.manual_seed(1337)
     for n in (1024, 1536, 2048, N):
         x = -2.3 + 0.5 * torch.randn((M, n), dtype=torch.float32, device="cuda")
@@ -138,7 +140,7 @@ def make_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             (n,), dtype=torch.float32, device="cuda", requires_grad=True
         )
         bias = torch.rand((n,), dtype=torch.float32, device="cuda", requires_grad=True)
-    return x, weight, bias
+        yield n, x, weight, bias
 
 
 def tensor_comparison(actual: torch.Tensor, expected: torch.Tensor) -> TensorComparison:
@@ -390,6 +392,53 @@ def count_suite_failures(phases: PhaseSuite) -> int:
     )
 
 
+def run_autotune_precondition_shape(
+    *,
+    source_fn: Callable[..., object],
+    n: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    output_dir: Path,
+    skip_graph: bool,
+    graph_repeats: int,
+    graph_replays: int,
+) -> dict[str, object]:
+    kernel = helion.kernel(source_fn, static_shapes=True, force_autotune=True)
+    layer_norm.layer_norm_fwd = kernel
+    start = time.perf_counter()
+    layer_norm.layer_norm(x, [n], weight, bias, EPS)
+    torch.cuda.synchronize()
+    autotune_seconds = time.perf_counter() - start
+    bound = kernel.bind((x, [n], weight, bias, EPS))
+    config = bound._config
+    assert config is not None
+    if skip_graph:
+        graph: dict[str, object] = {"skipped": True}
+    else:
+        graph = graph_benchmark(
+            lambda: layer_norm.layer_norm(x, [n], weight, bias, EPS),
+            graph_repeats=graph_repeats,
+            graph_replays=graph_replays,
+        )
+    probe = layer_norm.layer_norm(x, [n], weight, bias, EPS)
+    probe.data.fill_(float("nan"))
+    del probe
+    out = layer_norm.layer_norm(x, [n], weight, bias, EPS)
+    baseline = F.layer_norm(x, [n], weight, bias, EPS)
+    accuracy = tensor_comparison(out, baseline)
+    return {
+        "n": n,
+        "autotune_seconds": autotune_seconds,
+        "selected_config": dict(config),
+        "graph_benchmark": graph,
+        "accuracy": accuracy,
+        "compiler": archive_compiler_artifacts(
+            output_dir / f"precondition-{n}", bound, config
+        ),
+    }
+
+
 def archive_compiler_artifacts(
     output_dir: Path,
     bound: BoundKernel[object],
@@ -453,7 +502,29 @@ def main() -> int:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     source_fn = layer_norm.layer_norm_fwd.fn
-    x, weight, bias = make_inputs()
+    preconditioning = (
+        [] if args.mode == "autotune" and args.precondition_autotune else None
+    )
+    target_inputs = None
+    for n, input_x, input_weight, input_bias in iter_inputs():
+        if preconditioning is not None and n in (1024, 2048):
+            preconditioning.append(
+                run_autotune_precondition_shape(
+                    source_fn=source_fn,
+                    n=n,
+                    x=input_x,
+                    weight=input_weight,
+                    bias=input_bias,
+                    output_dir=args.output_dir,
+                    skip_graph=args.skip_graph,
+                    graph_repeats=args.graph_repeats,
+                    graph_replays=args.graph_replays,
+                )
+            )
+        if n == N:
+            target_inputs = (input_x, input_weight, input_bias)
+    assert target_inputs is not None
+    x, weight, bias = target_inputs
     references = {
         "x": x.detach().clone(),
         "weight": weight.detach().clone(),
@@ -552,6 +623,7 @@ def main() -> int:
         "requested_exact_config": EXACT_CONFIG,
         "selected_config": dict(config),
         "autotune_seconds": autotune_seconds,
+        "preconditioning": preconditioning,
         "environment": environment_info(),
         "input_mutation": {
             "x": not torch.equal(x, references["x"]),
