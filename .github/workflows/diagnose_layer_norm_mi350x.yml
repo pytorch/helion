@@ -1,0 +1,126 @@
+name: Diagnose MI350X layer norm accuracy
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose_layer_norm_mi350x.yml
+      - scripts/diagnose_layer_norm_mi350x.py
+  workflow_dispatch:
+
+concurrency:
+  group: mi350x-layer-norm-diagnostic-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    name: Reproduce and isolate on MI350X
+    runs-on: linux.rocm.gpu.ecosystem.gfx950.1
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    container:
+      image: rocm/dev-ubuntu-24.04:7.1.1-complete
+      options: --device=/dev/kfd --device=/dev/dri
+    defaults:
+      run:
+        shell: bash -l {0}
+    env:
+      HELION_AUTOTUNE_LOG_LEVEL: INFO
+      HELION_AUTOTUNE_BUDGET_SECONDS: "5400"
+      HELION_AUTOTUNE_RANDOM_SEED: "123456"
+      HELION_PRINT_OUTPUT_CODE: "1"
+      HIP_VISIBLE_DEVICES: "0"
+      ROCR_VISIBLE_DEVICES: "0"
+
+    steps:
+      - name: Setup toolchain
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y git
+
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Record ROCm and runner identity
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/system
+          rocminfo 2>&1 | tee diagnostics/system/rocminfo.txt
+          rocm-smi --showdriverversion --showuniqueid --showserial --showbus --showproductname 2>&1 | tee diagnostics/system/rocm-smi.txt || true
+          amd-smi version 2>&1 | tee diagnostics/system/amd-smi-version.txt || true
+          cat /opt/rocm/.info/version 2>&1 | tee diagnostics/system/rocm-version.txt || true
+          uname -a 2>&1 | tee diagnostics/system/uname.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12
+
+      - name: Install exact benchmark dependencies
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/rocm7.1"
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          python -c "import helion, torch, triton; print(helion.__file__, torch.__version__, triton.__version__)"
+
+      - name: Run fixed-config isolation matrix
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          source .venv/bin/activate
+          status=0
+          for variant in exact no_xcd_remap no_load_cache_modifiers no_store_cache_modifiers waves_per_eu_1 block_size_8; do
+            rm -rf "/tmp/helion-layer-norm-${variant}" "/tmp/torchinductor-layer-norm-${variant}"
+            if ! HELION_CACHE_DIR="/tmp/helion-layer-norm-${variant}" \
+              TORCHINDUCTOR_CACHE_DIR="/tmp/torchinductor-layer-norm-${variant}" \
+              python scripts/diagnose_layer_norm_mi350x.py \
+                --mode fixed \
+                --variant "${variant}" \
+                --iterations 250 \
+                --graph-repeats 128 \
+                --graph-replays 10 \
+                --output-dir "diagnostics/fixed-${variant}" \
+                2>&1 | tee "diagnostics/fixed-${variant}.log"; then
+              status=1
+            fi
+          done
+          exit "${status}"
+
+      - name: Reproduce the full autotune-to-accuracy sequence
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          rm -rf /tmp/helion-layer-norm-autotune /tmp/torchinductor-layer-norm-autotune
+          HELION_AUTOTUNE_LOG="$PWD/diagnostics/autotune" \
+          HELION_CACHE_DIR=/tmp/helion-layer-norm-autotune \
+          TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor-layer-norm-autotune \
+          python scripts/diagnose_layer_norm_mi350x.py \
+            --mode autotune \
+            --iterations 250 \
+            --graph-repeats 128 \
+            --graph-replays 10 \
+            --output-dir diagnostics/autotune-sequence \
+            2>&1 | tee diagnostics/autotune-sequence.log
+
+      - name: Print diagnostic summaries
+        if: always()
+        run: |
+          set -euo pipefail
+          find diagnostics -name summary.json -print -exec cat {} \;
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mi350x-layer-norm-diagnostics-${{ github.run_attempt }}
+          path: diagnostics
+          if-no-files-found: error
