@@ -713,6 +713,34 @@ class TestIndexing(RefEagerTestBase, TestCase):
                         self.assertIn("tl.where", code_test)
                     torch.testing.assert_close(result_test, result_pointer)
 
+    def test_extra_mask_load_size_one_dim(self):
+        """An extra_mask load whose only block index hits a size-1 dimension."""
+
+        @helion.kernel(static_shapes=True)
+        def gather_rows(
+            x: torch.Tensor,
+            base: torch.Tensor,
+            valid: torch.Tensor,
+            out: torch.Tensor,
+        ) -> None:
+            for tile_j, tile_r in hl.tile(
+                [out.size(0), out.size(1)], block_size=[1, None]
+            ):
+                j = tile_j.begin
+                v = tile_r.index < valid[j]
+                xt = hl.load(x, [base[j] + tile_r.index, 0], extra_mask=v)
+                out[tile_j.begin, tile_r] = torch.where(v, xt, 0)
+
+        # x.size(0) == 1 makes the row index fold away, leaving a scalar offset.
+        x = torch.randn(1, 4, device=DEVICE, dtype=HALF_DTYPE)
+        base = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        valid = torch.ones(1, device=DEVICE, dtype=torch.int32)
+        out = x.new_empty(1, 8)
+        code_and_output(gather_rows, (x, base, valid, out), block_size=[8])
+        expected = torch.zeros_like(out)
+        expected[0, 0] = x[0, 0]
+        torch.testing.assert_close(out, expected)
+
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @skipIfRefEager("test checks generated Triton code")
     def test_mask_store_falls_back_to_pointer(self):
