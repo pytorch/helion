@@ -26,6 +26,7 @@ from torch._inductor.codegen.wrapper import (
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._subclasses import FakeTensor
 from torch._subclasses import FakeTensorMode
+import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
@@ -275,6 +276,7 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
+        self._is_distributed = is_distributed
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
         self._backend.validate_environment()
@@ -361,40 +363,88 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
-        if settings.autotune_force_persistent or is_distributed:
-            for pid_type in (
-                "flat",
-                "xyz",
-            ):
-                self.config_spec.disallow_pid_type(pid_type)
+        # The distributed restriction is deferred to
+        # restrict_pid_types_for_persistent() so it can gate on a real per-kernel
+        # signal after tracing rather than the process-global dist.is_initialized().
+        # force_persistent restricts pid_types unconditionally; the symm-mem
+        # signal-pad clamp is symm-mem-specific and left to
+        # restrict_pid_types_for_persistent().
+        if settings.autotune_force_persistent:
+            self._disallow_nonpersistent_pid_types()
 
+        # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
+        self.has_barrier: bool = False
+
+    def _disallow_nonpersistent_pid_types(self) -> None:
+        """Restrict the search space to persistent kernels. Idempotent."""
+        for pid_type in ("flat", "xyz"):
+            self.config_spec.disallow_pid_type(pid_type)
+
+    def restrict_pid_types_for_persistent(self, args: Sequence[object]) -> None:
+        """Restrict to persistent kernels when the kernel needs cross-rank sync.
+
+        Called after tracing so it can gate on a real per-kernel signal (an
+        ``hl.barrier()`` or a symmetric-memory tensor argument) rather than the
+        process-global ``dist.is_initialized()``, which would needlessly shrink
+        the search space for every kernel in a distributed process. A barrier or
+        symm-mem tensor forces persistent pid_types; the signal-pad clamp is a
+        symm-mem-only constraint, so a barrier-only kernel keeps its full
+        ``max_num_sm_multiplier`` range.
+        """
+        if not dist.is_initialized():
+            return
+
+        # Two independent signals: a barrier forces persistent pid_types, while a
+        # symmetric-memory kernel additionally needs the signal-pad clamp.
+        # ``_is_distributed`` already folds in ``kernel_uses_symm_mem(args)``; scan
+        # the args only as the newer-torch fallback when it is unset.
+        uses_symm_mem = self._is_distributed
+        if not uses_symm_mem:
+            from .._dist_utils import is_symm_mem_tensor
+
+            uses_symm_mem = any(
+                isinstance(arg, torch.Tensor)
+                and is_symm_mem_tensor(arg, self.process_group_name)
+                for arg in args
+            )
+
+        if not uses_symm_mem and not self.has_barrier:
+            return
+
+        self._disallow_nonpersistent_pid_types()
+        if uses_symm_mem:
+            self._clamp_max_num_sm_multiplier_for_symm_mem()
+
+    def _clamp_max_num_sm_multiplier_for_symm_mem(self) -> None:
+        """Clamp max_num_sm_multiplier to the symmetric-memory signal-pad budget."""
         # CUDA symmetric-memory persistent-kernel sizing only. Guard on CUDA: the
         # Pallas/TPU backend traces with a cpu-device torch tensor (the torch<->jax
         # bridge), so under a multi-host (dist-initialized) serve this would call
         # get_num_sm(cpu) -> "TODO: implement for other devices" and crash the
         # kernel compile. _SymmetricMemory / SM-multiplier are irrelevant to Pallas.
-        if is_distributed and device.type == "cuda":
-            from torch._C._distributed_c10d import _SymmetricMemory
+        if self.device.type != "cuda":
+            return
 
-            from .._dist_utils import max_num_blocks_for_symm_mem
-            from ..runtime import get_num_sm
+        from torch._C._distributed_c10d import _SymmetricMemory
 
-            num_sms = get_num_sm(device, reserved_sms=settings.persistent_reserved_sms)
-            # Floor to previous power of two since PowerOfTwoFragment requires pow2 bounds
-            raw_max = min(
-                max_num_blocks_for_symm_mem() // num_sms,
-                self.config_spec.max_num_sm_multiplier,
+        from .._dist_utils import max_num_blocks_for_symm_mem
+        from ..runtime import get_num_sm
+
+        num_sms = get_num_sm(
+            self.device, reserved_sms=self.settings.persistent_reserved_sms
+        )
+        # Floor to previous power of two since PowerOfTwoFragment requires pow2 bounds
+        raw_max = min(
+            max_num_blocks_for_symm_mem() // num_sms,
+            self.config_spec.max_num_sm_multiplier,
+        )
+        newmax = 1 << (raw_max.bit_length() - 1) if raw_max > 0 else 1
+        if newmax < self.config_spec.max_num_sm_multiplier:
+            warnings.warn(
+                f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
+                stacklevel=1,
             )
-            newmax = 1 << (raw_max.bit_length() - 1) if raw_max > 0 else 1
-            if newmax < self.config_spec.max_num_sm_multiplier:
-                warnings.warn(
-                    f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
-                    stacklevel=1,
-                )
-            self.config_spec.max_num_sm_multiplier = newmax
-
-        # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
-        self.has_barrier: bool = False
+        self.config_spec.max_num_sm_multiplier = newmax
 
     @property
     def runtime_arg_values_by_name(self) -> dict[str, object]:
