@@ -43,25 +43,17 @@ def _(state: CodegenState) -> None:
         state, tensor, subscript, parts, value
     )
     idx_str = ", ".join(parts)
-    patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
     from .gather import emit_scatter_store
-    from .plan_tiling import IndirectScatterPattern
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+    from .tensorcore_plan import OneHotScatterPlan
 
-    scatter_patterns = [
-        pattern
-        for pattern in patterns or ()
-        if isinstance(pattern, IndirectScatterPattern)
-    ]
-    assert len(scatter_patterns) <= 1, (
-        "Pallas store expected at most one indirect scatter pattern"
-    )
-    if scatter_patterns:
-        value = emit_scatter_store(
-            state, scatter_patterns[0].plan, name, idx_str, value
-        )
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
+    is_scatter = isinstance(plan, OneHotScatterPlan)
+    if is_scatter:
+        value = emit_scatter_store(state, plan.plan, name, idx_str, value)
     from .ordered_carry import emit_carry_store
 
-    if not scatter_patterns and state.device_function.carry_tiles:
+    if not is_scatter and state.device_function.carry_tiles:
         if emit_carry_store(state, tensor, subscript, name, idx_str, value):
             return
     state.codegen.add_statement(
