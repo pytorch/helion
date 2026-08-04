@@ -38,9 +38,9 @@ jobs:
             fi
           done
 
-          json='{"kernels":['
+          json='{"include":['
           for ((i=0; i<jobs; i++)); do
-            json+="\"${BUCKETS[i]}\""
+            json+="{\"kernels\":\"${BUCKETS[i]}\",\"shard_index\":${i}}"
             if (( i < jobs - 1 )); then json+=","; fi
           done
           json+=']}'

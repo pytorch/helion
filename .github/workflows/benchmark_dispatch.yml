@@ -168,7 +168,9 @@ jobs:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_mi350x == 'true' }}
     with:
-      max-runners: 13
+      # Each MI350 runner exposes all eight host GPUs. Keep one shard per GPU
+      # so ROCR_VISIBLE_DEVICES can assign them without overlap.
+      max-runners: 8
       kernels: ${{ github.event.inputs.kernels }}
 
   run-mi350x:
@@ -188,7 +190,9 @@ jobs:
       container-options: --device=/dev/kfd --device=/dev/dri
       alias: mi350x
       kernels: ${{ matrix.kernels }}
-      env-vars: ${{ github.event.inputs.env_vars }}
+      env-vars: >-
+        ROCR_VISIBLE_DEVICES=${{ matrix.shard_index }}
+        ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
 
   run-tpu:
