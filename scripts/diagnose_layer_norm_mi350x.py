@@ -93,6 +93,14 @@ class PhaseResult(TypedDict):
     first_failures: list[dict[str, object]]
 
 
+class PhaseSuite(TypedDict):
+    direct_before_graph: PhaseResult
+    graph_benchmark: dict[str, object]
+    accuracy_after_graph: PhaseResult
+    raw_poison_after_graph: PhaseResult
+    raw_after_graph: PhaseResult
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("fixed", "autotune"), required=True)
@@ -337,6 +345,51 @@ def run_tritonbench_accuracy_stress(
     }
 
 
+def run_phase_suite(
+    *,
+    iterations: int,
+    direct_iterations: int,
+    skip_graph: bool,
+    graph_repeats: int,
+    graph_replays: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    references: dict[str, torch.Tensor],
+) -> PhaseSuite:
+    direct = run_raw_stress(direct_iterations, x, weight, bias, references)
+    if skip_graph:
+        graph: dict[str, object] = {"skipped": True}
+    else:
+        graph = graph_benchmark(
+            lambda: layer_norm.layer_norm(x, [N], weight, bias, EPS),
+            graph_repeats=graph_repeats,
+            graph_replays=graph_replays,
+        )
+    accuracy = run_tritonbench_accuracy_stress(iterations, x, weight, bias)
+    raw_poison = run_raw_poison_stress(iterations, x, weight, bias, references)
+    post_graph_raw = run_raw_stress(20, x, weight, bias, references)
+    return {
+        "direct_before_graph": direct,
+        "graph_benchmark": graph,
+        "accuracy_after_graph": accuracy,
+        "raw_poison_after_graph": raw_poison,
+        "raw_after_graph": post_graph_raw,
+    }
+
+
+def count_suite_failures(phases: PhaseSuite) -> int:
+    return sum(
+        phase["failure_count"]
+        for phase in (
+            phases["direct_before_graph"],
+            phases["accuracy_after_graph"],
+            phases["raw_poison_after_graph"],
+            phases["raw_after_graph"],
+        )
+    )
+
+
 def archive_compiler_artifacts(
     output_dir: Path,
     bound: BoundKernel[object],
@@ -399,6 +452,7 @@ def environment_info() -> dict[str, object]:
 def main() -> int:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    source_fn = layer_norm.layer_norm_fwd.fn
     x, weight, bias = make_inputs()
     references = {
         "x": x.detach().clone(),
@@ -415,13 +469,13 @@ def main() -> int:
     autotune_seconds = None
     if args.mode == "autotune":
         kernel = helion.kernel(
-            layer_norm.layer_norm_fwd.fn,
+            source_fn,
             static_shapes=True,
             force_autotune=True,
         )
     else:
         kernel = helion.kernel(
-            layer_norm.layer_norm_fwd.fn,
+            source_fn,
             config=make_config(args.variant),
             static_shapes=True,
         )
@@ -442,18 +496,54 @@ def main() -> int:
     direct_iterations = (
         min(args.iterations, 20) if args.mode == "autotune" else args.iterations
     )
-    direct = run_raw_stress(direct_iterations, x, weight, bias, references)
-    if args.skip_graph:
-        graph: dict[str, object] = {"skipped": True}
-    else:
-        graph = graph_benchmark(
-            lambda: layer_norm.layer_norm(x, [N], weight, bias, EPS),
+    phases = run_phase_suite(
+        iterations=args.iterations,
+        direct_iterations=direct_iterations,
+        skip_graph=args.skip_graph,
+        graph_repeats=args.graph_repeats,
+        graph_replays=args.graph_replays,
+        x=x,
+        weight=weight,
+        bias=bias,
+        references=references,
+    )
+    compiler = archive_compiler_artifacts(args.output_dir, bound, config)
+
+    post_autotune_exact = None
+    post_autotune_exact_failure_count = 0
+    if args.mode == "autotune":
+        exact_kernel = helion.kernel(
+            source_fn,
+            config=make_config("exact"),
+            static_shapes=True,
+        )
+        layer_norm.layer_norm_fwd = exact_kernel
+        layer_norm.layer_norm_fwd(x, [N], weight, bias, EPS)
+        torch.cuda.synchronize()
+        exact_bound = exact_kernel.bind((x, [N], weight, bias, EPS))
+        exact_config = exact_bound._config
+        assert exact_config is not None
+        exact_phases = run_phase_suite(
+            iterations=args.iterations,
+            direct_iterations=20,
+            skip_graph=args.skip_graph,
             graph_repeats=args.graph_repeats,
             graph_replays=args.graph_replays,
+            x=x,
+            weight=weight,
+            bias=bias,
+            references=references,
         )
-    accuracy = run_tritonbench_accuracy_stress(args.iterations, x, weight, bias)
-    raw_poison = run_raw_poison_stress(args.iterations, x, weight, bias, references)
-    post_graph_raw = run_raw_stress(20, x, weight, bias, references)
+        post_autotune_exact = {
+            "selected_config": dict(exact_config),
+            **exact_phases,
+            "compiler": archive_compiler_artifacts(
+                args.output_dir / "post-autotune-exact",
+                exact_bound,
+                exact_config,
+            ),
+        }
+        post_autotune_exact_failure_count = count_suite_failures(exact_phases)
     torch.cuda.synchronize()
 
     summary = {
@@ -468,19 +558,13 @@ def main() -> int:
             "weight": not torch.equal(weight, references["weight"]),
             "bias": not torch.equal(bias, references["bias"]),
         },
-        "direct_before_graph": direct,
-        "graph_benchmark": graph,
-        "accuracy_after_graph": accuracy,
-        "raw_poison_after_graph": raw_poison,
-        "raw_after_graph": post_graph_raw,
-        "compiler": archive_compiler_artifacts(args.output_dir, bound, config),
+        **phases,
+        "compiler": compiler,
+        "post_autotune_exact": post_autotune_exact,
     }
     summary_path = args.output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    mismatch_count = sum(
-        phase["failure_count"]
-        for phase in (direct, accuracy, raw_poison, post_graph_raw)
-    )
+    mismatch_count = count_suite_failures(phases) + post_autotune_exact_failure_count
     print(
         "SUMMARY "
         f"mode={args.mode} variant={args.variant} "
