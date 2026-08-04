@@ -385,9 +385,6 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     @skipIfRefEager("ref eager does not support lifted variable")
-    @xfailIfPallasTpu(
-        "Mosaic does not support reshaping a 1D vector to [..., 2] on TPU"
-    )
     def test_view_blocksize_constexpr(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def foo(x: torch.Tensor) -> torch.Tensor:
