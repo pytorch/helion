@@ -152,7 +152,9 @@ jobs:
           set -x
           source .venv/bin/activate
           uv pip install pip
-          uv pip install quack-kernels --no-deps
+          # Quack 0.6.2 requires nvidia-cutlass-dsl==4.6.1, which is incompatible
+          # with Helion's nvidia-cutlass-dsl==4.5.2 pin.
+          uv pip install "quack-kernels==0.6.1" --no-deps
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
           pushd tritonbench/
