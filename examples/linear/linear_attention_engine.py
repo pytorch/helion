@@ -1988,54 +1988,114 @@ def chunk_fwd_A_diag_anchored_helion(
     build_kk: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Anchored intra-chunk score matrix. Rows split into BC_DIAG-row sub-blocks;
-    gc_n is gc at the sub-block's first row (the decay anchor):
+    gc_n is gc at the sub-block's first row (the decay anchor), and cols is the live
+    width 0 : (i + 1) * BC_DIAG the causal mask leaves nonzero:
         qg = q_blk * exp2(gc_blk - gc_n)        # [BC_DIAG, D]
-        kg = k     * exp2(gc_n   - gc)          # [C, D]
-        a  = (qg @ kg.T) * scale                # [BC_DIAG, C]
-        A[tile_row] = a * causal                # [BC_DIAG, C], keep t >= s
+        kg = k[cols] * exp2(gc_n - gc[cols])    # [cols, D]
+        a  = (qg @ kg.T) * scale                # [BC_DIAG, cols]
+        A[rows, cols] = a * causal              # keep t >= s
     Anchoring at gc_n bounds each exponent to BC_DIAG rows, so exp2 stays in range.
     With build_kk=True (kda) it also emits the strictly-lower k-rows Gram Akk,
-    kg_row = k_blk * exp2(gc_blk - gc_n), Akk[tile_row] = (kg_row @ kg.T) * strict,
+    kg_row = k_blk * exp2(gc_blk - gc_n), Akk[rows, cols] = (kg_row @ kg.T) * strict,
     sharing the anchored kg column operand; Akk feeds the WY/UT transform (fp32).
-    Akk is always returned (zeros when build_kk=False; callers ignore it)."""
+    Akk is always returned (zeros when build_kk=False; callers ignore it), and both
+    arrive zeroed so the columns past cols already hold what a full-width form would
+    store there.
+
+    The sub-blocks are written out, one per tier, each guarded on the chunk size:
+        tier 0:  rows  0..15,  cols  0..15      always
+        tier 1:  rows 16..31,  cols  0..31      C >= 2 * BC_DIAG
+        tier 2:  rows 32..47,  cols  0..47      C >= 3 * BC_DIAG
+        tier 3:  rows 48..63,  cols  0..63      C >= 4 * BC_DIAG
+    so C = 32 takes tiers 0-1 and C = 64 all four. Unrolled rather than tiled because
+    each width must be a literal: hl.arange rejects arithmetic on a specialized size.
+    FLA's KDA unrolls the same way in chunk_intra.py."""
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
+    assert C in (2 * BC_DIAG, 4 * BC_DIAG), (
+        f"chunk size C must be {2 * BC_DIAG} or {4 * BC_DIAG}, got {C}"
+    )
 
     A = torch.zeros([BHN, C, C], dtype=q.dtype, device=q.device)
     Akk = torch.zeros([BHN, C, C], dtype=q.dtype, device=q.device)
 
     for tile_bhn in hl.tile(BHN, block_size=1):
-        kt = k[tile_bhn, :, :].float()
-        gct = gc[tile_bhn, :, :].float()
-        idx = hl.arange(C)
+        rows0 = 0 + hl.arange(16)
+        cols0 = hl.arange(16)
+        q0 = q[tile_bhn, rows0, :].float()
+        kc0 = k[tile_bhn, cols0, :].float()
+        g0 = gc[tile_bhn, rows0, :].float()
+        gcol0 = gc[tile_bhn, cols0, :].float()
+        n0 = gc[tile_bhn, 0, :].float()
+        e0 = torch.exp2((g0 - n0[:, None, :]) * RCP_LN2)
+        kgt0 = (kc0 * torch.exp2((n0[:, None, :] - gcol0) * RCP_LN2)).transpose(-2, -1)
+        a0 = hl.dot(q0 * e0, kgt0) * scale
+        causal0 = (rows0[:, None] >= cols0[None, :])[None, :, :]
+        A[tile_bhn, rows0, cols0] = a0 * causal0.to(a0.dtype)
+        if build_kk:
+            akk0 = hl.dot(k[tile_bhn, rows0, :].float() * e0, kgt0)
+            strict0 = (rows0[:, None] > cols0[None, :])[None, :, :]
+            Akk[tile_bhn, rows0, cols0] = akk0 * strict0.to(akk0.dtype)
 
-        for tile_row in hl.tile(C, block_size=BC_DIAG):
-            row_begin = tile_row.begin
-            row_end = row_begin + BC_DIAG
-            q_blk = q[tile_bhn, tile_row, :].float()
-            gc_blk = gc[tile_bhn, tile_row, :].float()
-            gc_n = gc[tile_bhn, row_begin, :].float()
-
-            in_range = (idx < row_end)[None, :]
-            erow = torch.exp2((gc_blk - gc_n[:, None, :]) * RCP_LN2)
-            qg = q_blk * erow
-            expo_k = torch.where(
-                in_range[:, :, None],
-                (gc_n[:, None, :] - gct) * RCP_LN2,
-                torch.zeros_like(gct),
+        if C >= 2 * BC_DIAG:
+            rows1 = 16 + hl.arange(16)
+            cols1 = hl.arange(32)
+            q1 = q[tile_bhn, rows1, :].float()
+            kc1 = k[tile_bhn, cols1, :].float()
+            g1 = gc[tile_bhn, rows1, :].float()
+            gcol1 = gc[tile_bhn, cols1, :].float()
+            n1 = gc[tile_bhn, 16, :].float()
+            e1 = torch.exp2((g1 - n1[:, None, :]) * RCP_LN2)
+            kgt1 = (kc1 * torch.exp2((n1[:, None, :] - gcol1) * RCP_LN2)).transpose(
+                -2, -1
             )
-            kg = kt * torch.exp2(expo_k)
-            kgt = kg.transpose(-2, -1)
-            a = hl.dot(qg, kgt) * scale
-
-            causal = tile_row.index[:, None] >= idx[None, :]
-            A[tile_bhn, tile_row, :] = a * causal[None, :, :].to(a.dtype)
-
+            a1 = hl.dot(q1 * e1, kgt1) * scale
+            causal1 = (rows1[:, None] >= cols1[None, :])[None, :, :]
+            A[tile_bhn, rows1, cols1] = a1 * causal1.to(a1.dtype)
             if build_kk:
-                kg_row = k[tile_bhn, tile_row, :].float() * erow
-                akk = hl.dot(kg_row, kgt)
-                strict = tile_row.index[:, None] > idx[None, :]
-                Akk[tile_bhn, tile_row, :] = akk * strict[None, :, :].to(akk.dtype)
+                akk1 = hl.dot(k[tile_bhn, rows1, :].float() * e1, kgt1)
+                strict1 = (rows1[:, None] > cols1[None, :])[None, :, :]
+                Akk[tile_bhn, rows1, cols1] = akk1 * strict1.to(akk1.dtype)
+
+        if C >= 3 * BC_DIAG:
+            rows2 = 32 + hl.arange(16)
+            cols2 = hl.arange(48)
+            q2 = q[tile_bhn, rows2, :].float()
+            kc2 = k[tile_bhn, cols2, :].float()
+            g2 = gc[tile_bhn, rows2, :].float()
+            gcol2 = gc[tile_bhn, cols2, :].float()
+            n2 = gc[tile_bhn, 32, :].float()
+            e2 = torch.exp2((g2 - n2[:, None, :]) * RCP_LN2)
+            kgt2 = (kc2 * torch.exp2((n2[:, None, :] - gcol2) * RCP_LN2)).transpose(
+                -2, -1
+            )
+            a2 = hl.dot(q2 * e2, kgt2) * scale
+            causal2 = (rows2[:, None] >= cols2[None, :])[None, :, :]
+            A[tile_bhn, rows2, cols2] = a2 * causal2.to(a2.dtype)
+            if build_kk:
+                akk2 = hl.dot(k[tile_bhn, rows2, :].float() * e2, kgt2)
+                strict2 = (rows2[:, None] > cols2[None, :])[None, :, :]
+                Akk[tile_bhn, rows2, cols2] = akk2 * strict2.to(akk2.dtype)
+
+        if C >= 4 * BC_DIAG:
+            rows3 = 48 + hl.arange(16)
+            cols3 = hl.arange(64)
+            q3 = q[tile_bhn, rows3, :].float()
+            kc3 = k[tile_bhn, cols3, :].float()
+            g3 = gc[tile_bhn, rows3, :].float()
+            gcol3 = gc[tile_bhn, cols3, :].float()
+            n3 = gc[tile_bhn, 48, :].float()
+            e3 = torch.exp2((g3 - n3[:, None, :]) * RCP_LN2)
+            kgt3 = (kc3 * torch.exp2((n3[:, None, :] - gcol3) * RCP_LN2)).transpose(
+                -2, -1
+            )
+            a3 = hl.dot(q3 * e3, kgt3) * scale
+            causal3 = (rows3[:, None] >= cols3[None, :])[None, :, :]
+            A[tile_bhn, rows3, cols3] = a3 * causal3.to(a3.dtype)
+            if build_kk:
+                akk3 = hl.dot(k[tile_bhn, rows3, :].float() * e3, kgt3)
+                strict3 = (rows3[:, None] > cols3[None, :])[None, :, :]
+                Akk[tile_bhn, rows3, cols3] = akk3 * strict3.to(akk3.dtype)
 
     return A, Akk
 
@@ -2077,10 +2137,12 @@ def chunk_fwd_A_diag_anchored_varlen_helion(
         tier 3:  rows 48..63,  cols  0..63      C >= 4 * BC_DIAG
     so C = 32 takes tiers 0-1 and C = 64 all four; the caller rejects any other C.
     cols is the width the causal mask leaves nonzero, so both matmuls span
-    (1 + 2 + ... + NC) * BC_DIAG column-rows instead of NC * C, and the caller's
-    zeroed A and Akk already hold what the full-width form would store past it. Unrolled rather than tiled because each width must be a literal:
-    hl.arange rejects arithmetic on a specialized size. FLA's KDA unrolls the same way
-    in chunk_intra.py, on the same NC >= 3 / NC >= 4 guards."""
+    BC_DIAG * (1 + 2 + ... + NC) = C * (NC + 1) / 2 columns instead of NC * C, and
+    the caller's zeroed A and Akk already hold what the full-width form would store
+    past it.
+    Unrolled rather than tiled because each width must be a literal: hl.arange
+    rejects arithmetic on a specialized size. FLA's KDA unrolls the same way in
+    chunk_intra.py, on the same NC >= 3 / NC >= 4 guards."""
     NT = token_base.size(0)
     C = hl.specialize(gc.size(1))
     D = hl.specialize(gc.size(2))
