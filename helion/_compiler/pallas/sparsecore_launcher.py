@@ -13,6 +13,7 @@ from .sc_base import SC_DMA_GRANULE_BYTES
 from .sc_base import SC_LANES
 from .sc_base import _reject
 from .sc_base import shared_acc_items
+from .sparsecore_compute import classify_cached_loads
 from .sparsecore_plan import AtomicAddPlan
 from .sparsecore_plan import CachedLoadPlan
 from .sparsecore_plan import DirectLoadPlan
@@ -103,6 +104,7 @@ def build_sparsecore_launcher_spec(
     index_padding = _index_padding(program)
     pad_inputs: list[list[object]] = []
     stream_inputs: list[list[object]] = []
+    packed_inputs: list[list[object]] = []
     seen_inputs: dict[int, tuple[object, ...]] = {}
     emitted_inputs: set[int] = set()
 
@@ -123,6 +125,7 @@ def build_sparsecore_launcher_spec(
         emitted_inputs.add(position)
         return True
 
+    packed_loads, ordinary_loads = classify_cached_loads(program)
     for plan in program.loads:
         position = arg_position(plan.access.tensor)
         if position is None:
@@ -169,7 +172,21 @@ def build_sparsecore_launcher_spec(
                         ]
                     )
         elif isinstance(plan, CachedLoadPlan):
-            record_input(position, ("raw",), plan)
+            if plan.access.node in packed_loads and plan.access.node in ordinary_loads:
+                _reject(
+                    "launcher",
+                    "one cached load is used by packed BF16 and ordinary values",
+                    node=plan.access.node,
+                )
+            if plan.access.node in packed_loads:
+                transform = (
+                    "packed_cached",
+                    int(plan.access.tensor.shape[-1]),
+                )
+                if record_input(position, transform, plan):
+                    packed_inputs.append([position, int(plan.access.tensor.shape[-1])])
+            else:
+                record_input(position, ("raw",), plan)
         else:
             record_input(position, ("raw",), plan)
 
@@ -216,6 +233,7 @@ def build_sparsecore_launcher_spec(
     return {
         "pad_inputs": pad_inputs,
         "stream_inputs": stream_inputs,
+        "packed_inputs": packed_inputs,
         "pad_outputs": pad_outputs,
         "reshape_outputs": reshape_outputs,
         "scalar_outputs": scalar_outputs,
