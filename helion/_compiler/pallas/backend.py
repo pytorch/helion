@@ -1434,6 +1434,7 @@ class PallasBackend(Backend):
         from ...autotuner.config_spec import VALID_PALLAS_WORKLIST_GROUPINGS
         from ..compile_environment import CompileEnvironment
         from .plan_tiling import plan_tiling
+        from .tensorcore_plan import build_tensorcore_plans
 
         # Validate pallas_loop_type before any codegen setup.
         self.build_launcher_name(config)
@@ -1447,6 +1448,7 @@ class PallasBackend(Backend):
         env = CompileEnvironment.current()
 
         plan_tiling(graphs, config, tile_strategy)
+        build_tensorcore_plans(graphs, config)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
         # reused across all configs of a BoundKernel (see CompileEnvironment's
