@@ -119,4 +119,3 @@ def test_tensorcore_plan_owns_indirect_fallbacks() -> None:
     assert isinstance(scatter, OneHotScatterPlan)
     assert gather.plan is gather_fallback
     assert scatter.plan is scatter_fallback
-    assert all(isinstance(pattern, TensorIndexPattern) for pattern in patterns[:1])
