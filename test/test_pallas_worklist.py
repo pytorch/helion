@@ -496,6 +496,21 @@ def _add_kernel(x, y):
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _nested_tile_no_grid_kernel(x, y):
+    """Nested ``hl.tile(..., block_size=)`` + ``hl.tile(mb_cta.begin, mb_cta.end)``,
+    no ``hl.grid``. Mirrors ``examples/rms_norm.py::rms_norm_bwd``: the config
+    space offers ``pallas_worklist_grouping`` because the nest is jagged-shaped,
+    but ``detect_compact_worklist_plan`` can't recognise it (needs ``hl.grid``).
+    Used to guard against a raise past the autotuner's skip path."""
+    out = torch.empty_like(x)
+    m_block = hl.register_block_size(x.size(0))
+    for mb_cta in hl.tile(x.size(0), block_size=m_block):
+        for mb in hl.tile(mb_cta.begin, mb_cta.end):
+            out[mb, :] = x[mb, :] + y[mb, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _noprep_ordered_kernel(q, k, q_offsets):
     """Jagged ordered reduction whose reused operand (k) has NO transpose prep:
     k is summed over each ordered tile, never head-major transposed.  It can still
@@ -829,6 +844,30 @@ class TestDetectAndGating(unittest.TestCase):
         # No inner Pallas loops -> no pallas_loop_type field at all.
         self.assertNotIn("pallas_loop_type", fields)
         self.assertNotIn("pallas_worklist_grouping", fields)
+
+    def test_grouping_downgrades_on_kernel_without_hl_grid(self):
+        """`pallas_worklist_grouping` is offered for any nested-tile kernel,
+        but ``detect_compact_worklist_plan`` needs an ``hl.grid`` owner. When
+        the kernel uses ``hl.tile(x, block_size=...)`` as the outer loop
+        instead, compiling with ``grouping in (1, 2)`` must silently
+        downgrade to no-op — not raise past the autotuner's skip path."""
+        bk = _nested_tile_no_grid_kernel.bind(
+            (torch.randn(128, 64), torch.randn(128, 64))
+        )
+        fields = bk.env.config_spec._flat_fields()
+        self.assertIn("pallas_worklist_grouping", fields)
+        # Must not raise: compile a config that would have hit
+        # `detect_compact_worklist_plan`'s InvalidConfig raise.
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                bk.compile_config(
+                    helion.Config(
+                        block_sizes=[128, 32],
+                        pallas_loop_type="unroll",
+                        pallas_worklist_grouping=grouping,
+                    ),
+                    allow_print=False,
+                )
 
 
 @onlyBackends(["pallas"])
@@ -1190,7 +1229,14 @@ class TestWorklistConfig(unittest.TestCase):
         self.assertIn("_wid = pl.program_id(0)", code)
         self.assertIn("work_seq_ref[_wid]", code)
 
-    def test_unsupported_kernel_raises(self):
+    def test_unsupported_kernel_downgrades(self):
+        """A kernel with no owner ``hl.grid`` can't build a compact-worklist
+        plan, but ``pallas_worklist_grouping`` is an independent autotune knob
+        that may still be set on it. Compiling with grouping in (1, 2) must
+        downgrade to a no-op — the generated code contains no compact-worklist
+        builder — rather than raising ``InvalidConfig`` past the autotuner's
+        skip path (which would fail the whole sweep step)."""
+
         def fn(x, y):
             out = torch.empty_like(x)
             for tile in hl.tile(out.size()):
@@ -1201,8 +1247,10 @@ class TestWorklistConfig(unittest.TestCase):
         args = (torch.randn(64, 64), torch.randn(64, 64))
         bound = kernel.bind(args)
         for grouping in (1, 2):
-            with self.subTest(grouping=grouping), self.assertRaises(exc.InvalidConfig):
-                bound.to_triton_code(_worklist_config([16, 16], grouping=grouping))
+            with self.subTest(grouping=grouping):
+                code = bound.to_code(_worklist_config([16, 16], grouping=grouping))
+                self.assertNotIn("_compact_build_worklist=", code)
+                self.assertNotIn("def _build_worklist(", code)
 
     def test_invalid_worklist_grouping_raises(self):
         args = (torch.randn(64, 64), torch.randn(64, 64))

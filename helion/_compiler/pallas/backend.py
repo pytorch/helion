@@ -1430,8 +1430,16 @@ class PallasBackend(Backend):
         grid strategy selects ``WorklistProgramIDs`` and the inner loop remaps its
         begin/end to metadata refs.  Registers the N metadata ref names as
         ``wrapper_only_params`` (kernel-signature-only) and computes the static
-        megablocks ``UPPER``.  ``detect_*`` raises ``exc.InvalidConfig`` on a
-        non-matching kernel (autotuner-skippable).
+        megablocks ``UPPER``.
+
+        ``detect_compact_worklist_plan`` raises ``exc.InvalidConfig`` for
+        kernels whose source doesn't match the compact-worklist pattern
+        (e.g. no owner ``hl.grid``, or an unsupported nest).  Since
+        ``pallas_worklist_grouping`` is a config knob that can be searched
+        independent of the kernel's structure, we catch that here and
+        silently downgrade to no-op grouping rather than propagating the
+        raise past autotune — otherwise a shape whose best-scoring config
+        happens to enable grouping will fail the whole sweep step.
         """
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
@@ -1441,8 +1449,15 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
         host_fn = HostFunction.current()
+        try:
+            detected = detect_compact_worklist_plan(host_fn)
+        except exc.InvalidConfig:
+            # Kernel doesn't support compact-worklist grouping — leave
+            # env.compact_worklist_plan = None so downstream lowering paths
+            # gated on `plan is not None` skip cleanly.
+            return
         plan = dataclasses.replace(
-            detect_compact_worklist_plan(host_fn),
+            detected,
             grouping=cast("int", config.get("pallas_worklist_grouping", 1)),
         )
         env.compact_worklist_plan = plan
