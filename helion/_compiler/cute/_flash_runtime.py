@@ -13,7 +13,6 @@ from typing import Any
 from typing import cast
 
 import cutlass
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import nvvm
 from cutlass.base_dsl.typing import Numeric
@@ -23,6 +22,8 @@ from cutlass.cute.typing import Float32
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blackwell_helpers as sm100_utils_flash
+
+from ._mlir_compat import ir
 
 
 @functools.cache
