@@ -102,6 +102,54 @@ def import_backend_codegen() -> None:
                 raise
 
 
+def repair_backend_codegen() -> None:
+    """Force-complete backend codegen registrations skipped due to partial import.
+
+    :func:`import_backend_codegen` relies on ``importlib.import_module`` to run
+    each backend's ``@_decorators.codegen`` / ``register_codegen`` handlers. When
+    a codegen module is already present in ``sys.modules`` in a partially
+    initialized state -- a circular import during package init cached it before
+    its module-scope registrations ran -- ``import_module`` returns the
+    incomplete module and the registrations are silently skipped, leaving
+    ``APIFunc._codegen`` empty for that backend. That surfaces later as
+    :class:`~helion.exc.BackendImplementationMissing` at codegen time (notably
+    under ``torch.compile`` in a packaged runtime, where the init import order
+    differs).
+
+    This reloads each backend's codegen leaf modules so their registrations run.
+    It is only safe once imports are settled (i.e. at codegen time, not during
+    package init) and relies on codegen registration being idempotent (see
+    ``_decorators.codegen`` and ``aten_lowering.register_codegen``).
+    """
+    import types
+
+    if not _REGISTRY:
+        for _cls in _BUILTIN_BACKENDS:
+            register_compiler_backend(_cls)
+    seen: set[str] = set()
+    for backend_cls in _REGISTRY.values():
+        package = backend_cls.__module__.rsplit(".", 1)[0]
+        if package in seen:
+            continue
+        seen.add(package)
+        module_name = f"{package}._codegen_modules"
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError as e:
+            if e.name != module_name:
+                raise
+            continue
+        # ``_codegen_modules`` may itself be cached partial; reloading it re-binds
+        # its leaf submodule attributes, and reloading each leaf re-runs the
+        # module-scope registration decorators (idempotently).
+        importlib.reload(module)
+        for value in list(vars(module).values()):
+            if isinstance(value, types.ModuleType) and value.__name__.startswith(
+                package + "."
+            ):
+                importlib.reload(value)
+
+
 # register built-in backends
 for _cls in _BUILTIN_BACKENDS:
     register_compiler_backend(_cls)

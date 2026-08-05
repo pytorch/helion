@@ -39,9 +39,27 @@ if TYPE_CHECKING:
 class CodegenDict(dict[str, "Callable[[CodegenState], object]"]):
     """A dict subclass that falls back to the 'common' key when a backend key is missing."""
 
+    # Set once the (global) codegen-registration repair has been attempted, so a
+    # genuinely-unregistered backend does not re-trigger the (expensive) reload on
+    # every lookup. See __missing__ / backend_registry.repair_backend_codegen.
+    _repaired: bool = False
+
     def __missing__(self, key: str) -> Callable[[CodegenState], object]:
         if key != "common" and "common" in self:
             return self["common"]
+        # A backend codegen can be absent because its codegen module was cached
+        # partially-initialized during a circular import at package-init time, so
+        # its module-scope @codegen registrations never ran (import_backend_codegen's
+        # importlib.import_module is a no-op on a partially cached module, leaving
+        # this dict empty). By codegen time imports are settled, so force-complete
+        # the registrations once and retry before giving up.
+        if key != "common" and not CodegenDict._repaired:
+            CodegenDict._repaired = True
+            from .._compiler.backend_registry import repair_backend_codegen
+
+            repair_backend_codegen()
+            if dict.__contains__(self, key):
+                return dict.__getitem__(self, key)
         raise KeyError(key)
 
     # pyrefly: ignore[bad-override]
@@ -282,9 +300,9 @@ def codegen(
         assert is_api_func(original_fn), (
             f"{type_propagation.__qualname__} can only be used on API functions"
         )
-        assert backend not in original_fn._codegen, (
-            f"codegen already registered for backend {backend!r}"
-        )
+        # Idempotent: repair_backend_codegen() may reload this codegen module (see
+        # CodegenDict.__missing__), re-running this decorator. Overwrite rather than
+        # assert so the repair reload is safe.
         original_fn._codegen[backend] = codegen_fn
         return _no_call
 

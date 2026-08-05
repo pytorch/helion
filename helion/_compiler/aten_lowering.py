@@ -62,9 +62,9 @@ class AtenLowering(Lowering):
         self, backend: str
     ) -> Callable[[CodegenHandler], CodegenHandler]:
         def decorator(handler: CodegenHandler) -> CodegenHandler:
-            assert backend not in self.codegen_impls, (
-                f"codegen already registered for backend {backend!r}"
-            )
+            # Idempotent: repair_backend_codegen() may reload this codegen module
+            # (see CodegenDict.__missing__), re-running this decorator. Overwrite
+            # rather than assert so the repair reload is safe.
             self.codegen_impls[backend] = handler
             return handler
 
