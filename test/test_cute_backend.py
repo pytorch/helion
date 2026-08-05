@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 from dataclasses import dataclass
 import gc
 import importlib
@@ -4212,6 +4213,7 @@ class TestCuteBackend(TestCase):
             dense_hd128 = resolve_flash_config(128, 512, force_two_cta)
 
         self.assertTrue(dense_64k.use_2cta_instrs)
+        self.assertEqual(dense_64k.pipeline_family, "fa4_2cta")
         self.assertTrue(dense_64k.precompute_qk_desc)
         self.assertTrue(dense_64k.epi_tma)
         self.assertFalse(dense_64k.epi_stg)
@@ -4223,38 +4225,212 @@ class TestCuteBackend(TestCase):
         self.assertTrue(dense_32k.use_2cta_instrs)
         self.assertTrue(dense_128k.use_2cta_instrs)
         self.assertFalse(dense_unaligned.use_2cta_instrs)
+        self.assertEqual(dense_unaligned.pipeline_family, "fa4")
         self.assertFalse(dense_256k.use_2cta_instrs)
+        self.assertEqual(dense_256k.pipeline_family, "fa4")
         self.assertFalse(dense_bf16.use_2cta_instrs)
+        self.assertEqual(dense_bf16.pipeline_family, "fa4")
         self.assertFalse(causal.use_2cta_instrs)
+        self.assertEqual(causal.pipeline_family, "fa4")
         self.assertTrue(dense_hd128.use_2cta_instrs)
         self.assertFalse(dense_hd128.precompute_qk_desc)
 
         fragments = _cute_flash.flash_autotune_fragments(64, 512)
-        two_cta = fragments[_cute_flash.FLASH_USE_2CTA_KEY]
+        family = fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY]
         epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
-        self.assertEqual(set(two_cta.search_choices or ()), {False, True})
+        self.assertEqual(
+            set(family.search_choices or ()),
+            {"fa4", "ws_overlap", "fa4_2cta"},
+        )
         self.assertEqual(epi_tma.search_choices, (False,))
 
         eligible_32k = _cute_flash.flash_autotune_fragments(64, 256)
-        self.assertEqual(
-            set(eligible_32k[_cute_flash.FLASH_USE_2CTA_KEY].search_choices or ()),
-            {False, True},
+        self.assertIn(
+            "fa4_2cta",
+            eligible_32k[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices or (),
         )
         eligible_128k = _cute_flash.flash_autotune_fragments(64, 1024)
-        self.assertEqual(
-            set(eligible_128k[_cute_flash.FLASH_USE_2CTA_KEY].search_choices or ()),
-            {False, True},
+        self.assertIn(
+            "fa4_2cta",
+            eligible_128k[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices or (),
         )
         ineligible_unaligned = _cute_flash.flash_autotune_fragments(64, 258)
-        self.assertEqual(
-            ineligible_unaligned[_cute_flash.FLASH_USE_2CTA_KEY].search_choices,
-            (False,),
+        self.assertNotIn(
+            "fa4_2cta",
+            ineligible_unaligned[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
+            or (),
         )
         ineligible = _cute_flash.flash_autotune_fragments(64, 2048)
-        self.assertEqual(
-            ineligible[_cute_flash.FLASH_USE_2CTA_KEY].search_choices,
-            (False,),
+        self.assertNotIn(
+            "fa4_2cta",
+            ineligible[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices or (),
         )
+
+    def test_flash_attention_pipeline_family_resolution(self) -> None:
+        expected_flags = {
+            "ws_overlap": ("ws_overlap", False, False, False, False, False),
+            "fa4": ("fa4", False, False, False, False, False),
+            "fa4_tma_4d": ("fa4", False, False, False, False, True),
+            "fa4_local_tma": ("fa4", False, False, False, True, False),
+            "fa4_local_tma_4d": ("fa4", False, False, False, True, True),
+            "fa4_cga2_local": ("fa4", False, True, False, False, False),
+            "fa4_cga2_local_tma_4d": (
+                "fa4",
+                False,
+                True,
+                False,
+                False,
+                True,
+            ),
+            "fa4_2cta": ("fa4", True, False, False, False, False),
+            "fa4_2cta_tma_4d": ("fa4", True, False, False, False, True),
+            "fa4_clc": ("fa4", False, False, True, False, False),
+            "fa4_clc_tma_4d": ("fa4", False, False, True, False, True),
+            "fa4_clc_local_tma": ("fa4", False, False, True, True, False),
+            "fa4_clc_local_tma_4d": ("fa4", False, False, True, True, True),
+        }
+        self.assertEqual(set(expected_flags), set(_cute_flash.FLASH_PIPELINE_FAMILIES))
+
+        with patch.dict(os.environ, {}, clear=True):
+            for family_name, expected in expected_flags.items():
+                with self.subTest(family=family_name):
+                    cfg = resolve_flash_config(
+                        64,
+                        512,
+                        {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
+                        dtype=torch.float16,
+                    )
+                    self.assertEqual(cfg.pipeline_family, family_name)
+                    self.assertEqual(
+                        (
+                            cfg.topology,
+                            cfg.use_2cta_instrs,
+                            cfg.use_cga2_local_cta,
+                            cfg.use_clc_scheduler,
+                            cfg.local_tma_partition,
+                            cfg.tensor_4d_tma,
+                        ),
+                        expected,
+                    )
+
+            legacy_by_family = {
+                "ws_overlap": {_cute_flash.FLASH_TOPOLOGY_KEY: "ws_overlap"},
+                "fa4_2cta_tma_4d": {
+                    _cute_flash.FLASH_TOPOLOGY_KEY: "fa4",
+                    _cute_flash.FLASH_USE_2CTA_KEY: True,
+                    _cute_flash.FLASH_TENSOR_4D_TMA_KEY: True,
+                },
+                "fa4_cga2_local_tma_4d": {
+                    _cute_flash.FLASH_TOPOLOGY_KEY: "fa4",
+                    _cute_flash.FLASH_CGA2_LOCAL_KEY: True,
+                    _cute_flash.FLASH_TENSOR_4D_TMA_KEY: True,
+                },
+                "fa4_clc_local_tma_4d": {
+                    _cute_flash.FLASH_TOPOLOGY_KEY: "fa4",
+                    _cute_flash.FLASH_CLC_KEY: True,
+                    _cute_flash.FLASH_LOCAL_TMA_PARTITION_KEY: True,
+                    _cute_flash.FLASH_TENSOR_4D_TMA_KEY: True,
+                },
+            }
+            for family_name, legacy_config in legacy_by_family.items():
+                with self.subTest(legacy_family=family_name):
+                    family_cfg = resolve_flash_config(
+                        64,
+                        512,
+                        {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: family_name},
+                        dtype=torch.float16,
+                    )
+                    legacy_cfg = resolve_flash_config(
+                        64,
+                        512,
+                        legacy_config,
+                        dtype=torch.float16,
+                    )
+                    self.assertEqual(legacy_cfg, family_cfg)
+
+            family_wins = resolve_flash_config(
+                64,
+                512,
+                {
+                    _cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                    _cute_flash.FLASH_TOPOLOGY_KEY: "ws_overlap",
+                    _cute_flash.FLASH_USE_2CTA_KEY: True,
+                    _cute_flash.FLASH_CGA2_LOCAL_KEY: True,
+                    _cute_flash.FLASH_CLC_KEY: True,
+                    _cute_flash.FLASH_LOCAL_TMA_PARTITION_KEY: True,
+                    _cute_flash.FLASH_TENSOR_4D_TMA_KEY: True,
+                },
+                dtype=torch.float16,
+            )
+            self.assertEqual(family_wins.pipeline_family, "fa4")
+
+            odd_kv = resolve_flash_config(
+                64,
+                511,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: ("fa4_clc_local_tma_4d")},
+                dtype=torch.float16,
+            )
+            self.assertEqual(odd_kv.pipeline_family, "ws_overlap")
+            bf16_2cta = resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta_tma_4d"},
+                dtype=torch.bfloat16,
+            )
+            self.assertEqual(bf16_2cta.pipeline_family, "fa4")
+            causal_clc = resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: ("fa4_clc_local_tma_4d")},
+                dtype=torch.float16,
+                is_causal=True,
+            )
+            self.assertEqual(causal_clc.pipeline_family, "fa4")
+
+            legacy_clc = resolve_flash_config(
+                64,
+                1024,
+                {
+                    _cute_flash.FLASH_TOPOLOGY_KEY: "fa4",
+                    _cute_flash.FLASH_CLC_KEY: True,
+                },
+            )
+            family_clc = resolve_flash_config(
+                64,
+                1024,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_clc"},
+            )
+            self.assertEqual(legacy_clc, family_clc)
+            self.assertEqual(family_clc.clc_heads_per_batch, 32)
+            self.assertEqual(family_clc.clc_stages, 2)
+            clc_fragments = _cute_flash.flash_autotune_fragments(
+                64,
+                1024,
+                pipeline_family_override="fa4_clc",
+            )
+            self.assertEqual(
+                clc_fragments[_cute_flash.FLASH_CLC_HEADS_PER_BATCH_KEY].default(),
+                32,
+            )
+
+            base = resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"},
+            )
+            with_dead_knobs = resolve_flash_config(
+                64,
+                512,
+                {
+                    _cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                    _cute_flash.FLASH_Q_TILE_COUNT_KEY: 17,
+                    _cute_flash.FLASH_MMA_INTERLEAVE_KEY: 9,
+                },
+            )
+            self.assertEqual(with_dead_knobs, base)
+            field_names = {field.name for field in dataclasses.fields(base)}
+            self.assertNotIn("q_tile_count", field_names)
+            self.assertNotIn("mma_interleave", field_names)
 
     def test_flash_attention_fa4_persistent_config_overrides_env(self) -> None:
         with patch.dict(os.environ, {"HELION_CUTE_FLASH_PERSISTENT": "1"}, clear=True):
@@ -4317,7 +4493,7 @@ class TestCuteBackend(TestCase):
                 2,
                 prefer_packed_reduce=True,
             )
-        self.assertFalse(sparse_env_override.packed_reduce)
+        self.assertTrue(sparse_env_override.packed_reduce)
 
         sparse_config_override = resolve_flash_config(
             64,
@@ -4325,7 +4501,7 @@ class TestCuteBackend(TestCase):
             {"cute_flash_packed_reduce": False},
             prefer_packed_reduce=True,
         )
-        self.assertFalse(sparse_config_override.packed_reduce)
+        self.assertTrue(sparse_config_override.packed_reduce)
 
     def test_flash_attention_small_biased_config_overrides(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -4348,7 +4524,7 @@ class TestCuteBackend(TestCase):
         self.assertEqual(resolve_flash_config(64, 64).causal_lpt_swizzle, 0)
         short_causal = resolve_flash_config(64, 2, is_causal=True)
         self.assertEqual(short_causal.e2e_offset, 2)
-        self.assertFalse(short_causal.packed_reduce)
+        self.assertTrue(short_causal.packed_reduce)
         self.assertEqual(short_causal.causal_lpt_swizzle, 0)
         self.assertEqual(
             resolve_flash_config(64, 64, is_causal=True).causal_lpt_swizzle,
@@ -8996,9 +9172,7 @@ class TestCuteConfigValuePriors(TestCase):
 
     def test_flash_priors_bias_dense_hd64_fa4_values(self) -> None:
         from helion._compiler.backend import CuteBackend
-        from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
         from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
-        from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
         from helion._compiler.cute.cute_flash import FLASH_CLC_PDL_KEY
         from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
         from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
@@ -9014,13 +9188,14 @@ class TestCuteConfigValuePriors(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
+        from helion._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
         from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
         from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
         from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
         from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
         from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
@@ -9029,8 +9204,6 @@ class TestCuteConfigValuePriors(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_SKIP_RESCALE_STATS_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
-        from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
-        from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
         from helion.autotuner.config_generation import ConfigGeneration
 
         q, k, v = (
@@ -9046,7 +9219,7 @@ class TestCuteConfigValuePriors(TestCase):
 
         expected = {
             FLASH_S_STAGE_KEY: {2},
-            FLASH_TOPOLOGY_KEY: {"fa4", "ws_overlap"},
+            FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap"},
             FLASH_PERSISTENT_KEY: {True},
             FLASH_PERSISTENT_CTAS_PER_SM_KEY: {1, 2, 3, 4},
             FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
@@ -9070,13 +9243,9 @@ class TestCuteConfigValuePriors(TestCase):
             FLASH_SOFTMAX_REGS_KEY: {184, 200},
             FLASH_KV_STAGE_KEY: {2, 3},
             FLASH_PACKED_REDUCE_KEY: {True},
-            FLASH_CGA2_LOCAL_KEY: {False, True},
-            FLASH_CLC_KEY: {False, True},
             FLASH_CLC_HEADS_PER_BATCH_KEY: {0, 32},
             FLASH_CLC_PDL_KEY: {False, True},
             FLASH_CLC_STAGES_KEY: {2, 3},
-            FLASH_LOCAL_TMA_PARTITION_KEY: {False, True},
-            FLASH_TENSOR_4D_TMA_KEY: {False, True},
             FLASH_E2E_OFFSET_KEY: {0, 1, 2, 3},
             FLASH_E2E_OFFSET0_KEY: {0, 1, 2, 3},
         }
@@ -9102,7 +9271,7 @@ class TestCuteConfigValuePriors(TestCase):
             {8.0, 16.0, 32.0},
         )
         for key, values in {
-            FLASH_TOPOLOGY_KEY: {"fa4", "ws_overlap"},
+            FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap"},
             FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
             FLASH_E2E_OFFSET_KEY: {0},
             FLASH_E2E_OFFSET0_KEY: {1},
@@ -9126,13 +9295,9 @@ class TestCuteConfigValuePriors(TestCase):
             FLASH_EPI_STG_STORE_KEY: {"slice"},
             FLASH_EPI_STG_GMEM_KEY: {"stage"},
             FLASH_PACKED_REDUCE_KEY: {True},
-            FLASH_CGA2_LOCAL_KEY: {False},
-            FLASH_CLC_KEY: {False},
             FLASH_CLC_HEADS_PER_BATCH_KEY: {0},
             FLASH_CLC_PDL_KEY: {False},
             FLASH_CLC_STAGES_KEY: {1},
-            FLASH_LOCAL_TMA_PARTITION_KEY: {False},
-            FLASH_TENSOR_4D_TMA_KEY: {False},
         }.items():
             self._assert_prior_choices(
                 very_long_priors[key],
@@ -9168,7 +9333,7 @@ class TestCuteConfigValuePriors(TestCase):
             "random.choices", side_effect=lambda values, weights, k: [values[0]]
         ):
             biased_config = gen.unflatten(gen.biased_random_flat()).config
-        self.assertEqual(biased_config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(biased_config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
         self.assertEqual(biased_config[FLASH_E2E_SCHEDULE_KEY], "8/2")
         self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
         self.assertEqual(biased_config[FLASH_KV_STAGE_KEY], 2)
@@ -9187,9 +9352,8 @@ class TestCuteConfigValuePriors(TestCase):
         self.assertEqual(biased_config[FLASH_CORR_TILE_SIZE_KEY], 16)
         self.assertFalse(biased_config[FLASH_SKIP_RESCALE_STATS_KEY])
         self.assertEqual(biased_config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-        self.assertFalse(biased_config[FLASH_CLC_KEY])
-        self.assertFalse(biased_config[FLASH_LOCAL_TMA_PARTITION_KEY])
-        self.assertFalse(biased_config[FLASH_TENSOR_4D_TMA_KEY])
+        for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
+            self.assertNotIn(legacy_key, biased_config)
 
     def test_flash_priors_bias_causal_hd64_shape_family_values(self) -> None:
         from helion._compiler.backend import CuteBackend
@@ -9205,9 +9369,9 @@ class TestCuteConfigValuePriors(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
         from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
         from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
-        from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
         from helion.autotuner.config_generation import ConfigGeneration
 
         q, k, v = (
@@ -9226,7 +9390,7 @@ class TestCuteConfigValuePriors(TestCase):
                 priors = CuteBackend().config_value_priors(bound.config_spec)
                 fragments = bound.config_spec._flat_fields()
                 expected = {
-                    FLASH_TOPOLOGY_KEY: {"fa4", "ws_overlap"},
+                    FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap"},
                     FLASH_PERSISTENT_KEY: {False},
                     FLASH_KV_STAGE_KEY: {2, 3, 4, 6, 8, 10},
                     FLASH_E2E_SCHEDULE_KEY: {"16/4", "8/2", "xu"},
