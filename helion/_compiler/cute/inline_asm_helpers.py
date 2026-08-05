@@ -9,7 +9,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 if TYPE_CHECKING:
-    from cutlass._mlir import ir
+    from ._mlir_compat import ir
 
 
 @dsl_user_op

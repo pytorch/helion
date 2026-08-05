@@ -6854,7 +6854,7 @@ def _flash_fa4_wrap(
         advance = """        flash_clc_pipeline.consumer_wait(flash_clc_consumer_state)
         flash_clc_response_ptr = (
             flash_clc_response_base
-            + flash_clc_consumer_state.index * cutlass.Int32(4))
+            + flash_clc_consumer_state.index * cutlass.Int32(4)).align(16)
         flash_clc_work = flash_clc_hw.work_tile_info_from_clc_response(
             flash_clc_response_ptr)
         flash_clc_pipeline.consumer_release(flash_clc_consumer_state)
@@ -7942,14 +7942,14 @@ if warp_idx == 15:
             flash_clc_producer_state)
         flash_clc_response_ptr = (
             flash_clc_response_base
-            + flash_clc_producer_state.index * cutlass.Int32(4))
+            + flash_clc_producer_state.index * cutlass.Int32(4)).align(16)
         with cute.arch.elect_one():
             cute.arch.issue_clc_query(flash_clc_mbar, flash_clc_response_ptr)
         flash_clc_producer_state.advance()
         flash_clc_pipeline.consumer_wait(flash_clc_consumer_state)
         flash_clc_response_ptr = (
             flash_clc_response_base
-            + flash_clc_consumer_state.index * cutlass.Int32(4))
+            + flash_clc_consumer_state.index * cutlass.Int32(4)).align(16)
         flash_clc_work = flash_clc_hw.work_tile_info_from_clc_response(
             flash_clc_response_ptr)
         flash_clc_pipeline.consumer_release(flash_clc_consumer_state)

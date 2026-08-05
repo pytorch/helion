@@ -960,7 +960,7 @@ def _split_lane_loop_with_register_stash(
         frag_by_name[name] = frag
         dtype = _stash_dtype_for_value(name, body, markers)
         decls.append(
-            statement_from_string(f"{frag} = cute.make_fragment({extent}, {dtype})")
+            statement_from_string(f"{frag} = cute.make_rmem_tensor({extent}, {dtype})")
         )
 
     def read_stash_stmts() -> list[ast.AST]:

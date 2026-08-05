@@ -158,6 +158,14 @@ def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_minimum_maximum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.minimum(torch.maximum(x[tile], y[tile]), x[tile])
+    return out
+
+
 @helion.kernel(backend="cute", autotune_effort="none")
 def cute_affine_scalar_args(
     x: torch.Tensor,
@@ -2944,6 +2952,9 @@ class TestCuteBackend(TestCase):
         )
 
         self.assertIn("problem_shape_ntile_mnl=(32, 64, 1)", code)
+        self.assertIn(
+            "flash_clc_consumer_state.index * cutlass.Int32(4)).align(16)", code
+        )
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
@@ -5471,6 +5482,44 @@ class TestCuteBackend(TestCase):
         x, y = args
         expected = torch.sigmoid(torch.sin(torch.relu(x * y)))
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    def test_pointwise_minimum_maximum_cutlass_45_fallback(self) -> None:
+        cases = (
+            (
+                torch.tensor(
+                    [[float("nan"), -0.0, 1.0]], device=DEVICE, dtype=torch.float32
+                ),
+                torch.tensor(
+                    [[2.0, 0.0, float("nan")]], device=DEVICE, dtype=torch.float32
+                ),
+            ),
+            (
+                torch.tensor(
+                    [[2**25 + 1, -(2**25 + 1)]], device=DEVICE, dtype=torch.int32
+                ),
+                torch.tensor([[2**25, -(2**25)]], device=DEVICE, dtype=torch.int32),
+            ),
+        )
+        for args in cases:
+            with self.subTest(dtype=str(args[0].dtype)):
+                with patch(
+                    "helion._compiler.inductor_lowering.cute_math_min_max_available",
+                    return_value=False,
+                ):
+                    code, out = code_and_output(cute_minimum_maximum, args)
+                x, y = args
+                torch.testing.assert_close(
+                    out, torch.minimum(torch.maximum(x, y), x), equal_nan=True
+                )
+                if x.is_floating_point():
+                    torch.testing.assert_close(
+                        torch.signbit(out),
+                        torch.signbit(torch.minimum(torch.maximum(x, y), x)),
+                    )
+                self.assertNotIn("cute.arch.fmax", code)
+                self.assertNotIn("cute.arch.fmin", code)
+                self.assertNotIn("cute.math.max", code)
+                self.assertNotIn("cute.math.min", code)
 
     def test_rms_norm_uses_native_rsqrt(self) -> None:
         x = torch.randn(8, 32, device=DEVICE, dtype=torch.float32)
@@ -10155,6 +10204,22 @@ class TestCuteBackendRequirements(TestCase):
         from helion._compiler.backend import CuteBackend
 
         CuteBackend().validate_environment()  # must not raise in this environment
+
+    def test_math_min_max_version_guard(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        self.addCleanup(cutedsl_compat.cute_math_min_max_available.cache_clear)
+        for version, expected in (("4.5.1", False), ("4.6.0", True), ("4.6.1", True)):
+            with self.subTest(version=version):
+                cutedsl_compat.cute_math_min_max_available.cache_clear()
+                with patch.object(
+                    cutedsl_compat.importlib.metadata,
+                    "version",
+                    return_value=version,
+                ):
+                    self.assertEqual(
+                        cutedsl_compat.cute_math_min_max_available(), expected
+                    )
 
     def test_unmet_requirement_raises_with_actionable_message(self) -> None:
         from helion._compiler.cute import cutedsl_compat

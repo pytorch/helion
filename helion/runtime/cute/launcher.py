@@ -347,7 +347,6 @@ def _append_cute_wrapper_plan(
                             "layout=cute.make_layout("
                             f"{rank3_gmem_shape}, stride={rank3_gmem_stride}))"
                         ),
-                        f"    {gmem_tensor}.mark_layout_dynamic(leading_dim=1)",
                     )
                     if rank3_mnl_tensor
                     else ()
@@ -815,7 +814,6 @@ def _append_cute_wrapper_plan(
                 f"arg{lhs_idx}.iterator, "
                 f"layout=cute.make_layout({lhs_tma_layout}))"
             ),
-            f"    {lhs_tma}.mark_layout_dynamic(leading_dim=1)",
         )
         rhs_tma_setup = (
             (
@@ -823,7 +821,6 @@ def _append_cute_wrapper_plan(
                 f"arg{rhs_idx}.iterator, "
                 f"layout=cute.make_layout({rhs_tma_layout}))"
             ),
-            f"    {rhs_tma}.mark_layout_dynamic(leading_dim=1)",
         )
     else:
         lhs_tma_setup = (
@@ -843,7 +840,6 @@ def _append_cute_wrapper_plan(
                         )
                     )
                 ),
-                f"    {lhs_tma}.mark_layout_dynamic(leading_dim=1)",
             )
             if dynamic_ab_tensormaps
             else ()
@@ -870,10 +866,6 @@ def _append_cute_wrapper_plan(
                 "layout=cute.make_layout("
                 f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
                 f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
-            ),
-            (
-                f"    {rhs_tma}.mark_layout_dynamic(leading_dim="
-                f"{1 if dynamic_ab_tensormap_rank2 or rhs_rank3_grouped_nt else (1 if b_k_major else 0)})"
             ),
         )
     smem_a_layout_expr = tcgen05_smem_layout_expr(
@@ -902,11 +894,7 @@ def _append_cute_wrapper_plan(
     if rhs_leading_passthrough:
         append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (2, 1, 0))
     lhs_tma_setup_lines = () if lhs_leading_passthrough else lhs_tma_setup
-    rhs_tma_setup_lines = (
-        (f"    {rhs_tma}.mark_layout_dynamic(leading_dim={1 if b_k_major else 0})",)
-        if rhs_leading_passthrough
-        else rhs_tma_setup
-    )
+    rhs_tma_setup_lines = () if rhs_leading_passthrough else rhs_tma_setup
     body.extend(
         (
             (
