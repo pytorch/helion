@@ -21,6 +21,8 @@ from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_engine import get_helion_fwd_kernel
 from .linear_attention_engine import recurrent_step
 from .linear_attention_fla import get_fla_fwd_kernel
+from .linear_attention_flashkda import flashkda_supports
+from .linear_attention_flashkda import get_flashkda_fwd_kernel
 from .linear_attention_utils import ACC_BWD_TOL
 from .linear_attention_utils import ACC_FWD_TOL
 from .linear_attention_utils import chunked_linear_attn_reference
@@ -381,6 +383,20 @@ class LinearAttentionExampleHarness:
     def fla_fb(self, i: Inputs, go_t: torch.Tensor, scale: float) -> None:
         self.fla_fwd(i, scale).backward(go_t)
 
+    def flashkda_fwd(self, i: Inputs, scale: float) -> torch.Tensor:
+        fwd = get_flashkda_fwd_kernel(self.variant)
+        assert fwd is not None
+        o, _ = fwd(
+            i.q,
+            i.k,
+            i.v,
+            i.g,
+            i.beta,
+            scale=scale,
+            **i.preamble,
+        )
+        return o
+
     def reference(self, i: Inputs) -> torch.Tensor:
         assert i.g is not None
         # The reference walks a head-first [B, H, T, *] batch; varlen inputs are
@@ -428,7 +444,7 @@ class LinearAttentionExampleHarness:
         fused_preamble: bool = False,
         varlen: bool = False,
         varlen_lengths: list[int] | None = None,
-    ) -> list[tuple[str, float, float, float, float]]:
+    ) -> list[tuple[str, float, float, float, float, float]]:
         return run_benchmark(
             self,
             configs if configs is not None else BENCH_CONFIGS,
@@ -470,6 +486,22 @@ def _grad_leaves(
 
 def _has_fla(harness: LinearAttentionExampleHarness) -> bool:
     return get_fla_fwd_kernel(harness.variant) is not None
+
+
+def _has_flashkda(
+    harness: LinearAttentionExampleHarness, inputs: Inputs, d: int, dv: int
+) -> bool:
+    """FlashKDA runs the varlen KDA forward only, at D == DV == 128.
+
+    It reads q/k/v/g token-major and takes the input transforms itself, which is
+    the varlen path's layout and flag set. The dense path is head-first, so it is
+    excluded rather than fed transposed tensors.
+    """
+    return (
+        get_flashkda_fwd_kernel(harness.variant) is not None
+        and flashkda_supports(d, dv)
+        and _is_varlen(inputs)
+    )
 
 
 def _is_varlen(inputs: Inputs) -> bool:
@@ -613,11 +645,11 @@ def _time_config(
     fused_preamble: bool = False,
     varlen: bool = False,
     varlen_lengths: list[int] | None = None,
-) -> tuple[float, float, float, float]:
-    """Time helion/FLA forward and fwd+bwd for one shape.
+) -> tuple[float, float, float, float, float]:
+    """Time helion/FLA forward and fwd+bwd for one shape, plus FlashKDA forward.
 
     The fwd+bwd pair is 0.0 for pre-activation inputs, which have no backward, and
-    varlen is one such case.
+    varlen is one such case. The FlashKDA time is 0.0 wherever it does not apply.
     """
     bi, hi, ti, di, dvi = shape
     extra: dict[str, object] = {}
@@ -642,8 +674,19 @@ def _time_config(
 
     fwd_ms = do_bench(lambda: harness.helion_fwd(inputs, C))
     fla_fwd_ms = do_bench(lambda: harness.fla_fwd(fla_inputs, scale))
+    fk_ms = (
+        do_bench(lambda: harness.flashkda_fwd(inputs, scale))
+        if _has_flashkda(harness, inputs, di, dvi)
+        else 0.0
+    )
     if inputs.preamble:
-        return cast("float", fwd_ms), cast("float", fla_fwd_ms), 0.0, 0.0
+        return (
+            cast("float", fwd_ms),
+            cast("float", fla_fwd_ms),
+            0.0,
+            0.0,
+            cast("float", fk_ms),
+        )
 
     grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
     go_t = _htf(grad_out)
@@ -662,6 +705,7 @@ def _time_config(
         cast("float", fla_fwd_ms),
         cast("float", fb_ms),
         cast("float", fla_fb_ms),
+        cast("float", fk_ms),
     )
 
 
@@ -672,26 +716,27 @@ def run_benchmark(
     fused_preamble: bool = False,
     varlen: bool = False,
     varlen_lengths: list[int] | None = None,
-) -> list[tuple[str, float, float, float, float]]:
-    """Benchmark forward and fwd+bwd, comparing against FLA.
+) -> list[tuple[str, float, float, float, float, float]]:
+    """Benchmark forward and fwd+bwd, comparing against FLA and FlashKDA.
 
-    Returns one (config, helion_fwd_ms, fla_fwd_ms, helion_fb_ms, fla_fb_ms) row
-    per config; empty when fla is unavailable. The fwd+bwd pair is 0.0 with
-    fused_preamble, whose inputs have no backward.
+    Returns one (config, helion_fwd_ms, fla_fwd_ms, helion_fb_ms, fla_fb_ms,
+    flashkda_fwd_ms) row per config; empty when fla is unavailable. The fwd+bwd
+    pair is 0.0 with fused_preamble, whose inputs have no backward, and the
+    FlashKDA time is 0.0 wherever it does not apply.
     """
-    rows: list[tuple[str, float, float, float, float]] = []
+    rows: list[tuple[str, float, float, float, float, float]] = []
     if not _has_fla(harness):
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return rows
 
     print(
         f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
-        f" {'Helion f+b':>12} {'FLA f+b':>12}"
+        f" {'Helion f+b':>12} {'FLA f+b':>12} {'FlashKDA':>10}"
     )
-    print("-" * 72)
+    print("-" * 83)
 
     for shape in configs:
-        fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms = _time_config(
+        fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms, fk_ms = _time_config(
             harness,
             shape,
             C,
@@ -702,9 +747,9 @@ def run_benchmark(
         cfg = f"({','.join(str(x) for x in shape)})"
         print(
             f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
-            f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f}"
+            f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f} {fk_ms:>10.3f}"
         )
-        rows.append((cfg, fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms))
+        rows.append((cfg, fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms, fk_ms))
 
     return rows
 
