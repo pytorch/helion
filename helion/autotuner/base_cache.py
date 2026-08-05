@@ -220,6 +220,10 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
     def get(self) -> Config | None:
         raise NotImplementedError
 
+    def get_or_raise(self) -> Config | None:
+        """Read the exact cache, propagating errors when the backend supports it."""
+        return self.get()
+
     @abc.abstractmethod
     def put(self, config: Config) -> None:
         raise NotImplementedError
@@ -242,77 +246,96 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Return a sequence of (description, key) tuples for all cache entries."""
         raise NotImplementedError
 
+    def _record_cache_hit(self, config: Config) -> None:
+        counters["autotune"]["cache_hit"] += 1
+        log.debug("cache hit: %s", str(config))
+        if self._should_report_cache_hit():
+            kernel_decorator = self.kernel.format_kernel_decorator(
+                config, self.autotuner.settings
+            )
+            print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
+            cache_info = self._get_cache_info_message()
+            self.autotuner.log(
+                f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
+            )
+
+    def _record_cache_miss(self, *, assert_cache_hit: bool) -> None:
+        counters["autotune"]["cache_miss"] += 1
+        log.debug("cache miss")
+        if not assert_cache_hit or os.environ.get("HELION_ASSERT_CACHE_HIT") != "1":
+            return
+
+        current_key = self._get_cache_key()
+        print("\n" + "=" * 80, file=sys.stderr)
+        print("HELION_ASSERT_CACHE_HIT: Cache miss detected!", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(f"\nKernel: {self.kernel.kernel.name}", file=sys.stderr)
+        print(f"\nCurrent cache key:\n{current_key}", file=sys.stderr)
+
+        cache_entries = self._list_cache_entries()
+        if cache_entries:
+            print(
+                f"\n{len(cache_entries)} other cache entries exist (but don't match):",
+                file=sys.stderr,
+            )
+            for i, (desc, cached_key) in enumerate(cache_entries, 1):
+                print(f"\n[Entry {i}] {desc}", file=sys.stderr)
+                print("  Key differences:", file=sys.stderr)
+                has_diff = False
+                for field_name in vars(current_key):
+                    current_val = str(getattr(current_key, field_name))
+                    cached_val = str(getattr(cached_key, field_name, "<missing>"))
+                    if current_val != cached_val:
+                        has_diff = True
+                        print(f"    {field_name}:", file=sys.stderr)
+                        print(f"      Current:  {current_val}", file=sys.stderr)
+                        print(f"      Cached:   {cached_val}", file=sys.stderr)
+                if not has_diff:
+                    print(
+                        "    (no differences found, likely a hash collision)",
+                        file=sys.stderr,
+                    )
+        else:
+            print("\nNo existing cache entries found.", file=sys.stderr)
+
+        print("=" * 80 + "\n", file=sys.stderr)
+        raise exc.CacheAssertionError(self.kernel.kernel.name)
+
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """Run autotuning, consulting and updating the on-disk cache.
 
         ``skip_cache`` (set by HELION_FORCE_AUTOTUNE) skips reading but
         still writes back.  HELION_SKIP_CACHE skips both reading and writing.
         """
+        settings = self.autotuner.settings
+        if settings.autotune_rag_enabled:
+            from .rag.adapter import autotune_with_rag
+
+            return autotune_with_rag(self, skip_cache=skip_cache)
         skip_cache_env = should_skip_cache()
-        skip_read = skip_cache or skip_cache_env
+        skip_read = skip_cache or skip_cache_env or not settings.autotune_exact_read
 
         if not skip_read:
             if (config := self.get()) is not None:
-                counters["autotune"]["cache_hit"] += 1
-                log.debug("cache hit: %s", str(config))
-                if self._should_report_cache_hit():
-                    kernel_decorator = self.kernel.format_kernel_decorator(
-                        config, self.autotuner.settings
-                    )
-                    print(
-                        f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr
-                    )
-                    cache_info = self._get_cache_info_message()
-                    self.autotuner.log(
-                        f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
-                    )
+                self._record_cache_hit(config)
                 return config
 
-        counters["autotune"]["cache_miss"] += 1
-        log.debug("cache miss")
-
-        if not skip_read and os.environ.get("HELION_ASSERT_CACHE_HIT") == "1":
-            current_key = self._get_cache_key()
-            print("\n" + "=" * 80, file=sys.stderr)
-            print("HELION_ASSERT_CACHE_HIT: Cache miss detected!", file=sys.stderr)
-            print("=" * 80, file=sys.stderr)
-            print(f"\nKernel: {self.kernel.kernel.name}", file=sys.stderr)
-            print(f"\nCurrent cache key:\n{current_key}", file=sys.stderr)
-
-            cache_entries = self._list_cache_entries()
-            if cache_entries:
-                print(
-                    f"\n{len(cache_entries)} other cache entries exist (but don't match):",
-                    file=sys.stderr,
-                )
-                for i, (desc, cached_key) in enumerate(cache_entries, 1):
-                    print(f"\n[Entry {i}] {desc}", file=sys.stderr)
-                    print("  Key differences:", file=sys.stderr)
-                    has_diff = False
-                    for field_name in vars(current_key):
-                        current_val = str(getattr(current_key, field_name))
-                        cached_val = str(getattr(cached_key, field_name, "<missing>"))
-                        if current_val != cached_val:
-                            has_diff = True
-                            print(f"    {field_name}:", file=sys.stderr)
-                            print(f"      Current:  {current_val}", file=sys.stderr)
-                            print(f"      Cached:   {cached_val}", file=sys.stderr)
-                    if not has_diff:
-                        print(
-                            "    (no differences found, likely a hash collision)",
-                            file=sys.stderr,
-                        )
-            else:
-                print("\nNo existing cache entries found.", file=sys.stderr)
-
-            print("=" * 80 + "\n", file=sys.stderr)
-            raise exc.CacheAssertionError(self.kernel.kernel.name)
+        self._record_cache_miss(assert_cache_hit=not skip_read)
 
         self.autotuner.log("Starting autotuning process, this may take a while...")
 
-        config = self._run_autotune_trials()
+        # Opt-in unified instrumentation: emit one canonical event for this
+        # RAG-disabled arm (lfbo / llm / hybrid) so every arm in the head-to-head
+        # campaign produces the same schema. Off by default, so ordinary
+        # autotuning and the three-arm campaign are unaffected.
+        if os.environ.get("HELION_AUTOTUNE_EMIT_EVENT") == "1":
+            from .rag.adapter import emit_baseline_attempt_event
 
-        if not skip_cache_env:
+            config = emit_baseline_attempt_event(self)
+        else:
+            config = self._run_autotune_trials()
+
+        if not skip_cache_env and settings.autotune_cache_write:
             self.put(config)
             counters["autotune"]["cache_put"] += 1
             log.debug("cache put: %s", str(config))

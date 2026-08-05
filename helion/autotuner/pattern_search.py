@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import math
+import time
 from typing import TYPE_CHECKING
 
 from .. import exc
@@ -117,17 +118,20 @@ class PatternSearch(PopulationBasedSearch):
         Returns:
             A list of flat configurations for the initial population.
         """
+        if (fixed := self.fixed_initial_population_flat()) is not None:
+            return fixed
         if (
             self.initial_population_strategy
             == InitialPopulationStrategy.FROM_BEST_AVAILABLE
         ):
             pop = self._generate_best_available_population_flat()
             if self.best_available_pad_random:
-                n_random = max(0, self.initial_population - len(pop))
+                target = self._candidate_generation_limit(self.initial_population)
+                n_random = max(0, target - len(pop))
                 pop.extend(self.config_gen.random_flat() for _ in range(n_random))
             return pop
         return self.config_gen.random_population_flat(
-            self.initial_population,
+            self._candidate_generation_limit(self.initial_population),
             user_seed_configs=self._autotune_seed_configs(),
             log_func=self.log,
         )
@@ -137,13 +141,13 @@ class PatternSearch(PopulationBasedSearch):
         self.log(
             f"Starting PatternSearch with initial_population={initial_population_name}, copies={self.copies}, max_generations={self.max_generations}"
         )
-        visited: set[Config] = set()
-        self.population = []
-        for flat_config in self._generate_initial_population_flat():
-            member = self.make_unbenchmarked(flat_config)
-            if member is not None and member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
+        generation_started = time.perf_counter()
+        initial_population = self._generate_initial_population_flat()
+        self._record_candidate_generation_time(time.perf_counter() - generation_started)
+        self.population, visited = self.make_initial_population(
+            initial_population,
+            target_size=self.initial_population,
+        )
         self.benchmark_population(self.population, desc="Initial population")
 
         # Compute adaptive compile timeout based on initial population compile times
@@ -247,6 +251,8 @@ class PatternSearch(PopulationBasedSearch):
         Returns:
             True the search copy is terminated, False otherwise.
         """
+        if self.settings.autotune_disable_trajectory_early_stop:
+            return False
         if best is current:
             return True  # no improvement, stop searching
         # Stop if the relative improvement is smaller than a user-specified delta

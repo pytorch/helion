@@ -6,6 +6,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import hashlib
 import logging
 import math
 from math import inf
@@ -38,6 +39,11 @@ from .benchmark_provider import _unset_fn
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .candidate_budget import AttemptBudget
+from .candidate_budget import AttemptCategory
+from .candidate_budget import CandidatePopulationUnderfilled
+from .candidate_budget import SharedAttemptState
+from .candidate_budget import random_replacement_draw_cap
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
@@ -57,6 +63,7 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
+    from .rag.instrumentation import InstrumentationCollector
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
@@ -243,6 +250,9 @@ class BaseSearch(BaseAutotuner):
         counters: A counter to track various metrics during the search.
     """
 
+    _attempt_instrumentation: InstrumentationCollector | None = None
+    _candidate_attempt_budget = AttemptBudget(None)
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -270,6 +280,15 @@ class BaseSearch(BaseAutotuner):
         self._benchmarked_members: dict[Config, PopulationMember] = {}
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
+        self._candidate_attempt_budget = AttemptBudget(
+            self.settings.autotune_candidate_attempt_limit
+        )
+        self._candidate_attempt_configs: set[Config] = set()
+        self._candidate_initial_population_open = True
+        self._precounted_initial_population_configs: set[Config] = set()
+        self._candidate_attempt_categories: dict[Config, AttemptCategory] = {}
+        self._candidate_sources: dict[Config, str] = {}
+        self._attempt_instrumentation: InstrumentationCollector | None = None
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -355,11 +374,70 @@ class BaseSearch(BaseAutotuner):
         return True
 
     def _budgeted_range(self, *args: int) -> Iterator[int]:
-        """Yield ``range(*args)`` until the autotune budget is exhausted."""
+        """Yield ``range(*args)`` until either autotune budget is exhausted."""
         for value in range(*args):
-            if self._autotune_budget_exceeded():
+            if (
+                self._autotune_budget_exceeded()
+                or self._candidate_attempt_budget.exhausted
+            ):
                 return
             yield value
+
+    @property
+    def candidate_attempt_budget(self) -> AttemptBudget:
+        """Counter shared by every candidate-producing phase of this search."""
+        return self._candidate_attempt_budget
+
+    def set_candidate_attempt_budget(self, budget: AttemptBudget) -> None:
+        """Share an externally-created budget before this search starts."""
+        if budget is self._candidate_attempt_budget:
+            return
+        if self._candidate_attempt_budget.spent() > 0:
+            raise RuntimeError(
+                "candidate attempts already started; budget cannot be reset"
+            )
+        self._candidate_attempt_budget = budget
+
+    def set_attempt_instrumentation(
+        self, collector: InstrumentationCollector | None
+    ) -> None:
+        """Attach the dependency-light collector used by the live RAG adapter."""
+        self._attempt_instrumentation = collector
+
+    def adopt_shared_attempt_state(self, state: SharedAttemptState) -> None:
+        """Adopt run-level shared attempt accounting before this search starts.
+
+        Points this search's attempt budget, cross-stage dedup set, and (when
+        present) instrumentation collector at the shared objects so a composed
+        search's stages charge one global ceiling, deduplicate candidates across
+        stages, and record one continuous trajectory. Must be called before any
+        attempt is recorded.
+        """
+        if self._candidate_attempt_budget.spent() > 0:
+            raise RuntimeError(
+                "candidate attempts already started; shared state cannot be adopted"
+            )
+        self.set_candidate_attempt_budget(state.budget)
+        self._candidate_attempt_configs = state.attempted_configs
+        if state.collector is not None:
+            self.set_attempt_instrumentation(state.collector)
+
+    def set_candidate_source(self, config: Config, source: str) -> None:
+        """Label a normalized candidate for per-evaluation instrumentation."""
+        self._candidate_sources[config] = source
+
+    def _candidate_generation_limit(self, requested: int) -> int:
+        """Bound eager candidate generation by the frozen remaining attempts."""
+        remaining = self._candidate_attempt_budget.remaining()
+        return requested if remaining is None else min(requested, remaining)
+
+    def _record_candidate_generation_time(self, seconds: float) -> None:
+        collector = self._attempt_instrumentation
+        if collector is None:
+            return
+        from .rag.types import Phase
+
+        collector.record_phase_transition(Phase.GENERATION, phase_seconds=seconds)
 
     @classmethod
     def get_kwargs_from_profile(
@@ -460,6 +538,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             A list of BenchmarkResult entries, one per input config.
         """
+        batch_started = time.perf_counter()
         passing_configs, passing_indices = self._apply_config_filter(configs)
         inner_results = self.benchmark_provider.benchmark(passing_configs, desc=desc)
 
@@ -483,12 +562,92 @@ class BaseSearch(BaseAutotuner):
                             perf=inf,
                             status="filtered",
                             compile_time=None,
+                            compilation_status="not_run",
+                            correctness_status="not_run",
+                            benchmark_status="filtered",
                         )
                     )
 
         for r in results:
             if r.perf < self.best_perf_so_far:
                 self.best_perf_so_far = r.perf
+
+        collector = self._attempt_instrumentation
+        if collector is not None:
+            from .rag.types import Phase
+
+            compile_seconds = sum(
+                result.compile_time
+                for result in results
+                if result.compile_time is not None
+                and math.isfinite(result.compile_time)
+                and result.compile_time >= 0.0
+            )
+            collector.record_phase_transition(
+                Phase.COMPILATION,
+                phase_seconds=compile_seconds or None,
+            )
+            correctness_seconds = sum(
+                result.correctness_time
+                for result in results
+                if result.correctness_time is not None
+                and math.isfinite(result.correctness_time)
+                and result.correctness_time >= 0.0
+            )
+            collector.record_phase_transition(
+                Phase.CORRECTNESS, phase_seconds=correctness_seconds or None
+            )
+            for result in results:
+                if result.compilation_status != "unknown":
+                    compilation_status = result.compilation_status
+                    correctness_status = result.correctness_status
+                    benchmark_status = result.benchmark_status
+                elif result.status == "ok":
+                    compilation_status = "ok"
+                    correctness_status = "ok"
+                    benchmark_status = "ok"
+                elif result.status == "timeout":
+                    compilation_status = "timeout"
+                    correctness_status = "not_run"
+                    benchmark_status = "not_run"
+                elif result.status == "filtered":
+                    compilation_status = "not_run"
+                    correctness_status = "not_run"
+                    benchmark_status = "filtered"
+                elif result.status == "peer_compilation_fail":
+                    compilation_status = "peer_compilation_fail"
+                    correctness_status = "not_run"
+                    benchmark_status = "not_run"
+                else:
+                    compilation_status = "unknown_failure"
+                    correctness_status = "unknown"
+                    benchmark_status = "error"
+                category = self._candidate_attempt_categories.get(result.config)
+                category_name = category.value if category is not None else "unknown"
+                config_repr = repr(result.config)
+                collector.record_evaluation(
+                    config_id=hashlib.sha256(config_repr.encode("utf-8")).hexdigest(),
+                    config_repr=config_repr,
+                    candidate_source=self._candidate_sources.get(
+                        result.config, category_name
+                    ),
+                    candidate_category=category_name,
+                    compatibility_status=(
+                        "filtered" if result.status == "filtered" else "compatible"
+                    ),
+                    compilation_status=compilation_status,
+                    compilation_seconds=result.compile_time,
+                    correctness_status=correctness_status,
+                    benchmark_status=benchmark_status,
+                    timeout_status=(
+                        "timed_out" if result.status == "timeout" else "not_timed_out"
+                    ),
+                    performance=result.perf,
+                )
+            collector.record_phase_transition(
+                Phase.BENCHMARKING,
+                phase_seconds=time.perf_counter() - batch_started,
+            )
 
         return results
 
@@ -505,6 +664,51 @@ class BaseSearch(BaseAutotuner):
             A BenchmarkResult with the compiled function and performance.
         """
         return self.benchmark_batch([config])[0]
+
+    def _record_rebenchmark_evaluations(
+        self,
+        members: Sequence[PopulationMember],
+        timings: Sequence[float | None],
+        *,
+        elapsed_seconds: float,
+        timeout_indices: set[int] | None = None,
+    ) -> None:
+        collector = self._attempt_instrumentation
+        if collector is None:
+            return
+        from .rag.types import Phase
+
+        timeout_indices = timeout_indices or set()
+        for index, (member, timing) in enumerate(zip(members, timings, strict=True)):
+            category = self._candidate_attempt_categories.get(member.config)
+            category_name = category.value if category is not None else "unknown"
+            config_repr = repr(member.config)
+            collector.record_evaluation(
+                config_id=hashlib.sha256(config_repr.encode("utf-8")).hexdigest(),
+                config_repr=config_repr,
+                candidate_source=self._candidate_sources.get(
+                    member.config, category_name
+                ),
+                candidate_category=category_name,
+                compatibility_status="compatible",
+                compilation_status="ok",
+                compilation_seconds=0.0,
+                correctness_status="ok",
+                benchmark_status=(
+                    "timeout"
+                    if index in timeout_indices
+                    else "ok"
+                    if timing is not None and math.isfinite(timing)
+                    else "unavailable"
+                ),
+                timeout_status=(
+                    "timed_out" if index in timeout_indices else "not_timed_out"
+                ),
+                performance=timing,
+            )
+        collector.record_phase_transition(
+            Phase.BENCHMARKING, phase_seconds=elapsed_seconds
+        )
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
@@ -607,6 +811,10 @@ class BaseSearch(BaseAutotuner):
         from .base_cache import should_skip_cache
 
         if self._skip_cache or should_skip_cache():
+            return []
+
+        # Independent best-available control (decoupled from the exact-cache read).
+        if not self.settings.autotune_best_available_read:
             return []
 
         from .local_cache import get_helion_cache_dir
@@ -798,6 +1006,7 @@ class PopulationBasedSearch(BaseSearch):
         # ``self.population``.
         self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
+        self._fixed_initial_population_flat: list[FlatConfig] | None = None
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
@@ -928,8 +1137,111 @@ class PopulationBasedSearch(BaseSearch):
         try:
             config = self.config_gen.unflatten(flat_values)
         except exc.InvalidConfig:
+            if self._candidate_attempt_budget.limit is not None:
+                self._candidate_attempt_budget.record(AttemptCategory.INVALID)
+            return None
+        if not self._admit_candidate_config(config):
             return None
         return PopulationMember(_unset_fn, [], flat_values, config)
+
+    def make_initial_population(
+        self, flat_values: Sequence[FlatConfig], *, target_size: int
+    ) -> tuple[list[PopulationMember], set[Config]]:
+        """Normalize one exact-size capped population, refilling rejected draws."""
+        population: list[PopulationMember] = []
+        visited: set[Config] = set()
+
+        def admit(flat: FlatConfig) -> None:
+            member = self.make_unbenchmarked(flat)
+            if member is not None and member.config not in visited:
+                visited.add(member.config)
+                population.append(member)
+
+        capped = self._candidate_attempt_budget.limit is not None
+        for flat in flat_values:
+            if capped and len(population) >= target_size:
+                break
+            admit(flat)
+
+        if capped:
+            replacement_draws = 0
+            draw_cap = random_replacement_draw_cap(target_size)
+            while (
+                len(population) < target_size
+                and not self._candidate_attempt_budget.exhausted
+                and replacement_draws < draw_cap
+            ):
+                replacement_draws += 1
+                admit(self.config_gen.random_flat())
+            if len(population) != target_size:
+                raise CandidatePopulationUnderfilled(
+                    requested=target_size, realized=len(population)
+                )
+        return population, visited
+
+    def _admit_candidate_config(
+        self,
+        config: Config,
+        category: AttemptCategory | None = None,
+    ) -> bool:
+        """Classify and charge one normalized config when the cap is enabled."""
+        budget = self._candidate_attempt_budget
+        if budget.limit is None:
+            resolved_category = category or (
+                AttemptCategory.INITIAL_POPULATION
+                if self._candidate_initial_population_open
+                else AttemptCategory.GENERATION
+            )
+            self._candidate_attempt_categories[config] = resolved_category
+            return True
+
+        if config in self._precounted_initial_population_configs:
+            self._precounted_initial_population_configs.remove(config)
+            self._candidate_attempt_configs.add(config)
+            self._candidate_attempt_categories[config] = (
+                AttemptCategory.INITIAL_POPULATION
+            )
+            return True
+
+        if config in self._candidate_attempt_configs:
+            budget.record(AttemptCategory.DUPLICATE)
+            return False
+
+        if category is None:
+            category = (
+                AttemptCategory.INITIAL_POPULATION
+                if self._candidate_initial_population_open
+                else AttemptCategory.GENERATION
+            )
+        if not budget.record(category):
+            return False
+        self._candidate_attempt_configs.add(config)
+        self._candidate_attempt_categories[config] = category
+        return True
+
+    def _admit_config_candidate(
+        self, config: Config, category: AttemptCategory
+    ) -> bool:
+        """Normalize and admit a non-flat candidate, such as an LLM proposal."""
+        if self._candidate_attempt_budget.limit is None:
+            return True
+        try:
+            normalized = self.config_gen.unflatten(self.config_gen.flatten(config))
+        except (
+            exc.InvalidConfig,
+            ValueError,
+            TypeError,
+            KeyError,
+            AssertionError,
+        ):
+            self._candidate_attempt_budget.record(AttemptCategory.INVALID)
+            return False
+        return self._admit_candidate_config(normalized, category)
+
+    def _finish_initial_candidate_attempts(self) -> None:
+        """Classify subsequent admitted candidates as generation attempts."""
+        self._candidate_initial_population_open = False
+        self._precounted_initial_population_configs.clear()
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
@@ -1049,6 +1361,40 @@ class PopulationBasedSearch(BaseSearch):
     ) -> None:
         self._best_available_seed_configs = list(configs)
 
+    def set_fixed_initial_population_configs(
+        self,
+        configs: Sequence[Config],
+        *,
+        attempts_already_recorded: bool = False,
+    ) -> None:
+        """Install an exact normalized population for a retrieval-seeded run."""
+        population: list[FlatConfig] = []
+        seen: set[Config] = set()
+        for config in configs:
+            flat = self.config_gen.flatten(config)
+            normalized = self.config_gen.unflatten(flat)
+            if normalized in seen:
+                raise ValueError("fixed initial population contains duplicate configs")
+            seen.add(normalized)
+            population.append(flat)
+        self._fixed_initial_population_flat = population
+        if attempts_already_recorded:
+            recorded = self._candidate_attempt_budget.spent_by(
+                AttemptCategory.INITIAL_POPULATION
+            )
+            if recorded < len(seen):
+                raise ValueError(
+                    "fixed initial population has more configs than recorded "
+                    "initial-population attempts"
+                )
+            self._precounted_initial_population_configs = seen
+
+    def fixed_initial_population_flat(self) -> list[FlatConfig] | None:
+        """Return a copy of the fixed RAG population, when configured."""
+        if self._fixed_initial_population_flat is None:
+            return None
+        return [list(flat) for flat in self._fixed_initial_population_flat]
+
     def benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"
     ) -> list[PopulationMember]:
@@ -1067,6 +1413,8 @@ class PopulationBasedSearch(BaseSearch):
             member.status = result.status
             member.compile_time = result.compile_time
             self._record_benchmarked_member(member)
+        if desc == "Initial population":
+            self._finish_initial_candidate_attempts()
         return members
 
     def _record_benchmarked_member(self, member: PopulationMember) -> None:
@@ -1366,6 +1714,7 @@ class PopulationBasedSearch(BaseSearch):
         """
         if len(members) < 2:
             return
+        rebenchmark_started = time.perf_counter()
 
         # Size the in-process repeat from the candidates being rechecked. A
         # global optimistic outlier can be the reason we are rebenchmarking.
@@ -1386,6 +1735,10 @@ class PopulationBasedSearch(BaseSearch):
                 desc=desc,
             )
             if isolated_timings is not None:
+                isolated_timings = sync_object(
+                    isolated_timings,
+                    process_group_name=self.kernel.env.process_group_name,
+                )
                 new_timings = [
                     m.perf if timing is None else timing
                     for m, timing in zip(members, isolated_timings, strict=True)
@@ -1397,6 +1750,16 @@ class PopulationBasedSearch(BaseSearch):
                     member.perfs.append(timing)
                     if timing < self.best_perf_so_far:
                         self.best_perf_so_far = timing
+                self._record_rebenchmark_evaluations(
+                    members,
+                    isolated_timings,
+                    elapsed_seconds=time.perf_counter() - rebenchmark_started,
+                    timeout_indices=(
+                        self.benchmark_provider._last_isolated_timeout_indices
+                        if isinstance(self.benchmark_provider, LocalBenchmarkProvider)
+                        else None
+                    ),
+                )
                 return
 
         if len(self.benchmark_provider.mutated_arg_indices) > 0:
@@ -1470,6 +1833,11 @@ class PopulationBasedSearch(BaseSearch):
         finally:
             for m in members:
                 clear_jit_fast_path_caches(m.fn, self.log)
+        self._record_rebenchmark_evaluations(
+            members,
+            new_timings,
+            elapsed_seconds=time.perf_counter() - rebenchmark_started,
+        )
         if confirm_suspicious:
             new_timings = self._confirm_suspicious_rebenchmark_timings(
                 members,
@@ -1505,6 +1873,7 @@ class PopulationBasedSearch(BaseSearch):
         if not suspicious:
             return timings
 
+        confirmation_started = time.perf_counter()
         confirmed = self.benchmark_provider.benchmark_isolated(
             [members[i].fn for i in suspicious],
             warmup=_SUSPICIOUS_REBENCHMARK_WARMUP,
@@ -1513,6 +1882,16 @@ class PopulationBasedSearch(BaseSearch):
         )
         if confirmed is None:
             return timings
+        self._record_rebenchmark_evaluations(
+            [members[i] for i in suspicious],
+            confirmed,
+            elapsed_seconds=time.perf_counter() - confirmation_started,
+            timeout_indices=(
+                self.benchmark_provider._last_isolated_timeout_indices
+                if isinstance(self.benchmark_provider, LocalBenchmarkProvider)
+                else None
+            ),
+        )
 
         updated = list(timings)
         for i, timing in zip(suspicious, confirmed, strict=True):
