@@ -18,15 +18,30 @@ from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch._inductor.ops_handler import OpsHandler
 
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
+    from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
     from ..device_function import DeviceFunction
     from ..tile_strategy import TileStrategy
 
     InductorOpOverrides = OpsHandler[Any]
+
+
+def _is_threadgroup_too_large(err: BaseException) -> bool:
+    """Recognize Metal's pipeline-state error for an oversized threadgroup."""
+    return "exceeds the maximum total threads per threadgroup" in str(err)
+
+
+#: Wall-clock ceiling for a Metal autotune run, unless the caller sets
+#: ``autotune_budget_seconds`` or asks for ``autotune_effort="full"``.  Every
+#: candidate pays an MSL compile, so an unbounded search is slow enough to be
+#: surprising.
+_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 300
 
 
 class MetalBackend(Backend):
@@ -474,8 +489,61 @@ class MetalBackend(Backend):
             )
         return strategy
 
+    # ------------------------------------------------------------------
+    # Autotuning
+    # ------------------------------------------------------------------
+
     def supports_precompile(self) -> bool:
+        # There is no Triton-style out-of-process precompile for MSL; the
+        # autotuner compiles and benchmarks each config inline.
         return False
+
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        # See metal/autotune.py for why neither shared benchmark works here.
+        from .autotune import do_bench_metal
+
+        return do_bench_metal
+
+    def get_interleaved_bench(self) -> Callable[..., list[float]]:
+        # Same rationale as get_do_bench, for the interleaved compare path.
+        from .autotune import interleaved_bench_metal
+
+        return interleaved_bench_metal
+
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        # A config the backend cannot express (an unsupported reduction
+        # layout, a threadgroup that does not fit) is an ordinary search miss:
+        # log it and move on.  A shader that fails to compile is reported by
+        # torch.mps as a SyntaxError and is almost always a real codegen bug,
+        # so surface that at warn level without aborting the search.
+        if isinstance(err, exc.BackendUnsupported):
+            return "debug"
+        if isinstance(err, RuntimeError) and _is_threadgroup_too_large(err):
+            # Same category as BackendUnsupported -- the config simply does not
+            # fit -- but Metal only notices when it builds the pipeline state,
+            # long after codegen, so it arrives as a RuntimeError from the
+            # launcher rather than a compile failure.  It is routine: 19% of a
+            # sampled matmul space with explicit thread counts lands here, and
+            # logging a fifth of the search at warn level would bury the
+            # failures that do deserve attention.
+            return "debug"
+        if isinstance(err, SyntaxError):
+            # torch.mps reports a shader that fails to compile as a
+            # SyntaxError.  That is almost always a real codegen bug, so it is
+            # surfaced without aborting the search.
+            return "warn"
+        # Anything else -- an MPS driver error, a pipeline-state failure we do
+        # not have a pattern for -- is still just one bad candidate, but it is
+        # not one we recognize, so say so.  Without a catch-all the shared
+        # fallback is ``classify_triton_exception``, which returns "raise" for
+        # any message it does not know; it knows no MPS message and Triton is
+        # not even installed here, so an unfamiliar driver error would abort
+        # the entire search.  Warn and move on, as the CuTe backend does --
+        # and, like CuTe, leave non-``Exception`` BaseExceptions
+        # (KeyboardInterrupt, SystemExit) to propagate.
+        if isinstance(err, Exception):
+            return "warn"
+        return None
 
     def autotune(
         self,
@@ -485,7 +553,19 @@ class MetalBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        return bound_kernel.config_spec.default_config()
+        # Every candidate is compiled inline (no precompile) and MSL
+        # compilation dominates, so bound the search unless the caller asked
+        # for "full" or set an explicit budget.  Mirrors CuteBackend.autotune.
+        settings = bound_kernel.settings
+        original_budget = settings.autotune_budget_seconds
+        if settings.autotune_budget_seconds is None and (
+            settings.autotune_effort != "full"
+        ):
+            settings.autotune_budget_seconds = _DEFAULT_AUTOTUNE_BUDGET_SECONDS
+        try:
+            return super().autotune(bound_kernel, args, force=force, **kwargs)
+        finally:
+            settings.autotune_budget_seconds = original_budget
 
     def transform_host_arg(
         self,
@@ -544,9 +624,12 @@ class MetalBackend(Backend):
         threads explicitly is rejected.  Users hitting that rejection should
         lower ``num_threads`` or ``block_sizes``.
         """
+        # Claim the MPP matmul's threads before the tiles take the whole budget.
         config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # Cap tile thread counts so the reduction axes still fit alongside them.
         config = self._config_with_reduction_thread_budget(block_ids, config)
+        # Re-clamp any count the passes above left not dividing its block size.
+        config = self._config_with_divisible_thread_counts(block_ids, config)
         # pyrefly: ignore[bad-argument-type]
         strategy = CuteBackend.create_loop_strategy(self, fn, block_ids, config)
         self._reject_dynamic_thread_extents(strategy)
@@ -590,6 +673,79 @@ class MetalBackend(Backend):
                 "compile the kernel with static_shapes=True",
             )
 
+    def _mutable_num_threads(self, config: Config) -> list[int]:
+        """Mutable copy of ``config.num_threads`` for the passes below.
+
+        Extended with auto (``0``) sentinels to the spec length, so a
+        config that leaves trailing axes unset can still be indexed by
+        ``block_id_to_index``.
+        """
+        from ..compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        num_threads = list(config.num_threads)
+        if len(num_threads) < len(env.config_spec.num_threads):
+            num_threads.extend(
+                [0] * (len(env.config_spec.num_threads) - len(num_threads))
+            )
+        return num_threads
+
+    def _record_thread_count(
+        self,
+        env: CompileEnvironment,
+        num_threads: list[int],
+        block_id: int,
+        chosen: int,
+    ) -> bool:
+        """Write an explicit thread count; return True if it changed anything."""
+        config_index = env.config_spec.num_threads.block_id_to_index(block_id)
+        if num_threads[config_index] != chosen:
+            num_threads[config_index] = chosen
+            return True
+        return False
+
+    def _finalize_thread_config(
+        self, config: Config, num_threads: list[int], changed: bool
+    ) -> Config:
+        """Return the original config when no axis changed, else a copy."""
+        if not changed:
+            return config
+        from ...runtime.config import Config
+
+        return Config.from_dict({**config.config, "num_threads": num_threads})
+
+    def _config_with_divisible_thread_counts(
+        self, block_ids: list[int], config: Config
+    ) -> Config:
+        """Round each explicit ``num_threads`` down to a divisor of its block size.
+
+        The shared loop strategy requires ``block_size % num_threads == 0`` and
+        raises otherwise.  Autotuning draws ``num_threads`` from the tensor
+        extent rather than the chosen block size, so a meaningful slice of the
+        search space would otherwise be spent on configs that cannot compile --
+        and a batch that happens to contain only such configs aborts the whole
+        search.  Clamping keeps every config in the space legal, in the same
+        spirit as the two thread-budget passes above.
+        """
+        from ..compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        num_threads = list(config.num_threads)
+        changed = False
+        for block_id in block_ids:
+            configured = int(
+                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+            )
+            if configured <= 0:
+                continue  # 0 means "use the block size"
+            block_size = env.block_sizes[block_id].from_config(config)
+            if not isinstance(block_size, int) or block_size % configured == 0:
+                continue
+            chosen = _largest_divisor_at_most(block_size, configured)
+            if self._record_thread_count(env, num_threads, block_id, chosen):
+                changed = True
+        return self._finalize_thread_config(config, num_threads, changed)
+
     def _reserved_reduction_threads(self, config: Config) -> int:
         """Threads the reduction axes will claim from the threadgroup.
 
@@ -621,37 +777,33 @@ class MetalBackend(Backend):
     def _config_with_reduction_thread_budget(
         self, block_ids: list[int], config: Config
     ) -> Config:
-        """Cap auto tile thread counts so the reduction axes still fit.
+        """Cap tile thread counts so the reduction axes still fit.
 
         Tile strategies are built before reduction strategies
         (``TileStrategyDispatch.__init__``), so without this the tiles claim
         the whole 1024-thread budget and ``adjust_reduction_thread_count``
-        would shrink the reduction below the extent it has to cover.
+        would shrink the reduction below the extent it has to cover -- which
+        Metal cannot recover from mid-planning the way CuTe's lane-loop
+        machinery does, so ``create_reduction_strategy`` rejects the config.
+
+        Autotuning makes that a search-efficiency problem as well as a
+        correctness one: it sets ``num_threads`` explicitly, so capping only
+        the *auto* axes left a slice of the space unable to compile.  Explicit
+        counts are capped too.
         """
         reserved = self._reserved_reduction_threads(config)
         if reserved <= 1:
             return config
 
-        from ...runtime.config import Config
         from ..compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
-        num_threads = list(config.num_threads)
-        if len(num_threads) < len(env.config_spec.num_threads):
-            num_threads.extend(
-                [0] * (len(env.config_spec.num_threads) - len(num_threads))
-            )
+        num_threads = self._mutable_num_threads(config)
 
         used = reserved
         changed = False
         tunable = set(env.config_spec.num_threads.valid_block_ids())
         for block_id in block_ids:
-            configured = int(
-                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
-            )
-            if configured > 0:
-                used *= configured
-                continue
             axis_size = env.block_sizes[block_id].from_config(config)
             if not isinstance(axis_size, int):
                 continue
@@ -664,20 +816,21 @@ class MetalBackend(Backend):
                 # rejects the config with a diagnostic.
                 used *= axis_size
                 continue
+            configured = int(
+                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+            )
+            # 0 means "use the block size"; anything larger than the block size
+            # is capped there because the axis has no more work than that.
+            requested = min(configured, axis_size) if configured > 0 else axis_size
             budget = max(1, MAX_THREADS_PER_THREADGROUP // max(1, used))
-            chosen = _largest_divisor_at_most(axis_size, budget)
-            if chosen >= axis_size:
-                used *= chosen
-                continue
-            config_index = env.config_spec.num_threads.block_id_to_index(block_id)
-            if num_threads[config_index] != chosen:
-                num_threads[config_index] = chosen
-                changed = True
+            chosen = _largest_divisor_at_most(axis_size, min(requested, budget))
             used *= chosen
+            if configured == 0 and chosen >= axis_size:
+                continue  # leave the auto sentinel alone
+            if self._record_thread_count(env, num_threads, block_id, chosen):
+                changed = True
 
-        if not changed:
-            return config
-        return Config.from_dict({**config.config, "num_threads": num_threads})
+        return self._finalize_thread_config(config, num_threads, changed)
 
     def _config_with_mpp_thread_budget(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
@@ -709,16 +862,11 @@ class MetalBackend(Backend):
         if len(block_ids) < 2:
             return config
 
-        from ...runtime.config import Config
         from ..compile_environment import CompileEnvironment
         from ..cute.thread_budget import MAX_THREADS_PER_BLOCK
 
         env = CompileEnvironment.current()
-        num_threads = list(config.num_threads)
-        if len(num_threads) < len(env.config_spec.num_threads):
-            num_threads.extend(
-                [0] * (len(env.config_spec.num_threads) - len(num_threads))
-            )
+        num_threads = self._mutable_num_threads(config)
 
         first_block_id = block_ids[0]
         first_axis_size = env.block_sizes[first_block_id].from_config(config)
@@ -741,15 +889,27 @@ class MetalBackend(Backend):
         used_threads = max(mpp_threads, first_axis_threads)
         changed = False
 
-        # Walk the remaining axes in launch order.  Explicit num_threads
-        # consume budget as-is; auto axes are reduced to the largest divisor
-        # that keeps the total threadgroup size under Metal's limit.
+        # Walk the remaining axes in launch order.  Auto axes are reduced to the
+        # largest divisor that keeps the total threadgroup size under Metal's
+        # limit; an explicit count is taken as given, but is rejected if the
+        # product cannot launch.  Metal only refuses an oversized threadgroup
+        # when it builds the pipeline state, so without this the config costs a
+        # full MSL compile before failing -- 15-45% of a sampled matmul search
+        # space, depending on seed.
         for block_id in block_ids[1:]:
             configured = int(
                 env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
             )
             if configured > 0:
                 used_threads *= configured
+                if used_threads > MAX_THREADS_PER_BLOCK:
+                    raise exc.BackendUnsupported(
+                        self.name,
+                        f"threadgroup of {used_threads} threads "
+                        f"(max {MAX_THREADS_PER_BLOCK}); MPP claims "
+                        f"{mpp_threads} on tid[0] and the explicit num_threads "
+                        "on the remaining axes do not fit alongside it",
+                    )
                 continue
 
             axis_size = env.block_sizes[block_id].from_config(config)
@@ -758,12 +918,8 @@ class MetalBackend(Backend):
 
             budget = max(1, MAX_THREADS_PER_BLOCK // max(1, used_threads))
             chosen = _largest_divisor_at_most(axis_size, budget)
-            config_index = env.config_spec.num_threads.block_id_to_index(block_id)
-            if num_threads[config_index] != chosen:
-                num_threads[config_index] = chosen
+            if self._record_thread_count(env, num_threads, block_id, chosen):
                 changed = True
             used_threads *= chosen
 
-        if not changed:
-            return config
-        return Config.from_dict({**config.config, "num_threads": num_threads})
+        return self._finalize_thread_config(config, num_threads, changed)
