@@ -428,7 +428,14 @@ def _resolve_tensor_index_patterns(
     if node.target is memory_ops.store:
         from .gather import build_scatter_plan
 
-        plan = build_scatter_plan(tensor, subscript, positions)
+        plan = build_scatter_plan(
+            tensor,
+            subscript,
+            positions,
+            patterns,
+            config,
+            len(node.args) > 3 and node.args[3] is not None,
+        )
         for i in positions:
             patterns[i] = IndirectScatterPattern(plan=plan)
         return

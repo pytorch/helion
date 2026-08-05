@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from helion._compiler.aten_lowering import LoweringContext
     from helion._compiler.inductor_lowering import CodegenState
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
+    from helion._compiler.tile_strategy import ForiLoopState
 
 
 def _load_route(
@@ -79,7 +80,12 @@ def resident_ref_load_expr(
     device_fn = state.device_function
 
     if any(isinstance(pattern, IndirectGatherPattern) for pattern in patterns):
-        raise exc.InvalidConfig("resident Ref cannot follow an indirect gather")
+        dma_ref = memory_op_dma_scratch(state)
+        if dma_ref is None:
+            raise exc.InvalidConfig(
+                "resident Ref indirect gather was not admitted by the fori scheduler"
+            )
+        return expr_from_string(dma_ref)
     parts, none_dims = index_parts(state, subscript, tensor)
     if none_dims or len(parts) != tensor.ndim:
         raise exc.InvalidConfig("resident Ref producer must preserve rank")
@@ -876,3 +882,47 @@ def vmem_name(state: CodegenState, name: str) -> str:
     if isinstance(loop, ForiLoopState) and name in loop._prefetched_load_tensors:
         return f"{ref}.at[{loop.loop_var_name} % 2]"
     return ref
+
+
+def _memory_op_fori_binding(
+    state: CodegenState,
+) -> tuple[ForiLoopState, tuple[str, int]] | None:
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    node = state.fx_node
+    if node is None:
+        return None
+    seen: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in reversed(loops):
+            if id(loop) in seen or not isinstance(loop, ForiLoopState):
+                continue
+            seen.add(id(loop))
+            binding = loop._memory_op_to_dma_scratch.get(node)
+            if binding is not None:
+                return loop, binding
+    return None
+
+
+def memory_op_dma_scratch(state: CodegenState) -> str | None:
+    """Return this memory operation's scheduler-owned VMEM stage, if any."""
+    found = _memory_op_fori_binding(state)
+    if found is None:
+        return None
+    loop, (scratch, buffer_count) = found
+    if buffer_count == 1:
+        return scratch
+    return f"{scratch}.at[{loop.loop_var_name} % {buffer_count}]"
+
+
+def emit_memory_op_prefix(state: CodegenState) -> None:
+    """Emit scheduler statements that must precede this memory operation."""
+    node = state.fx_node
+    if node is None:
+        return
+    found = _memory_op_fori_binding(state)
+    if found is None:
+        return
+    loop, _binding = found
+    for statement in loop._memory_op_prefix.pop(node, ()):
+        state.codegen.add_statement(statement)

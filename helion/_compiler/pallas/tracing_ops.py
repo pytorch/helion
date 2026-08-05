@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+from dataclasses import dataclass
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
+    from .gather import DmaGroupCandidate
 
 
 @_decorators.codegen(_not, "pallas")
@@ -478,6 +480,273 @@ def _classify_loop_tensors(
                     stored_tensors[key] = (fake, tensor_node, sub_vals)
 
     return loaded_tensors, stored_tensors
+
+
+@dataclass
+class _ForiDmaGroupAccess:
+    """One scheduler-owned static indirect DMA group."""
+
+    node: torch.fx.Node
+    fake: torch.Tensor
+    direction: str
+    sub_meta: list[object]
+    candidate: DmaGroupCandidate
+    metadata_fake: torch.Tensor
+    metadata_sub_meta: list[object]
+    metadata_patterns: list[object]
+    buffer_count: int = 1
+    scratch_name: str = ""
+    sem_name: str = ""
+
+
+def _memory_op_tensor(node: torch.fx.Node) -> torch.Tensor | None:
+    if not node.args or not isinstance(node.args[0], torch.fx.Node):
+        return None
+    value = node.args[0].meta.get("val")
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def _dma_group_candidate_for_node(
+    node: torch.fx.Node,
+) -> tuple[DmaGroupCandidate, str] | None:
+    from ...language import memory_ops
+    from .plan_tiling import IndirectGatherPattern
+    from .plan_tiling import IndirectScatterPattern
+
+    if node.target not in (memory_ops.load, memory_ops.store):
+        return None
+    candidates: list[DmaGroupCandidate] = []
+    for pattern in node.meta.get("indexing_patterns") or ():
+        if isinstance(pattern, (IndirectGatherPattern, IndirectScatterPattern)):
+            candidate = pattern.plan.dma_group
+            if candidate is not None and candidate not in candidates:
+                candidates.append(candidate)
+    if len(candidates) != 1:
+        return None
+    direction = "load" if node.target is memory_ops.load else "store"
+    return candidates[0], direction
+
+
+def _collect_fori_dma_groups(
+    graph_info: object,
+    block_ids: list[int],
+    state: CodegenState,
+) -> tuple[list[_ForiDmaGroupAccess], set[int]]:
+    """Admit complete storages whose accesses belong to one fori scheduler.
+
+    Admission is atomic per storage: no tensor is promoted to HBM until every
+    access through every exact alias has been checked. A declined candidate
+    retains the one-hot lowering unless a resident-Ref chain requires DMA, in
+    which case resident planning rejects that configuration.
+    """
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+    from ..device_ir import ForLoopGraphInfo
+    from ..tile_strategy import DeviceLoopState
+    from ..tile_strategy import EmitPipelineLoopState
+    from ..tile_strategy import ForiLoopState
+    from .plan_tiling import ArbitraryIndexPattern
+    from .plan_tiling import TileBeginWithOffsetPattern
+    from .plan_tiling import TilePattern
+
+    env = CompileEnvironment.current()
+    nested_scheduler = any(
+        isinstance(loop, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState))
+        for loops in state.codegen.active_device_loops.values()
+        for loop in loops
+    )
+    if (
+        not isinstance(graph_info, ForLoopGraphInfo)
+        or len(block_ids) != 1
+        or env.compact_worklist_plan is not None
+        or nested_scheduler
+    ):
+        return [], set()
+
+    steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
+    step = steps[0] if isinstance(steps, (list, tuple)) else steps
+    if step is not None and sympy.sympify(step) not in (
+        sympy.Integer(0),
+        sympy.Integer(1),
+    ):
+        return [], set()
+
+    begin_expr, end_expr = _get_loop_begin_and_end(state, 0)
+    try:
+        loop_begin = int(begin_expr)
+        loop_end = int(end_expr)
+    except ValueError:
+        return [], set()
+
+    accesses_by_storage: dict[
+        int, list[tuple[object, torch.fx.Node, torch.Tensor]]
+    ] = {}
+    memory_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+    for owner in state.codegen.codegen_graphs:
+        for node in owner.graph.nodes:
+            if node.op != "call_function" or node.target not in memory_targets:
+                continue
+            fake = _memory_op_tensor(node)
+            if fake is None:
+                continue
+            accesses_by_storage.setdefault(id(fake.untyped_storage()), []).append(
+                (owner, node, fake)
+            )
+
+    admitted: list[_ForiDmaGroupAccess] = []
+    metadata_ids: set[int] = set()
+    promoted_aliases: list[torch.Tensor] = []
+    for storage_accesses in accesses_by_storage.values():
+        local: list[_ForiDmaGroupAccess] = []
+        local_metadata_ids: set[int] = set()
+        exact_shape: tuple[int, ...] | None = None
+        exact_stride: tuple[int, ...] | None = None
+        valid = True
+        for owner, node, fake in storage_accesses:
+            if owner.graph_id != graph_info.graph_id or node.target in ATOMIC_OPS:
+                valid = False
+                break
+            found = _dma_group_candidate_for_node(node)
+            if found is None:
+                valid = False
+                break
+            candidate, direction = found
+            if candidate.index_block_id not in block_ids:
+                valid = False
+                break
+            if (loop_end - loop_begin) % candidate.group_count != 0:
+                valid = False
+                break
+            shape = tuple(int(size) for size in fake.shape)
+            stride = tuple(int(value) for value in fake.stride())
+            if (
+                fake.storage_offset() != 0
+                or not fake.is_contiguous()
+                or (exact_shape is not None and shape != exact_shape)
+                or (exact_stride is not None and stride != exact_stride)
+            ):
+                valid = False
+                break
+            exact_shape = shape
+            exact_stride = stride
+
+            index_node = candidate.index_node
+            metadata_fake = _memory_op_tensor(index_node)
+            metadata_patterns = index_node.meta.get("indexing_patterns")
+            metadata_sub_meta = _extract_subscript_vals(index_node.args[1])
+            if (
+                metadata_fake is None
+                or not isinstance(index_node.args[1], (list, tuple))
+                or not isinstance(metadata_patterns, list)
+                or len(metadata_patterns) != len(metadata_sub_meta)
+            ):
+                valid = False
+                break
+            for pattern, index_value in zip(
+                metadata_patterns, metadata_sub_meta, strict=True
+            ):
+                if isinstance(pattern, TilePattern):
+                    continue
+                if isinstance(pattern, TileBeginWithOffsetPattern):
+                    if not state.codegen.active_device_loops.get(pattern.block_id):
+                        valid = False
+                        break
+                    continue
+                if not isinstance(pattern, ArbitraryIndexPattern) or not isinstance(
+                    index_value, (int, torch.SymInt)
+                ):
+                    valid = False
+                    break
+            if not valid:
+                break
+            # Address metadata must be cheap enough to remain on its enclosing
+            # BlockSpec.  Outer-grid slicing can make the physical block smaller;
+            # charging the full logical tensor is deliberately conservative.
+            try:
+                metadata_bytes = (
+                    int(metadata_fake.numel()) * metadata_fake.dtype.itemsize
+                )
+            except (TypeError, ValueError):
+                valid = False
+                break
+            if metadata_bytes > (16 << 20):
+                valid = False
+                break
+            metadata_accesses = accesses_by_storage.get(
+                id(metadata_fake.untyped_storage()), ()
+            )
+            if not metadata_accesses:
+                valid = False
+                break
+            try:
+                metadata_shape = tuple(int(size) for size in metadata_fake.shape)
+                metadata_stride = tuple(int(value) for value in metadata_fake.stride())
+            except (TypeError, ValueError):
+                valid = False
+                break
+            if metadata_fake.storage_offset() != 0 or not metadata_fake.is_contiguous():
+                valid = False
+                break
+            for metadata_owner, metadata_node, metadata_alias in metadata_accesses:
+                if (
+                    metadata_owner.graph_id != graph_info.graph_id
+                    or metadata_node.target is not memory_ops.load
+                    or metadata_alias.storage_offset() != 0
+                    or not metadata_alias.is_contiguous()
+                    or tuple(int(size) for size in metadata_alias.shape)
+                    != metadata_shape
+                    or tuple(int(value) for value in metadata_alias.stride())
+                    != metadata_stride
+                ):
+                    valid = False
+                    break
+                local_metadata_ids.add(id(metadata_alias))
+            if not valid:
+                break
+            local.append(
+                _ForiDmaGroupAccess(
+                    node=node,
+                    fake=fake,
+                    direction=direction,
+                    sub_meta=_extract_subscript_vals(node.args[1]),
+                    candidate=candidate,
+                    metadata_fake=metadata_fake,
+                    metadata_sub_meta=metadata_sub_meta,
+                    metadata_patterns=metadata_patterns,
+                )
+            )
+
+        load_positions = [
+            position
+            for position, access in enumerate(local)
+            if access.direction == "load"
+        ]
+        store_positions = [
+            position
+            for position, access in enumerate(local)
+            if access.direction == "store"
+        ]
+        phase_ordered = (
+            len(load_positions) <= 1
+            and len(store_positions) <= 1
+            and (
+                not load_positions
+                or not store_positions
+                or load_positions[0] < store_positions[0]
+            )
+        )
+        if not valid or not local or not phase_ordered:
+            continue
+        admitted.extend(local)
+        promoted_aliases.extend(fake for _owner, _node, fake in storage_accesses)
+        metadata_ids.update(local_metadata_ids)
+
+    device_fn = DeviceFunction.current()
+    for fake in promoted_aliases:
+        device_fn.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
+    return admitted, metadata_ids
 
 
 def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
@@ -2742,10 +3011,17 @@ def _classify_pipelined_tensors(
             if isinstance(val, torch.Tensor):
                 atomic_storages.add(id(val.untyped_storage()))
 
+    from ..device_function import PallasMemorySpace
+
     pipelined_ids: set[int] = set()
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
+        if (
+            state.device_function.pallas_memory_space.get(id(fake))
+            == PallasMemorySpace.HBM
+        ):
+            continue
         if not _can_stream_inner_tile(
             fake, sub_meta, direction, block_ids, vmem_shape, env, state
         ):
@@ -2793,6 +3069,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
+    dma_group_accesses, dma_metadata_ids = _collect_fori_dma_groups(
+        graph_info, block_ids, state
+    )
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
     scratch_names: list[str] = []
@@ -2825,6 +3104,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
+    # Indirect addresses must be available before the graph body so the
+    # scheduler can form the next iteration's HBM Refs. Keep their producer
+    # tensors on the enclosing BlockSpec instead of streaming them here.
+    pipelined_tensor_ids -= dma_metadata_ids
 
     # Compact worklist: the compact-tile aligned_load and exact_store tensors use
     # max-sized pl.Element BlockSpecs, which Pallas double-buffers across the
@@ -2875,6 +3158,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     tensor_to_sem: dict[str, str] = {}
     prefetched_load_tensors: set[str] = set()
     prefetched_loads: list[tuple[torch.Tensor, list[object], str, str]] = []
+    memory_op_to_dma_scratch: dict[torch.fx.Node, tuple[str, int]] = {}
+    memory_op_prefix: dict[torch.fx.Node, list[ast.stmt]] = {}
+    dma_group_loads: list[_ForiDmaGroupAccess] = []
+    dma_group_stores: list[_ForiDmaGroupAccess] = []
     # compact_worklist shares this lowering but keeps its compact/resident routes;
     # only an actual fori_loop config enables depth-two staging.
     load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
@@ -2893,6 +3180,44 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     stored_tensor_storages = {
         id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
     }
+
+    for access in dma_group_accesses:
+        storage_id = id(access.fake.untyped_storage())
+        input_slots = input_slots_by_id.get(
+            id(access.fake), input_slots_by_storage.get(storage_id)
+        )
+        buffer_count = (
+            state.config.pallas_load_buffer_count[input_slots[0]]
+            if load_buffer_counts_active
+            and input_slots is not None
+            and len(input_slots) == 1
+            else 1
+        )
+        assert buffer_count in (1, 2)
+        access.buffer_count = buffer_count
+        stage_shape = (
+            access.candidate.group_count,
+            *access.candidate.member_shape,
+        )
+        hbm_name = state.device_function.tensor_arg(access.fake).name
+        direction_suffix = "gather" if access.direction == "load" else "scatter"
+        access.scratch_name = state.device_function.register_scratch(
+            (buffer_count, *stage_shape) if buffer_count == 2 else stage_shape,
+            access.fake.dtype,
+            name_hint=f"{hbm_name.replace('_hbm', '')}_{direction_suffix}_buf",
+        )
+        access.sem_name = state.device_function.register_dma_semaphore(
+            name_hint=f"{hbm_name.replace('_hbm', '')}_{direction_suffix}_sem",
+            shape=(buffer_count,) if buffer_count == 2 else (),
+        )
+        memory_op_to_dma_scratch[access.node] = (
+            access.scratch_name,
+            buffer_count,
+        )
+        if access.direction == "load":
+            dma_group_loads.append(access)
+        else:
+            dma_group_stores.append(access)
 
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
@@ -3017,6 +3342,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
         _prefetched_load_tensors=prefetched_load_tensors,
+        _memory_op_to_dma_scratch=memory_op_to_dma_scratch,
+        _memory_op_prefix=memory_op_prefix,
     )
     resident_prep_lowerings = _prepare_resident_prep_lowerings(
         state, block_ids, all_tensor_info
@@ -3065,6 +3392,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         clamp: bool,
         iteration_indices: list[str],
         stage_expr: str | None = None,
+        hbm_part_overrides: dict[int, str] | None = None,
+        resident_source: bool = False,
+        indexing_patterns: list[object] | None = None,
     ) -> tuple[str, str]:
         """Build (vmem_ref, hbm_ref) ref slices for a DMA copy with loop variable.
 
@@ -3086,6 +3416,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         hbm_needs_slice = False
         vmem_needs_slice = False
         for dim_idx in range(len(shape)):
+            if hbm_part_overrides and dim_idx in hbm_part_overrides:
+                hbm_parts.append(hbm_part_overrides[dim_idx])
+                hbm_needs_slice = True
+                vmem_parts.append(":")
+                continue
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
@@ -3126,6 +3461,41 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
                 if grid_loops:
+                    if resident_source:
+                        idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
+                        pattern = _subscript_at_dim(indexing_patterns or [], dim_idx)
+                        from .plan_tiling import ArbitraryIndexPattern
+                        from .plan_tiling import TileBeginWithOffsetPattern
+
+                        if isinstance(pattern, ArbitraryIndexPattern):
+                            hbm_parts.append(
+                                state.device_function.literal_expr(idx_meta)
+                            )
+                        elif isinstance(pattern, TileBeginWithOffsetPattern):
+                            dim_tilings = (
+                                state.device_function.pallas_tensor_dim_tilings[
+                                    id(fake)
+                                ]
+                            )
+                            if dim_tilings[dim_idx].can_tile:
+                                hbm_parts.append(
+                                    state.device_function.literal_expr(pattern.offset)
+                                )
+                            else:
+                                offset = state.codegen.offset_var(bid)
+                                if pattern.offset != 0:
+                                    offset += (
+                                        " + "
+                                        + state.device_function.literal_expr(
+                                            pattern.offset
+                                        )
+                                    )
+                                hbm_parts.append(offset)
+                        else:
+                            hbm_parts.append(":")
+                        hbm_needs_slice = True
+                        vmem_parts.append(":")
+                        continue
                     offset = state.codegen.offset_var(bid)
                     bs_var = state.device_function.block_size_var(bid)
                     if bs_var:
@@ -3142,7 +3512,18 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
                 if is_scalar_index(idx_meta):
                     offset_expr = state.device_function.literal_expr(idx_meta)
-                    hbm_parts.append(f"pl.ds({offset_expr}, 1)")
+                    hbm_parts.append(
+                        offset_expr if resident_source else f"pl.ds({offset_expr}, 1)"
+                    )
+                    hbm_needs_slice = True
+                elif isinstance(idx_meta, slice) and idx_meta != slice(None):
+                    start = 0 if idx_meta.start is None else idx_meta.start
+                    stop = shape[dim_idx] if idx_meta.stop is None else idx_meta.stop
+                    if not isinstance(start, int) or not isinstance(stop, int):
+                        raise NotImplementedError(
+                            "Pallas DMA requires concrete bounded slice extents"
+                        )
+                    hbm_parts.append(f"pl.ds({start}, {stop - start})")
                     hbm_needs_slice = True
                 else:
                     hbm_parts.append(":")
@@ -3192,6 +3573,98 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             *(statement_from_string(f"{copy_var}.{method}()") for method in methods),
         ]
 
+    def _dma_group_statements(
+        access: _ForiDmaGroupAccess,
+        iteration_indices: list[str],
+        stage_expr: str | None,
+        methods: tuple[str, ...],
+    ) -> list[ast.stmt]:
+        """Emit starts or an aggregate wait for one static indirect group."""
+        candidate = access.candidate
+        hbm_name = state.device_function.tensor_arg(access.fake).name
+        metadata_name = state.device_function.tensor_arg(access.metadata_fake).name
+        scratch_ref = (
+            f"{access.scratch_name}.at[{stage_expr}]"
+            if stage_expr is not None
+            else access.scratch_name
+        )
+        sem_ref = (
+            f"{access.sem_name}.at[{stage_expr}]"
+            if stage_expr is not None
+            else access.sem_name
+        )
+        result: list[ast.stmt] = []
+
+        if "start" in methods:
+            _, metadata_ref = _build_dma_slices(
+                access.metadata_fake,
+                "_unused_metadata_scratch",
+                metadata_name,
+                access.metadata_sub_meta,
+                clamp=False,
+                iteration_indices=iteration_indices,
+                resident_source=True,
+                indexing_patterns=access.metadata_patterns,
+            )
+            index_name = state.device_function.new_var("_dma_indices")
+            result.append(statement_from_string(f"{index_name} = {metadata_ref}[...]"))
+            lane_name = state.device_function.new_var("_dma_member")
+            _, member_hbm = _build_dma_slices(
+                access.fake,
+                "_unused_group_scratch",
+                hbm_name,
+                access.sub_meta,
+                clamp=False,
+                iteration_indices=iteration_indices,
+                hbm_part_overrides={0: f"{index_name}[{lane_name}]"},
+            )
+            member_vmem = f"{scratch_ref}.at[{lane_name}]"
+            source, destination = (
+                (member_vmem, member_hbm)
+                if access.direction == "store"
+                else (member_hbm, member_vmem)
+            )
+            copy_name = state.device_function.new_var(
+                "_scatter_copy" if access.direction == "store" else "_gather_copy"
+            )
+            result.append(
+                statement_from_string(
+                    f"for {lane_name} in range({candidate.group_count}):\n"
+                    f"    {copy_name} = pltpu.make_async_copy("
+                    f"{source}, {destination}, {sem_ref})\n"
+                    f"    {copy_name}.start()"
+                )
+            )
+
+        if "wait" in methods:
+            _, aggregate_hbm = _build_dma_slices(
+                access.fake,
+                "_unused_group_scratch",
+                hbm_name,
+                access.sub_meta,
+                clamp=False,
+                iteration_indices=iteration_indices,
+                hbm_part_overrides={0: f"pl.ds(0, {candidate.group_count})"},
+            )
+            source, destination = (
+                (scratch_ref, aggregate_hbm)
+                if access.direction == "store"
+                else (aggregate_hbm, scratch_ref)
+            )
+            wait_name = state.device_function.new_var(
+                "_scatter_wait" if access.direction == "store" else "_gather_wait"
+            )
+            result.extend(
+                [
+                    statement_from_string(
+                        f"{wait_name} = pltpu.make_async_copy("
+                        f"{source}, {destination}, {sem_ref})"
+                    ),
+                    statement_from_string(f"{wait_name}.wait()"),
+                ]
+            )
+        return result
+
     def _guarded_statements(
         condition: str, name_hint: str, statements: list[ast.stmt]
     ) -> ast.FunctionDef:
@@ -3206,19 +3679,36 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     prime_statements: list[ast.stmt] = []
     body_prefetch: ast.FunctionDef | None = None
     body_current_stage_waits: list[ast.stmt] = []
-    if prefetched_loads:
+    epilogue_statements: list[ast.stmt] = []
+    double_buffered_group_loads = [
+        access for access in dma_group_loads if access.buffer_count == 2
+    ]
+    single_buffered_group_loads = [
+        access for access in dma_group_loads if access.buffer_count == 1
+    ]
+    needs_iteration_count = bool(
+        prefetched_loads or double_buffered_group_loads or dma_group_stores
+    )
+    num_iterations: str | None = None
+    if needs_iteration_count:
         num_iterations = state.device_function.new_var("_num_iterations")
         prime_statements.append(
             statement_from_string(f"{num_iterations} = {grid_parts[-1]}")
         )
         grid_parts[-1] = num_iterations
 
+    if prefetched_loads or double_buffered_group_loads:
+        assert num_iterations is not None
         prime_indices = [*loop_vars]
         prime_indices[-1] = "0"
         prime_starts: list[ast.stmt] = []
         for record in prefetched_loads:
             prime_starts.extend(
                 _dma_copy_statements(*record, prime_indices, "0", ("start",))
+            )
+        for access in double_buffered_group_loads:
+            prime_starts.extend(
+                _dma_group_statements(access, prime_indices, "0", ("start",))
             )
         prime_statements.append(
             _guarded_statements(
@@ -3236,6 +3726,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             next_starts.extend(
                 _dma_copy_statements(*record, next_indices, next_stage, ("start",))
             )
+        for access in double_buffered_group_loads:
+            next_starts.extend(
+                _dma_group_statements(access, next_indices, next_stage, ("start",))
+            )
         body_prefetch = _guarded_statements(
             f"{next_iteration} < {num_iterations}",
             "_prefetch_fori_loads",
@@ -3246,6 +3740,54 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         for record in prefetched_loads:
             body_current_stage_waits.extend(
                 _dma_copy_statements(*record, loop_vars, current_stage, ("wait",))
+            )
+        for access in double_buffered_group_loads:
+            body_current_stage_waits.extend(
+                _dma_group_statements(access, loop_vars, current_stage, ("wait",))
+            )
+
+    # A store scratch remains live until its asynchronous writeback completes.
+    # Wait only at the store site that is about to overwrite the same stage;
+    # next-iteration gathers use separate scratch and remain independent.
+    for access in dma_group_stores:
+        reuse_distance = access.buffer_count
+        prior_iteration = f"({loop_vars[-1]} - {reuse_distance})"
+        prior_indices = [*loop_vars]
+        prior_indices[-1] = prior_iteration
+        current_store_stage = (
+            f"{loop_vars[-1]} % {access.buffer_count}"
+            if access.buffer_count == 2
+            else None
+        )
+        prior_wait = _dma_group_statements(
+            access, prior_indices, current_store_stage, ("wait",)
+        )
+        memory_op_prefix.setdefault(access.node, []).append(
+            _guarded_statements(
+                f"{loop_vars[-1]} >= {reuse_distance}",
+                "_wait_reused_fori_store",
+                prior_wait,
+            )
+        )
+
+        assert num_iterations is not None
+        for back in range(access.buffer_count):
+            pending_iteration = f"({num_iterations} - {back + 1})"
+            pending_indices = [*loop_vars]
+            pending_indices[-1] = pending_iteration
+            pending_stage = (
+                f"{pending_iteration} % {access.buffer_count}"
+                if access.buffer_count == 2
+                else None
+            )
+            epilogue_statements.append(
+                _guarded_statements(
+                    f"{num_iterations} > {back}",
+                    "_drain_fori_store",
+                    _dma_group_statements(
+                        access, pending_indices, pending_stage, ("wait",)
+                    ),
+                )
             )
 
     # For loop-carried state, remap args to scratch reads inside the body
@@ -3273,6 +3815,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         if body_prefetch is not None:
             state.codegen.add_statement(body_prefetch)
 
+        for access in single_buffered_group_loads:
+            for statement in _dma_group_statements(
+                access, loop_vars, None, ("start", "wait")
+            ):
+                state.codegen.add_statement(statement)
+
         for fake, _tensor_node, sub_meta in loaded_tensors.values():
             hbm_name = state.device_function.tensor_arg(fake).name
             if (
@@ -3298,9 +3846,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             graph_results = codegen_call_with_graph(
                 state.codegen, graph_info.graph, body_args
             )
+        assert not memory_op_prefix, (
+            "fori_loop DMA store wait was not consumed by its memory operation"
+        )
 
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
+
+        for access in dma_group_stores:
+            store_stage = (
+                f"{loop_vars[-1]} % {access.buffer_count}"
+                if access.buffer_count == 2
+                else None
+            )
+            for statement in _dma_group_statements(
+                access, loop_vars, store_stage, ("start",)
+            ):
+                state.codegen.add_statement(statement)
 
         for fake, _tensor_node, sub_meta in stored_tensors.values():
             hbm_name = state.device_function.tensor_arg(fake).name
@@ -3359,6 +3921,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             for statement in call_prefix:
                 state.add_statement(statement)
             state.add_statement(fori_call)
+            for statement in epilogue_statements:
+                state.add_statement(statement)
         else:
             # Inner: wrap in the next outer function's body
             current_body = [fn_def, *call_prefix, fori_call]

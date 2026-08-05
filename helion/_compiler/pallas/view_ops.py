@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
+    from .gather import DmaGroupCandidate
 
 
 _RESIDENT_PLAN_KEY = "pallas_resident_ref_plan"
@@ -277,6 +278,19 @@ def _physical_shape(
     return cast("tuple[int, ...]", shape) if None not in shape else None
 
 
+def _indirect_dma_group(producer: torch.fx.Node) -> DmaGroupCandidate | None:
+    """Return the sole scheduler-addressable gather group, if present."""
+    from .plan_tiling import IndirectGatherPattern
+
+    groups = [
+        pattern.plan.dma_group
+        for pattern in producer.meta.get("indexing_patterns") or ()
+        if isinstance(pattern, IndirectGatherPattern)
+        and pattern.plan.dma_group is not None
+    ]
+    return groups[0] if len(groups) == 1 else None
+
+
 def _root_variants(
     producer: torch.fx.Node,
     graph_info: GraphInfo,
@@ -284,8 +298,6 @@ def _root_variants(
 ) -> tuple[_ResidentVariant, ...] | None:
     from .backend import SliceAddressing
     from .backend import _slice_addressing
-    from .plan_tiling import IndirectGatherPattern
-
     tensor = _node_value(producer.args[0])
     value = producer.meta.get("val")
     indices = producer.args[1]
@@ -295,12 +307,16 @@ def _root_variants(
         or tensor.ndim != value.ndim
         or producer.args[2] is not None
         or not isinstance(indices, (list, tuple))
-        or any(
-            isinstance(pattern, IndirectGatherPattern)
-            for pattern in producer.meta.get("indexing_patterns") or ()
-        )
     ):
         return None
+
+    dma_group = _indirect_dma_group(producer)
+    if dma_group is not None:
+        shape = _physical_shape(value, context.config, 1)
+        expected = (dma_group.group_count, *dma_group.member_shape)
+        if shape != expected:
+            return None
+        return (_ResidentVariant(1, shape, (), None),)
 
     selected = _narrowed_dims(indices)
     if len(selected) != 1:
@@ -741,6 +757,7 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
             if (
                 isinstance(tensor, torch.Tensor)
                 and id(tensor.untyped_storage()) in mutated_storages
+                and _indirect_dma_group(producer) is None
             ):
                 _mark_rejected_descendants(
                     producer,

@@ -1883,6 +1883,12 @@ class ForiLoopState(DeviceLoopOrGridState):
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
     _prefetched_load_tensors: set[str] = dataclasses.field(default_factory=set)
+    _memory_op_to_dma_scratch: dict[torch.fx.Node, tuple[str, int]] = dataclasses.field(
+        default_factory=dict
+    )
+    _memory_op_prefix: dict[torch.fx.Node, list[ast.stmt]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass

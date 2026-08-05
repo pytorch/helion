@@ -63,3 +63,72 @@ class TestResidentRefJaxExport(unittest.TestCase):
                 tile_end = min(tile_begin + 8, end)
                 expected[tile_begin:tile_end] = q_host[tile_end - 1 : tile_end]
         np.testing.assert_array_equal(np.asarray(out), expected)
+
+    def test_indirect_dma_scratch_composes_resident_subviews(self) -> None:
+        """Grouped state DMA remains addressable through resident Ref views."""
+
+        def state_roundtrip(
+            indices: torch.Tensor, table: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out = torch.empty(
+                [indices.size(0), *table.shape[2:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for _ in hl.grid(1):
+                for tile_b in hl.tile(indices.size(0)):
+                    selected_indices = hl.load(indices, [tile_b])
+                    selected = hl.load(
+                        table,
+                        [selected_indices, slice(None), slice(None), slice(None)],
+                    )
+                    state_0 = selected[:, 0, :, :]
+                    state_1 = selected[:, 1, :, :]
+                    state_2 = selected[:, 2, :, :]
+                    out[tile_b, :, :] = state_0 + state_1 + state_2
+                    history = hl.arange(3)[None, :, None, None]
+                    updated = torch.where(
+                        history == 0,
+                        state_1[:, None, :, :],
+                        torch.where(
+                            history == 1,
+                            state_2[:, None, :, :],
+                            state_0[:, None, :, :],
+                        ),
+                    )
+                    hl.store(
+                        table,
+                        [selected_indices, slice(None), slice(None), slice(None)],
+                        updated,
+                    )
+            return out, table
+
+        kernel = helion.kernel(
+            state_roundtrip,
+            config=helion.Config(
+                block_sizes=[128],
+                pallas_loop_type="fori_loop",
+                pallas_load_buffer_count=[1, 2],
+            ),
+            static_shapes=True,
+            backend="pallas",
+        )
+        indices = (jnp.arange(256, dtype=jnp.int32) * 3) % 512
+        table = jax.random.normal(
+            jax.random.key(0),
+            (512, 3, 4, 128),
+            dtype=jnp.bfloat16,
+        )
+        selected = table[indices]
+        expected_out = selected[:, 0] + selected[:, 1] + selected[:, 2]
+        expected_table = table.at[indices].set(
+            jnp.stack([selected[:, 1], selected[:, 2], selected[:, 0]], axis=1)
+        )
+
+        out, updated_table = jax.block_until_ready(
+            jax.jit(kernel.jax_fn, donate_argnums=(1,))(indices, table)
+        )
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected_out))
+        np.testing.assert_array_equal(
+            np.asarray(updated_table), np.asarray(expected_table)
+        )

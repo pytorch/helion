@@ -265,6 +265,12 @@ def _tensor_arg_to_jax(arg: object) -> object:
     if isinstance(arg, torch.Tensor):
         import jax.numpy as jnp
 
+        if arg.device.type == "meta":
+            torch_to_jnp, _ = _build_dtype_maps()
+            return jnp.empty(
+                tuple(int(size) for size in arg.shape),
+                dtype=torch_to_jnp[arg.dtype],
+            )
         return jnp.asarray(arg.detach().cpu().numpy())
     return arg
 
@@ -296,7 +302,6 @@ def default_pallas_jax_launcher(
     """
     from .pallas.launcher import _pallas_apply_ds_padding
     from .pallas.launcher import _pallas_compile_jit_fn
-    from .pallas.launcher import _pallas_output_only_descriptors
     from .pallas.launcher import _pallas_padded_output_dims_by_arg
     from .pallas.launcher import _pallas_slice_to_orig
     from .settings import is_pallas_interpret
@@ -306,6 +311,7 @@ def default_pallas_jax_launcher(
     )
 
     output_indices = _output_indices if _output_indices is not None else []
+    original_args = args
 
     # Capture original shapes BEFORE padding so output-only tensors can
     # be sliced back after the pallas_call.  ``_pallas_apply_ds_padding``
@@ -390,6 +396,7 @@ def default_pallas_jax_launcher(
             _hbm_arg_indices=_hbm_arg_indices,
             _matmul_dot_general=None,
             interpret=interpret,
+            preserve_hbm_aliases=True,
         )
 
     jax_inputs = [_tensor_arg_to_jax(args[i]) for i in result.tensor_arg_indices]
@@ -397,16 +404,9 @@ def default_pallas_jax_launcher(
     if not isinstance(jax_results, (tuple, list)):
         jax_results = (jax_results,)
 
-    # Same descriptor list the torch fast-path uses (see
-    # ``_LauncherFastPath.output_only_descriptors``).  In-place positions
-    # would normally alias back into a torch tensor on the torch path — but
-    # JAX has no in-place mutation, so when every output is in-place we
-    # surface them as fresh JAX values instead of returning ``None``.
-    descriptors = _pallas_output_only_descriptors(
-        output_indices, result.arg_to_tensor_pos
-    )
-    if not descriptors:
-        descriptors = tuple(enumerate(output_indices))
+    # Retain every fresh output long enough to update aliased adapters before
+    # applying the wrapper's output-only return convention.
+    descriptors = tuple(enumerate(output_indices))
 
     output_results: list[object] = [jax_results[out_idx] for out_idx, _ in descriptors]
     output_orig_pos: list[int] = [orig_pos for _, orig_pos in descriptors]
@@ -430,6 +430,28 @@ def default_pallas_jax_launcher(
                     dims,
                     cast("torch.Size", orig_shape),
                 )
+
+    inplace_indices = (
+        set(_inplace_indices) if _inplace_indices is not None else set(output_indices)
+    )
+    for original_position, result_value in zip(
+        output_orig_pos, output_results, strict=True
+    ):
+        if original_position not in inplace_indices:
+            continue
+        adapter = original_args[original_position]
+        if isinstance(adapter, _JaxExportTensor):
+            adapter._jax_arr = result_value
+
+    visible_results = [
+        result_value
+        for original_position, result_value in zip(
+            output_orig_pos, output_results, strict=True
+        )
+        if original_position not in inplace_indices
+    ]
+    if visible_results:
+        output_results = visible_results
 
     if len(output_results) == 1:
         return _JaxExportTensor.from_jax(output_results[0], device=device)

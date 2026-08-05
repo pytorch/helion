@@ -1,10 +1,10 @@
-"""Pallas indirect-gather/scatter lowering.
+"""Pallas indirect-gather/scatter planning and fallback lowering.
 
-No native gather in Pallas. Floating ``table[idx]`` emits
-``one_hot(idx, V) @ table``; int32 ``table[idx]`` emits a boolean one-hot
-select and reduction. Scatter store projects source lanes to target rows with
-one-hot matrices, resolves duplicate lanes within one program, and merges
-updates with the existing target block.
+Floating ``table[idx]`` normally emits ``one_hot(idx, V) @ table``; int32
+accesses emit a boolean one-hot select and reduction.  A ``fori_loop`` may bind
+an eligible access to scheduler-owned DMA scratch instead.  This module only
+describes that static transfer group and consumes the binding: scratch,
+semaphores, and DMA lifetime remain owned by the loop lowering.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -37,6 +38,8 @@ class GatherPlan:
     index_ndim: int
     emit_select: bool
     use_highest_precision: bool
+    dma_group: DmaGroupCandidate | None
+    resident_block_bytes: int | None
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,28 @@ class ScatterPlan:
     jnp_dtype: str
     target_ndim: int
     index_ndim: int
+    dma_group: DmaGroupCandidate | None
+
+
+@dataclass(frozen=True)
+class DmaGroupCandidate:
+    """A static group of equal-shaped transfers through one indirect axis.
+
+    ``index_node`` is a normal Helion load from resident address metadata.  Its
+    one non-scalar tiled dimension supplies ``group_count`` scalar HBM member
+    addresses for the leading axis of a contiguous tensor.  Selecting one
+    member leaves ``member_shape``; the scheduler packs members contiguously in
+    scratch.
+
+    Dynamic live counts and per-member extents deliberately remain outside the
+    first implementation.  The group/member representation can add them
+    without changing loop scheduling or access-site binding.
+    """
+
+    index_node: torch.fx.Node
+    index_block_id: int
+    group_count: int
+    member_shape: tuple[int, ...]
 
 
 def build_gather_plan(
@@ -74,16 +99,13 @@ def build_gather_plan(
             f"got {tensor.dtype}"
         )
 
+    dma_group = _dma_group_candidate(tensor, subscript, indirect_pos, patterns, config)
     elements = resident_block_elements(tensor, patterns, config)
-    if elements is not None:
-        table_bytes = elements * tensor.dtype.itemsize
-        if table_bytes > _GATHER_VMEM_THRESHOLD_BYTES:
-            raise NotImplementedError(
-                f"Pallas gather: resident block is {table_bytes} bytes, exceeds "
-                f"the {_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The "
-                "current codegen requires the full gather axis in VMEM; reduce "
-                "V, tile the broadcast dims, or use a half-precision dtype."
-            )
+    resident_block_bytes = (
+        elements * tensor.dtype.itemsize if elements is not None else None
+    )
+    if dma_group is None:
+        _check_resident_block_size(resident_block_bytes)
 
     # MXU truncates fp32 to bf16 without HIGHEST. For bf16/fp16 the truncation is a no-op.
     use_highest = tensor.dtype not in (torch.bfloat16, torch.float16)
@@ -101,6 +123,170 @@ def build_gather_plan(
         index_ndim=index_ndim,
         emit_select=emit_select,
         use_highest_precision=use_highest,
+        dma_group=dma_group,
+        resident_block_bytes=resident_block_bytes,
+    )
+
+
+def _check_resident_block_size(table_bytes: int | None) -> None:
+    if table_bytes is None or table_bytes <= _GATHER_VMEM_THRESHOLD_BYTES:
+        return
+    raise NotImplementedError(
+        f"Pallas gather: resident block is {table_bytes} bytes, exceeds "
+        f"the {_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The "
+        "current codegen requires the full gather axis in VMEM; reduce "
+        "V, tile the broadcast dims, or use a half-precision dtype."
+    )
+
+
+def _concrete_size(size: int | torch.SymInt, config: Config) -> int | None:
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    concrete = env.try_concretize_symint(size)
+    if isinstance(concrete, int):
+        return concrete
+    block_id = env.get_block_id(size)
+    if block_id is None:
+        return None
+    block_size = env.block_sizes[block_id].from_config(config)
+    return block_size if isinstance(block_size, int) else None
+
+
+def _member_shape(
+    tensor: torch.Tensor,
+    patterns: list[IndexingPattern],
+    indirect_pos: int,
+    config: Config,
+) -> tuple[int, ...] | None:
+    """Return one indirect member's static rectangular transfer shape."""
+    from .plan_tiling import ArbitrarySlicePattern
+    from .plan_tiling import NonePattern
+    from .plan_tiling import TilePattern
+
+    shape: list[int] = []
+    tensor_dim = 0
+    for pattern in patterns:
+        if isinstance(pattern, NonePattern):
+            return None
+        dim_size = _concrete_size(tensor.shape[tensor_dim], config)
+        if dim_size is None:
+            return None
+        if tensor_dim == indirect_pos:
+            tensor_dim += 1
+            continue
+        if isinstance(pattern, TilePattern):
+            from ..compile_environment import CompileEnvironment
+
+            block_size = (
+                CompileEnvironment.current()
+                .block_sizes[pattern.block_id]
+                .from_config(config)
+            )
+            if not isinstance(block_size, int):
+                return None
+            dim_size = min(dim_size, block_size)
+        elif isinstance(pattern, ArbitrarySlicePattern):
+            selected = pattern.slice
+            if selected.step not in (None, 1):
+                return None
+            start = 0 if selected.start is None else selected.start
+            stop = dim_size if selected.stop is None else selected.stop
+            if not isinstance(start, int) or not isinstance(stop, int):
+                return None
+            if not 0 <= start <= stop <= dim_size:
+                return None
+            dim_size = stop - start
+        else:
+            # Scalar trailing indices squeeze dimensions and arbitrary tensor
+            # indices require a second indirect axis.  Neither is a rectangular
+            # member transfer in this first implementation.
+            return None
+        shape.append(dim_size)
+        tensor_dim += 1
+    return tuple(shape)
+
+
+def _dma_group_candidate(
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    indirect_pos: int,
+    patterns: list[IndexingPattern],
+    config: Config,
+) -> DmaGroupCandidate | None:
+    """Recognize a static leading-axis DMA group backed by resident metadata."""
+    from ...language import memory_ops
+    from .plan_tiling import ArbitraryIndexPattern
+    from .plan_tiling import TileBeginWithOffsetPattern
+    from .plan_tiling import TilePattern
+
+    if config.get("pallas_loop_type") != "fori_loop":
+        return None
+    if indirect_pos != 0 or not tensor.dtype.is_floating_point:
+        return None
+    if tensor.ndim < 3 or not tensor.is_contiguous():
+        return None
+    index_node = subscript[indirect_pos]
+    if (
+        not isinstance(index_node, torch.fx.Node)
+        or index_node.op != "call_function"
+        or index_node.target is not memory_ops.load
+    ):
+        return None
+    index = index_node.meta.get("val")
+    if (
+        not isinstance(index, torch.Tensor)
+        or index.ndim != 1
+        or index.dtype != torch.int32
+        or (len(index_node.args) > 2 and index_node.args[2] is not None)
+    ):
+        return None
+
+    index_patterns = index_node.meta.get("indexing_patterns")
+    if not isinstance(index_patterns, list):
+        return None
+    group_patterns = [
+        pattern for pattern in index_patterns if isinstance(pattern, TilePattern)
+    ]
+    if len(group_patterns) != 1:
+        return None
+    if any(
+        not isinstance(
+            pattern,
+            (
+                ArbitraryIndexPattern,
+                TileBeginWithOffsetPattern,
+                TilePattern,
+            ),
+        )
+        for pattern in index_patterns
+    ):
+        return None
+    group_pattern = group_patterns[0]
+    if any(
+        isinstance(pattern, TileBeginWithOffsetPattern)
+        and pattern.block_id == group_pattern.block_id
+        for pattern in index_patterns
+    ):
+        return None
+    group_count = _concrete_size(index.shape[0], config)
+    member_shape = _member_shape(tensor, patterns, indirect_pos, config)
+    source_rows = _concrete_size(tensor.shape[indirect_pos], config)
+    if (
+        group_count is None
+        or group_count <= 0
+        or source_rows is None
+        or group_count > source_rows
+        or not member_shape
+    ):
+        return None
+    if member_shape[-1] % 128 != 0:
+        return None
+    return DmaGroupCandidate(
+        index_node=index_node,
+        index_block_id=group_pattern.block_id,
+        group_count=group_count,
+        member_shape=member_shape,
     )
 
 
@@ -108,6 +294,9 @@ def build_scatter_plan(
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
     indirect_positions: list[int],
+    patterns: list[IndexingPattern],
+    config: Config,
+    has_extra_mask: bool,
 ) -> ScatterPlan:
     """Validate a Pallas scatter site and return its one-hot plan."""
     from ..compile_environment import CompileEnvironment
@@ -116,6 +305,10 @@ def build_scatter_plan(
         raise NotImplementedError(
             f"Pallas scatter: only floating-point output dtypes are supported, "
             f"got {tensor.dtype}"
+        )
+    if has_extra_mask:
+        raise NotImplementedError(
+            "Pallas scatter: extra_mask is not supported for tensor indices"
         )
     if len(indirect_positions) > 1:
         raise NotImplementedError(
@@ -131,11 +324,19 @@ def build_scatter_plan(
             "Pallas scatter: only rank-1 tensor indices are supported"
         )
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    dma_group = _dma_group_candidate(
+        tensor,
+        subscript,
+        indirect_pos,
+        patterns,
+        config,
+    )
     return ScatterPlan(
         indirect_pos=indirect_pos,
         jnp_dtype=jnp_dtype,
         target_ndim=tensor.ndim,
         index_ndim=index_ndim,
+        dma_group=dma_group,
     )
 
 
@@ -152,6 +353,13 @@ def emit_gather(
 
     Contracting dim is ``jnp.ndim(idx)``: one_hot adds one trailing axis.
     """
+    from . import codegen as pallas_codegen
+
+    dma_ref = pallas_codegen.memory_op_dma_scratch(state)
+    if dma_ref is not None:
+        return expr_from_string(f"{dma_ref}[...]")
+    _check_resident_block_size(plan.resident_block_bytes)
+
     ast_subscripts = state.ast_args[1]
     assert isinstance(ast_subscripts, list)
     ast_idx = ast_subscripts[plan.indirect_pos]
@@ -161,8 +369,6 @@ def emit_gather(
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
-
-    from . import codegen as pallas_codegen
 
     parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
     base_index = ", ".join(parts)
@@ -242,7 +448,7 @@ def emit_scatter_store(
     name: str,
     base_index: str,
     value: ast.AST,
-) -> ast.AST:
+) -> ast.AST | None:
     """Emit one Pallas program's tensor-indexed store block.
 
     ``base_index`` is the target block with the indirect dimension replaced by
@@ -262,6 +468,15 @@ def emit_scatter_store(
     this Pallas program; duplicate writes from different programs have the same
     unspecified winner semantics as regular parallel stores in other backends.
     """
+    from . import codegen as pallas_codegen
+
+    dma_ref = pallas_codegen.memory_op_dma_scratch(state)
+    if dma_ref is not None:
+        state.codegen.add_statement(
+            statement_from_string(f"{dma_ref}[...] = {{value}}", value=value)
+        )
+        return None
+
     oh = _scatter_one_hot_name(state, plan, name)
     m = f"jnp.shape({oh})[0]"
     eye = f"jnp.eye({m}, dtype=jnp.float32)"
