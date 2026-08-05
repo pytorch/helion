@@ -460,12 +460,12 @@ def analyze_search_space(
     # can't report one) makes the total unknown; otherwise the product is exact
     # (Python big ints, so large attention-style spaces report a real number
     # rather than being truncated).
-    total_size: int | None = 1
-    for dim in dimensions:
-        if dim.cardinality == 0:
-            total_size = None
-            break
-        total_size *= dim.cardinality
+    product = 1
+    total_size: int | None = None
+    if all(dim.cardinality != 0 for dim in dimensions):
+        for dim in dimensions:
+            product *= dim.cardinality
+        total_size = product
 
     return SearchSpaceReport(
         kernel_name=kernel_name,
@@ -582,11 +582,6 @@ def log_search_space_comparison(
         logger.info(f"  Coverage: {coverage:.6f}%")
         logger.info(f"  Search algorithm: {report.search_algorithm}")
         logger.info(f"  Time elapsed: {report.elapsed_seconds:.1f}s")
-        if coverage < 0.01:
-            logger.info(
-                "  Note: Very low coverage - consider increasing "
-                "autotune_budget_seconds"
-            )
     else:
         logger.info(
             "  Total space: unknown (a dimension's cardinality could not be determined)"
