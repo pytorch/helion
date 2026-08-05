@@ -231,19 +231,10 @@ Search space for flash_attention_fwd:
     - num_warps: CuTe backend (uses num_threads)
     - pallas_loop_type: CuTe backend (no Pallas loops)
     ...
-
-Search Coverage:
-  Configs tested: 128
-  Total space: 2,457,600
-  Coverage: 0.005208%
-  Search algorithm: DifferentialEvolutionSearch
-  Time elapsed: 245.3s
-
-Feature Exploration Report for flash_attention_fwd:
-  Backend: cute
   Search algorithm: DifferentialEvolutionSearch
   Time: 245.3s, Configs tested: 128
-  Overall search space coverage: 0.0052%
+  Configs attempted: 512 (500 valid, 12 invalid, 97.7% valid)
+  Overall search space coverage: 0.005208%
   Per-feature exploration:
     Average feature coverage: 31.2%
     Minimum feature coverage: 8.3%
@@ -254,6 +245,13 @@ Feature Exploration Report for flash_attention_fwd:
   Features with <50% exploration:
     - loop_orders: only 12 of 120 values tested
     - pid_type: only 2 of 8 values tested
+
+Search Coverage:
+  Configs tested: 128
+  Total space: 2,457,600
+  Coverage: 0.005208%
+  Search algorithm: DifferentialEvolutionSearch
+  Time elapsed: 245.3s
 ```
 
 This helps identify if the search algorithm is properly exploring the space or getting stuck in local optima.

@@ -183,15 +183,17 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_log_search_space_path
 
-    Optional path to save search space analysis as JSON. When set, Helion writes two files per autotuned
-    kernel/shape. The kernel name and the autotuner's stable cache hash are injected into the filename stem
-    (matching the ``.best_config`` cache key) so distinct kernels/shapes do not overwrite each other:
+    Optional path to save search space analysis as JSON. When set, Helion writes one JSON file per
+    autotuned kernel/shape. The kernel name and the autotuner's stable cache hash are injected into the
+    filename stem (matching the ``.best_config`` cache key) so distinct kernels/shapes do not overwrite
+    each other:
 
-    - ``<stem>.<kernel>.<hash>.json``: Search space summary with dimensions, constraints, and coverage metrics
-    - ``<stem>.<kernel>.<hash>_exploration.json``: Per-feature exploration statistics (all possible values vs. tested values)
+    - ``<stem>.<kernel>.<hash>.json``: a single report combining the search-space description (dimensions,
+      possible values, constraints, total size) with the exploration outcome (per-dimension observed values
+      and coverage, configs tested, valid/invalid attempts).
 
-    For example, ``autotune_log_search_space_path="/tmp/analysis.json"`` yields files like
-    ``/tmp/analysis.my_kernel.3f9a1c2e.json`` and ``/tmp/analysis.my_kernel.3f9a1c2e_exploration.json``.
+    For example, ``autotune_log_search_space_path="/tmp/analysis.json"`` yields a file like
+    ``/tmp/analysis.my_kernel.3f9a1c2e.json``.
     A directory (existing path or trailing separator) is also accepted, in which case the default
     ``autotune_search_space.json`` filename is used inside it. Requires ``autotune_log_search_space`` to be enabled.
     Default is ``None`` (only logs to console). Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH``.
