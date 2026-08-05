@@ -26,9 +26,10 @@ def load_expr(
     subscript: list[object],
     tensor: torch.Tensor,
 ) -> ast.AST:
-    """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it."""
+    """Emit a normal load or a selected TensorCore gather plan."""
     from helion._compiler.pallas.gather import emit_gather
-    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+    from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
     name = state.device_function.tensor_arg(tensor).name
     name = vmem_name(state, name)
@@ -38,9 +39,9 @@ def load_expr(
 
     assert state.fx_node is not None
     patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
-    for pattern in patterns:
-        if isinstance(pattern, IndirectGatherPattern):
-            return emit_gather(state, pattern.plan, name)
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, OneHotGatherPlan):
+        return emit_gather(state, plan.plan, name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
@@ -517,8 +518,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
-    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
-    from helion._compiler.pallas.plan_tiling import IndirectScatterPattern
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -546,16 +546,18 @@ def _generated_index_code(
             pattern, idx, state, subscript_index, in_pipeline
         )
 
-    if isinstance(pattern, IndirectGatherPattern):
-        # The gather emitter consumes the tensor index and projects the full
-        # resident table axis through one-hot, so normal load codegen must
-        # expose that axis instead of indexing it a second time.
-        return ":"
+    if isinstance(pattern, TensorIndexPattern):
+        from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+        from helion._compiler.pallas.tensorcore_plan import TensorCorePlan
 
-    if isinstance(pattern, IndirectScatterPattern):
-        # The scatter emitter consumes the tensor index and projects source lanes
-        # through one-hot matrices, so normal store codegen must expose the full
-        # resident target axis instead of indexing it a second time.
+        assert state.fx_node is not None
+        plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+        assert (
+            isinstance(plan, TensorCorePlan)
+            and subscript_index in plan.indirect_positions
+        ), "TensorCore plan does not handle a tensor-valued index"
+        # The plan consumes the tensor index, so ordinary indexing must expose
+        # the full tensor axis instead of applying the index a second time.
         return ":"
 
     raise RuntimeError(
@@ -708,7 +710,7 @@ def _is_compact_aligned_load(
 ) -> bool:
     """True if *tensor* is a compact-tile aligned-load or exact-store tensor.
 
-    Both get a per-tile ``pl.Element`` BlockSpec sliced at ``tile_start`` (Pallas
+    Both get a per-tile window BlockSpec sliced at ``tile_start`` (Pallas
     double-buffers the load's prefetch and the store's write-back), so the body
     accesses the whole sliced block at local offset 0.
     """
@@ -731,7 +733,7 @@ def _is_ordered_aligned_load(
 ) -> bool:
     """True if *tensor* is a resident ordered reduction operand.
 
-    Resident operands get a per-range ``pl.Element(C)`` window keyed on
+    Resident operands get a per-range ``C``-row window keyed on
     ``range_start`` (not tile_start), so the fori body reads at the LOCAL
     ordered-tile offset ``offset - range_start`` rather than the absolute offset.
     """
@@ -775,12 +777,12 @@ def _ds_expr(
     if block_size is None:
         return ":"
     # compact_aligned_load: the tensor is a per-tile sliced BlockSpec block (the
-    # launcher slices it to one tile at tile_start via pl.Element, so Pallas
+    # launcher slices it to one tile at tile_start, so Pallas
     # double-buffers it across work items).  The body therefore reads the whole
     # sliced block at local offset 0, not the absolute tile_start.
     if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
         return f"pl.ds(0, {block_size})"
-    # Resident ordered operand: pl.Element(C) window at range_start, so read
+    # Resident ordered operand: C-row window at range_start, so read
     # at the LOCAL offset within the window (absolute offset - range_start).
     if not tile_offset and _is_ordered_aligned_load(state, block_id, tensor):
         from helion._compiler.compile_environment import CompileEnvironment

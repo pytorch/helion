@@ -275,7 +275,7 @@ def _(state: CodegenState) -> None:
 def _codegen_resident_cache(state: CodegenState) -> object:
     """Range-keyed resident-window lowering for the compact-worklist ordered loop.
 
-    The ordered operand is held in a per-range resident ``pl.Element(C)`` window
+    The ordered operand is held in a per-range resident ``C``-row window
     keyed on ``range_start`` (``C`` is the compile-threaded physical window).
     Optional prep-cache descriptors are installed by the dynamic resident loop.
 
@@ -3134,7 +3134,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     )
 
     # Compact worklist: the compact-tile aligned_load and exact_store tensors use
-    # max-sized pl.Element BlockSpecs, which Pallas double-buffers across the
+    # max-sized window BlockSpecs, which Pallas double-buffers across the
     # work-item grid.  Keep them OUT of the manual make_async_copy DMA path: with
     # a single straight-line compact tile there is no inner loop to overlap, so a
     # DMA start()/wait() would run fully serial (load -> wait -> compute -> store
@@ -3156,7 +3156,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         }
 
     # Resident caching: only active resident ordered operands are held in a
-    # per-range pl.Element window and read at the local ordered-tile offset (see
+    # per-range resident window and read at the local ordered-tile offset (see
     # codegen._is_ordered_aligned_load).  Keep just those OFF the streamed
     # make_async_copy path.  Gate on the SAME decision the window is built from,
     # so an inactive residency decision leaves every operand streaming.

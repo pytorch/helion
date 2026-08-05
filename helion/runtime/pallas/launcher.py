@@ -204,7 +204,7 @@ def compact_ordered_budget_capacity(
 
     ``operands`` is ``[(shape, itemsize), ...]`` for every resident ordered
     operand.  Each ``C`` token costs that per-token footprint twice because the
-    ``pl.Element`` resident window is double-buffered by Pallas.  ``prep_operands``
+    resident window is double-buffered by Pallas.  ``prep_operands``
     adds any optional persistent prep-cache copies (for today's transpose-cache
     path, one more equivalent copy).  Pass ``[]`` for a resident-only/no-prep
     reduction.
@@ -228,13 +228,15 @@ def compact_ordered_physical_window(
     """Block-aligned physical resident window that fits the VMEM budget.
 
     :func:`compact_ordered_budget_capacity` gives the largest per-source length the
-    VMEM budget allows (the logical bound ``C``).  The resident ``pl.Element``
-    window, optional prep-cache scratch, and the refill/reduction ``pl.ds`` slices
-    are all tiled by the ordered block, so the allocation must be a block multiple.
-    Round the budget DOWN to a block multiple so the allocation never exceeds the
-    VMEM budget; cap by the operand extent rounded UP to one block so short tensors
-    still get a legal ``pl.Element(block, padding=...)`` window instead of a
-    zero-sized allocation.
+    VMEM budget allows (the logical bound ``C``).  The resident window, optional
+    prep-cache scratch, and the refill/reduction ``pl.ds`` slices are all tiled by
+    the ordered block, so the allocation must be a block multiple.  Round the
+    budget DOWN to a block multiple so the allocation never exceeds the VMEM
+    budget; cap by the operand extent rounded UP to one block so a short tensor
+    still gets a whole block rather than a zero-sized allocation -- including an
+    operand with no rows, which keeps resident caching (and therefore
+    ``pallas_loop_type='unroll'``) admissible for an all-empty ordered
+    reduction.
 
     Returns 0 when the budget cannot hold one ordered block. The selected loop
     policy decides whether that is an invalid resident config or irrelevant to a
@@ -249,6 +251,11 @@ def compact_ordered_physical_window(
     budget_physical = (budget_capacity // block) * block
     if budget_physical <= 0:
         return 0
+    # Floored to 1 so an operand with NO rows still admits a one-block window:
+    # returning 0 would make the resident decision inactive, and
+    # pallas_loop_type='unroll' rejects that outright, so a legal all-empty
+    # ordered reduction would stop compiling.  The window is made safe instead by
+    # padding one dummy row for such an operand (see _compute_pad_info).
     min_leading = min(max(1, int(shape[0])) for shape, _itemsize in operands)
     extent_physical = ((min_leading + block - 1) // block) * block
     return min(budget_physical, extent_physical)
@@ -2137,6 +2144,64 @@ def default_pallas_launcher(
     )
 
 
+def _compact_window_block_spec(
+    t: object,
+    window: int,
+    ref_pos: int,
+    scalar_refs: tuple[object, ...],
+) -> object:
+    """BlockSpec for one compact-worklist window: up to ``window`` rows of dim 0
+    at the runtime row offset in ``scalar_refs[ref_pos]``, other dims full.
+
+    The offset is a RAW compact row (an owner base plus a tile step), never
+    aligned down to a sublane boundary, so the block dim must accept a dynamic,
+    possibly-unaligned start.
+
+    ``pl.BoundedSlice`` accepts one AND lets the index map choose the transfer
+    SIZE, which is what keeps the window inside the tensor.  That matters
+    because a compact/jagged tensor is normally allocated with exactly
+    ``sum(lengths)`` rows, so a fixed full-window transfer runs off the end on
+    the last window of the final range -- a BoundsCheck core halt on
+    ``dma.hbm_to_vmem``, plus a matching store past the output.  Pallas does not
+    prevent that by itself: it clamps a block dim against the array only when
+    that dim is TILED (jax's Mosaic ``_create_bounded_slice`` returns
+    ``ds(start, size)`` verbatim when the dim has no tiling, which is the case
+    for the leading dim of a ``(rows, ...)`` tensor).  A ``pl.Element`` window
+    cannot express the clamp -- its size is fixed and its ``padding=`` never
+    reaches that computation -- and would instead need the CALLER's tensor
+    padded, costing a full copy of every windowed operand.
+
+    The START is clamped too, and both clamps are held at or above zero:
+    worklist entries past ``num_work`` are padded with a repeated owner but an
+    unbounded group offset, so they can record a start beyond the tensor.  A
+    resident operand with no rows of its own is given one dummy row instead (see
+    ``_zero_row_resident_pad_info``), so the clamp always has an in-bounds row
+    and this slice is never empty.
+
+    The kernel body still slices ``pl.ds(0, window)`` off a window-sized ref and
+    masks the tail, so a short transfer only leaves already-masked rows stale.
+    """
+    from jax.experimental import pallas as pl
+    import jax.numpy as jnp
+
+    ndim = int(t.ndim)  # type: ignore[attr-defined]
+    block_shape = (pl.BoundedSlice(window), *t.shape[1:])  # type: ignore[union-attr,attr-defined]
+
+    def index_map(
+        wid: object,
+        _pos: int = ref_pos,
+        _nd: int = ndim,
+        _rows: int = int(t.shape[0]),  # type: ignore[attr-defined]
+        _window: int = window,
+    ) -> tuple[object, ...]:
+        start = scalar_refs[_pos][wid]  # type: ignore[index]
+        start = jnp.clip(start, 0, max(_rows - 1, 0))
+        size = jnp.clip(jnp.int32(_rows) - start, 0, _window)
+        return (pl.ds(start, size), *(jnp.int32(0) for _ in range(_nd - 1)))
+
+    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+
+
 def _pallas_compact_in_out_specs(
     pl: object,
     jnp: object,
@@ -2162,8 +2227,8 @@ def _pallas_compact_in_out_specs(
     owner-indexed tensor (its ``grid_dims`` carry the owner grid dim ``0``) gets
     an ``index_map`` that reads ``owner_ids[wid]`` (a ``scalar_refs`` table); a
     compact-aligned-load tensor (``aligned_set``) gets a per-tile
-    ``pl.Element`` slice at ``tile_start`` so Pallas double-buffers it across work
-    items; everything else is full/SMEM.  ``scalar_refs`` are the SMEM refs
+    ``pl.BoundedSlice`` window at ``tile_start`` so Pallas double-buffers it
+    across work items; everything else is full/SMEM.  ``scalar_refs`` are the SMEM refs
     holding the worklist metadata tables; every ``index_map`` receives only
     ``wid`` and closes over them.
     """
@@ -2178,57 +2243,24 @@ def _pallas_compact_in_out_specs(
         t = args[idx]
         assert _is_torch_tensor_or_jax_array(t)
         if idx in aligned_set:
-            # compact_aligned_load: slice dim 0 to one tile at tile_start via
-            # pl.Element so Pallas prefetches/double-buffers it; other dims full.
-            # Use the FULL compact_block (not min with the tensor length): the
-            # body slices ``pl.ds(0, compact_block)``, and the ``padding=(0,
-            # compact_block)`` lets the read overshoot the tensor end (handles a
-            # short compact dimension).  Clamping the block here would mismatch the
-            # body's pl.ds size and slice out of bounds.
-            #
-            # tile_start is the RAW compact offset (base + tile*block), NOT
-            # sublane-aligned-down: packed rows can start at arbitrary
-            # offsets.  pl.Element is exactly the mechanism that tolerates a
-            # dynamic, possibly-unaligned start -- Mosaic lowers an element-indexed
-            # block to a dynamic-offset (un)masked access, where a plain int block
-            # dim would require an aligned, fixed-grid block.  Verified bitwise ==
-            # fori_loop on unaligned/random offsets; this holds for both the load
-            # and the full-block store.
-            # Element only on dim 0: emit_pipeline rejects it on the lane dim.
-            block = compact_block
-            elt = pl.Element(block, padding=(0, block))  # type: ignore[union-attr]
-            block_shape = (elt, *t.shape[1:])
-
-            def aligned_index_map(
-                wid: object,
-                _pos: int = tile_start_ref_pos,
-                _nd: int = t.ndim,
-            ) -> tuple[object, ...]:
-                tile_start = scalar_refs[_pos][wid]  # type: ignore[index]
-                return (tile_start, *(jnp.int32(0) for _ in range(_nd - 1)))  # type: ignore[union-attr]
-
-            return pl.BlockSpec(block_shape, aligned_index_map)  # type: ignore[union-attr]
+            # compact_aligned_load / compact_exact_store: one compact_block-row
+            # window at tile_start, so Pallas prefetches and double-buffers both
+            # the load and the store write-back across work items.  Window
+            # sizing and the tensor-end hazard: _compact_window_block_spec.
+            # Windowed on dim 0 only: emit_pipeline rejects it on the lane dim.
+            return _compact_window_block_spec(
+                t, compact_block, tile_start_ref_pos, scalar_refs
+            )
         if idx in ordered_aligned_set:
-            # Resident caching: per-range resident window sized ``ordered_window`` (C)
-            # at ``range_start`` -- the fori body reads it at the local ordered-tile
-            # offset (offset - range_start).  padding=(0, C) tolerates reads past
-            # the range tail (same as the compact_aligned_load window).  Keying
-            # on range_start lets Pallas dedup the load across same-range tiles.
-            # Element only on dim 0: emit_pipeline rejects it on the lane dim.
+            # Resident caching: per-range resident window sized ``ordered_window``
+            # (C) at ``range_start`` -- the fori body reads it at the local
+            # ordered-tile offset (offset - range_start).  Keying on range_start
+            # lets Pallas dedup the load across same-range tiles.
             assert ordered_window > 0
             assert range_start_ref_pos >= 0
-            oelt = pl.Element(ordered_window, padding=(0, ordered_window))  # type: ignore[union-attr]
-            oblock_shape = (oelt, *t.shape[1:])
-
-            def ordered_index_map(
-                wid: object,
-                _pos: int = range_start_ref_pos,
-                _nd: int = t.ndim,
-            ) -> tuple[object, ...]:
-                start = scalar_refs[_pos][wid]  # type: ignore[index]
-                return (start, *(jnp.int32(0) for _ in range(_nd - 1)))  # type: ignore[union-attr]
-
-            return pl.BlockSpec(oblock_shape, ordered_index_map)  # type: ignore[union-attr]
+            return _compact_window_block_spec(
+                t, ordered_window, range_start_ref_pos, scalar_refs
+            )
         entry = block_spec_info[arg_to_tpos[idx]] if block_spec_info else None
         if entry is not None:
             block_shape_template, grid_dims = entry
@@ -2356,8 +2388,8 @@ def _pallas_compile_compact_jit_fn(
     )
     out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
     # NOTE: the shared _pallas_check_vmem_or_raise estimator does not yet
-    # understand pl.Element block shapes (compact_aligned_load), so it is not
-    # applied here; adding pl.Element support to the estimator is a follow-up.
+    # understand the compact window's block shape (compact_aligned_load), so it
+    # is not applied here; teaching the estimator about it is a follow-up.
     # Offsets-tensor positions within the tensor-arg list (jit_fn input order).
     offset_tpos = [arg_to_tensor_pos[i] for i in offset_arg_indices]
 

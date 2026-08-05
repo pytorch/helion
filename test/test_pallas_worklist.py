@@ -44,7 +44,7 @@ from helion.runtime.settings import is_pallas_interpret
 if _get_backend() == "pallas" and is_pallas_interpret():
     pytest.skip(
         "compact worklist is TPU-only: JAX interpret mode does not support "
-        "pl.Element block specs",
+        "dynamic pl.BoundedSlice sizes",
         allow_module_level=True,
     )
 
@@ -1850,6 +1850,29 @@ class TestWorklistNumerics(unittest.TestCase):
                 torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
     @skipIfPallasInterpret(
+        "the zero-row resident DMA path is validated on real TPU, not "
+        "Pallas interpret mode"
+    )
+    def test_fully_jagged_all_empty_kv_matches_zero(self):
+        """Positive Q with globally empty K/V exercises the dummy resident row."""
+        H, D, block = 2, 16, 16
+        qo = _offsets([10, 23, 7, 40])
+        kvo = _offsets([0, 0, 0, 0])
+        lq = int(qo[-1])
+        torch.manual_seed(0)
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.empty(0, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.empty(0, H, D, device=DEVICE, dtype=torch.bfloat16)
+
+        _, out = code_and_output(
+            _fully_jagged_kernel,
+            (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
+            **_worklist_config([block, block], loop_type="unroll"),
+        )
+
+        torch.testing.assert_close(out, torch.zeros_like(q), rtol=0, atol=0)
+
+    @skipIfPallasInterpret(
         "the resident-cache ordered KV path is validated on real TPU, not "
         "Pallas interpret mode"
     )
@@ -2609,6 +2632,145 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
 
         self.assertEqual(ordered_resident_bound_arg(plan("kvo")), "kvo")
         self.assertIsNone(ordered_resident_bound_arg(plan(None)))
+
+
+@onlyBackends(["pallas"])
+class TestCompactWindowSpec(unittest.TestCase):
+    """The BlockSpec a compact-worklist window is built from.
+
+    The window must clamp its own transfer: a compact/jagged tensor is normally
+    allocated with exactly ``sum(lengths)`` rows, so a fixed full-window
+    transfer reads past the end on the last window of the final range.
+    """
+
+    def _spec(self, rows=200, window=256, start=0):
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _compact_window_block_spec
+
+        t = torch.zeros(rows, 2, 8)
+        starts = jnp.asarray([start], jnp.int32)
+        return _compact_window_block_spec(t, window, 0, (starts,)), rows, window
+
+    def test_window_is_a_self_clamping_bounded_slice(self):
+        """A BoundedSlice block dim lets the index map pick the transfer size,
+        which is what an Element window cannot express."""
+        from jax.experimental import pallas as pl
+
+        spec, _rows, window = self._spec()
+        self.assertIsInstance(spec.block_shape[0], pl.BoundedSlice)
+        self.assertEqual(spec.block_shape[0].block_size, window)
+        # Trailing dims ride along whole.
+        self.assertEqual(tuple(spec.block_shape[1:]), (2, 8))
+
+    def test_transfer_never_leaves_the_tensor(self):
+        """start + size <= rows for every start, including a start past the end.
+
+        Worklist entries past ``num_work`` are padded with a repeated owner but
+        an unbounded group offset, so they can record a start beyond the tensor;
+        the slice has to stay legal for those too.
+        """
+        rows, window = 200, 256
+        for start in (0, 1, rows - window // 2, rows - 1, rows, rows + 10_000):
+            with self.subTest(start=start):
+                spec, _, _ = self._spec(rows=rows, window=window, start=start)
+                sliced = spec.index_map(0)[0]
+                lo = int(sliced.start)
+                size = int(sliced.size)
+                self.assertGreaterEqual(lo, 0)
+                self.assertGreaterEqual(size, 1)
+                self.assertLessEqual(lo + size, rows)
+
+    def test_one_row_operand_slices_that_row(self):
+        """An empty resident operand is padded to one dummy row, so the window
+        has an in-bounds row to slice: ``ds(0, 1)`` rather than ``ds(0, 0)``.
+
+        The row is never read -- an operand is only empty when every ordered
+        range is empty, so the reduction is zero-trip.
+        """
+        spec, _rows, _window = self._spec(rows=1, window=256, start=0)
+        sliced = spec.index_map(0)[0]
+        self.assertEqual(int(sliced.start), 0)
+        self.assertEqual(int(sliced.size), 1)
+
+    def test_zero_row_operand_keeps_a_one_block_window(self):
+        """A zero-row operand must still admit a window.
+
+        Returning 0 would make the resident decision inactive, and
+        ``pallas_loop_type='unroll'`` rejects that outright, so a legal
+        all-empty ordered reduction would stop compiling.
+        """
+        from helion.runtime.pallas.launcher import compact_ordered_physical_window
+
+        vmem = 64 * 1024 * 1024
+        self.assertEqual(
+            compact_ordered_physical_window(
+                [((0, 2, 8), 2)], vmem, 128, prep_operands=[]
+            ),
+            128,
+        )
+
+    def test_full_window_when_it_fits(self):
+        """A window wholly inside the tensor transfers all of it -- the clamp
+        must not shrink transfers that were already in bounds."""
+        spec, _rows, window = self._spec(rows=4096, window=256, start=1000)
+        sliced = spec.index_map(0)[0]
+        self.assertEqual(int(sliced.start), 1000)
+        self.assertEqual(int(sliced.size), window)
+
+
+@onlyBackends(["pallas"])
+class TestZeroRowResidentPadding(unittest.TestCase):
+    """A resident operand with no rows gets exactly one dummy row.
+
+    Positive Q with all-empty KV is a legal zero-trip ordered reduction, but the
+    resident window is opened regardless, so an operand with zero rows would
+    leave it with no in-bounds row to slice.
+    """
+
+    def _pad_dims_and_resident(self, kvlens, block=128):
+        import ast as _ast
+        import re as _re
+
+        qo = _offsets([300, 100])
+        ko = _offsets(kvlens)
+        lq, lk = int(qo[-1]), int(ko[-1])
+        bk = _fully_jagged_kernel.bind(
+            (
+                torch.randn(lq, 2, 8),
+                torch.randn(lk, 2, 8),
+                torch.randn(lk, 2, 8),
+                qo,
+                ko,
+            )
+        )
+        code = bk.to_triton_code(_worklist_config([block, block]))
+
+        def grab(name, default=None):
+            match = _re.search(rf"{name}=(\[[^\]]*\]|\d+)", code)
+            if match is None:
+                return default
+            return _ast.literal_eval(match.group(1))
+
+        return (
+            grab("_ds_pad_dims", []),
+            grab("_compact_ordered_aligned_arg_indices", []),
+        )
+
+    def test_zero_row_kv_pads_one_row_per_resident_operand(self):
+        pad_dims, resident = self._pad_dims_and_resident([0, 0])
+        self.assertTrue(resident, "expected an active resident window for zero-row KV")
+        for arg in resident:
+            # block_size 1 makes the pad formula reduce to extra_pad: one row.
+            self.assertIn((arg, 0, 1, 1), pad_dims)
+
+    def test_non_empty_kv_pads_nothing(self):
+        """The dummy row must be confined to the degenerate case: padding a real
+        operand would copy the whole tensor."""
+        pad_dims, resident = self._pad_dims_and_resident([256, 128])
+        self.assertTrue(resident, "expected an active resident window")
+        for arg in resident:
+            self.assertNotIn((arg, 0, 1, 1), pad_dims)
 
 
 if __name__ == "__main__":
