@@ -216,12 +216,17 @@ def _make(kernel):
             tf.write(src)
             fname = tf.name
 
-        spec = importlib.util.spec_from_file_location(
-            f"_flydsl_jit_{abs(hash(cache_key))}", fname
-        )
-        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
-        _flydsl_jit_cache[cache_key] = mod._make(flydsl_kernel)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"_flydsl_jit_{abs(hash(cache_key))}", fname
+            )
+            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            _flydsl_jit_cache[cache_key] = mod._make(flydsl_kernel)
+        finally:
+            import os as _os
+
+            _os.unlink(fname)
 
     # Persistent null stream (fx.Stream(None) -> stream 0), reused across launches.
     global _flydsl_stream

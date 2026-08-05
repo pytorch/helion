@@ -6177,6 +6177,66 @@ def _(state: CodegenState) -> ast.AST:
                 )
             return expr_from_string(f"fx.memref_load_vec({r_var})")
 
+        # Whole-row looped reduction tail with large OOB: when the last loop pass
+        # has threads whose chunk_idx exceeds the logical_divide layout by more than
+        # AMD's buffer-descriptor padding (~256 fp16 elements = 512 bytes), the
+        # unconditional copy_atom_call fires a GPU page fault even though the
+        # per-element predicate would zero the result afterward.  Fall back to
+        # guarded scalar loads (element-wise if-in-range) for these cases.
+        # OOB distance = chunk_idx_max − (numel // vec_width)
+        #              = chunk // V + thread_count − 1 − numel // V
+        # When _tc > 0 and _lb is set, compute and compare to the safe threshold.
+        _redcol_large_oob = False
+        if (
+            is_redcol
+            and redcol_pred is not None
+            and _tc > 0
+            and _lb > 0
+            and vec_width > 0
+        ):
+            import contextlib as _cl
+
+            _numel_int: int | None = None
+            _numel_sym = env.block_sizes[col_block_id].numel
+            with _cl.suppress(TypeError, ValueError):
+                _numel_int = int(_numel_sym)
+            if _numel_int is not None:
+                _chunk_idx_max = _lb // vec_width + _tc - 1
+                _div_layout_size = (_numel_int + vec_width - 1) // vec_width
+                _oob_elems = _chunk_idx_max - _div_layout_size
+                # Convert OOB elements to bytes and compare against the
+                # conservative lower-bound for PyTorch's ROCm allocator rounding
+                # (512 bytes).  AMD's buffer descriptor hardware returns 0 for OOB
+                # reads within allocated physical pages but page-faults once the
+                # byte address crosses into an unmapped page.  Using bytes (not
+                # elements) makes the threshold dtype-agnostic: fp16 allows
+                # 512/2=256 OOB elements, fp32 allows 512/4=128, int64 512/8=64.
+                _elem_bytes = tensor.element_size()
+                _SAFE_OOB_BYTES = 512
+                if _oob_elems * _elem_bytes > _SAFE_OOB_BYTES:
+                    _redcol_large_oob = True
+
+        if _redcol_large_oob:
+            # Use per-element guarded scalar loads: column of element j is
+            # redcol_offset + lane * vec_width + j (same as _colj in the store).
+            _n_expr_rl = state.sympy_expr(env.block_sizes[col_block_id].numel)
+            _lane_mod_rl = _tc if _tc > 0 else 64
+            _zero_rl = f"{dtype_str}(0)"
+            for _j in range(vec_width):
+                _colj_rl = (
+                    f"({redcol_offset}) + (fx.thread_idx.x % {_lane_mod_rl}) "
+                    f"* {vec_width} + {_j}"
+                )
+                state.add_statement(
+                    statement_from_string(
+                        f"if ({_colj_rl}) < ({_n_expr_rl}):\n"
+                        f"    fx.memref_store(fx.memref_load({_row}, {_colj_rl}), {r_var}, {_j})\n"
+                        f"else:\n"
+                        f"    fx.memref_store({_zero_rl}, {r_var}, {_j})"
+                    )
+                )
+            return expr_from_string(f"fx.memref_load_vec({r_var})")
+
         state.add_statement(
             statement_from_string(
                 f"fx.copy_atom_call({_atom_name}, fx.slice({_div_name}, (None, {chunk_idx})), {r_var})"

@@ -437,6 +437,7 @@ def _(state: CodegenState) -> ast.AST:
                 strategy.offset_var(index),
                 _v,
                 state.sympy_expr(env.block_sizes[index].numel),
+                lane_mod=_tc,
             )
             mask_terms.append(_pred)
         elif index == _col_index and _tc == 0 and mask_var is not None:

@@ -3409,6 +3409,14 @@ class FlyDSLBackend(Backend):
         # where unrolling is cheap (≤ threshold tiles → ≤ threshold register vecs).
         _CONSTEXPR_THRESHOLD = 16
 
+        # Numel of the first looped-reduction dim (used in _add to filter bad chunks).
+        _rl_numel: int | None = None
+        if spec.reduction_loops._data:
+            import contextlib as _cl
+
+            with _cl.suppress(TypeError, ValueError):
+                _rl_numel = int(spec.reduction_loops._data[0].size_hint)
+
         def _add(
             bs: list[int], rl: int | None, v: int | None, cr: bool = False
         ) -> None:
@@ -3416,6 +3424,19 @@ class FlyDSLBackend(Backend):
             # of 256 (one warp-pass = 64 lanes x 4 elems).  Reject bad configs.
             if _user_tiled and any(b % 256 != 0 for b in bs[1:]):
                 return
+            # Safety: reject configs where the last reduction-loop chunk causes an
+            # OOB BufferCopy128b access.  Thread ``t`` in the last chunk accesses
+            # divided-buffer index ``last_offset // v_eff + t``; the divided buffer
+            # has ``ceil(N / v_eff)`` elements.  Skip if that index can exceed the
+            # buffer size (hardware buffer instructions fault on true OOB).
+            if rl is not None and _rl_numel is not None and _rl_numel > 0:
+                v_eff = max(1, v or 1)
+                tc = rl // v_eff  # thread count for this chunk
+                last_offset = ((_rl_numel + rl - 1) // rl - 1) * rl
+                max_div_idx = last_offset // v_eff + tc - 1
+                n_div = (_rl_numel + v_eff - 1) // v_eff
+                if max_div_idx >= n_div:
+                    return  # last chunk OOBs the divided buffer
             key = (tuple(bs), rl, v, cr)
             if key in seen:
                 return
@@ -3492,13 +3513,45 @@ class FlyDSLBackend(Backend):
                         if tc is not None and tc <= _CONSTEXPR_THRESHOLD:
                             _add(bs, c, None, cr=True)
 
+        # If no candidates were generated (every chunk was filtered), fall back to
+        # the persistent config (reduction_loops=None) which is always safe.
+        if not candidates:
+            from ..runtime.config import Config as _Config
+
+            return _Config(block_sizes=list(block_sizes))
+
         if len(candidates) <= 1:
-            return candidates[0] if candidates else default
+            return candidates[0]
 
         bound_kernel.settings.autotune_precompile = None
+
+        # The default config (used as autotune baseline) may contain
+        # reduction_loops=[N_next_pow2//2] which OOBs for non-power-of-2 N
+        # (e.g. N=7680 gets reduction_loops=[4096] → last chunk accesses
+        # elements 4096+1023*4=8188 > 7680, causing a GPU memory fault).
+        # Always use the persistent (looped-off) config as the baseline so
+        # the accuracy check compares against a safe reference.
+        prev_baseline_fn = bound_kernel.settings.autotune_baseline_fn
+        if prev_baseline_fn is None and _rl_numel is not None:
+            _safe_bs = (
+                [block_sizes[0]] + ([256] * (ndim - 1))
+                if ndim >= 2
+                else [block_sizes[0]]
+            )
+            _persistent_config = Config(block_sizes=_safe_bs)
+            _persistent_fn = bound_kernel.compile_config(
+                _persistent_config, allow_print=False
+            )
+            bound_kernel.settings.autotune_baseline_fn = lambda *a, _fn=_persistent_fn: (
+                _fn(*a)
+            )
+
         from ..autotuner import FiniteSearch
 
-        return FiniteSearch(bound_kernel, args, candidates).autotune()
+        try:
+            return FiniteSearch(bound_kernel, args, candidates).autotune()
+        finally:
+            bound_kernel.settings.autotune_baseline_fn = prev_baseline_fn
 
     def adjust_block_size_constraints(
         self,

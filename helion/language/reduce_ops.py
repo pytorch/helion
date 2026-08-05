@@ -480,9 +480,11 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     for step in range(_STEPS):
         off = _WARP >> (step + 1)
         if reduction_type == "sum":
+            # arith.FastMathFlags is the correct namespace; fmath.FastMathFlags
+            # does not exist (flydsl.expr.math has no FastMathFlags attribute).
             state.add_statement(
                 statement_from_string(
-                    f"{r} = {r}.addf({r}.shuffle_xor({off}, {_WARP}), fastmath=fmath.FastMathFlags.fast)"
+                    f"{r} = {r}.addf({r}.shuffle_xor({off}, {_WARP}), fastmath=arith.FastMathFlags.fast)"
                 )
             )
         elif reduction_type == "max":
@@ -492,9 +494,10 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
                 )
             )
         elif reduction_type == "min":
+            # flydsl Vector has no .minimumf(); use min(a,b) = -max(-a,-b).
             state.add_statement(
                 statement_from_string(
-                    f"{r} = {r}.minimumf({r}.shuffle_xor({off}, {_WARP}))"
+                    f"{r} = -({r}.shuffle_xor({off}, {_WARP})).maximumf(-{r})"
                 )
             )
         else:
