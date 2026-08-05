@@ -453,6 +453,7 @@ class PallasBackend(Backend):
         *,
         block_size_var: str | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         if reduction_type in {"sum", "max", "min", "prod"}:
             return f"jnp.{reduction_type}({input_name}, axis={dim})"
@@ -472,6 +473,7 @@ class PallasBackend(Backend):
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         fn = "jnp.argmax" if reduction_type == "argmax" else "jnp.argmin"
         return (
@@ -487,6 +489,7 @@ class PallasBackend(Backend):
         acc_index: str,
         value: str,
         index: str,
+        dtype: torch.dtype | None = None,
     ) -> list[str]:
         if reduction_type == "argmin":
             better = (

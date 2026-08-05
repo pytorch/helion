@@ -1460,6 +1460,9 @@ class CuteBackend(Backend):
     def reduction_axis_first(self) -> bool:
         return True
 
+    def supports_lane_loop_reductions(self) -> bool:
+        return True
+
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
@@ -1596,6 +1599,7 @@ class CuteBackend(Backend):
         *,
         block_size_var: str | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         threads = (
             threads_in_group
@@ -1647,6 +1651,7 @@ class CuteBackend(Backend):
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
         if index_dtype is None:
             raise exc.BackendUnsupported(self.name, "missing index_dtype for argreduce")
@@ -1678,6 +1683,7 @@ class CuteBackend(Backend):
         acc_index: str,
         value: str,
         index: str,
+        dtype: torch.dtype | None = None,
     ) -> list[str]:
         if reduction_type == "argmin":
             better = (

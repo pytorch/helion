@@ -33,6 +33,11 @@ import torch
 from ... import exc
 from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
+from .msl_reduction import REDUCTION_INCLUDES
+from .msl_reduction import REDUCTION_NAMESPACE
+from .msl_reduction import REDUCTION_PREAMBLE
+from .reduction import SIMD_GROUP_VAR
+from .reduction import TG_BUFFER_GLOBAL_PREFIX
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,6 +62,7 @@ class _MetalKernel:
 
         Args are the kernel arguments (tensors and scalars) — used to
         infer dtypes for the MSL kernel signature.
+
         """
         # Parse the function source to get the AST
         source = inspect.getsource(self._fn)
@@ -103,6 +109,11 @@ def _generate_msl(
         "#include <c10/metal/special_math.h>",
         "using namespace metal;",
     ]
+    threadgroup_buffers = _threadgroup_buffers(fn_globals, body_stmts)
+    uses_reductions = _uses_reductions(body_stmts)
+    if uses_reductions:
+        msl_parts.extend(REDUCTION_INCLUDES)
+        msl_parts.extend(("", REDUCTION_PREAMBLE))
     if _uses_mpp_markers(body_stmts):
         _raise_if_mpp_unsupported_device()
         msl_parts.extend(
@@ -128,8 +139,14 @@ def _generate_msl(
 
     params: list[str] = []
     scalar_preamble: list[str] = []
-    for buf_idx, (name, arg) in enumerate(zip(param_names, args, strict=True)):
-        assert isinstance(arg, torch.Tensor), f"Expected tensor, got {type(arg)}"
+    buf_idx = 0
+    for name, arg in zip(param_names, args, strict=True):
+        if not isinstance(arg, torch.Tensor):
+            # A host-side constexpr the launcher passes positionally (e.g. a
+            # rolled reduction's ``_REDUCTION_BLOCK_*``).  ``default_metal_launcher``
+            # only binds tensors as buffers, so bake the value into the shader.
+            scalar_preamble.append(f"    {_constexpr_decl(name, arg)}")
+            continue
         if arg.dtype not in DTYPE_TO_METAL:
             raise ValueError(f"Unsupported Metal dtype: {arg.dtype}")
         metal_dtype = DTYPE_TO_METAL[arg.dtype]
@@ -142,6 +159,7 @@ def _generate_msl(
             scalar_preamble.append(f"    {metal_dtype} {name} = {buf_param}[0];")
         else:
             params.append(f"device {metal_dtype}* {name} [[buffer({buf_idx})]]")
+        buf_idx += 1
 
     params.extend(
         (
@@ -149,6 +167,10 @@ def _generate_msl(
             "uint3 tid [[thread_position_in_threadgroup]]",
         )
     )
+    if threadgroup_buffers:
+        # Cross-SIMD-group reductions index their slice of the shared scratch
+        # buffer by SIMD group; see metal/reduction.py::_group_base_expr.
+        params.append(f"uint {SIMD_GROUP_VAR} [[simdgroup_index_in_threadgroup]]")
 
     sig = ",\n    ".join(params)
     required_threads_attr = ""
@@ -171,12 +193,31 @@ def _generate_msl(
     for name in sorted(block_sizes):
         msl_parts.append(f"    constexpr int {name} = {block_sizes[name]};")
 
-    state = EmitState(declared=set(block_sizes))
+    # ``threadgroup`` variables are only legal at kernel scope, but a reduction
+    # can be emitted from inside a loop body, so their declarations are hoisted
+    # here from the generated ``_METAL_TG_BUF_*`` module globals.
+    for buf_name, buf_dtype, buf_slots in threadgroup_buffers:
+        msl_parts.append(f"    threadgroup {buf_dtype} {buf_name}[{buf_slots}];")
+
+    state = EmitState(
+        declared={*block_sizes, *(name for name, _, _ in threadgroup_buffers)}
+    )
 
     _emit_stmts(body_stmts, msl_parts, indent=4, state=state)
 
     msl_parts.append("}")
     return "\n".join(msl_parts)
+
+
+def _constexpr_decl(name: str, value: object) -> str:
+    """MSL declaration for a non-tensor kernel argument."""
+    if isinstance(value, bool):
+        return f"constexpr bool {name} = {'true' if value else 'false'};"
+    if isinstance(value, int):
+        return f"constexpr int {name} = {value};"
+    if isinstance(value, float):
+        return f"constexpr float {name} = {value!r};"
+    raise exc.BackendUnsupported("metal", f"kernel argument type: {type(value)}")
 
 
 def _uses_mpp_markers(body_stmts: list[ast.stmt]) -> bool:
@@ -187,6 +228,46 @@ def _uses_mpp_markers(body_stmts: list[ast.stmt]) -> bool:
         if isinstance(func, ast.Name) and func.id.startswith("_metal_mpp_"):
             return True
     return False
+
+
+def _uses_reductions(body_stmts: list[ast.stmt]) -> bool:
+    """Return True if the body calls into the ``helion_red`` MSL namespace.
+
+    Every reduction the Metal backend emits is routed through that namespace
+    (see ``metal/msl_reduction.py``), so this one check decides whether the
+    kernel needs the reduction preamble and the SIMD-group index parameter.
+    """
+    for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
+        if isinstance(node, ast.Name) and node.id == REDUCTION_NAMESPACE:
+            return True
+    return False
+
+
+def _threadgroup_buffers(
+    fn_globals: dict[str, object],
+    body_stmts: list[ast.stmt],
+) -> list[tuple[str, str, int]]:
+    """Collect ``(name, metal_dtype, slots)`` scratch declarations to hoist.
+
+    Written by ``metal/reduction.py::alloc_threadgroup_buffer`` as generated
+    module-level globals, the same transport ``_BLOCK_SIZE_*`` uses.  Only
+    buffers this kernel body actually references are declared, so a global left
+    behind by discarded codegen cannot consume threadgroup memory here.
+    """
+    referenced = {
+        node.id
+        for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[]))
+        if isinstance(node, ast.Name)
+    }
+    buffers = []
+    for name in sorted(fn_globals):
+        if not name.startswith(TG_BUFFER_GLOBAL_PREFIX):
+            continue
+        buf_name, buf_dtype, buf_slots = fn_globals[name]  # type: ignore[misc]
+        if buf_name not in referenced:
+            continue
+        buffers.append((str(buf_name), str(buf_dtype), int(buf_slots)))  # type: ignore[arg-type]
+    return buffers
 
 
 def _raise_if_mpp_unsupported_device() -> None:

@@ -21,10 +21,13 @@ Handles:
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
+from typing import Iterator
 
 from ... import exc
 from .mpp_graph_codegen import MPPSetupParams
+from .msl_reduction import REDUCTION_NAMESPACE
 
 
 @dataclasses.dataclass
@@ -34,12 +37,34 @@ class EmitState:
     Tracks declared variable names (to avoid duplicate ``auto`` declarations)
     and MPP matmul setup parameters (keyed by setup variable name).
 
+    Declarations are tracked per C++ block scope.  A rolled reduction emits
+    several sibling ``for`` loops that assign the same Helion variable (e.g.
+    ``rindex_1``); each needs its own ``auto`` because the previous loop's
+    declaration went out of scope at its closing brace.
+
     MPPGraph lowering emits explicit ``_coop_iter`` loops. The walker derives
     the MMA-result substitution from the setup marker's ``fx_name``.
     """
 
     declared: set[str] = dataclasses.field(default_factory=set)
     mpp_setups: dict[str, MPPSetupParams] = dataclasses.field(default_factory=dict)
+    _enclosing: list[set[str]] = dataclasses.field(default_factory=list)
+
+    def is_declared(self, name: str) -> bool:
+        return name in self.declared or any(name in s for s in self._enclosing)
+
+    def declare(self, name: str) -> None:
+        self.declared.add(name)
+
+    @contextlib.contextmanager
+    def block_scope(self) -> Iterator[None]:
+        """Enter a nested C++ block; declarations made inside do not escape."""
+        self._enclosing.append(self.declared)
+        self.declared = set()
+        try:
+            yield
+        finally:
+            self.declared = self._enclosing.pop()
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +150,14 @@ def _emit_stmts(
                 params = _extract_mpp_setup_params(value)
                 state.mpp_setups[target.id] = params
                 _emit_mpp_setup(target.id, params, parts, indent=indent)
-                state.declared.add(target.id)
+                state.declare(target.id)
                 continue
             val_msl = _ast_expr_to_msl(value, subs=subs)
-            if target.id in state.declared:
+            if state.is_declared(target.id):
                 parts.append(f"{pad}{target.id} = {val_msl};")
             else:
                 parts.append(f"{pad}auto {target.id} = {val_msl};")
-                state.declared.add(target.id)
+                state.declare(target.id)
         elif isinstance(stmt, ast.Expr):
             call = stmt.value
             # tl.store(ptr + offset, val, mask) → if (mask) { *(ptr+offset) = val; }
@@ -171,12 +196,14 @@ def _emit_stmts(
         elif isinstance(stmt, ast.If):
             test_msl = _ast_expr_to_msl(stmt.test, subs=subs)
             parts.append(f"{pad}if ({test_msl}) {{")
-            _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
+            with state.block_scope():
+                _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
             if stmt.orelse:
                 parts.append(f"{pad}}} else {{")
-                _emit_stmts(
-                    stmt.orelse, parts, indent=indent + 4, state=state, subs=subs
-                )
+                with state.block_scope():
+                    _emit_stmts(
+                        stmt.orelse, parts, indent=indent + 4, state=state, subs=subs
+                    )
             parts.append(f"{pad}}}")
         elif isinstance(stmt, ast.For):
             _emit_for(stmt, parts, indent=indent, state=state, subs=subs)
@@ -238,7 +265,10 @@ def _emit_for(
                 f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{",
             )
         )
-        _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=coop_subs)
+        with state.block_scope():
+            _emit_stmts(
+                stmt.body, parts, indent=indent + 4, state=state, subs=coop_subs
+            )
         parts.append(f"{pad}}}")
         return
 
@@ -278,8 +308,9 @@ def _emit_for(
     parts.append(
         f"{pad}for (int {loop_var} = {start}; {loop_var} < {end}; {loop_var} += {step}) {{"
     )
-    state.declared.add(loop_var)
-    _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
+    with state.block_scope():
+        state.declare(loop_var)
+        _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
     parts.append(f"{pad}}}")
 
 
@@ -714,6 +745,22 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
     assert isinstance(node, ast.Call)
     func = node.func
 
+    # Inductor's constant_repr spells non-finite floats as float("inf") /
+    # float("-inf") / float("nan"); MSL has literals for those.  Reduction
+    # identities for max/min are the main source.
+    if (
+        isinstance(func, ast.Name)
+        and func.id == "float"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        text = node.args[0].value.strip().lower()
+        literal = _NON_FINITE_FLOATS.get(text)
+        if literal is None:
+            raise exc.BackendUnsupported("metal", f"float constant: {text!r}")
+        return literal
+
     # tl.load(ptr + offset, mask, other=0) → (mask ? *(ptr+offset) : (other))
     if (
         isinstance(func, ast.Attribute)
@@ -748,7 +795,14 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
     return f"{func_msl}({', '.join(args_msl)})"
 
 
-_CPP_NAMESPACE_ROOTS = frozenset({"metal", "c10"})
+#: What Inductor's ``constant_repr`` emits for non-finite float constants.
+_NON_FINITE_FLOATS = {
+    "inf": "INFINITY",
+    "-inf": "(-INFINITY)",
+    "nan": "NAN",
+}
+
+_CPP_NAMESPACE_ROOTS = frozenset({"metal", "c10", REDUCTION_NAMESPACE})
 
 
 def _is_cpp_namespace_root(node: ast.Attribute) -> bool:
@@ -763,12 +817,34 @@ def _is_cpp_namespace_root(node: ast.Attribute) -> bool:
     return isinstance(node.value, ast.Name) and node.value.id in _CPP_NAMESPACE_ROOTS
 
 
+def _is_broadcast_subscript(index: ast.expr) -> bool:
+    """Return True for a pure reshape/broadcast index such as ``[:, None]``."""
+    elts = index.elts if isinstance(index, ast.Tuple) else [index]
+    if not elts:
+        return False
+    return all(
+        (
+            isinstance(elt, ast.Slice)
+            and elt.lower is None
+            and elt.upper is None
+            and elt.step is None
+        )
+        or (isinstance(elt, ast.Constant) and elt.value is None)
+        for elt in elts
+    )
+
+
 def _ast_subscript_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
     """Convert an AST Subscript node to MSL.
 
-    Only simple index subscripts (e.g. ``tgid[0]``) are supported.
+    Only simple index subscripts (e.g. ``tgid[0]``) are supported, plus
+    tile-shape broadcasts (``x[:, None]``), which Helion emits when a reduced
+    value is broadcast back over the reduction axis.  Metal values are
+    per-thread scalars, so those are a no-op.
     """
     assert isinstance(node, ast.Subscript)
+    if _is_broadcast_subscript(node.slice):
+        return _ast_expr_to_msl(node.value, subs=subs)
     buf_name = _ast_expr_to_msl(node.value, subs=subs)
     idx = _ast_expr_to_msl(node.slice, subs=subs)
     return f"{buf_name}[{idx}]"
