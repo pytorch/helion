@@ -416,6 +416,62 @@ class TestMetalBoundsMasking(unittest.TestCase):
         self.assertIn("(tid[0] < _BLOCK_SIZE_0)", msl)
         self.assertIn("(tid[1] < _BLOCK_SIZE_1)", msl)
 
+    def test_a_dynamic_tile_thread_extent_is_rejected(self) -> None:
+        """A threadgroup is shaped at launch, so its extents must be known then.
+
+        ``thread_block_sizes`` reports only the extents it can resolve, and the
+        launcher turns those into the literal ``_block_dims``.  An extent it
+        drops leaves the axis one thread wide while the index expression stays
+        ``offset + tid``, so each tile is computed in its first row alone and
+        the rest of the output keeps whatever ``empty_like`` handed back.
+
+        Only a block size read off a tensor under ``static_shapes=False`` gets
+        here; a config-chosen one is an ``int``.  Three ways in, one per
+        strategy: flattened, ND, and the ND lane path -- the last being the one
+        whose thread mask skips an axis it cannot bound, on the strength of the
+        axis never reaching codegen.
+        """
+
+        @helion.kernel(backend="metal", autotune_effort="none", static_shapes=False)
+        def flat(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tm in hl.tile(x.size(0), block_size=x.size(0) // 2):
+                out[tm] = x[tm] * 2.0
+            return out
+
+        @helion.kernel(backend="metal", autotune_effort="none", static_shapes=False)
+        def nd_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile(
+                [x.size(0), x.size(1)], block_size=[x.size(0) // 2, 16]
+            ):
+                out[tm, tn] = x[tm, tn] * 2.0
+            return out
+
+        # ``num_threads`` below the (static) block size gives axis 0 a lane
+        # loop, which is what routes this through
+        # ``PerThreadNDTileStrategy.codegen_grid`` rather than the base ND path.
+        @helion.kernel(
+            backend="metal",
+            static_shapes=False,
+            configs=[helion.Config(block_sizes=[64], num_threads=[16])],
+        )
+        def nd_lane(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile(
+                [x.size(0), x.size(1)], block_size=[None, x.size(1) // 2]
+            ):
+                out[tm, tn] = x[tm, tn] * 2.0
+            return out
+
+        x = torch.randn(128, 32, device=DEVICE)
+        for kernel in (flat, nd_kernel, nd_lane):
+            with (
+                self.subTest(kernel=kernel.fn.__name__),
+                self.assertRaisesRegex(exc.BackendUnsupported, "not known until"),
+            ):
+                kernel(x[:, 0] if kernel is flat else x)
+
 
 # ---------------------------------------------------------------------------
 # Tests – arithmetic
