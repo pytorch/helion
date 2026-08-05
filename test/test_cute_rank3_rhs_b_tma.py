@@ -546,6 +546,7 @@ def test_rank3_rhs_grouped_nt_codegen_uses_nkg_tma_view() -> None:
     assert "tcgen05_rhs_safe_group" in code
     assert "tcgen05_rhs_group = (" in code
     assert ".layout.stride[0])).load()" in code
+    assert "while tcgen05_work_tile_valid:" in code
     assert "cute.slice_(tma_tensor_b" not in code
     assert "tma_tensor_b[tcgen05_rhs_safe_group" not in code
     assert any(
