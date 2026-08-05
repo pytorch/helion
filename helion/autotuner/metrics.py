@@ -35,6 +35,8 @@ class AutotuneMetrics:
     num_compile_failures: int = 0
     num_worker_failures: int = 0
     num_accuracy_failures: int = 0
+    num_unique_sources: int = 0
+    num_source_deduplications: int = 0
     num_generations: int = 0
     autotune_time: float = 0.0
     best_perf_ms: float = 0.0
@@ -60,6 +62,8 @@ class AutotuneMetrics:
             "num_compile_failures": self.num_compile_failures,
             "num_worker_failures": self.num_worker_failures,
             "num_accuracy_failures": self.num_accuracy_failures,
+            "num_unique_sources": self.num_unique_sources,
+            "num_source_deduplications": self.num_source_deduplications,
             "num_generations": self.num_generations,
             "autotune_time": self.autotune_time,
             "best_perf_ms": self.best_perf_ms,

@@ -236,7 +236,13 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.args = args
         search.log = AutotuningLogger(settings)
         search.config_spec = SimpleNamespace(
-            default_config=lambda: helion.Config(block_sizes=[1])
+            default_config=lambda: helion.Config(block_sizes=[1]),
+            cute_flash_search_enabled=False,
+            backend=SimpleNamespace(
+                should_deduplicate_generated_sources=lambda config_spec: False,
+                get_do_bench=lambda: None,
+                classify_autotune_exception=lambda error: None,
+            ),
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
@@ -567,6 +573,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 compile_time=0.5,
                 config_id=config_id,
                 config=config,
+                source_hash="source-abc",
             )
             logger.record_autotune_entry(entry)
             logger("finalized entry", level=logging.CRITICAL)
@@ -603,6 +610,11 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(cell("perf_ms"), "1.234000")
         self.assertEqual(cell("compile_time_s"), "0.50")
         self.assertEqual(cell("config"), str(config))
+        source_rows = list(
+            csv.reader(base_path.with_suffix(".sources.csv").read_text().splitlines())
+        )
+        self.assertEqual(source_rows[0][-2:], ["status", "source_hash"])
+        self.assertEqual(source_rows[1][-2:], ["ok", "source-abc"])
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
@@ -6367,7 +6379,13 @@ class TestAutotuneBudget(TestCase):
         # Match the cute backend's path: CuteBackend.supports_precompile()
         # is False, which clears autotune_precompile in autotune setup.
         provider.settings.autotune_precompile = None
-        provider.config_spec = SimpleNamespace()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                should_deduplicate_generated_sources=lambda config_spec: False
+            ),
+        )
         provider.args = ()
         provider.log = AutotuningLogger(provider.settings)
         provider._autotune_metrics = SimpleNamespace(
@@ -6375,6 +6393,8 @@ class TestAutotuneBudget(TestCase):
             num_compile_failures=0,
             num_worker_failures=0,
             num_accuracy_failures=0,
+            num_unique_sources=0,
+            num_source_deduplications=0,
             num_generations=0,
             kernel_source="",
         )
@@ -6382,7 +6402,184 @@ class TestAutotuneBudget(TestCase):
         provider._benchmark_worker = None
         provider._precompile_args_path = None
         provider._precompile_tmpdir = None
+        provider._effective_source_hashes = set()
+        provider._effective_source_results = {}
         return provider
+
+    def test_cute_flash_benchmark_deduplicates_effective_sources(self) -> None:
+        provider = self._make_stub_provider()
+
+        def generated_source_hash(fn):
+            return fn.source_hash
+
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=generated_source_hash,
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+
+        def compile_config(config, allow_print):
+            def fn():
+                return None
+
+            block_size = config.get("block_sizes")[0]
+            fn.source_hash = "shared" if block_size in (1, 2, 4) else "unique"
+            return fn
+
+        provider.kernel.compile_config = compile_config
+        configs = [
+            helion.Config(block_sizes=[1]),
+            helion.Config(block_sizes=[2]),
+            helion.Config(block_sizes=[3]),
+        ]
+        repeated_config = helion.Config(block_sizes=[4])
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(1.0, 2.0),
+        ) as benchmark:
+            results = provider.benchmark(configs)
+            repeated_results = provider.benchmark([repeated_config])
+
+        self.assertEqual(benchmark.call_count, 2)
+        self.assertEqual([result.perf for result in results], [1.0, 1.0, 2.0])
+        self.assertEqual(results[1].status, "deduplicated")
+        self.assertIs(results[0].fn, results[1].fn)
+        self.assertEqual(repeated_results[0].perf, 1.0)
+        self.assertEqual(repeated_results[0].status, "deduplicated")
+        self.assertIs(repeated_results[0].config, repeated_config)
+        self.assertIs(repeated_results[0].fn, results[0].fn)
+        self.assertIsNot(repeated_results[0], results[0])
+        self.assertEqual(provider._autotune_metrics.num_unique_sources, 2)
+        self.assertEqual(provider._autotune_metrics.num_source_deduplications, 2)
+
+    def test_backend_policy_can_disable_effective_source_dedup(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: False,
+            ),
+        )
+        configs = [
+            helion.Config(block_sizes=[1]),
+            helion.Config(block_sizes=[2]),
+        ]
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(1.0, 2.0),
+        ) as benchmark:
+            results = provider.benchmark(configs)
+
+        self.assertEqual(benchmark.call_count, 2)
+        self.assertEqual([result.perf for result in results], [1.0, 2.0])
+        self.assertEqual(provider._autotune_metrics.num_unique_sources, 0)
+        self.assertEqual(provider._autotune_metrics.num_source_deduplications, 0)
+
+    def test_failed_effective_source_is_retried(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        configs = [helion.Config(block_sizes=[1])]
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(math.inf, 1.0),
+        ) as benchmark:
+            first = provider.benchmark(configs)
+            second = provider.benchmark(configs)
+
+        self.assertEqual(benchmark.call_count, 2)
+        self.assertEqual(first[0].status, "error")
+        self.assertEqual(second[0].status, "ok")
+
+    def test_failed_effective_source_alias_is_logged(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        representative = helion.Config(block_sizes=[1])
+        alias = helion.Config(block_sizes=[2])
+
+        with (
+            patch.object(
+                LocalBenchmarkProvider,
+                "_benchmark_function",
+                return_value=math.inf,
+            ),
+            patch.object(
+                provider.log,
+                "register_config",
+                side_effect=lambda config: (
+                    "representative" if config is representative else "alias"
+                ),
+            ),
+            patch.object(provider.log, "record_autotune_entry") as record_entry,
+        ):
+            results = provider.benchmark([representative, alias])
+
+        alias_entries = [
+            call.args[0]
+            for call in record_entry.call_args_list
+            if call.args[0].config is alias
+        ]
+        self.assertEqual([result.status for result in results], ["error", "error"])
+        self.assertEqual(len(alias_entries), 1)
+        self.assertEqual(alias_entries[0].status, "error")
+        self.assertIsNone(alias_entries[0].perf_ms)
+        self.assertEqual(alias_entries[0].source_hash, "shared")
+
+    def test_effective_source_dedup_is_disabled_for_distributed(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(
+                should_deduplicate_generated_sources=lambda config_spec: True
+            )
+        )
+        with patch(
+            "helion.autotuner.benchmark_provider.dist.is_initialized",
+            return_value=True,
+        ):
+            self.assertFalse(provider._effective_source_dedup_enabled())
+
+    def test_cute_backend_reports_attached_generated_source_hash(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        backend = CuteBackend()
+        compiled = SimpleNamespace(
+            __name__="kernel",
+            __globals__={
+                "_helion_kernel": SimpleNamespace(_helion_cute_source_hash="source-abc")
+            },
+        )
+        self.assertEqual(backend.generated_source_hash(compiled), "source-abc")
+        self.assertIsNone(backend.generated_source_hash(SimpleNamespace()))
+        self.assertTrue(
+            backend.should_deduplicate_generated_sources(
+                SimpleNamespace(cute_flash_search_enabled=True)
+            )
+        )
+        self.assertFalse(
+            backend.should_deduplicate_generated_sources(
+                SimpleNamespace(cute_flash_search_enabled=False)
+            )
+        )
 
     def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
         """``LocalBenchmarkProvider.benchmark`` must stop compiling
