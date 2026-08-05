@@ -5,7 +5,7 @@ After ``hoist_warp_reduce`` runs, two-pass online softmax still has TWO
 Both loops bitcast the SAME ``_tile_unroll_vec_*`` hoist var to extract
 the per-lane scalar.
 
-The pass introduces a small ``cute.make_fragment(V, cutlass.Float32)``
+The pass introduces a small ``cute.make_rmem_tensor(V, cutlass.Float32)``
 cache. V-loop 1 stores ``Float32(values)`` into the cache once per lane;
 V-loop 2 reads the cached fp32 value back instead of re-running the
 ``Uint16 -> Float16`` bitcast chain. Eliminates the redundant per-lane
@@ -94,7 +94,7 @@ class TestCuteMergeSiblingVLoops(TestCase):
         # The cache is allocated as Float32 (promotes from fp16 so V-loop
         # 2 doesn't need the redundant Float32 cast).
         self.assertIn(
-            "_helion_vmerge_cache_0 = cute.make_fragment(4, cutlass.Float32)",
+            "_helion_vmerge_cache_0 = cute.make_rmem_tensor(4, cutlass.Float32)",
             code,
         )
 

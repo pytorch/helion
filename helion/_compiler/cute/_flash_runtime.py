@@ -125,7 +125,9 @@ def flash_fa4_shared_storage(
             # PipelineClcFetchAsync expects one full and one empty mbarrier per
             # CLC stage. The response is 16 bytes, stored as 4 Int32s.
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
-            clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
+            ]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
@@ -158,7 +160,9 @@ def flash_fa4_shared_storage(
         # PipelineClcFetchAsync expects one full and one empty mbarrier per
         # CLC stage. The response is 16 bytes, stored as 4 Int32s.
         clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
-        clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
+        clc_response: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
+        ]
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]

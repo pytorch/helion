@@ -13,6 +13,16 @@ from packaging.version import Version
 # carry per-build compatibility shims and inline workarounds.
 CUTE_MIN_CUDA_VERSION = "13"
 CUTE_MIN_VERSION = Version("4.5.1")
+CUTE_MATH_MIN_MAX_VERSION = Version("4.6.0")
+
+
+@lru_cache(maxsize=1)
+def cute_math_min_max_available() -> bool:
+    """Return whether ``cute.math.min/max`` are available in this CuTe DSL."""
+    return (
+        Version(importlib.metadata.version("nvidia-cutlass-dsl"))
+        >= CUTE_MATH_MIN_MAX_VERSION
+    )
 
 
 @lru_cache(maxsize=1)

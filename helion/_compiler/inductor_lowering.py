@@ -53,6 +53,7 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
+from .cute.cutedsl_compat import cute_math_min_max_available
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -1194,6 +1195,64 @@ class GenerateASTFromInductor(DefaultHandler):
             # Some backend op handlers do not implement rsqrt directly.
             # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
             return self.reciprocal(self.sqrt(x))
+
+    def neg(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("neg", (x,), {})
+        return self._lift(expr_from_string("-({x})", x=self._to_ast(x)))
+
+    def abs(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("abs", (x,), {})
+        return self._lift(expr_from_string("abs({x})", x=self._to_ast(x)))
+
+    def maximum(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("maximum", (a, b), {})
+        dtype = self._expected_tensor_dtype()
+        if dtype is not None:
+            a = self._create_cast_expr(a, dtype)
+            b = self._create_cast_expr(b, dtype)
+        if not cute_math_min_max_available():
+            return self._lift(
+                expr_from_string(
+                    "{a} if {a} != {a} else "
+                    "({b} if {b} != {b} else ({a} if {a} >= {b} else {b}))",
+                    a=self._to_ast(a),
+                    b=self._to_ast(b),
+                )
+            )
+        return self._lift(
+            expr_from_string(
+                "cute.math.max({a}, {b}, propagate_nan=True)",
+                a=self._to_ast(a),
+                b=self._to_ast(b),
+            )
+        )
+
+    def minimum(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("minimum", (a, b), {})
+        dtype = self._expected_tensor_dtype()
+        if dtype is not None:
+            a = self._create_cast_expr(a, dtype)
+            b = self._create_cast_expr(b, dtype)
+        if not cute_math_min_max_available():
+            return self._lift(
+                expr_from_string(
+                    "{a} if {a} != {a} else "
+                    "({b} if {b} != {b} else ({a} if {a} <= {b} else {b}))",
+                    a=self._to_ast(a),
+                    b=self._to_ast(b),
+                )
+            )
+        return self._lift(
+            expr_from_string(
+                "cute.math.min({a}, {b}, propagate_nan=True)",
+                a=self._to_ast(a),
+                b=self._to_ast(b),
+            )
+        )
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
         # Triton promotes scalar*tensor results to float32, deviating from
