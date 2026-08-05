@@ -19,16 +19,31 @@ class Config:
     data_dir: Path
     index_dir: Path
     writeback_dir: Path
+    model_revision: str | None = None
+    tokenizer_revision: str | None = None
     manifold_base: str = ""
     manifest_path: Path | None = None
     hardware_family: str | None = None
     autotune_log_dir: Path | None = None
     uploads_dir: Path | None = None
+    generation_id: str | None = None
 
     @property
     def corpus_dir(self) -> Path:
         """Where extracted corpus lives under data_dir."""
         return self.data_dir / "corpus"
+
+    @property
+    def embedding_policy(self) -> dict[str, object]:
+        """Return the implementation-bound embedding policy used by lookup."""
+        return {
+            "device": os.environ.get("HELION_RAG_EMBED_DEVICE", "auto"),
+            "normalize_embeddings": True,
+            "pooling": "model_default",
+            "precision": "model_default",
+            "sequence_length": "model_default",
+            "truncation": "model_default",
+        }
 
 
 def _config() -> Config:
@@ -44,6 +59,8 @@ def _config() -> Config:
 
     return Config(
         embed_model=os.environ.get("HELION_EMBED_MODEL", DEFAULT_EMBED_MODEL),
+        model_revision=os.environ.get("HELION_RAG_MODEL_REVISION") or None,
+        tokenizer_revision=os.environ.get("HELION_RAG_TOKENIZER_REVISION") or None,
         data_dir=p("HELION_RAG_DATA_DIR", _HOME_RAG / "ci_artifacts"),
         index_dir=p("HELION_RAG_INDEX_DIR", _HOME_RAG / "rag_index"),
         writeback_dir=p("HELION_RAG_WRITEBACK_DIR", _HOME_RAG / "rag_writeback"),
@@ -52,4 +69,5 @@ def _config() -> Config:
         hardware_family=os.environ.get("HELION_RAG_HARDWARE_FAMILY") or None,
         autotune_log_dir=opt("HELION_RAG_AUTOTUNE_LOG_DIR"),
         uploads_dir=opt("HELION_RAG_UPLOADS_DIR"),
+        generation_id=os.environ.get("HELION_RAG_GENERATION_ID") or None,
     )

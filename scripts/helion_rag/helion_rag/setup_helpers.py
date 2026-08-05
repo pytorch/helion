@@ -7,10 +7,95 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from typing import cast
 
 from helion_rag.hardware import resolve_family
 from helion_rag.manifest import load_manifest
 from helion_rag.manifest import validate_manifest
+from helion_rag.signing import generate_keypair
+
+
+def ensure_signing_keypair(private_path: str | Path, public_path: str | Path) -> bool:
+    """Create one deployment keypair, or preserve the complete existing pair."""
+    private = Path(private_path)
+    public = Path(public_path)
+    if private.exists() != public.exists():
+        raise RuntimeError(
+            f"partial signing keypair: expected both {private} and {public}"
+        )
+    if private.exists():
+        private.chmod(0o600)
+        return False
+    private.parent.mkdir(parents=True, exist_ok=True)
+    public.parent.mkdir(parents=True, exist_ok=True)
+    private_pem, public_pem = generate_keypair()
+    private.write_bytes(private_pem)
+    private.chmod(0o600)
+    public.write_bytes(public_pem)
+    return True
+
+
+def _shell_quote(value: str | Path) -> str:
+    text = str(value).replace("'", "'\\''")
+    return f"'{text}'"
+
+
+def write_environment(
+    path: str | Path,
+    *,
+    rag_root: str | Path,
+    hardware_family: str,
+    manifold_base: str,
+    embed_model: str,
+    private_key_path: str | Path,
+    public_key_path: str | Path,
+    llm_provider: str,
+    llm_model: str,
+    llm_ca_bundle: str,
+    vertex_base_url: str | None = None,
+    vertex_project_id: str | None = None,
+    cloud_ml_region: str | None = None,
+    hf_home: str | Path | None = None,
+    collect_autotune: bool = False,
+) -> None:
+    """Write the managed RAG/Vertex environment without persisting credentials."""
+    root = Path(rag_root)
+    values: list[tuple[str, str | Path | None]] = [
+        ("HELION_RAG_HARDWARE_FAMILY", hardware_family),
+        ("HELION_RAG_MANIFOLD_BASE", manifold_base),
+        ("HELION_RAG_MANIFEST", root / "manifest.json"),
+        ("HELION_RAG_DATA_DIR", root / "ci_artifacts"),
+        ("HELION_RAG_INDEX_DIR", root / "rag_index"),
+        ("HELION_RAG_WRITEBACK_DIR", root / "rag_writeback"),
+        ("HELION_RAG_AUTOTUNE_LOG_DIR", root / "autotune_logs"),
+        ("HELION_RAG_UPLOADS_DIR", root / "uploads"),
+        ("HELION_RAG_PRIVATE_KEY_PATH", private_key_path),
+        ("HELION_RAG_PUBLIC_KEY_PATH", public_key_path),
+        ("HELION_EMBED_MODEL", embed_model),
+        ("HELION_LLM_PROVIDER", llm_provider),
+        ("HELION_LLM_MODEL", llm_model),
+        ("HELION_LLM_CA_BUNDLE", llm_ca_bundle),
+        ("ANTHROPIC_VERTEX_BASE_URL", vertex_base_url),
+        ("ANTHROPIC_VERTEX_PROJECT_ID", vertex_project_id),
+        ("CLOUD_ML_REGION", cloud_ml_region),
+        ("HF_HOME", hf_home),
+    ]
+    if collect_autotune:
+        values.extend(
+            [
+                ("HELION_AUTOTUNE_LOG", root / "autotune_logs" / "helion-rag"),
+                ("HELION_AUTOTUNE_LOG_DETAILS", "1"),
+            ]
+        )
+    lines = ["# Managed by setup-helion-rag.sh"]
+    lines.extend(
+        f"export {name}={_shell_quote(value)}"
+        for name, value in values
+        if value is not None and str(value) != ""
+    )
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def check_helion_import(repo_path: str | Path) -> int:
@@ -98,4 +183,5 @@ def publish_manifest(
             return {"published": False, "reason": "already-present", "family": family}
         local.write_text(json.dumps(obj, indent=2), encoding="utf-8")
         manifold_put(str(local), dest)
-    return {"published": True, "family": family, "families": sorted(obj["families"])}
+    families = cast("dict[str, object]", obj["families"])
+    return {"published": True, "family": family, "families": sorted(families)}

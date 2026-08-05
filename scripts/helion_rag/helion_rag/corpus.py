@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import asdict
+from dataclasses import dataclass
 import hashlib
 import json
 import operator
@@ -24,6 +25,28 @@ from helion_rag.models import ExactEntry
 from helion_rag.models import Ref
 
 __all__ = ["_CODEGEN_SETTINGS"]
+
+# Extended-schema identity fields (§6.2) recorded only during live tuning; they are
+# the single source of truth for the field names shared with the audit runner.
+# The S4 subset makes a record eligible for Tier-0 auto-reuse; S5 adds strict
+# toolchain identity. All are absent on historical CI JSONL.
+EXTENDED_S4_FIELDS = (
+    "canonical_source_hash",
+    "normalized_specialization_identity",
+    "config_spec_fingerprint",
+    "record_id",
+)
+EXTENDED_S5_FIELDS = (
+    "toolchain_identity",
+    "tolerance_policy_version",
+)
+# Fields that gate Tier-0 auto-reuse eligibility (the S4 identity content, excluding
+# the record_id, which is a masking/tie-break id rather than identity content).
+_TIER0_REQUIRED_FIELDS = (
+    "canonical_source_hash",
+    "normalized_specialization_identity",
+    "config_spec_fingerprint",
+)
 
 
 def _to_canonical_nested(v):
@@ -46,22 +69,17 @@ def _normalize_kernel_source(src: str) -> str:
     return ast.dump(ast.parse(src))
 
 
-def _tier0_eligible(kernel_source: str) -> bool:
-    """Reject kernels with epilogue or Callable args."""
-    tree = ast.parse(kernel_source)
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        a = node.args
-        for p in (*a.posonlyargs, *a.args, *a.kwonlyargs):
-            if p.arg == "epilogue":
-                return False
-            if p.annotation is not None and "Callable" in ast.unparse(p.annotation):
-                return False
-        for d in (*a.defaults, *(d for d in a.kw_defaults if d is not None)):
-            if isinstance(d, ast.Lambda):
-                return False
-    return True
+def _tier0_eligible(record: dict) -> bool:
+    """Whether a record carries the extended S4 identity required for Tier-0 reuse.
+
+    Historical CI JSONL lacks these fields and is therefore never eligible (shadow
+    evidence only); a record regenerated during live tuning with a canonical source
+    hash, normalized specialization identity, and ConfigSpec fingerprint is eligible.
+    """
+    return all(
+        isinstance(record.get(field), str) and record[field]
+        for field in _TIER0_REQUIRED_FIELDS
+    )
 
 
 def _workload_key(
@@ -119,7 +137,7 @@ def _parse_record(
     run_id = record.get("run_id")
     key = _workload_key(ksrc, shapes, dtypes, record.get("settings") or {}, family)
     ref = Ref(family=family, source_file=source_file, run_id=run_id)
-    return {
+    parsed = {
         "family": family,
         "kernel_name": record.get("kernel_name", ""),
         "run_id": run_id,
@@ -127,12 +145,18 @@ def _parse_record(
         "input_shapes": shapes,
         "dtypes": dtypes,
         "workload_key": key,
-        "tier0_eligible": _tier0_eligible(ksrc),
+        "tier0_eligible": _tier0_eligible(record),
         "embed_text": ksrc.strip(),
         "best": oks[0],
         "top_n": oks[:top_n],
         "ref": ref,
     }
+    # Carry any extended-schema identity fields through so a regenerated corpus
+    # keeps them; historical records simply have none of these.
+    for field in (*EXTENDED_S4_FIELDS, *EXTENDED_S5_FIELDS):
+        if field in record:
+            parsed[field] = record[field]
+    return parsed
 
 
 def load_corpus(corpus_dir, required: bool = True) -> list:
@@ -159,6 +183,43 @@ def load_corpus(corpus_dir, required: bool = True) -> list:
     _log(f"loaded {len(out)} records from {nfiles} files under {corpus_dir}")
     if not out and required:
         _die(f"no usable *.meta.jsonl records under {corpus_dir}")
+    return out
+
+
+@dataclass(frozen=True)
+class ExtendedSchemaReport:
+    """Counts of extended-schema vs historical records, reported separately (§6.2)."""
+
+    total: int
+    extended: int
+    historical: int
+
+
+def extended_schema_report(records: list) -> ExtendedSchemaReport:
+    """Partition parsed records into extended-schema (Tier-0-eligible) vs historical.
+
+    Historical and extended-schema results must never be merged (§6.2); this keeps
+    the two populations countable and separate.
+    """
+    extended = sum(1 for record in records if record.get("tier0_eligible"))
+    return ExtendedSchemaReport(
+        total=len(records), extended=extended, historical=len(records) - extended
+    )
+
+
+def regen_extended(records: list, family: str, source_file: str = "regen") -> list:
+    """Parse live-tuning runs that recorded the extended S4/S5 identity into corpus
+    records (recording only).
+
+    A full multi-kernel regeneration campaign is out of scope; this ingests runs
+    that already captured the extended fields during live tuning so a regenerated
+    corpus can carry Tier-0-eligible records.
+    """
+    out = []
+    for record in records:
+        parsed = _parse_record(record, family, source_file)
+        if parsed:
+            out.append(parsed)
     return out
 
 
