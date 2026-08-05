@@ -1,0 +1,100 @@
+{
+  "arm_policies": {
+    "contextual_rag_llm": {
+      "autotuner": "LLMGuidedSearch",
+      "provider_requests": 1,
+      "rag_enabled": true,
+      "tuner_mode": "llm"
+    },
+    "hybrid_lfbo_llm": {
+      "autotuner": "LLMSeededLFBOTreeSearch",
+      "provider_requests": 1,
+      "rag_enabled": false,
+      "tuner_mode": "hybrid"
+    },
+    "lfbo": {
+      "autotuner": "LFBOTreeSearch",
+      "provider_requests": 0,
+      "rag_enabled": false,
+      "tuner_mode": "lfbo"
+    },
+    "llm": {
+      "autotuner": "LLMGuidedSearch",
+      "provider_requests": 1,
+      "rag_enabled": false,
+      "tuner_mode": "llm"
+    }
+  },
+  "arms": [
+    "lfbo",
+    "llm",
+    "hybrid_lfbo_llm",
+    "contextual_rag_llm"
+  ],
+  "base_seed": 1000,
+  "best_of_k": 1,
+  "cache_policy": {
+    "best_available_read": false,
+    "exact_read": false,
+    "write": false
+  },
+  "candidate_attempt_limit": 80,
+  "code_id": "6c62ad2623fcd69c8831c750403873b8ce567a48b13aaa75846037707a289605",
+  "config_hash": "1acdab900185cfbea76d6c380c767417ed3724b54a90520d9962a3fb18f8f653",
+  "disable_trajectory_early_stop": true,
+  "effort": "quick",
+  "generation_id": "000000",
+  "llm_compile_timeout_s": 15,
+  "llm_configs_per_round": 15,
+  "llm_initial_random_configs": 10,
+  "llm_rounds": 1,
+  "manifest_version": 1,
+  "model": "claude-opus-4-8",
+  "provider": "vertex",
+  "random_seeds": [
+    1000,
+    1001,
+    1002,
+    1003,
+    1004
+  ],
+  "repetitions": 5,
+  "schedule_seed": 20260722,
+  "timeout_seconds": 1800.0,
+  "total_run_units": 660,
+  "workloads": [
+    "matmul-8192x8192x8192",
+    "matmul-4096x4096x4096",
+    "matmul_split_k-64x65536x64",
+    "matmul_split_k-64x16384x64",
+    "matmul_split_k-64x1024x64",
+    "attention-2x8x4096x64",
+    "attention-2x8x8192x64",
+    "fp8_attention-2x4x8192x64",
+    "fp8_attention-2x4x2048x64",
+    "fp8_attention-2x4x512x64",
+    "grouped_gemm-g2m1024",
+    "grouped_gemm-g4m512",
+    "grouped_gemm-g8m512",
+    "swiglu-2048x2048",
+    "swiglu-4096x4096",
+    "swiglu-8192x8192",
+    "softmax-4096x32768",
+    "softmax-4096x8192",
+    "softmax-4096x1024",
+    "gdn_fwd_h-b1h4s2048ds128",
+    "gdn_fwd_h-b1h4s8192ds128",
+    "gdn_fwd_h-b1h4s4096ds64",
+    "rms_norm-4096x1024",
+    "rms_norm-4096x32768",
+    "rms_norm-4096x8192",
+    "rope-1x4x2x512x128",
+    "rope-1x4x2x8192x128",
+    "rope-1x4x2x2048x128",
+    "mamba2_chunk_scan-b1h4s2048ds128",
+    "mamba2_chunk_scan-b1h4s4096ds256",
+    "mamba2_chunk_scan-b1h4s8192ds256",
+    "matmul-1024x1024x1024",
+    "attention-2x8x512x64"
+  ]
+}
