@@ -3644,7 +3644,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
-            # Enable the flash-attention autotune surface (Tasks #25 + #28) when
+            # Enable the flash-attention autotune surface when
             # the dense flash dataflow is detected, analogous to how a matmul
             # detection sets ``cute_tcgen05_search_enabled``. Default-off
             # otherwise so the flash knobs never widen the search surface for
@@ -3662,6 +3662,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_kv_tile_pruning=flash_shape.has_kv_tile_pruning,
                     requires_ws_overlap=flash_shape.requires_ws_overlap,
                     small_biased_candidate=flash_shape.small_biased_candidate,
+                    standard_dense_output=flash_shape.standard_dense_output,
+                    standard_causal_output=flash_shape.standard_causal_output,
                 )
             else:
                 from ..language.matmul_ops import enable_cute_tcgen05_search

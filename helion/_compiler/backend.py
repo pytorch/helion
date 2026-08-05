@@ -67,6 +67,8 @@ class FlashSearchSurface(NamedTuple):
     has_kv_tile_pruning: bool
     requires_ws_overlap: bool
     small_biased_candidate: bool
+    standard_dense_output: bool
+    standard_causal_output: bool
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -517,6 +519,24 @@ class Backend(abc.ABC):
         cache key from the generated source (CuTe) override this.  No-op default.
         """
         return None
+
+    def generated_source_hash(self, compiled_fn: object) -> str | None:
+        """Return the exact generated-source hash attached to ``compiled_fn``.
+
+        Backends may return ``None`` when generated-source identity is not
+        available. The autotuner uses a non-``None`` value only for
+        backend-scoped effective-code deduplication.
+        """
+        return None
+
+    def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
+        """Whether the autotuner may merge source-identical candidates.
+
+        This is disabled by default because source identity is not necessarily
+        sufficient to establish benchmark equivalence for every backend and
+        search domain.
+        """
+        return False
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         """Classify an exception that occurred during autotuning.
@@ -2772,6 +2792,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         from .cute.cute_flash import (
             flash_attention_graph_small_biased_candidate_from_graphs,
         )
+        from .cute.cute_flash import (
+            flash_attention_graph_standard_causal_output_from_graphs,
+        )
+        from .cute.cute_flash import (
+            flash_attention_graph_standard_dense_output_from_graphs,
+        )
 
         if not flash_attention_graph_lse_plan_valid_from_graphs(
             device_ir.graphs,
@@ -2782,6 +2808,20 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             continue
         small_biased_candidate = (
             flash_attention_graph_small_biased_candidate_from_graphs(
+                device_ir.graphs,
+                root_block_ids=root_grid_ids,
+                kv_block_id=block_ids[0],
+                score_plan=pattern.score_plan,
+            )
+        )
+        standard_dense_output = flash_attention_graph_standard_dense_output_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
+        )
+        standard_causal_output = (
+            flash_attention_graph_standard_causal_output_from_graphs(
                 device_ir.graphs,
                 root_block_ids=root_grid_ids,
                 kv_block_id=block_ids[0],
@@ -2826,6 +2866,8 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             has_kv_tile_pruning=pattern.score_plan.has_kv_tile_pruning,
             requires_ws_overlap=pattern.score_plan.requires_ws_overlap,
             small_biased_candidate=small_biased_candidate,
+            standard_dense_output=standard_dense_output,
+            standard_causal_output=standard_causal_output,
         )
     return None
 

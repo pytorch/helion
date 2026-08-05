@@ -393,6 +393,15 @@ class BaseSearch(BaseAutotuner):
             log=self.log,
             autotune_metrics=self._autotune_metrics,
         )
+        if self.config_spec.compiler_seed_timeout_retry_repetitions is not None:
+            seed_config_gen = self.config_spec.create_config_generation(
+                overrides=self.settings.autotune_config_overrides or None,
+                advanced_controls_files=self.settings.autotune_search_acf or None,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+            self.benchmark_provider.set_compiler_seed_configs(
+                [config for _flat, config in seed_config_gen.seed_flat_config_pairs()]
+            )
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _is_restricted_search(self) -> bool:
@@ -886,7 +895,13 @@ class PopulationMember:
     flat_values: FlatConfig
     config: Config
     status: Literal[
-        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "unknown"
+        "ok",
+        "error",
+        "timeout",
+        "peer_compilation_fail",
+        "filtered",
+        "deduplicated",
+        "unknown",
     ] = "unknown"
     compile_time: float | None = None
 
