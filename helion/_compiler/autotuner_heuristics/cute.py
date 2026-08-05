@@ -737,7 +737,7 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
         from ..cute.cute_flash import flash_attention_seed_config
 
         assert spec._cute_flash_head_dim is not None
-        return flash_attention_seed_config(
+        seed = flash_attention_seed_config(
             spec._cute_flash_head_dim,
             spec._cute_flash_num_kv,
             dtype=spec._cute_flash_dtype,
@@ -747,6 +747,12 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
             small_biased_candidate=spec._cute_flash_small_biased_candidate,
             block_size_targets=spec._cute_flash_block_size_target_list(),
         )
+        if seed is not None:
+            # A fresh worker retry uses one setup launch plus three timed
+            # launches. The median is robust while using half the launches of
+            # the normal path that timed out.
+            spec.compiler_seed_timeout_retry_repetitions = 3
+        return seed
 
 
 class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):

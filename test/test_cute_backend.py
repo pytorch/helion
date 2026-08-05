@@ -3237,10 +3237,11 @@ class TestCuteBackend(TestCase):
             (131072, "deg1_8x2_corr10", 2, 1),
             (196608, "deg1_8x2_corr10", 2, 1),
             (262144, "deg1_16x8", 0, 10),
+            (262656, "deg1_16x8", 0, 10),
         )
         for sequence_length, packet, offset, offset0 in cases:
             with self.subTest(sequence_length=sequence_length):
-                torch.manual_seed(20260728 + sequence_length)
+                torch.manual_seed(1000 + sequence_length)
                 q, k, v = (
                     torch.randn(
                         1,
@@ -3252,18 +3253,64 @@ class TestCuteBackend(TestCase):
                     )
                     for _ in range(3)
                 )
+                config: dict[str, object] = {
+                    "block_sizes": [1, 128, 128],
+                    "cute_flash_pipeline_family": "fa4_2cta",
+                    "cute_flash_exp2_packet": packet,
+                    "cute_flash_e2e_offset": offset,
+                    "cute_flash_e2e_offset0": offset0,
+                }
+                if packet == "deg1_16x8":
+                    config["cute_flash_kv_stage"] = 2
                 code, out = code_and_output(
                     cute_dense_attention,
                     (q, k, v),
-                    block_sizes=[1, 128, 128],
-                    cute_flash_pipeline_family="fa4_2cta",
-                    cute_flash_exp2_packet=packet,
-                    cute_flash_e2e_offset=offset,
-                    cute_flash_e2e_offset0=offset0,
+                    **config,
                 )
+                self.assertIn("is_two_cta=True", code)
                 self.assertIn("degree1=True", code)
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
+
+    def test_flash_attention_dense_degree1_seed_requires_standard_output(self) -> None:
+        target = torch.empty(1, 1, 262_144, 64, dtype=torch.float16, device=DEVICE)
+        cases = (
+            (cute_dense_attention, True),
+            (cute_dense_attention_with_lse, False),
+            (cute_softcap_attention, False),
+        )
+        for kernel, expected_standard in cases:
+            with self.subTest(kernel=kernel.__name__):
+                bound = kernel.bind((target, target, target))
+                self.assertEqual(
+                    bound.config_spec._cute_flash_standard_dense_output,
+                    expected_standard,
+                )
+                has_degree1_seed = any(
+                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
+                    in {"deg1_8x2_corr10", "deg1_16x8"}
+                    for seed in bound.config_spec.compiler_seed_configs
+                )
+                self.assertEqual(has_degree1_seed, expected_standard)
+
+    def test_flash_attention_hybrid_seed_excludes_auxiliary_outputs(self) -> None:
+        target = torch.empty(1, 1, 65_536, 64, dtype=torch.float16, device=DEVICE)
+        slopes = torch.empty(1, dtype=torch.float32, device=DEVICE)
+        cases = (
+            (cute_causal_attention, (target, target, target)),
+            (cute_alibi_attention, (target, target, target, slopes)),
+        )
+        for kernel, args in cases:
+            with self.subTest(kernel=kernel.__name__):
+                bound = kernel.bind(args)
+                self.assertFalse(bound.config_spec._cute_flash_standard_causal_output)
+                self.assertFalse(
+                    any(
+                        seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
+                        == "hybrid_deg1_16x8"
+                        for seed in bound.config_spec.compiler_seed_configs
+                    )
+                )
 
     def test_flash_attention_bias_fires_and_matches_sdpa(self) -> None:
         q, k, v = (
@@ -4666,7 +4713,23 @@ class TestCuteBackend(TestCase):
             dense_unaligned = resolve_flash_config(64, 258, force_two_cta)
             dense_256k = resolve_flash_config(64, 2048, force_two_cta)
             dense_midrange = resolve_flash_config(64, 1536, force_two_cta)
-            dense_above_range = resolve_flash_config(64, 2052, force_two_cta)
+            dense_long = resolve_flash_config(64, 2052, force_two_cta)
+            dense_long_unaligned = resolve_flash_config(64, 2050, force_two_cta)
+            dense_long_seed = next(
+                seed
+                for seed in _cute_flash.flash_attention_seed_configs(
+                    64,
+                    2052,
+                    standard_dense_output=True,
+                )
+                if seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY) == "deg1_16x8"
+            )
+            dense_long_degree1 = resolve_flash_config(
+                64,
+                2052,
+                dense_long_seed.config,
+                standard_dense_output=True,
+            )
             dense_bf16 = resolve_flash_config(
                 64, 512, force_two_cta, dtype=torch.bfloat16
             )
@@ -4691,8 +4754,20 @@ class TestCuteBackend(TestCase):
         self.assertEqual(dense_256k.pipeline_family, "fa4_2cta")
         self.assertTrue(dense_midrange.use_2cta_instrs)
         self.assertEqual(dense_midrange.pipeline_family, "fa4_2cta")
-        self.assertFalse(dense_above_range.use_2cta_instrs)
-        self.assertEqual(dense_above_range.pipeline_family, "fa4")
+        self.assertTrue(dense_long.use_2cta_instrs)
+        self.assertEqual(dense_long.pipeline_family, "fa4_2cta")
+        self.assertTrue(dense_long_degree1.use_2cta_instrs)
+        self.assertEqual(dense_long_degree1.pipeline_family, "fa4_2cta")
+        self.assertEqual(dense_long_degree1.exp2_packet, "deg1_16x8")
+        self.assertTrue(
+            _cute_flash._flash_disc_exp2_codegen_params(
+                dense_long_degree1.exp2_packet,
+                dense_long_degree1.e2e_freq,
+                dense_long_degree1.e2e_res,
+            ).degree1_unmasked
+        )
+        self.assertFalse(dense_long_unaligned.use_2cta_instrs)
+        self.assertEqual(dense_long_unaligned.pipeline_family, "fa4")
         self.assertFalse(dense_bf16.use_2cta_instrs)
         self.assertEqual(dense_bf16.pipeline_family, "fa4")
         self.assertFalse(causal.use_2cta_instrs)
@@ -4736,10 +4811,17 @@ class TestCuteBackend(TestCase):
             eligible_midrange[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
             or (),
         )
-        ineligible_above_range = _cute_flash.flash_autotune_fragments(64, 2052)
+        eligible_long = _cute_flash.flash_autotune_fragments(64, 2052)
+        self.assertIn(
+            "fa4_2cta",
+            eligible_long[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices or (),
+        )
+        ineligible_long_unaligned = _cute_flash.flash_autotune_fragments(64, 2050)
         self.assertNotIn(
             "fa4_2cta",
-            ineligible_above_range[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
+            ineligible_long_unaligned[
+                _cute_flash.FLASH_PIPELINE_FAMILY_KEY
+            ].search_choices
             or (),
         )
 
@@ -9866,7 +9948,7 @@ class TestCuteConfigValuePriors(TestCase):
             {8.0, 16.0, 32.0},
         )
         for key, values in {
-            FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap"},
+            FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap", "fa4_2cta"},
             FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
             FLASH_E2E_OFFSET_KEY: {0},
             FLASH_E2E_OFFSET0_KEY: {1},
