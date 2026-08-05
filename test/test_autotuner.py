@@ -242,8 +242,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
-        search._search_summary = None
-        search._exploration_tracker = None
+        search._search_space_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,
@@ -6092,8 +6091,7 @@ class TestAutotuneBudget(TestCase):
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
-        search._search_summary = None
-        search._exploration_tracker = None
+        search._search_space_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,

@@ -11,6 +11,7 @@ import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Iterator
 from typing import NamedTuple
 from typing import cast
 
@@ -586,6 +587,20 @@ def get_valid_store_cache_modifiers(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and supports_amd_cdna_tunables():
         return ("", ".cs", ".wt")
     return ("",)
+
+
+class SearchDimensionInfo(NamedTuple):
+    """One tunable search dimension described from the config spec.
+
+    ``cardinality`` is the number of distinct values (``None`` if unknown /
+    unbounded); ``values`` are the explicit choices when cheaply enumerable.
+    """
+
+    name: str
+    cardinality: int | None
+    values: list[object] | None
+    is_sequence: bool
+    num_items: int
 
 
 class ConfigSpec:
@@ -2318,6 +2333,37 @@ class ConfigSpec:
         shrink_block_sizes_for_numel_constraints(
             self.tensor_numel_constraints, block_sizes, min_sizes
         )
+
+    def iter_search_dimensions(
+        self, value_limit: int = 100
+    ) -> Iterator[SearchDimensionInfo]:
+        """Yield one :class:`SearchDimensionInfo` per tunable field.
+
+        Public entry point for describing the search space. Scalar fragments
+        report their own ``cardinality()``/``search_values()``; a
+        ``BlockIdSequence`` reports the product of its per-item cardinalities.
+        Fields whose sizing depends on ConfigSpec-level state rather than the
+        fragment (e.g. ``pid_type``, ``num_stages``) are left to the caller.
+        """
+        from .block_id_sequence import BlockIdSequence
+
+        for name, field in self._flat_fields().items():
+            if isinstance(field, BlockIdSequence):
+                yield SearchDimensionInfo(
+                    name=name,
+                    cardinality=field.cardinality(self),
+                    values=None,
+                    is_sequence=True,
+                    num_items=len(field),
+                )
+            else:
+                yield SearchDimensionInfo(
+                    name=name,
+                    cardinality=field.cardinality(),
+                    values=field.search_values(value_limit),
+                    is_sequence=False,
+                    num_items=0,
+                )
 
     def _flat_fields(
         self,

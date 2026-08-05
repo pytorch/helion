@@ -60,8 +60,7 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
-    from .search_space_logger import FeatureExplorationTracker
-    from .search_space_logger import SearchSpaceSummary
+    from .search_space_logger import SearchSpaceTracker
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
@@ -275,8 +274,7 @@ class BaseSearch(BaseAutotuner):
         self._benchmarked_members: dict[Config, PopulationMember] = {}
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
-        self._search_summary: SearchSpaceSummary | None = None
-        self._exploration_tracker: FeatureExplorationTracker | None = None
+        self._search_space_tracker: SearchSpaceTracker | None = None
 
     @property
     def performance_unit(self) -> Literal["ms", "ratio"]:
@@ -353,28 +351,25 @@ class BaseSearch(BaseAutotuner):
             or self.settings.autotune_log_search_space_verbose
         ):
             try:
-                from .search_space_logger import FeatureExplorationTracker
+                from .search_space_logger import SearchSpaceTracker
                 from .search_space_logger import analyze_search_space
 
                 hardware_spec, specialization_key = (
                     self._get_current_hardware_and_specialization()
                 )
-                self._search_summary = analyze_search_space(
+                report = analyze_search_space(
                     self.config_spec,
                     kernel_name=kernel_name,
                     specialization_key=specialization_key,
                     hardware=hardware_spec,
                 )
-                self._exploration_tracker = FeatureExplorationTracker(
-                    self._search_summary
-                )
+                self._search_space_tracker = SearchSpaceTracker(report)
             except Exception:
                 self.log.debug(
                     "Search space analysis setup failed; continuing autotuning",
                     exc_info=True,
                 )
-                self._search_summary = None
-                self._exploration_tracker = None
+                self._search_space_tracker = None
         host_function = getattr(self.kernel, "host_function", None)
         self._kernel_metadata: KernelMetadata = KernelMetadata(
             kernel_name=kernel_name,
@@ -536,10 +531,10 @@ class BaseSearch(BaseAutotuner):
         passing_configs, passing_indices = self._apply_config_filter(configs)
         # Record configs for exploration tracking. Diagnostic only; must never
         # interfere with benchmarking.
-        if self._exploration_tracker is not None:
+        if self._search_space_tracker is not None:
             try:
                 for config in passing_configs:
-                    self._exploration_tracker.record_config(config)
+                    self._search_space_tracker.record_config(config)
             except Exception:
                 self.log.debug(
                     "Exploration tracking failed; continuing autotuning",
@@ -688,50 +683,25 @@ class BaseSearch(BaseAutotuner):
         if (
             self.settings.autotune_log_search_space
             or self.settings.autotune_log_search_space_verbose
-        ) and self._search_summary is not None:
+        ) and self._search_space_tracker is not None:
             try:
+                from .local_cache import stable_autotune_hash
                 from .search_space_logger import log_search_space_comparison
-                from .search_space_logger import save_exploration_report
-                from .search_space_logger import save_search_space_summary
 
-                log_search_space_comparison(
-                    self.log._logger,
-                    self._search_summary,
-                    self._autotune_metrics.num_configs_tested,
-                    type(self).__name__,
-                    end - start,
+                tracker = self._search_space_tracker
+                tracker.record_invalid(self._generation_invalid_config_count())
+                report = tracker.finish(
+                    search_algorithm=type(self).__name__,
+                    elapsed_seconds=end - start,
                 )
-                report = None
-                if self._exploration_tracker is not None:
-                    self._exploration_tracker.record_invalid(
-                        self._generation_invalid_config_count()
-                    )
-                    report = self._exploration_tracker.generate_report(
-                        search_algorithm=type(self).__name__,
-                        elapsed_seconds=end - start,
-                    )
-                    report.log_summary(self.log._logger)
+                log_search_space_comparison(self.log._logger, report)
                 if self.settings.autotune_log_search_space_path:
-                    cache_hash = self._get_autotune_cache_hash()
-                    saved_path = save_search_space_summary(
-                        self._search_summary,
-                        self._autotune_metrics.num_configs_tested,
-                        type(self).__name__,
-                        end - start,
+                    saved_path = report.save(
                         self.settings.autotune_log_search_space_path,
-                        cache_hash,
+                        stable_autotune_hash(self),
                     )
                     if saved_path:
                         self.log(f"Search space analysis saved to: {saved_path}")
-                    if report is not None:
-                        report_path = save_exploration_report(
-                            report,
-                            saved_path,
-                        )
-                        if report_path:
-                            self.log(
-                                f"Feature exploration report saved to: {report_path}"
-                            )
             except Exception:
                 self.log.debug(
                     "Search space logging failed; continuing autotuning",
@@ -762,27 +732,6 @@ class BaseSearch(BaseAutotuner):
         specialization_key = str(_normalize_spec_key(spec_key))
 
         return hardware, specialization_key
-
-    def _get_autotune_cache_hash(self) -> str | None:
-        """Return the autotuner's stable local-cache hash for this run.
-
-        This is the same hash used as the ``.best_config`` cache filename stem,
-        so search-space logs written with it line up with the cache entry and
-        differ per kernel/shape. Best-effort: returns ``None`` if the kernel is
-        not cacheable or the key can't be built, so callers must tolerate None.
-        """
-        try:
-            if not self.kernel.is_cacheable():
-                return None
-            from .local_cache import LocalAutotuneCache
-
-            return LocalAutotuneCache(self)._generate_key().stable_hash()
-        except Exception:
-            self.log.debug(
-                "Could not compute autotune cache hash for search space log",
-                exc_info=True,
-            )
-            return None
 
     def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
         """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped.

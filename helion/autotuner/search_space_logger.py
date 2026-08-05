@@ -13,57 +13,158 @@ for autotuning, including:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
-import math
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any
-
-    from ..autotuner.block_id_sequence import BlockIdSequence
-    from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_spec import ConfigSpec
+    from ..autotuner.config_spec import SearchDimensionInfo
     from ..runtime.config import Config
 
 log = logging.getLogger(__name__)
 
 
+def canonical_config_id(config: Config) -> str:
+    """Stable 16-hex id for a config: sha256 of its canonical (sorted) JSON.
+
+    The same config always maps to the same id, so it is safe as a set key for
+    counting distinct configs. Shared with the autotuner dataset logger.
+    """
+    canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclasses.dataclass
-class SearchSpaceDimension:
-    """Description of one dimension of the search space."""
+class DimensionStats:
+    """One search dimension: its possible values and what was observed.
+
+    Merges the static description of a dimension (cardinality / enumerable
+    values / why it is constrained) with the dynamic exploration record
+    (distinct observed values), so coverage is computed from a single object.
+    """
 
     name: str
-    dim_type: str  # "discrete", "continuous", "boolean", "categorical"
-    size: int  # Number of possible values
-    values: list[object] | None = None  # Explicit values if small enough
-    constrained_by: str | None = None  # Why this dimension is restricted
+    dim_type: str  # "discrete" | "categorical"
+    cardinality: int  # number of possible values (0 == inapplicable)
+    possible_values: list[object] | None = None  # explicit values if enumerable
+    constrained_by: str | None = None
+    observed_values: set[object] = dataclasses.field(default_factory=set)
+
+    def observe(self, value: object) -> None:
+        try:
+            self.observed_values.add(value)
+        except TypeError:
+            # unhashable (e.g. nested list) -- coerce to repr for tracking
+            self.observed_values.add(repr(value))
+
+    @property
+    def observed_count(self) -> int:
+        """Distinct observed values, clamped to ``cardinality``.
+
+        The observed set can exceed a projected-size estimate, so clamp to keep
+        the displayed fraction sane (never ``7/4``).
+        """
+        if not self.cardinality:
+            return len(self.observed_values)
+        return min(len(self.observed_values), self.cardinality)
+
+    @property
+    def coverage_percent(self) -> float:
+        if not self.cardinality:
+            return 0.0
+        return (self.observed_count / self.cardinality) * 100
+
+    @property
+    def applicable(self) -> bool:
+        return self.cardinality > 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "type": self.dim_type,
+            "cardinality": self.cardinality,
+            "possible_values": (
+                self.possible_values if self.cardinality <= 100 else None
+            ),
+            "constrained_by": self.constrained_by,
+            "observed_count": self.observed_count,
+            "observed_values": sorted(self.observed_values, key=repr),
+            "coverage_percent": round(self.coverage_percent, 2),
+        }
+
+    def to_summary_line(self) -> str:
+        if not self.cardinality:
+            return f"{self.name}: no autotunable choices for this kernel"
+        return (
+            f"{self.name}: {self.observed_count}/{self.cardinality} "
+            f"options tested ({self.coverage_percent:.1f}%)"
+        )
 
 
 @dataclasses.dataclass
-class SearchSpaceSummary:
-    """Summary of the valid search space for one kernel."""
+class SearchSpaceReport:
+    """Unified search-space + exploration report for one kernel.
+
+    Combines the search-space description (identity, dimensions, restrictions,
+    total size) with the exploration outcome (configs attempted/valid/invalid,
+    timing, algorithm) and owns serialization + logging + saving.
+    """
 
     # Identity
     kernel_name: str
     specialization_key: str | None
-
-    # Backend/hardware constraints
     backend: str
     hardware: str | None
 
     # Search space structure
-    dimensions: list[SearchSpaceDimension]
+    dimensions: list[DimensionStats]
     total_search_space_size: int | None  # None if too large/infinite
-
-    # What's enabled/disabled
-    enabled_features: list[str]
-    disabled_features: list[str]  # (feature, reason) pairs
-
-    # Shape-dependent constraints
+    disabled_features: list[str]  # "feature: reason" strings
     shape_constraints: list[str]
+
+    # Exploration outcome (populated at finish()). ``configs_tested`` counts
+    # distinct configs (by canonical id) and is the denominator for coverage.
+    # ``explored_valid``/``explored_invalid`` are raw attempt counts (a config
+    # re-attempted across generations counts each time), kept on the same scale
+    # so ``explored_valid_percent`` is meaningful.
+    search_algorithm: str = ""
+    elapsed_seconds: float = 0.0
+    configs_tested: int = 0
+    explored_valid: int = 0
+    explored_invalid: int = 0
+
+    @property
+    def enabled_features(self) -> list[str]:
+        return [d.name for d in self.dimensions]
+
+    @property
+    def explored_total(self) -> int:
+        return self.explored_valid + self.explored_invalid
+
+    @property
+    def explored_valid_percent(self) -> float:
+        total = self.explored_total
+        return (self.explored_valid / total) * 100 if total else 0.0
+
+    @property
+    def applicable_dimensions(self) -> list[DimensionStats]:
+        return [d for d in self.dimensions if d.applicable]
+
+    @property
+    def avg_feature_coverage(self) -> float:
+        applicable = self.applicable_dimensions
+        if not applicable:
+            return 0.0
+        return sum(d.coverage_percent for d in applicable) / len(applicable)
+
+    @property
+    def min_feature_coverage(self) -> float:
+        applicable = self.applicable_dimensions
+        return min((d.coverage_percent for d in applicable), default=0.0)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -71,22 +172,26 @@ class SearchSpaceSummary:
             "specialization_key": self.specialization_key,
             "backend": self.backend,
             "hardware": self.hardware,
-            "dimensions": [
-                {
-                    "name": d.name,
-                    "type": d.dim_type,
-                    "size": d.size,
-                    "values": d.values if d.size <= 100 else None,
-                    "constrained_by": d.constrained_by,
-                }
-                for d in self.dimensions
-            ],
             "total_search_space_size": (
                 str(self.total_search_space_size)
                 if self.total_search_space_size is not None
                 else "infinite"
             ),
-            "enabled_features": self.enabled_features,
+            "search_algorithm": self.search_algorithm,
+            "elapsed_seconds": self.elapsed_seconds,
+            "configs_tested": self.configs_tested,
+            "explored_valid": self.explored_valid,
+            "explored_invalid": self.explored_invalid,
+            "explored_total": self.explored_total,
+            "explored_valid_percent": round(self.explored_valid_percent, 2),
+            "coverage_percent": (
+                round((self.configs_tested / self.total_search_space_size) * 100, 6)
+                if self.total_search_space_size
+                else None
+            ),
+            "avg_feature_coverage": round(self.avg_feature_coverage, 2),
+            "min_feature_coverage": round(self.min_feature_coverage, 2),
+            "dimensions": [d.to_dict() for d in self.dimensions],
             "disabled_features": self.disabled_features,
             "shape_constraints": self.shape_constraints,
         }
@@ -95,7 +200,7 @@ class SearchSpaceSummary:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
     def log_summary(self, logger: logging.Logger, level: int = logging.INFO) -> None:
-        """Log a human-readable summary."""
+        """Log a human-readable search-space + exploration summary."""
         size_str = (
             f"{self.total_search_space_size:,}"
             if self.total_search_space_size is not None
@@ -107,13 +212,12 @@ class SearchSpaceSummary:
         )
         logger.log(level, f"  Total search space size: {size_str}")
         logger.log(level, f"  Search dimensions: {len(self.dimensions)}")
+
         if self.disabled_features:
             logger.log(level, f"  Disabled features ({len(self.disabled_features)}):")
-            # Collapse features disabled solely because they aren't supported by
-            # the selected backend (the backend is already printed above) into a
-            # single summary line, and list feature-specific reasons explicitly.
-            generic_reason = f"Not supported by {self.backend} backend"
-            generic_suffix = f": {generic_reason}"
+            # Collapse features disabled solely because the selected backend
+            # doesn't support them into one line; list specific reasons.
+            generic_suffix = f": Not supported by {self.backend} backend"
             backend_specific = [
                 feat[: -len(generic_suffix)]
                 for feat in self.disabled_features
@@ -134,6 +238,7 @@ class SearchSpaceSummary:
                     f"    - {len(backend_specific)} feature(s) not supported by "
                     f"{self.backend} backend (e.g. {', '.join(backend_specific[:3])})",
                 )
+
         if self.shape_constraints:
             logger.log(level, f"  Shape constraints ({len(self.shape_constraints)}):")
             for constraint in self.shape_constraints[:5]:
@@ -141,154 +246,16 @@ class SearchSpaceSummary:
             if len(self.shape_constraints) > 5:
                 logger.log(level, f"    ... and {len(self.shape_constraints) - 5} more")
 
+        if not self.search_algorithm:
+            return
 
-@dataclasses.dataclass
-class FeatureExplorationStats:
-    """Statistics about which values of a feature were explored."""
-
-    feature_name: str
-    all_possible_values: list[object]  # All values in the search space
-    tested_values: list[object]  # Values that were actually tested
-    coverage_percent: float  # (tested / all) * 100
-    # Total number of possible values. May be larger than
-    # len(all_possible_values) when the values aren't explicitly enumerated
-    # (e.g. block_sizes, loop_orders); falls back to len(all_possible_values).
-    total_options: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.total_options is None:
-            self.total_options = len(self.all_possible_values)
-
-    @property
-    def displayed_tested_count(self) -> int:
-        """Number of tested values, clamped to ``total_options``.
-
-        The recorded tested set can occasionally exceed a dimension's size
-        estimate (the estimate bounds a projected space, while tracking counts
-        distinct observed values). Clamp so the displayed fraction is never
-        nonsensical (e.g. ``7/4``).
-        """
-        if not self.total_options:
-            return len(self.tested_values)
-        return min(len(self.tested_values), self.total_options)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "feature_name": self.feature_name,
-            "all_possible_values": self.all_possible_values,
-            "tested_values": self.tested_values,
-            "total_options": self.total_options,
-            "tested_options": self.displayed_tested_count,
-            "coverage_percent": round(self.coverage_percent, 2),
-        }
-
-    def to_summary_line(self) -> str:
-        """Single-line summary: 'pid_type: 2/8 options tested (25.0%)'."""
-        if not self.total_options:
-            # No choices are available for this kernel (e.g. epilogue_subtile on
-            # a non-matmul kernel). Report it as inapplicable rather than 0/0.
-            return f"{self.feature_name}: no autotunable choices for this kernel"
-        return (
-            f"{self.feature_name}: {self.displayed_tested_count}/{self.total_options} "
-            f"options tested ({self.coverage_percent:.1f}%)"
-        )
-
-
-@dataclasses.dataclass
-class ExplorationReport:
-    """Complete report on feature exploration during autotuning.
-
-    Identity/search-space fields (``kernel_name``, ``backend``,
-    ``total_search_space_size``) are not stored separately: they are composed
-    from a :class:`SearchSpaceSummary` and exposed as read-only properties so
-    there is a single source of truth for that metadata.
-    """
-
-    # Composed search-space metadata (the single source of truth for
-    # kernel_name / backend / total_search_space_size).
-    summary: SearchSpaceSummary
-
-    search_algorithm: str
-    elapsed_seconds: float
-    configs_tested: int
-
-    # Per-feature exploration stats
-    feature_stats: list[FeatureExplorationStats]
-
-    # Overall exploration quality
-    avg_feature_coverage: float  # Average coverage across all features
-    min_feature_coverage: float  # Minimum coverage (bottleneck feature)
-
-    # Explored-config validity breakdown. ``explored_valid`` configs survived
-    # unflattening (after in-place repair) and were tracked for exploration;
-    # ``explored_invalid`` were candidates that a config fragment / normalize
-    # step rejected as InvalidConfig before they could be benchmarked. Their
-    # sum is the total number of configurations the search attempted (counting
-    # repeats; algorithms such as differential evolution may re-attempt the
-    # same config across generations).
-    explored_valid: int = 0
-    explored_invalid: int = 0
-
-    @property
-    def kernel_name(self) -> str:
-        return self.summary.kernel_name
-
-    @property
-    def backend(self) -> str:
-        return self.summary.backend
-
-    @property
-    def total_search_space_size(self) -> int | None:
-        return self.summary.total_search_space_size
-
-    @property
-    def explored_total(self) -> int:
-        """Total configurations attempted (valid + invalid)."""
-        return self.explored_valid + self.explored_invalid
-
-    @property
-    def explored_valid_percent(self) -> float:
-        """Percentage of attempted configurations that were valid."""
-        total = self.explored_total
-        if total == 0:
-            return 0.0
-        return (self.explored_valid / total) * 100
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "kernel_name": self.kernel_name,
-            "backend": self.backend,
-            "search_algorithm": self.search_algorithm,
-            "elapsed_seconds": self.elapsed_seconds,
-            "configs_tested": self.configs_tested,
-            "total_search_space_size": (
-                str(self.total_search_space_size)
-                if self.total_search_space_size is not None
-                else "infinite"
-            ),
-            "explored_valid": self.explored_valid,
-            "explored_invalid": self.explored_invalid,
-            "explored_total": self.explored_total,
-            "explored_valid_percent": round(self.explored_valid_percent, 2),
-            "feature_stats": [stats.to_dict() for stats in self.feature_stats],
-            "avg_feature_coverage": round(self.avg_feature_coverage, 2),
-            "min_feature_coverage": round(self.min_feature_coverage, 2),
-        }
-
-    def log_summary(self, logger: logging.Logger, level: int = logging.INFO) -> None:
-        """Log a human-readable exploration summary."""
-        logger.log(level, f"\nFeature Exploration Report for {self.kernel_name}:")
-        logger.log(level, f"  Backend: {self.backend}")
+        # Exploration outcome.
         logger.log(level, f"  Search algorithm: {self.search_algorithm}")
         logger.log(
             level,
-            f"  Time: {self.elapsed_seconds:.1f}s, Configs tested: {self.configs_tested:,}",
+            f"  Time: {self.elapsed_seconds:.1f}s, "
+            f"Configs tested: {self.configs_tested:,}",
         )
-
-        # Report how many attempted configurations were valid vs. rejected by a
-        # config fragment / normalize step. Only meaningful once at least one
-        # candidate was attempted (search algorithms that never materialize
-        # candidates via the tracker leave these at zero).
         if self.explored_total > 0:
             logger.log(
                 level,
@@ -297,15 +264,9 @@ class ExplorationReport:
                 f"{self.explored_invalid:,} invalid, "
                 f"{self.explored_valid_percent:.1f}% valid)",
             )
-
-        if self.total_search_space_size is not None:
-            overall_coverage = (
-                self.configs_tested / self.total_search_space_size
-            ) * 100
-            logger.log(
-                level, f"  Overall search space coverage: {overall_coverage:.6f}%"
-            )
-
+        if self.total_search_space_size:
+            coverage = (self.configs_tested / self.total_search_space_size) * 100
+            logger.log(level, f"  Overall search space coverage: {coverage:.6f}%")
         logger.log(level, "  Per-feature exploration:")
         logger.log(
             level, f"    Average feature coverage: {self.avg_feature_coverage:.1f}%"
@@ -313,165 +274,92 @@ class ExplorationReport:
         logger.log(
             level, f"    Minimum feature coverage: {self.min_feature_coverage:.1f}%"
         )
-
-        # List all features with their exploration stats
-        for stats in sorted(self.feature_stats, key=lambda s: s.coverage_percent):
-            logger.log(level, f"    - {stats.to_summary_line()}")
-
-        # Highlight poorly explored features. Skip features with no available
-        # choices for this kernel (total_options == 0) — those are inapplicable,
-        # not under-explored.
-        poor_coverage = [
-            s
-            for s in self.feature_stats
-            if s.total_options and s.coverage_percent < 50.0
-        ]
-        if poor_coverage:
+        for dim in sorted(self.dimensions, key=lambda d: d.coverage_percent):
+            logger.log(level, f"    - {dim.to_summary_line()}")
+        poor = [d for d in self.applicable_dimensions if d.coverage_percent < 50.0]
+        if poor:
             logger.log(level, "\n  Features with <50% exploration:")
-            for stats in poor_coverage:
+            for dim in poor:
                 logger.log(
                     level,
-                    f"    - {stats.feature_name}: only {stats.displayed_tested_count} "
-                    f"of {stats.total_options} values tested",
+                    f"    - {dim.name}: only {dim.observed_count} "
+                    f"of {dim.cardinality} values tested",
                 )
 
+    def save(self, output_path: str, cache_hash: str | None = None) -> str:
+        """Best-effort write of the report as one JSON document.
 
-class FeatureExplorationTracker:
-    """Track which feature values are tested during autotuning.
+        Returns the written path, or an empty string on failure. Never raises:
+        search-space logging is diagnostic and must not crash the autotuner.
+        """
+        try:
+            path = resolve_report_path(
+                output_path,
+                kernel_name=self.kernel_name,
+                cache_hash=cache_hash,
+            )
+            path.write_text(self.to_json())
+            return str(path)
+        except Exception:
+            log.debug(
+                "Failed to save search space report to %r", output_path, exc_info=True
+            )
+            return ""
 
-    This tracker records every config tested and aggregates statistics
-    about which feature values were explored vs. which were available.
+
+class SearchSpaceTracker:
+    """Record which config values are tested during autotuning.
+
+    Owns the exploration counters and feeds observed values into the report's
+    :class:`DimensionStats`. ``finish()`` returns the completed report.
     """
 
-    def __init__(self, search_summary: SearchSpaceSummary) -> None:
-        self.search_summary = search_summary
-        self.tested_configs: list[Config] = []
-        self._feature_value_sets: dict[str, set[object]] = {}
-        # Count of candidate configs rejected as InvalidConfig before they
-        # could be benchmarked (see record_invalid). Valid explored configs are
-        # ``len(self.tested_configs)``.
+    def __init__(self, report: SearchSpaceReport) -> None:
+        self.report = report
+        self._dimensions = {d.name: d for d in report.dimensions}
+        self._seen_keys: set[str] = set()
+        # Raw count of valid configs recorded (duplicates counted), kept on the
+        # same scale as invalid_config_count for the validity breakdown.
+        self.valid_config_count: int = 0
         self.invalid_config_count: int = 0
 
-        # Initialize empty sets for each feature
-        for dim in search_summary.dimensions:
-            self._feature_value_sets[dim.name] = set()
-
     def record_config(self, config: Config) -> None:
-        """Record a tested (valid) configuration."""
-        self.tested_configs.append(config)
-
-        # Extract feature values from config
-        for feature_name in self._feature_value_sets:
-            value = _extract_feature_value(config, feature_name)
+        """Record a tested (valid) configuration and its observed values."""
+        self.valid_config_count += 1
+        self._seen_keys.add(canonical_config_id(config))
+        for name, dim in self._dimensions.items():
+            value = _extract_feature_value(config, name)
             if value is not None:
-                try:
-                    self._feature_value_sets[feature_name].add(value)
-                except TypeError:
-                    # unhashable (e.g. nested list) — coerce to repr for tracking
-                    self._feature_value_sets[feature_name].add(repr(value))
+                dim.observe(value)
 
     def record_invalid(self, count: int = 1) -> None:
-        """Record ``count`` candidate configs rejected as InvalidConfig.
-
-        These are candidates that a config fragment or normalize step ruled out
-        (e.g. a block size violating a tensor numel constraint) before they
-        could be benchmarked, so they never reach :meth:`record_config`.
-        """
+        """Record ``count`` candidate configs rejected as InvalidConfig."""
         if count > 0:
             self.invalid_config_count += count
 
-    def generate_report(
-        self,
-        search_algorithm: str,
-        elapsed_seconds: float,
-    ) -> ExplorationReport:
-        """Generate an exploration report from recorded configs."""
-        feature_stats: list[FeatureExplorationStats] = []
-
-        # Build mapping from search_summary dimensions
-        for dim in self.search_summary.dimensions:
-            all_values = dim.values if dim.values is not None else []
-            tested_values = sorted(
-                self._feature_value_sets.get(dim.name, set()), key=repr
-            )
-
-            # Some dimensions (e.g. block_sizes, loop_orders, l2_groupings,
-            # flatten_loops) don't enumerate explicit `values` but do compute a
-            # `size`. Use `size` as the denominator so coverage isn't divided by
-            # zero. Clamp tested count to the total so coverage never exceeds
-            # 100% (the recorded tested set can include configs the size
-            # estimate doesn't cover exactly).
-            total_options = len(all_values) if all_values else dim.size
-
-            if total_options > 0:
-                coverage = (
-                    min(len(tested_values), total_options) / total_options
-                ) * 100
-            else:
-                coverage = 0.0
-
-            feature_stats.append(
-                FeatureExplorationStats(
-                    feature_name=dim.name,
-                    all_possible_values=all_values,
-                    tested_values=tested_values,
-                    total_options=total_options,
-                    coverage_percent=coverage,
-                )
-            )
-
-        # Calculate aggregate metrics. Only features that actually have
-        # autotunable choices (total_options > 0) contribute; a feature with no
-        # available options (e.g. epilogue_subtile on a non-matmul kernel) is
-        # inapplicable, not under-explored, so it must not drag coverage to 0%.
-        applicable_stats = [s for s in feature_stats if s.total_options]
-        if applicable_stats:
-            avg_coverage = sum(s.coverage_percent for s in applicable_stats) / len(
-                applicable_stats
-            )
-            min_coverage = min(s.coverage_percent for s in applicable_stats)
-        else:
-            avg_coverage = 0.0
-            min_coverage = 0.0
-
-        return ExplorationReport(
-            summary=self.search_summary,
-            search_algorithm=search_algorithm,
-            elapsed_seconds=elapsed_seconds,
-            configs_tested=len(self.tested_configs),
-            feature_stats=feature_stats,
-            avg_feature_coverage=avg_coverage,
-            min_feature_coverage=min_coverage,
-            explored_valid=len(self.tested_configs),
-            explored_invalid=self.invalid_config_count,
-        )
+    def finish(
+        self, search_algorithm: str, elapsed_seconds: float
+    ) -> SearchSpaceReport:
+        """Populate the report's exploration outcome and return it."""
+        self.report.search_algorithm = search_algorithm
+        self.report.elapsed_seconds = elapsed_seconds
+        # configs_tested = distinct configs (coverage denominator);
+        # explored_valid/invalid = raw attempt counts (validity breakdown).
+        self.report.configs_tested = len(self._seen_keys)
+        self.report.explored_valid = self.valid_config_count
+        self.report.explored_invalid = self.invalid_config_count
+        return self.report
 
 
 def _extract_feature_value(config: Config, feature_name: str) -> object:
-    """Extract a feature value from a Config object.
-
-    Args:
-        config: The tested configuration
-        feature_name: Name of the feature to extract
-
-    Returns:
-        The feature value, or None if not applicable
-    """
-    # List-valued config attributes must be coerced to a hashable tuple so the
-    # tracker can add them to a set. These are the only genuine special cases;
-    # every scalar feature (pid_type, num_warps, num_stages, maxnreg,
-    # epilogue_subtile, ...) is a plain Config attribute handled by the generic
-    # getattr path below.
+    """Extract a feature value from a Config object (None if not applicable)."""
+    # List-valued config attributes are coerced to a hashable tuple.
     if feature_name in ("block_sizes", "loop_orders", "l2_groupings", "flatten_loops"):
         return tuple(getattr(config, feature_name))
-
-    # ``pallas_loop_type`` is stored in the config dict but is not exposed as a
-    # Config attribute/property, so it must be read via ``get``.
+    # ``pallas_loop_type`` is stored in the config dict, not as an attribute.
     if feature_name == "pallas_loop_type":
         return config.get("pallas_loop_type")
-
-    # Generic attribute access (covers pid_type, num_warps, num_stages,
-    # maxnreg, epilogue_subtile, and any other scalar tunable).
+    # Generic scalar tunables (pid_type, num_warps, num_stages, maxnreg, ...).
     return getattr(config, feature_name, None)
 
 
@@ -480,7 +368,7 @@ def analyze_search_space(
     kernel_name: str = "",
     specialization_key: str | None = None,
     hardware: str | None = None,
-) -> SearchSpaceSummary:
+) -> SearchSpaceReport:
     """Analyze the valid search space for a kernel's config spec.
 
     This examines which features are enabled/disabled based on:
@@ -496,20 +384,18 @@ def analyze_search_space(
         hardware: Optional hardware identifier
 
     Returns:
-        A SearchSpaceSummary describing the valid search space
+        A SearchSpaceReport describing the valid search space
     """
     from ..autotuner.config_spec import VALID_KEYS
     from ..autotuner.config_spec import VALID_PID_TYPES
 
-    dimensions: list[SearchSpaceDimension] = []
-    enabled_features: list[str] = []
+    dimensions: list[DimensionStats] = []
     disabled_features: list[str] = []
     shape_constraints: list[str] = []
 
     flat_fields = config_spec._flat_fields()
-    for name, field in flat_fields.items():
-        enabled_features.append(name)
-        dim = _dimension_from_field(name, field, config_spec)
+    for info in config_spec.iter_search_dimensions():
+        dim = _dimension_from_info(info, config_spec)
         if dim is not None:
             dimensions.append(dim)
 
@@ -572,316 +458,63 @@ def analyze_search_space(
     # Calculate total search space size (product of dimensions)
     total_size: int | None = 1
     for dim in dimensions:
-        if dim.size > 1:
+        if dim.cardinality > 1:
             if total_size is None:
                 break
-            total_size *= dim.size
+            total_size *= dim.cardinality
             if total_size > 10**12:  # Cap at 1 trillion
                 total_size = None
                 break
 
-    return SearchSpaceSummary(
+    return SearchSpaceReport(
         kernel_name=kernel_name,
         specialization_key=specialization_key,
         backend=config_spec.backend_name,
         hardware=hardware,
         dimensions=dimensions,
         total_search_space_size=total_size,
-        enabled_features=enabled_features,
         disabled_features=disabled_features,
         shape_constraints=shape_constraints,
     )
 
 
-# Dimensions requiring bespoke handling; routed to _analyze_dimension_size.
-# Every other field goes through the generic fragment dispatch.
-_SPECIAL_DIMENSIONS: frozenset[str] = frozenset(
-    {
-        "block_sizes",
-        "pid_type",
-        "num_stages",
-        "loop_orders",
-        "l2_groupings",
-        "flatten_loops",
-        "epilogue_subtile",
-        "pallas_loop_type",
-    }
-)
-
-
-def _fragment_size(frag: ConfigSpecFragment) -> int:
-    """Number of distinct values a scalar fragment can take.
-
-    Dispatches on fragment *type* rather than config key, so any current or
-    future scalar tunable is handled without a per-key branch.
-    """
-    from ..autotuner.config_fragment import BaseIntegerFragment
-    from ..autotuner.config_fragment import BooleanFragment
-    from ..autotuner.config_fragment import EnumFragment
-    from ..autotuner.config_fragment import IntegerFragment
-    from ..autotuner.config_fragment import NumThreadsFragment
-    from ..autotuner.config_fragment import PermutationFragment
-    from ..autotuner.config_fragment import PowerOfTwoFragment
-
-    if isinstance(frag, EnumFragment):
-        return len(frag._active_choices())
-    if isinstance(frag, BooleanFragment):
-        return 2
-    if isinstance(frag, PermutationFragment):
-        return math.factorial(frag.length)
-    if isinstance(frag, NumThreadsFragment):
-        # "0" (auto) plus every power of two up to ``high``.
-        return 1 + _count_power_of_two_values(1, frag.high)
-    if isinstance(frag, IntegerFragment):
-        return frag.high - frag.low + 1
-    if isinstance(frag, PowerOfTwoFragment):
-        # Covers BlockSizeFragment / NumWarpsFragment as well.
-        return _count_power_of_two_values(frag.low, frag.high)
-    if isinstance(frag, BaseIntegerFragment):
-        return frag.high - frag.low + 1
-    # Unknown fragment type: fall back to its encoded dimension as a lower bound.
-    return frag.dim()
-
-
-def _fragment_values(frag: ConfigSpecFragment) -> list[object] | None:
-    """Explicit list of values for a scalar fragment, when enumerable.
-
-    Returns ``None`` when the values aren't cheaply/usefully enumerable.
-    """
-    from ..autotuner.config_fragment import BaseIntegerFragment
-    from ..autotuner.config_fragment import BooleanFragment
-    from ..autotuner.config_fragment import EnumFragment
-    from ..autotuner.config_fragment import IntegerFragment
-    from ..autotuner.config_fragment import NumThreadsFragment
-    from ..autotuner.config_fragment import PowerOfTwoFragment
-
-    if isinstance(frag, EnumFragment):
-        return list(frag._active_choices())
-    if isinstance(frag, BooleanFragment):
-        return [False, True]
-    if isinstance(frag, NumThreadsFragment):
-        return [0, *_power_of_two_values(1, frag.high)]
-    if isinstance(frag, IntegerFragment):
-        return list(range(frag.low, frag.high + 1))
-    if isinstance(frag, PowerOfTwoFragment):
-        return _power_of_two_values(frag.low, frag.high)
-    if isinstance(frag, BaseIntegerFragment):
-        return list(range(frag.low, frag.high + 1))
-    return None
-
-
-def _dimension_from_field(
-    name: str,
-    field: BlockIdSequence[Any] | ConfigSpecFragment,
+def _dimension_from_info(
+    info: SearchDimensionInfo,
     config_spec: ConfigSpec,
-) -> SearchSpaceDimension | None:
-    """Build a :class:`SearchSpaceDimension` for one tunable field.
+) -> DimensionStats | None:
+    """Build a :class:`DimensionStats` from a spec-provided dimension.
 
-    Genuinely special dimensions (see ``_SPECIAL_DIMENSIONS``) are delegated to
-    :func:`_analyze_dimension_size` to preserve their bespoke sizing/messages.
-    A :class:`BlockIdSequence` field multiplies its per-item fragment sizes.
-    Any other field is a scalar fragment dispatched generically on its type.
+    Cardinality and values come from the config spec (fragment-derived); this
+    only attaches the human-readable ``constrained_by`` annotation, which is
+    spec-state specific and not encoded in the fragment itself.
     """
-    from ..autotuner.block_id_sequence import BlockIdSequence
+    from ..autotuner.config_spec import VALID_PID_TYPES
 
-    if name in _SPECIAL_DIMENSIONS:
-        return _analyze_dimension_size(config_spec, name)
+    cardinality = info.cardinality if info.cardinality is not None else 0
+    values = info.values if info.values is not None and cardinality <= 100 else None
 
-    if isinstance(field, BlockIdSequence):
-        num_items = len(field)
-        if num_items == 0:
-            return SearchSpaceDimension(
-                name=name,
-                dim_type="discrete",
-                size=0,
-                constrained_by="0 loop(s)",
-            )
-        total = 1
-        for item in field:
-            total *= _fragment_size(item._fragment(config_spec))
-        return SearchSpaceDimension(
-            name=name,
-            dim_type="discrete",
-            size=total,
-            constrained_by=f"{num_items} loop(s)",
-        )
-
-    # Scalar fragment: dispatch generically on fragment type.
-    size = _fragment_size(field)
-    values = _fragment_values(field)
-    return SearchSpaceDimension(
-        name=name,
-        dim_type="categorical",
-        size=size,
-        values=values if values is not None and size <= 100 else None,
-    )
-
-
-def _power_of_two_values(min_val: int, max_val: int) -> list[object]:
-    """List power-of-two values in ``[min_val, max_val]``."""
-    values: list[object] = []
-    val = 1
-    while val <= max_val:
-        if val >= min_val:
-            values.append(val)
-        val *= 2
-    return values
-
-
-def _analyze_dimension_size(
-    config_spec: ConfigSpec,
-    key: str,
-) -> SearchSpaceDimension | None:
-    """Analyze the size of one config dimension."""
-    from ..autotuner.config_fragment import IntegerFragment
-    from ..autotuner.config_spec import AUTOTUNED_PALLAS_LOOP_TYPES
-    from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
-
-    # Handle special cases
-    if key == "block_sizes":
-        total = 1
-        for spec in config_spec.block_sizes:
-            # Count power-of-two values in range
-            range_size = _count_power_of_two_values(spec.min_size, spec.max_size)
-            total *= range_size
-        return SearchSpaceDimension(
-            name="block_sizes",
-            dim_type="discrete",
-            size=total,
-            constrained_by="tensor numel constraints"
-            if config_spec.tensor_numel_constraints
-            else None,
-        )
-
-    if key == "pid_type":
-        from ..autotuner.config_spec import VALID_PID_TYPES
-
-        allowed: list[object] = list(config_spec.allowed_pid_types)
-        disabled = [pt for pt in VALID_PID_TYPES if pt not in allowed]
-        return SearchSpaceDimension(
-            name="pid_type",
-            dim_type="categorical",
-            size=len(allowed),
-            values=allowed,
-            constrained_by=(
+    constrained_by: str | None = None
+    if info.name == "block_sizes" and config_spec.tensor_numel_constraints:
+        constrained_by = "tensor numel constraints"
+    elif info.name == "pid_type":
+        disabled = [
+            pt for pt in VALID_PID_TYPES if pt not in config_spec.allowed_pid_types
+        ]
+        if disabled:
+            constrained_by = (
                 f"{len(disabled)} pid_type(s) disabled by kernel "
                 f"({', '.join(disabled)})"
-                if disabled
-                else None
-            ),
-        )
-
-    if key == "num_stages":
-        frag = config_spec._num_stages_fragment()
-        if isinstance(frag, IntegerFragment):
-            size = frag.high - frag.low + 1
-            return SearchSpaceDimension(
-                name="num_stages",
-                dim_type="discrete",
-                size=size,
-                values=list(range(frag.low, frag.high + 1)) if size <= 20 else None,
             )
-        return None
+    elif info.is_sequence and info.num_items:
+        constrained_by = f"{info.num_items} loop(s)"
 
-    if key == "loop_orders":
-        # ``config.loop_orders`` is a list[list[int]]: one permutation per loop
-        # spec. Each spec permutes ``len(spec.block_ids)`` block_ids, so the
-        # number of distinct orderings for that spec is
-        # ``factorial(len(spec.block_ids))`` and the total is their product.
-        size = 1
-        permuted_specs = 0
-        for spec in config_spec.loop_orders:
-            n = len(spec.block_ids)
-            if n <= 1:
-                continue  # A single (or empty) block_id has only one ordering.
-            permuted_specs += 1
-            size *= math.factorial(min(n, 6))  # Cap per-spec at 6! to bound size.
-        return SearchSpaceDimension(
-            name="loop_orders",
-            dim_type="discrete",
-            size=size,
-            constrained_by=f"{permuted_specs} permutable loop(s)"
-            if permuted_specs
-            else None,
-        )
-
-    if key == "pallas_loop_type":
-        if config_spec.has_pallas_inner_loops:
-            choices = (
-                VALID_PALLAS_LOOP_TYPES
-                if config_spec.has_symbolic_or_data_dependent_bounds
-                else AUTOTUNED_PALLAS_LOOP_TYPES
-            )
-            return SearchSpaceDimension(
-                name="pallas_loop_type",
-                dim_type="categorical",
-                size=len(choices),
-                values=list(choices),
-            )
-        return SearchSpaceDimension(
-            name="pallas_loop_type",
-            dim_type="categorical",
-            size=0,
-            constrained_by="no pallas inner loops",
-        )
-
-    if key == "epilogue_subtile":
-        if config_spec.epilogue_subtile_autotune_choices:
-            return SearchSpaceDimension(
-                name="epilogue_subtile",
-                dim_type="categorical",
-                size=len(config_spec.epilogue_subtile_autotune_choices),
-                values=[str(v) for v in config_spec.epilogue_subtile_autotune_choices],
-            )
-        return SearchSpaceDimension(
-            name="epilogue_subtile",
-            dim_type="categorical",
-            size=0,
-            constrained_by="not a matmul-like kernel or k_hint too small",
-        )
-
-    if key == "l2_groupings":
-        # ``config.l2_groupings`` is a list[int]: one power-of-two value per
-        # spec. Each slot uses PowerOfTwoFragment(1, 64, 1) → {1, 2, 4, 8, 16,
-        # 32, 64} = 7 values.
-        num_specs = len(config_spec.l2_groupings)
-        if num_specs == 0:
-            return None
-        per_slot_size = _count_power_of_two_values(1, 64)
-        return SearchSpaceDimension(
-            name="l2_groupings",
-            dim_type="discrete",
-            size=per_slot_size**num_specs,
-            constrained_by=f"{num_specs} loop(s)",
-        )
-
-    if key == "flatten_loops":
-        # Boolean per loop
-        num_specs = len(config_spec.flatten_loops)
-        if num_specs == 0:
-            return None
-        return SearchSpaceDimension(
-            name="flatten_loops",
-            dim_type="discrete",
-            size=2**num_specs,
-            constrained_by=f"{num_specs} loop(s)",
-        )
-
-    # Generic fragment analysis for other keys
-    return None
-
-
-def _count_power_of_two_values(min_val: int, max_val: int) -> int:
-    """Count power-of-two values in [min_val, max_val]."""
-    if min_val > max_val:
-        return 0
-    count = 0
-    val = 1
-    while val <= max_val:
-        if val >= min_val:
-            count += 1
-        val *= 2
-    return max(count, 1)  # At least one value
+    return DimensionStats(
+        name=info.name,
+        dim_type="discrete" if info.is_sequence else "categorical",
+        cardinality=cardinality,
+        possible_values=values,
+        constrained_by=constrained_by,
+    )
 
 
 def _get_disable_reason(config_spec: ConfigSpec, key: str) -> str:
@@ -925,228 +558,77 @@ def _get_disable_reason(config_spec: ConfigSpec, key: str) -> str:
 
 def log_search_space_comparison(
     logger: logging.Logger,
-    summary: SearchSpaceSummary,
-    configs_tested: int,
-    search_algorithm: str,
-    elapsed_seconds: float,
+    report: SearchSpaceReport,
 ) -> None:
-    """Log comparison of search space vs. what was actually searched.
+    """Log a search-space vs. searched comparison banner.
 
-    Args:
-        logger: Logger to write to
-        summary: The search space summary
-        configs_tested: Number of configs actually tested
-        search_algorithm: Name of the search algorithm used
-        elapsed_seconds: Total autotune time
+    All figures come from ``report`` so the banner, the report summary, and the
+    saved JSON never disagree.
     """
     logger.info("=" * 60)
     logger.info("Autotune Search Space Analysis")
     logger.info("=" * 60)
 
-    summary.log_summary(logger, logging.INFO)
+    report.log_summary(logger, logging.INFO)
 
-    if (
-        summary.total_search_space_size is not None
-        and summary.total_search_space_size > 0
-    ):
-        coverage = (configs_tested / summary.total_search_space_size) * 100
-        logger.info("\nSearch Coverage:")
-        logger.info(f"  Configs tested: {configs_tested:,}")
-        logger.info(f"  Total space: {summary.total_search_space_size:,}")
+    total = report.total_search_space_size
+    configs_tested = report.configs_tested
+    logger.info("\nSearch Coverage:")
+    logger.info(f"  Configs tested: {configs_tested:,}")
+    if total is not None and total > 0:
+        coverage = (configs_tested / total) * 100
+        logger.info(f"  Total space: {total:,}")
         logger.info(f"  Coverage: {coverage:.6f}%")
-        logger.info(f"  Search algorithm: {search_algorithm}")
-        logger.info(f"  Time elapsed: {elapsed_seconds:.1f}s")
+        logger.info(f"  Search algorithm: {report.search_algorithm}")
+        logger.info(f"  Time elapsed: {report.elapsed_seconds:.1f}s")
         if coverage < 0.01:
             logger.info(
-                "  Note: Very low coverage - consider increasing autotune_budget_seconds"
+                "  Note: Very low coverage - consider increasing "
+                "autotune_budget_seconds"
             )
     else:
-        logger.info("\nSearch Coverage:")
-        logger.info(f"  Configs tested: {configs_tested:,}")
         logger.info("  Total space: too large to enumerate")
-        logger.info(f"  Search algorithm: {search_algorithm}")
-        logger.info(f"  Time elapsed: {elapsed_seconds:.1f}s")
+        logger.info(f"  Search algorithm: {report.search_algorithm}")
+        logger.info(f"  Time elapsed: {report.elapsed_seconds:.1f}s")
 
     logger.info("=" * 60)
 
 
-def save_search_space_summary(
-    summary: SearchSpaceSummary,
-    configs_tested: int,
-    search_algorithm: str,
-    elapsed_seconds: float,
-    output_path: str,
-    cache_hash: str | None = None,
-) -> str:
-    """Save search space analysis to a JSON file.
-
-    Args:
-        summary: The search space summary
-        configs_tested: Number of configs actually tested
-        search_algorithm: Name of the search algorithm used
-        elapsed_seconds: Total autotune time
-        output_path: Path to save the JSON file
-        cache_hash: The autotuner's stable cache hash for this kernel/shape.
-            When provided, it is injected into the filename so each kernel/run
-            writes a distinct file (matching the ``.best_config`` cache key)
-            instead of overwriting a shared ``output_path``.
-
-    Returns:
-        The path to the saved file, or an empty string if saving failed. This
-        function is best-effort and never raises: search space logging is
-        purely diagnostic and must never crash the autotuner.
-    """
-    output = {
-        **summary.to_dict(),
-        "configs_tested": configs_tested,
-        "search_algorithm": search_algorithm,
-        "elapsed_seconds": elapsed_seconds,
-        "coverage_percent": (
-            (configs_tested / summary.total_search_space_size) * 100
-            if summary.total_search_space_size and summary.total_search_space_size > 0
-            else None
-        ),
-    }
-
-    try:
-        path = _build_unique_output_path(
-            output_path,
-            kernel_name=summary.kernel_name,
-            cache_hash=cache_hash,
-            default_filename="autotune_search_space.json",
-        )
-        path.write_text(json.dumps(output, indent=2, default=str))
-        return str(path)
-    except Exception:
-        log.debug(
-            "Failed to save search space summary to %r", output_path, exc_info=True
-        )
-        return ""
-
-
-def save_exploration_report(
-    report: ExplorationReport,
-    summary_path: str,
-) -> str:
-    """Save a feature exploration report next to a saved search space summary.
-
-    The report is written alongside ``summary_path`` (the concrete path returned
-    by :func:`save_search_space_summary`) with its ``.json`` suffix replaced by
-    ``_exploration.json``. Passing the already-resolved summary path — rather
-    than the raw configured path — guarantees the two files share the same
-    kernel/hash token and therefore always pair up.
-
-    Args:
-        report: The exploration report to serialize.
-        summary_path: The concrete path the search space summary was written to
-            (the return value of :func:`save_search_space_summary`). An empty
-            string (summary save failed) is treated as nothing to do.
-
-    Returns:
-        The path to the saved file, or an empty string if saving failed or was
-        skipped. This function is best-effort and never raises: search space
-        logging is purely diagnostic and must never crash the autotuner.
-    """
-    if not summary_path:
-        return ""
-    try:
-        path = Path(summary_path)
-        # Derive the exploration report path from the resolved summary path so
-        # the two files always sit side by side and share the same token. Only
-        # the true extension is swapped (not any ".json" that happens to appear
-        # earlier in the stem, e.g. a kernel literally named "foo.json").
-        report_path = path.with_name(f"{path.stem}_exploration{path.suffix or '.json'}")
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(json.dumps(report.to_dict(), indent=2, default=str))
-        return str(report_path)
-    except Exception:
-        log.debug(
-            "Failed to save exploration report near %r", summary_path, exc_info=True
-        )
-        return ""
-
-
-def _sanitize_filename_token(token: str) -> str:
-    """Reduce ``token`` to a filesystem-safe fragment for use in a filename."""
-    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", token).strip("._-")
-    return cleaned[:64]  # keep filenames from growing unbounded
-
-
-def _build_unique_output_path(
+def resolve_report_path(
     output_path: str,
     kernel_name: str,
     cache_hash: str | None,
-    default_filename: str,
+    default_filename: str = "autotune_search_space.json",
 ) -> Path:
-    """Resolve ``output_path`` to a per-kernel file path.
+    """Resolve ``output_path`` to a per-kernel report file path.
 
+    Directory paths (existing or trailing-separator) get ``default_filename``.
     The kernel name and the autotuner's stable cache hash are injected into the
-    filename stem so different kernels/shapes each write a distinct file
-    (matching the ``.best_config`` cache key) instead of overwriting a shared
-    ``output_path``. Re-tuning the *same* kernel/shape reuses the same hash and
-    intentionally rewrites its file, mirroring the cache. Directory paths
-    (existing or trailing-separator) are supported by writing the default
-    filename into them.
+    filename stem so each kernel/shape writes a distinct file (matching the
+    ``.best_config`` cache key). Re-tuning the same kernel/shape reuses the hash
+    and intentionally rewrites its file; without a hash, a numeric suffix guards
+    against clobbering an unrelated file.
 
     Example: ``analysis.json`` -> ``analysis.my_kernel.3f9a1c2e.json``.
-
-    Args:
-        output_path: The user-provided path (may be a file or directory).
-        kernel_name: Kernel name to embed in the filename (may be empty).
-        cache_hash: The autotuner stable cache hash to embed (may be None/empty,
-            in which case only the kernel name is used).
-        default_filename: Filename to use if ``output_path`` refers to a
-            directory.
-
-    Returns:
-        A resolved :class:`~pathlib.Path` whose parent directory exists. If no
-        distinguishing token is available and a file already exists at the
-        computed path, a numeric suffix is appended so nothing is overwritten.
     """
-    base = _resolve_output_path(output_path, default_filename)
 
-    parts = [base.stem]
-    kernel_token = _sanitize_filename_token(kernel_name)
-    if kernel_token:
-        parts.append(kernel_token)
-    hash_token = _sanitize_filename_token(cache_hash or "")
-    if hash_token:
-        parts.append(hash_token)
-    candidate = base.with_name(f"{'.'.join(parts)}{base.suffix}")
+    def token(value: str) -> str:
+        return re.sub(r"[^0-9A-Za-z._-]+", "_", value).strip("._-")[:64]
 
-    # A hash token makes the path deterministic and unique per kernel/shape;
-    # rewriting it on re-tune is intentional (mirrors the .best_config cache).
-    # Only when no hash is available do we guard against clobbering an unrelated
-    # file by appending a numeric suffix.
-    if hash_token:
+    path = Path(output_path)
+    if path.is_dir() or output_path.endswith(("/", "\\")):
+        path = path / default_filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    parts = [
+        path.stem,
+        *(t for t in (token(kernel_name), token(cache_hash or "")) if t),
+    ]
+    candidate = path.with_name(f"{'.'.join(parts)}{path.suffix}")
+    if token(cache_hash or ""):
         return candidate
     counter = 1
     while candidate.exists():
-        candidate = base.with_name(f"{'.'.join(parts)}.{counter}{base.suffix}")
+        candidate = path.with_name(f"{'.'.join(parts)}.{counter}{path.suffix}")
         counter += 1
     return candidate
-
-
-def _resolve_output_path(output_path: str, default_filename: str) -> Path:
-    """Resolve ``output_path`` to a concrete file path safe to write to.
-
-    Handles the cases where ``output_path`` is a directory (existing or with a
-    trailing separator) by appending ``default_filename``, and ensures the
-    parent directory exists.
-
-    Args:
-        output_path: The user-provided path (may be a file or directory).
-        default_filename: Filename to use if ``output_path`` refers to a
-            directory.
-
-    Returns:
-        A resolved :class:`~pathlib.Path` whose parent directory exists.
-    """
-    path = Path(output_path)
-    # Treat an existing directory, or a path ending in a separator (an intended
-    # directory that may not exist yet), as a directory to write into.
-    ends_with_sep = output_path.endswith(("/", "\\"))
-    if path.is_dir() or ends_with_sep:
-        path = path / default_filename
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
