@@ -40,7 +40,6 @@ from .._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
 from .._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
 from .._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
-from .._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
 from .._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from .._compiler.cute.cute_flash import FlashAttentionConfig
@@ -653,6 +652,7 @@ class ConfigSpec:
         self._cute_flash_has_kv_tile_pruning: bool = False
         self._cute_flash_requires_ws_overlap: bool = False
         self._cute_flash_small_biased_candidate: bool = False
+        self._cute_flash_standard_dense_output: bool = False
         self._cute_flash_block_size_targets: dict[int, int] = {}
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
@@ -818,6 +818,7 @@ class ConfigSpec:
             flash_config,
             dtype=self._cute_flash_dtype,
             is_causal=self._cute_flash_is_causal,
+            standard_dense_output=self._cute_flash_standard_dense_output,
             prefer_packed_reduce=(
                 self._cute_flash_has_kv_tile_pruning
                 or self._cute_flash_requires_ws_overlap
@@ -838,8 +839,12 @@ class ConfigSpec:
             return
         assert self._cute_flash_head_dim is not None
         assert self._cute_flash_num_kv is not None
-        config.pop(FLASH_Q_TILE_COUNT_KEY, None)
-        config.pop(FLASH_MMA_INTERLEAVE_KEY, None)
+        # ``q_tile_count`` is a family-derived invariant and is projected back
+        # to its canonical value below.  The historical MMA key accepted any
+        # truthy object, so preserve that fixed-config compatibility before the
+        # active Boolean fragment validates it.
+        if FLASH_MMA_INTERLEAVE_KEY in config:
+            config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
         from .._compiler.cute.cute_flash import flash_autotune_fragments
 
         block_size_targets = self._cute_flash_block_size_target_list()
@@ -902,6 +907,7 @@ class ConfigSpec:
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
+            standard_dense_output=self._cute_flash_standard_dense_output,
             topology_override=cast("str | None", topology_override),
             pipeline_family_override=pipeline_family_override,
         )
@@ -1080,11 +1086,7 @@ class ConfigSpec:
             effective_topology,
             fix_invalid=fix_invalid,
         )
-        for key in (
-            *FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS,
-            FLASH_Q_TILE_COUNT_KEY,
-            FLASH_MMA_INTERLEAVE_KEY,
-        ):
+        for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
             config.pop(key, None)
 
     def _normalize_cute_flash_register_budget(
@@ -1157,6 +1159,7 @@ class ConfigSpec:
         has_kv_tile_pruning: bool = False,
         requires_ws_overlap: bool = False,
         small_biased_candidate: bool = False,
+        standard_dense_output: bool = False,
     ) -> None:
         self.cute_flash_search_enabled = True
         self._cute_flash_head_dim = head_dim
@@ -1166,6 +1169,7 @@ class ConfigSpec:
         self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
         self._cute_flash_requires_ws_overlap = requires_ws_overlap
         self._cute_flash_small_biased_candidate = small_biased_candidate
+        self._cute_flash_standard_dense_output = standard_dense_output
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -2328,6 +2332,7 @@ class ConfigSpec:
                         small_biased_candidate=(
                             self._cute_flash_small_biased_candidate
                         ),
+                        standard_dense_output=self._cute_flash_standard_dense_output,
                     )
                 )
             elif self.supports_config_key("num_threads"):
