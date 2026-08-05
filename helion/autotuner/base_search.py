@@ -365,8 +365,9 @@ class BaseSearch(BaseAutotuner):
                 )
                 self._search_space_tracker = SearchSpaceTracker(report)
             except Exception:
-                self.log.debug(
-                    "Search space analysis setup failed; continuing autotuning",
+                self.log.warning(
+                    "Search space analysis setup failed; the end-of-run summary "
+                    "will be skipped (autotuning continues normally)",
                     exc_info=True,
                 )
                 self._search_space_tracker = None
@@ -692,12 +693,27 @@ class BaseSearch(BaseAutotuner):
         if (
             self.settings.autotune_log_search_space
             or self.settings.autotune_log_search_space_verbose
-        ) and self._search_space_tracker is not None:
+        ):
             try:
                 from .local_cache import stable_autotune_hash
                 from .search_space_logger import log_search_space_comparison
 
                 tracker = self._search_space_tracker
+                if tracker is None:
+                    from .search_space_logger import SearchSpaceTracker
+                    from .search_space_logger import analyze_search_space
+
+                    hardware_spec, specialization_key = (
+                        self._get_current_hardware_and_specialization()
+                    )
+                    tracker = SearchSpaceTracker(
+                        analyze_search_space(
+                            self.config_spec,
+                            kernel_name=self._autotune_metrics.kernel_name,
+                            specialization_key=specialization_key,
+                            hardware=hardware_spec,
+                        )
+                    )
                 tracker.record_invalid(self._generation_invalid_config_count())
                 report = tracker.finish(
                     search_algorithm=type(self).__name__,
@@ -712,8 +728,9 @@ class BaseSearch(BaseAutotuner):
                     if saved_path:
                         self.log(f"Search space analysis saved to: {saved_path}")
             except Exception:
-                self.log.debug(
-                    "Search space logging failed; continuing autotuning",
+                self.log.warning(
+                    "Search space logging failed; the end-of-run summary was not "
+                    "emitted (autotuning result is unaffected)",
                     exc_info=True,
                 )
         cached_path = self.kernel.get_cached_path(best)
