@@ -122,7 +122,7 @@ class SearchSpaceReport:
 
     # Search space structure
     dimensions: list[DimensionStats]
-    total_search_space_size: int | None  # None if too large/infinite
+    total_search_space_size: int | None  # exact product, or None if unknown
     disabled_features: list[str]  # "feature: reason" strings
     shape_constraints: list[str]
 
@@ -175,7 +175,7 @@ class SearchSpaceReport:
             "total_search_space_size": (
                 str(self.total_search_space_size)
                 if self.total_search_space_size is not None
-                else "infinite"
+                else "unknown"
             ),
             "search_algorithm": self.search_algorithm,
             "elapsed_seconds": self.elapsed_seconds,
@@ -204,7 +204,7 @@ class SearchSpaceReport:
         size_str = (
             f"{self.total_search_space_size:,}"
             if self.total_search_space_size is not None
-            else "infinite"
+            else "unknown"
         )
         logger.log(level, f"Search space for {self.kernel_name}:")
         logger.log(
@@ -455,16 +455,17 @@ def analyze_search_space(
             f"epilogue_subtile enabled for k_hint={config_spec.epilogue_subtile_k_hint}"
         )
 
-    # Calculate total search space size (product of dimensions)
+    # Total search space size: exact product of per-dimension cardinalities.
+    # A dimension whose cardinality is unknown (0 sentinel from a fragment that
+    # can't report one) makes the total unknown; otherwise the product is exact
+    # (Python big ints, so large attention-style spaces report a real number
+    # rather than being truncated).
     total_size: int | None = 1
     for dim in dimensions:
-        if dim.cardinality > 1:
-            if total_size is None:
-                break
-            total_size *= dim.cardinality
-            if total_size > 10**12:  # Cap at 1 trillion
-                total_size = None
-                break
+        if dim.cardinality == 0:
+            total_size = None
+            break
+        total_size *= dim.cardinality
 
     return SearchSpaceReport(
         kernel_name=kernel_name,
@@ -587,7 +588,9 @@ def log_search_space_comparison(
                 "autotune_budget_seconds"
             )
     else:
-        logger.info("  Total space: too large to enumerate")
+        logger.info(
+            "  Total space: unknown (a dimension's cardinality could not be determined)"
+        )
         logger.info(f"  Search algorithm: {report.search_algorithm}")
         logger.info(f"  Time elapsed: {report.elapsed_seconds:.1f}s")
 

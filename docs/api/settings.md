@@ -165,6 +165,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
     - **Feature exploration report**: Per-feature statistics showing how many options were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
     - **Exploration quality**: Average and minimum feature coverage, highlighting poorly explored features (<50%)
 
+    The total search space size is the exact combinatorial product of every
+    dimension's cardinality (an arbitrary-precision integer, so for large kernels
+    it can be very large); it is reported as ``unknown`` only when some
+    dimension's cardinality cannot be determined.
+
     Default is ``False``. Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE`` (set to ``1`` to enable).
 
     See :doc:`autotuner` for example output and the :py:mod:`helion.autotuner.search_space_logger` module for implementation details.

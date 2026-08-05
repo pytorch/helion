@@ -212,7 +212,7 @@ search stops. The default is ``None`` (no budget).
 Helion can log a search space analysis after each autotune run (opt-in, disabled by default). This feature helps you understand:
 
 - **Which features are being searched** — Shows enabled/disabled config keys and why (backend constraints, hardware limits, kernel properties)
-- **Total search space size** — Calculates the combinatorial space from all search dimensions
+- **Total search space size** — The exact combinatorial product of all search dimensions' cardinalities (an arbitrary-precision integer that can be very large; reported as ``unknown`` only when a dimension's cardinality can't be determined)
 - **Coverage metrics** — How many configs were tested vs. total space
 - **Per-feature exploration** — Exactly how many options of each feature were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
 
