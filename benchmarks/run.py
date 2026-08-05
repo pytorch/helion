@@ -519,7 +519,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         {
             "num_inputs": 8,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
             "non_square": "",  # use --non-square shapes
-            "rep": "3000",  # gemm b200 can have noisy results from throttling
+            # gemm b200 can have noisy results from throttling. Not on XPU: a
+            # timing-enabled Event.record() there costs ~200us of host time,
+            # growing with the number of outstanding events, so the thousands
+            # of iterations in a 3 s window inflate the recorded timings.
+            **({} if torch.xpu.is_available() else {"rep": "3000"}),
         },
     ),
     "gemm-bwd": (

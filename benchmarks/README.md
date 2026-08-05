@@ -17,6 +17,18 @@ For example, to benchmark the CuTe backend:
 
 `$ python benchmarks/run.py --helion-backend cute --metrics speedup,accuracy --kernel gemm`
 
+### Intel GPU (XPU)
+
+The benchmark runner also works on Intel GPUs. Pass `--device xpu` to run the
+kernels through TritonBench on an XPU device:
+
+`$ python benchmarks/run.py --device xpu --metrics speedup,accuracy --kernel vector_add`
+
+This needs TritonBench `main` from 2026-09-08 or later, which includes the Intel
+XPU support series (meta-pytorch/tritonbench#1217 to #1220). The commit pinned in
+`.github/ci_commit_pins/tritonbench.txt` predates it, so update an older
+TritonBench checkout (e.g. `benchmarks/tritonbench`) first.
+
 ### CUDA Graph Benchmarking
 
 For more accurate kernel performance measurements, especially during autotuning, you can enable CUDA graph benchmarking:

@@ -163,8 +163,14 @@ def ragged_attention_tritonbench(
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None,
     max_seq_len: int,
+    seq_sparsity: float | None = None,
 ) -> Callable[[], torch.Tensor]:
-    """Wrapper function for jagged attention kernel"""
+    """Wrapper function for jagged attention kernel.
+
+    TritonBench's ragged_attention ``get_test_inputs`` returns a trailing
+    ``seq_sparsity`` value (unused by this kernel); accept it as an optional
+    argument so the wrapper matches the operator's input tuple.
+    """
     return lambda: _helion_jagged_attention_kernel(
         max_seq_len=max_seq_len,
         alpha=1.0 / v.size(2) ** 2,
