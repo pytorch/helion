@@ -106,7 +106,7 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
-@_decorators.codegen(subscript, flydsl)
+@_decorators.codegen(subscript, "flydsl")
 def _(state: CodegenState) -> ast.AST:
     # FlyDSL per-thread scalars: shape-only subscripts like [:, None] are no-ops.
     return state.ast_arg(0)

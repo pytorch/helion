@@ -11,6 +11,7 @@ import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import ClassVar
 from typing import NamedTuple
 from typing import Sequence
 
@@ -3395,7 +3396,12 @@ class FlyDSLBackend(Backend):
         # model (indices = offset//4 + lane), so the step must be V*64 = 256.
         # We validate this in _add to catch any future rogue config.
         _bs_ids = spec.block_sizes.valid_block_ids()
-        _user_tiled = any(f.block_id in _bs_ids for f in spec.reduction_facts)
+        # Detect user-tiled reductions: env block_sizes marked reduction=True
+        # whose block_id is in spec.block_sizes (not spec.reduction_loops).
+        _user_tiled = any(
+            info.reduction and info.block_id in _bs_ids
+            for info in bound_kernel.env.block_sizes
+        )
 
         # For user-tiled reductions, pin ALL column dims to 256 in the template
         # so every generated candidate (and the effective default) is valid.
@@ -3653,7 +3659,9 @@ class FlyDSLBackend(Backend):
         _env = CompileEnvironment.current()
         _spec = _env.config_spec
         _bs_ids = _spec.block_sizes.valid_block_ids()
-        if any(f.block_id in _bs_ids for f in _spec.reduction_facts):
+        if any(
+            info.reduction and info.block_id in _bs_ids for info in _env.block_sizes
+        ):
             if any(int(b) % 256 != 0 for b in bs[1:]):
                 raise exc.BackendUnsupported(
                     self.name,

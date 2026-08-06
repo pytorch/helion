@@ -15,9 +15,12 @@ from .. import exc
 from . import _decorators
 
 if TYPE_CHECKING:
+    import ast
+
     from .._compiler.helper_function import CombineFunction
     from .._compiler.helper_function import CombineFunctionBasic
     from .._compiler.helper_function import CombineFunctionTuple
+    from .._compiler.inductor_lowering import CodegenState
 
 
 __all__ = ["reduce"]
@@ -463,6 +466,8 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if dim is None:
         raise exc.BackendUnsupported("flydsl", "hl.reduce(..., dim=None)")
 
+    from .._compiler.cute.reduce_ops import _infer_builtin_reduction_type_for_cute
+
     reduction_type = _infer_builtin_reduction_type_for_cute(
         state, int(combine_graph_id)
     )
@@ -504,173 +509,3 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
             raise exc.BackendUnsupported("flydsl", f"reduction {reduction_type!r}")
 
     return expr_from_string(r)
-
-
-@_decorators.codegen(_reduce, "cute")
-def _(state: CodegenState) -> ast.AST | list[ast.AST]:
-    from .._compiler.ast_extension import expr_from_string
-
-    combine_graph_id = state.proxy_arg(0)
-    dim = state.proxy_arg(2)
-    is_tuple_input = bool(state.proxy_arg(4))
-
-    if dim is None:
-        raise exc.BackendUnsupported("cute", "hl.reduce(..., dim=None)")
-
-    from .._compiler.compile_environment import CompileEnvironment
-
-    backend = CompileEnvironment.current().backend
-    dim_int = cast("int", dim)
-    combine_graph_id_int = cast("int", combine_graph_id)
-
-    if not is_tuple_input:
-        reduction_type = _infer_builtin_reduction_type_for_cute(
-            state, combine_graph_id_int
-        )
-        if reduction_type is None:
-            raise exc.BackendUnsupported(
-                "cute",
-                "hl.reduce custom combine function",
-            )
-        input_name = state.codegen.lift(
-            state.ast_arg(1), dce=True, prefix="reduce_input"
-        ).id
-        return expr_from_string(
-            backend.reduction_expr(
-                input_name,
-                reduction_type,
-                dim_int,
-            )
-        )
-
-    proxy_input = state.proxy_arg(1)
-    ast_input = state.ast_args[1]
-    if not isinstance(proxy_input, (tuple, list)) or not isinstance(
-        ast_input, (tuple, list)
-    ):
-        raise exc.BackendUnsupported("cute", "hl.reduce tuple inputs")
-    tuple_arity = len(proxy_input)
-    if len(ast_input) != tuple_arity:
-        raise exc.BackendUnsupported("cute", "hl.reduce tuple inputs")
-
-    if reduction_types := _infer_tuple_builtin_reduction_types_for_cute(
-        state, combine_graph_id_int, tuple_arity
-    ):
-        result_exprs: list[ast.AST] = []
-        for i, reduction_type in enumerate(reduction_types):
-            input_node = ast_input[i]
-            assert isinstance(input_node, ast.AST), input_node
-            input_name = state.codegen.lift(
-                input_node, dce=True, prefix=f"reduce_input_{i}"
-            ).id
-            result_exprs.append(
-                expr_from_string(
-                    backend.reduction_expr(
-                        input_name,
-                        reduction_type,
-                        dim_int,
-                    )
-                )
-            )
-        return result_exprs
-
-    argreduce_type = _infer_tuple_argreduce_type_for_cute(state, combine_graph_id_int)
-    if argreduce_type is None:
-        raise exc.BackendUnsupported("cute", "hl.reduce tuple custom combine function")
-    if tuple_arity != 2:
-        raise exc.BackendUnsupported(
-            "cute",
-            "hl.reduce tuple arg-reductions require 2 tuple elements",
-        )
-    if not isinstance(proxy_input[0], torch.Tensor) or not isinstance(
-        proxy_input[1], torch.Tensor
-    ):
-        raise exc.BackendUnsupported("cute", "hl.reduce tuple arg-reduction inputs")
-    if not isinstance(ast_input[0], ast.AST) or not isinstance(ast_input[1], ast.AST):
-        raise exc.BackendUnsupported("cute", "hl.reduce tuple arg-reduction inputs")
-
-    value_name = state.codegen.lift(ast_input[0], dce=True, prefix="reduce_value").id
-    index_name = state.codegen.lift(ast_input[1], dce=True, prefix="reduce_index").id
-    index_dtype = proxy_input[1].dtype
-    value_reduction = "max" if argreduce_type == "argmax" else "min"
-    reduced_value_expr = expr_from_string(
-        backend.reduction_expr(
-            value_name,
-            value_reduction,
-            dim_int,
-        )
-    )
-    reduced_index_expr = expr_from_string(
-        backend.argreduce_result_expr(
-            value_name,
-            index_name,
-            argreduce_type,
-            dim_int,
-            index_dtype,
-            index_dtype=index_dtype,
-        )
-    )
-    return [reduced_value_expr, reduced_index_expr]
-
-
-def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:
-    """Register the helper function and return its final name."""
-    from .._compiler.device_ir import HelperFunctionGraphInfo
-
-    helper_graph_info = state.get_graph(combine_graph_id)
-    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
-    state.codegen.device_function.register_helper_function(helper_graph_info)
-    # Get the final name from the helper manager (which uses the namespace)
-    return state.codegen.device_function.helper_manager.get_final_name(
-        helper_graph_info
-    )
-
-
-def _create_reduce_expression(
-    input_tensor: ast.AST, dim: object, helper_func_name: str, keep_dims: bool
-) -> ast.AST:
-    """Create the tl.reduce expression."""
-    from .._compiler.ast_extension import expr_from_string
-
-    if dim is None:
-        # Reduce all dimensions
-        if keep_dims:
-            template = (
-                f"tl.reduce({{input_tensor}}, None, {helper_func_name}, keep_dims=True)"
-            )
-        else:
-            template = f"tl.reduce({{input_tensor}}, None, {helper_func_name})"
-        return expr_from_string(
-            template,
-            input_tensor=input_tensor,
-        )
-    # Reduce specific dimension
-    if keep_dims:
-        template = f"tl.reduce({{input_tensor}}, {{dim_value}}, {helper_func_name}, keep_dims=True)"
-    else:
-        template = f"tl.reduce({{input_tensor}}, {{dim_value}}, {helper_func_name})"
-    return expr_from_string(
-        template,
-        input_tensor=input_tensor,
-        # pyrefly: ignore [bad-argument-type]
-        dim_value=ast.Constant(value=dim),
-    )
-
-
-def _create_tuple_result_expressions(
-    state: CodegenState, reduce_expr: ast.AST
-) -> list[ast.AST]:
-    """Create getitem expressions for tuple results."""
-    from .._compiler.ast_extension import expr_from_string
-
-    raw_input = state.ast_args[1]
-    num_elements = len(raw_input) if isinstance(raw_input, tuple) else 2
-
-    return [
-        expr_from_string(
-            "{reduce_result}[{index}]",
-            reduce_result=reduce_expr,
-            index=ast.Constant(value=i),
-        )
-        for i in range(num_elements)
-    ]
