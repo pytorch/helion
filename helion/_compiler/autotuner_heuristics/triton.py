@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import BlockSizeSpec
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
+    from ...autotuner.config_spec import PointwiseElementwiseFact
     from ...autotuner.config_spec import ReductionDescriptor
     from ...autotuner.config_spec import ReductionKernelFact
     from ..compile_environment import CompileEnvironment
@@ -991,8 +992,15 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
     promote_seed_to_default = True
     PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"))
 
+    # Arches whose pointwise constants have been measured. An allow-list, not a
+    # ``>= sm100`` compare: an unmeasured arch (including a same-generation consumer
+    # part with a different SM count / bandwidth) keeps the conservative sm90 path.
+    TUNED_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", "sm100"),)
+
     # Hill-climbed constants (see _lab/pointwise/NOTEBOOK.md).
     TILE_BYTES = 8192  # target HBM bytes moved per tile
+    # Higher per-SM bandwidth needs more bytes in flight per program to saturate it.
+    TILE_BYTES_SM100 = 16384
     MIN_WAVES = 8  # grid >= num_sm * MIN_WAVES (size_hint-aware grid floor)
     BLOCK_FLOOR = 256  # never regress toward the bs=32 default
     # Per-program register/working-set ceiling (fp32-compute bytes) before spill / block-numel
@@ -1007,6 +1015,50 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
     ELEMS_PER_WARP = (
         64  # each warp needs at least this many tile elements to be worth spawning
     )
+    # Tile elements per thread at the optimum, as a ladder over the gather stride: a
+    # stride-k gather discards part of every 32B sector, so the same useful bytes need
+    # more requests in flight and the per-thread element count falls. Bands (16/4/2)
+    # rather than a ``16 // stride`` formula because they measure better -- stride 2
+    # wants 4, not 8, and the falloff flattens past stride 4. Tile elements, not
+    # elements-times-slab: the optimum does not scale with the untiled slab.
+    ELEMS_PER_THREAD_BY_STRIDE = ((1, 16), (4, 4))
+    ELEMS_PER_THREAD_WIDE_GATHER = 2
+    # Warp slots per SM (threads/SM / 32), the hardware residency limit. A CTA asking
+    # ``nw`` warps leaves room for ``slots // nw`` CTAs per SM, so the grid stays within
+    # one resident wave iff ``programs <= num_sm * (slots // nw)``: warps are free until
+    # they cost a second wave. Inert on a saturated grid (the largest fitting nw is 1).
+    # Overridden by the device's own limit where available.
+    WARP_SLOTS_PER_SM = 64
+    # Target a fraction just under a full wave -- the last warp doubling before the
+    # boundary costs more per-CTA parallelism than it buys in latency hiding.
+    WAVE_TARGET_NUMERATOR = 3
+    WAVE_TARGET_DENOMINATOR = 4
+    # Grid floor for occ_cap. Looser than sm90's: with ~2x the SMs the same wave count
+    # is twice the programs, and the tighter value only bound cells that BLOCK_FLOOR
+    # then clamped straight back, so it never adapted the tile.
+    MIN_WAVES_SM100 = 4
+
+    @classmethod
+    def tile_bytes_for(cls, env: CompileEnvironment) -> int:
+        """The per-program HBM byte budget for this device.
+
+        Arch-keyed rather than one promoted-everywhere constant: the sm90 value was
+        hill-climbed on H100 and B200 wants a larger tile (see ``TILE_BYTES_SM100``).
+        """
+        return (
+            cls.TILE_BYTES_SM100
+            if matches_hardware(env, cls.TUNED_TARGETS)
+            else cls.TILE_BYTES
+        )
+
+    @classmethod
+    def min_waves_for(cls, env: CompileEnvironment) -> int:
+        """The occupancy-cap wave count for this device (see ``MIN_WAVES_SM100``)."""
+        return (
+            cls.MIN_WAVES_SM100
+            if matches_hardware(env, cls.TUNED_TARGETS)
+            else cls.MIN_WAVES
+        )
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -1019,16 +1071,25 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         fact = spec.pointwise_facts[0]
         num_sm = max(1, get_num_sm(env.device))
+        tuned_arch = matches_hardware(env, cls.TUNED_TARGETS)
         # slab_numel (untiled inner slab per tiled element) scaled by two widths into two caps:
         # budget_target = tiled elements per bandwidth-saturating program (STORAGE bytes); reg_cap =
         # how many fit before the fp32 working set spills (COMPUTE bytes; coarse proxy — see the fact).
         # A heavy rope slab makes both ~1, so it is not tiled past ~1 (vs the old spilling [1,256]).
         slab_bytes = max(1, fact.slab_numel * fact.storage_itemsize)
         reg_bytes = max(1, fact.slab_numel * fact.compute_itemsize)
-        budget_target = max(1, cls.TILE_BYTES // slab_bytes)
+        # Charge bytes FETCHED from HBM, not bytes the kernel finds useful: a stride-k
+        # gather pulls k 32B sectors per useful sector, so a W-element tile costs
+        # k*W*slab_bytes of real traffic. Charging useful bytes over-sizes a strided
+        # tile by k, and makes two kernels with the same fact but different gather
+        # strides get the same width when their optima differ by exactly that factor.
+        fetch_bytes = (
+            slab_bytes * max(1, fact.gather_stride) if tuned_arch else slab_bytes
+        )
+        budget_target = max(1, cls.tile_bytes_for(env) // fetch_bytes)
         reg_cap = max(1, cls.REGISTER_BYTES // reg_bytes)
         # size_hint-aware: cap the tile so the grid keeps the SMs busy on small problems.
-        occ_cap = max(1, fact.total_numel // (num_sm * cls.MIN_WAVES))
+        occ_cap = max(1, fact.total_numel // (num_sm * cls.min_waves_for(env)))
         target = max(1, min(budget_target, reg_cap, occ_cap))
         # Anti-undershoot floor, capped by the REGISTER budget only (NOT budget_target, NOT occ_cap):
         # keep a coalesced per-operand run, lowering it only on a genuine register overflow (a heavy
@@ -1044,13 +1105,87 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
         tile_numel = 1
         for b in block_sizes:
             tile_numel *= b
-        # num_warps only when the SFU ramp raises it above the default; else None (Config drops None
-        # keys), so the flat family stays block_sizes-only and byte-identical (no dead knob).
-        num_warps = cls._warps_for(fact.sfu_ops, tile_numel)
+        # num_warps: lanes + residency on a tuned arch, else the SFU ramp. Emitted only
+        # when it differs from the compiler default, so a shape landing on the default
+        # stays block_sizes-only (no dead knob).
+        if tuned_arch:
+            num_warps = cls._warps_for_sm100(
+                fact, tile_numel, num_sm, cls.warp_slots_per_sm(env)
+            )
+        else:
+            num_warps = cls._warps_for(fact.sfu_ops, tile_numel)
         return Config(
             block_sizes=block_sizes,
-            num_warps=num_warps if num_warps > cls.DEFAULT_WARPS else None,
+            num_warps=num_warps if num_warps != cls.DEFAULT_WARPS else None,
         )
+
+    @classmethod
+    def warp_slots_per_sm(cls, env: CompileEnvironment) -> int:
+        """Resident warp slots per SM, queried from the device where available."""
+        props = getattr(torch.cuda, "get_device_properties", None)
+        if props is not None and env.device.type == "cuda":
+            threads = getattr(props(env.device), "max_threads_per_multi_processor", 0)
+            if threads:
+                return max(1, threads // 32)
+        return cls.WARP_SLOTS_PER_SM
+
+    @classmethod
+    def _elems_per_thread(cls, gather_stride: int) -> int:
+        """Tile elements per thread at the optimum, by gather stride (banded, not a
+        formula -- see ``ELEMS_PER_THREAD_BY_STRIDE``). Unknown stride reads coalesced."""
+        stride = max(1, gather_stride)
+        for limit, elems in cls.ELEMS_PER_THREAD_BY_STRIDE:
+            if stride <= limit:
+                return elems
+        return cls.ELEMS_PER_THREAD_WIDE_GATHER
+
+    @classmethod
+    def _warps_for_sm100(
+        cls,
+        fact: PointwiseElementwiseFact,
+        tile_numel: int,
+        num_sm: int,
+        warp_slots: int,
+    ) -> int:
+        """num_warps from tile lanes and grid residency.
+
+        ``sfu_ops`` alone is the wrong signal for bandwidth-bound work -- a 1-op
+        activation sits below ``SFU_W8``, so every such kernel fell to the default warp
+        count regardless of tile size. Two terms replace it, combined with ``max``
+        because both answer "how many warps does this program want":
+
+        * lanes the tile can keep busy, ``tile_numel / (32 * elems_per_thread)``;
+        * the largest warp count whose CTAs still fit resident at once (see
+          ``WARP_SLOTS_PER_SM``) -- warps are free until they cost a second wave. Inert
+          on a saturated grid, so it speaks only where warps are still free.
+
+        This is not the usual occupancy lever, which shrinks the TILE for more CTAs;
+        that is ``occ_cap`` in ``get_seed_config``, and shrinking the tile instead
+        measured worse on every cell tried. The SFU ramp is kept as a floor, since
+        transcendental latency is independent of byte traffic.
+        """
+        per_thread = cls._elems_per_thread(fact.gather_stride)
+        work = cls._pow2_floor(max(1, tile_numel // (32 * per_thread)))
+        programs = max(1, fact.total_numel // max(1, tile_numel))
+        wave_slots = (
+            warp_slots * cls.WAVE_TARGET_NUMERATOR // cls.WAVE_TARGET_DENOMINATOR
+        )
+        resident_wave = cls._pow2_floor(max(1, (num_sm * wave_slots) // programs))
+        target = max(work, resident_wave)
+        # The SFU ramp as a floor (never lowers the ladder's answer).
+        if fact.sfu_ops >= cls.SFU_W16:
+            target = max(target, cls.MAX_WARPS)
+        elif fact.sfu_ops >= cls.SFU_W8:
+            target = max(target, 8)
+        # Starvation cap: warps with too few elements hurt, so a program cannot use more
+        # warps than its WIDEST SINGLE load/store gives it lanes for. That uses the MAX
+        # per-op fan-out, not the ``slab_numel`` SUM the byte budgets use -- lanes do not
+        # add across ops, since a CTA's separate vector instructions run over the same
+        # threads. It also keeps a partially tiled kernel honest, where a size-1 tile
+        # still materializes a wide untiled load.
+        lanes = tile_numel * max(1, fact.max_op_slab_numel)
+        cap = cls._pow2_floor(max(1, lanes // cls.ELEMS_PER_WARP))
+        return max(1, min(cls.MAX_WARPS, target, cap))
 
     @classmethod
     def _warps_for(cls, sfu_ops: int, tile_numel: int) -> int:
