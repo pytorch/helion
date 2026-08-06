@@ -2896,15 +2896,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # left byte-identical).
         if isinstance(normalized, int) and normalized < 2:
             normalized = 8
-        # A looped reduction whose chunk equals or exceeds the reduction
-        # extent has only one iteration — it is semantically identical to a
-        # persistent reduction, but the looped codegen path occasionally
-        # produces subtly different results on the CuTe backend (e.g. when a
-        # multi-pass kernel like layer_norm reuses the loaded inputs across
-        # two reductions).  Collapsing to ``None`` here matches the
-        # ``_flat_config`` behaviour and keeps the persistent/loop choice in
-        # sync regardless of how the value was generated.
-        if isinstance(normalized, int) and normalized >= self.size_hint:
+        # A looped reduction whose chunk exactly equals the reduction extent has
+        # only one iteration — semantically identical to a persistent reduction.
+        # Collapse to None to match ``_flat_config`` and avoid CuTe-backend
+        # codegen differences (e.g. multi-pass layer_norm).  Chunks *strictly
+        # greater* than size_hint are left as-is so that backends like FlyDSL
+        # can detect the out-of-bounds condition in pre_codegen and raise an
+        # appropriate error rather than silently falling back to persistent.
+        if isinstance(normalized, int) and normalized == self.size_hint:
             return None
         return normalized
 

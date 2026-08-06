@@ -998,7 +998,7 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                     )
                 )
-                if env.backend_name == "cute":
+                if env.backend_name in ("cute", "flydsl"):
                     env.config_spec.cute_vector_widths.append(
                         CuteVectorWidthSpec(
                             block_id=rdim.block_id,
