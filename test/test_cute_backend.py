@@ -7159,6 +7159,77 @@ class TestCuteBackend(TestCase):
         self.assertIn("cutlass.Float8E4M3FN", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
 
+    def test_matmul_mma_tcgen05_one_shot_rejects_cluster_cap(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        m, k, n = 128, 128, 8192
+        x = torch.randn(m, k, device=DEVICE).to(torch.float8_e4m3fn)
+        y = torch.randn(k, n, device=DEVICE).to(torch.float8_e4m3fn)
+        scale_m = torch.ones(m, n, device=DEVICE)
+        scale_n = torch.ones(n, device=DEVICE)
+        bound = cute_matmul_mma_fp8_rowwise_colwise_scale.bind((x, y, scale_m, scale_n))
+        config = helion.Config(
+            block_sizes=[128, 128, 128],
+            pid_type="persistent_blocked",
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_one_shot_role_scheduler=True,
+            tcgen05_role_scheduler_cluster_cap=64,
+        )
+        with self.assertRaisesRegex(BackendUnsupported, "without a role scheduler"):
+            bound.to_triton_code(config)
+
+    def test_matmul_mma_tcgen05_one_shot_rejects_partial_cluster_axis(
+        self,
+    ) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        m, k, n = 512, 128, 384
+        x = torch.randn(m, k, device=DEVICE).to(torch.float8_e4m3fn)
+        y = torch.randn(k, n, device=DEVICE).to(torch.float8_e4m3fn)
+        scale_m = torch.ones(m, n, device=DEVICE)
+        scale_n = torch.ones(n, device=DEVICE)
+        bound = cute_matmul_mma_fp8_rowwise_colwise_scale.bind((x, y, scale_m, scale_n))
+        config = helion.Config(
+            block_sizes=[256, 128, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_one_shot_role_scheduler=True,
+        )
+        with self.assertRaisesRegex(
+            BackendUnsupported, "static-full, unbatched persistent FP8 grid"
+        ):
+            bound.to_triton_code(config)
+
+    def test_matmul_mma_tcgen05_one_shot_rejects_leading_batch(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        x = torch.randn(2, 128, 128, device=DEVICE).to(torch.float8_e4m3fn)
+        y = torch.randn(2, 128, 128, device=DEVICE).to(torch.float8_e4m3fn)
+        bound = cute_batched_baddbmm_tcgen05.bind((x, y))
+        config = helion.Config(
+            block_sizes=[1, 128, 128, 128],
+            pid_type="persistent_blocked",
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_one_shot_role_scheduler=True,
+        )
+        with self.assertRaisesRegex(BackendUnsupported, "unbatched"):
+            bound.to_triton_code(config)
+
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
             torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),

@@ -597,6 +597,94 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def test_tcgen05_c_stages_three_config_validation(self) -> None:
+        """C-stage 3 is explicit-only and restricted to measured tile shapes."""
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        config_spec.cute_tcgen05_search_enabled = True
+        for block_id in range(3):
+            config_spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=4096,
+                    max_size=4096,
+                )
+            )
+
+        validation_fragment = config_spec._cute_tcgen05_config.optional_fragments()[
+            "tcgen05_c_stages"
+        ]
+        search_fragment = config_spec._cute_tcgen05_config.optional_fragments(
+            for_search=True
+        )["tcgen05_c_stages"]
+        self.assertEqual(validation_fragment.choices, (2, 3, 4))
+        self.assertEqual(search_fragment.choices, (2, 4))
+
+        allowed_block_sizes = (
+            [64, 32, 256],
+            [64, 32, 512],
+            [64, 64, 128],
+            [128, 64, 256],
+            [128, 128, 128],
+            [256, 128, 128],
+        )
+        for block_sizes in allowed_block_sizes:
+            with self.subTest(block_sizes=block_sizes):
+                config: dict[str, object] = {
+                    "block_sizes": block_sizes,
+                    "tcgen05_c_stages": 3,
+                }
+                config_spec.normalize(config)
+                self.assertEqual(config["tcgen05_c_stages"], 3)
+
+        invalid_config: dict[str, object] = {
+            "block_sizes": [64, 64, 256],
+            "tcgen05_c_stages": 3,
+        }
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05_c_stages=3 is validated only for block_sizes",
+        ):
+            config_spec.normalize(invalid_config)
+
+        config_spec.normalize(invalid_config, _fix_invalid=True)
+        self.assertEqual(invalid_config["tcgen05_c_stages"], 2)
+
+    def test_tcgen05_role_scheduler_control_config_validation(self) -> None:
+        from helion._compiler.cute.tcgen05_constants import (
+            TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY,
+        )
+        from helion._compiler.cute.tcgen05_constants import (
+            TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY,
+        )
+
+        config_spec = ConfigSpec(backend=CuteBackend())
+        config_spec.cute_tcgen05_search_enabled = True
+        config: dict[str, object] = {
+            TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY: True,
+            TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY: 65,
+        }
+        config_spec.normalize(config)
+        self.assertIs(config[TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY], True)
+        self.assertEqual(config[TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY], 65)
+
+        invalid_values = (
+            (TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY, "yes", "must be a boolean"),
+            (
+                TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY,
+                66,
+                "must be one of",
+            ),
+        )
+        for key, value, error in invalid_values:
+            with self.subTest(key=key, value=value):
+                with self.assertRaisesRegex(exc.InvalidConfig, error):
+                    config_spec.normalize({key: value})
+
+                repaired = {key: value}
+                config_spec.normalize(repaired, _fix_invalid=True)
+                self.assertNotIn(key, repaired)
+
     def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
         return SimpleNamespace(
             env={inp: ast.Name(id="x", ctx=ast.Load())},
@@ -2032,8 +2120,8 @@ class TestCuteLowerings(unittest.TestCase):
 
     def test_tcgen05_persistent_post_loop_stmts_appear_after_while(self) -> None:
         """Compiling a persistent_blocked kernel must emit the cleanup
-        block (producer_tail / TMEM allocator setup / free) AFTER the
-        ``while tcgen05_work_tile_valid`` loop.
+        block (producer_tail / TMEM allocator setup / free) AFTER all
+        persistent work-tile loops.
 
         Before the post-loop split landed, those statements stayed inside
         the persistent loop and were yielded back as scf.while carries,
@@ -2074,42 +2162,38 @@ class TestCuteLowerings(unittest.TestCase):
             )
             code = bound.to_triton_code(cfg)
 
-        # Locate the persistent while loop and verify post-loop
-        # statements live OUTSIDE its body. The cleanest check is to find
-        # the line of ``while tcgen05_work_tile_valid`` and the first
-        # following dedented statement (= post-loop boundary), then
-        # confirm producer_tail / free fall on the post-loop side.
-        lines = code.splitlines()
-        while_line_idx = next(
-            i for i, line in enumerate(lines) if "while tcgen05_work_tile_valid" in line
+        # Role-local codegen emits one work-tile loop per warp role. Verify
+        # one-shot cleanup follows the last of those loops, rather than being
+        # replayed in any role's per-tile body.
+        tree = ast.parse(code)
+        work_tile_loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.While)
+            and (
+                "tcgen05_role_local_" in ast.unparse(node.test)
+                or ast.unparse(node.test) == "tcgen05_work_tile_valid"
+            )
+        ]
+        self.assertTrue(
+            work_tile_loops, "expected at least one persistent work-tile loop"
         )
-        while_indent = len(lines[while_line_idx]) - len(
-            lines[while_line_idx].lstrip(" ")
+        last_work_tile_line = max(
+            node.end_lineno or node.lineno for node in work_tile_loops
         )
-        post_loop_line_idx = None
-        for i in range(while_line_idx + 1, len(lines)):
-            line = lines[i]
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            indent = len(line) - len(line.lstrip(" "))
-            if indent <= while_indent:
-                post_loop_line_idx = i
-                break
-        self.assertIsNotNone(
-            post_loop_line_idx, "post-loop statements should follow the while"
-        )
-        post_loop_block = "\n".join(lines[post_loop_line_idx:])
-        in_loop_block = "\n".join(lines[while_line_idx + 1 : post_loop_line_idx])
-        # Cleanup statements must be in the post-loop block, not the
-        # work-tile body.
         for tag in (
             "tcgen05_acc_pipeline.producer_tail",
             "tcgen05_tmem_allocator.free",
         ):
-            self.assertIn(tag, post_loop_block, f"{tag} must follow the while loop")
-            self.assertNotIn(
-                tag, in_loop_block, f"{tag} must not appear inside the while loop"
+            cleanup_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and tag in ast.unparse(node.func)
+            ]
+            self.assertTrue(cleanup_calls, f"expected cleanup call {tag}")
+            self.assertTrue(
+                all(node.lineno > last_work_tile_line for node in cleanup_calls),
+                f"{tag} must follow all work-tile loops",
             )
 
     def test_tcgen05_persistent_path_compiles(self) -> None:
@@ -2155,7 +2239,7 @@ class TestCuteLowerings(unittest.TestCase):
             # z-seeded and tile-advance scheduler paths lives in
             # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
             code = bound.to_triton_code(cfg)
-            self.assertIn("while tcgen05_work_tile_valid", code)
+            self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
             self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
             from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -4755,10 +4839,6 @@ class TestCuteLowerings(unittest.TestCase):
         found_role_local_producer_loop = False
         found_role_local_exec_loop = False
         found_role_local_epi_loop = False
-        shared_loop_has_tma_producer = False
-        shared_loop_preserves_barriers = False
-        shared_scheduler_retargeted_to_exec = False
-        shared_loop_excludes_tma = False
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.If)
@@ -4776,7 +4856,8 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("tile_offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
                 self.assertIn("for tile_offset_2 in range", role_src)
                 self.assertIn(
-                    "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
+                    "if tcgen05_tma_initial_full_tile and "
+                    "tcgen05_tma_initial_next_full_tile",
                     role_src,
                 )
                 self.assertNotIn(
@@ -4850,49 +4931,6 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertNotIn("cute.arch.sync_threads()", role_src)
                 found_role_local_epi_loop = True
 
-        for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.While)
-                and ast.unparse(node.test) == "tcgen05_work_tile_valid"
-            ):
-                continue
-            shared_src = ast.unparse(node)
-            shared_loop_has_tma_producer = (
-                "producer_try_acquire(tcgen05_ab_producer_state)" in shared_src
-            )
-            self.assertNotIn("consumer_try_wait(tcgen05_ab_consumer_state)", shared_src)
-            self.assertNotIn("cute.gemm(", shared_src)
-            self.assertNotIn(
-                "tcgen05_acc_pipeline.producer_commit(tcgen05_acc_producer_state)",
-                shared_src,
-            )
-            self.assertNotIn(
-                "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
-                shared_src,
-            )
-            self.assertNotIn(
-                "tcgen05_acc_pipeline.consumer_release(tcgen05_acc_consumer_state)",
-                shared_src,
-            )
-            self.assertNotIn("cute.nvgpu.CopyUniversalOp()", shared_src)
-            self.assertNotIn("PipelineTmaStore.create", shared_src)
-            shared_loop_preserves_barriers = "cute.arch.sync_threads()" in shared_src
-            shared_scheduler_retargeted_to_exec = (
-                "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(4)"
-                in shared_src
-                and "tcgen05_tile_sched.advance_to_next_work()" in shared_src
-            )
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.If):
-                continue
-            test_src = ast.unparse(node.test)
-            if not (test_src.startswith("not ") and "cutlass.Int32(5)" in test_src):
-                continue
-            shared_loop_excludes_tma = any(
-                isinstance(child, ast.While)
-                and ast.unparse(child.test) == "tcgen05_work_tile_valid"
-                for child in node.body
-            )
         self.assertTrue(
             found_role_local_producer_loop,
             "Expected a role-local TMA producer while containing the "
@@ -4911,27 +4949,14 @@ class TestCuteLowerings(unittest.TestCase):
         self._assert_role_local_c_store_pipeline_lifetime(
             code, tree, epi_role_predicate
         )
-        self.assertTrue(
-            shared_loop_preserves_barriers,
-            "Shared persistent while must preserve CTA barriers so the "
-            "role-local warps can rejoin as barrier participants. Generated code:\n"
-            + code,
-        )
-        self.assertTrue(
-            shared_scheduler_retargeted_to_exec,
-            "Shared scheduler advance should be owned by the exec warp in "
-            "the role-local mainloop path. Generated code:\n" + code,
-        )
         self.assertFalse(
-            shared_loop_excludes_tma,
-            "The TMA warp must still enter the shared while after its "
-            "role-local producer loop so existing sync_threads barriers "
-            "remain valid. Generated code:\n" + code,
-        )
-        self.assertFalse(
-            shared_loop_has_tma_producer,
-            "Shared persistent while should not contain the TMA producer "
-            "K-loop. Generated code:\n" + code,
+            any(
+                isinstance(node, ast.While)
+                and ast.unparse(node.test) == "tcgen05_work_tile_valid"
+                for node in ast.walk(tree)
+            ),
+            "Dependency-only shared work should not emit a redundant persistent "
+            "loop. Generated code:\n" + code,
         )
 
     def test_tcgen05_flat_static_full_uses_tma_store_epilogue(self) -> None:
@@ -9577,12 +9602,18 @@ class TestCuteLowerings(unittest.TestCase):
                     self.assertIn("tcgen05_ab_consumer_state.advance()", role_src)
                     release_pos = role_src.index("tcgen05_ab_pipeline.consumer_release")
                     advance_pos = role_src.index("tcgen05_ab_consumer_state.advance()")
-                    next_ab_peek_blocks = [
+                    self.assertLess(release_pos, advance_pos)
+                    leader_blocks = [
                         ast.unparse(child)
                         for child in ast.walk(node)
                         if isinstance(child, ast.If)
-                        and "tcgen05_tma_next_consumer_tile" in ast.unparse(child.test)
                         and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                    ]
+                    next_ab_peek_blocks = [
+                        block
+                        for block in leader_blocks
+                        if "tcgen05_tma_next_consumer_tile" in block
+                        and "tcgen05_ab_pipeline.consumer_try_wait" in block
                     ]
                     self.assertTrue(
                         next_ab_peek_blocks,
@@ -9596,15 +9627,8 @@ class TestCuteLowerings(unittest.TestCase):
                         "tcgen05_ab_pipeline.consumer_try_wait",
                         next_ab_peek_pos,
                     )
-                    self.assertLess(release_pos, advance_pos)
                     self.assertLess(advance_pos, next_ab_peek_pos)
                     self.assertLess(next_ab_peek_pos, next_ab_try_pos)
-                    leader_blocks = [
-                        ast.unparse(child)
-                        for child in ast.walk(node)
-                        if isinstance(child, ast.If)
-                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
-                    ]
                     self.assertTrue(
                         any(
                             "tcgen05_acc_pipeline.producer_acquire("
@@ -18387,6 +18411,77 @@ class TestPersistentLoopSplitter(unittest.TestCase):
     def _stmt(self, text: str) -> ast.stmt:
         return ast.parse(text).body[0]
 
+    def test_stmt_name_uses_augassign_reads_and_writes_target(self) -> None:
+        from helion._compiler.program_id import _stmt_name_uses
+
+        reads, writes = _stmt_name_uses(self._stmt("value += increment"))
+
+        self.assertEqual(reads, {"value", "increment"})
+        self.assertEqual(writes, {"value"})
+
+    def test_tcgen05_grid_work_clusters_uses_configured_cap(self) -> None:
+        from helion._compiler.cute.tcgen05_constants import (
+            TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY,
+        )
+        from helion._compiler.program_id import DeviceFunction
+
+        splitter, _ = self._make_helper()
+        device_function = SimpleNamespace(
+            config={TCGEN05_ROLE_SCHEDULER_CLUSTER_CAP_CONFIG_KEY: 65}
+        )
+        with patch.object(DeviceFunction, "current", return_value=device_function):
+            grid = splitter._tcgen05_grid_work_clusters_expr("total_clusters")
+
+        self.assertEqual(grid, "min((total_clusters), 65)")
+
+    def test_role_local_one_shot_scheduler_omits_tile_loop(self) -> None:
+        from helion._compiler.cute.tcgen05_constants import (
+            TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY,
+        )
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        stub_df.config = {TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY: True}
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__",
+            stmts=[self._stmt("tma_pipeline.producer_acquire(state)")],
+        )
+
+        emitted = splitter._build_role_local_while(
+            stub_df,
+            self._make_minimal_layout(),
+            role_block,
+            scheduler_var_prefix="one_shot_test",
+        )
+        emitted_src = ast.unparse(emitted)
+
+        self.assertFalse(any(isinstance(node, ast.While) for node in ast.walk(emitted)))
+        self.assertIn("producer_acquire(state)", emitted_src)
+        self.assertNotIn("advance_to_next_work", emitted_src)
+        self.assertNotIn("get_current_work", emitted_src)
+
+    def test_shared_loop_omission_preserves_post_loop_dependencies(self) -> None:
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        splitter, _ = self._make_helper()
+        partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[],
+            shared_body_extracted=[self._stmt("final_state = current_state")],
+        )
+
+        self.assertTrue(splitter._tcgen05_shared_loop_safe_to_omit(partition, []))
+        self.assertFalse(
+            splitter._tcgen05_shared_loop_safe_to_omit(
+                partition, [self._stmt("cleanup_state = final_state")]
+            )
+        )
+        self.assertFalse(
+            splitter._tcgen05_shared_loop_safe_to_omit(
+                partition, [self._stmt("final_state += 1")]
+            )
+        )
+
     def _make_role_local_stubs(self, *, num_pid_dims: int = 2) -> tuple[object, object]:
         """Build a richer device-function stub plus per-pid stubs that
         the role-local-while builders need (``new_var`` for variable
@@ -18401,6 +18496,7 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         class _StubDeviceFunction:
             def __init__(self) -> None:
                 self._counter = 0
+                self.config: dict[str, object] = {}
                 self.cute_state = CuteDeviceFunctionState()
 
             def new_var(self, name: str) -> str:
