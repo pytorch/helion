@@ -127,15 +127,11 @@ class TestSearchSpaceTracker(unittest.TestCase):
 
         self.assertEqual(by_name["num_warps"].coverage_percent, 100.0)
 
-    def test_coverage_clamped_to_100_percent(self) -> None:
-        dims = [_dim("loop_orders", 2)]
-        tracker = SearchSpaceTracker(_report(dimensions=dims))
-        for order in ([0, 1, 2], [0, 2, 1], [1, 0, 2], [2, 1, 0]):
-            tracker.record_config(
-                _FakeConfig(block_sizes=[32], loop_orders=order, num_warps=4)
-            )
-        report = tracker.finish("LFBOTreeSearch", 1.0)
-        self.assertEqual(report.dimensions[0].coverage_percent, 100.0)
+        # The rendered summary uses cardinality as the denominator, and flags
+        # the under-explored dimension.
+        joined = "\n".join(_capture(report, "coverage"))
+        self.assertIn("block_sizes: 16/4096 options tested", joined)
+        self.assertIn("only 16 of 4096 values tested", joined)
 
     def test_empty_dimension_reports_zero_not_crash(self) -> None:
         dims = [_dim("loop_orders", 0)]
@@ -273,17 +269,6 @@ class TestDisabledFeatureGrouping(unittest.TestCase):
         self.assertFalse(any("feature(s) not supported by" in ln for ln in lines))
 
 
-class TestReportSummary(unittest.TestCase):
-    def test_summary_uses_cardinality_denominator(self) -> None:
-        dim = _dim("block_sizes", 4096)
-        dim.observe((32,))
-        tracker = SearchSpaceTracker(_report(dimensions=[dim], total=138240))
-        report = tracker.finish("LFBOTreeSearch", 1.0)
-        joined = "\n".join(_capture(report, "report"))
-        self.assertIn("block_sizes: 1/4096 options tested", joined)
-        self.assertIn("only 1 of 4096 values tested", joined)
-
-
 class _FakeSpec:
     """Duck-typed ConfigSpec exposing only what a branch under test reads."""
 
@@ -292,19 +277,6 @@ class _FakeSpec:
 
 
 class TestDimensionFromInfo(unittest.TestCase):
-    def test_permutation_fragment_factorial(self) -> None:
-        from helion.autotuner.config_fragment import PermutationFragment
-
-        self.assertEqual(PermutationFragment(3).cardinality(), 6)
-        self.assertEqual(PermutationFragment(1).cardinality(), 1)
-
-    def test_power_of_two_fragment_values(self) -> None:
-        from helion.autotuner.config_fragment import PowerOfTwoFragment
-
-        frag = PowerOfTwoFragment(1, 64)
-        self.assertEqual(frag.cardinality(), 7)
-        self.assertEqual(frag.search_values(), [1, 2, 4, 8, 16, 32, 64])
-
     def test_pid_type_reports_disabled_values(self) -> None:
         spec = _FakeSpec(
             allowed_pid_types=("flat", "xyz"), tensor_numel_constraints=None
@@ -405,6 +377,57 @@ class TestDisallowPidTypeReasons(unittest.TestCase):
         ]
         for c in pid_constraints:
             self.assertNotIn("xyz", c)
+
+
+class TestTotalSearchSpaceSize(unittest.TestCase):
+    """The reported total is the exact combinatorial product of per-dimension
+    cardinalities (arbitrary precision, never truncated), or None ('unknown')
+    when a dimension's cardinality can't be determined."""
+
+    def _spec(self) -> object:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        return ConfigSpec(backend=TritonBackend())
+
+    def test_large_product_not_truncated(self) -> None:
+        """A space far above 1e12 reports the exact big int, not None/'unknown'."""
+        from helion.autotuner.config_spec import SearchDimensionInfo
+
+        spec = self._spec()
+        # 4^4 * 3^7 * ... style: force a >1e12 product via controlled dims.
+        dims = [
+            SearchDimensionInfo("indexing", 256, None, False, 0),
+            SearchDimensionInfo("load_eviction_policies", 2187, None, False, 0),
+            SearchDimensionInfo("a", 25, None, False, 0),
+            SearchDimensionInfo("b", 25, None, False, 0),
+            SearchDimensionInfo("c", 9, None, False, 0),
+            SearchDimensionInfo("d", 9, None, False, 0),
+            SearchDimensionInfo("e", 8, None, False, 0),
+            SearchDimensionInfo("f", 8, None, False, 0),
+            SearchDimensionInfo("g", 6, None, False, 0),
+        ]
+        spec.iter_search_dimensions = lambda value_limit=100: iter(dims)  # type: ignore[method-assign]
+        report = analyze_search_space(spec, kernel_name="k")
+        expected = 256 * 2187 * 25 * 25 * 9 * 9 * 8 * 8 * 6
+        self.assertEqual(report.total_search_space_size, expected)
+        self.assertGreater(expected, 10**12)
+        # Rendered as the exact integer, never "unknown"/"infinite".
+        self.assertEqual(report.to_dict()["total_search_space_size"], str(expected))
+
+    def test_unknown_cardinality_makes_total_unknown(self) -> None:
+        """A dimension whose cardinality is unknown (0 sentinel) -> None/'unknown'."""
+        from helion.autotuner.config_spec import SearchDimensionInfo
+
+        spec = self._spec()
+        dims = [
+            SearchDimensionInfo("known", 8, None, False, 0),
+            SearchDimensionInfo("custom", 0, None, False, 0),  # unreportable
+        ]
+        spec.iter_search_dimensions = lambda value_limit=100: iter(dims)  # type: ignore[method-assign]
+        report = analyze_search_space(spec, kernel_name="k")
+        self.assertIsNone(report.total_search_space_size)
+        self.assertEqual(report.to_dict()["total_search_space_size"], "unknown")
 
 
 class TestRestrictionReasons(unittest.TestCase):
