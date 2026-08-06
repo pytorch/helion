@@ -570,7 +570,7 @@ def test_rank3_rhs_grouped_nt_codegen_uses_nkg_tma_view() -> None:
         f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride2, arg{rhs_idx}_stride0)"
         in wrapper
     )
-    assert ".mark_layout_dynamic(leading_dim=1)" in wrapper
+    assert ".mark_layout_dynamic(" not in wrapper
 
 
 def test_rank3_rhs_grouped_static_codegen_uses_group_scheduler() -> None:

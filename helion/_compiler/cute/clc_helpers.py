@@ -24,8 +24,9 @@ from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 if TYPE_CHECKING:
-    from cutlass._mlir import ir
     import cutlass.cute as cute
+
+    from ._mlir_compat import ir
 
 
 @dsl_user_op
