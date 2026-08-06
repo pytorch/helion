@@ -45,7 +45,12 @@ VARIANTS = [
     "delta_rule",
     "gated_delta_rule",
     "kda",
+    "kda_fused",
 ]
+
+# Variants run with fused_preamble, mapped to the example module they share. These
+# are forward-only, so they emit no "-bwd" row.
+FUSED_PREAMBLE_VARIANTS = {"kda_fused": "kda"}
 
 # benchmark() takes (B, H, T, D, DV); our shapes use D == DV.
 _CONFIGS = [(name, b, h, t, d, d) for (name, b, t, h, d) in SHAPES]
@@ -96,7 +101,6 @@ def write_results_json(
         vrd = verdicts.get(variant, [])
         # ok / REF-ERR -> 1.0; FAIL / HEL-ERR -> 0.0.
         fwd_ok = [0.0 if v[0] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
-        bwd_ok = [0.0 if v[1] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
         # Forward: Helion accuracy + latency + speedup vs the FLA baseline.
         add_metric(variant, "helion_accuracy", labels, fwd_ok)
         add_metric(variant, "helion_latency_ms", labels, [r[1] for r in rows])
@@ -106,7 +110,11 @@ def write_results_json(
             labels,
             [r[2] / r[1] if r[1] else 0.0 for r in rows],
         )
+        if variant in FUSED_PREAMBLE_VARIANTS:
+            # Forward-only: no backward to time, and no verdict to report.
+            continue
         # Forward+backward as a separate "<variant>-bwd" row.
+        bwd_ok = [0.0 if v[1] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
         bwd = f"{variant}-bwd"
         add_metric(bwd, "helion_accuracy", labels, bwd_ok)
         add_metric(bwd, "helion_latency_ms", labels, [r[3] for r in rows])
@@ -157,10 +165,12 @@ def main() -> None:
     verdicts: dict[str, list[tuple[str, str]]] = {}
     for name in names:
         print(f"=== {name} ===")
-        mod = importlib.import_module(f"examples.linear.example_{name}")
+        base = FUSED_PREAMBLE_VARIANTS.get(name, name)
+        mod = importlib.import_module(f"examples.linear.example_{base}")
         harness = mod.HARNESS
-        verdicts[name] = harness.accuracy(bench_configs)
-        results[name] = harness.benchmark(bench_configs)
+        kw = {"fused_preamble": True} if name in FUSED_PREAMBLE_VARIANTS else {}
+        verdicts[name] = harness.accuracy(bench_configs, **kw)
+        results[name] = harness.benchmark(bench_configs, **kw)
 
     if args.output:
         write_results_json(args.output, results, verdicts)

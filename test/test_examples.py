@@ -2894,14 +2894,14 @@ class TestExamples(RefEagerTestBase, TestCase):
                 )
                 kernel.settings.autotune_effort = "none"
 
-    def _run_linear_example(self, name: str) -> None:
+    def _run_linear_example(self, name: str, method: str = "test") -> None:
         import importlib
 
         self._skip_linear_engine_autotune()
         mod = importlib.import_module(f"examples.linear.{name}")
         harness = getattr(mod, "HARNESS", None)
         if harness is not None:
-            harness.test()
+            getattr(harness, method)()
         else:
             mod.test()
 
@@ -2960,6 +2960,13 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_kda_fused_preamble(self):
+        self._run_linear_example("example_kda", method="test_fused_preamble")
 
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 
