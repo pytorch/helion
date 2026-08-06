@@ -205,6 +205,7 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     c_stage_count: int
     epi_warp_count: int
     ab_load_warp_count: int = 1
+    one_shot_role_scheduler: bool = False
     # Dedicated scheduler warp count for ROLE_LOCAL_WITH_SCHEDULER. Default
     # zero keeps MONOLITHIC's historical role IDs; one adds a scheduler warp
     # after the AB-load warp that publishes work-tile metadata through the
