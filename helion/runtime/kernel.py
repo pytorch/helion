@@ -2338,13 +2338,13 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
         if isinstance(arg, (tuple, list)):
             for item in arg:
                 try:
-                    return _find_device(item)
+                    return _find_device((item,))
                 except exc.NoTensorArgs:
                     pass
         elif isinstance(arg, dict):
             for item in arg.values():
                 try:
-                    return _find_device(item)
+                    return _find_device((item,))
                 except exc.NoTensorArgs:
                     pass
     raise exc.NoTensorArgs
