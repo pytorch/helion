@@ -24,13 +24,51 @@ from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
+
+# %%
+# Autotune baselines
+# ------------------
+# On TPU the kernel's default autotune-baseline config (block_sizes=[128]) OOMs
+# scoped vmem at large reduction dims (e.g. H=32768), which hard-fails autotuning
+# before it can search vmem-fitting configs ("Default config failed while
+# computing baseline"). Provide eager fp32 baselines there (they run fine on XLA
+# without the scoped-vmem blowup); other backends keep the default-config
+# baseline. Inverse of attention.py's _baseline_unless_tpu.
+def _baseline_on_tpu(fn: Callable[..., Any]) -> Callable[..., Any] | None:
+    return fn if DEVICE.type == "tpu" else None
+
+
+def _rms_norm_fwd_baseline(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
+) -> tuple[torch.Tensor, torch.Tensor]:
+    xf = x.to(torch.float32)
+    inv_rms = torch.rsqrt(xf.pow(2).mean(-1) + eps)
+    out = (xf * inv_rms[:, None] * weight.to(torch.float32)).to(x.dtype)
+    return out, inv_rms.reshape(-1, 1)
+
+
+def _rms_norm_bwd_baseline(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rsqrt: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    xf = x.to(torch.float32)
+    do = grad_out.to(torch.float32)
+    r = rsqrt.to(torch.float32)
+    w = weight.to(torch.float32)
+    grad_x = (w * do * r - xf * r**3 * (w * do * xf).mean(-1, keepdim=True)).to(x.dtype)
+    grad_weight = (xf * do * r).sum(0).to(weight.dtype)
+    return grad_x, grad_weight
+
+
 # %%
 # RMS Normalization Kernel
 # ------------------------
 
 
 # %%
-@helion.kernel
+@helion.kernel(autotune_baseline_fn=_baseline_on_tpu(_rms_norm_fwd_baseline))
 def rms_norm_fwd(
     x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -71,7 +109,10 @@ def rms_norm_fwd(
     return out, inv_rms.reshape(-1, 1)
 
 
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    autotune_baseline_fn=_baseline_on_tpu(_rms_norm_bwd_baseline),
+)
 def rms_norm_bwd(
     grad_out: torch.Tensor,
     x: torch.Tensor,
