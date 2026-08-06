@@ -924,6 +924,20 @@ def _generic_epilogue_code(
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
     def test_generic_pointwise_uses_inductor_semantics(self) -> None:
+        """The epilogue is rendered from Inductor's lowering, not a template.
+
+        ``tcgen05_chain_step`` is the hand-written chain this replaced. What
+        stands in for "Inductor's semantics" is the value itself: the kernel
+        asks for ``add(acc, 1.0, alpha=2.0)``, which is ``acc + 2.0``, and a
+        template that ignored ``alpha`` would still fuse and still emit a
+        fragment store.
+
+        This asserted ``tcgen05_epi_value`` until now, and never passed. That
+        name is only bound when the captured expression is not already an
+        ``ast.Name`` (fragment_epilogue.py:205), so it tracks whether Inductor's
+        CSE happened to lift the final node -- here it does, into ``v_15``, and
+        the marker is absent.
+        """
         x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
         code = _generic_epilogue_code(
             _generic_pointwise_epilogue,
@@ -931,8 +945,22 @@ class TestCuteTcgen05GenericEpilogue(unittest.TestCase):
             _generic_epilogue_config([128, 128, 32]),
         )
         self.assertIn("cute.gemm", code)
-        self.assertIn("tcgen05_epi_value", code)
+        self.assertIn("tcgen05_acc_vec", code)
         self.assertNotIn("tcgen05_chain_step", code)
+
+        weight = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        values = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        bound = _generic_pointwise_epilogue.bind((values, weight))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        config = _generic_epilogue_config([128, 128, 32])
+        bound.set_config(config)
+        shifted = values.float() @ weight.float() + 2.0
+        torch.testing.assert_close(
+            bound(values, weight).float(),
+            (shifted * torch.sigmoid(shifted)).to(torch.bfloat16).float(),
+            atol=2e-1,
+            rtol=2e-2,
+        )
 
     def test_generic_api_elementwise_uses_existing_codegen(self) -> None:
         x = torch.empty([128, 128], device=DEVICE, dtype=torch.bfloat16)
@@ -7200,16 +7228,17 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("tcgen05_tCgAux_base_0", code)
         self.assertIn("tcgen05_tTR_gAux_0", code)
         self.assertIn("tcgen05_aux_loaded_0", code)
-        self.assertIn("tcgen05_epi_value", code)
-        # The chain renderer must produce
-        # ``aux_loaded ... chain_step ... acc_vec`` in that order
-        # (inside the per-subtile loop body).
+        self.assertIn("tcgen05_acc_vec", code)
+        # The chain renderer must produce ``aux_loaded ... acc_vec`` in that
+        # order (inside the per-subtile loop body).
+        # The rendered value used to land in a ``tcgen05_epi_value`` local.
+        # That name is only bound when the captured expression is not already
+        # an ``ast.Name`` (fragment_epilogue.py:205), and Inductor's CSE now
+        # names it (``v_N``), so the store is the stable anchor.
         first_aux_loaded = code.find("tcgen05_aux_loaded_0")
         self.assertGreaterEqual(first_aux_loaded, 0)
-        first_step = code.find("tcgen05_epi_value", first_aux_loaded)
-        first_vec = code.find("tcgen05_acc_vec", first_step)
-        self.assertGreater(first_step, first_aux_loaded)
-        self.assertGreater(first_vec, first_step)
+        first_vec = code.find("tcgen05_acc_vec", first_aux_loaded)
+        self.assertGreater(first_vec, first_aux_loaded)
 
     def test_tcgen05_fused_residual_epilogue_aux_load_late_marker(self) -> None:
         """Per-thread aux LDG stays after the T2R copy but before math.
@@ -7849,21 +7878,20 @@ class TestCuteLowerings(unittest.TestCase):
         # and a per-step chain local.
         self.assertIn("cute.where", code)
         self.assertIn("tcgen05_epi_acc", code)
-        self.assertIn("tcgen05_epi_value", code)
+        self.assertIn("tcgen05_acc_vec", code)
         # Anchor ordering on the *first* splice-site block (a single
-        # ``tcgen05_epi_acc ... tcgen05_epi_value ... tcgen05_acc_vec``
-        # window). Prior version used ``code.find`` first-occurrence
-        # which globally compared positions across all three splice
-        # sites (SIMT, TMA, helper) and falsely failed if any site
-        # emitted them in a different relative order. The single-block
-        # anchor avoids that fragility while still pinning the
-        # structural ordering.
+        # ``tcgen05_epi_acc ... tcgen05_acc_vec`` window). Comparing
+        # first-occurrences globally would span all three splice sites
+        # (SIMT, TMA, helper) and falsely fail if any emitted them in a
+        # different relative order.
+        # The rendered value used to land in a ``tcgen05_epi_value`` local.
+        # That name is only bound when the captured expression is not already
+        # an ``ast.Name`` (fragment_epilogue.py:205), and Inductor's CSE now
+        # names it (``v_N``), so the store is the stable anchor.
         first_load = code.find("tcgen05_epi_acc")
         self.assertGreaterEqual(first_load, 0)
-        first_step = code.find("tcgen05_epi_value", first_load)
-        first_vec = code.find("tcgen05_acc_vec", first_step)
-        self.assertGreater(first_step, first_load)
-        self.assertGreater(first_vec, first_step)
+        first_vec = code.find("tcgen05_acc_vec", first_load)
+        self.assertGreater(first_vec, first_load)
 
     def test_tcgen05_fused_relu_epilogue_ieee_edge_cases(self) -> None:
         """G3.1.1 relu must match ``torch.relu`` on the full IEEE
@@ -8483,7 +8511,7 @@ class TestCuteLowerings(unittest.TestCase):
         # at the per-thread T2R register.
         self.assertIn("cute.math.exp2", code)
         self.assertIn("tcgen05_epi_acc", code)
-        self.assertIn("tcgen05_epi_value", code)
+        self.assertIn("tcgen05_acc_vec", code)
         self.assertIn("1.4426950408889634", code)
 
     def test_tcgen05_fused_sigmoid_epilogue_runtime_correctness_bf16(self) -> None:
@@ -8539,7 +8567,7 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
         self.assertIn("cute.math.exp2", code)
         self.assertIn("1.4426950408889634", code)
-        self.assertIn("tcgen05_epi_value", code)
+        self.assertIn("tcgen05_acc_vec", code)
         out = bound(x, y)
         expected = torch.sigmoid((x @ y).float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
@@ -8579,7 +8607,7 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(cfg)
         self.assertIn("cute.math.exp2", code)
         self.assertIn("1.4426950408889634", code)
-        self.assertIn("tcgen05_epi_value", code)
+        self.assertIn("tcgen05_acc_vec", code)
         out = bound(x, y)
         ref = x @ y
         expected = (ref * torch.sigmoid(ref)).to(x.dtype)
@@ -13317,7 +13345,7 @@ class TestCuteLowerings(unittest.TestCase):
             device_function=SimpleNamespace(
                 tensor_arg=lambda tensor: SimpleNamespace(name="A"),
                 cute_state=SimpleNamespace(
-                    matmul_operand_block_remap={}, matmul_operand_index_override={}
+                    matmul_operand_block_remap={}, load_index_override={}
                 ),
             ),
         )
@@ -14562,7 +14590,7 @@ class TestCuteLowerings(unittest.TestCase):
             sympy_expr=lambda expr: str(expr),
             device_function=SimpleNamespace(
                 cute_state=SimpleNamespace(
-                    matmul_operand_block_remap={}, matmul_operand_index_override={}
+                    matmul_operand_block_remap={}, load_index_override={}
                 )
             ),
         )
@@ -14600,7 +14628,7 @@ class TestCuteLowerings(unittest.TestCase):
             codegen=_FakeMaskCodegen(_FakeMaskedLoopStrategy([1]), {1}),
             device_function=SimpleNamespace(
                 cute_state=SimpleNamespace(
-                    matmul_operand_block_remap={}, matmul_operand_index_override={}
+                    matmul_operand_block_remap={}, load_index_override={}
                 )
             ),
         )
