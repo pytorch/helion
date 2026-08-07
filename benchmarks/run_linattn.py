@@ -24,14 +24,13 @@ import torch
 
 # (name, B, T, H, D); D is both the query/key and the value dim (D = DV).
 # The six production shapes from flash-linear-attention/benchmarks/ops/registry.
-# The full sweep times out CI, so we comment out all but two shapes.
 SHAPES: list[tuple[str, int, int, int, int]] = [
-    # ("B1_T8192_H96_D128", 1, 8192, 96, 128),
-    # ("B2_T16384_H16_D128", 2, 16384, 16, 128),
-    # ("B4_T2048_H16_D128", 4, 2048, 16, 128),
+    ("B1_T8192_H96_D128", 1, 8192, 96, 128),
+    ("B2_T16384_H16_D128", 2, 16384, 16, 128),
+    ("B4_T2048_H16_D128", 4, 2048, 16, 128),
     ("B4_T4096_H64_D128", 4, 4096, 64, 128),
     ("B8_T2048_H32_D256", 8, 2048, 32, 256),
-    # ("B8_T1024_H8_D64", 8, 1024, 8, 64),
+    ("B8_T1024_H8_D64", 8, 1024, 8, 64),
 ]
 
 # Variants with their own examples.linear.example_<name> module, whose
@@ -57,16 +56,14 @@ VARLEN_VARIANTS = {"kda_varlen": "kda"}
 VARIANTS = [*DENSE_VARIANTS, *FUSED_PREAMBLE_VARIANTS, *VARLEN_VARIANTS]
 
 # (name, sequence lengths, H, D) for the varlen variants. The lengths are FlashKDA's
-# three cases from its benchmarks/bench_fwd.py, verbatim, each holding 8192 tokens. As
-# with SHAPES the full sweep times out CI, so all but the ragged pair are commented
-# out: ragged is the case no dense shape can express.
+# three cases from its benchmarks/bench_fwd.py, verbatim, each holding 8192 tokens.
 VARLEN_SHAPES: list[tuple[str, list[int], int, int]] = [
-    # ("fixed_T8192_H96_D128", [8192], 96, 128),
-    # ("fixed_T8192_H64_D128", [8192], 64, 128),
+    ("fixed_T8192_H96_D128", [8192], 96, 128),
+    ("fixed_T8192_H64_D128", [8192], 64, 128),
     ("ragged_T8192_H96_D128", [1300, 547, 2048, 963, 271, 3063], 96, 128),
     ("ragged_T8192_H64_D128", [1300, 547, 2048, 963, 271, 3063], 64, 128),
-    # ("uniform_T8192_H96_D128", [1024] * 8, 96, 128),
-    # ("uniform_T8192_H64_D128", [1024] * 8, 64, 128),
+    ("uniform_T8192_H96_D128", [1024] * 8, 96, 128),
+    ("uniform_T8192_H64_D128", [1024] * 8, 64, 128),
 ]
 
 # benchmark() takes (B, H, T, D, DV); our shapes use D == DV.
