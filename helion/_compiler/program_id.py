@@ -49,6 +49,8 @@ def _stmt_name_uses(stmt: ast.AST) -> tuple[set[str], set[str]]:
                 writes.add(node.id)
             else:
                 reads.add(node.id)
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            reads.add(node.target.id)
     return reads, writes
 
 
@@ -2096,7 +2098,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             for role_block in partition.role_blocks_extracted
             if role_block.role_predicate is not None
         }
-        full_role_local_body = {
+        has_all_role_local_bodies = {
             self._tcgen05_tma_load_role_predicate(),
             self._tcgen05_mma_exec_role_predicate(),
             self._tcgen05_epi_role_predicate(),
@@ -2105,7 +2107,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             use_role_local_body and layout.cluster_m == 1 and not is_multi_root
         )
         use_validated_two_cta_role_local_body = (
-            full_role_local_body
+            has_all_role_local_bodies
             and layout.cluster_m == 2
             and self._tcgen05_has_validated_role_local_two_cta_runtime()
             and not is_multi_root
@@ -2114,13 +2116,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             use_validated_cluster_m1_role_local_body
             or use_validated_two_cta_role_local_body
         )
+        # Once all three work-producing roles own independent persistent
+        # schedulers, a single-root kernel no longer needs the shared scheduler
+        # for progress. Whether its loop can actually disappear is decided
+        # separately from the generated residual body's meaningful work.
+        can_omit_shared_scheduler = has_all_role_local_bodies and not is_multi_root
         omit_shared_loop = (
-            full_role_local_body
-            and not is_multi_root
-            and (
-                layout.cluster_m > 1
-                or self._tcgen05_has_scheduler_warp()
-                or self._tcgen05_uses_grouped_static_persistent()
+            can_omit_shared_scheduler
+            and not self._tcgen05_shared_loop_has_meaningful_work(
+                partition, post_loop_stmts
             )
         )
         if self._tcgen05_uses_staged_work_tile_mailbox() and not omit_shared_loop:
@@ -2150,9 +2154,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
 
         setup: list[ast.stmt] = []
-        # Fully role-local CtaGroup.TWO does not consume the shared work-tile
-        # SMEM handoff. Validated CtaGroup.TWO skips the shared scheduler;
-        # each role owns a scheduler loop over the capped persistent grid.
+        # Fully role-local codegen does not consume the shared work-tile SMEM
+        # handoff. Each role owns a scheduler loop over the capped persistent
+        # grid, so validated cluster_m=1 and CtaGroup.TWO skip the shared
+        # scheduler and residual loop.
         if not omit_shared_loop:
             setup.extend(self._build_tcgen05_persistent_prelude(layout))
         elif self._tcgen05_has_scheduler_warp():
@@ -2173,6 +2178,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         partition,
                         build_shared_tile_body=False,
                         epi_role_prelude_stmts=epi_role_prelude_stmts,
+                        post_loop_stmts=post_loop_stmts,
                     )
                 )
             else:
@@ -2186,11 +2192,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
             setup.extend(role_local_whiles)
             if not omit_shared_loop:
-                # Validated cluster_m=1 and guarded partial/multi-root
-                # role-local shapes still rejoin the shared loop so existing
-                # CTA-wide barriers remain valid. Fully role-local CtaGroup.TWO
-                # codegen skips this residual loop; its work is already owned
-                # by role-local schedulers and cross-role pipelines.
+                # Partial and multi-root role-local shapes still rejoin the
+                # shared loop. Validated fully role-local codegen skips this
+                # residual loop; its work is already owned by role-local
+                # schedulers and cross-role pipelines.
                 setup.append(
                     create(
                         ast.While,
@@ -2751,9 +2756,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         acc pipelines (the existing pipeline barriers carry the data
         dependency); no ``cute.arch.sync_threads()`` is emitted inside
         the role-local loop. The caller decides whether to append a residual
-        shared loop after these role-local loops; validated cluster_m=1 keeps
-        it for existing CTA-wide barriers, while guarded fully role-local
-        CtaGroup.TWO omits it.
+        shared loop after these role-local loops. It is omitted when the
+        residual shared body contains only cloned dependency setup and legacy
+        barriers that no longer protect shared work.
 
         The returned statement is the role-local ``while`` itself,
         wrapped in ``if {role_predicate}:`` so only the matching warps
@@ -5499,8 +5504,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _tcgen05_shared_stmt_safe_to_omit(cls, stmt: ast.stmt) -> bool:
         """Return whether a removed shared stmt is dependency-only setup.
 
-        Fully role-local CtaGroup.TWO codegen intentionally omits the residual
-        shared ``while``. The remaining shared view may still contain scalar
+        Fully role-local codegen intentionally omits the residual shared
+        ``while``. The remaining shared view may still contain scalar
         PID/offset/view setup that role-local loops clone through dependency
         extraction, plus legacy bare ``sync_threads`` barriers that no longer
         bracket shared work after every role has moved out. Other observable
@@ -5543,21 +5548,84 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return isinstance(stmt, ast.Pass)
 
     def _assert_tcgen05_omit_shared_loop_safe(
-        self, partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody
+        self,
+        partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody,
+        post_loop_stmts: list[ast.stmt] | None = None,
     ) -> None:
-        unsafe = [
-            ast.unparse(stmt)
+        unsafe = self._tcgen05_unsafe_shared_stmts(partition)
+        assert not unsafe, (
+            "tcgen05 fully role-local codegen would discard observable shared "
+            "statement(s) while omitting the residual shared loop: "
+            + "; ".join(ast.unparse(stmt) for stmt in unsafe)
+        )
+        dependencies = self._tcgen05_shared_post_loop_dependencies(
+            partition, post_loop_stmts
+        )
+        assert not dependencies, (
+            "tcgen05 fully role-local codegen would discard shared definition(s) "
+            "used by post-loop cleanup: " + ", ".join(sorted(dependencies))
+        )
+
+    def _tcgen05_unsafe_shared_stmts(
+        self, partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody
+    ) -> list[ast.stmt]:
+        return [
+            stmt
             for stmt in partition.shared_body_extracted
             if not self._tcgen05_shared_stmt_safe_to_omit(stmt)
         ]
-        assert not unsafe, (
-            "tcgen05 fully role-local codegen would discard observable shared "
-            "statement(s) while omitting the residual shared loop: " + "; ".join(unsafe)
+
+    def _tcgen05_shared_post_loop_dependencies(
+        self,
+        partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody,
+        post_loop_stmts: list[ast.stmt] | None,
+    ) -> set[str]:
+        shared_writes: set[str] = set()
+        for stmt in partition.shared_body_extracted:
+            _, writes = _stmt_name_uses(stmt)
+            shared_writes.update(writes)
+        post_loop_reads: set[str] = set()
+        for stmt in post_loop_stmts or ():
+            reads, _ = _stmt_name_uses(stmt)
+            post_loop_reads.update(reads)
+        return shared_writes & post_loop_reads
+
+    def _tcgen05_shared_loop_has_meaningful_work(
+        self,
+        partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody,
+        post_loop_stmts: list[ast.stmt],
+    ) -> bool:
+        """Return whether the residual shared loop must be emitted.
+
+        This is deliberately fail-closed: any statement outside the narrow
+        side-effect-free allowlist, or any definition consumed by post-loop
+        cleanup, makes the shared loop meaningful. Kernel-family admission
+        only establishes that independent role schedulers are available; the
+        actual residual body decides whether codegen may omit the loop.
+        """
+        unsafe = (
+            self._tcgen05_grouped_unsafe_shared_stmts(partition)
+            if self._tcgen05_uses_grouped_static_persistent()
+            else self._tcgen05_unsafe_shared_stmts(partition)
+        )
+        return bool(
+            unsafe
+            or self._tcgen05_shared_post_loop_dependencies(partition, post_loop_stmts)
         )
 
     def _assert_tcgen05_grouped_omit_shared_loop_safe(
         self, partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody
     ) -> None:
+        unsafe = self._tcgen05_grouped_unsafe_shared_stmts(partition)
+        assert not unsafe, (
+            "tcgen05 grouped static scheduler would discard observable shared "
+            "statement(s) while omitting the residual shared loop: "
+            + "; ".join(ast.unparse(stmt) for stmt in unsafe)
+        )
+
+    def _tcgen05_grouped_unsafe_shared_stmts(
+        self, partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody
+    ) -> list[ast.stmt]:
         plan = self._tcgen05_plan()
         worklist_metadata = bool(
             plan is not None
@@ -5587,8 +5655,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     "mask_3",
                 }
             )
-        unsafe = [
-            ast.unparse(stmt)
+        return [
+            stmt
             for stmt in partition.shared_body_extracted
             if not self._tcgen05_grouped_stmt_safe_to_omit(
                 stmt,
@@ -5596,10 +5664,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 worklist_metadata=worklist_metadata,
             )
         ]
-        assert not unsafe, (
-            "tcgen05 grouped static scheduler would discard observable shared "
-            "statement(s) while omitting the residual shared loop: " + "; ".join(unsafe)
-        )
 
     def _build_tcgen05_persistent_tile_body_role_local(
         self,
@@ -5609,6 +5673,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         *,
         build_shared_tile_body: bool = True,
         epi_role_prelude_stmts: list[ast.stmt] | None = None,
+        post_loop_stmts: list[ast.stmt] | None = None,
     ) -> tuple[list[ast.stmt], list[ast.stmt]]:
         """Build the per-tile body in role-local-while form.
 
@@ -5628,11 +5693,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         - ``shared_tile_body`` is the optional per-tile body for the shared
           ``while`` (the work-tile body without the extracted role blocks).
           Built via :meth:`_build_tcgen05_persistent_tile_body` with existing
-          ``cute.arch.sync_threads()`` calls preserved. Validated cluster_m=1
-          role-local kernels still append this loop after role-local work so
-          those CTA-wide barriers remain valid for epilogue synchronization
-          and work-tile metadata publication. Guarded fully role-local
-          CtaGroup.TWO codegen omits the residual shared loop in the caller.
+          ``cute.arch.sync_threads()`` calls preserved. The caller omits this
+          loop only when the residual statements are dependency-only setup or
+          legacy barriers that no longer protect shared work.
 
         Caller wires both into the persistent kernel as siblings of
         each other inside the same setup list when the residual shared loop
@@ -5663,10 +5726,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 layout, shared_role_blocks
             )
         else:
+            assert post_loop_stmts is not None, (
+                "omitting the tcgen05 shared loop requires explicit post-loop "
+                "dependency validation"
+            )
             if self._tcgen05_uses_grouped_static_persistent():
                 self._assert_tcgen05_grouped_omit_shared_loop_safe(partition)
+                dependencies = self._tcgen05_shared_post_loop_dependencies(
+                    partition, post_loop_stmts
+                )
+                assert not dependencies, (
+                    "tcgen05 grouped static scheduler would discard shared "
+                    "definition(s) used by post-loop cleanup: "
+                    + ", ".join(sorted(dependencies))
+                )
             else:
-                self._assert_tcgen05_omit_shared_loop_safe(partition)
+                self._assert_tcgen05_omit_shared_loop_safe(partition, post_loop_stmts)
             shared_tile_body = []
         # Merge extracted blocks by ``role_predicate`` so each predicate
         # gets one role-local loop carrying all of its per-tile
