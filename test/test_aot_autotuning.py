@@ -30,7 +30,9 @@ import helion.autotuner.aot_cache as aot_cache_module
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import _deserialize_tuple
+from helion.autotuner.aot_cache import _deserialize_value
 from helion.autotuner.aot_cache import _serialize_tuple
+from helion.autotuner.aot_cache import _serialize_value
 from helion.autotuner.aot_cache import get_aot_mode
 from helion.autotuner.aot_compile import _standalone_call_key
 from helion.autotuner.aot_compile import generate_standalone_file
@@ -74,6 +76,52 @@ class TestShapeKey:
 
         key3 = ShapeKey("k", (1, 2, 4), "hw")
         assert key1.stable_hash() != key3.stable_hash()
+
+
+@onlyBackends(["triton", "cute"])
+class TestCodeSerialization:
+    """Tests for specialization keys containing function code objects (e.g. callable kernel args)."""
+
+    def test_code_round_trips_through_serialize_value(self) -> None:
+        def fn(v):
+            return v * 2
+
+        serialized = _serialize_value(fn.__code__)
+        deserialized = _deserialize_value(serialized)
+        assert deserialized == (fn.__code__.co_code, fn.__code__.co_consts)
+
+    def test_stable_hash_same_for_rename(self) -> None:
+        def double(v):
+            return v * 2
+
+        def double_renamed(v):
+            return v * 2
+
+        h1 = ShapeKey("k", (double.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (double_renamed.__code__,), "hw").stable_hash()
+        assert h1 == h2
+
+    def test_stable_hash_differs_for_behavior_change(self) -> None:
+        def double(v):
+            return v * 2
+
+        def triple(v):
+            return v * 3
+
+        h1 = ShapeKey("k", (double.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (triple.__code__,), "hw").stable_hash()
+        assert h1 != h2
+
+    def test_stable_hash_differs_for_nested_lambda_behavior_change(self) -> None:
+        def with_nested_lambda_2():
+            return lambda v: v * 2
+
+        def with_nested_lambda_3():
+            return lambda v: v * 3
+
+        h1 = ShapeKey("k", (with_nested_lambda_2.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (with_nested_lambda_3.__code__,), "hw").stable_hash()
+        assert h1 != h2
 
 
 @onlyBackends(["triton", "cute"])
