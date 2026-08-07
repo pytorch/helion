@@ -670,7 +670,7 @@ class _DirectCallKernel:
 
     call_custom_kernel: object
     kernel_name: str
-    kernel_key: str
+    mlir_fingerprint: str
     output_shapes: object
     donate_argnums: object
     out_tree: object
@@ -683,7 +683,7 @@ class _DirectCallKernel:
 def _build_direct_call_invoke(
     call_custom_kernel: object,
     kernel_name: str,
-    kernel_key: str,
+    mlir_fingerprint: str,
     output_shapes: object,
     donate_argnums: object,
     out_tree: object,
@@ -696,7 +696,7 @@ def _build_direct_call_invoke(
         def invoke_no_alias(input_tensors: list[object]) -> object:
             results = call_custom_kernel(  # type: ignore[operator]
                 kernel_name,
-                kernel_key,
+                mlir_fingerprint,
                 inputs=input_tensors,
                 output_shapes=output_shapes,
                 donate_argnums=donate_argnums,
@@ -708,7 +708,7 @@ def _build_direct_call_invoke(
     def invoke_with_alias(input_tensors: list[object]) -> object:
         results = call_custom_kernel(  # type: ignore[operator]
             kernel_name,
-            kernel_key,
+            mlir_fingerprint,
             inputs=input_tensors,
             output_shapes=output_shapes,
             donate_argnums=donate_argnums,
@@ -773,6 +773,7 @@ def _make_helion_static_jax_callable_class() -> type:
             if cached_entry is None:
                 return result
             output_shapes, out_tree = cached_entry
+            mlir_fingerprint = self.kernel_key_to_mlir_fingerprint[kernel_key]
             sig_tuple = tuple(
                 (a.shape, a.dtype)  # type: ignore[attr-defined]
                 for a in args
@@ -784,7 +785,7 @@ def _make_helion_static_jax_callable_class() -> type:
             invoke = _build_direct_call_invoke(
                 tpu_torch_pallas.call_custom_kernel,
                 self.name,
-                kernel_key,
+                mlir_fingerprint,
                 output_shapes,
                 self.donate_argnums,
                 out_tree,
@@ -793,7 +794,7 @@ def _make_helion_static_jax_callable_class() -> type:
             self._helion_direct_call = _DirectCallKernel(
                 call_custom_kernel=tpu_torch_pallas.call_custom_kernel,
                 kernel_name=self.name,
-                kernel_key=kernel_key,
+                mlir_fingerprint=mlir_fingerprint,
                 output_shapes=output_shapes,
                 donate_argnums=self.donate_argnums,
                 out_tree=out_tree,
