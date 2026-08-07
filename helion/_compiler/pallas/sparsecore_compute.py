@@ -16,11 +16,14 @@ from ..ast_extension import expr_from_string
 from ..helper_function import CodegenInterface
 from ..inductor_lowering import GraphInterpreter
 from ..inductor_lowering import ReductionLowering
+from .memory_access import MemoryAccessKind
 from .sc_base import _CAST_STORE_DTYPES
 from .sc_base import SC_LANES
 from .sparsecore_plan import IndirectLoadPlan
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from ..generate_ast import GenerateAST
     from .sparsecore_program import SparseCoreProgram
 
@@ -59,20 +62,88 @@ class _LocalCodegen(CodegenInterface):
 class LaneChunk:
     start: int
     size: int
+    unique_start: int
 
 
-def chunk_schedule(value_size: int) -> list[LaneChunk]:
+def chunk_schedule(value_size: int, dtype: torch.dtype) -> list[LaneChunk]:
     if value_size < 1:
         raise NotImplementedError("SparseCore value is empty")
-    if value_size % SC_LANES:
+    if dtype is not torch.bfloat16:
+        if value_size % SC_LANES:
+            raise NotImplementedError(
+                f"SparseCore value size {value_size} must be a multiple of {SC_LANES}"
+            )
+        return [
+            LaneChunk(start, SC_LANES, start)
+            for start in range(0, value_size, SC_LANES)
+        ]
+    if value_size < 2 * SC_LANES or value_size % SC_LANES:
         raise NotImplementedError(
-            f"SparseCore value size {value_size} must be a multiple of {SC_LANES}"
+            f"SparseCore bf16 value size {value_size} must be a multiple of "
+            f"{SC_LANES} and at least {2 * SC_LANES}"
         )
-    return [LaneChunk(start, SC_LANES) for start in range(0, value_size, SC_LANES)]
+    starts = list(range(0, max(value_size - 31, 1), 32))
+    if starts[-1] != value_size - 32:
+        starts.append(value_size - 32)
+    chunks: list[LaneChunk] = []
+    covered = 0
+    for start in starts:
+        chunks.append(LaneChunk(start, 32, max(covered, start)))
+        covered = max(covered, start + 32)
+    return chunks
 
 
 def _value_size(value: torch.Tensor) -> int:
     return math.prod(int(dim) for dim in value.shape[1:]) if value.ndim > 1 else 1
+
+
+def packed_bf16_segments(
+    program: SparseCoreProgram,
+    node: torch.fx.Node,
+    memo: dict[torch.fx.Node, tuple[int, ...]] | None = None,
+) -> tuple[int, ...]:
+    """Find packed BF16 boundaries inherited by a value."""
+    if memo is None:
+        memo = {}
+    if node in memo:
+        return memo[node]
+    plan = program.plan_by_node.get(node)
+    if (
+        plan is not None
+        and plan.access.kind is MemoryAccessKind.LOAD
+        and plan.layout.logical_dtype is torch.bfloat16
+    ):
+        result = (plan.layout.value_size,)
+    else:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor) and _value_size(value) == 1:
+            result = ()
+        elif node.target is torch.ops.aten.stack.default:
+            values = node.args[0]
+            if not isinstance(values, (list, tuple)):
+                raise NotImplementedError("SparseCore stack has no value sequence")
+            result = tuple(
+                segment
+                for child in values
+                if isinstance(child, torch.fx.Node)
+                for segment in packed_bf16_segments(program, child, memo)
+            )
+        else:
+            candidates = [
+                segments
+                for parent in node.all_input_nodes
+                if (segments := packed_bf16_segments(program, parent, memo))
+            ]
+            if not candidates:
+                result = ()
+            elif all(candidate == candidates[0] for candidate in candidates[1:]):
+                result = candidates[0]
+            else:
+                raise NotImplementedError(
+                    "SparseCore pointwise operands have incompatible packed BF16 layouts"
+                )
+    memo[node] = result
+    return result
 
 
 @dataclass(frozen=True)
@@ -142,6 +213,7 @@ class _ChunkInterpreter(GraphInterpreter):
         self,
         owner: SparseCoreCompute,
         chunk: LaneChunk,
+        part: str,
         reduction_values: dict[torch.fx.Node, ast.AST],
         *,
         entry: int | None = None,
@@ -149,6 +221,7 @@ class _ChunkInterpreter(GraphInterpreter):
         super().__init__(owner.program.graph, owner.local_codegen)
         self.owner = owner
         self.chunk = chunk
+        self.part = part
         self.entry = entry
         self.env.update(reduction_values)
 
@@ -197,7 +270,12 @@ class _ChunkInterpreter(GraphInterpreter):
         assert isinstance(selected, torch.fx.Node)
         child = _ChunkInterpreter(
             self.owner,
-            LaneChunk(local, self.chunk.size),
+            LaneChunk(
+                local,
+                self.chunk.size,
+                max(0, self.chunk.unique_start - group * value_size),
+            ),
+            self.part,
             {
                 key: value
                 for key, value in self.env.items()
@@ -217,11 +295,16 @@ class _ChunkInterpreter(GraphInterpreter):
         target = n.target
         lowering = n.meta.get("lowering")
         if isinstance(lowering, ReductionLowering):
-            return self.owner.vector_reduction_expr(n, self.chunk, self.env)
+            return self.owner.vector_reduction_expr(
+                n,
+                self.chunk,
+                self.part,
+                self.env,
+            )
         if target in (_host_tensor, _get_symnode):
             return expr_from_string("0")
         if target is memory_ops.load:
-            return self.owner.load_expr(n, self.chunk, self.entry)
+            return self.owner.load_expr(n, self.chunk, self.part, self.entry)
         if target is memory_ops.store:
             return None
         if target is _mask_to:
@@ -263,6 +346,7 @@ class _ChunkInterpreter(GraphInterpreter):
             if isinstance(value, torch.Tensor) and value.dtype in (
                 torch.int8,
                 torch.bool,
+                torch.bfloat16,
             ):
                 if any(user.target is not memory_ops.store for user in n.users):
                     raise NotImplementedError(
@@ -339,6 +423,30 @@ class SparseCoreCompute:
         self.counter += 1
         return f"_sc_{prefix}{self.counter}"
 
+    def value_chunks(
+        self, node: torch.fx.Node, value_size: int, dtype: torch.dtype
+    ) -> tuple[list[LaneChunk], bool]:
+        segments = packed_bf16_segments(self.program, node)
+        if not segments:
+            return chunk_schedule(value_size, dtype), False
+        if sum(segments) != value_size:
+            raise NotImplementedError(
+                "SparseCore packed BF16 layout does not cover the logical value"
+            )
+        result: list[LaneChunk] = []
+        offset = 0
+        for segment in segments:
+            result.extend(
+                LaneChunk(
+                    offset + chunk.start,
+                    chunk.size,
+                    offset + chunk.unique_start,
+                )
+                for chunk in chunk_schedule(segment, torch.bfloat16)
+            )
+            offset += segment
+        return result, True
+
     def _buffer_ref(self, buffer: str, item: str, start: int, size: int) -> str:
         return f"{buffer}[_sc_q, {item}, pl.ds({start}, {size})]"
 
@@ -346,6 +454,7 @@ class SparseCoreCompute:
         self,
         node: torch.fx.Node,
         chunk: LaneChunk,
+        part: str,
         entry: int | None,
     ) -> ast.AST:
         plan = self.program.plan_by_node[node]
@@ -373,12 +482,21 @@ class SparseCoreCompute:
             start = chunk.start % value_size
             ref = self._buffer_ref(buffer, "_sc_item", start, chunk.size)
 
-        return expr_from_string(ref)
+        if value.dtype is not torch.bfloat16:
+            return expr_from_string(ref)
+        even = self.new_var("e")
+        odd = self.new_var("o")
+        self.lines.append(
+            f"{self.indent}{even}, {odd} = plsc.unpack({ref}, "
+            "format=plsc.PackFormat.INTERLEAVED)"
+        )
+        return expr_from_string(even if part == "even" else odd)
 
     def vector_reduction_expr(
         self,
         node: torch.fx.Node,
         chunk: LaneChunk,
+        part: str,
         reduction_values: dict[torch.fx.Node, object],
     ) -> ast.AST:
         info = next(
@@ -396,7 +514,7 @@ class SparseCoreCompute:
             if isinstance(value, ast.AST)
         }
         for entry in range(info.input_count):
-            interpreter = _ChunkInterpreter(self, chunk, inherited, entry=entry)
+            interpreter = _ChunkInterpreter(self, chunk, part, inherited, entry=entry)
             expressions.append(ast.unparse(interpreter.run_until(info.source)))
         if info.kind == "sum":
             return expr_from_string("(" + " + ".join(expressions) + ")")
@@ -404,6 +522,12 @@ class SparseCoreCompute:
         for expression in expressions[1:]:
             result = f"jnp.maximum({result}, {expression})"
         return expr_from_string(result)
+
+    def _part_mask(self, chunk: LaneChunk, part: str) -> str | None:
+        if chunk.size != 32 or chunk.unique_start <= chunk.start:
+            return None
+        parity = 0 if part == "even" else 1
+        return f"({chunk.start + parity} + 2 * _sc_lane) >= {chunk.unique_start}"
 
     def emit_scalar_reductions(
         self,
@@ -413,6 +537,13 @@ class SparseCoreCompute:
         for info in self.reductions:
             if not info.scalar or info.node not in active_nodes:
                 continue
+            source_value = info.source.meta.get("val")
+            if not isinstance(source_value, torch.Tensor):
+                raise NotImplementedError("SparseCore reduction source is not a tensor")
+            chunks, packed_bf16 = self.value_chunks(
+                info.source, info.input_size, source_value.dtype
+            )
+            neutral = "0.0" if info.kind == "sum" else "-jnp.inf"
             acc = self.new_var("acc")
             init = "jnp.zeros" if info.kind == "sum" else "jnp.full"
             init_args = "" if info.kind == "sum" else "-jnp.inf, "
@@ -420,15 +551,21 @@ class SparseCoreCompute:
                 f"{self.indent}{acc} = {init}(({SC_LANES},), "
                 f"{init_args}dtype=jnp.float32)"
             )
-            for chunk in chunk_schedule(info.input_size):
-                interpreter = _ChunkInterpreter(self, chunk, reduction_values)
-                expression = ast.unparse(interpreter.run_until(info.source))
-                if info.kind == "sum":
-                    self.lines.append(f"{self.indent}{acc} = {acc} + {expression}")
-                else:
-                    self.lines.append(
-                        f"{self.indent}{acc} = jnp.maximum({acc}, {expression})"
-                    )
+            for chunk in chunks:
+                parts: Iterable[str] = ("even", "odd") if packed_bf16 else ("even",)
+                for part in parts:
+                    interpreter = _ChunkInterpreter(self, chunk, part, reduction_values)
+                    expression = ast.unparse(interpreter.run_until(info.source))
+                    mask = self._part_mask(chunk, part)
+                    if mask is not None:
+                        expression = f"jnp.where({mask}, {expression}, {neutral})"
+                    combine = "+" if info.kind == "sum" else "jnp.maximum"
+                    if combine == "+":
+                        self.lines.append(f"{self.indent}{acc} = {acc} + {expression}")
+                    else:
+                        self.lines.append(
+                            f"{self.indent}{acc} = jnp.maximum({acc}, {expression})"
+                        )
             result = self.new_var("red")
             aggregate = "jnp.sum" if info.kind == "sum" else "jnp.max"
             self.lines.append(
@@ -440,10 +577,11 @@ class SparseCoreCompute:
         self,
         node: torch.fx.Node,
         chunk: LaneChunk,
+        part: str,
         reduction_values: dict[torch.fx.Node, ast.AST],
     ) -> str:
         return ast.unparse(
-            _ChunkInterpreter(self, chunk, reduction_values).run_until(node)
+            _ChunkInterpreter(self, chunk, part, reduction_values).run_until(node)
         )
 
     def emit_store(
@@ -461,26 +599,37 @@ class SparseCoreCompute:
             raise NotImplementedError("SparseCore store value is not a tensor")
         value_size = _value_size(value)
         if value_size == 1:
-            chunk = LaneChunk(0, SC_LANES)
-            expression = self._value(value_node, chunk, reduction_values)
+            chunk = LaneChunk(0, SC_LANES, 0)
+            expression = self._value(value_node, chunk, "even", reduction_values)
             if plan.layout.logical_dtype in _CAST_STORE_DTYPES:
                 expression = f"({expression}).astype(jnp.int32)"
             self.lines.append(f"{self.indent}{buffer}[_sc_item] = {expression}")
             return
         cast_output = plan.layout.logical_dtype in _CAST_STORE_DTYPES
-        for chunk in chunk_schedule(value_size):
+        chunks, _ = self.value_chunks(value_node, value_size, value.dtype)
+        for chunk in chunks:
             dst = f"{buffer}[_sc_item, pl.ds({chunk.start}, {chunk.size})]"
-            expression = self._value(value_node, chunk, reduction_values)
-            if cast_output:
+            even = self._value(value_node, chunk, "even", reduction_values)
+            if value.dtype is torch.bfloat16:
+                odd = self._value(value_node, chunk, "odd", reduction_values)
                 self.lines.append(
-                    f"{self.indent}{dst} = ({expression}).astype(jnp.int32)"
+                    f"{self.indent}{dst} = plsc.pack({even}, {odd}, "
+                    "format=plsc.PackFormat.INTERLEAVED, "
+                    "preferred_element_type=jnp.bfloat16)"
                 )
+            elif cast_output:
+                self.lines.append(f"{self.indent}{dst} = ({even}).astype(jnp.int32)")
             else:
-                self.lines.append(f"{self.indent}{dst} = {expression}")
+                self.lines.append(f"{self.indent}{dst} = {even}")
 
     def emit_body(self, indent: str, *, store_nodes: set[torch.fx.Node]) -> list[str]:
         self.lines = []
         self.indent = indent
+        if any(
+            plan.layout.logical_dtype is torch.bfloat16
+            for plan in self.program.memory_plans
+        ):
+            self.lines.append(f"{indent}_sc_lane = lax.iota(jnp.int32, {SC_LANES})")
         reduction_values: dict[torch.fx.Node, ast.AST] = {}
         active_nodes: set[torch.fx.Node] = set()
 

@@ -174,6 +174,16 @@ class TestPallasSparseCoreCodegen(TestCase):
         with self.assertRaisesRegex(exc.InvalidConfig, "code: access_pattern"):
             _code(_scaled_rows, (source, scale))
 
+    def test_bf16_gather_composes_interleaved_pack_unpack(self) -> None:
+        index = torch.randint(0, 512, (513,), dtype=torch.int32)
+        table = torch.randn(512, 64, dtype=torch.bfloat16)
+
+        code = _code(_embedding, (index, table), block=512)
+
+        self.assertIn("plsc.unpack", code)
+        self.assertIn("plsc.pack", code)
+        self.assertNotIn("jnp.concatenate", code)
+
     def test_indirect_store_uses_layout_derived_tail_row(self) -> None:
         source = torch.randn(513, 64)
         index = torch.randperm(513, dtype=torch.int32)
@@ -374,11 +384,12 @@ class TestPallasSparseCoreNumerics(TestCase):
 
         torch.testing.assert_close(result.cpu(), source.cpu().amax(dim=1) > 0.5)
 
-    def test_stock_embedding(self) -> None:
+    def test_stock_embedding_and_bf16_gather(self) -> None:
         from examples.embedding import embedding
 
         index = torch.randint(0, 2048, (4, 129), dtype=torch.int32, device=DEVICE)
         table = torch.randn(2048, 64, device=DEVICE)
+        bf16_table = table.to(torch.bfloat16)
 
         _, stock = code_and_output(
             embedding,
@@ -386,8 +397,17 @@ class TestPallasSparseCoreNumerics(TestCase):
             block_sizes=[256, 64],
             core_type="sparsecore",
         )
+        _, bf16 = code_and_output(
+            _embedding,
+            (index.reshape(-1), bf16_table),
+            block_sizes=[256],
+            core_type="sparsecore",
+        )
 
         torch.testing.assert_close(stock.cpu(), table.cpu()[index.cpu().long()])
+        torch.testing.assert_close(
+            bf16.cpu(), bf16_table.cpu()[index.cpu().reshape(-1).long()]
+        )
 
     def test_weighted_and_masked_gather_reductions(self) -> None:
         from examples.sparsecore_ops import masked_gather_sum

@@ -54,9 +54,9 @@ def test_direct_stream_is_lowered_without_graph_topology() -> None:
 
 def test_indirect_load_retains_its_local_dependency() -> None:
     graph = torch.fx.Graph()
-    table = torch.empty(4096, 64)
+    table = torch.empty(4096, 64, dtype=torch.bfloat16)
     index = torch.empty(32, 4, dtype=torch.int32)
-    result = torch.empty(32, 4, 64)
+    result = torch.empty(32, 4, 64, dtype=torch.bfloat16)
     table_node = _placeholder(graph, "table", table)
     index_node = _placeholder(graph, "index", index)
     load = graph.call_function(memory_ops.load, (table_node, (index_node, slice(None))))
