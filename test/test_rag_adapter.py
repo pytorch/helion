@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -41,6 +42,14 @@ from helion.autotuner.rag.types import RetrievedNeighbor
 from helion.autotuner.rag.types import TunerMode
 from helion.autotuner.rag.types import WorkloadDescriptor
 from helion.runtime.config import Config
+
+# These exercise the adapter's seam onto the standalone helion_rag bundle
+# (reranking and the campaign event schema). CI installs helion only, so the
+# bundle is absent there and these skip rather than fail.
+requires_helion_rag = pytest.mark.skipif(
+    importlib.util.find_spec("helion_rag") is None,
+    reason="requires the helion_rag bundle under scripts/helion_rag",
+)
 
 
 class _KernelDefinition:
@@ -103,6 +112,7 @@ def test_driver_identity_uses_the_resolved_cuda_device() -> None:
     assert "--id=2" in run.call_args.args[0]
 
 
+@requires_helion_rag
 def test_convert_lookup_reranks_pool_and_uses_fastest_compatible_config() -> None:
     descriptor = build_workload_descriptor(_search())
     neighbors = []
@@ -194,6 +204,7 @@ def _compatible_neighbors() -> list[dict[str, object]]:
     return neighbors
 
 
+@requires_helion_rag
 def test_convert_lookup_honors_non_default_final_neighbors() -> None:
     descriptor = build_workload_descriptor(_search())
     policy = FrozenRetrievalPolicy(semantic_pool_size=8, final_neighbors=3)
@@ -209,6 +220,7 @@ def test_convert_lookup_honors_non_default_final_neighbors() -> None:
     assert len(evidence.neighbors) == 3
 
 
+@requires_helion_rag
 def test_convert_lookup_default_policy_retains_five() -> None:
     descriptor = build_workload_descriptor(_search())
 
@@ -221,6 +233,7 @@ def test_convert_lookup_default_policy_retains_five() -> None:
     assert len(evidence.neighbors) == 5
 
 
+@requires_helion_rag
 def test_live_adapter_requests_a_pinned_generation_lookup() -> None:
     descriptor = build_workload_descriptor(_search())
     autotuner = SimpleNamespace(
@@ -437,6 +450,7 @@ def test_exact_hit_skips_descriptor_and_retrieval() -> None:
     retrieve.assert_not_called()
 
 
+@requires_helion_rag
 def test_exact_hit_event_records_explicit_probe_outcome(tmp_path, monkeypatch) -> None:
     path = tmp_path / "events.jsonl"
     monkeypatch.setenv("HELION_RAG_EVENT_LOG", str(path))
@@ -449,6 +463,7 @@ def test_exact_hit_event_records_explicit_probe_outcome(tmp_path, monkeypatch) -
     assert event["retrieval"]["exact_cache_probe"] == "hit"
 
 
+@requires_helion_rag
 def test_propagated_error_emits_one_terminal_event_before_reraising(
     tmp_path, monkeypatch
 ) -> None:
@@ -788,6 +803,7 @@ def test_retrieval_controls_are_deterministic_distinct_and_keep_k() -> None:
     assert shuffled.neighbors != random_a.neighbors
 
 
+@requires_helion_rag
 def test_event_records_retrieval_control_candidate_source(
     tmp_path, monkeypatch
 ) -> None:
@@ -837,6 +853,7 @@ def test_event_records_retrieval_control_candidate_source(
     assert event["retrieval"]["candidate_source"] == "random_neighbors"
 
 
+@requires_helion_rag
 def test_terminal_event_contains_all_neighbors_evaluations_and_accounting(
     tmp_path, monkeypatch
 ) -> None:
@@ -963,6 +980,7 @@ def test_terminal_event_contains_all_neighbors_evaluations_and_accounting(
     }
 
 
+@requires_helion_rag
 def test_terminal_event_contains_aggregate_provider_identity_and_tokens(
     tmp_path, monkeypatch
 ) -> None:
@@ -1023,6 +1041,7 @@ def test_terminal_event_contains_aggregate_provider_identity_and_tokens(
     assert provider["output_tokens"] == 5
 
 
+@requires_helion_rag
 def test_event_without_descriptor_uses_signed_static_artifact_identities(
     tmp_path, monkeypatch
 ) -> None:

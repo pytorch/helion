@@ -569,12 +569,24 @@ class _LiveDecisionRunner:
         raise AssertionError(f"unexpected live RAG decision {type(decision).__name__}")
 
 
+def _provider_reporting_search(autotuner: BaseSearch) -> BaseSearch | None:
+    """The search if it reports provider usage, else None (LFBO reports nothing).
+
+    Dispatched on type rather than probed with hasattr: these methods live on
+    classes in this same tree, so a rename should break loudly instead of
+    silently zeroing the campaign's provider accounting.
+    """
+    from ..llm_search import LLMGuidedSearch
+    from ..llm_seeded_lfbo import LLMSeededSearch
+
+    return (
+        autotuner if isinstance(autotuner, (LLMSeededSearch, LLMGuidedSearch)) else None
+    )
+
+
 def _provider_tokens(autotuner: BaseSearch) -> dict[str, int | None]:
-    # Duck-typed so both LLMGuidedSearch and the LLM-seeded hybrid (which
-    # delegates to its LLM stage) report provider usage; LFBO-only searches
-    # have no such method and report zeros.
-    if hasattr(autotuner, "aggregate_token_usage"):
-        return autotuner.aggregate_token_usage()
+    if (search := _provider_reporting_search(autotuner)) is not None:
+        return search.aggregate_token_usage()
     return {
         "requests": 0,
         "input_tokens": None,
@@ -585,16 +597,16 @@ def _provider_tokens(autotuner: BaseSearch) -> dict[str, int | None]:
 
 
 def _provider_identity(autotuner: BaseSearch) -> dict[str, str | None]:
-    if hasattr(autotuner, "aggregate_provider_identity"):
-        return autotuner.aggregate_provider_identity()
+    if (search := _provider_reporting_search(autotuner)) is not None:
+        return search.aggregate_provider_identity()
     return {"request_id": None, "response_id": None, "cache_state": None}
 
 
 def _provider_replay_identities(
     autotuner: BaseSearch,
 ) -> tuple[tuple[str, str | None], ...]:
-    if hasattr(autotuner, "provider_replay_identities"):
-        return autotuner.provider_replay_identities
+    if (search := _provider_reporting_search(autotuner)) is not None:
+        return search.provider_replay_identities
     return ()
 
 
@@ -668,7 +680,11 @@ def resolve_driver_identity(device: torch.device | None) -> str | None:
 
 def _hybrid_stage_record(autotuner: BaseSearch) -> object | None:
     """Map a composed search's stage breakdown into the canonical event record."""
-    breakdown = getattr(autotuner, "hybrid_stage_breakdown", None)
+    from ..llm_seeded_lfbo import LLMSeededSearch
+
+    if not isinstance(autotuner, LLMSeededSearch):
+        return None
+    breakdown = autotuner.hybrid_stage_breakdown
     if not isinstance(breakdown, dict):
         return None
     from helion_rag.experiment.events import (  # pyrefly: ignore[missing-import]
