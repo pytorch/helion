@@ -32,6 +32,7 @@ from pathlib import Path
 import sys
 import threading
 import traceback
+import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -1144,11 +1145,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return super().autotune(skip_cache=skip_cache)
 
 
+def _code_identity(code: types.CodeType) -> tuple[bytes, tuple[Any, ...]]:
+    """Semantic identity of a code object: bytecode+constants"""
+    return (
+        code.co_code,
+        code.co_consts,
+    )
+
+
 def _serialize_value(val: object) -> object:
     """Serialize a single value to JSON-compatible format.
 
     Supports: None, bool, int, float, str, type, tuple, frozenset, set,
-    torch.dtype, torch.device, list, dict.
+    torch.dtype, torch.device, list, dict, code, bytes.
     """
     if val is None:
         return None
@@ -1170,13 +1179,21 @@ def _serialize_value(val: object) -> object:
         return [_serialize_value(v) for v in val]
     if isinstance(val, dict):
         return {k: _serialize_value(v) for k, v in val.items()}
+    if isinstance(val, types.CodeType):
+        return {"__code__": _serialize_value(_code_identity(val))}
+    if isinstance(val, bytes):
+        return {"__bytes__": val.hex()}
     raise TypeError(f"Cannot serialize type: {type(val).__name__}")
 
 
 def _deserialize_value(val: object) -> object:
     """Deserialize a JSON value back to Python object.
 
-    Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__, __type__.
+    Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__,
+    __type__, __code__, __bytes__.
+
+    Note: __code__ is not turned back into a code object. This is fine because the AOT
+    cache only compares specialization keys, it never calls the original function.
     """
     if isinstance(val, dict):
         if "__tuple__" in val:
@@ -1192,6 +1209,10 @@ def _deserialize_value(val: object) -> object:
             return torch.device(val["__device__"])
         if "__type__" in val:
             return _import_type(val["__type__"])
+        if "__code__" in val:
+            return _deserialize_value(val["__code__"])
+        if "__bytes__" in val:
+            return bytes.fromhex(val["__bytes__"])
         return {k: _deserialize_value(v) for k, v in val.items()}
     if isinstance(val, list):
         return [_deserialize_value(v) for v in val]
