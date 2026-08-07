@@ -3700,6 +3700,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             has_leading_passthrough=(
                                 candidate.operands.has_leading_passthrough
                             ),
+                            allow_small_n=(
+                                candidate.operands.lhs.source_to_logical_order
+                                is not None
+                                and candidate.operands.rhs.source_to_logical_order
+                                is not None
+                            ),
                         )
                         if search_plan is None:
                             continue
@@ -3727,6 +3733,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         explicit_epi_tile_compatible=all(
                             item.explicit_epi_tile_compatible
                             for item, _lhs, _plan in search_candidates
+                        ),
+                        allow_fp8_small_n_persistent=(
+                            all(
+                                item.operands.rhs.source_to_logical_order
+                                is not None
+                                for item, _lhs, _plan in search_candidates
+                            )
                         ),
                     )
         config_spec.raise_grid_block_minimums()

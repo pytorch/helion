@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import math
 import operator
 import re
 from types import SimpleNamespace
@@ -601,6 +602,73 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def test_tcgen05_swapped_matmul_small_n_runtime(self) -> None:
+        """Swapped operands use tcgen05 with a column-major small-N output."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def swapped_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            out_t = out.T
+            for tile_n, tile_m in hl.tile([n, m]):
+                acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        y[tile_k, tile_n].T,
+                        x[tile_m, tile_k].T,
+                        acc=acc,
+                    )
+                out_t[tile_n, tile_m] = acc.to(torch.bfloat16)
+            return out
+
+        m, k, n = 2, 4096, 256
+        scale = 1.0 / math.sqrt(k)
+        torch.manual_seed(0)
+        x = (scale * torch.randn(m, k, device=DEVICE)).to(torch.float8_e4m3fn)
+        y = (scale * torch.randn(k, n, device=DEVICE)).to(torch.float8_e4m3fn)
+        y = y.T.contiguous().T
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[64, 16, 256],
+            indexing=["tensor_descriptor"] * 3,
+            pid_type="persistent_interleaved",
+            tcgen05_ab_stages=9,
+            tcgen05_acc_stages=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+
+        with patch_cute_mma_support():
+            bound = swapped_matmul.bind((x, y))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(config)
+            code = bound.to_triton_code(config)
+            actual = bound(x, y)
+
+        expected = torch._scaled_mm(
+            x,
+            y,
+            torch.ones((m, 1), device=DEVICE),
+            torch.ones((1, n), device=DEVICE),
+            use_fast_accum=False,
+            out_dtype=torch.bfloat16,
+        )
+        self.assertIn(
+            "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code
+        )
+        self.assertIn("cute.gemm(", code)
+        self.assertIn(
+            "tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.COL_MAJOR", code
+        )
+        self.assertIn("'lhs_tma_order': (1, 0)", code)
+        self.assertIn("'rhs_tma_order': (0, 1)", code)
+        self.assertIn("while tcgen05_role_local", code)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_mma_operand_matrix_major_tracks_source_order(self) -> None:
         graph = Graph()
         load = graph.placeholder("load")
