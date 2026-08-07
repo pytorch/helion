@@ -24,6 +24,7 @@ from ._fixtures import SHAPES
 from ._fixtures import SRC
 
 pytest.importorskip("faiss")
+pytest.importorskip("cryptography")
 
 
 def _cfg(tmp_path: Path) -> Config:

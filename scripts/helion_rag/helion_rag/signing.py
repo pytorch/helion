@@ -20,11 +20,15 @@ import json
 import os
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+# cryptography is imported lazily inside the functions that need it, matching
+# how index.py defers langchain: `pytest .` from the repo root collects this
+# package's tests without installing it, so a module-level import here breaks
+# collection for the whole repo.
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 MANIFEST_VERSION = 1
 MANIFEST_NAME = "manifest.json"
@@ -84,6 +88,9 @@ def sha256_file(path: Path) -> str:
 # --------------------------------------------------------------------------- #
 def generate_keypair() -> tuple[bytes, bytes]:
     """Return ``(private_pem, public_pem)`` for the offline publisher / tests."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     private = Ed25519PrivateKey.generate()
     private_pem = private.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -98,6 +105,9 @@ def generate_keypair() -> tuple[bytes, bytes]:
 
 
 def load_private_key(private_pem: bytes) -> Ed25519PrivateKey:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     try:
         key = serialization.load_pem_private_key(private_pem, password=None)
     except (TypeError, ValueError) as exc:
@@ -108,6 +118,9 @@ def load_private_key(private_pem: bytes) -> Ed25519PrivateKey:
 
 
 def load_public_key(public_pem: bytes) -> Ed25519PublicKey:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
     try:
         key = serialization.load_pem_public_key(public_pem)
     except (TypeError, ValueError) as exc:
@@ -171,6 +184,8 @@ def verify_manifest_signature(
     manifest: dict, signature: bytes, public_key: Ed25519PublicKey
 ) -> None:
     """Raise :class:`SignatureError` if the signature does not match the manifest."""
+    from cryptography.exceptions import InvalidSignature
+
     try:
         public_key.verify(signature, canonical_json_bytes(manifest))
     except (InvalidSignature, ValueError) as exc:

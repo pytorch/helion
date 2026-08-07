@@ -11,6 +11,7 @@ from helion_rag import signing
 from helion_rag.config import Config
 
 pytest.importorskip("faiss")
+pytest.importorskip("cryptography")
 
 _FAMILY = "h100"
 

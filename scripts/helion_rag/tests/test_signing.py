@@ -12,6 +12,8 @@ from helion_rag.signing import MissingArtifactError
 from helion_rag.signing import SignatureError
 from helion_rag.signing import VersionMismatchError
 
+pytest.importorskip("cryptography")
+
 
 def _write(gen_dir, name, content=b"data"):
     (gen_dir / name).write_bytes(content)

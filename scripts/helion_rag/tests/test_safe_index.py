@@ -9,6 +9,8 @@ from helion_rag.signing import HashMismatchError
 from helion_rag.signing import MissingArtifactError
 from helion_rag.signing import SignatureError
 
+pytest.importorskip("cryptography")
+
 _VECTORS = np.array(
     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
     dtype="float32",
