@@ -183,6 +183,11 @@ jobs:
           uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
           python -c "from packaging.version import Version; import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__); assert torch.cuda.is_available(); assert Version(triton.__version__) >= Version('3.7.1'), triton.__version__"
           python -c "import fla; print('fla', fla.__name__)"
+          # FlashKDA builds a CUDA extension: --no-build-isolation for the torch
+          # import in its setup.py, and FLASH_KDA_CUDA_ARCHS so the arch does not
+          # depend on a device being visible while installing.
+          FLASH_KDA_CUDA_ARCHS=all uv pip install "git+https://github.com/MoonshotAI/FlashKDA" --no-build-isolation --no-deps
+          python -c "import flash_kda; print('flash_kda', flash_kda.__name__)"
 
       - name: Run TritonBench Benchmark
         if: inputs.suite == 'tritonbench'

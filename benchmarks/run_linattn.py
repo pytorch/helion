@@ -36,7 +36,8 @@ SHAPES: list[tuple[str, int, int, int, int]] = [
 
 # Variants with their own examples.linear.example_<name> module, whose
 # benchmark(configs) returns (cfg, helion_fwd_ms, fla_fwd_ms, helion_fb_ms,
-# fla_fb_ms) rows. Each emits a forward and a forward+backward ("<variant>-bwd") row.
+# fla_fb_ms, flashkda_fwd_ms) rows. Each emits a forward and a forward+backward
+# ("<variant>-bwd") row.
 DENSE_VARIANTS = [
     "vanilla_linear_attn",
     "simple_gla",
@@ -127,6 +128,16 @@ def write_results_json(
             labels,
             [r[2] / r[1] if r[1] else 0.0 for r in rows],
         )
+        # FlashKDA against the same FLA baseline, on the varlen shapes only.
+        fk = [r[5] for r in rows]
+        if any(fk):
+            add_metric(variant, "flashkda_latency_ms", labels, fk)
+            add_metric(
+                variant,
+                "flashkda_speedup",
+                labels,
+                [r[2] / r[5] if r[5] else 0.0 for r in rows],
+            )
         if variant in FUSED_PREAMBLE_VARIANTS or variant in VARLEN_VARIANTS:
             # Forward-only: no backward to time, and no verdict to report.
             continue
