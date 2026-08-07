@@ -179,6 +179,13 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     segment_store_row_index: Node | None = None
     segment_store_valid_m: Node | None = None
     orientation: Tcgen05Orientation = Tcgen05Orientation.MN
+    output_column_major: bool = False
+
+    @property
+    def d_store_layout(self) -> str:
+        if self.output_column_major:
+            return "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+        return super().d_store_layout
 
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:
