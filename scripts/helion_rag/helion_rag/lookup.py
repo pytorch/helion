@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from helion_rag import signing
@@ -11,7 +12,18 @@ from helion_rag.config import _config
 import helion_rag.corpus as corpus
 import helion_rag.hardware as hardware
 import helion_rag.index as index_mod
+from helion_rag.embedding_text import query_text
 from helion_rag.manifest import load_manifest
+from helion_rag.shape_distance import shape_distance
+from helion_rag.shape_distance import shape_relevance
+
+# Semantic over-fetch depth before shape reranking. Measured on the published
+# 46-workload H100 study: the deepest pre-rerank rank reranking ever promoted
+# into the final top-3 was 39 (p50 3, p95 21), so 64 leaves ~1.6x headroom. It
+# does bind -- 8 of those workloads had more than 64 candidates above the
+# similarity threshold -- so revisit this if the corpus grows well beyond the
+# ~150 workloads per hardware family it was measured at.
+_TIER1_POOL = 64
 
 
 def _load_manifest_opt(cfg) -> dict | None:
@@ -57,19 +69,36 @@ def _artifact_identity(
     }
 
 
+def _distinct_kernel_neighbors(neighbors: list[dict], k: int) -> list[dict]:
+    """Keep the best-ranked workload for each distinct kernel type."""
+    selected = []
+    seen = set()
+    for neighbor in neighbors:
+        kernel_name = neighbor.get("kernel_name")
+        if kernel_name in seen:
+            continue
+        seen.add(kernel_name)
+        selected.append(neighbor)
+        if len(selected) >= k:
+            break
+    return selected
+
+
 def lookup(
     kernel_source: str,
     shapes: str,
     dtypes: str,
     hardware: str,
     settings: dict | None = None,
-    k: int = 8,
+    kernel_name: str = "",
+    k: int | None = None,
     cfg=None,
     propagate_artifact_errors: bool = False,
     require_generation_pin: bool = False,
 ) -> dict:
     """Try Tier-0 exact match, then Tier-1 vector similarity, else Tier-2 miss."""
     cfg = cfg or _config()
+    k = k if k is not None else int(os.environ.get("HELION_RAG_K", "8"))
     family = _resolve_family(hardware, cfg)
     if family is None:
         return _tier2(None, f"lookup: unrecognized hardware {hardware!r}; Tier 2 miss")
@@ -116,8 +145,12 @@ def lookup(
             "artifact_identity": artifact_identity,
         }
 
-    query_vec = index_mod._embeddings(cfg).embed_query(kernel_source.strip())
-    hits = safe_idx.search(query_vec, k)
+    # Over-fetch a pool rather than k: shape reranking below reorders the
+    # semantic hits, so the final top-k can come from anywhere in the pool.
+    query_vec = index_mod._embeddings(cfg).embed_query(
+        query_text(kernel_source, shapes, dtypes, kernel_name, cfg.embed_text)
+    )
+    hits = safe_idx.search(query_vec, _TIER1_POOL)
     if not hits:
         return _tier2(family, artifact_identity=artifact_identity)
 
@@ -130,20 +163,42 @@ def lookup(
             artifact_identity=artifact_identity,
         )
 
-    neighbors = [
-        {
-            "kernel_name": md.get("kernel_name"),
-            "input_shapes": md.get("input_shapes"),
-            "dtypes": md.get("dtypes"),
-            "top_n": md.get("top_n"),
-            "ref": md.get("ref"),
-            "score": float(score),
-        }
-        for score, md in hits
-    ]
+    neighbors = []
+    for score, md in hits:
+        if score < threshold:
+            continue
+        distance = shape_distance(shapes, md.get("input_shapes") or "")
+        shape_score = shape_relevance(distance)
+        neighbors.append(
+            {
+                "kernel_name": md.get("kernel_name"),
+                "input_shapes": md.get("input_shapes"),
+                "dtypes": md.get("dtypes"),
+                "top_n": md.get("top_n"),
+                "ref": md.get("ref"),
+                "score": float(score),
+                "shape_distance": distance,
+                "relevance": (
+                    float(score) * shape_score if shape_score else float(score)
+                ),
+            }
+        )
+    if os.environ.get("HELION_RAG_SHAPE_RERANK", "0") == "1":
+        neighbors.sort(
+            key=lambda neighbor: (
+                neighbor["shape_distance"],
+                -neighbor["score"],
+                (neighbor.get("top_n") or [{"median": float("inf")}])[0]["median"],
+            )
+        )
+    selected = (
+        _distinct_kernel_neighbors(neighbors, k)
+        if os.environ.get("HELION_RAG_DISTINCT_KERNELS") == "1"
+        else neighbors[:k]
+    )
     return {
         "tier": 1,
         "family": family,
-        "neighbors": neighbors,
+        "neighbors": selected,
         "artifact_identity": artifact_identity,
     }

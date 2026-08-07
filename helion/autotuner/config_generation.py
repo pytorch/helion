@@ -468,6 +468,11 @@ class ConfigGeneration:
             try:
                 flat = self.flatten(config)
                 normalized = self.unflatten(flat)
+                # A foreign-workload seed can survive flatten/unflatten yet still
+                # encode to a fragment length that mismatches this spec's surrogate
+                # dimension (LFBO seeds train_x via encode_config). Validate it here
+                # so an un-encodable seed is skipped rather than crashing autotuning.
+                self.encode_config(flat)
             except (
                 InvalidConfig,
                 ValueError,

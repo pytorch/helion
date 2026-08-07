@@ -5203,6 +5203,34 @@ class TestAutotuneSeedConfigs(TestCase):
             "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
         )
 
+    def test_random_initial_population_skips_unencodable_seed_configs(self) -> None:
+        """A seed that flattens but cannot encode is dropped, not fatal.
+
+        Surrogate searches encode every seed into ``train_x``. A config carried
+        over from a different workload can round-trip through flatten/unflatten
+        and still encode to a fragment length that mismatches this spec, which
+        used to abort the whole autotune instead of skipping one seed.
+        """
+        seed_config = self._seed_config()
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(bound, args, initial_population=3)
+        search.log = Mock()
+
+        with patch.object(
+            ConfigGeneration,
+            "encode_config",
+            side_effect=AssertionError("fragment length mismatch"),
+        ):
+            configs = self._population_configs(search)
+
+        # The population is still built; only the offending seed is dropped.
+        self.assertGreaterEqual(len(configs), 3)
+        search.log.assert_called_once()
+        self.assertIn(
+            "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
+        )
+
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 @onlyBackends(["triton"])
