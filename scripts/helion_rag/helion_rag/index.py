@@ -24,6 +24,7 @@ from helion_rag.corpus import _exact_map
 from helion_rag.corpus import _group_by_family
 from helion_rag.corpus import _runid_map
 from helion_rag.corpus import load_corpus
+from helion_rag.embedding_text import index_text
 
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -272,7 +273,8 @@ def build_family_index(cfg, family: str, records: list) -> Path:
         _recover_orphaned_generations(fam_dir)
         emb = _embeddings(cfg)
         vectors = np.asarray(
-            emb.embed_documents([r["embed_text"] for r in records]), dtype="float32"
+            emb.embed_documents([index_text(r, cfg.embed_text) for r in records]),
+            dtype="float32",
         )
         idx = safe_index.build_safe_index(vectors, [_metadata_for(r) for r in records])
         exact = _exact_map(records)

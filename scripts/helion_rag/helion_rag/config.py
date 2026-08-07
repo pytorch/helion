@@ -27,6 +27,7 @@ class Config:
     autotune_log_dir: Path | None = None
     uploads_dir: Path | None = None
     generation_id: str | None = None
+    embed_text: str = "source"
 
     @property
     def corpus_dir(self) -> Path:
@@ -70,4 +71,5 @@ def _config() -> Config:
         autotune_log_dir=opt("HELION_RAG_AUTOTUNE_LOG_DIR"),
         uploads_dir=opt("HELION_RAG_UPLOADS_DIR"),
         generation_id=os.environ.get("HELION_RAG_GENERATION_ID") or None,
+        embed_text=os.environ.get("HELION_RAG_EMBED_TEXT", "source"),
     )
