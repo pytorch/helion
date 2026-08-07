@@ -68,6 +68,7 @@ from helion._compiler.cute.cute_mma import _new_tcgen05_sched_pipeline_plan
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
+from helion._compiler.cute.cute_mma import _tcgen05_explicit_epilogue_tile_supported
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
@@ -606,6 +607,33 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def test_tcgen05_explicit_epilogue_tile_structural_rules(self) -> None:
+        valid = [(False, 64, 64, (64, n, n)) for n in (16, 32, 64)] + [
+            (True, 256, 256, (128, 32, 32)),
+            (False, 128, 128, (128, 32, 32)),
+            (False, 128, 128, (128, 64, 64)),
+        ]
+        invalid = [
+            (True, 256, 256, (128, 32, 16)),
+            (False, 64, 64, (32, 32, 32)),
+            (False, 64, 64, (64, 8, 8)),
+            (False, 64, 96, (64, 12, 12)),
+            (True, 128, 128, (64, 32, 32)),
+            (True, 256, 256, (64, 64, 64)),
+        ]
+        for expected, cases in ((True, valid), (False, invalid)):
+            for is_two_cta, bm, bn, tile_shape in cases:
+                with self.subTest(tile_shape=tile_shape, bm=bm, bn=bn):
+                    self.assertEqual(
+                        _tcgen05_explicit_epilogue_tile_supported(
+                            is_two_cta=is_two_cta,
+                            bm=bm,
+                            bn=bn,
+                            tile_shape=tile_shape,
+                        ),
+                        expected,
+                    )
+
     def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
         return SimpleNamespace(
             env={inp: ast.Name(id="x", ctx=ast.Load())},
@@ -2748,16 +2776,17 @@ class TestCuteLowerings(unittest.TestCase):
 
         torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_explicit_epilogue_tile_rejects_unsupported_shape(self) -> None:
+    def test_tcgen05_explicit_epilogue_tile_accepts_single_cta_shape(self) -> None:
+        torch.manual_seed(0)
         args = (
-            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
         )
         cfg = _make_tcgen05_role_local_monolithic_seed_config(
-            block_sizes=[256, 256, 128],
+            block_sizes=[128, 128, 128],
             l2_groupings=[1],
             pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
+            tcgen05_cluster_m=1,
             tcgen05_cluster_n=1,
             tcgen05_ab_stages=2,
             tcgen05_acc_stages=2,
@@ -2768,18 +2797,22 @@ class TestCuteLowerings(unittest.TestCase):
                     Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
                 ),
                 TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
-                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 64,
-                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 64,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
             },
         )
         with patch_cute_mma_support():
             bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            with self.assertRaisesRegex(
-                exc.BackendUnsupported,
-                r"epi_tile=\(128, 32\).*d_store_box_n=32",
-            ):
-                bound.to_triton_code(cfg)
+            code = bound.to_triton_code(cfg)
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        self.assertIn(
+            "tcgen05_store_epi_tile = (cute.make_layout(128), cute.make_layout(32))",
+            code,
+        )
+        torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_explicit_epilogue_tile_runtime_correctness(self) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
