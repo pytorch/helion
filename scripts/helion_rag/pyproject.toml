@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Helion RAG over CI artifacts for autotuning assistance"
 requires-python = ">=3.9"
 dependencies = [
+    "cryptography",
     "langchain",
     "langchain-community",
     "langchain-huggingface",
