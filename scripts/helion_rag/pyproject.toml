@@ -19,10 +19,6 @@ dependencies = [
 readme = "README.md"
 
 [project.optional-dependencies]
-# Only plot_narrative_figures.py needs these; the gnuplot figure pack in
-# analyze_head_to_head.py renders without any Python plotting package.
-figures = ["matplotlib>=3.7", "numpy"]
-
 [project.scripts]
 helion-rag = "helion_rag.cli:main"
 

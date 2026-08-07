@@ -208,73 +208,62 @@ A production autotuner should therefore route policies by workload family and re
 
 ### A. Aggregate effects versus LFBO
 
-![Geometric-mean performance and readiness ratios versus LFBO](figures/01_aggregate_effects.png)
 
 Points are geometric-mean ratios and error bars are 95% kernel-bootstrap intervals. The dashed line at 1 denotes parity with LFBO.
 
 ### B. Performance trend over wall time
 
-![Normalized incumbent performance versus elapsed wall time](figures/02_trajectory_walltime.png)
 
 Lower normalized incumbent is better. LLM and RAG-LLM reach near-best configurations earlier; LFBO and especially Hybrid continue searching longer.
 
 ### C. Performance trend over benchmarked configurations
 
-![Normalized incumbent performance versus benchmarked configurations](figures/03_trajectory_candidates.png)
 
 This view separates candidate efficiency from wall-clock overhead and shows how quickly each policy reduces incumbent latency as configurations are benchmarked.
 
 ### D. Search overhead across representative kernels
 
-![Four-way evaluated-configuration comparison across 15 representative kernels](figures/04_search_overhead.png)
 
 The 15-workload poster subset spans every kernel family and is ordered by LFBO readiness difficulty. Geometric-mean evaluated configurations were **40.9 / 32.4 / 69.8 / 32.5** for LFBO / LLM / Hybrid / RAG-LLM; corresponding readiness geometric means were **120.9 / 68.3 / 188.6 / 75.9 s**. Hybrid explores most deeply, while LLM and RAG-LLM use the smallest search budgets.
 
 ### E. Cold-start step trajectory
 
-![Median best latency versus wall-clock time for the 8192 cubed MatMul](figures/05_cold_start_step.png)
 
 For `matmul-8192x8192x8192`, the best median internal latencies for LFBO / LLM / Hybrid / RAG-LLM were **3.754 / 1.662 / 1.665 / 1.573 ms**. The three LLM-assisted approaches reached those displayed minima at approximately 25.4 s, while LFBO reached its minimum at 39.7 s. The post-step rendering does not imply an unmeasured result at time zero.
 
 ### F. Per-kernel RAG-LLM/LFBO performance ratios
 
-![Per-kernel LLM, Hybrid, and RAG-LLM selected-latency ratios over LFBO](figures/06_per_kernel_ratio.png)
 
 Each kernel shows LLM/LFBO, Hybrid/LFBO, and RAG-LLM/LFBO; LFBO is the solid 1.0 reference. Under the ±2.5% band, LLM recorded **15 wins / 9 ties / 9 losses**, Hybrid **19/8/6**, and RAG-LLM **16/8/9**. Dashed lines mark the empirical parity band, and the logarithmic axis keeps the large Split-K regressions visible without hiding near-parity kernels.
 
 ### G. Suite-wide normalized trajectory regret
 
-![Suite median oracle regret with interquartile ribbons](figures/07_suite_regret.png)
 
 The heavy lines are suite medians and ribbons are workload-level 25th–75th percentiles for all four approaches. Once every workload was observable, median regrets were **42.3% LFBO, 10.7% LLM, 10.3% Hybrid, and 4.9% RAG-LLM**; final displayed medians were **42.3%, 6.4%, 5.0%, and 3.8%**, respectively. The reference is the best internal trajectory incumbent observed for each workload, distinct from the stabilized final-outcome oracle used in the result table.
 
 ### H. Time to hit the ≤5% regret target
 
-![CDF of workloads reaching within five percent of the trajectory oracle](figures/08_time_to_hit.png)
 
 This CDF keeps all 33 workloads in the denominator. By approximately 26.4 s, coverage was **0.0% / 36.4% / 39.4% / 42.4%** for LFBO / LLM / Hybrid / RAG-LLM. Final coverage was **24.2% / 36.4% / 51.5% / 54.5%**. Thus all LLM-assisted approaches accelerate cold start, with contextual RAG attaining the highest strict-target coverage; the data do not support the hypothetical claim that every workload is optimized within two seconds.
 
 ### I. Fifteen-workload small-multiple grid
 
-![Three by five grid of four-way per-workload step trajectories](figures/09_small_multiples.png)
 
 The 3×5 grid exposes workload heterogeneity hidden by suite aggregates. Every panel contains all four approaches, retains its own latency scale, and shares a common wall-clock range and color convention. It is intended as the granular poster panel for attendees interested in specific operators.
 
-SVG and PDF versions of each figure are available in `figures/` for poster editing.
+Figures are not checked in; regenerate them from a campaign directory with `scripts/helion_rag/analyze_head_to_head.py`.
 
 ### J. Selected performance by kernel
 
-![Selected latency normalized to LFBO for every kernel](figures/10_selected_performance_by_kernel.png)
 
 Performance is normalized within each workload to LFBO=1 so kernels spanning several orders of magnitude remain comparable. Learned guidance produces large improvements on conventional attention, MatMul, grouped GEMM, and Mamba-2, while most saturated elementwise kernels cluster near parity. The two large Split-K cases are the dominant exceptions: LLM and RAG-LLM regress sharply, whereas Hybrid stays close to LFBO.
 
 ### K. Readiness wall time by kernel
 
-![Median readiness wall time for every kernel](figures/11_wall_time_by_kernel.png)
 
 Wall time has a much more stable policy ordering than performance. LLM is fastest or nearly fastest across the suite, RAG-LLM is slightly slower, LFBO is generally next, and Hybrid is consistently slowest. Workload complexity changes the magnitude of readiness time—especially for RoPE and large attention—but rarely changes the ordering.
 
-The reproducible plotting source is `analysis/plot_separate_performance_walltime.gnuplot`; PNG, SVG, and PDF versions of both plots are available in `figures/`.
+Both plots regenerate from a campaign directory with `scripts/helion_rag/analyze_head_to_head.py`.
 
 ## Expanded per-kernel metrics
 

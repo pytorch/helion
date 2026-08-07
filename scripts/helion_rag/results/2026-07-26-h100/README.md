@@ -39,10 +39,9 @@ seed repeatability, and limitations.
 | `analysis/all_arm_table.md` | the full per-kernel table |
 | `analysis/aggregate_statistics.{json,csv}` | pairwise contrasts, CIs, adjusted p |
 | `analysis/reliability.csv`, `analysis/cost.csv` | correctness and token accounting |
-| `figures/*.svg` | five representative figures |
 
-`trajectory_long.csv` (29,052 rows, 4.2 MB) and the PDF/PNG figure renderings are
-omitted to keep the repository small. Both regenerate from a campaign directory:
+`trajectory_long.csv` (29,052 rows, 4.2 MB) and every figure are omitted to keep
+the repository small. All of them regenerate from a campaign directory:
 
 ```bash
 PYTHONPATH=scripts/helion_rag .venv/bin/python \
