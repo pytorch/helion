@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import math
 import operator
 import re
 from types import SimpleNamespace
@@ -63,6 +64,7 @@ from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
 from helion._compiler.cute.cute_mma import _mma_loop_is_exclusive
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
+from helion._compiler.cute.cute_mma import _MmaOperandAnalysis
 from helion._compiler.cute.cute_mma import _MmaOperandInfo
 from helion._compiler.cute.cute_mma import _MmaRoleCoordinatePlan
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
@@ -638,6 +640,129 @@ class TestCuteLowerings(unittest.TestCase):
                         expected,
                     )
 
+    def test_tcgen05_search_uses_source_mapped_n(self) -> None:
+        from helion.language.matmul_ops import plan_cute_tcgen05_search
+
+        fake_env = SimpleNamespace(
+            backend_name="cute",
+            get_block_id=lambda size: None,
+        )
+        support = SimpleNamespace(tcgen05_f8=True, tcgen05_f16bf16=True)
+        lhs = torch.empty(64, 32, dtype=torch.bfloat16)
+        small_rhs = torch.empty(32, 2, dtype=torch.bfloat16)
+        regular_rhs = torch.empty(32, 96, dtype=torch.bfloat16)
+        with (
+            patch.object(CompileEnvironment, "current", return_value=fake_env),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            mapped_plan = plan_cute_tcgen05_search(
+                lhs,
+                small_rhs,
+                has_leading_passthrough=False,
+                source_mapped_n=2,
+            )
+            self.assertIsNotNone(mapped_plan)
+            assert mapped_plan is not None
+            self.assertEqual(mapped_plan.source_mapped_n, 2)
+            self.assertEqual(mapped_plan.max_search_n, 16)
+            self.assertIsNone(
+                plan_cute_tcgen05_search(
+                    lhs,
+                    small_rhs,
+                    has_leading_passthrough=False,
+                )
+            )
+            self.assertIsNone(
+                plan_cute_tcgen05_search(
+                    lhs,
+                    regular_rhs,
+                    has_leading_passthrough=False,
+                    source_mapped_n=32,
+                )
+            )
+
+    def test_tcgen05_swapped_matmul_small_n_runtime(self) -> None:
+        """Swapped operands use tcgen05 with a column-major small-N output."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def swapped_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            out_t = out.T
+            for tile_n, tile_m in hl.tile([n, m]):
+                acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        y[tile_k, tile_n].T,
+                        x[tile_m, tile_k].T,
+                        acc=acc,
+                    )
+                out_t[tile_n, tile_m] = acc.to(torch.bfloat16)
+            return out
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def direct_small_n(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        m, k, n = 2, 4096, 256
+        scale = 1.0 / math.sqrt(k)
+        torch.manual_seed(0)
+        x = (scale * torch.randn(m, k, device=DEVICE)).to(torch.float8_e4m3fn)
+        y = (scale * torch.randn(k, n, device=DEVICE)).to(torch.float8_e4m3fn)
+        y = y.T.contiguous().T
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[64, 16, 256],
+            indexing=["tensor_descriptor"] * 3,
+            pid_type="persistent_interleaved",
+            tcgen05_ab_stages=9,
+            tcgen05_acc_stages=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+
+        with patch_cute_mma_support():
+            direct_bound = direct_small_n.bind((y.T, x.T))
+            self.assertFalse(direct_bound.env.config_spec.cute_tcgen05_search_enabled)
+            bound = swapped_matmul.bind((x, y))
+            self.assertTrue(bound.env.config_spec.cute_tcgen05_search_enabled)
+            bound.set_config(config)
+            code = bound.to_triton_code(config)
+            actual = bound(x, y)
+
+        expected = torch._scaled_mm(
+            x,
+            y,
+            torch.ones((m, 1), device=DEVICE),
+            torch.ones((1, n), device=DEVICE),
+            use_fast_accum=False,
+            out_dtype=torch.bfloat16,
+        )
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn(
+            "tcgen05_c_layout = cutlass.utils.layout.LayoutEnum.COL_MAJOR", code
+        )
+        self.assertIn("'lhs_tma_order': (1, 0)", code)
+        self.assertIn("'rhs_tma_order': (0, 1)", code)
+        self.assertIn("while tcgen05_role_local", code)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_mma_operand_matrix_major_tracks_source_order(self) -> None:
         graph = Graph()
         load = graph.placeholder("load")
@@ -660,6 +785,34 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(direct.matrix_major, "row")
         self.assertEqual(transposed.matrix_major, "col")
         self.assertEqual((transposed.matrix_rows, transposed.matrix_cols), (8, 4))
+        identity_order = dataclasses.replace(
+            direct,
+            source_to_logical_order=(0, 1),
+        )
+        self.assertFalse(direct.has_trailing_matrix_axis_swap)
+        self.assertTrue(transposed.has_trailing_matrix_axis_swap)
+        self.assertFalse(identity_order.has_trailing_matrix_axis_swap)
+        self.assertIsNone(
+            _MmaOperandAnalysis(
+                lhs=direct,
+                rhs=transposed,
+            ).source_mapped_logical_n
+        )
+        self.assertEqual(
+            _MmaOperandAnalysis(
+                lhs=transposed,
+                rhs=transposed,
+            ).source_mapped_logical_n,
+            4,
+        )
+        for lhs, rhs in (
+            (identity_order, transposed),
+            (transposed, identity_order),
+        ):
+            with self.subTest(lhs_order=lhs.source_to_logical_order):
+                self.assertIsNone(
+                    _MmaOperandAnalysis(lhs=lhs, rhs=rhs).source_mapped_logical_n
+                )
 
         padded_row_major = torch.empty_strided((4, 8), (16, 1))
         self.assertEqual(

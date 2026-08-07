@@ -295,6 +295,11 @@ class _Tcgen05LayoutPlan:
     epilogue_rest_mode: str
 
 
+def _trailing_matrix_axis_swap(ndim: int) -> tuple[int, ...]:
+    """Return the axis order that swaps only the two matrix dimensions."""
+    return (*range(ndim - 2), ndim - 1, ndim - 2)
+
+
 @dataclass(frozen=True)
 class _MmaOperandInfo:
     load: Node
@@ -355,6 +360,12 @@ class _MmaOperandInfo:
     @property
     def matrix_major(self) -> str | None:
         return _tcgen05_tma_matrix_major(self.logical_fake)
+
+    @property
+    def has_trailing_matrix_axis_swap(self) -> bool:
+        return self.source_to_logical_order == _trailing_matrix_axis_swap(
+            self.source_fake.ndim
+        )
 
     @property
     def matrix_rows(self) -> int | torch.SymInt:
@@ -2425,6 +2436,18 @@ class _MmaOperandAnalysis:
     rhs: _MmaOperandInfo
 
     @property
+    def source_mapped_logical_n(self) -> int | torch.SymInt | None:
+        """Return swapped logical N derived from the RHS source-axis order."""
+        if (
+            not self.lhs.has_trailing_matrix_axis_swap
+            or not self.rhs.has_trailing_matrix_axis_swap
+        ):
+            return None
+        assert self.rhs.source_to_logical_order is not None
+        rhs_source_n_axis = self.rhs.source_to_logical_order[-1]
+        return self.rhs.source_fake.shape[rhs_source_n_axis]
+
+    @property
     def leading_passthrough_block_id(self) -> int | None:
         return (
             self.lhs.leading_passthrough_block_id
@@ -2501,11 +2524,7 @@ def _unwrap_mma_operand_permute(
     # supports swapping the two trailing matrix axes. Arbitrary permutations
     # would also require remapping M/N/K, leading batch/group axes, tile block
     # ids, and TMA coordinates throughout the rest of the lowering.
-    trailing_axis_swap = (
-        *range(value_fake.ndim - 2),
-        value_fake.ndim - 1,
-        value_fake.ndim - 2,
-    )
+    trailing_axis_swap = _trailing_matrix_axis_swap(value_fake.ndim)
     if normalized != trailing_axis_swap:
         return None
     return node.args[0], normalized

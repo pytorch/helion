@@ -3783,6 +3783,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     tuple(block_ids) for block_ids in device_ir.grid_block_ids
                 }
                 search_candidates = []
+                source_mapped_ns: list[int | torch.SymInt | None] = []
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         candidate = analyze_cute_mma_node(node, device_ir=device_ir)
@@ -3800,12 +3801,19 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             and isinstance(rhs, torch.Tensor)
                         ):
                             continue
+                        source_mapped_n = candidate.operands.source_mapped_logical_n
+                        # Track every structurally relevant MMA, including
+                        # candidates whose individual search plan is rejected.
+                        # A rejected direct-layout matmul must not disappear
+                        # before the shared small-N relaxation is checked.
+                        source_mapped_ns.append(source_mapped_n)
                         search_plan = plan_cute_tcgen05_search(
                             lhs,
                             rhs,
                             has_leading_passthrough=(
                                 candidate.operands.has_leading_passthrough
                             ),
+                            source_mapped_n=source_mapped_n,
                         )
                         if search_plan is None:
                             continue
@@ -3833,6 +3841,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         explicit_epi_tile_compatible=all(
                             item.explicit_epi_tile_compatible
                             for item, _lhs, _plan in search_candidates
+                        ),
+                        allow_fp8_small_n_persistent=(
+                            bool(source_mapped_ns)
+                            and all(value is not None for value in source_mapped_ns)
                         ),
                     )
         config_spec.raise_grid_block_minimums()

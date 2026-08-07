@@ -320,6 +320,7 @@ class CuteTcgen05SearchPlan:
     static_m: int
     static_n: int
     static_k: int
+    source_mapped_n: int | None
     leading_work_multiplier: int
     is_fp8: bool
     mma_k: int
@@ -336,6 +337,7 @@ def plan_cute_tcgen05_search(
     rhs: torch.Tensor,
     *,
     has_leading_passthrough: bool,
+    source_mapped_n: int | torch.SymInt | None = None,
 ) -> CuteTcgen05SearchPlan | None:
     """Return search limits without mutating the shared ``ConfigSpec``."""
     m, n, k = _dot_dimensions(lhs, rhs)
@@ -343,6 +345,16 @@ def plan_cute_tcgen05_search(
     static_m = _static_problem_extent(env, m)
     static_n = _static_problem_extent(env, n)
     static_k = _static_problem_extent(env, k)
+    static_source_mapped_n = (
+        _static_problem_extent(env, source_mapped_n)
+        if source_mapped_n is not None
+        else None
+    )
+    if static_source_mapped_n is not None and static_source_mapped_n != static_n:
+        return None
+    allow_small_n = (
+        static_source_mapped_n is not None and 0 < static_source_mapped_n < 16
+    )
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     mma_k = 32 if is_fp8 else 16
     if (
@@ -353,10 +365,12 @@ def plan_cute_tcgen05_search(
         or static_n is None
         or static_k is None
         or static_m < 64
-        or static_n < 8
+        or (not allow_small_n and static_n < 8)
         or static_k < mma_k
     ):
         return None
+    search_n = static_source_mapped_n if allow_small_n else static_n
+    assert search_n is not None
 
     from .._compiler.cute.mma_support import get_cute_mma_support
 
@@ -367,7 +381,7 @@ def plan_cute_tcgen05_search(
     def pow2_floor_at_least(value: int, minimum: int) -> int:
         return 1 << (max(minimum, value).bit_length() - 1)
 
-    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
+    max_tcgen05_n = min(256, pow2_floor_at_least(search_n, 16 if allow_small_n else 8))
     max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
     max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
     max_search_n = max_tcgen05_n
@@ -395,6 +409,7 @@ def plan_cute_tcgen05_search(
         static_m=static_m,
         static_n=static_n,
         static_k=static_k,
+        source_mapped_n=static_source_mapped_n,
         leading_work_multiplier=leading_work_multiplier,
         is_fp8=is_fp8,
         mma_k=mma_k,
@@ -417,6 +432,7 @@ def enable_cute_tcgen05_search(
     input_dtype: torch.dtype,
     has_leading_passthrough: bool,
     explicit_epi_tile_compatible: bool,
+    allow_fp8_small_n_persistent: bool,
 ) -> None:
     """Apply one preflighted tcgen05 search plan to the shared config."""
     env = CompileEnvironment.current()
@@ -439,6 +455,14 @@ def enable_cute_tcgen05_search(
     allow_full_tile_persistent_pid_types = (
         static_m % max_search_m == 0
         and static_n % max_search_n == 0
+        and static_k % max_search_k == 0
+    )
+    allow_fp8_small_n_persistent_pid_types = (
+        plan.is_fp8
+        and allow_fp8_small_n_persistent
+        and plan.source_mapped_n is not None
+        and 0 < plan.source_mapped_n < max_search_n
+        and static_m % max_search_m == 0
         and static_k % max_search_k == 0
     )
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
@@ -492,7 +516,10 @@ def enable_cute_tcgen05_search(
                 allow_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
     spec.narrow_tcgen05_autotune_to_validated_configs(
-        allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
+        allow_persistent_pid_types=(
+            allow_full_tile_persistent_pid_types
+            or allow_fp8_small_n_persistent_pid_types
+        ),
         allow_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
         allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
