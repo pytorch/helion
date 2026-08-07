@@ -211,6 +211,7 @@ def naive_recurrent_reference(
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Step-by-step recurrent computation. Slow but correct.
 
@@ -222,6 +223,10 @@ def naive_recurrent_reference(
                                     (decay + dt_bias)), or -exp(A_log) *
                                     softplus(...) when lower_bound is None
     The names match the flags on the kernels, so a caller forwards one dict to both.
+
+    cu_seqlens [N+1] marks sequence boundaries in a varlen batch (B == 1), where
+    sequence n spans tokens cu_seqlens[n] : cu_seqlens[n+1]. The state resets to
+    zero at each boundary, so no key from one sequence reaches another's output.
     """
     if use_qk_l2norm_in_kernel:
         q = F.normalize(q.float(), dim=-1).to(q.dtype)
@@ -246,8 +251,11 @@ def naive_recurrent_reference(
     S = q.new_zeros(B, H, D, DV, dtype=torch.float32)
     outputs = []
     diagonal = decay.dim() == 4
+    starts = set() if cu_seqlens is None else set(cu_seqlens[:-1].tolist())
 
     for t in range(T):
+        if t in starts:
+            S = torch.zeros_like(S)
         qt = q[:, :, t].float() * q_scale
         kt = k[:, :, t].float()
         vt = v[:, :, t].float()
