@@ -270,6 +270,50 @@ class _MmaOperandInfo:
     rhs_k_block_id: int | None = None
     rhs_rank3_grouped_nt: bool = False
     rhs_segment_group: _Rank3RhsSegmentGroupInfo | None = None
+    source_to_logical_order: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_to_logical_order is None:
+            return
+        expected = self.source_fake.permute(self.source_to_logical_order)
+
+        def mismatch(field: str, actual: object, expected_value: object) -> str:
+            return (
+                f"Invalid MMA operand analysis: logical_fake {field} does not "
+                "match source_fake.permute(source_to_logical_order). The recorded "
+                "logical order is likely incorrect. Please report a bug to the "
+                "Helion maintainers with this context: "
+                f"source_to_logical_order={self.source_to_logical_order}, "
+                f"source_shape={self.source_fake.shape}, "
+                f"source_stride={self.source_fake.stride()}, "
+                f"logical_shape={self.logical_fake.shape}, "
+                f"logical_stride={self.logical_fake.stride()}, "
+                f"field={field}, actual={actual}, expected={expected_value}"
+            )
+
+        assert self.logical_fake.dtype == expected.dtype, mismatch(
+            "dtype", self.logical_fake.dtype, expected.dtype
+        )
+        assert self.logical_fake.device == expected.device, mismatch(
+            "device", self.logical_fake.device, expected.device
+        )
+        assert self.logical_fake.shape == expected.shape, mismatch(
+            "shape", self.logical_fake.shape, expected.shape
+        )
+        assert self.logical_fake.stride() == expected.stride(), mismatch(
+            "stride", self.logical_fake.stride(), expected.stride()
+        )
+        assert self.logical_fake.storage_offset() == expected.storage_offset(), (
+            mismatch(
+                "storage_offset",
+                self.logical_fake.storage_offset(),
+                expected.storage_offset(),
+            )
+        )
+
+    @property
+    def matrix_major(self) -> str | None:
+        return _tcgen05_tma_matrix_major(self.logical_fake)
 
     @property
     def matrix_rows(self) -> int | torch.SymInt:
@@ -818,6 +862,15 @@ def _tcgen05_tma_matrix_major(tensor: torch.Tensor) -> str | None:
     if tensor.stride(-2) == 1:
         return "col"
     return None
+
+
+def _compose_axis_orders(
+    source_to_logical: tuple[int, ...],
+    logical_to_target: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Map source axes directly into a target ordered from logical axes."""
+    assert len(source_to_logical) == len(logical_to_target)
+    return tuple(source_to_logical[logical_dim] for logical_dim in logical_to_target)
 
 
 def _rank3_rhs_index_block_id(index: Node, *, reduction: bool | None) -> int | None:
@@ -1900,6 +1953,7 @@ class _MmaSearchGraphView:
 @dataclass(frozen=True)
 class _MmaOutputStoreAnalysis:
     explicit_epi_tile_compatible: bool
+    output_column_major: bool
 
 
 def _mma_tiles_are_static_full(
@@ -1913,11 +1967,47 @@ def _mma_tiles_are_static_full(
     )
 
 
+def _unwrap_mma_operand_permute(
+    node: Node,
+) -> tuple[Node, tuple[int, ...] | None] | None:
+    """Unwrap the trailing-axis swap supported by collective MMA lowering.
+
+    Return ``(node, None)`` when no permutation is present, or the source node
+    and its source-to-logical axis order for a supported swap. Return ``None``
+    when the node is a malformed or unsupported permutation.
+    """
+    if node.op != "call_function" or node.target is not torch.ops.aten.permute.default:
+        return node, None
+    if len(node.args) != 2 or not isinstance(node.args[0], Node):
+        return None
+    value_fake = node.meta.get("val")
+    order = node.args[1]
+    if not isinstance(value_fake, torch.Tensor) or not isinstance(order, (list, tuple)):
+        return None
+    normalized = tuple(int(cast("int", dim)) % value_fake.ndim for dim in order)
+    # The order representation is general, but collective MMA lowering only
+    # supports swapping the two trailing matrix axes. Arbitrary permutations
+    # would also require remapping M/N/K, leading batch/group axes, tile block
+    # ids, and TMA coordinates throughout the rest of the lowering.
+    trailing_axis_swap = (
+        *range(value_fake.ndim - 2),
+        value_fake.ndim - 1,
+        value_fake.ndim - 2,
+    )
+    if normalized != trailing_axis_swap:
+        return None
+    return node.args[0], normalized
+
+
 def _analyze_mma_operand(
     node: Node,
     env: CompileEnvironment,
 ) -> _MmaOperandInfo | None:
-    info = _direct_load_tensor(node)
+    permute = _unwrap_mma_operand_permute(node)
+    if permute is None:
+        return None
+    load_value, source_to_logical_order = permute
+    info = _direct_load_tensor(load_value)
     if info is None:
         return None
     load_node, _, source_fake = info
@@ -1938,16 +2028,25 @@ def _analyze_mma_operand(
             block_size, source_fake.size(dim)
         ):
             return None
+    if source_to_logical_order is not None:
+        block_ids = tuple(block_ids[dim] for dim in source_to_logical_order)
     if source_fake.ndim not in (2, 3):
+        return None
+    if source_to_logical_order is not None and source_fake.ndim == 3:
         return None
     if value_fake.ndim not in (2, source_fake.ndim):
         return None
     return _MmaOperandInfo(
         load=load_node,
-        terminal=load_node,
+        terminal=node if source_to_logical_order is not None else load_node,
         source_fake=source_fake,
-        logical_fake=source_fake,
+        logical_fake=(
+            source_fake.permute(source_to_logical_order)
+            if source_to_logical_order is not None
+            else source_fake
+        ),
         block_ids=block_ids,
+        source_to_logical_order=source_to_logical_order,
     )
 
 
@@ -1980,7 +2079,7 @@ def _analyze_mma_operands(
     # matrices. Keep other layouts out of the shared search/planning/codegen
     # capability until their rank-3 descriptor mapping is supported.
     if leading_passthrough_block_id is not None and any(
-        operand.source_fake.stride(-1) != 1
+        operand.matrix_major != "row"
         for operand in (lhs, rhs)
         if operand.is_leading_passthrough
     ):
@@ -2190,6 +2289,7 @@ class _CuteMmaNode(_CuteMmaTarget):
 
     operands: _MmaOperandAnalysis
     explicit_epi_tile_compatible: bool
+    output_column_major: bool
 
     @property
     def requires_scalar_fallback(self) -> bool:
@@ -2325,7 +2425,11 @@ def analyze_cute_mma_node(
     if not _mma_result_can_be_deferred(node) or not _mma_loop_is_exclusive(node):
         return None
     output_store_analysis: _MmaOutputStoreAnalysis | None = None
-    if operands.has_leading_passthrough:
+    needs_output_store_analysis = operands.has_leading_passthrough or (
+        operands.lhs.source_to_logical_order is not None
+        and operands.rhs.source_to_logical_order is not None
+    )
+    if needs_output_store_analysis:
         cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
         if isinstance(cached, _MmaOutputStoreAnalysis):
             output_store_analysis = cached
@@ -2362,13 +2466,18 @@ def analyze_cute_mma_node(
         out_dtype=target.out_dtype,
         operands=operands,
         explicit_epi_tile_compatible=(
-            _tcgen05_tma_matrix_major(operands.lhs.source_fake) == "row"
-            and _tcgen05_tma_matrix_major(operands.rhs.source_fake) in ("row", "col")
+            operands.lhs.matrix_major == "row"
+            and operands.rhs.matrix_major in ("row", "col")
             and (
                 output_store_analysis.explicit_epi_tile_compatible
                 if output_store_analysis is not None
                 else True
             )
+        ),
+        output_column_major=(
+            output_store_analysis.output_column_major
+            if output_store_analysis is not None
+            else False
         ),
         with_acc=target.with_acc,
         is_dot=target.is_dot,
@@ -4071,6 +4180,7 @@ def _analyze_mma_output_stores(
         return None
     env = CompileEnvironment.current()
     explicit_epi_tile_compatible = True
+    output_column_major: bool | None = None
     for store, chain in analyzed_stores:
         tensor_node = store.args[0] if store.args else None
         tensor_fake = (
@@ -4092,8 +4202,17 @@ def _analyze_mma_output_stores(
             tensor_fake.dtype == analysis.lhs.source_fake.dtype
             and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_steps)
         )
+        store_major = _tcgen05_tma_matrix_major(tensor_fake)
+        if store_major is None:
+            return None
+        store_column_major = store_major == "col"
+        if output_column_major is None:
+            output_column_major = store_column_major
+        elif output_column_major != store_column_major:
+            return None
     return _MmaOutputStoreAnalysis(
-        explicit_epi_tile_compatible=explicit_epi_tile_compatible
+        explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        output_column_major=bool(output_column_major),
     )
 
 
@@ -4213,6 +4332,9 @@ def _emit_mma_pipeline(
     rhs_node = candidate.rhs if candidate is not None else rhs_node
     if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
         return None
+    output_column_major = (
+        candidate.output_column_major if candidate is not None else False
+    )
 
     env = CompileEnvironment.current()
     requested_schedule = _requested_tcgen05_grouped_schedule(grouped_mode)
@@ -4532,8 +4654,8 @@ def _emit_mma_pipeline(
         torch.bfloat16,
         torch.float8_e4m3fn,
     )
-    _lhs_major = _tcgen05_tma_matrix_major(lhs_fake)
-    _rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
+    _lhs_major = lhs_operand.matrix_major
+    _rhs_major = rhs_operand.matrix_major
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
     # layout Helion emits expects the standard row-major A. Only B's major
     # mode is made layout-aware here.
@@ -6290,7 +6412,7 @@ def _emit_mma_pipeline(
     tcgen05_explicit_d_store_box_n: int | None = None
     tcgen05_d_store_layout = (
         "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
-        if nm_worklist
+        if nm_worklist or output_column_major
         else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
     )
     nm_explicit_store_wave = False
@@ -8010,9 +8132,21 @@ def _emit_mma_pipeline(
                 if tcgen05_grouped_dynamic_ab_tensormap_rank == 2:
                     ab_tma_plan["dynamic_ab_tensormap_rank"] = 2
             if lhs_operand.is_leading_passthrough:
-                ab_tma_plan["lhs_leading_passthrough"] = True
+                ab_tma_plan["lhs_tma_order"] = (1, 2, 0)
+            elif lhs_operand.source_to_logical_order is not None:
+                # A TensorMaps use logical (M, K) order. Compose that order
+                # with the program's source-to-logical permutation.
+                ab_tma_plan["lhs_tma_order"] = _compose_axis_orders(
+                    lhs_operand.source_to_logical_order, (0, 1)
+                )
             if rhs_operand.is_leading_passthrough:
-                ab_tma_plan["rhs_leading_passthrough"] = True
+                ab_tma_plan["rhs_tma_order"] = (2, 1, 0)
+            elif rhs_operand.source_to_logical_order is not None:
+                # B TensorMaps use logical (N, K) order. For B=x.T, composing
+                # that swap with x's source-to-logical swap produces identity.
+                ab_tma_plan["rhs_tma_order"] = _compose_axis_orders(
+                    rhs_operand.source_to_logical_order, (1, 0)
+                )
             # ``smem_swizzle_*`` overrides are recorded only when codegen
             # selected an explicit SMEM atom kind (either from a user
             # override or the scalar-edge fallback workaround). Keeping
@@ -9425,6 +9559,7 @@ def _emit_mma_pipeline(
                 segment_store_row_index=segment_store_row_index,
                 segment_store_valid_m=segment_store_valid_m,
                 orientation=tcgen05_matmul_plan.orientation,
+                output_column_major=output_column_major,
             ),
         )
         if tcgen05_pure_matmul_object is not None:

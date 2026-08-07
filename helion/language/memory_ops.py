@@ -3118,6 +3118,8 @@ def _codegen_cute_store_tcgen05_tile(
         }
         if leading_passthrough_output:
             d_tma_plan["d_leading_passthrough"] = True
+        if tcgen05_value.output_column_major:
+            d_tma_plan["d_column_major"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
         if d_tma_uses_tail_rank3_mnl_tensor:
             tail_d_tma_plan = {

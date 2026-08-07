@@ -53,6 +53,7 @@ from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
+from helion._compiler.cute.cute_mma import _compose_axis_orders
 from helion._compiler.cute.cute_mma import _decode_cute_mma_target
 from helion._compiler.cute.cute_mma import _emit_sched_pipeline_setup
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
@@ -62,15 +63,18 @@ from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
 from helion._compiler.cute.cute_mma import _mma_loop_is_exclusive
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
+from helion._compiler.cute.cute_mma import _MmaOperandInfo
 from helion._compiler.cute.cute_mma import _MmaRoleCoordinatePlan
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
 from helion._compiler.cute.cute_mma import _new_tcgen05_sched_pipeline_plan
+from helion._compiler.cute.cute_mma import _operand_infos_exclusive_for_mma
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
+from helion._compiler.cute.cute_mma import _unwrap_mma_operand_permute
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
@@ -597,6 +601,107 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def test_mma_operand_matrix_major_tracks_source_order(self) -> None:
+        graph = Graph()
+        load = graph.placeholder("load")
+        row_major = torch.empty_strided((4, 8), (8, 1))
+
+        direct = _MmaOperandInfo(
+            load=load,
+            terminal=load,
+            source_fake=row_major,
+            logical_fake=row_major,
+            block_ids=(0, 1),
+        )
+        transposed = dataclasses.replace(
+            direct,
+            logical_fake=row_major.permute(1, 0),
+            block_ids=(1, 0),
+            source_to_logical_order=(1, 0),
+        )
+
+        self.assertEqual(direct.matrix_major, "row")
+        self.assertEqual(transposed.matrix_major, "col")
+        self.assertEqual((transposed.matrix_rows, transposed.matrix_cols), (8, 4))
+
+        padded_row_major = torch.empty_strided((4, 8), (16, 1))
+        self.assertEqual(
+            dataclasses.replace(
+                direct,
+                source_fake=padded_row_major,
+                logical_fake=padded_row_major.permute(1, 0),
+                block_ids=(1, 0),
+                source_to_logical_order=(1, 0),
+            ).matrix_major,
+            "col",
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "logical_fake shape does not match.*logical order is likely "
+            "incorrect.*report a bug to the Helion maintainers",
+        ):
+            dataclasses.replace(
+                direct,
+                source_to_logical_order=(1, 0),
+            )
+
+    def test_unwrap_mma_operand_permute(self) -> None:
+        graph = Graph()
+        load = graph.placeholder("load")
+        transpose = graph.call_function(torch.ops.aten.permute.default, (load, (1, 0)))
+        transpose.meta["val"] = torch.empty(4, 8).mT
+        unsupported = graph.call_function(
+            torch.ops.aten.permute.default, (load, (0, 1))
+        )
+        unsupported.meta["val"] = torch.empty(4, 8)
+
+        self.assertEqual(_unwrap_mma_operand_permute(load), (load, None))
+        self.assertEqual(_unwrap_mma_operand_permute(transpose), (load, (1, 0)))
+        self.assertIsNone(_unwrap_mma_operand_permute(unsupported))
+
+    def test_mma_source_and_tma_orders_are_composed(self) -> None:
+        source_transpose = (1, 0)
+
+        self.assertEqual(
+            _compose_axis_orders(source_transpose, (0, 1)),
+            (1, 0),
+        )
+        self.assertEqual(
+            _compose_axis_orders(source_transpose, (1, 0)),
+            (0, 1),
+        )
+
+    def test_mma_operand_exclusivity_tracks_source_order(self) -> None:
+        graph = Graph()
+        lhs_load = graph.placeholder("lhs_load")
+        rhs_load = graph.placeholder("rhs_load")
+        lhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (lhs_load, (1, 0))
+        )
+        rhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (rhs_load, (1, 0))
+        )
+        mma = graph.call_function(
+            torch.ops.aten.mm.default, (lhs_transpose, rhs_transpose)
+        )
+        source = torch.empty(4, 8)
+        lhs = _MmaOperandInfo(
+            load=lhs_load,
+            terminal=lhs_transpose,
+            source_fake=source,
+            logical_fake=source.mT,
+            source_to_logical_order=(1, 0),
+        )
+        rhs = dataclasses.replace(lhs, load=rhs_load, terminal=rhs_transpose)
+
+        self.assertTrue(_operand_infos_exclusive_for_mma(lhs, rhs, mma))
+        self.assertFalse(
+            _operand_infos_exclusive_for_mma(
+                dataclasses.replace(lhs, terminal=lhs_load), rhs, mma
+            )
+        )
+
     def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
         return SimpleNamespace(
             env={inp: ast.Name(id="x", ctx=ast.Load())},
@@ -11069,6 +11174,84 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cutlass.Float16, 1)", emitted)
         self.assertEqual(
             call_args, ["tma_atom_a", "tma_tensor_a", "tma_atom_b", "tma_tensor_b"]
+        )
+
+    def test_tcgen05_ab_tma_wrapper_plan_uses_explicit_orders(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_ab_tma",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "lhs_tma_order": (1, 0),
+                "rhs_tma_order": (0, 1),
+                "bm": 64,
+                "bn": 16,
+                "bk": 256,
+                "ab_stage_count": 2,
+                "input_dtype": "cutlass.Float8E4M3FN",
+                "acc_dtype": "cutlass.Float32",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+        )
+        emitted = "\n".join(body)
+        self.assertIn(
+            "tma_atom_a_lhs_tma = cute.make_tensor(arg0.iterator, "
+            "layout=cute.make_layout((arg0_shape1, arg0_shape0), "
+            "stride=(arg0_stride1, arg0_stride0)))",
+            emitted,
+        )
+        self.assertIn(
+            "tma_atom_b_rhs_tma = cute.make_tensor(arg1.iterator, "
+            "layout=cute.make_layout((arg1_shape0, arg1_shape1), "
+            "stride=(arg1_stride0, arg1_stride1)))",
+            emitted,
+        )
+
+    def test_tcgen05_ab_tma_wrapper_plan_uses_rank3_orders(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_ab_tma",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "lhs_tma_order": (1, 2, 0),
+                "rhs_tma_order": (2, 1, 0),
+                "bm": 64,
+                "bn": 16,
+                "bk": 32,
+                "ab_stage_count": 2,
+                "input_dtype": "cutlass.Float16",
+                "acc_dtype": "cutlass.Float32",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+        )
+        emitted = "\n".join(body)
+        self.assertIn(
+            "layout=cute.make_layout((arg0_shape1, arg0_shape2, arg0_shape0), "
+            "stride=(arg0_stride1, arg0_stride2, arg0_stride0))",
+            emitted,
+        )
+        self.assertIn(
+            "layout=cute.make_layout((arg1_shape2, arg1_shape1, arg1_shape0), "
+            "stride=(arg1_stride2, arg1_stride1, arg1_stride0))",
+            emitted,
         )
 
     def test_tcgen05_wide_codegen_uses_dense_physical_participant_ids(self) -> None:
