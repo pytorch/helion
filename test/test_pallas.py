@@ -27,6 +27,7 @@ from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
+from helion.runtime.settings import is_pallas_interpret
 
 if TYPE_CHECKING:
     from helion.autotuner.base_search import PopulationBasedSearch
@@ -5970,6 +5971,59 @@ class TestPallasIndirectGather(TestCase):
 
         return roundtrip_state_views
 
+    @staticmethod
+    def _grid_state_subview_roundtrip_kernel():
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def roundtrip_state_views(
+            indices: torch.Tensor, table: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out = torch.empty(
+                [indices.size(0), *table.shape[2:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b in hl.tile(indices.size(0)):
+                selected_indices = hl.load(indices, [tile_b])
+                selected = hl.load(
+                    table,
+                    [selected_indices, slice(None), slice(None), slice(None)],
+                )
+                hl.store(
+                    table,
+                    [selected_indices, slice(None), slice(None), slice(None)],
+                    hl.zeros(
+                        [tile_b, table.size(1), table.size(2), table.size(3)],
+                        dtype=table.dtype,
+                    ),
+                )
+                # Create the gathered subviews only after scatter scratch was used.
+                state_0 = selected[:, 0, :, :]
+                state_1 = selected[:, 1, :, :]
+                state_2 = selected[:, 2, :, :]
+                hl.store(
+                    out,
+                    [tile_b, slice(None), slice(None)],
+                    state_0 + state_1 + state_2,
+                )
+            return out, table
+
+        return roundtrip_state_views
+
+    @staticmethod
+    def _grid_state_gather_kernel():
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_state(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), *table.shape[1:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b in hl.tile(indices.size(0)):
+                out[tile_b, :, :, :] = table[indices[tile_b], :, :, :]
+            return out
+
+        return gather_state
+
     @parametrize("buffer_count", (1, 2))
     def test_fori_indirect_gather_uses_group_dma(self, buffer_count: int) -> None:
         gather_state = self._persistent_state_gather_kernel()
@@ -6051,17 +6105,10 @@ class TestPallasIndirectGather(TestCase):
         self.assertIn("def _drain_fori_store", code)
         body_start = code.index("def _fori_body_0")
         body = code[body_start : code.index("\n    _num_iterations =", body_start)]
-        if buffer_count == 2:
-            self.assertLess(
-                body.index("_prefetch_fori_loads"), body.index("_gather_wait")
-            )
-        else:
-            self.assertNotIn("_prefetch_fori_loads", body)
+        self.assertNotIn("_prefetch_fori_loads", body)
+        self.assertNotIn("_wait_reused_fori_store", body)
         self.assertLess(
-            body.index("_gather_wait"), body.index("_wait_reused_fori_store")
-        )
-        self.assertLess(
-            body.index("_wait_reused_fori_store"), body.index("_scatter_copy")
+            body.index("_wait_prior_fori_scatter"), body.index("_gather_copy")
         )
 
     def test_fori_indirect_gather_scratch_composes_resident_subviews(self) -> None:
@@ -6089,6 +6136,216 @@ class TestPallasIndirectGather(TestCase):
         self.assertIn("[:, pl.ds(1, 1), :, :]", code)
         self.assertIn("[:, pl.ds(2, 1), :, :]", code)
 
+    @parametrize("loop_type", ("unroll", "emit_pipeline", "fori_loop"))
+    @skipIfPallasInterpret("root HBM DMA requires TPU lowering")
+    def test_grid_indirect_dma_separates_scratch_for_resident_subviews(
+        self, loop_type: str
+    ) -> None:
+        roundtrip_state = self._grid_state_subview_roundtrip_kernel()
+        table = torch.empty(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(256, device=DEVICE, dtype=torch.int32)
+        code = roundtrip_state.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[128], pallas_loop_type=loop_type)
+        )
+        self.assertNotIn("one_hot", code)
+        self.assertNotIn("jax.lax.fori_loop", code)
+        self.assertIn("table_dma_buf", code)
+        self.assertIn("table_dma_buf_1", code)
+        self.assertNotIn("table_gather_buf", code)
+        self.assertNotIn("table_scatter_buf", code)
+        self.assertIn("[:, pl.ds(0, 1), :, :]", code)
+        self.assertIn("[:, pl.ds(1, 1), :, :]", code)
+        self.assertIn("[:, pl.ds(2, 1), :, :]", code)
+        self.assertLess(code.index("_gather_wait"), code.index("state_0 ="))
+        self.assertLess(code.index("table_dma_buf_1[...]"), code.index("_scatter_copy"))
+        self.assertLess(code.index("_scatter_wait"), code.index("state_0 ="))
+
+    def test_grid_indirect_dma_interpret_falls_back(self) -> None:
+        gather_state = self._grid_state_gather_kernel()
+        table = torch.empty(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(256, device=DEVICE, dtype=torch.int32)
+        code = gather_state.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[128], pallas_loop_type="unroll")
+        )
+        if is_pallas_interpret():
+            self.assertIn("one_hot", code)
+            self.assertNotIn("table_dma_buf", code)
+        else:
+            self.assertNotIn("one_hot", code)
+            self.assertIn("table_dma_buf", code)
+
+    def test_grid_indirect_dma_declines_partial_group(self) -> None:
+        gather_state = self._grid_state_gather_kernel()
+        table = torch.empty(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(192, device=DEVICE, dtype=torch.int32)
+        code = gather_state.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[128], pallas_loop_type="unroll")
+        )
+        self.assertIn("one_hot", code)
+        self.assertNotIn("table_dma_buf", code)
+
+    def test_grid_indirect_dma_declines_tiled_members(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def tiled_gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), table.size(1), table.size(2)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_h in hl.tile([indices.size(0), table.size(1)]):
+                out[tile_b, tile_h, :] = table[indices[tile_b], tile_h, :]
+            return out
+
+        table = torch.empty(64, 16, 128, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.arange(32, device=DEVICE, dtype=torch.int32)
+        code = tiled_gather.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[32, 8], pallas_loop_type="unroll")
+        )
+        self.assertIn("one_hot", code)
+        self.assertNotIn("table_dma_buf", code)
+
+    @skipIfPallasInterpret("root HBM DMA requires TPU lowering")
+    def test_grid_indirect_dma_supports_aligned_fixed_slices(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def sliced_roundtrip(
+            indices: torch.Tensor, table: torch.Tensor
+        ) -> torch.Tensor:
+            for tile_b in hl.tile(indices.size(0)):
+                selected_indices = indices[tile_b]
+                selected = table[selected_indices, :, :, :]
+                table[selected_indices, 0:2, :, :] = selected[:, 0:2, :, :] + 1
+            return table
+
+        table = torch.empty(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(256, device=DEVICE, dtype=torch.int32)
+        code = sliced_roundtrip.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[128], pallas_loop_type="unroll")
+        )
+        self.assertNotIn("one_hot", code)
+        self.assertIn("table_dma_buf", code)
+        self.assertIn("table_dma_buf_1", code)
+        self.assertIn("(128, 3, 4, 128)", code)
+        self.assertIn("(128, 2, 4, 128)", code)
+
+    def test_grid_indirect_dma_declines_unaligned_fixed_slice(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def sliced_gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), table.size(1), table.size(2), 128],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b in hl.tile(indices.size(0)):
+                out[tile_b, :, :, :] = table[indices[tile_b], :, :, 1:129]
+            return out
+
+        table = torch.empty(
+            512,
+            3,
+            4,
+            256,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(128, device=DEVICE, dtype=torch.int32)
+        code = sliced_gather.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[128], pallas_loop_type="unroll")
+        )
+        self.assertIn("one_hot", code)
+        self.assertNotIn("table_dma_buf", code)
+
+    def test_indirect_gather_rejects_extra_mask(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def masked_gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), *table.shape[1:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b in hl.tile(indices.size(0)):
+                selected = indices[tile_b]
+                mask = (selected >= 0)[:, None, None, None]
+                out[tile_b, :, :, :] = hl.load(
+                    table,
+                    [selected, slice(None), slice(None), slice(None)],
+                    extra_mask=mask,
+                )
+            return out
+
+        table = torch.empty(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(128, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(NotImplementedError, "extra_mask"):
+            masked_gather.bind((indices, table)).to_code(
+                helion.Config(block_sizes=[128], pallas_loop_type="unroll")
+            )
+
+    def test_grid_indirect_dma_declines_shared_storage_across_roots(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_twice(
+            indices: torch.Tensor, table: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_0 = torch.empty(
+                [indices.size(0), *table.shape[1:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            out_1 = torch.empty_like(out_0)
+            for tile_b in hl.tile(indices.size(0)):
+                out_0[tile_b, :, :, :] = table[indices[tile_b], :, :, :]
+            for tile_b in hl.tile(indices.size(0)):
+                out_1[tile_b, :, :, :] = table[indices[tile_b], :, :, :]
+            return out_0, out_1
+
+        table = torch.empty(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(256, device=DEVICE, dtype=torch.int32)
+        code = gather_twice.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[128, 128], pallas_loop_type="unroll")
+        )
+        self.assertGreaterEqual(code.count("one_hot"), 2)
+        self.assertNotIn("table_dma_buf", code)
+
     def test_fori_indirect_gather_declines_partial_group(self) -> None:
         gather_state = self._persistent_state_gather_kernel()
         table = torch.empty(
@@ -6101,6 +6358,75 @@ class TestPallasIndirectGather(TestCase):
         )
         indices = torch.arange(192, device=DEVICE, dtype=torch.int32)
         code = gather_state.bind((indices, table)).to_code(
+            helion.Config(block_sizes=[128], pallas_loop_type="fori_loop")
+        )
+        self.assertIn("one_hot", code)
+        self.assertNotIn("table_gather_buf", code)
+
+    def test_fori_indirect_gather_declines_outer_grid_tail(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_tiled_members(
+            indices: torch.Tensor, table: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), *table.shape[1:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_m in hl.tile(table.size(2)):
+                for tile_b in hl.tile(indices.size(0)):
+                    out[tile_b, :, tile_m, :] = table[indices[tile_b], :, tile_m, :]
+            return out
+
+        table = torch.randn(
+            512,
+            3,
+            10,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = (torch.arange(128, device=DEVICE, dtype=torch.int32) * 3) % 512
+        code, result = code_and_output(
+            gather_tiled_members,
+            (indices, table),
+            block_sizes=[8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("one_hot", code)
+        self.assertNotIn("table_gather_buf", code)
+        expected = table.cpu()[indices.cpu().long()].to(device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    def test_fori_indirect_gather_declines_tiled_data_members(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_tiled_members(
+            indices: torch.Tensor, table: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty(
+                (
+                    indices.size(0),
+                    table.size(1),
+                    indices.size(0),
+                    table.size(3),
+                ),
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b in hl.tile(indices.size(0)):
+                out[tile_b, :, tile_b, :] = table[indices[tile_b], :, tile_b, :]
+            return out
+
+        table = torch.empty(
+            256,
+            3,
+            64,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        indices = torch.arange(128, device=DEVICE, dtype=torch.int32)
+        code = gather_tiled_members.bind((indices, table)).to_code(
             helion.Config(block_sizes=[128], pallas_loop_type="fori_loop")
         )
         self.assertIn("one_hot", code)

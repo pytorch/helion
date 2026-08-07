@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
 
@@ -20,6 +21,28 @@ if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
     from helion._compiler.tile_strategy import ForiLoopState
+
+
+def async_copy_statements(
+    state: CodegenState,
+    source: str,
+    destination: str,
+    semaphore: str,
+    methods: tuple[str, ...],
+    name_hint: str,
+) -> list[ast.stmt]:
+    """Emit a Pallas async-copy handle followed by selected operations.
+
+    Schedulers may request ``start`` and ``wait`` separately so placement stays
+    independent of address formation and scratch allocation.
+    """
+    copy_name = state.device_function.new_var(name_hint)
+    return [
+        statement_from_string(
+            f"{copy_name} = pltpu.make_async_copy({source}, {destination}, {semaphore})"
+        ),
+        *(statement_from_string(f"{copy_name}.{method}()") for method in methods),
+    ]
 
 
 def _load_route(
@@ -83,8 +106,14 @@ def resident_ref_load_expr(
         dma_ref = memory_op_dma_scratch(state)
         if dma_ref is None:
             raise exc.InvalidConfig(
-                "resident Ref indirect gather was not admitted by the fori scheduler"
+                "resident Ref indirect gather was not admitted by a DMA scheduler"
             )
+        from helion._compiler.pallas.gather import emit_grid_dma_group
+
+        for pattern in patterns:
+            if isinstance(pattern, IndirectGatherPattern):
+                emit_grid_dma_group(state, pattern.plan, arg_name, "load")
+                break
         return expr_from_string(dma_ref)
     parts, none_dims = index_parts(state, subscript, tensor)
     if none_dims or len(parts) != tensor.ndim:
@@ -907,12 +936,21 @@ def _memory_op_fori_binding(
 def memory_op_dma_scratch(state: CodegenState) -> str | None:
     """Return this memory operation's scheduler-owned VMEM stage, if any."""
     found = _memory_op_fori_binding(state)
-    if found is None:
+    if found is not None:
+        loop, (scratch, buffer_count) = found
+        if buffer_count == 1:
+            return scratch
+        return f"{scratch}.at[{loop.loop_var_name} % {buffer_count}]"
+    binding = grid_memory_op_dma_binding(state)
+    return binding[0] if binding is not None else None
+
+
+def grid_memory_op_dma_binding(state: CodegenState) -> tuple[str, str] | None:
+    """Return this root-grid memory operation's (scratch, semaphore)."""
+    node = state.fx_node
+    if node is None:
         return None
-    loop, (scratch, buffer_count) = found
-    if buffer_count == 1:
-        return scratch
-    return f"{scratch}.at[{loop.loop_var_name} % {buffer_count}]"
+    return state.device_function.pallas_grid_dma_bindings.get(node)
 
 
 def emit_memory_op_prefix(state: CodegenState) -> None:

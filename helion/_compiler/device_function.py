@@ -342,6 +342,10 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
+        # Root-grid memory operations routed through explicit DMA scratch.
+        # The tuple is (VMEM scratch name, DMA semaphore name). Inner-loop
+        # schedulers keep their iteration-specific bindings on the loop state.
+        self.pallas_grid_dma_bindings: dict[torch.fx.Node, tuple[str, str]] = {}
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}

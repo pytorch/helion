@@ -1322,6 +1322,10 @@ class PallasBackend(Backend):
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
 
+        from .tracing_ops import plan_grid_dma_groups
+
+        plan_grid_dma_groups(graphs)
+
         from .view_ops import plan_resident_ref_views
 
         plan_resident_ref_views(graphs, config)

@@ -1,10 +1,10 @@
 """Pallas indirect-gather/scatter planning and fallback lowering.
 
 Floating ``table[idx]`` normally emits ``one_hot(idx, V) @ table``; int32
-accesses emit a boolean one-hot select and reduction.  A ``fori_loop`` may bind
-an eligible access to scheduler-owned DMA scratch instead.  This module only
-describes that static transfer group and consumes the binding: scratch,
-semaphores, and DMA lifetime remain owned by the loop lowering.
+accesses emit a boolean one-hot select and reduction. An eligible scheduler may
+bind the access to explicit DMA scratch instead. This module only describes the
+static transfer group and consumes the binding: scratch, semaphores, and DMA
+lifetime remain owned by the active schedule.
 """
 
 from __future__ import annotations
@@ -58,8 +58,8 @@ class DmaGroupCandidate:
     ``index_node`` is a normal Helion load from resident address metadata.  Its
     one non-scalar tiled dimension supplies ``group_count`` scalar HBM member
     addresses for the leading axis of a contiguous tensor.  Selecting one
-    member leaves ``member_shape``; the scheduler packs members contiguously in
-    scratch.
+    member leaves an untiled, full-or-fixed-slice ``member_shape``; the scheduler
+    packs members contiguously in scratch.
 
     Dynamic live counts and per-member extents deliberately remain outside the
     first implementation.  The group/member representation can add them
@@ -78,11 +78,16 @@ def build_gather_plan(
     indirect_positions: list[int],
     patterns: list[IndexingPattern],
     config: Config,
+    has_extra_mask: bool,
 ) -> GatherPlan:
     """Validate the gather site and return its plan. Runs during plan_tiling."""
     from ..compile_environment import CompileEnvironment
     from .plan_tiling import resident_block_elements
 
+    if has_extra_mask:
+        raise NotImplementedError(
+            "Pallas gather: extra_mask is not supported for tensor indices"
+        )
     if len(indirect_positions) > 1:
         raise NotImplementedError(
             "Pallas gather: multiple indirect dims are not supported"
@@ -160,10 +165,14 @@ def _member_shape(
     config: Config,
 ) -> tuple[int, ...] | None:
     """Return one indirect member's static rectangular transfer shape."""
+    from ..compile_environment import CompileEnvironment
     from .plan_tiling import ArbitrarySlicePattern
     from .plan_tiling import NonePattern
-    from .plan_tiling import TilePattern
+    from helion._compiler.backend import PallasBackend
 
+    env = CompileEnvironment.current()
+    backend = env.backend
+    assert isinstance(backend, PallasBackend)
     shape: list[int] = []
     tensor_dim = 0
     for pattern in patterns:
@@ -175,18 +184,7 @@ def _member_shape(
         if tensor_dim == indirect_pos:
             tensor_dim += 1
             continue
-        if isinstance(pattern, TilePattern):
-            from ..compile_environment import CompileEnvironment
-
-            block_size = (
-                CompileEnvironment.current()
-                .block_sizes[pattern.block_id]
-                .from_config(config)
-            )
-            if not isinstance(block_size, int):
-                return None
-            dim_size = min(dim_size, block_size)
-        elif isinstance(pattern, ArbitrarySlicePattern):
+        if isinstance(pattern, ArbitrarySlicePattern):
             selected = pattern.slice
             if selected.step not in (None, 1):
                 return None
@@ -195,6 +193,14 @@ def _member_shape(
             if not isinstance(start, int) or not isinstance(stop, int):
                 return None
             if not 0 <= start <= stop <= dim_size:
+                return None
+            dim_from_end = tensor.ndim - tensor_dim - 1
+            required_alignment = backend._get_pallas_required_alignment(
+                dim_from_end,
+                tensor.ndim,
+                tensor.dtype.itemsize * 8,
+            )
+            if start % required_alignment != 0:
                 return None
             dim_size = stop - start
         else:
@@ -220,11 +226,15 @@ def _dma_group_candidate(
     from .plan_tiling import TileBeginWithOffsetPattern
     from .plan_tiling import TilePattern
 
-    if config.get("pallas_loop_type") != "fori_loop":
-        return None
     if indirect_pos != 0 or not tensor.dtype.is_floating_point:
         return None
     if tensor.ndim < 3 or not tensor.is_contiguous():
+        return None
+    # BlockSpecs normally apply TilePatterns before the body sees a Ref. Manual
+    # DMA uses the raw HBM Ref and would need absolute, tail-safe pl.ds() slices.
+    # Keep data members untiled; the metadata TilePattern below still defines
+    # how many indirect rows form the group.
+    if any(isinstance(pattern, TilePattern) for pattern in patterns):
         return None
     index_node = subscript[indirect_pos]
     if (
@@ -280,7 +290,7 @@ def _dma_group_candidate(
         or not member_shape
     ):
         return None
-    if member_shape[-1] % 128 != 0:
+    if any(size <= 0 for size in member_shape) or member_shape[-1] % 128 != 0:
         return None
     return DmaGroupCandidate(
         index_node=index_node,
@@ -340,6 +350,108 @@ def build_scatter_plan(
     )
 
 
+def dma_group_transfer_statements(
+    state: CodegenState,
+    *,
+    direction: str,
+    group_count: int,
+    index_name: str,
+    member_hbm: str,
+    aggregate_hbm: str,
+    scratch_ref: str,
+    sem_ref: str,
+    methods: tuple[str, ...],
+) -> list[ast.stmt]:
+    """Emit starts and/or an aggregate wait for one indirect DMA group."""
+    from .codegen import async_copy_statements
+
+    result: list[ast.stmt] = []
+    if "start" in methods:
+        lane_name = state.device_function.new_var("_dma_member")
+        member_hbm = member_hbm.replace("{index}", f"{index_name}[{lane_name}]")
+        member_vmem = f"{scratch_ref}.at[{lane_name}]"
+        source, destination = (
+            (member_vmem, member_hbm)
+            if direction == "store"
+            else (member_hbm, member_vmem)
+        )
+        loop = statement_from_string(
+            f"for {lane_name} in range({group_count}):\n    pass"
+        )
+        assert isinstance(loop, ast.For)
+        loop.body = async_copy_statements(
+            state,
+            source,
+            destination,
+            sem_ref,
+            ("start",),
+            "_scatter_copy" if direction == "store" else "_gather_copy",
+        )
+        result.append(loop)
+    if "wait" in methods:
+        source, destination = (
+            (scratch_ref, aggregate_hbm)
+            if direction == "store"
+            else (aggregate_hbm, scratch_ref)
+        )
+        result.extend(
+            async_copy_statements(
+                state,
+                source,
+                destination,
+                sem_ref,
+                ("wait",),
+                "_scatter_wait" if direction == "store" else "_gather_wait",
+            )
+        )
+    return result
+
+
+def emit_grid_dma_group(
+    state: CodegenState,
+    plan: GatherPlan | ScatterPlan,
+    name: str,
+    direction: str,
+) -> None:
+    """Emit the initial immediate-wait policy for a root-grid DMA binding."""
+    from . import codegen as pallas_codegen
+
+    binding = pallas_codegen.grid_memory_op_dma_binding(state)
+    if binding is None:
+        return
+    group = plan.dma_group
+    assert group is not None
+    scratch_ref, sem_ref = binding
+    ast_subscripts = state.ast_args[1]
+    assert isinstance(ast_subscripts, list)
+    ast_idx = ast_subscripts[plan.indirect_pos]
+    assert isinstance(ast_idx, ast.AST)
+    index_name = state.codegen.lift(ast_idx, dce=False, prefix="index").id
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
+    parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
+    member_parts = [*parts]
+    member_parts[plan.indirect_pos] = "{index}"
+    aggregate_parts = [*parts]
+    aggregate_parts[plan.indirect_pos] = f"pl.ds(0, {group.group_count})"
+    member_hbm = f"{name}.at[{', '.join(member_parts)}]"
+    aggregate_hbm = f"{name}.at[{', '.join(aggregate_parts)}]"
+    for statement in dma_group_transfer_statements(
+        state,
+        direction=direction,
+        group_count=group.group_count,
+        index_name=index_name,
+        member_hbm=member_hbm,
+        aggregate_hbm=aggregate_hbm,
+        scratch_ref=scratch_ref,
+        sem_ref=sem_ref,
+        methods=("start", "wait"),
+    ):
+        state.codegen.add_statement(statement)
+
+
 def emit_gather(
     state: CodegenState,
     plan: GatherPlan,
@@ -357,6 +469,7 @@ def emit_gather(
 
     dma_ref = pallas_codegen.memory_op_dma_scratch(state)
     if dma_ref is not None:
+        emit_grid_dma_group(state, plan, name, "load")
         return expr_from_string(f"{dma_ref}[...]")
     _check_resident_block_size(plan.resident_block_bytes)
 
@@ -472,9 +585,13 @@ def emit_scatter_store(
 
     dma_ref = pallas_codegen.memory_op_dma_scratch(state)
     if dma_ref is not None:
+        # This intentionally follows torch.index_put_(accumulate=False): writes
+        # to duplicate tensor indices have undefined ordering. Avoid a runtime
+        # uniqueness check on the scatter hot path.
         state.codegen.add_statement(
             statement_from_string(f"{dma_ref}[...] = {{value}}", value=value)
         )
+        emit_grid_dma_group(state, plan, name, "store")
         return None
 
     oh = _scatter_one_hot_name(state, plan, name)

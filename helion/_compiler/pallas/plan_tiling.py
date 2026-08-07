@@ -420,7 +420,14 @@ def _resolve_tensor_index_patterns(
     if node.target is memory_ops.load:
         from .gather import build_gather_plan
 
-        plan = build_gather_plan(tensor, subscript, positions, patterns, config)
+        plan = build_gather_plan(
+            tensor,
+            subscript,
+            positions,
+            patterns,
+            config,
+            len(node.args) > 2 and node.args[2] is not None,
+        )
         for i in positions:
             patterns[i] = IndirectGatherPattern(plan=plan)
         return

@@ -298,6 +298,7 @@ def _root_variants(
 ) -> tuple[_ResidentVariant, ...] | None:
     from .backend import SliceAddressing
     from .backend import _slice_addressing
+
     tensor = _node_value(producer.args[0])
     value = producer.meta.get("val")
     indices = producer.args[1]
@@ -314,7 +315,7 @@ def _root_variants(
     if dma_group is not None:
         shape = _physical_shape(value, context.config, 1)
         expected = (dma_group.group_count, *dma_group.member_shape)
-        if shape != expected:
+        if shape is None or shape != expected:
             return None
         return (_ResidentVariant(1, shape, (), None),)
 
