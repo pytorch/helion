@@ -3319,9 +3319,9 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
-    # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
-    # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
-    # TMA paths must keep the guarded fallback path.
+    # Static-full pipelined TMA loops can drop the per-K runtime full-tile
+    # branch and scalar fallback. Non-pipelined/asymmetric paths must keep the
+    # guarded fallback path.
     static_full_tiles: bool = False
     tma_desc_ptr_a: str | None = None
     tma_desc_ptr_b: str | None = None
@@ -3421,13 +3421,6 @@ def _build_kloop_pipeline_producer_if(
     assert args.use_tma_a and args.use_tma_b, (
         "pipelined branch requires both A and B to be TMA-loaded"
     )
-    assert not (args.static_full_tiles and args.is_two_cta), (
-        "static-full fast path is only valid for one-CTA pipelined TMA loops"
-    )
-    if load_current_tile:
-        assert not args.static_full_tiles, (
-            "current-tile producer is only used by role-local pipelined TMA loops"
-        )
     k_offset = (
         args.tma_k_tile
         if load_current_tile
@@ -3445,7 +3438,8 @@ def _build_kloop_pipeline_producer_if(
     )
     # CtaGroup.TWO uses CTA-rank-specific TMA partitions, so both CTAs issue
     # these copies; PipelineTmaUmma gates the full-barrier tx setup internally.
-    src = f"if {' and '.join(predicate_terms)}:\n"
+    predicate = " and ".join(predicate_terms) or "True"
+    src = f"if {predicate}:\n"
     producer_advance_src = (
         emit_pipeline_advance(args.tma_producer_state, indent="    ")
         if not args.skip_producer_advance
@@ -3478,9 +3472,6 @@ def _build_kloop_pipeline_consumer_if(
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
-        )
         assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
@@ -3573,9 +3564,6 @@ def _build_kloop_pipeline_release_if(
     multicast mask; separate peer arrivals over-count the empty barrier.
     """
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
-        )
         assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
@@ -3603,6 +3591,19 @@ def _build_kloop_pipeline_release_if(
             release_src + "\n" + advance_src, release_gate, indent=indent
         )
     if args.static_full_tiles:
+        if args.is_two_cta and gate_exec_warp:
+            owner_gate = _tcgen05_two_cta_owner_predicate(
+                args.exec_active,
+                is_two_cta=True,
+                gate_exec_warp=False,
+                cluster_n=args.cluster_n,
+            )
+            assert owner_gate is not None
+            full_tile_src = (
+                f"if {args.exec_active}:\n"
+                f"    if {owner_gate}:\n"
+                f"        {release_src}\n" + textwrap.indent(advance_src, "    ")
+            )
         return statement_from_string(full_tile_src)
     fallback_src = (
         "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
@@ -5190,8 +5191,7 @@ def _emit_mma_pipeline(
     tcgen05_static_full_tma_fast_path = (
         tcgen05_static_full_tiles
         and tcgen05_use_tma_pipeline
-        and not tcgen05_is_two_cta
-        and not tcgen05_use_role_local_mma_exec
+        and not tcgen05_grouped_static_persistent_requested
     )
     tcgen05_acc_producer_mode = df.config.get(
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
@@ -8972,6 +8972,12 @@ def _emit_mma_pipeline(
                     assert mma_stage_stmt is not None
                     assert smem_a_mma_stmt is not None
                     assert smem_b_mma_stmt is not None
+                    outer_owner_gated_exec = (
+                        tcgen05_static_full_tma_fast_path
+                        and tcgen05_is_two_cta
+                        and tcgen05_cluster_m == 2
+                        and tcgen05_cluster_n == 1
+                    )
                     exec_loop_body: list[ast.stmt] = [
                         mma_stage_stmt,
                         smem_a_mma_stmt,
@@ -8999,10 +9005,6 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
-                            # Static-full pipeline builders require their
-                            # internal exec gate to keep emitting a single
-                            # statement. The outer wrapper below makes the
-                            # cloned loop's role ownership explicit.
                             gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                             use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
@@ -9023,9 +9025,6 @@ def _emit_mma_pipeline(
                                 tcgen05_frag_a=tcgen05_frag_a,
                                 tcgen05_frag_b=tcgen05_frag_b,
                                 mma_stage=mma_stage,
-                                # See the consumer wait comment above: pure
-                                # lifecycle has an outer exec-active role
-                                # wrapper plus the static-full builder gate.
                                 gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
@@ -9034,7 +9033,6 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_release_if(
                             tma_kloop_args,
-                            # See the consumer wait comment above.
                             gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                         )
@@ -9051,15 +9049,23 @@ def _emit_mma_pipeline(
                         exec_loop_body,
                         iter_expr=cloned_k_loop_iter_expr,
                     )
-                    exec_stmt: ast.stmt = exec_loop
+                    exec_role_stmt: ast.stmt = exec_loop
+                    if outer_owner_gated_exec:
+                        # Only the V-leader consumes AB stages and issues UMMA.
+                        # Keep the follower out of the cloned K loop entirely;
+                        # it still participates in the TMA-load role.
+                        exec_role_stmt = _wrap_stmt_in_if(
+                            exec_loop, _TCGEN05_CLUSTER_LEADER_PREDICATE
+                        )
+                    exec_stmt: ast.stmt = exec_role_stmt
                     if tcgen05_use_pure_matmul_role_lifecycle:
                         exec_stmt = _wrap_stmt_in_if(
-                            exec_loop, tcgen05_plan.exec_active
+                            exec_role_stmt, tcgen05_plan.exec_active
                         )
                     prefix.append(exec_stmt)
                     per_tile_stmts.append(exec_stmt)
                     if tcgen05_use_role_local_mma_exec:
-                        mma_exec_role_stmts.append(exec_loop)
+                        mma_exec_role_stmts.append(exec_role_stmt)
                 else:
                     cg.add_statement(
                         statement_from_string(
