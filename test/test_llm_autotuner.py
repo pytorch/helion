@@ -45,7 +45,10 @@ class TestLLMGuidedSearch(TestCase):
         from helion.autotuner.llm_search import LLMGuidedSearch
 
         search = LLMGuidedSearch.__new__(LLMGuidedSearch)
-        search.settings = Settings()
+        # The typed-raise contract below only applies when the RAG fallback
+        # boundary is installed to catch and classify; with it off the search
+        # degrades instead (see LLMGuidedSearch._parse_configs).
+        search.settings = Settings(autotune_rag_enabled=True)
         search.log = AutotuningLogger(search.settings)
         search._messages = []
         search._all_benchmark_results = []
@@ -113,6 +116,20 @@ class TestLLMGuidedSearch(TestCase):
                 search = self._make_mock_search()
                 configs = LLMGuidedSearch._parse_configs(search, response)
                 self.assertEqual(len(configs), expected)
+
+    def test_parse_configs_degrades_when_no_fallback_boundary_is_installed(self):
+        """Without RAG, an unusable round yields no configs instead of aborting.
+
+        The search keeps its incumbent and stops, which is what plain
+        LLMGuidedSearch users got before the typed exceptions were introduced.
+        """
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        search = self._make_mock_search(settings=Settings(autotune_rag_enabled=False))
+        search.log = AutotuningLogger(search.settings)
+        for response in ("not json at all", "{}", '{"configs": []}'):
+            with self.subTest(response=response):
+                self.assertEqual(LLMGuidedSearch._parse_configs(search, response), [])
 
     def test_parse_configs_rejects_invalid_declared_schema(self):
         from helion.autotuner.llm_search import LLMGuidedSearch

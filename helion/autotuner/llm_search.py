@@ -528,6 +528,16 @@ class LLMGuidedSearch(PopulationBasedSearch):
                     budget_exhausted if budget.limit is not None else None
                 ),
             )
+        except (exc.InvalidResponseSchema, exc.ZeroValidCandidates) as unusable:
+            # These are typed so the RAG boundary can classify them into a
+            # FallbackReason; when that boundary is not installed nothing catches
+            # them, and an unusable round would abort a search that previously
+            # just kept its incumbent. An empty "configs" array is an ordinary
+            # thing for a converged LLM to return.
+            if self.settings.autotune_rag_enabled:
+                raise
+            self.log(f"Ignoring unusable LLM response: {unusable}")
+            return []
         finally:
             self._record_candidate_generation_time(
                 time.perf_counter() - parsing_started
