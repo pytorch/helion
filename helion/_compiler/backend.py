@@ -3708,6 +3708,35 @@ class FlyDSLBackend(Backend):
                     f"multiple of 256 (got block_sizes={list(bs)})",
                 )
 
+        # Guard: reject configs where the last reduction-loop chunk causes an OOB
+        # BufferCopy128b access (same logic as _add() in autotune, but also fires
+        # when code_and_output is called directly with an explicit config).
+        _rl = getattr(config, "reduction_loops", None) or []
+        _rl_chunk = int(_rl[0]) if _rl and _rl[0] is not None else 0
+        if _rl_chunk > 0 and _spec.reduction_loops._data:
+            _rl_numel_pre: int | None = None
+            import contextlib as _cl
+
+            with _cl.suppress(TypeError, ValueError):
+                _rl_numel_pre = int(_spec.reduction_loops._data[0].size_hint)
+            if _rl_numel_pre is not None and _rl_numel_pre > 0:
+                _vw_pre = config.config.get("cute_vector_widths", []) or []
+                _v_pre = max(
+                    4,
+                    int(_vw_pre[0]) if _vw_pre else 1,
+                )
+                tc_pre = _rl_chunk // _v_pre
+                last_offset = ((_rl_numel_pre + _rl_chunk - 1) // _rl_chunk - 1) * _rl_chunk
+                max_div_idx = last_offset // _v_pre + tc_pre - 1
+                n_div = (_rl_numel_pre + _v_pre - 1) // _v_pre
+                if max_div_idx >= n_div:
+                    raise exc.BackendUnsupported(
+                        self.name,
+                        f"reduction chunk {_rl_chunk} with N={_rl_numel_pre} and "
+                        f"V={_v_pre} would OOB the last-chunk BufferCopy access "
+                        f"(max_div_idx={max_div_idx} >= n_div={n_div})",
+                    )
+
         # W=1 only: one warp per row.
         self._flydsl_warps_per_row = 1
         self._flydsl_bm = bm
