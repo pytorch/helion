@@ -1,9 +1,9 @@
 # Final Report: LFBO, LLM, Hybrid, and Contextual RAG-LLM Kernel Autotuning
 
-**Campaign:** `head_to_head_4arm_shapes`  
-**Finalized:** 2026-07-26  
-**Updated:** 2026-07-27 (added per-approach regret against the LFBO baseline)  
-**Scope:** 33 GPU-kernel workloads, four search approaches, five paired repetitions, 660 completed runs
+- **Campaign:** `head_to_head_4arm_shapes`
+- **Finalized:** 2026-07-26
+- **Updated:** 2026-07-27 (added per-approach regret against the LFBO baseline)
+- **Scope:** 33 GPU-kernel workloads, four search approaches, five paired repetitions, 660 completed runs
 
 ## Poster-ready abstract
 
