@@ -325,7 +325,11 @@ class TestFlydslReduction(TestCase):
             tc = chunk // v
             last_offset = ((7680 + chunk - 1) // chunk - 1) * chunk
             max_div_idx = last_offset // v + tc - 1
-            self.assertLess(max_div_idx, n_div, f"autotune selected OOB config: chunk={chunk}, V={v}")
+            self.assertLess(
+                max_div_idx,
+                n_div,
+                f"autotune selected OOB config: chunk={chunk}, V={v}",
+            )
 
 
 if __name__ == "__main__":
