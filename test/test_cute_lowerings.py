@@ -141,6 +141,15 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
@@ -6339,6 +6348,176 @@ class TestCuteLowerings(unittest.TestCase):
             "loads whose index expression is not exactly the carrier tile-id symbol",
             message,
         )
+
+    def test_tcgen05_aux_load_placement_config(self) -> None:
+        """The placement knob moves only aux loads across the acc wait."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                acc = acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def unscaled_fp8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([64, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 64], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([64, 1], device=DEVICE).expand(64, 64),
+            torch.empty([64], device=DEVICE),
+        )
+        base = {
+            "block_sizes": [64, 64, 128],
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "indexing": ["tensor_descriptor"] * 5,
+        }
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            placement_fragment = bound.env.config_spec._flat_fields()[
+                TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+            ]
+            self.assertEqual(
+                placement_fragment.choices,  # type: ignore[attr-defined]
+                (
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+                    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+                ),
+            )
+            for fix_invalid in (False, True):
+                invalid_placement = helion.Config(
+                    **base,
+                    **{
+                        TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
+                        ),
+                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                        ),
+                    },
+                )
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    "per-subtile auxiliary loads cannot precede",
+                ):
+                    bound.env.config_spec.normalize(
+                        invalid_placement, _fix_invalid=fix_invalid
+                    )
+            no_aux_bound = unscaled_fp8.bind(args[:2])
+            no_aux_bound.env.config_spec.cute_tcgen05_search_enabled = True
+            no_aux_base = {
+                **base,
+                "indexing": ["tensor_descriptor"]
+                * no_aux_bound.env.config_spec.indexing.length,
+            }
+            for fix_invalid in (False, True):
+                no_aux_config = helion.Config(
+                    **no_aux_base,
+                    **{
+                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                        )
+                    },
+                )
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    "no per-subtile auxiliary loads",
+                ):
+                    no_aux_bound.env.config_spec.normalize(
+                        no_aux_config, _fix_invalid=fix_invalid
+                    )
+            codes = {
+                placement: bound.to_triton_code(
+                    helion.Config(
+                        **base,
+                        **{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: placement},
+                    )
+                )
+                for placement in (
+                    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+                )
+            }
+
+        for placement, code in codes.items():
+            loop_pos = code.find("for _tcgen05_subtile in cutlass.range")
+            aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
+            acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+            t2r_pos = code.find("cute.copy(tcgen05_tiled_copy_t2r,", loop_pos)
+            self.assertGreater(aux_load_pos, loop_pos)
+            self.assertGreater(acc_wait_pos, loop_pos)
+            self.assertGreater(t2r_pos, acc_wait_pos)
+            if placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT:
+                self.assertLess(aux_load_pos, acc_wait_pos)
+            else:
+                self.assertGreater(aux_load_pos, t2r_pos)
+
+        m128_args = (
+            torch.empty([512, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([512, 1], device=DEVICE).expand(512, 128),
+            torch.empty([128], device=DEVICE),
+        )
+        m128_base = {
+            **base,
+            "block_sizes": [128, 128, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+        }
+        with patch_cute_mma_support():
+            m128_bound = scaled_fp8.bind(m128_args)
+            m128_bound.env.config_spec.cute_tcgen05_search_enabled = True
+            m128_codes = {
+                placement: m128_bound.to_triton_code(
+                    helion.Config(
+                        **m128_base,
+                        **{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: placement},
+                    )
+                )
+                for placement in (
+                    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+                )
+            }
+
+        pre_code = m128_codes[TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT]
+        post_code = m128_codes[TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT]
+        self.assertIn("tcgen05_aux_rmem_full_1", pre_code)
+        self.assertNotIn("tcgen05_aux_rmem_full_1", post_code)
+        post_loop_pos = post_code.find("for _tcgen05_subtile in cutlass.range")
+        post_wait_pos = post_code.find(
+            "tcgen05_acc_pipeline.consumer_wait", post_loop_pos
+        )
+        post_aux_load_pos = post_code.find("tcgen05_aux_loaded_0", post_loop_pos)
+        self.assertGreater(post_aux_load_pos, post_wait_pos)
 
     def test_tcgen05_fused_residual_epilogue_runtime_correctness(self) -> None:
         """``out[tile] = (acc + residual[tile_m, tile_n]).to(x.dtype)``
@@ -15702,6 +15881,14 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
             code = bound.to_triton_code(cfg)
+            cfg.config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "partial-output TMA-store epilogue",
+            ):
+                bound.to_triton_code(cfg)
         self.assertIn("'kind': 'tcgen05_aux_tma'", code)
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", code)
