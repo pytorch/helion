@@ -283,6 +283,23 @@ class MemoryOpFact(NamedTuple):
     # ``subscript_block_ids`` (from ``.stride()``). A stride-1 position is the contiguous (coalescing)
     # axis — the last subscript for a row-major tensor, a different one for a transposed/strided view.
     subscript_strides: tuple[int, ...] = ()
+    # GATHER stride per subscript position: the multiplier on the tile index in the op's
+    # ADDRESS expression (``x[tile]`` → 1, ``x[2*tile.index]`` → 2). Independent of
+    # ``subscript_strides``, the accessed tensor's LAYOUT stride -- two ops can index the
+    # same row-major tensor while one reads it stride-2 and the other stride-1. A stride-k
+    # gather wastes ``1 - 1/k`` of every 32B sector, so this is the coalescing signal;
+    # 1 means coalesced or unknown. See ``indexing_strategy.subscript_index_scale``.
+    subscript_index_scales: tuple[int, ...] = ()
+    # Size-hinted extent at each subscript position. With ``subscript_affine_block_ids``
+    # this gives the tile ONE op materializes: the product of extents at non-tiled
+    # positions (a tiled position contributes its block size). Distinct from
+    # ``accessed_numel``, a per-TENSOR count that also grows for an oversized tensor.
+    subscript_extents: tuple[int, ...] = ()
+    # Block-ids resolved THROUGH an affine (scaled/offset) subscript.
+    # ``subscript_block_ids`` reads ``meta["tile_with_offset"]``, which the lowering sets
+    # for ``tile_index + const`` but not ``tile_index * const``, so a scaled subscript
+    # loses its axis there. Separate field so existing consumers are unaffected.
+    subscript_affine_block_ids: tuple[int | None, ...] = ()
     # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
     # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
     # resolvable fake tensor). A FULL-EXTENT op has ``accessed_numel`` == the problem numel; a
@@ -332,6 +349,16 @@ class PointwiseElementwiseFact(NamedTuple):
     - ``sfu_ops``: count of transcendental (SFU) ops. SFU ops are latency-bound on a distinct unit, so
       a transcendental-heavy tile wants more warps while an all-FMA tile of the same op count does not
       — so SFU count (not total op count) drives the num_warps ramp.
+    - ``gather_stride``: the widest GATHER stride any full-extent op applies to a tiled axis in
+      its ADDRESS expression (``x[tile]`` → 1, ``x[2*tile.index]`` → 2). A stride-k gather
+      touches k 32B sectors per useful sector, so the same useful bytes cost ~k× the requests —
+      the coalescing input to the byte budget and the num_warps ramp. NOT the layout stride,
+      which cannot distinguish two ops indexing one row-major tensor at different strides.
+      1 means coalesced, or an address form the walk does not recognize.
+    - ``max_op_slab_numel``: the LARGEST single op's untiled fan-out, vs ``slab_numel``'s SUM
+      of the same quantity. Bytes ADD across ops (so the sum sizes the byte/register budgets)
+      but LANES do not (separate vector instructions over the same threads), so the max is what
+      bounds a num_warps starvation cap.
     """
 
     total_numel: int
@@ -340,6 +367,8 @@ class PointwiseElementwiseFact(NamedTuple):
     compute_itemsize: int
     contig_block_ids: tuple[int, ...] = ()
     sfu_ops: int = 0
+    gather_stride: int = 1
+    max_op_slab_numel: int = 1
 
 
 def shrink_block_sizes_for_numel_constraints(

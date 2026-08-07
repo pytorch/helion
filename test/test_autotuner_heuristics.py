@@ -1087,6 +1087,265 @@ class TestRopePointwiseSeed(TestCase):
         self.assertGreater(math.prod(ew_seed.config["block_sizes"]), 8)
 
 
+class TestPointwiseComputeItemsize(TestCase):
+    """``compute_itemsize`` measures DATA width, not index width.
+
+    The fact walks only what reaches a load/store's data path, so int64 address
+    arithmetic does not inflate it. The split is data-vs-address, not
+    float-vs-integer -- both directions are asserted here.
+    """
+
+    @staticmethod
+    def _fact(kernel: object, args: tuple[object, ...]) -> object:
+        bound = kernel.bind(args)  # pyrefly: ignore [missing-attribute]
+        facts = bound.config_spec.pointwise_facts
+        assert len(facts) == 1, facts
+        return facts[0]
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_int64_indexing_does_not_inflate_compute_itemsize(self) -> None:
+        # int64-INDEXED but half-precision DATA (promoting to fp32 -> 4).
+        # The SCALED subscript is load-bearing: a plain ``x[tile]`` lowers to a
+        # ``_get_symnode`` with no tensor val, so no int64 node exists and the test
+        # would pass even with the fix reverted.
+        @helion.kernel(backend="triton", index_dtype=torch.int64, static_shapes=False)
+        def add_int64_index(x: torch.Tensor) -> torch.Tensor:
+            m, n2 = x.shape
+            n2 = hl.specialize(n2)
+            n = n2 // 2
+            out = x.new_empty(m, n)
+            for tile_m, tile_n in hl.tile([m, n]):
+                a = x[tile_m, 2 * tile_n.index].to(torch.float32)
+                b = x[tile_m, 2 * tile_n.index + 1].to(torch.float32)
+                out[tile_m, tile_n] = (a * b).to(out.dtype)
+            return out
+
+        x = torch.randn(256, 512, device=DEVICE, dtype=HALF_DTYPE)
+        bound = add_int64_index.bind((x,))
+        self.assertEqual(bound.env.index_dtype, torch.int64)
+        # Guard the guard: an int64 tensor is actually present to be picked up.
+        self.assertTrue(
+            any(
+                isinstance(node.meta.get("val"), torch.Tensor)
+                and node.meta["val"].dtype == torch.int64
+                for graph_info in bound.host_function.device_ir.graphs
+                for node in graph_info.graph.nodes
+            )
+        )
+        facts = bound.config_spec.pointwise_facts
+        self.assertEqual(len(facts), 1)
+        fact = facts[0]
+        self.assertEqual(fact.storage_itemsize, 2)
+        # 4 = the fp32 compute promotion, not 8 = the int64 index arithmetic.
+        self.assertEqual(fact.compute_itemsize, 4)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_integer_compute_kernel_reports_its_data_width(self) -> None:
+        # Guards against filtering to float dtypes: this DATA is genuinely int64, so
+        # 8 is correct and a float-only walk would report 1 and emit a spilling tile.
+        @helion.kernel(backend="triton")
+        def add_int64_data(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.ones(256, 256, device=DEVICE, dtype=torch.int64)
+        y = torch.ones(256, 256, device=DEVICE, dtype=torch.int64)
+        fact = self._fact(add_int64_data, (x, y))
+        self.assertEqual(fact.storage_itemsize, 8)
+        self.assertEqual(fact.compute_itemsize, 8)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_gather_index_tensor_does_not_inflate_compute_itemsize(self) -> None:
+        # A gather whose index was itself loaded as int64: the cut at loads means the
+        # walk never reaches it, so the data width stays half-precision.
+        @helion.kernel(backend="triton")
+        def gather_rows(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[idx[tile_m], tile_n]
+            return out
+
+        x = torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE)
+        idx = torch.zeros(256, device=DEVICE, dtype=torch.int64)
+        fact = self._fact(gather_rows, (x, idx))
+        self.assertEqual(fact.compute_itemsize, 2)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_intermediate_wider_than_every_buffer_is_counted(self) -> None:
+        # Why the walk cannot just read buffer dtypes: every buffer is half-precision
+        # but an fp64 intermediate is register-resident, and under-reporting it
+        # over-estimates ``reg_cap``. ``storage_itemsize`` already covers buffers.
+        @helion.kernel(backend="triton")
+        def fp64_intermediate(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                a = x[tile].to(torch.float64)
+                b = y[tile].to(torch.float64)
+                out[tile] = (a * b + a).to(out.dtype)
+            return out
+
+        x = torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE)
+        fact = self._fact(fp64_intermediate, (x, y))
+        self.assertEqual(fact.storage_itemsize, 2)
+        self.assertEqual(fact.compute_itemsize, 8)
+
+
+class TestPointwiseGatherStride(TestCase):
+    """``gather_stride`` is the address-expression scale, not the layout stride.
+
+    Two kernels can index one row-major tensor -- identical layout strides -- while
+    reading it at different gather strides, and their optimal tiles then differ.
+    """
+
+    @staticmethod
+    def _fact(kernel: object, args: tuple[object, ...]) -> object:
+        bound = kernel.bind(args)  # pyrefly: ignore [missing-attribute]
+        facts = bound.config_spec.pointwise_facts
+        assert len(facts) == 1, facts
+        return facts[0]
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_interleaved_and_contiguous_halves_differ(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=False)
+        def interleaved(x: torch.Tensor) -> torch.Tensor:
+            m, n2 = x.shape
+            n2 = hl.specialize(n2)
+            n = n2 // 2
+            out = x.new_empty(m, n)
+            for tile_m, tile_n in hl.tile([m, n]):
+                a = x[tile_m, 2 * tile_n.index]
+                b = x[tile_m, 2 * tile_n.index + 1]
+                out[tile_m, tile_n] = a * b
+            return out
+
+        @helion.kernel(backend="triton", static_shapes=False)
+        def halves(x: torch.Tensor) -> torch.Tensor:
+            m, n2 = x.shape
+            n2 = hl.specialize(n2)
+            n = n2 // 2
+            out = x.new_empty(m, n)
+            for tile_m, tile_n in hl.tile([m, n]):
+                a = x[tile_m, tile_n.index]
+                b = x[tile_m, tile_n.index + n]
+                out[tile_m, tile_n] = a * b
+            return out
+
+        x = torch.randn(256, 512, device=DEVICE, dtype=HALF_DTYPE)
+        inter = self._fact(interleaved, (x,))
+        contig = self._fact(halves, (x,))
+        # The stride-2 gather is recognized...
+        self.assertEqual(inter.gather_stride, 2)
+        # ...and the stride-1 control is not penalized.
+        self.assertEqual(contig.gather_stride, 1)
+        # Layout stride is 1 for both, so ``subscript_strides`` cannot tell them apart.
+        for fact_owner in (interleaved, halves):
+            bound = fact_owner.bind((x,))
+            inner = [
+                m.subscript_strides[-1]
+                for m in bound.config_spec.memory_op_facts
+                if m.subscript_strides
+            ]
+            self.assertTrue(all(s == 1 for s in inner), inner)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_plain_elementwise_is_stride_one(self) -> None:
+        @helion.kernel(backend="triton")
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE)
+        self.assertEqual(self._fact(add, (x, x)).gather_stride, 1)
+
+    @onlyBackends(["triton"])
+    def test_elems_per_thread_is_a_three_band_ladder(self) -> None:
+        # Bands are 16 coalesced / 4 at strides 2-4 / 2 beyond. Guards two wrong
+        # forms: saturate-at-2 (returns 4 past stride 4) and a continuous
+        # ``16 // stride`` (returns 8 at stride 2).
+        eps = TritonPointwiseSeedHeuristic._elems_per_thread
+        self.assertEqual(eps(1), 16)
+        for stride in (2, 3, 4):
+            self.assertEqual(eps(stride), 4, f"stride {stride}")
+        for stride in (8, 16, 32):
+            self.assertEqual(eps(stride), 2, f"stride {stride}")
+        # Monotonically non-increasing, and never below the wide-gather floor.
+        values = [eps(s) for s in (1, 2, 4, 8, 16, 64, 1024)]
+        self.assertEqual(values, sorted(values, reverse=True))
+        self.assertGreaterEqual(
+            min(values), TritonPointwiseSeedHeuristic.ELEMS_PER_THREAD_WIDE_GATHER
+        )
+        # A degenerate/absent stride reads as coalesced rather than penalized.
+        self.assertEqual(eps(0), 16)
+
+
+class TestPointwiseArchConstants(TestCase):
+    """The seed's byte constants are arch-keyed; unmeasured arches keep the sm90 path."""
+
+    @onlyBackends(["triton"])
+    def test_tile_bytes_and_waves_are_arch_keyed(self) -> None:
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        env = MagicMock(spec=CompileEnvironment)
+        env.device = torch.device(DEVICE)
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            self.assertEqual(
+                TritonPointwiseSeedHeuristic.tile_bytes_for(env),
+                TritonPointwiseSeedHeuristic.TILE_BYTES,
+            )
+            self.assertEqual(
+                TritonPointwiseSeedHeuristic.min_waves_for(env),
+                TritonPointwiseSeedHeuristic.MIN_WAVES,
+            )
+        with patch(
+            "helion._hardware.get_hardware_info", return_value=BLACKWELL_HARDWARE
+        ):
+            self.assertEqual(
+                TritonPointwiseSeedHeuristic.tile_bytes_for(env),
+                TritonPointwiseSeedHeuristic.TILE_BYTES_SM100,
+            )
+            self.assertEqual(
+                TritonPointwiseSeedHeuristic.min_waves_for(env),
+                TritonPointwiseSeedHeuristic.MIN_WAVES_SM100,
+            )
+        # An arch the seed FIRES on but was never tuned for keeps the conservative
+        # sm90-calibrated values, not the B200 ones. Covers both directions of the
+        # allow-list: an OLDER arch (sm80), and -- the case a ``>= sm100`` version
+        # compare would get wrong -- a NEWER/adjacent one. sm120 (consumer Blackwell,
+        # GB202) and a hypothetical future sm110 both sort above sm100 numerically
+        # while having entirely different SM counts and HBM bandwidth, so neither may
+        # inherit B200's fitted constants.
+        for name, cc in (("sm80", "sm80"), ("sm120", "sm120"), ("sm110", "sm110")):
+            hardware = HardwareInfo(
+                device_kind="cuda",
+                hardware_name=f"untuned-{name}",
+                runtime_version="12.8",
+                compute_capability=cc,
+            )
+            with (
+                self.subTest(arch=name),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+            ):
+                self.assertEqual(
+                    TritonPointwiseSeedHeuristic.tile_bytes_for(env),
+                    TritonPointwiseSeedHeuristic.TILE_BYTES,
+                )
+                self.assertEqual(
+                    TritonPointwiseSeedHeuristic.min_waves_for(env),
+                    TritonPointwiseSeedHeuristic.MIN_WAVES,
+                )
+
+
 class TestTritonStandardReductionHeuristic(TestCase):
     """Triton standard row-reduction heuristic: seeds the "one row per program"
     skeleton with an rnumel-scaled ``num_warps`` ramp and faithful per-slot load
