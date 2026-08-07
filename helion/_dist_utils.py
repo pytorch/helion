@@ -36,6 +36,7 @@ def all_gather_object(obj: T, process_group_name: str | None = None) -> list[T]:
 
     group = _resolve_process_group(process_group_name)
     object_list = [None] * dist.get_world_size(group)
+    # pyrefly: ignore[bad-argument-type]
     dist.all_gather_object(object_list, obj, group=group)
     return object_list  # pyrefly: ignore
 
@@ -121,6 +122,7 @@ def check_config_consistancy(
     assert process_group_name is not None
     group = _resolve_process_group(process_group_name)
     all_configs = [None] * dist.get_world_size(group)
+    # pyrefly: ignore[bad-argument-type]
     dist.all_gather_object(all_configs, config, group=group)
     if dist.get_rank() == 0:
         # do the check on rank 0

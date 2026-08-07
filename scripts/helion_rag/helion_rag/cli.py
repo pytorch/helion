@@ -120,6 +120,25 @@ def main(argv: list[str] | None = None) -> int:
     ap = sh_sub.add_parser("artifact-path", help="get artifact path for family")
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--family", required=True)
+    ek = sh_sub.add_parser("ensure-keypair", help="create signing keys once")
+    ek.add_argument("--private", required=True)
+    ek.add_argument("--public", required=True)
+    we = sh_sub.add_parser("write-env", help="write managed runtime environment")
+    we.add_argument("--out", required=True)
+    we.add_argument("--rag-root", required=True)
+    we.add_argument("--hardware-family", required=True)
+    we.add_argument("--manifold-base", required=True)
+    we.add_argument("--embed-model", required=True)
+    we.add_argument("--private-key", required=True)
+    we.add_argument("--public-key", required=True)
+    we.add_argument("--llm-provider", required=True)
+    we.add_argument("--llm-model", required=True)
+    we.add_argument("--llm-ca-bundle", required=True)
+    we.add_argument("--vertex-base-url")
+    we.add_argument("--vertex-project-id")
+    we.add_argument("--cloud-ml-region")
+    we.add_argument("--hf-home")
+    we.add_argument("--collect-autotune", action="store_true")
     pm = sh_sub.add_parser(
         "publish-manifest", help="register a family in the shared manifest"
     )
@@ -199,8 +218,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             manifold_put = _manifold_put(cfg.manifold_base)
         uploads_dir = cfg.uploads_dir or (cfg.writeback_dir.parent / "uploads")
+        autotune_log_dir = cfg.autotune_log_dir or (
+            cfg.writeback_dir.parent / "autotune_logs"
+        )
         summary = run_upload(
-            autotune_log_dir=cfg.autotune_log_dir,
+            autotune_log_dir=autotune_log_dir,
             uploads_dir=uploads_dir,
             family=cfg.hardware_family,
             contributor=_contributor(),
@@ -230,6 +252,28 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if shm.is_represented(args.manifest, args.family) else 1
         if act == "artifact-path":
             print(shm.artifact_path(args.manifest, args.family))
+            return 0
+        if act == "ensure-keypair":
+            shm.ensure_signing_keypair(args.private, args.public)
+            return 0
+        if act == "write-env":
+            shm.write_environment(
+                args.out,
+                rag_root=args.rag_root,
+                hardware_family=args.hardware_family,
+                manifold_base=args.manifold_base,
+                embed_model=args.embed_model,
+                private_key_path=args.private_key,
+                public_key_path=args.public_key,
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
+                llm_ca_bundle=args.llm_ca_bundle,
+                vertex_base_url=args.vertex_base_url,
+                vertex_project_id=args.vertex_project_id,
+                cloud_ml_region=args.cloud_ml_region,
+                hf_home=args.hf_home,
+                collect_autotune=args.collect_autotune,
+            )
             return 0
         if act == "publish-manifest":
             summary = shm.publish_manifest(

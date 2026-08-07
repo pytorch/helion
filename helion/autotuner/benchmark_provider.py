@@ -34,6 +34,7 @@ from .benchmark_job import AccuracyCheckJob
 from .benchmark_job import AccuracyCheckResult
 from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
+from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
 from .benchmarking import PerfStats
 from .benchmarking import clear_jit_fast_path_caches
@@ -209,6 +210,10 @@ class BenchmarkResult(NamedTuple):
     perf: float
     status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
     compile_time: float | None
+    compilation_status: str = "unknown"
+    correctness_status: str = "unknown"
+    benchmark_status: str = "unknown"
+    correctness_time: float | None = None
 
 
 def _unset_fn(*args: object) -> NoReturn:
@@ -341,6 +346,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_baseline_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
+        self._last_timeout_stage: Literal["benchmark", "correctness"] | None = None
+        self._last_correctness_time: float | None = None
+        self._last_isolated_timeout_indices: set[int] = set()
         # budget_exceeded_fn inherits the class-level _never_exceeded default
         # until BaseSearch._prepare installs the search's real hook.
 
@@ -743,6 +751,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """
         all_configs = configs
         compiled: dict[int, Callable[..., object]] = {}
+        compile_failed_indices: set[int] = set()
         futures: list[PrecompileFuture] | None = None
 
         # Compilation phase
@@ -756,6 +765,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 with capture_output() as captured:
                     compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception as e:
+                compile_failed_indices.add(i)
                 if not compiled and i == len(all_configs) - 1:
                     raise
                 maybe_dump_triton_failure(
@@ -798,9 +808,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         # Initialize results with defaults
         results: list[BenchmarkResult] = [
             BenchmarkResult(
-                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
+                config=c,
+                fn=_unset_fn,
+                perf=inf,
+                status="error",
+                compile_time=None,
+                compilation_status=(
+                    "error" if i in compile_failed_indices else "not_run"
+                ),
+                correctness_status="not_run",
+                benchmark_status="not_run",
             )
-            for c in all_configs
+            for i, c in enumerate(all_configs)
         ]
 
         # Benchmark loop with progress reporting
@@ -850,21 +869,51 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
+                accuracy_failures = self._autotune_metrics.num_accuracy_failures
                 stats = self._benchmark_function(config, fn)
                 if stats is not None and stats.median is not None:
                     perf = stats.median
                     status = "ok" if math.isfinite(perf) else "error"
                     recorded_perf = perf if math.isfinite(perf) else None
+                    compilation_status = "ok"
+                    correctness_status = "ok"
+                    benchmark_status = status
                 else:
                     perf = inf
-                    status = "error"
                     recorded_perf = None
+                    compilation_status = "ok"
+                    if self._last_timeout_stage is not None:
+                        status = "timeout"
+                        correctness_status = (
+                            "timeout"
+                            if self._last_timeout_stage == "correctness"
+                            else "not_run"
+                        )
+                        benchmark_status = (
+                            "timeout"
+                            if self._last_timeout_stage == "benchmark"
+                            else "not_run"
+                        )
+                    elif (
+                        self._autotune_metrics.num_accuracy_failures > accuracy_failures
+                    ):
+                        status = "error"
+                        correctness_status = "failed"
+                        benchmark_status = "not_run"
+                    else:
+                        status = "error"
+                        correctness_status = "unknown"
+                        benchmark_status = "error"
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=perf,
                     status=status,
                     compile_time=compile_time,
+                    compilation_status=compilation_status,
+                    correctness_status=correctness_status,
+                    benchmark_status=benchmark_status,
+                    correctness_time=self._last_correctness_time,
                 )
             else:
                 status = "timeout" if reason == "timeout" else "error"
@@ -878,6 +927,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                    compilation_status=(
+                        "ok"
+                        if status == "peer_compilation_fail"
+                        else "timeout"
+                        if status == "timeout"
+                        else "error"
+                    ),
+                    correctness_status="not_run",
+                    benchmark_status="not_run",
                 )
             if config_id is not None:
                 self.log.record_autotune_entry(
@@ -908,6 +966,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """Benchmark a single compiled function.  Returns a ``PerfStats``
         on success (callers extract ``stats.median`` as latency) or ``None``
         on failure."""
+        self._last_timeout_stage = None
+        self._last_correctness_time = None
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
 
@@ -974,18 +1034,23 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 output = fn(*working_args)  # make sure the kernel is compiled
                 synchronize_device()
 
-            pass_accuracy_check = (
-                not self.settings.autotune_accuracy_check
-                or self._validate_against_baseline(config, output, working_args)
+            correctness_started = (
+                time.perf_counter() if self.settings.autotune_accuracy_check else None
+            )
+            pass_accuracy_check = not self.settings.autotune_accuracy_check or (
+                self._validate_against_baseline(config, output, working_args)
             )
             if not pass_accuracy_check:
                 self._autotune_metrics.num_accuracy_failures += 1
-            if not all(
+            all_ranks_accurate = all(
                 all_gather_object(
                     pass_accuracy_check,
                     process_group_name=self.kernel.env.process_group_name,
                 )
-            ):
+            )
+            if correctness_started is not None:
+                self._last_correctness_time = time.perf_counter() - correctness_started
+            if not all_ranks_accurate:
                 # for distributed kernels like matmul-reduce-scatter, different ranks compute
                 # a different chunk. It's possible that some ranks pass the accuracy check while
                 # others don't. Skip the config if any rank fails the accuracy check.
@@ -1116,6 +1181,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             result = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
             if result is None:
                 return _FALLBACK
+        except BenchmarkTimeout as e:
+            self._last_timeout_stage = "benchmark"
+            self.log.warning(f"Benchmark subprocess timed out for {config!r}: {e}")
+            self._autotune_metrics.num_compile_failures += 1
+            return None
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
@@ -1146,8 +1216,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         stats = result
 
         if self.settings.autotune_accuracy_check:
+            correctness_started = time.perf_counter()
             try:
                 accuracy_result = self._run_subprocess_accuracy_check_job(fn)
+            except BenchmarkTimeout as e:
+                self._last_timeout_stage = "correctness"
+                self.log.warning(
+                    f"Accuracy check subprocess timed out for {config!r}: {e}"
+                )
+                self._autotune_metrics.num_compile_failures += 1
+                return None
             except BenchmarkSubprocessError as e:
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
@@ -1176,6 +1254,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self._autotune_metrics.num_compile_failures += 1
                 return None
+            finally:
+                self._last_correctness_time = time.perf_counter() - correctness_started
 
             if accuracy_result is not None:
                 if not accuracy_result.ok:
@@ -1217,6 +1297,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self._autotune_metrics.num_compile_failures += 1
                 return None
             finally:
+                self._last_correctness_time = time.perf_counter() - correctness_started
                 # Same as the in-process path: drop JIT fast-path caches so
                 # this fn's tensors aren't pinned in GPU memory across configs.
                 self._clear_jit_fast_path_caches(fn)
@@ -1303,14 +1384,19 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self.settings.autotune_benchmark_fn is not None:
             return None
 
+        self._last_isolated_timeout_indices.clear()
         timings: list[float | None] = []
-        for fn in fns:
+        for index, fn in enumerate(fns):
             try:
                 timing = self._run_subprocess_benchmark_job(
                     cast("CompiledConfig", fn),
                     warmup=warmup,
                     rep=rep,
                 )
+            except BenchmarkTimeout as e:
+                self._last_isolated_timeout_indices.add(index)
+                self.log.warning(f"{desc} subprocess timed out: {e}")
+                timing = None
             except BenchmarkSubprocessError as e:
                 self.log.warning(f"{desc} subprocess failed: {e}")
                 timing = None

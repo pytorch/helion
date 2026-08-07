@@ -498,6 +498,19 @@ class _Settings:
             "HELION_AUTOTUNE_BUDGET_SECONDS",
         )
     )
+    autotune_candidate_attempt_limit: int | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_int,
+            "HELION_AUTOTUNE_CANDIDATE_ATTEMPT_LIMIT",
+        )
+    )
+    autotune_disable_trajectory_early_stop: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool,
+            "HELION_AUTOTUNE_DISABLE_TRAJECTORY_EARLY_STOP",
+            False,
+        )
+    )
     autotune_ignore_errors: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_AUTOTUNE_IGNORE_ERRORS", False
@@ -523,6 +536,24 @@ class _Settings:
     )
     force_autotune: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_FORCE_AUTOTUNE", False)
+    )
+    autotune_rag_enabled: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_RAG_ENABLED", False)
+    )
+    autotune_exact_read: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_EXACT_READ", True
+        )
+    )
+    autotune_best_available_read: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_BEST_AVAILABLE_READ", True
+        )
+    )
+    autotune_cache_write: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_CACHE_WRITE", True
+        )
     )
     autotune_config_overrides: dict[str, object] = dataclasses.field(
         default_factory=_get_autotune_config_overrides
@@ -559,8 +590,16 @@ class _Settings:
     )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
-    autotune_baseline_atol: float | None = None
-    autotune_baseline_rtol: float | None = None
+    autotune_baseline_atol: float | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_float, "HELION_AUTOTUNE_BASELINE_ATOL"
+        )
+    )
+    autotune_baseline_rtol: float | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_float, "HELION_AUTOTUNE_BASELINE_RTOL"
+        )
+    )
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
     autotune_best_available_max_configs: int = dataclasses.field(
@@ -676,6 +715,17 @@ class Settings(_Settings):
             "@helion.kernel(autotune_budget_seconds=N). Default None "
             "(no budget)."
         ),
+        "autotune_candidate_attempt_limit": (
+            "Optional positive cap on candidate attempts across the entire "
+            "autotune search, including rejected invalid and duplicate candidates. "
+            "Set HELION_AUTOTUNE_CANDIDATE_ATTEMPT_LIMIT=N or pass "
+            "autotune_candidate_attempt_limit=N. Default None (no cap)."
+        ),
+        "autotune_disable_trajectory_early_stop": (
+            "Disable performance-trajectory early stopping for controlled "
+            "equal-budget comparisons. Set "
+            "HELION_AUTOTUNE_DISABLE_TRAJECTORY_EARLY_STOP=1. Default False."
+        ),
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
@@ -709,6 +759,24 @@ class Settings(_Settings):
             "The result is still written to the cache so subsequent runs "
             "can reuse it. Set HELION_SKIP_CACHE=1 instead to skip both "
             "reading and writing the cache."
+        ),
+        "autotune_rag_enabled": (
+            "Opt-in kill switch for the experimental tiered-RAG autotuning policy. "
+            "Default False (RAG off). Set HELION_RAG_ENABLED=1 to enable."
+        ),
+        "autotune_exact_read": (
+            "If True (default), read Helion's exact autotune cache. Independent of "
+            "the best-available warm start; set HELION_AUTOTUNE_EXACT_READ=0 to skip "
+            "only the exact read without disabling warm starts."
+        ),
+        "autotune_best_available_read": (
+            "If True (default), seed the initial population from best-available "
+            "cached configs. Set HELION_AUTOTUNE_BEST_AVAILABLE_READ=0 to disable "
+            "warm starts without affecting the exact-cache read."
+        ),
+        "autotune_cache_write": (
+            "If True (default), write winning configs back to the autotune cache. "
+            "Set HELION_AUTOTUNE_CACHE_WRITE=0 to keep writes quarantined."
         ),
         "autotune_config_overrides": (
             "Dictionary of config key/value pairs forced during autotuning. "
@@ -823,6 +891,15 @@ class Settings(_Settings):
                 f"autotune_best_of_k must be >= 1, got {self.autotune_best_of_k!r}; "
                 f"set HELION_AUTOTUNE_BEST_OF_K to a positive integer "
                 f"(default 1 = single-trial behavior)"
+            )
+
+        if (
+            self.autotune_candidate_attempt_limit is not None
+            and self.autotune_candidate_attempt_limit <= 0
+        ):
+            raise ValueError(
+                "autotune_candidate_attempt_limit must be positive, got "
+                f"{self.autotune_candidate_attempt_limit!r}"
             )
 
         self._check_ref_eager_mode_before_print_output_code()

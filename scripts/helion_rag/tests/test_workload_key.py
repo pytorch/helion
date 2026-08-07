@@ -65,9 +65,9 @@ def test_runid_map_keeps_all_run_ids_but_dedup_keeps_fastest() -> None:
     assert deduped[0]["run_id"] == "R2"  # lower median wins regardless of load order
 
 
-def test_tier0_eligible() -> None:
-    assert C._tier0_eligible(SRC_PLAIN) is True
-    assert C._tier0_eligible(SRC_EPILOGUE) is False
+def test_historical_schema_is_never_tier0_eligible() -> None:
+    assert C._tier0_eligible({"kernel_source": SRC_PLAIN}) is False
+    assert C._tier0_eligible({"kernel_source": SRC_EPILOGUE}) is False
 
 
 def _record(shapes: str, dtypes: str) -> dict:

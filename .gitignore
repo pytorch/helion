@@ -116,3 +116,6 @@ cute_sweep_results.jsonl
 .claude/settings.local.json
 .claude/worktrees/*
 .helion-rag/
+# Checked-in reference results for the four-arm autotuning experiment; the
+# repo-wide *.csv rule above would otherwise swallow the analysis tables.
+!scripts/helion_rag/results/**/*.csv

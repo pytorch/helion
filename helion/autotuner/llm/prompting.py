@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -279,6 +280,38 @@ def build_author_seed_section(kernel: _AutotunableKernel) -> str:
     return _section("Author Seed Configs", body)
 
 
+def build_retrieved_examples_section(
+    examples: Sequence[Mapping[str, object]],
+) -> str:
+    """Format retrieved semantically-similar neighbors as few-shot examples (§6.3).
+
+    No-op ("") when there are no examples, so callers may always pass the list.
+    Each example is a mapping with optional ``kernel_name``, ``input_shapes``,
+    ``dtypes``, and ``config`` (a dict) fields; missing fields are tolerated.
+    """
+    if not examples:
+        return ""
+    lines: list[str] = []
+    for example in examples:
+        name = example.get("kernel_name") or "kernel"
+        shapes = example.get("input_shapes", "")
+        dtypes = example.get("dtypes", "")
+        config = example.get("config")
+        config_text = (
+            json.dumps(config, separators=(",", ":"))
+            if isinstance(config, dict)
+            else "(config unavailable)"
+        )
+        lines.append(f"{name} shapes={shapes} dtypes={dtypes} -> {config_text}")
+    body = (
+        "Configs that performed well on semantically similar kernels retrieved from "
+        "prior tuning. Treat them as strong priors to adapt to this kernel's shapes "
+        "and config space, not guarantees:\n"
+        + "\n".join(f"  - {line}" for line in lines)
+    )
+    return _section("Retrieved Neighbor Examples", body)
+
+
 def build_initial_prompt(
     *,
     kernel: _AutotunableKernel,
@@ -286,6 +319,7 @@ def build_initial_prompt(
     config_spec: ConfigSpec,
     configs_per_round: int,
     compile_timeout_s: int | None,
+    retrieved_examples: Sequence[Mapping[str, object]] | None = None,
 ) -> str:
     """Build the full initial user prompt sent to the LLM."""
     default_config = config_spec.default_config()
@@ -312,6 +346,7 @@ def build_initial_prompt(
         default_section,
         build_compiler_analysis_section(config_spec),
         build_author_seed_section(kernel),
+        build_retrieved_examples_section(retrieved_examples or ()),
         guidance,
         _section("Task", task_section),
     )

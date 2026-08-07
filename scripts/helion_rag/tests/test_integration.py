@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from helion_rag.config import Config
@@ -16,13 +17,26 @@ from ._fixtures import FAMILY
 from ._fixtures import SHAPES
 from ._fixtures import SRC
 
-_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+# Small model by default for CI; override with a locally-cached model (e.g.
+# Qwen/Qwen3-Embedding-4B) to validate against the audit-diagnostic models.
+_EMBED_MODEL = os.environ.get(
+    "HELION_RAG_TEST_EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B"
+)
 
 
 @pytest.fixture
-def _index_deps():
-    pytest.importorskip("langchain_community")
+def _index_deps(tmp_path, monkeypatch):
+    pytest.importorskip("langchain_huggingface")
     pytest.importorskip("faiss")
+    from helion_rag import signing
+
+    priv_pem, pub_pem = signing.generate_keypair()
+    priv_path = tmp_path / "priv.pem"
+    pub_path = tmp_path / "pub.pem"
+    priv_path.write_bytes(priv_pem)
+    pub_path.write_bytes(pub_pem)
+    monkeypatch.setenv("HELION_RAG_PRIVATE_KEY_PATH", str(priv_path))
+    monkeypatch.setenv("HELION_RAG_PUBLIC_KEY_PATH", str(pub_path))
 
 
 def _cfg(tmp_path: Path) -> Config:

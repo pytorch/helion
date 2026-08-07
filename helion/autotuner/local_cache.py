@@ -93,6 +93,19 @@ def parse_cache_entry(raw: str) -> SavedBestConfig:
         raise ValueError(f"malformed cache entry: {e}") from e
 
 
+def _load_best_config(path: Path) -> Config | None:
+    """Load a ``.best_config`` file.
+
+    Returns ``None`` only when the entry is absent (a genuine cache miss); a
+    corrupt or unreadable entry raises, so callers can distinguish a true miss
+    from a read error (used by the RAG typed exact-cache probe).
+    """
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    return Config.from_json(data["config"])
+
+
 def iter_cache_entries(
     cache_path: Path, *, max_scan: int | None = None
 ) -> Iterator[SavedBestConfig]:
@@ -202,12 +215,19 @@ class LocalAutotuneCache(AutotuneCacheBase):
         return get_helion_cache_dir() / f"{self.key.stable_hash()}.best_config"
 
     def get(self) -> Config | None:
-        path = self._get_local_cache_path()
         try:
-            data = json.loads(path.read_text())
-            return Config.from_json(data["config"])
+            return _load_best_config(self._get_local_cache_path())
         except Exception:
             return None
+
+    def get_or_raise(self) -> Config | None:
+        """Like :meth:`get` but raises on a read error instead of swallowing it.
+
+        Returns ``None`` only for a genuine miss (absent entry); a corrupt or
+        unreadable entry raises so the RAG typed probe can record an
+        ``ExactReadError`` distinct from an ``ExactMiss``.
+        """
+        return _load_best_config(self._get_local_cache_path())
 
     def put(self, config: Config) -> None:
         path = self._get_local_cache_path()

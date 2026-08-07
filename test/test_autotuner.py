@@ -916,6 +916,8 @@ def _make_stub_benchmark_provider() -> LocalBenchmarkProvider:
     )
     provider.mutated_arg_indices = ()
     provider._benchmark_worker = None
+    provider._last_timeout_stage = None
+    provider._last_correctness_time = None
     provider._precompile_args_path = None
     provider._precompile_tmpdir = None
     return provider

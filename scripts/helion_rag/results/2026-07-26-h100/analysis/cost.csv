@@ -1,0 +1,5 @@
+arm,provider_requests_total,input_tokens_total,output_tokens_total
+lfbo,0,0,0
+llm,165,629915,116241
+hybrid_lfbo_llm,165,629915,116681
+contextual_rag_llm,165,745070,130173

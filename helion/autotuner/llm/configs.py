@@ -6,9 +6,12 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from ... import exc
 from .parsing import parse_jsonish
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ...runtime.config import Config
     from ..config_fragment import ConfigSpecFragment
     from ..config_spec import ConfigSpec
@@ -68,6 +71,9 @@ def parse_response_configs(
     config_spec: ConfigSpec,
     default_config_dict: dict[str, object],
     log: AutotuningLogger,
+    admit_config: Callable[[Config], bool] | None = None,
+    record_invalid: Callable[[], bool] | None = None,
+    budget_exhausted: Callable[[], bool] | None = None,
 ) -> list[Config]:
     """Parse, validate, normalize, and deduplicate configs from an LLM response."""
     import helion
@@ -80,14 +86,19 @@ def parse_response_configs(
         raw_configs = parsed
 
     if not isinstance(raw_configs, list):
-        log.warning("Failed to parse LLM response as a config list")
-        return []
+        raise exc.InvalidResponseSchema(
+            "LLM response must be a JSON array or an object with a 'configs' array"
+        )
 
     configs: list[Config] = []
     seen: set[str] = set()
     for index, raw in enumerate(raw_configs):
+        if budget_exhausted is not None and budget_exhausted():
+            break
         if not isinstance(raw, dict):
             log.debug(f"Skipping non-dict config at index {index}")
+            if record_invalid is not None and not record_invalid():
+                break
             continue
         try:
             validate_sparse_config_shape(raw, config_spec=config_spec)
@@ -95,8 +106,17 @@ def parse_response_configs(
             merged.update(raw)
             config_spec.normalize(merged, _fix_invalid=True)
             config = helion.Config(**cast("dict[str, Any]", merged))
-        except Exception as e:
-            log.debug(f"Skipping invalid config {index}: {e}")
+        except (exc.InvalidConfig, ValueError) as error:
+            log.debug(f"Skipping invalid config {index}: {error}")
+            if record_invalid is not None and not record_invalid():
+                break
+            continue
+
+        if admit_config is not None:
+            if admit_config(config):
+                configs.append(config)
+            elif budget_exhausted is not None and budget_exhausted():
+                break
             continue
 
         config_key = repr(config)
@@ -105,6 +125,10 @@ def parse_response_configs(
         seen.add(config_key)
         configs.append(config)
 
+    if not configs:
+        raise exc.ZeroValidCandidates(
+            "LLM response contained zero unique ConfigSpec-compatible configs"
+        )
     log(f"Parsed {len(configs)} valid configs from LLM response")
     return configs
 

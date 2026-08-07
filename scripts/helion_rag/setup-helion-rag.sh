@@ -20,6 +20,12 @@ HELION_REPO=""; PYTHON_BIN=""; MANIFOLD_BASE=""; HW_FAMILY=""
 INTERACTIVE=1; DRY_RUN=0; ALLOW_GLOBAL=0
 EMBED_MODEL="${HELION_EMBED_MODEL:-Qwen/Qwen3-Embedding-8B}"
 HF_HOME_VALUE="${HF_HOME:-}"
+LLM_PROVIDER_VALUE="${HELION_LLM_PROVIDER:-vertex}"
+LLM_MODEL_VALUE="${HELION_LLM_MODEL:-claude-opus-4-8}"
+LLM_CA_BUNDLE_VALUE="${HELION_LLM_CA_BUNDLE:-/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem}"
+VERTEX_BASE_URL_VALUE="${ANTHROPIC_VERTEX_BASE_URL:-}"
+VERTEX_PROJECT_ID_VALUE="${ANTHROPIC_VERTEX_PROJECT_ID:-}"
+CLOUD_ML_REGION_VALUE="${CLOUD_ML_REGION:-}"
 COLLECT_AUTOTUNE=0
 MANIFEST_TMP=""
 
@@ -143,6 +149,7 @@ else info "hardware family not represented: $HW_FAMILY"; fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
   plan "would create $RAG_ROOT/{ci_artifacts,rag_index,rag_writeback,autotune_logs,uploads}"
+  plan "would create or preserve an Ed25519 publisher keypair under $RAG_ROOT"
   plan "would pip install -e $PKG_ROOT"
   if [ "$FAMILY_REPRESENTED" -eq 1 ]; then
     plan "would install deps, write env.sh, fetch corpus, and build index"
@@ -163,25 +170,31 @@ mkdir -p "$RAG_ROOT"/{ci_artifacts,rag_index,rag_writeback,autotune_logs,uploads
 cp "$MANIFEST_TMP" "$RAG_ROOT/manifest.json"
 info "created $RAG_ROOT layout"
 
+PRIVATE_KEY_PATH="$RAG_ROOT/publisher-private.pem"
+PUBLIC_KEY_PATH="$RAG_ROOT/publisher-public.pem"
+helion_rag_py setup-helper ensure-keypair \
+  --private "$PRIVATE_KEY_PATH" --public "$PUBLIC_KEY_PATH"
+info "signing keypair ready under $RAG_ROOT"
+
 write_env() {
   local collect="${1:-0}"
-  {
-    echo "# Managed by setup-helion-rag.sh"
-    printf 'export HELION_RAG_HARDWARE_FAMILY=%s\n' "$(shq "$HW_FAMILY")"
-    printf 'export HELION_RAG_MANIFOLD_BASE=%s\n' "$(shq "$MANIFOLD_BASE")"
-    printf 'export HELION_RAG_MANIFEST=%s\n' "$(shq "$RAG_ROOT/manifest.json")"
-    printf 'export HELION_RAG_DATA_DIR=%s\n' "$(shq "$RAG_ROOT/ci_artifacts")"
-    printf 'export HELION_RAG_INDEX_DIR=%s\n' "$(shq "$RAG_ROOT/rag_index")"
-    printf 'export HELION_RAG_WRITEBACK_DIR=%s\n' "$(shq "$RAG_ROOT/rag_writeback")"
-    printf 'export HELION_RAG_AUTOTUNE_LOG_DIR=%s\n' "$(shq "$RAG_ROOT/autotune_logs")"
-    printf 'export HELION_RAG_UPLOADS_DIR=%s\n' "$(shq "$RAG_ROOT/uploads")"
-    printf 'export HELION_EMBED_MODEL=%s\n' "$(shq "$EMBED_MODEL")"
-  } > "$RAG_ROOT/env.sh"
-  [ -n "$HF_HOME_VALUE" ] && printf 'export HF_HOME=%s\n' "$(shq "$HF_HOME_VALUE")" >> "$RAG_ROOT/env.sh"
-  if [ "$collect" -eq 1 ]; then
-    printf 'export HELION_AUTOTUNE_LOG=%s\n' "$(shq "$RAG_ROOT/autotune_logs/helion-rag")" >> "$RAG_ROOT/env.sh"
-    printf 'export HELION_AUTOTUNE_LOG_DETAILS=1\n' >> "$RAG_ROOT/env.sh"
-  fi
+  local args=(setup-helper write-env
+    --out "$RAG_ROOT/env.sh"
+    --rag-root "$RAG_ROOT"
+    --hardware-family "$HW_FAMILY"
+    --manifold-base "$MANIFOLD_BASE"
+    --embed-model "$EMBED_MODEL"
+    --private-key "$PRIVATE_KEY_PATH"
+    --public-key "$PUBLIC_KEY_PATH"
+    --llm-provider "$LLM_PROVIDER_VALUE"
+    --llm-model "$LLM_MODEL_VALUE"
+    --llm-ca-bundle "$LLM_CA_BUNDLE_VALUE")
+  [ -n "$VERTEX_BASE_URL_VALUE" ] && args+=(--vertex-base-url "$VERTEX_BASE_URL_VALUE")
+  [ -n "$VERTEX_PROJECT_ID_VALUE" ] && args+=(--vertex-project-id "$VERTEX_PROJECT_ID_VALUE")
+  [ -n "$CLOUD_ML_REGION_VALUE" ] && args+=(--cloud-ml-region "$CLOUD_ML_REGION_VALUE")
+  [ -n "$HF_HOME_VALUE" ] && args+=(--hf-home "$HF_HOME_VALUE")
+  [ "$collect" -eq 1 ] && args+=(--collect-autotune)
+  helion_rag_py "${args[@]}"
 }
 write_env 0
 info "wrote RAG environment to $RAG_ROOT/env.sh"

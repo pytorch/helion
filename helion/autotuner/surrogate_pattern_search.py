@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import operator
 import random
+import time
 from typing import TYPE_CHECKING
 
 from .. import exc
@@ -11,6 +12,7 @@ from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import check_population_consistency
 from .base_search import performance
+from .candidate_budget import AttemptCategory
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
@@ -386,15 +388,17 @@ class LFBOPatternSearch(PatternSearch):
             f" max_generations={self.max_generations},"
             f" similarity_penalty={self.similarity_penalty}"
         )
-        visited: set[Config] = set()
-        self.population = []
-        for flat_config in self._generate_initial_population_flat():
-            member = self.make_unbenchmarked(flat_config)
-            if member is not None and member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
+        generation_started = time.perf_counter()
+        initial_population = self._generate_initial_population_flat()
+        self._record_candidate_generation_time(time.perf_counter() - generation_started)
+        self.population, visited = self.make_initial_population(
+            initial_population,
+            target_size=self.initial_population,
+        )
         self.set_generation(0)
-        self.benchmark_population(self.population, desc="Initial population")
+        self.benchmark_population(
+            self.population, desc="Initial population", initial_population=True
+        )
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(
@@ -513,7 +517,14 @@ class LFBOPatternSearch(PatternSearch):
         ]
         warp_idx = self.config_gen.num_warps_index
         tune_warps = warp_idx >= 0 and warp_idx not in overridden
-        for _ in range(self.num_neighbors):
+        requested = (
+            min(self.num_neighbors, self.num_neighbors_cap)
+            if self.num_neighbors_cap > 0
+            else self.num_neighbors
+        )
+        for _ in range(self._candidate_generation_limit(requested)):
+            if self.candidate_attempt_budget.exhausted:
+                break
             new_flat = [*base]  # Copy the base configuration
             modified_indices = set()
 
@@ -566,6 +577,8 @@ class LFBOPatternSearch(PatternSearch):
             # Only add if it's different from the base
             if new_flat != base:
                 neighbors.append(new_flat)
+            elif self.candidate_attempt_budget.limit is not None:
+                self.candidate_attempt_budget.record(AttemptCategory.DUPLICATE)
 
         return self.shrink_neighbors(neighbors)
 
@@ -594,8 +607,12 @@ class LFBOPatternSearch(PatternSearch):
         patience = self.patience
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
+            generation_started = time.perf_counter()
             with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 all_neighbors = self._generate_neighbors(current.flat_values)
+            self._record_candidate_generation_time(
+                time.perf_counter() - generation_started
+            )
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
                 if new_member is not None and new_member.config not in visited:
@@ -604,7 +621,11 @@ class LFBOPatternSearch(PatternSearch):
 
             # score candidates
             n_sorted = int(len(candidates) * self.frac_selected)
+            selection_started = time.perf_counter()
             candidates = self._surrogate_select(candidates, n_sorted)
+            self._record_candidate_generation_time(
+                time.perf_counter() - selection_started
+            )
 
             if len(candidates) <= 1:
                 self.log(f"Copy {copy_idx} finish because of no candidates")
@@ -800,7 +821,14 @@ class LFBOTreeSearch(LFBOPatternSearch):
 
         all_results: list[FlatConfig] = []
 
-        for _ in range(self.num_neighbors):
+        requested = (
+            min(self.num_neighbors, self.num_neighbors_cap)
+            if self.num_neighbors_cap > 0
+            else self.num_neighbors
+        )
+        for _ in range(self._candidate_generation_limit(requested)):
+            if self.candidate_attempt_budget.exhausted:
+                break
             # 1. Pick a random tree
             tree_idx = random.randint(0, n_trees - 1)
             estimator = surrogate.estimators_[tree_idx]
@@ -867,5 +895,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             # Only keep if different from base
             if current_flat != base_list:
                 all_results.append(list(current_flat))
+            elif self.candidate_attempt_budget.limit is not None:
+                self.candidate_attempt_budget.record(AttemptCategory.DUPLICATE)
 
         return self.shrink_neighbors(all_results)

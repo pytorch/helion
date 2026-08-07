@@ -58,6 +58,57 @@ class AutotuneError(BaseError):
     message = "{0}"
 
 
+class RetrievalProviderError(BaseError):
+    """Base for RAG provider/transport failures eligible for fail-closed fallback.
+
+    Only subclasses of this type may be caught by the RAG execution wrapper (§3.1).
+    Authentication, configuration, parser-invariant, and programming errors do NOT
+    inherit from it, so they always propagate.
+    """
+
+    message = "{0}"
+
+
+class ProviderTimeout(RetrievalProviderError):
+    """The provider did not respond within the request timeout."""
+
+
+class ProviderTransportError(RetrievalProviderError):
+    """A network/transport failure reaching the provider (connection, DNS, TLS)."""
+
+
+class ProviderRateLimited(RetrievalProviderError):
+    """The provider rate-limited the request (e.g. HTTP 429)."""
+
+
+class ProviderServerError(RetrievalProviderError):
+    """The provider returned a server error (e.g. HTTP 5xx)."""
+
+
+class RetrieverUnavailable(RetrievalProviderError):
+    """The retriever or index backend was unavailable."""
+
+
+class InvalidResponseSchema(RetrievalProviderError):
+    """Transport succeeded but the response did not match the declared schema."""
+
+
+class ZeroValidCandidates(RetrievalProviderError):
+    """A valid response yielded zero unique ConfigSpec-compatible candidates."""
+
+
+class ProviderAuthError(BaseError):
+    """Provider auth/configuration error (e.g. HTTP 401/403); always propagates."""
+
+    message = "{0}"
+
+
+class ProviderRequestError(BaseError):
+    """Malformed/unsupported request or missing provider configuration; propagates."""
+
+    message = "{0}"
+
+
 class BackendImplementationMissing(BaseError):
     message = "Backend '{backend}' is missing required implementation: {detail}"
 

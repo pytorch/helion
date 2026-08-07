@@ -33,15 +33,20 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 import os
 import time
 from typing import TYPE_CHECKING
 
+from .. import exc
 from .base_search import BenchmarkResult
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import check_population_consistency
+from .candidate_budget import AttemptCategory
+from .candidate_budget import random_replacement_draw_cap
 from .effort_profile import DEFAULT_LLM_CONFIGS_PER_ROUND
 from .effort_profile import DEFAULT_LLM_INITIAL_RANDOM_CONFIGS
 from .effort_profile import DEFAULT_LLM_MAX_ROUNDS
@@ -58,11 +63,20 @@ from .llm.prompting import build_initial_search_guidance
 from .llm.prompting import build_refinement_prompt
 from .llm.prompting import build_system_prompt
 from .llm.transport import DEFAULT_REQUEST_TIMEOUT_S
-from .llm.transport import call_provider as _call_provider
+from .llm.transport import ProviderMetadata as _ProviderMetadata
+from .llm.transport import ProviderReplayRecord as _ProviderReplayRecord
+from .llm.transport import TokenUsage as _TokenUsage
+from .llm.transport import append_provider_replay_record
+from .llm.transport import call_provider_with_usage as _call_provider_with_usage
 from .llm.transport import infer_provider as _infer_provider
+from .llm.transport import provider_replay_extra_headers_hash
+from .llm.transport import provider_replay_request_id
+from .llm.transport import provider_replay_response_hash
+from .rag.seeding import build_seeded_population
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -117,6 +131,8 @@ def guided_search_kwargs_from_config(
         kwargs["fast_mode"] = _env_get_bool("HELION_LLM_FAST_MODE", False)
     if (value := os.environ.get("HELION_LLM_COMPILE_TIMEOUT_S")) is not None:
         kwargs["compile_timeout_s"] = int(value)
+    if (value := os.environ.get("HELION_LLM_REQUEST_TIMEOUT_S")) is not None:
+        kwargs["request_timeout_s"] = float(value)
     return kwargs
 
 
@@ -172,6 +188,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
             Can also be set via HELION_LLM_FAST_MODE.
     """
 
+    _provider_requests = 0
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -190,6 +208,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         compile_timeout_s: int | None = None,
         effort_level: str | None = None,
         fast_mode: bool = False,
+        retrieved_examples: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         super().__init__(kernel, args, finishing_rounds=finishing_rounds)
         if max_rounds < 1:
@@ -208,11 +227,18 @@ class LLMGuidedSearch(PopulationBasedSearch):
         self.compile_timeout_s = compile_timeout_s
         self.effort_level = effort_level
         self.fast_mode = fast_mode
+        self._retrieved_examples = [
+            dict(example) for example in retrieved_examples or ()
+        ]
 
         self._messages: list[dict[str, str]] = []
         self._all_benchmark_results: list[BenchmarkResult] = []
         self._latest_results_by_config_key: dict[str, BenchmarkResult] = {}
         self._llm_call_times: list[float] = []
+        self._token_usage: list[_TokenUsage] = []
+        self._provider_metadata: list[_ProviderMetadata] = []
+        self._provider_replay_identities: list[tuple[str, str | None]] = []
+        self._provider_requests = 0
         self._benchmark_times: list[float] = []
         self._llm_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -248,6 +274,75 @@ class LLMGuidedSearch(PopulationBasedSearch):
             config_spec=self.config_spec,
             configs_per_round=self.configs_per_round,
             compile_timeout_s=self.settings.autotune_compile_timeout,
+            retrieved_examples=self._retrieved_examples,
+        )
+
+    def set_retrieved_examples(self, examples: Sequence[Mapping[str, object]]) -> None:
+        """Replace the structured Tier-1 examples included in the first prompt."""
+        self._retrieved_examples = [dict(example) for example in examples]
+
+    def _prepare_best_available_initial_evidence(self) -> None:
+        """Add live best-available configs to round-0 seeds and prompt context."""
+        if (
+            not self.settings.autotune_best_available_read
+            or self.fixed_initial_population_flat() is not None
+        ):
+            return
+
+        cached = self._find_similar_cached_configs(
+            self.settings.autotune_best_available_max_configs
+        )
+        best_available: list[Config] = []
+        seen: set[Config] = set()
+        for entry in cached:
+            try:
+                config = self.config_gen.unflatten(entry.to_mutable_flat_config())
+            except (exc.InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
+                continue
+            if config not in seen:
+                seen.add(config)
+                best_available.append(config)
+        if not best_available:
+            return
+
+        target_size = self.initial_random_configs + 1
+        seeds = [*best_available, self.config_spec.default_config()]
+
+        def draw_random() -> Config:
+            return self.config_gen.unflatten(self.config_gen.random_flat())
+
+        def is_valid(config: Config) -> bool:
+            try:
+                self.config_gen.unflatten(self.config_gen.flatten(config))
+            except (exc.InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
+                return False
+            return True
+
+        population, _ = build_seeded_population(
+            seeds,
+            n=target_size,
+            num_neighbors_cap=target_size,
+            draw_random=draw_random,
+            is_valid=is_valid,
+            flatten_key=lambda config: config,
+            budget=self.candidate_attempt_budget,
+            draw_cap=random_replacement_draw_cap(target_size),
+        )
+        self.set_fixed_initial_population_configs(
+            population, attempts_already_recorded=True
+        )
+        best_available_set = set(best_available)
+        for config in population:
+            self.set_candidate_source(
+                config,
+                "best_available" if config in best_available_set else "initial_seed",
+            )
+        self._retrieved_examples.extend(
+            {
+                "kernel_name": "best_available",
+                "config": dict(config.config),
+            }
+            for config in best_available
         )
 
     def _build_refinement_prompt(self, round_num: int) -> str:
@@ -285,6 +380,10 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _call_llm(self, messages: list[dict[str, str]]) -> str:
         """Send one synchronous request to the configured provider and time it."""
         t0 = time.perf_counter()
+        provider: str | None = None
+        max_output_tokens = self._max_output_tokens_for_request()
+        result = None
+        request_hash: str | None = None
         try:
             provider = self.provider or _infer_provider(self.model)
             if provider == "unsupported":
@@ -294,22 +393,91 @@ class LLMGuidedSearch(PopulationBasedSearch):
                     "Responses. Set HELION_LLM_PROVIDER to override the provider "
                     "when using a proxy."
                 )
-            return _call_provider(
+            effective_api_base = self.api_base or os.environ.get("HELION_LLM_API_BASE")
+            request_hash = provider_replay_request_id(
+                provider,
+                model=self.model,
+                api_base=effective_api_base,
+                messages=messages,
+                max_output_tokens=max_output_tokens,
+                request_timeout_s=self.request_timeout_s,
+                effort_level=self.effort_level,
+                fast_mode=self.fast_mode,
+                extra_headers_sha256=provider_replay_extra_headers_hash(),
+            )
+            self._provider_requests += 1
+            result = _call_provider_with_usage(
                 provider,
                 model=self.model,
                 api_base=self.api_base,
                 api_key=self.api_key,
                 messages=messages,
-                max_output_tokens=self._max_output_tokens_for_request(),
+                max_output_tokens=max_output_tokens,
                 request_timeout_s=self.request_timeout_s,
                 effort_level=self.effort_level,
                 fast_mode=self.fast_mode,
             )
+            self._token_usage.append(result.usage)
+            self._provider_metadata.append(
+                _ProviderMetadata(
+                    request_id=result.request_id,
+                    response_id=result.response_id,
+                    cache_state=result.cache_state,
+                )
+            )
+            append_provider_replay_record(
+                _ProviderReplayRecord(
+                    provider=provider,
+                    model=self.model,
+                    api_base=effective_api_base,
+                    messages=tuple(dict(message) for message in messages),
+                    max_output_tokens=max_output_tokens,
+                    request_timeout_s=self.request_timeout_s,
+                    effort_level=self.effort_level,
+                    fast_mode=self.fast_mode,
+                    request_id=result.request_id or request_hash,
+                    response_id=result.response_id,
+                    cache_state=result.cache_state,
+                    response_text=result.text,
+                    usage=result.usage,
+                    error_type=None,
+                )
+            )
+            self._provider_replay_identities.append(
+                (request_hash, provider_replay_response_hash(result.text))
+            )
+            return result.text
         except Exception as e:
+            if provider is not None and request_hash is not None and result is None:
+                append_provider_replay_record(
+                    _ProviderReplayRecord(
+                        provider=provider,
+                        model=self.model,
+                        api_base=self.api_base or os.environ.get("HELION_LLM_API_BASE"),
+                        messages=tuple(dict(message) for message in messages),
+                        max_output_tokens=max_output_tokens,
+                        request_timeout_s=self.request_timeout_s,
+                        effort_level=self.effort_level,
+                        fast_mode=self.fast_mode,
+                        request_id=request_hash,
+                        response_id=None,
+                        cache_state=None,
+                        response_text=None,
+                        usage=_TokenUsage(),
+                        error_type=type(e).__name__,
+                    )
+                )
+                self._provider_replay_identities.append((request_hash, None))
             self.log.warning(f"LLM call failed: {type(e).__name__}: {e}")
             raise
         finally:
-            self._llm_call_times.append(time.perf_counter() - t0)
+            elapsed = time.perf_counter() - t0
+            self._llm_call_times.append(elapsed)
+            collector = self._attempt_instrumentation
+            if collector is not None:
+                from .rag.types import Phase
+
+                collector.record_phase_transition(Phase.PROVIDER, phase_seconds=elapsed)
 
     def _call_llm_async(
         self, messages: list[dict[str, str]]
@@ -336,12 +504,44 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _parse_configs(self, response: str) -> list[Config]:
         """Parse and validate candidate configs from a raw LLM response."""
-        return parse_response_configs(
-            response,
-            config_spec=self.config_spec,
-            default_config_dict=self._default_config_dict,
-            log=self.log,
-        )
+        parsing_started = time.perf_counter()
+        budget = self.candidate_attempt_budget
+
+        def record_invalid() -> bool:
+            return budget.record(AttemptCategory.INVALID)
+
+        def admit_config(config: Config) -> bool:
+            return self._admit_config_candidate(config, AttemptCategory.LLM_PROPOSED)
+
+        def budget_exhausted() -> bool:
+            return budget.exhausted
+
+        try:
+            return parse_response_configs(
+                response,
+                config_spec=self.config_spec,
+                default_config_dict=self._default_config_dict,
+                log=self.log,
+                admit_config=admit_config if budget.limit is not None else None,
+                record_invalid=record_invalid if budget.limit is not None else None,
+                budget_exhausted=(
+                    budget_exhausted if budget.limit is not None else None
+                ),
+            )
+        except (exc.InvalidResponseSchema, exc.ZeroValidCandidates) as unusable:
+            # These are typed so the RAG boundary can classify them into a
+            # FallbackReason; when that boundary is not installed nothing catches
+            # them, and an unusable round would abort a search that previously
+            # just kept its incumbent. An empty "configs" array is an ordinary
+            # thing for a converged LLM to return.
+            if self.settings.autotune_rag_enabled:
+                raise
+            self.log(f"Ignoring unusable LLM response: {unusable}")
+            return []
+        finally:
+            self._record_candidate_generation_time(
+                time.perf_counter() - parsing_started
+            )
 
     # ── Search loop ──────────────────────────────────────────────
 
@@ -381,6 +581,32 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _build_seed_configs(self) -> list[Config]:
         """Build the initial benchmark set: default plus a few random seeds."""
+        if self.candidate_attempt_budget.limit is not None:
+            fixed = self.fixed_initial_population_flat()
+            if fixed is None:
+                target_size = self.initial_random_configs + 1
+                default_flat = self.config_gen.flatten(
+                    self.config_spec.default_config()
+                )
+                generated_size = self._candidate_generation_limit(target_size)
+                random_flats = self.config_gen.random_population_flat(generated_size)[
+                    1:
+                ]
+                initial_flats = (
+                    [default_flat, *random_flats] if generated_size > 0 else []
+                )
+            else:
+                initial_flats = fixed
+                target_size = len(fixed)
+
+            try:
+                population, _ = self.make_initial_population(
+                    initial_flats, target_size=target_size
+                )
+            finally:
+                self._finish_initial_candidate_attempts()
+            return [member.config for member in population]
+
         # Start from default and add only distinct random configs that unflatten cleanly.
         seed_configs: list[Config] = [self.config_spec.default_config()]
         seen_config_keys = {self._config_key(seed_configs[0])}
@@ -399,12 +625,25 @@ class LLMGuidedSearch(PopulationBasedSearch):
         return seed_configs
 
     def _dedupe_new_configs(
-        self, configs: list[Config], seen_config_keys: set[str]
+        self,
+        configs: list[Config],
+        seen_config_keys: set[str],
+        *,
+        attempts_already_recorded: bool = False,
     ) -> list[Config]:
         """Filter out configs that have already been seen in earlier rounds."""
         # Drop configs that were already benchmarked or queued in prior rounds.
         new_configs: list[Config] = []
         for cfg in configs:
+            if (
+                self.candidate_attempt_budget.exhausted
+                and not attempts_already_recorded
+            ):
+                break
+            if not attempts_already_recorded and not self._admit_config_candidate(
+                cfg, AttemptCategory.LLM_PROPOSED
+            ):
+                continue
             key = self._config_key(cfg)
             if key in seen_config_keys:
                 continue
@@ -521,6 +760,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _update_early_stop_state(self, state: _SearchLoopState) -> bool:
         """Track weak-improvement rounds and decide whether to stop early."""
+        if self.settings.autotune_disable_trajectory_early_stop:
+            return False
         # Stop after repeated weak rounds so extra LLM calls do not just churn.
         current_best = self.best.perf
         if (
@@ -548,7 +789,9 @@ class LLMGuidedSearch(PopulationBasedSearch):
         """Run round 0 by overlapping the initial LLM request with seed benchmarking."""
         # Launch the first request before benchmarking because round 0 does not need
         # any prior search feedback to build its prompt.
+        seeding_started = time.perf_counter()
         seed_configs = self._build_seed_configs()
+        self._record_candidate_generation_time(time.perf_counter() - seeding_started)
         state.seen_config_keys.update(self._config_key(cfg) for cfg in seed_configs)
 
         self.log(
@@ -557,9 +800,16 @@ class LLMGuidedSearch(PopulationBasedSearch):
             f"{max(0, len(seed_configs) - 1)} random)"
         )
 
-        # Failure to dispatch the initial LLM request is fatal (see
+        # Do not generate proposals after the frozen candidate budget is spent.
+        # Failure to dispatch an eligible request remains fatal (see
         # _wait_for_initial_llm_response for the rationale).
-        llm_future = self._call_llm_async(self._build_llm_messages())
+        if self.candidate_attempt_budget.exhausted:
+            llm_future = None
+        else:
+            prompt_started = time.perf_counter()
+            messages = self._build_llm_messages()
+            self._record_candidate_generation_time(time.perf_counter() - prompt_started)
+            llm_future = self._call_llm_async(messages)
 
         if seed_configs:
             self._benchmark_and_ingest(seed_configs, generation=0, desc="Round 0 seed")
@@ -571,7 +821,11 @@ class LLMGuidedSearch(PopulationBasedSearch):
             self._messages.append({"role": "assistant", "content": llm_response})
             llm_configs = self._parse_configs(llm_response)
 
-        round0_configs = self._dedupe_new_configs(llm_configs, state.seen_config_keys)
+        round0_configs = self._dedupe_new_configs(
+            llm_configs,
+            state.seen_config_keys,
+            attempts_already_recorded=(self.candidate_attempt_budget.limit is not None),
+        )
         if round0_configs:
             self.log(
                 f"Round 0: benchmarking {len(round0_configs)} new configs from the LLM"
@@ -586,9 +840,12 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _run_refinement_round(self, round_num: int, state: _SearchLoopState) -> bool:
         """Run one post-seed refinement round and report whether search should stop."""
         # Build the next prompt from the stabilized prior round, then benchmark new configs.
+        prompt_started = time.perf_counter()
         prompt = self._build_refinement_prompt(round_num)
+        messages = self._build_llm_messages(prompt)
+        self._record_candidate_generation_time(time.perf_counter() - prompt_started)
         # LLM failures are intentionally fatal (see _wait_for_initial_llm_response).
-        llm_response = self._call_llm(self._build_llm_messages(prompt))
+        llm_response = self._call_llm(messages)
 
         self._messages.append({"role": "user", "content": prompt})
         self._messages.append({"role": "assistant", "content": llm_response})
@@ -596,6 +853,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         new_configs = self._dedupe_new_configs(
             self._parse_configs(llm_response),
             state.seen_config_keys,
+            attempts_already_recorded=(self.candidate_attempt_budget.limit is not None),
         )
         if not new_configs:
             self.log(f"Round {round_num}: no new unique configs from LLM, stopping")
@@ -629,7 +887,10 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _autotune_inner(self) -> Config:
         """Run round 0 once, then iterate the synchronized refinement rounds."""
+        self._prepare_best_available_initial_evidence()
+        prompt_started = time.perf_counter()
         self._initialize_prompt_state()
+        self._record_candidate_generation_time(time.perf_counter() - prompt_started)
         state = _SearchLoopState(seen_config_keys=set())
         self._run_initial_round(state)
 
@@ -641,6 +902,70 @@ class LLMGuidedSearch(PopulationBasedSearch):
         best = self.run_finishing_phase(best, self.finishing_rounds)
         return best.config
 
+    def aggregate_token_usage(self) -> dict[str, int | None]:
+        """Sum provider-reported token usage across every request this search (§6.3).
+
+        Reports the total tokens to readiness plus the request count; a field is
+        ``None`` when no request reported it (never a tokenizer estimate). The
+        per-request breakdown lives in ``self._token_usage``.
+        """
+
+        def _sum(field: str) -> int | None:
+            if len(self._token_usage) != self._provider_requests:
+                return None
+            values = [getattr(usage, field) for usage in self._token_usage]
+            if not values or any(value is None for value in values):
+                return None
+            return sum(value for value in values if value is not None)
+
+        return {
+            "requests": self._provider_requests,
+            "input_tokens": _sum("input_tokens"),
+            "cached_input_tokens": _sum("cached_input_tokens"),
+            "output_tokens": _sum("output_tokens"),
+            "reasoning_tokens": _sum("reasoning_tokens"),
+        }
+
+    @property
+    def provider_request_metadata(self) -> tuple[_ProviderMetadata, ...]:
+        """Return the non-secret metadata retained for successful requests."""
+        return tuple(self._provider_metadata)
+
+    @property
+    def provider_replay_identities(self) -> tuple[tuple[str, str | None], ...]:
+        """Return ordered canonical request/response identities for this attempt."""
+        return tuple(self._provider_replay_identities)
+
+    def aggregate_provider_identity(self) -> dict[str, str | None]:
+        """Project per-request identities into one deterministic attempt identity."""
+
+        def aggregate(field: str) -> str | None:
+            values = [getattr(item, field) for item in self._provider_metadata]
+            if not values:
+                return None
+            if len(values) == 1:
+                return values[0]
+            canonical = json.dumps(
+                values, ensure_ascii=True, separators=(",", ":")
+            ).encode("utf-8")
+            return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+        cache_states = [item.cache_state for item in self._provider_metadata]
+        cache_state = (
+            None
+            if not cache_states
+            else "unknown"
+            if "unknown" in cache_states
+            else "miss"
+            if "miss" in cache_states
+            else "hit"
+        )
+        return {
+            "request_id": aggregate("request_id"),
+            "response_id": aggregate("response_id"),
+            "cache_state": cache_state,
+        }
+
     def _log_search_stats(self) -> None:
         """Report how much time went to LLM calls and benchmarking."""
         if not self._llm_call_times:
@@ -651,7 +976,11 @@ class LLMGuidedSearch(PopulationBasedSearch):
             if self._benchmark_times
             else 0.0
         )
+        tokens = self.aggregate_token_usage()
         self.log(
             f"LLM search stats: avg LLM call={avg_llm:.1f}s, "
-            f"avg benchmark={avg_bench:.1f}s"
+            f"avg benchmark={avg_bench:.1f}s, "
+            f"requests={tokens['requests']}, "
+            f"total input/output tokens={tokens['input_tokens']}/"
+            f"{tokens['output_tokens']}"
         )

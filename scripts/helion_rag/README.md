@@ -4,7 +4,9 @@ Helion RAG builds a searchable corpus of Helion CI autotuning artifacts.
 
 You can use the `setup-helion-rag.sh` script to configure the tools in an existing Helion checkout. It validates the Python interpreter and Manifold access, installs the package in editable mode, fetches the corpus for the selected hardware, and builds a local FAISS index.
 
-You don't need any LLM API keys for this. The "RAG" here is purely retrieval-based and searches over CI benchmark artifacts. Lookup results are standalone output: this package does not modify Helion or automatically apply retrieved configurations during execution.
+You don't need any LLM API keys to build or query the corpus. The "RAG" here is purely retrieval-based and searches over CI benchmark artifacts. The `helion_rag` CLI is standalone: `lookup` prints results and never applies a retrieved configuration for you.
+
+Helion itself can consume this corpus during autotuning, but only when you opt in with `HELION_RAG_ENABLED=1`; that path lives in `helion/autotuner/rag/`, not here. The `experiment/` and `stats/` subpackages drive the four-arm study that measures whether it is worth it — see [`docs/rag_autotuning_experiment.md`](../../docs/rag_autotuning_experiment.md).
 
 ## Package layout
 
@@ -18,7 +20,10 @@ helion_rag/
   config.py         # Parses HELION_RAG_* environment variables into a Config dataclass
   corpus.py         # Handles benchmark zips: parsing meta.jsonl, workload hashing, tier-0 checks, and deduplication
   index.py          # FAISS index generation, exact mapping, and similarity search
+  safe_index.py     # Signature-checked index loading that fails closed on tampering
+  signing.py        # Ed25519 signing and verification of published index generations
   lookup.py         # The core lookup logic (exact match → similar match → miss)
+  rerank.py         # Shape-aware reranking of the semantic candidate pool
   ingest.py         # Writes autotune logs back to the corpus idempotently
   upload.py         # Uploads zip runs to Manifold atomically
   manifest.py       # Validates and loads manifest.json
@@ -26,6 +31,24 @@ helion_rag/
   models.py         # Dataclasses for PerfStats, Ref, and ExactEntry
   setup_helpers.py  # CLI helpers for the bash setup script (validating, resolving families, checking artifacts, etc.)
   _util.py          # Shared constants and logging helpers
+  experiment/       # Four-arm head-to-head harness (see below)
+    head_to_head.py         # Arm table, frozen controls, and the study manifest
+    head_to_head_worker.py  # Runs one (workload, arm, repetition) unit in isolation
+    scheduler.py            # Balanced Latin-square execution order
+    events.py               # The canonical instrumentation event every arm emits
+    workloads/              # Registry of benchmarkable kernels; add a file to add a shape
+  stats/            # Paired statistics for the study
+    paired.py               # Wilcoxon, rank-biserial, wins/ties/losses, bootstrap ratio CIs
+    gates.py                # Holm multiplicity control across the contrast family
+```
+
+Top-level scripts, all run from the repository root with `PYTHONPATH=scripts/helion_rag`:
+
+```text
+run_head_to_head_campaign.py  # Resumable campaign driver
+analyze_head_to_head.py       # Tables, statistics, and the gnuplot figure pack
+plot_narrative_figures.py     # Optional matplotlib figures (needs the `figures` extra)
+results/                      # Checked-in results from the published campaign
 ```
 
 ## Setup
@@ -128,26 +151,41 @@ If you need to add a new family, `setup_helpers.publish_manifest()` will safely 
 
 ## Tests
 
-The test suite covers the standalone corpus, index, lookup, ingest, upload, manifest, and hardware-resolution paths:
+The test suite covers the standalone corpus, index, lookup, ingest, upload, manifest, and hardware-resolution paths, plus the four-arm harness and its analysis:
 
 ```text
 scripts/helion_rag/tests/
   __init__.py                 # Package marker for relative imports
   _fixtures.py                # Shared setup imported via inspect to avoid duplication
   test_corpus_ingest_upload.py   # Covers extraction (incl. the CLI path), idempotent ingest, atomic uploads
+  test_corpus_extended_schema.py # Extended-vs-historical record schema and tier-0 eligibility
   test_index_generation.py       # Single-writer publication and interrupted-build recovery
+  test_safe_index.py             # Fail-closed loading of a tampered index
+  test_signing.py                # Ed25519 signing and verification
+  test_rollback.py               # Republishing last-good content as a newer generation
   test_lookup.py                 # Tier-0 exact and Tier-2 miss over an on-disk bundle
+  test_rerank.py                 # Shape-aware reranking of the candidate pool
   test_integration.py            # Tier-1 lookup over a real FAISS index
   test_manifest_hardware.py      # Manifest validation and hardware family resolution (pure helpers)
+  test_setup_environment.py      # env.sh generation from the setup helpers
   test_util.py                   # Similarity-threshold input contract
   test_workload_key.py           # Workload key parity, deduplication, and AST checks
+  test_experiment_events.py      # The canonical instrumentation event schema
+  test_experiment_scheduler.py   # Latin-square balance
+  test_head_to_head.py           # Arm table, frozen controls, manifest hashing
+  test_head_to_head_campaign.py  # Driver resume, locking, and atomic result recording
+  test_head_to_head_analysis.py  # Tables, estimands, and figures on a synthetic campaign
+  test_plot_narrative_figures.py # Optional matplotlib figures
+  test_stats_gates.py            # Holm multiplicity control
 ```
 
 You can run the suite like this:
 ```bash
-cd scripts/helion_rag
-../../.rag-venv/bin/pytest tests -q
+PYTHONPATH=scripts/helion_rag .venv/bin/python -m pytest scripts/helion_rag/tests -q
 ```
+
+The Helion-side RAG adapter is tested separately under the repository's own suite
+(`test/test_rag_*.py`).
 
 ## Prerequisites
 

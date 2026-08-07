@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+import fcntl
+import hashlib
 import json
 import os
+from pathlib import Path
 import re
+import socket
 import ssl
 from typing import TYPE_CHECKING
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+
+from ... import exc
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -245,14 +252,289 @@ def extract_openai_response_text(response: dict[str, object]) -> str:
             texts.extend(_extract_text_content_items(item.get("content")))
         if texts:
             return "".join(texts)
-    raise RuntimeError(f"Unexpected OpenAI responses payload: {response}")
+    raise exc.InvalidResponseSchema(f"Unexpected OpenAI responses payload: {response}")
 
 
 def extract_anthropic_text(response: dict[str, object]) -> str:
     """Extract concatenated text from an Anthropic Messages payload."""
     if texts := _extract_text_content_items(response.get("content")):
         return "".join(texts)
-    raise RuntimeError(f"Unexpected Anthropic payload: {response}")
+    raise exc.InvalidResponseSchema(f"Unexpected Anthropic payload: {response}")
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Provider-reported token counts (§4, §6.3); ``None`` marks a missing field.
+
+    Missing fields are never substituted with a tokenizer estimate in the primary
+    token claim.
+    """
+
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    """One provider response with non-secret replay and cache metadata."""
+
+    text: str
+    usage: TokenUsage
+    request_id: str | None = None
+    response_id: str | None = None
+    cache_state: str = "unknown"
+
+
+@dataclass(frozen=True)
+class ProviderMetadata:
+    """Non-secret identity and provider-reported cache state for one request."""
+
+    request_id: str | None
+    response_id: str | None
+    cache_state: str
+
+
+@dataclass(frozen=True)
+class ProviderReplayRecord:
+    """Credential-free provider request and response data for frozen replay."""
+
+    provider: str
+    model: str
+    api_base: str | None
+    messages: tuple[dict[str, str], ...]
+    max_output_tokens: int
+    request_timeout_s: float
+    effort_level: str | None
+    fast_mode: bool
+    request_id: str
+    response_id: str | None
+    cache_state: str | None
+    response_text: str | None
+    usage: TokenUsage
+    error_type: str | None
+
+
+def provider_replay_request_id(
+    provider: str,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+    request_timeout_s: float,
+    effort_level: str | None,
+    fast_mode: bool,
+    api_base: str | None = None,
+    extra_headers_sha256: str | None = None,
+) -> str:
+    """Return the stable logical identity used when a provider returns no ID."""
+    return _canonical_sha256(
+        {
+            "provider": provider,
+            "model": model,
+            "api_base": api_base,
+            "messages": messages,
+            "max_output_tokens": max_output_tokens,
+            "request_timeout_s": request_timeout_s,
+            "effort_level": effort_level,
+            "fast_mode": fast_mode,
+            "extra_headers_sha256": extra_headers_sha256,
+        }
+    )
+
+
+def provider_replay_response_hash(response_text: str) -> str:
+    """Return the stable content identity for a successful replay response."""
+    return _canonical_sha256({"response_text": response_text})
+
+
+def provider_replay_extra_headers_hash() -> str | None:
+    """Return the credential-free identity of configured extra headers."""
+    extra_headers = _extra_headers()
+    if not extra_headers:
+        return None
+    return hashlib.sha256(
+        json.dumps(extra_headers, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def append_provider_replay_record(record: ProviderReplayRecord) -> Path | None:
+    """Append one canonical provider replay row when a log path is configured."""
+    raw_path = os.environ.get("HELION_RAG_PROVIDER_REPLAY_LOG")
+    if raw_path is None:
+        return None
+    path = Path(raw_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    extra_headers_sha256 = provider_replay_extra_headers_hash()
+    request_hash = provider_replay_request_id(
+        record.provider,
+        model=record.model,
+        api_base=record.api_base,
+        messages=list(record.messages),
+        max_output_tokens=record.max_output_tokens,
+        request_timeout_s=record.request_timeout_s,
+        effort_level=record.effort_level,
+        fast_mode=record.fast_mode,
+        extra_headers_sha256=extra_headers_sha256,
+    )
+    payload = {
+        "provider": record.provider,
+        "model": record.model,
+        "api_base": record.api_base,
+        "extra_headers_sha256": extra_headers_sha256,
+        "messages": list(record.messages),
+        "max_output_tokens": record.max_output_tokens,
+        "request_timeout_s": record.request_timeout_s,
+        "effort_level": record.effort_level,
+        "fast_mode": record.fast_mode,
+        "request_id": record.request_id,
+        "request_hash": request_hash,
+        "response_id": record.response_id,
+        "response_hash": (
+            provider_replay_response_hash(record.response_text)
+            if record.response_text is not None
+            else None
+        ),
+        "cache_state": record.cache_state,
+        "response_text": record.response_text,
+        "usage": {
+            "input_tokens": record.usage.input_tokens,
+            "cached_input_tokens": record.usage.cached_input_tokens,
+            "output_tokens": record.usage.output_tokens,
+            "reasoning_tokens": record.usage.reasoning_tokens,
+        },
+        "error_type": record.error_type,
+    }
+    line = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = memoryview(line + b"\n")
+        while data:
+            written = os.write(fd, data)
+            if written == 0:
+                raise OSError("provider replay log write made no progress")
+            data = data[written:]
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    return path
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def extract_openai_usage(response: dict[str, object]) -> TokenUsage:
+    """Read provider-reported usage from an OpenAI Responses payload."""
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return TokenUsage()
+    input_details = usage.get("input_tokens_details")
+    output_details = usage.get("output_tokens_details")
+    return TokenUsage(
+        input_tokens=_int_or_none(usage.get("input_tokens")),
+        cached_input_tokens=_int_or_none(
+            input_details.get("cached_tokens")
+            if isinstance(input_details, dict)
+            else None
+        ),
+        output_tokens=_int_or_none(usage.get("output_tokens")),
+        reasoning_tokens=_int_or_none(
+            output_details.get("reasoning_tokens")
+            if isinstance(output_details, dict)
+            else None
+        ),
+    )
+
+
+def extract_anthropic_usage(response: dict[str, object]) -> TokenUsage:
+    """Read provider-reported usage from an Anthropic Messages payload.
+
+    Anthropic reports cached input as ``cache_read_input_tokens`` and folds
+    thinking into ``output_tokens`` (no separate reasoning field).
+    """
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return TokenUsage()
+    return TokenUsage(
+        input_tokens=_int_or_none(usage.get("input_tokens")),
+        cached_input_tokens=_int_or_none(usage.get("cache_read_input_tokens")),
+        output_tokens=_int_or_none(usage.get("output_tokens")),
+        reasoning_tokens=None,
+    )
+
+
+def _canonical_sha256(payload: object) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _provider_metadata(
+    request_payload: dict[str, Any],
+    response: dict[str, object],
+    usage: TokenUsage,
+) -> ProviderMetadata:
+    provider_request_id = response.get("request_id")
+    provider_response_id = response.get("id", response.get("response_id"))
+    cached_input_tokens = usage.cached_input_tokens
+    cache_state = (
+        "hit"
+        if cached_input_tokens is not None and cached_input_tokens > 0
+        else "miss"
+        if cached_input_tokens == 0
+        else "unknown"
+    )
+    return ProviderMetadata(
+        request_id=(
+            provider_request_id
+            if isinstance(provider_request_id, str) and provider_request_id
+            else _canonical_sha256(request_payload)
+        ),
+        response_id=(
+            provider_response_id
+            if isinstance(provider_response_id, str) and provider_response_id
+            else _canonical_sha256(response)
+        ),
+        cache_state=cache_state,
+    )
+
+
+def _identity_request_payload(
+    provider: str,
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+    effort_level: str | None,
+    fast_mode: bool,
+) -> dict[str, Any]:
+    if provider in {"bedrock", "vertex"}:
+        payload = _anthropic_payload(
+            model, messages, max_output_tokens, effort_level, fast_mode
+        )
+        # Keep the logical model in the identity even though these transports put
+        # it in the API call rather than the wire body.
+        payload["anthropic_version"] = (
+            _BEDROCK_ANTHROPIC_VERSION
+            if provider == "bedrock"
+            else _VERTEX_ANTHROPIC_VERSION
+        )
+        return payload
+    return _build_provider_payload(
+        provider,
+        model=model,
+        messages=messages,
+        max_output_tokens=max_output_tokens,
+        effort_level=effort_level,
+        fast_mode=fast_mode,
+    )
 
 
 def _openai_payload(
@@ -365,6 +647,7 @@ class _ProviderConfig:
     ]
     build_headers: Callable[[str, bool], dict[str, str]]
     extract_text: Callable[[dict[str, object]], str]
+    extract_usage: Callable[[dict[str, object]], TokenUsage]
 
 
 _PROVIDER_CONFIGS = {
@@ -380,6 +663,7 @@ _PROVIDER_CONFIGS = {
         build_payload=_openai_payload,
         build_headers=_openai_headers,
         extract_text=extract_openai_response_text,
+        extract_usage=extract_openai_usage,
     ),
     "anthropic": _ProviderConfig(
         endpoint="messages",
@@ -393,6 +677,7 @@ _PROVIDER_CONFIGS = {
         build_payload=_anthropic_payload,
         build_headers=_anthropic_headers,
         extract_text=extract_anthropic_text,
+        extract_usage=extract_anthropic_usage,
     ),
 }
 
@@ -437,7 +722,7 @@ def _resolve_api_key(provider: str, api_key: str | None) -> str:
     config = _provider_config(provider)
     if resolved_api_key := _first_set_env(*config.api_key_env_names):
         return resolved_api_key
-    raise RuntimeError(config.missing_api_key_error)
+    raise exc.ProviderAuthError(config.missing_api_key_error)
 
 
 def _resolve_v1_endpoint(api_base: str, endpoint: str) -> str:
@@ -551,6 +836,93 @@ def _extra_headers() -> dict[str, str]:
     return headers
 
 
+def _http_status_error(code: int, url: str, body: str) -> exc.BaseError:
+    """Map an HTTP status to a typed transport exception (§3.1).
+
+    401/403 and other 4xx (except 408/429) are auth/config/programming errors that
+    propagate; 408/429/5xx are catchable provider failures eligible for fallback.
+    """
+    detail = f"HTTP {code} from {url}: {body}"
+    if code in (401, 403):
+        return exc.ProviderAuthError(detail)
+    if code == 408:
+        return exc.ProviderTimeout(detail)
+    if code == 429:
+        return exc.ProviderRateLimited(detail)
+    if 500 <= code < 600:
+        return exc.ProviderServerError(detail)
+    return exc.ProviderRequestError(detail)
+
+
+def _bedrock_error(error: Exception, model_id: str) -> exc.BaseError | None:
+    """Map botocore failures to the same catchability contract as HTTP."""
+    detail = f"Bedrock invoke_model failed for {model_id!r}: {error}"
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return exc.ProviderTimeout(detail)
+
+    response = getattr(error, "response", None)
+    error_payload = response.get("Error") if isinstance(response, Mapping) else None
+    metadata = (
+        response.get("ResponseMetadata") if isinstance(response, Mapping) else None
+    )
+    code = error_payload.get("Code") if isinstance(error_payload, Mapping) else None
+    status = metadata.get("HTTPStatusCode") if isinstance(metadata, Mapping) else None
+    error_name = type(error).__name__
+    if (
+        status in (401, 403)
+        or code
+        in {
+            "AccessDeniedException",
+            "IncompleteSignature",
+            "InvalidClientTokenId",
+            "NotAuthorizedException",
+            "UnrecognizedClientException",
+        }
+        or error_name
+        in {
+            "CredentialRetrievalError",
+            "NoCredentialsError",
+            "PartialCredentialsError",
+            "TokenRetrievalError",
+            "UnauthorizedSSOTokenError",
+        }
+    ):
+        return exc.ProviderAuthError(detail)
+    if error_name in {
+        "ConfigNotFound",
+        "ConfigParseError",
+        "InvalidConfigError",
+        "NoRegionError",
+        "ProfileNotFound",
+    }:
+        return exc.ProviderRequestError(detail)
+    if status == 408:
+        return exc.ProviderTimeout(detail)
+    if status == 429 or code in {
+        "LimitExceededException",
+        "ServiceQuotaExceededException",
+        "ThrottlingException",
+        "TooManyRequestsException",
+    }:
+        return exc.ProviderRateLimited(detail)
+    if isinstance(status, int) and 500 <= status < 600:
+        return exc.ProviderServerError(detail)
+    if isinstance(status, int) and 400 <= status < 500:
+        return exc.ProviderRequestError(detail)
+    if isinstance(error, OSError) or error_name in {
+        "ConnectionClosedError",
+        "ConnectTimeoutError",
+        "EndpointConnectionError",
+        "HTTPClientError",
+        "ProxyConnectionError",
+        "ReadTimeoutError",
+        "ResponseStreamingError",
+        "SSLError",
+    }:
+        return exc.ProviderTransportError(detail)
+    return None
+
+
 def _post_json(
     url: str,
     payload: dict[str, Any],
@@ -558,7 +930,7 @@ def _post_json(
     *,
     request_timeout_s: float,
 ) -> dict[str, object]:
-    """Send one JSON POST and normalize HTTP and payload errors."""
+    """Send one JSON POST and normalize HTTP and payload errors into typed exc."""
     request = urllib_request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
@@ -572,14 +944,23 @@ def _post_json(
             ssl_context=_build_ssl_context(),
         )
     except urllib_error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} from {url}: {body}") from e
+        detail = e.read().decode("utf-8", errors="replace")
+        raise _http_status_error(e.code, url, detail) from e
+    except TimeoutError as e:
+        # A read-phase timeout surfaces raw (it is not a URLError subclass).
+        raise exc.ProviderTimeout(f"Request to {url} timed out") from e
     except urllib_error.URLError as e:
-        raise RuntimeError(f"Request to {url} failed: {e.reason}") from e
+        if isinstance(e.reason, (TimeoutError, socket.timeout)):
+            raise exc.ProviderTimeout(f"Request to {url} timed out: {e.reason}") from e
+        raise exc.ProviderTransportError(f"Request to {url} failed: {e.reason}") from e
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise exc.InvalidResponseSchema(f"Malformed JSON payload from {url}") from e
 
     if isinstance(body, dict):
         return body
-    raise RuntimeError(f"Unexpected JSON payload from {url}: {type(body).__name__}")
+    raise exc.InvalidResponseSchema(
+        f"Unexpected JSON payload from {url}: {type(body).__name__}"
+    )
 
 
 # Anthropic-on-Bedrock requires this version string in the request body and
@@ -606,7 +987,7 @@ def _call_bedrock(
     request_timeout_s: float,
     effort_level: str | None,
     fast_mode: bool,
-) -> str:
+) -> dict[str, object]:
     """Invoke Anthropic-on-Bedrock via boto3, reusing the Anthropic codecs.
 
     Auth is handled by boto3's default credential chain (IAM role, env creds,
@@ -624,7 +1005,7 @@ def _call_bedrock(
         import boto3  # pyrefly: ignore [missing-import]
         import botocore.config  # pyrefly: ignore [missing-import]
     except ImportError as e:
-        raise RuntimeError(
+        raise exc.ProviderRequestError(
             "Bedrock provider requested but boto3 is not installed. "
             "Install it with `pip install boto3`."
         ) from e
@@ -640,26 +1021,44 @@ def _call_bedrock(
     model_id = payload.pop("model")
     payload["anthropic_version"] = _BEDROCK_ANTHROPIC_VERSION
 
-    client = boto3.client(
-        "bedrock-runtime",
-        region_name=_resolve_bedrock_region(api_base),
-        config=botocore.config.Config(
-            read_timeout=request_timeout_s,
-            connect_timeout=request_timeout_s,
-            retries={"max_attempts": 2, "mode": "standard"},
-        ),
-    )
+    try:
+        client = boto3.client(
+            "bedrock-runtime",
+            region_name=_resolve_bedrock_region(api_base),
+            config=botocore.config.Config(
+                read_timeout=request_timeout_s,
+                connect_timeout=request_timeout_s,
+                retries={"max_attempts": 2, "mode": "standard"},
+            ),
+        )
+    except Exception as e:  # botocore configuration and credential errors
+        if mapped := _bedrock_error(e, model_id):
+            raise mapped from e
+        raise
     try:
         response = client.invoke_model(modelId=model_id, body=json.dumps(payload))
     except Exception as e:  # botocore.exceptions.ClientError and friends
-        raise RuntimeError(f"Bedrock invoke_model failed for {model_id!r}: {e}") from e
+        if mapped := _bedrock_error(e, model_id):
+            raise mapped from e
+        raise
 
-    body = json.loads(response["body"].read())
+    try:
+        raw_body = response["body"].read()
+    except Exception as e:
+        if mapped := _bedrock_error(e, model_id):
+            raise mapped from e
+        raise
+    try:
+        body = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise exc.InvalidResponseSchema(
+            f"Malformed Bedrock payload from {model_id!r}"
+        ) from e
     if not isinstance(body, dict):
-        raise RuntimeError(
+        raise exc.InvalidResponseSchema(
             f"Unexpected Bedrock payload from {model_id!r}: {type(body).__name__}"
         )
-    return extract_anthropic_text(body)
+    return body
 
 
 # Anthropic-on-Vertex-AI names the model in the URL (not the body) and requires
@@ -678,7 +1077,7 @@ def _call_vertex(
     request_timeout_s: float,
     effort_level: str | None,
     fast_mode: bool,
-) -> str:
+) -> dict[str, object]:
     """Invoke Anthropic-on-Vertex-AI over HTTPS, reusing the Anthropic codecs.
 
     Vertex AI hosts Anthropic models under the publisher ``rawPredict`` endpoint.
@@ -708,7 +1107,7 @@ def _call_vertex(
         or os.environ.get("ANTHROPIC_VERTEX_BASE_URL")
     )
     if not base:
-        raise RuntimeError(
+        raise exc.ProviderRequestError(
             "Vertex provider requires the endpoint base URL via api_base, "
             "HELION_LLM_API_BASE, or ANTHROPIC_VERTEX_BASE_URL."
         )
@@ -716,7 +1115,7 @@ def _call_vertex(
         "ANTHROPIC_VERTEX_PROJECT_ID"
     )
     if not project:
-        raise RuntimeError(
+        raise exc.ProviderRequestError(
             "Vertex provider requires the project id via "
             "HELION_LLM_VERTEX_PROJECT or ANTHROPIC_VERTEX_PROJECT_ID."
         )
@@ -740,8 +1139,98 @@ def _call_vertex(
     key = api_key or os.environ.get("HELION_LLM_API_KEY")
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    response = _post_json(url, payload, headers, request_timeout_s=request_timeout_s)
-    return extract_anthropic_text(response)
+    return _post_json(url, payload, headers, request_timeout_s=request_timeout_s)
+
+
+def call_provider_with_usage(
+    provider: str,
+    *,
+    model: str,
+    api_base: str | None,
+    api_key: str | None,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+    request_timeout_s: float,
+    effort_level: str | None = None,
+    fast_mode: bool = False,
+) -> ProviderResult:
+    """Send one request; return extracted text plus provider-reported token usage.
+
+    Usage is populated only from fields present in the provider response; missing
+    fields remain empty rather than being estimated.
+    """
+    normalized_provider = normalize_provider(provider)
+    request_payload = _identity_request_payload(
+        normalized_provider,
+        model=model,
+        messages=messages,
+        max_output_tokens=max_output_tokens,
+        effort_level=effort_level,
+        fast_mode=fast_mode,
+    )
+    if normalized_provider == "vertex":
+        # Vertex names the model in the URL and authenticates by SSL/bearer, so
+        # it bypasses the api-key-required _ProviderConfig path (like Bedrock).
+        response = _call_vertex(
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+            request_timeout_s=request_timeout_s,
+            effort_level=effort_level,
+            fast_mode=fast_mode,
+        )
+        usage = extract_anthropic_usage(response)
+        metadata = _provider_metadata(request_payload, response, usage)
+        return ProviderResult(
+            text=extract_anthropic_text(response),
+            usage=usage,
+            request_id=metadata.request_id,
+            response_id=metadata.response_id,
+            cache_state=metadata.cache_state,
+        )
+    if normalized_provider == "bedrock":
+        # Bedrock uses boto3/SigV4 instead of an HTTP+api-key transport, so it
+        # bypasses the _ProviderConfig path entirely.
+        response = _call_bedrock(
+            model=model,
+            api_base=api_base,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+            request_timeout_s=request_timeout_s,
+            effort_level=effort_level,
+            fast_mode=fast_mode,
+        )
+        usage = extract_anthropic_usage(response)
+        metadata = _provider_metadata(request_payload, response, usage)
+        return ProviderResult(
+            text=extract_anthropic_text(response),
+            usage=usage,
+            request_id=metadata.request_id,
+            response_id=metadata.response_id,
+            cache_state=metadata.cache_state,
+        )
+    config = _provider_config(normalized_provider)
+    resolved_api_key = _resolve_api_key(normalized_provider, api_key)
+    response = _post_json(
+        _resolve_v1_endpoint(
+            _resolve_api_base(normalized_provider, api_base),
+            config.endpoint,
+        ),
+        request_payload,
+        _build_provider_headers(normalized_provider, resolved_api_key, fast_mode),
+        request_timeout_s=request_timeout_s,
+    )
+    usage = config.extract_usage(response)
+    metadata = _provider_metadata(request_payload, response, usage)
+    return ProviderResult(
+        text=config.extract_text(response),
+        usage=usage,
+        request_id=metadata.request_id,
+        response_id=metadata.response_id,
+        cache_state=metadata.cache_state,
+    )
 
 
 def call_provider(
@@ -757,48 +1246,14 @@ def call_provider(
     fast_mode: bool = False,
 ) -> str:
     """Resolve credentials, send one request, and extract text from the response."""
-    normalized_provider = normalize_provider(provider)
-    if normalized_provider == "vertex":
-        # Vertex names the model in the URL and authenticates by SSL/bearer, so
-        # it bypasses the api-key-required _ProviderConfig path (like Bedrock).
-        return _call_vertex(
-            model=model,
-            api_base=api_base,
-            api_key=api_key,
-            messages=messages,
-            max_output_tokens=max_output_tokens,
-            request_timeout_s=request_timeout_s,
-            effort_level=effort_level,
-            fast_mode=fast_mode,
-        )
-    if normalized_provider == "bedrock":
-        # Bedrock uses boto3/SigV4 instead of an HTTP+api-key transport, so it
-        # bypasses the _ProviderConfig path entirely.
-        return _call_bedrock(
-            model=model,
-            api_base=api_base,
-            messages=messages,
-            max_output_tokens=max_output_tokens,
-            request_timeout_s=request_timeout_s,
-            effort_level=effort_level,
-            fast_mode=fast_mode,
-        )
-    config = _provider_config(normalized_provider)
-    resolved_api_key = _resolve_api_key(normalized_provider, api_key)
-    response = _post_json(
-        _resolve_v1_endpoint(
-            _resolve_api_base(normalized_provider, api_base),
-            config.endpoint,
-        ),
-        _build_provider_payload(
-            normalized_provider,
-            model=model,
-            messages=messages,
-            max_output_tokens=max_output_tokens,
-            effort_level=effort_level,
-            fast_mode=fast_mode,
-        ),
-        _build_provider_headers(normalized_provider, resolved_api_key, fast_mode),
+    return call_provider_with_usage(
+        provider,
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        messages=messages,
+        max_output_tokens=max_output_tokens,
         request_timeout_s=request_timeout_s,
-    )
-    return config.extract_text(response)
+        effort_level=effort_level,
+        fast_mode=fast_mode,
+    ).text

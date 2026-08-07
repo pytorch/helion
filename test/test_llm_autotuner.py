@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion.autotuner.candidate_budget import AttemptBudget
+from helion.autotuner.candidate_budget import AttemptCategory
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
@@ -41,13 +45,17 @@ class TestLLMGuidedSearch(TestCase):
         from helion.autotuner.llm_search import LLMGuidedSearch
 
         search = LLMGuidedSearch.__new__(LLMGuidedSearch)
-        search.settings = Settings()
+        # The typed-raise contract below only applies when the RAG fallback
+        # boundary is installed to catch and classify; with it off the search
+        # degrades instead (see LLMGuidedSearch._parse_configs).
+        search.settings = Settings(autotune_rag_enabled=True)
         search.log = AutotuningLogger(search.settings)
         search._messages = []
         search._all_benchmark_results = []
         search._latest_results_by_config_key = {}
         search.configs_per_round = 15
         search._llm_call_times = []
+        search._provider_replay_identities = []
         search._benchmark_times = []
         search.model = "gpt-5.5"
         search.api_base = None
@@ -66,6 +74,16 @@ class TestLLMGuidedSearch(TestCase):
         for name, value in overrides.items():
             setattr(search, name, value)
         return search
+
+    def test_request_timeout_can_come_from_confirmation_environment(self):
+        from helion.autotuner.llm_search import guided_search_kwargs_from_config
+
+        with patch.dict(
+            os.environ, {"HELION_LLM_REQUEST_TIMEOUT_S": "47.5"}, clear=False
+        ):
+            kwargs = guided_search_kwargs_from_config(None, Settings())
+
+        self.assertEqual(kwargs["request_timeout_s"], 47.5)
 
     def test_parse_configs_accepts_common_llm_outputs(self):
         """LLM config parsing accepts the response shapes we expect to see in practice."""
@@ -91,7 +109,6 @@ class TestLLMGuidedSearch(TestCase):
                 json.dumps({"configs": [{"block_sizes": [64]}, {"block_sizes": [64]}]}),
                 1,
             ),
-            ("malformed", "not json at all", 0),
         ]
 
         for name, response, expected in cases:
@@ -99,6 +116,60 @@ class TestLLMGuidedSearch(TestCase):
                 search = self._make_mock_search()
                 configs = LLMGuidedSearch._parse_configs(search, response)
                 self.assertEqual(len(configs), expected)
+
+    def test_parse_configs_degrades_when_no_fallback_boundary_is_installed(self):
+        """Without RAG, an unusable round yields no configs instead of aborting.
+
+        The search keeps its incumbent and stops, which is what plain
+        LLMGuidedSearch users got before the typed exceptions were introduced.
+        """
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        search = self._make_mock_search(settings=Settings(autotune_rag_enabled=False))
+        search.log = AutotuningLogger(search.settings)
+        for response in ("not json at all", "{}", '{"configs": []}'):
+            with self.subTest(response=response):
+                self.assertEqual(LLMGuidedSearch._parse_configs(search, response), [])
+
+    def test_parse_configs_rejects_invalid_declared_schema(self):
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        for response in ("not json at all", "{}", '{"configs": {}}'):
+            with (
+                self.subTest(response=response),
+                self.assertRaises(exc.InvalidResponseSchema),
+            ):
+                LLMGuidedSearch._parse_configs(self._make_mock_search(), response)
+
+    def test_parse_configs_rejects_zero_unique_compatible_candidates(self):
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        for response in ('{"configs": []}', '{"configs": ["not-a-config"]}'):
+            with (
+                self.subTest(response=response),
+                self.assertRaises(exc.ZeroValidCandidates),
+            ):
+                LLMGuidedSearch._parse_configs(self._make_mock_search(), response)
+
+    def test_parse_configs_propagates_programming_invariants(self):
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        def broken_normalize(raw, _fix_invalid=False):
+            raise AssertionError("normalizer invariant")
+
+        search = self._make_mock_search(
+            config_spec=SimpleNamespace(
+                normalize=broken_normalize,
+                default_config=lambda: helion.Config(block_sizes=[64]),
+                _flat_fields=dict,
+            )
+        )
+        search._default_config_dict = dict(search.config_spec.default_config())
+
+        with self.assertRaisesRegex(AssertionError, "normalizer invariant"):
+            LLMGuidedSearch._parse_configs(
+                search, '{"configs": [{"block_sizes": [128]}]}'
+            )
 
     def test_parse_configs_rejects_shape_guesses(self):
         """LLM config parsing rejects guessed scalar/list shapes instead of repairing them."""
@@ -117,21 +188,311 @@ class TestLLMGuidedSearch(TestCase):
         )
         search._default_config_dict = dict(search.config_spec.default_config())
 
-        cases = [
-            ("non-power-of-two num_warps", '{"configs": [{"num_warps": 6}]}', 0),
-            ("scalar block_sizes", '{"configs": [{"block_sizes": 64}]}', 0),
-            ("list scalar field", '{"configs": [{"num_stages": [2]}]}', 0),
-            (
-                "well-shaped config",
-                '{"configs": [{"block_sizes": [64, 128], "num_warps": 8, "num_stages": 2}]}',
-                1,
+        invalid_cases = [
+            ("non-power-of-two num_warps", '{"configs": [{"num_warps": 6}]}'),
+            ("scalar block_sizes", '{"configs": [{"block_sizes": 64}]}'),
+            ("list scalar field", '{"configs": [{"num_stages": [2]}]}'),
+        ]
+
+        for name, response in invalid_cases:
+            with self.subTest(name=name), self.assertRaises(exc.ZeroValidCandidates):
+                LLMGuidedSearch._parse_configs(search, response)
+
+        configs = LLMGuidedSearch._parse_configs(
+            search,
+            '{"configs": [{"block_sizes": [64, 128], "num_warps": 8, "num_stages": 2}]}',
+        )
+        self.assertEqual(len(configs), 1)
+
+    def test_candidate_budget_counts_invalid_and_duplicate_llm_proposals(self):
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        class ConfigGeneration:
+            @staticmethod
+            def flatten(config):
+                return [config]
+
+            @staticmethod
+            def unflatten(flat):
+                return flat[0]
+
+        search = self._make_mock_search()
+        search._candidate_attempt_budget = AttemptBudget(3)
+        search._candidate_attempt_configs = set()
+        search._candidate_attempt_categories = {}
+        search._candidate_sources = {}
+        search._candidate_initial_population_open = False
+        search._precounted_initial_population_configs = set()
+        search.config_gen = ConfigGeneration()
+
+        configs = LLMGuidedSearch._parse_configs(
+            search,
+            '{"configs": ["invalid", {"x": 1}, {"x": 1}, {"x": 2}]}',
+        )
+
+        self.assertEqual([config["x"] for config in configs], [1])
+        self.assertEqual(
+            search.candidate_attempt_budget.by_category(),
+            {
+                AttemptCategory.INITIAL_POPULATION: 0,
+                AttemptCategory.INVALID: 1,
+                AttemptCategory.DUPLICATE: 1,
+                AttemptCategory.GENERATION: 0,
+                AttemptCategory.LLM_PROPOSED: 1,
+            },
+        )
+
+    def test_failed_provider_request_is_counted_without_token_estimates(self):
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        search = self._make_mock_search(provider="anthropic")
+        search._provider_requests = 0
+        search._token_usage = []
+        with (
+            patch(
+                "helion.autotuner.llm_search._call_provider_with_usage",
+                side_effect=RuntimeError("timeout"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            LLMGuidedSearch._call_llm(search, [{"role": "user", "content": "x"}])
+
+        self.assertEqual(
+            search.aggregate_token_usage(),
+            {
+                "requests": 1,
+                "input_tokens": None,
+                "cached_input_tokens": None,
+                "output_tokens": None,
+                "reasoning_tokens": None,
+            },
+        )
+
+    def test_multiple_requests_retain_metadata_and_expose_aggregate_identity(self):
+        from helion.autotuner.llm.transport import ProviderResult
+        from helion.autotuner.llm.transport import TokenUsage
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        search = self._make_mock_search(provider="anthropic")
+        search._provider_requests = 0
+        search._token_usage = []
+        search._provider_metadata = []
+        responses = [
+            ProviderResult(
+                text="first",
+                usage=TokenUsage(input_tokens=10, cached_input_tokens=5),
+                request_id="request-1",
+                response_id="response-1",
+                cache_state="hit",
+            ),
+            ProviderResult(
+                text="second",
+                usage=TokenUsage(input_tokens=12, cached_input_tokens=0),
+                request_id="request-2",
+                response_id="response-2",
+                cache_state="miss",
             ),
         ]
 
-        for name, response, expected in cases:
-            with self.subTest(name=name):
-                configs = LLMGuidedSearch._parse_configs(search, response)
-                self.assertEqual(len(configs), expected)
+        with patch(
+            "helion.autotuner.llm_search._call_provider_with_usage",
+            side_effect=responses,
+        ):
+            self.assertEqual(
+                LLMGuidedSearch._call_llm(
+                    search, [{"role": "user", "content": "first"}]
+                ),
+                "first",
+            )
+            self.assertEqual(
+                LLMGuidedSearch._call_llm(
+                    search, [{"role": "user", "content": "second"}]
+                ),
+                "second",
+            )
+
+        self.assertEqual(
+            [metadata.request_id for metadata in search.provider_request_metadata],
+            ["request-1", "request-2"],
+        )
+        identity = search.aggregate_provider_identity()
+        self.assertTrue(identity["request_id"].startswith("sha256:"))
+        self.assertTrue(identity["response_id"].startswith("sha256:"))
+        self.assertEqual(identity["cache_state"], "miss")
+        self.assertEqual(search.aggregate_token_usage()["input_tokens"], 22)
+
+    def test_provider_request_and_response_are_persisted_for_replay(self):
+        import json
+
+        from helion.autotuner.llm.transport import ProviderResult
+        from helion.autotuner.llm.transport import TokenUsage
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        search = self._make_mock_search(
+            provider="anthropic", api_base="https://provider.example"
+        )
+        search._provider_requests = 0
+        search._token_usage = []
+        search._provider_metadata = []
+        messages = [{"role": "user", "content": "replay this request"}]
+        result = ProviderResult(
+            text='{"configs": []}',
+            usage=TokenUsage(
+                input_tokens=11,
+                cached_input_tokens=2,
+                output_tokens=3,
+                reasoning_tokens=None,
+            ),
+            request_id="request-replay-1",
+            response_id="response-replay-1",
+            cache_state="hit",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            replay_log = Path(directory) / "provider-replay.jsonl"
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "HELION_RAG_PROVIDER_REPLAY_LOG": str(replay_log),
+                        "HELION_LLM_EXTRA_HEADERS": '{"X-Route":"frozen"}',
+                    },
+                ),
+                patch(
+                    "helion.autotuner.llm_search._call_provider_with_usage",
+                    return_value=result,
+                ),
+            ):
+                self.assertEqual(
+                    LLMGuidedSearch._call_llm(search, messages), result.text
+                )
+
+            records = [json.loads(line) for line in replay_log.read_text().splitlines()]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["provider"], "anthropic")
+        self.assertEqual(records[0]["model"], "gpt-5.5")
+        self.assertEqual(records[0]["api_base"], "https://provider.example")
+        self.assertEqual(
+            records[0]["extra_headers_sha256"],
+            "709957ca2029ef6645925a4984c1dcba8c00763433840e4bb56aec72d6e2f4ed",
+        )
+        self.assertEqual(records[0]["messages"], messages)
+        self.assertEqual(records[0]["response_text"], result.text)
+        self.assertEqual(records[0]["request_id"], "request-replay-1")
+        self.assertEqual(records[0]["response_id"], "response-replay-1")
+        self.assertTrue(records[0]["request_hash"].startswith("sha256:"))
+        self.assertTrue(records[0]["response_hash"].startswith("sha256:"))
+        self.assertEqual(
+            search.provider_replay_identities,
+            ((records[0]["request_hash"], records[0]["response_hash"]),),
+        )
+        self.assertEqual(records[0]["usage"]["input_tokens"], 11)
+        self.assertIsNone(records[0]["error_type"])
+
+    def test_failed_provider_request_is_persisted_for_replay(self):
+        import json
+
+        from helion.autotuner.llm_search import LLMGuidedSearch
+
+        search = self._make_mock_search(provider="anthropic")
+        search._provider_requests = 0
+        search._token_usage = []
+        search._provider_metadata = []
+        messages = [{"role": "user", "content": "request that times out"}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            replay_log = Path(directory) / "provider-replay.jsonl"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"HELION_RAG_PROVIDER_REPLAY_LOG": str(replay_log)},
+                ),
+                patch(
+                    "helion.autotuner.llm_search._call_provider_with_usage",
+                    side_effect=exc.ProviderTimeout("deadline"),
+                ),
+                self.assertRaises(exc.ProviderTimeout),
+            ):
+                LLMGuidedSearch._call_llm(search, messages)
+
+            records = [json.loads(line) for line in replay_log.read_text().splitlines()]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["messages"], messages)
+        self.assertTrue(records[0]["request_id"].startswith("sha256:"))
+        self.assertTrue(records[0]["request_hash"].startswith("sha256:"))
+        self.assertIsNone(records[0]["response_id"])
+        self.assertIsNone(records[0]["response_hash"])
+        self.assertIsNone(records[0]["response_text"])
+        self.assertEqual(records[0]["error_type"], "ProviderTimeout")
+        self.assertEqual(
+            search.provider_replay_identities,
+            ((records[0]["request_hash"], None),),
+        )
+
+    def test_aggregate_cache_state_is_unknown_when_any_request_lacks_evidence(self):
+        from helion.autotuner.llm.transport import ProviderMetadata
+
+        search = self._make_mock_search()
+        search._provider_metadata = [
+            ProviderMetadata("request-1", "response-1", "hit"),
+            ProviderMetadata("request-2", "response-2", "unknown"),
+        ]
+
+        self.assertEqual(search.aggregate_provider_identity()["cache_state"], "unknown")
+
+    def test_aggregate_tokens_are_unknown_when_any_request_omits_the_field(self):
+        from helion.autotuner.llm.transport import TokenUsage
+
+        search = self._make_mock_search()
+        search._provider_requests = 2
+        search._token_usage = [
+            TokenUsage(input_tokens=10, cached_input_tokens=3, output_tokens=4),
+            TokenUsage(input_tokens=None, cached_input_tokens=0, output_tokens=5),
+        ]
+
+        usage = search.aggregate_token_usage()
+        self.assertIsNone(usage["input_tokens"])
+        self.assertEqual(usage["cached_input_tokens"], 3)
+        self.assertEqual(usage["output_tokens"], 9)
+
+    def test_provider_duration_is_not_counted_as_candidate_generation(self):
+        from helion.autotuner.llm.transport import ProviderResult
+        from helion.autotuner.llm.transport import TokenUsage
+        from helion.autotuner.llm_search import LLMGuidedSearch
+        from helion.autotuner.rag.instrumentation import InstrumentationCollector
+        from helion.autotuner.rag.types import Phase
+
+        search = self._make_mock_search(provider="anthropic")
+        search._provider_requests = 0
+        search._token_usage = []
+        search._provider_metadata = []
+        collector = InstrumentationCollector()
+        search.set_attempt_instrumentation(collector)
+        result = ProviderResult(text="ok", usage=TokenUsage())
+
+        with (
+            patch(
+                "helion.autotuner.llm_search._call_provider_with_usage",
+                return_value=result,
+            ),
+            patch(
+                "helion.autotuner.llm_search.time.perf_counter",
+                side_effect=[10.0, 12.5],
+            ),
+        ):
+            self.assertEqual(
+                LLMGuidedSearch._call_llm(
+                    search, [{"role": "user", "content": "request"}]
+                ),
+                "ok",
+            )
+
+        self.assertEqual(
+            [snapshot.phase for snapshot in collector.phase_snapshots], [Phase.PROVIDER]
+        )
+        self.assertEqual(collector.phase_snapshots[0].phase_seconds, 2.5)
 
     def test_context_window_keeps_prefix_and_recent_history(self):
         """Prompt context always keeps the fixed prefix and trims only old round history."""
@@ -1370,6 +1731,20 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 )
                 llm_instances.append(self)
 
+            _provider_requests = 0
+
+            def adopt_shared_attempt_state(self, state) -> None:
+                pass
+
+            def aggregate_token_usage(self):
+                return {
+                    "requests": 0,
+                    "input_tokens": None,
+                    "cached_input_tokens": None,
+                    "output_tokens": None,
+                    "reasoning_tokens": None,
+                }
+
             def autotune(self, *, skip_cache=False):
                 self.skip_cache = skip_cache
                 return Config(num_warps=4)
@@ -1400,6 +1775,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 )
                 self.seed_configs = None
                 lfbo_instances.append(self)
+
+            def adopt_shared_attempt_state(self, state) -> None:
+                pass
 
             def set_best_available_seed_configs(self, configs):
                 self.seed_configs = list(configs)
@@ -1503,6 +1881,20 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 )
                 llm_instances.append(self)
 
+            _provider_requests = 0
+
+            def adopt_shared_attempt_state(self, state) -> None:
+                pass
+
+            def aggregate_token_usage(self):
+                return {
+                    "requests": 0,
+                    "input_tokens": None,
+                    "cached_input_tokens": None,
+                    "output_tokens": None,
+                    "reasoning_tokens": None,
+                }
+
             def autotune(self, *, skip_cache=False):
                 self.skip_cache = skip_cache
                 stage_order.append("llm")
@@ -1534,6 +1926,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 )
                 self.seed_configs = None
                 lfbo_instances.append(self)
+
+            def adopt_shared_attempt_state(self, state) -> None:
+                pass
 
             def set_best_available_seed_configs(self, configs):
                 self.seed_configs = list(configs)
@@ -1583,6 +1978,22 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
         self.assertEqual(search._autotune_metrics.num_generations, 7)
 
+    def test_config_gen_delegates_to_a_stage_search(self):
+        """The composed search borrows a stage's config_gen for event emission."""
+        from helion.autotuner import LLMSeededLFBOTreeSearch
+
+        search = LLMSeededLFBOTreeSearch.__new__(LLMSeededLFBOTreeSearch)
+        search._llm_stage_search = None
+        search._second_stage_search = None
+        with self.assertRaises(AttributeError):
+            _ = search.config_gen
+        second_gen = object()
+        search._second_stage_search = SimpleNamespace(config_gen=second_gen)
+        self.assertIs(search.config_gen, second_gen)
+        llm_gen = object()
+        search._llm_stage_search = SimpleNamespace(config_gen=llm_gen)
+        self.assertIs(search.config_gen, llm_gen)  # LLM stage preferred
+
     def test_zero_llm_rounds_falls_back_to_lfbo_strategy(self):
         """Disabling LLM rounds skips stage 1 and leaves the second-stage strategy unchanged."""
         from helion.autotuner import InitialPopulationStrategy
@@ -1608,6 +2019,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self.best_perf_so_far = 0.4
                 self._autotune_metrics = AutotuneMetrics(num_configs_tested=3)
                 lfbo_instances.append(self)
+
+            def adopt_shared_attempt_state(self, state) -> None:
+                pass
 
             def autotune(self):
                 return Config(num_warps=16)

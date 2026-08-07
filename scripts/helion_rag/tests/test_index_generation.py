@@ -32,3 +32,23 @@ def test_recover_orphaned_generation_and_temp_dir(tmp_path: Path) -> None:
 
     assert not stale_tmp.exists()
     assert (family_dir / "current").read_text(encoding="utf-8") == "000001\n"
+
+
+def test_completed_generations_are_retained_for_explicit_replay(tmp_path: Path) -> None:
+    family_dir = tmp_path / FAMILY
+    generations = family_dir / "generations"
+    for generation_id in ("000000", "000001", "000002", "000003"):
+        generation = generations / generation_id
+        generation.mkdir(parents=True)
+        (generation / "manifest.json").write_text("{}", encoding="utf-8")
+        (generation / "manifest.sig").write_bytes(b"signature")
+    (family_dir / "current").write_text("000003\n", encoding="utf-8")
+
+    index_mod._gc_old_generations(family_dir)
+
+    assert {path.name for path in generations.iterdir()} == {
+        "000000",
+        "000001",
+        "000002",
+        "000003",
+    }
