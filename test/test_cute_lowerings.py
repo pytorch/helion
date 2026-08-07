@@ -4744,13 +4744,14 @@ class TestCuteLowerings(unittest.TestCase):
         """Persistent tcgen05 lifts producer, exec, and epi work into
         role-local persistent loops. The TMA producer K-loop is now a
         top-level extracted role block, not an inline wrapper inside the
-        shared K-loop, and its predicate drops the inline
-        ``tcgen05_tma_warp`` gate because the enclosing role-local loop
-        already restricts execution to that warp. The MMA-exec role owns
-        AB consumer wait/release, UMMA issue, and acc producer state. The
-        epi role owns acc consumer wait/release and the TMA-store epilogue
-        with a role-local tile counter for the SMEM ring. The generated kernel
-        is also executed and checked against PyTorch."""
+        shared K-loop. Its predicate drops the inline ``tcgen05_tma_warp``
+        gate because the enclosing role-local loop already restricts execution
+        to that warp, and drops the current-tile full check because this
+        configuration is statically divisible. The MMA-exec role owns AB
+        consumer wait/release, UMMA issue, and acc producer state. The epi role
+        owns acc consumer wait/release and the TMA-store epilogue with a
+        role-local tile counter for the SMEM ring. The generated kernel is also
+        executed and checked against PyTorch."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -4833,13 +4834,10 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("pid_0 = virtual_pid % num_blocks_0", role_src)
                 self.assertIn("tile_offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
                 self.assertIn("for tile_offset_2 in range", role_src)
-                self.assertIn(
-                    "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
-                    role_src,
-                )
+                self.assertIn("if tcgen05_tma_next_full_tile:", role_src)
+                self.assertNotIn("tcgen05_tma_full_tile =", role_src)
                 self.assertNotIn(
-                    "tcgen05_tma_full_tile and tcgen05_tma_warp and "
-                    "tcgen05_tma_next_full_tile",
+                    "tcgen05_tma_warp and tcgen05_tma_next_full_tile",
                     role_src,
                 )
                 found_role_local_producer_loop = True
@@ -9554,6 +9552,22 @@ class TestCuteLowerings(unittest.TestCase):
                     )
                     found_role_local_tma = True
                 elif test_src == exec_role_predicate:
+                    outer_owner_k_loops = [
+                        loop
+                        for owner in ast.walk(node)
+                        if isinstance(owner, ast.If)
+                        and ast.unparse(owner.test) == _TCGEN05_CLUSTER_LEADER_PREDICATE
+                        for loop in ast.walk(owner)
+                        if isinstance(loop, ast.For)
+                        and "tcgen05_ab_pipeline.consumer_wait" in ast.unparse(loop)
+                        and "cute.gemm(" in ast.unparse(loop)
+                    ]
+                    self.assertEqual(
+                        len(outer_owner_k_loops),
+                        1,
+                        "Expected the complete MMA K loop to be nested under the "
+                        "CtaGroup.TWO leader gate. Generated role code:\n" + role_src,
+                    )
                     first_ab_peek_pos = role_src.index(
                         "tcgen05_ab_pipeline.consumer_try_wait"
                     )
@@ -19792,6 +19806,19 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertIsInstance(producer, ast.If)
         self.assertEqual(ast.unparse(producer.test), "tma_warp and next_full_tile")
 
+        current_tile_producer = _build_kloop_pipeline_producer_if(
+            args,
+            gate_tma_warp=False,
+            load_current_tile=True,
+        )
+        self.assertEqual(ast.unparse(current_tile_producer.test), "True")
+        current_tile_src = ast.unparse(
+            ast.Module(body=current_tile_producer.body, type_ignores=[])
+        )
+        self.assertIn("gA[None, tma_k_tile]", current_tile_src)
+        self.assertIn("gB[None, tma_k_tile]", current_tile_src)
+        self.assertNotIn("tma_k_tile +", current_tile_src)
+
         consumer = _build_kloop_pipeline_consumer_if(
             args,
             include_scalar_fallback=False,
@@ -19812,19 +19839,30 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             _build_kloop_pipeline_release_if(args)
 
         two_cta_args = self._make_args(is_two_cta=True, static_full_tiles=True)
-        for builder in (
-            _build_kloop_pipeline_producer_if,
-            _build_kloop_pipeline_consumer_if,
-            _build_kloop_pipeline_release_if,
-        ):
-            with (
-                self.subTest(builder=builder.__name__),
-                self.assertRaisesRegex(AssertionError, "one-CTA"),
-            ):
-                if builder is _build_kloop_pipeline_producer_if:
-                    builder(two_cta_args)
-                else:
-                    builder(two_cta_args, include_scalar_fallback=False)
+        two_cta_producer = _build_kloop_pipeline_producer_if(two_cta_args)
+        self.assertEqual(
+            ast.unparse(two_cta_producer.test), "tma_warp and next_full_tile"
+        )
+
+        two_cta_consumer = _build_kloop_pipeline_consumer_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(
+            ast.unparse(two_cta_consumer.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+
+        two_cta_release = _build_kloop_pipeline_release_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(ast.unparse(two_cta_release.test), "exec_active")
+        self.assertEqual(self._stmt_kinds(two_cta_release.body), ["If", "advance"])
+        release_gate = two_cta_release.body[0]
+        self.assertIsInstance(release_gate, ast.If)
+        self.assertEqual(
+            ast.unparse(release_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE
+        )
+        self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
 
     def test_non_pipeline_builders_reject_static_full_fast_path(self) -> None:
         args = self._make_args(static_full_tiles=True)
