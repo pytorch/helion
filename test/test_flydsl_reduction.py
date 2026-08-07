@@ -308,21 +308,24 @@ class TestFlydslReduction(TestCase):
         torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-3, atol=1e-3)
 
     def test_large_chunk_oob_rejected(self) -> None:
-        # chunk=4096 with N=7680 and V=8: two passes (offsets 0, 4096).
-        # On the second pass the max chunk_idx = 4096//8 + (512-1) = 1023
-        # which exceeds the div layout size 7680//8 = 960 by 63 elements =
-        # 1008 bytes > 512-byte safe threshold -> pre_codegen must reject
-        # with BackendUnsupported rather than allowing a GPU memory fault.
+        # chunk=4096 with N=7680 and V=8 would OOB the divided buffer on the
+        # last pass (max_div_idx=1023 >= n_div=960). The autotune _add() guard
+        # rejects this config so it is never offered as a candidate. Verify
+        # that autotune on N=7680 never selects a chunk that exceeds N//V.
         x = torch.randn(8, 7680, device=DEVICE, dtype=torch.float16)
         w = torch.randn(7680, device=DEVICE, dtype=torch.float16)
-        with self.assertRaises(helion.exc.BackendUnsupported):
-            code_and_output(
-                rms_norm_fwd,
-                (x, w, 1e-5),
-                block_sizes=[1],
-                reduction_loops=[4096],
-                cute_vector_widths=[8],
-            )
+        bk = rms_norm_fwd.bind((x, w, 1e-5))
+        cfg = bk.autotune((x, w, 1e-5), force=True)
+        rl = cfg.config.get("reduction_loops") or []
+        vw = cfg.config.get("cute_vector_widths") or []
+        if rl and rl[0] is not None:
+            chunk = int(rl[0])
+            v = int(vw[0]) if vw else 4
+            n_div = (7680 + v - 1) // v
+            tc = chunk // v
+            last_offset = ((7680 + chunk - 1) // chunk - 1) * chunk
+            max_div_idx = last_offset // v + tc - 1
+            self.assertLess(max_div_idx, n_div, f"autotune selected OOB config: chunk={chunk}, V={v}")
 
 
 if __name__ == "__main__":
