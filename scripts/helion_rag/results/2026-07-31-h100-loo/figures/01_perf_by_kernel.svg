@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1000 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Kernel latency: LFBO vs RAG+LFBO" font-family="system-ui,-apple-system,Segoe UI,sans-serif">
+<rect x="0" y="0" width="1000" height="380" rx="12" fill="#fcfcfb" stroke="#e6e5df"/>
+<line x1="54" x2="986" y1="286.0" y2="286.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="46" y="289.0" text-anchor="end" font-size="11" fill="#898781">0.020</text>
+<line x1="54" x2="986" y1="231.9" y2="231.9" stroke="#e1e0d9" stroke-width="1"/>
+<text x="46" y="234.9" text-anchor="end" font-size="11" fill="#898781">0.050</text>
+<line x1="54" x2="986" y1="190.9" y2="190.9" stroke="#e1e0d9" stroke-width="1"/>
+<text x="46" y="193.9" text-anchor="end" font-size="11" fill="#898781">0.100</text>
+<line x1="54" x2="986" y1="150.0" y2="150.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="46" y="153.0" text-anchor="end" font-size="11" fill="#898781">0.200</text>
+<line x1="54" x2="986" y1="95.9" y2="95.9" stroke="#e1e0d9" stroke-width="1"/>
+<text x="46" y="98.9" text-anchor="end" font-size="11" fill="#898781">0.500</text>
+<line x1="54" x2="986" y1="54.9" y2="54.9" stroke="#e1e0d9" stroke-width="1"/>
+<text x="46" y="57.9" text-anchor="end" font-size="11" fill="#898781">1.00</text>
+<line x1="54" x2="986" y1="14.0" y2="14.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="46" y="17.0" text-anchor="end" font-size="11" fill="#898781">2.00</text>
+<line x1="54" x2="986" y1="286" y2="286" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="54" y="12" font-size="11" fill="#898781">ms</text>
+<rect x="730" y="20" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="745" y="31" font-size="12" fill="#52514e">LFBO (baseline)</text>
+<rect x="840" y="20" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="855" y="31" font-size="12" fill="#52514e">RAG + LFBO</text>
+<path d="M64.1 286.0 L64.1 77.0 Q64.1 73.0 68.1 73.0 L80.1 73.0 Q84.1 73.0 84.1 77.0 L84.1 286.0 Z" fill="#2a78d6"/>
+<path d="M86.1 286.0 L86.1 84.7 Q86.1 80.7 90.1 80.7 L102.1 80.7 Q106.1 80.7 106.1 84.7 L106.1 286.0 Z" fill="#eb6834"/>
+<text x="85.1" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 85.1 298)">attention</text>
+<path d="M126.2 286.0 L126.2 70.2 Q126.2 66.2 130.2 66.2 L142.2 66.2 Q146.2 66.2 146.2 70.2 L146.2 286.0 Z" fill="#2a78d6"/>
+<path d="M148.2 286.0 L148.2 70.2 Q148.2 66.2 152.2 66.2 L164.2 66.2 Q168.2 66.2 168.2 70.2 L168.2 286.0 Z" fill="#eb6834"/>
+<text x="147.2" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 147.2 298)">cross_entropy</text>
+<path d="M188.3 286.0 L188.3 116.2 Q188.3 112.2 192.3 112.2 L204.3 112.2 Q208.3 112.2 208.3 116.2 L208.3 286.0 Z" fill="#2a78d6"/>
+<path d="M210.3 286.0 L210.3 118.4 Q210.3 114.4 214.3 114.4 L226.3 114.4 Q230.3 114.4 230.3 118.4 L230.3 286.0 Z" fill="#eb6834"/>
+<text x="209.3" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 209.3 298)">mamba2_chunk_scan</text>
+<path d="M250.5 286.0 L250.5 169.5 Q250.5 165.5 254.5 165.5 L266.5 165.5 Q270.5 165.5 270.5 169.5 L270.5 286.0 Z" fill="#2a78d6"/>
+<path d="M272.5 286.0 L272.5 167.8 Q272.5 163.8 276.5 163.8 L288.5 163.8 Q292.5 163.8 292.5 167.8 L292.5 286.0 Z" fill="#eb6834"/>
+<text x="271.5" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 271.5 298)">mamba2_chunk_state</text>
+<path d="M312.6 286.0 L312.6 74.4 Q312.6 70.4 316.6 70.4 L328.6 70.4 Q332.6 70.4 332.6 74.4 L332.6 286.0 Z" fill="#2a78d6"/>
+<path d="M334.6 286.0 L334.6 74.7 Q334.6 70.7 338.6 70.7 L350.6 70.7 Q354.6 70.7 354.6 74.7 L354.6 286.0 Z" fill="#eb6834"/>
+<text x="333.6" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 333.6 298)">jsd_forward</text>
+<path d="M374.7 286.0 L374.7 112.3 Q374.7 108.3 378.7 108.3 L390.7 108.3 Q394.7 108.3 394.7 112.3 L394.7 286.0 Z" fill="#2a78d6"/>
+<path d="M396.7 286.0 L396.7 112.4 Q396.7 108.4 400.7 108.4 L412.7 108.4 Q416.7 108.4 416.7 112.4 L416.7 286.0 Z" fill="#eb6834"/>
+<text x="395.7" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 395.7 298)">kl_div_forward</text>
+<path d="M436.9 286.0 L436.9 161.5 Q436.9 157.5 440.9 157.5 L452.9 157.5 Q456.9 157.5 456.9 161.5 L456.9 286.0 Z" fill="#2a78d6"/>
+<path d="M458.9 286.0 L458.9 160.8 Q458.9 156.8 462.9 156.8 L474.9 156.8 Q478.9 156.8 478.9 160.8 L478.9 286.0 Z" fill="#eb6834"/>
+<text x="457.9" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 457.9 298)">layer_norm_bwd</text>
+<path d="M499.0 286.0 L499.0 202.0 Q499.0 198.0 503.0 198.0 L515.0 198.0 Q519.0 198.0 519.0 202.0 L519.0 286.0 Z" fill="#2a78d6"/>
+<path d="M521.0 286.0 L521.0 200.8 Q521.0 196.8 525.0 196.8 L537.0 196.8 Q541.0 196.8 541.0 200.8 L541.0 286.0 Z" fill="#eb6834"/>
+<text x="520.0" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 520.0 298)">layer_norm_fwd</text>
+<path d="M561.1 286.0 L561.1 232.1 Q561.1 228.1 565.1 228.1 L577.1 228.1 Q581.1 228.1 581.1 232.1 L581.1 286.0 Z" fill="#2a78d6"/>
+<path d="M583.1 286.0 L583.1 233.1 Q583.1 229.1 587.1 229.1 L599.1 229.1 Q603.1 229.1 603.1 233.1 L603.1 286.0 Z" fill="#eb6834"/>
+<text x="582.1" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 582.1 298)">matmul</text>
+<path d="M623.3 286.0 L623.3 127.6 Q623.3 123.6 627.3 123.6 L639.3 123.6 Q643.3 123.6 643.3 127.6 L643.3 286.0 Z" fill="#2a78d6"/>
+<path d="M645.3 286.0 L645.3 127.2 Q645.3 123.2 649.3 123.2 L661.3 123.2 Q665.3 123.2 665.3 127.2 L665.3 286.0 Z" fill="#eb6834"/>
+<text x="644.3" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 644.3 298)">matmul_bf16_int4</text>
+<path d="M685.4 286.0 L685.4 173.5 Q685.4 169.5 689.4 169.5 L701.4 169.5 Q705.4 169.5 705.4 173.5 L705.4 286.0 Z" fill="#2a78d6"/>
+<path d="M707.4 286.0 L707.4 173.9 Q707.4 169.9 711.4 169.9 L723.4 169.9 Q727.4 169.9 727.4 173.9 L727.4 286.0 Z" fill="#eb6834"/>
+<text x="706.4" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 706.4 298)">rms_norm_bwd</text>
+<path d="M747.5 286.0 L747.5 230.0 Q747.5 226.0 751.5 226.0 L763.5 226.0 Q767.5 226.0 767.5 230.0 L767.5 286.0 Z" fill="#2a78d6"/>
+<path d="M769.5 286.0 L769.5 230.6 Q769.5 226.6 773.5 226.6 L785.5 226.6 Q789.5 226.6 789.5 230.6 L789.5 286.0 Z" fill="#eb6834"/>
+<text x="768.5" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 768.5 298)">rms_norm_fwd</text>
+<path d="M809.7 286.0 L809.7 215.8 Q809.7 211.8 813.7 211.8 L825.7 211.8 Q829.7 211.8 829.7 215.8 L829.7 286.0 Z" fill="#2a78d6"/>
+<path d="M831.7 286.0 L831.7 196.6 Q831.7 192.6 835.7 192.6 L847.7 192.6 Q851.7 192.6 851.7 196.6 L851.7 286.0 Z" fill="#eb6834"/>
+<text x="830.7" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 830.7 298)">rope_fwd*</text>
+<path d="M871.8 286.0 L871.8 256.9 Q871.8 252.9 875.8 252.9 L887.8 252.9 Q891.8 252.9 891.8 256.9 L891.8 286.0 Z" fill="#2a78d6"/>
+<path d="M893.8 286.0 L893.8 258.5 Q893.8 254.5 897.8 254.5 L909.8 254.5 Q913.8 254.5 913.8 258.5 L913.8 286.0 Z" fill="#eb6834"/>
+<text x="892.8" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 892.8 298)">softmax_two_pass</text>
+<path d="M933.9 286.0 L933.9 31.4 Q933.9 27.4 937.9 27.4 L949.9 27.4 Q953.9 27.4 953.9 31.4 L953.9 286.0 Z" fill="#2a78d6"/>
+<path d="M955.9 286.0 L955.9 31.4 Q955.9 27.4 959.9 27.4 L971.9 27.4 Q975.9 27.4 975.9 31.4 L975.9 286.0 Z" fill="#eb6834"/>
+<text x="954.9" y="298" text-anchor="end" font-size="11" fill="#52514e" transform="rotate(-38 954.9 298)">welford</text>
+</svg>

@@ -1,0 +1,64 @@
+{
+  "diagnostics": {
+    "heldout_shape_leakage_count": 0,
+    "mean_same_kernel_neighbor_rate": 1.0,
+    "oracle_workloads": 64,
+    "tier0_rag_cells": 0,
+    "tier1_coverage": 1.0
+  },
+  "margins": {
+    "cv_med": 0.0083,
+    "n_workloads": 61,
+    "perf_lfbo": 1.02,
+    "time": 1.05
+  },
+  "pairs": {
+    "rag_lfbo": {
+      "autotune_ratio": {
+        "ci95": [
+          0.8093851343305619,
+          1.000888076650106
+        ],
+        "estimate": 0.894843756654321,
+        "n": 44
+      },
+      "baseline": "lfbo",
+      "candidate": "rag_lfbo",
+      "completion": {
+        "candidate_completion": 0.9777777777777777,
+        "mcnemar_p": 0.75,
+        "n": 45,
+        "passes": true,
+        "table": {
+          "baseline_complete_candidate_failed": 1,
+          "baseline_failed_candidate_complete": 1,
+          "both_complete": 43,
+          "both_failed": 0
+        }
+      },
+      "delta_perf": 1.02,
+      "end_to_end_ratio": {
+        "ci95": [
+          0.8208280800925106,
+          1.0104661386567835
+        ],
+        "estimate": 0.9065772786983602,
+        "n": 44
+      },
+      "perf_ratio": {
+        "ci95": [
+          0.9635329897912659,
+          1.013131910729291
+        ],
+        "estimate": 0.9923298043919396,
+        "n": 44
+      },
+      "perf_tipping_points": {
+        "1.25": 0.9973963034010809,
+        "1.5": 1.0015377607765843,
+        "2.0": 1.0081074977462317
+      },
+      "verdict": "non_inferior_only"
+    }
+  }
+}

@@ -8,6 +8,8 @@ You don't need any LLM API keys to build or query the corpus. The "RAG" here is 
 
 Helion itself can consume this corpus during autotuning, but only when you opt in with `HELION_RAG_ENABLED=1`; that path lives in `helion/autotuner/rag/`, not here. The `experiment/` and `stats/` subpackages drive the four-arm study that measures whether it is worth it — see [`docs/rag_autotuning_experiment.md`](../../docs/rag_autotuning_experiment.md).
 
+The `loo_*` modules drive a second, separate study: whether retrieved configs are worth using as **seeds for the LFBO search** (no LLM involved) — see [`docs/rag_lfbo_warm_start_experiment.md`](../../docs/rag_lfbo_warm_start_experiment.md). It has its own seeding path in `patch.py` under `HELION_RAG_LOO_SEEDING=1`, which is mutually exclusive with `HELION_RAG_ENABLED`.
+
 ## Package layout
 
 Here's a quick tour of how the codebase is organized:
@@ -40,6 +42,14 @@ helion_rag/
   stats/            # Paired statistics for the study
     paired.py               # Wilcoxon, rank-biserial, wins/ties/losses, bootstrap ratio CIs
     gates.py                # Holm multiplicity control across the contrast family
+  patch.py          # Seeds LFBO from retrieved configs (HELION_RAG_LOO_SEEDING)
+  shape_distance.py # Log-scaled shape proximity used to rank neighbours
+  embedding_text.py # Index/query text composition, shared so both stay in sync
+  loo.py            # Leave-one-workload-out fold construction and corpus fingerprints
+  loo_inputs.py     # Builds real tensors and loads kernels for a workload
+  loo_experiment.py # The three-phase driver: preflight, select, eval
+  loo_run.py        # Runs one cell in a fresh subprocess and records its outcome
+  loo_report.py     # Cluster bootstrap, completion gate, and the verdict
 ```
 
 Top-level scripts, all run from the repository root with `PYTHONPATH=scripts/helion_rag`:
@@ -186,6 +196,22 @@ PYTHONPATH=scripts/helion_rag .venv/bin/python -m pytest scripts/helion_rag/test
 
 The Helion-side RAG adapter is tested separately under the repository's own suite
 (`test/test_rag_*.py`).
+
+## Leave-one-workload-out LFBO study
+
+Measures whether warm-starting `LFBOTreeSearch` from retrieved neighbour configs
+makes the search cheaper without costing kernel quality. Three resumable phases:
+
+```bash
+PYTHONPATH=scripts/helion_rag .rag-venv/bin/python -m helion_rag.loo_experiment \
+  --phase preflight --env-file .helion-rag/env.sh --family h100 \
+  --output-dir .helion-rag/loo_evaluation/my-run --code-revision my-run-r1
+```
+
+Repeat with `--phase select` and `--phase eval`, then analyse with
+`python -m helion_rag.loo_report`. Add `--dry-run` to a phase to write the
+planned matrix and stop. Design, controls, and the published H100 results are in
+[`docs/rag_lfbo_warm_start_experiment.md`](../../docs/rag_lfbo_warm_start_experiment.md).
 
 ## Prerequisites
 
