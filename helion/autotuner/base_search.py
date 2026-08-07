@@ -251,6 +251,9 @@ class BaseSearch(BaseAutotuner):
     """
 
     _attempt_instrumentation: InstrumentationCollector | None = None
+    # Class-level default so searches built with __new__ (test doubles, and the
+    # adapter's baseline probe) can read the budget before __init__ runs; every
+    # real instance replaces it with its own in __init__.
     _candidate_attempt_budget = AttemptBudget(None)
 
     def __init__(
@@ -1396,7 +1399,11 @@ class PopulationBasedSearch(BaseSearch):
         return [list(flat) for flat in self._fixed_initial_population_flat]
 
     def benchmark_population(
-        self, members: list[PopulationMember], *, desc: str = "Benchmarking"
+        self,
+        members: list[PopulationMember],
+        *,
+        desc: str = "Benchmarking",
+        initial_population: bool = False,
     ) -> list[PopulationMember]:
         """
         Benchmark multiple population members in parallel.  Members should be created with make_unbenchmarked.
@@ -1404,6 +1411,8 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
+            initial_population: Whether these members are the initial population,
+                which closes initial-population attempt accounting once benchmarked.
         """
         results = self.benchmark_batch([m.config for m in members], desc=desc)
         for member, result in zip(members, results, strict=True):
@@ -1413,7 +1422,7 @@ class PopulationBasedSearch(BaseSearch):
             member.status = result.status
             member.compile_time = result.compile_time
             self._record_benchmarked_member(member)
-        if desc == "Initial population":
+        if initial_population:
             self._finish_initial_candidate_attempts()
         return members
 

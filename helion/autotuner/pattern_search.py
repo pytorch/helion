@@ -148,7 +148,9 @@ class PatternSearch(PopulationBasedSearch):
             initial_population,
             target_size=self.initial_population,
         )
-        self.benchmark_population(self.population, desc="Initial population")
+        self.benchmark_population(
+            self.population, desc="Initial population", initial_population=True
+        )
 
         # Compute adaptive compile timeout based on initial population compile times
         self.set_adaptive_compile_timeout(
