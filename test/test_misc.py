@@ -735,6 +735,25 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
 
+    def test_builtin_min_max_over_scalar_tensors(self) -> None:
+        """min()/max() mixing a loaded 0-D tensor with an int must pick correctly.
+
+        The Pallas worklist rewrites such a bound into its own metadata, so the
+        traced op is dead there and a min/max mix-up would not show up in those
+        numerics.  Here the value reaches the output.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def clamp_kernel(values):
+            out = torch.zeros_like(values)
+            for i in hl.grid(values.size(0)):
+                out[i] = min(max(values[i], 3), 7)
+            return out
+
+        values = torch.tensor([-5, 0, 3, 4, 7, 9], dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(clamp_kernel, (values,))
+        torch.testing.assert_close(result, values.clamp(3, 7))
+
     def test_torch_tensor_constant_in_kernel(self):
         """Test that torch.tensor() with a constant value works inside a kernel."""
 

@@ -879,14 +879,20 @@ def _compact_worklist_bounds(
     begin_ref, extent_ref = (f"{n}_ref" for n in ref_names(plan))
     begin = f"{begin_ref}[_wid]"
     end = f"{begin} + {extent_ref}[_wid]"
-    if kind == "ordered" and plan.ordered_end_clamped_to_compact:
-        # The source range above still spans the whole reused window; this work
-        # item computes only through the compact tile's current end.
+    if kind == "ordered":
+        # The source range above still spans the whole reused window; these
+        # narrow only what this work item computes.  Resident-window reads take
+        # the local offset as (absolute offset - range_start), so a begin that
+        # no longer coincides with the window base needs nothing extra.
         compact_begin, compact_extent = (
             f"{name}_ref" for name in compact_ref_names(plan)
         )
-        compact_end = f"{compact_begin}[_wid] + {compact_extent}[_wid]"
-        end = f"jnp.minimum({end}, {compact_end})"
+        if plan.ordered_begin_window is not None:
+            window_start = f"{compact_begin}[_wid] - {plan.ordered_begin_window}"
+            begin = f"jnp.maximum({begin}, {window_start})"
+        if plan.ordered_end_clamped_to_compact:
+            compact_end = f"{compact_begin}[_wid] + {compact_extent}[_wid]"
+            end = f"jnp.minimum({end}, {compact_end})"
     return begin, end
 
 

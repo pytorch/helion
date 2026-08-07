@@ -433,6 +433,44 @@ def _causal_jagged_kernel(q, k, v, offsets):
     return out
 
 
+# Sliding-window causal attention: each query attends to the keys in a fixed
+# span before it, so the ordered loop's begin also depends on the enclosing
+# tile.  The kernel below spells the span as a literal in both its bound and
+# its mask, since a module global would be read at runtime by the body while
+# the bound baked a value.  This copy is for the reference and the assertions;
+# test_sliding_window_preserves_source_range pins it to the kernel's literal.
+_SLIDING_WINDOW = 16
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _sliding_window_jagged_kernel(q, k, v, offsets):
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = offsets.size(0) - 1
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(num_sequences):
+        q_start = offsets[seq_idx]
+        q_end = offsets[seq_idx + 1]
+        k_start = offsets[seq_idx]
+        k_end = offsets[seq_idx + 1]
+        for tile_q in hl.tile(q_start, q_end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            for tile_k in hl.tile(
+                max(k_start, tile_q.begin - 16),
+                min(k_end, tile_q.end),
+            ):
+                k_blk = k[tile_k, :, :].transpose(0, 1)
+                v_blk = v[tile_k, :, :].transpose(0, 1)
+                scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                delta = tile_q.index[None, :, None] - tile_k.index[None, None, :]
+                keep = (delta >= 0) & (delta <= 16)
+                scores = torch.where(keep, scores, 0.0)
+                acc = torch.baddbmm(acc, scores.to(v.dtype), v_blk)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
 @helion.kernel(backend="pallas", static_shapes=True)
 def _flash_prep_kernel(q, k, v, q_offsets, kv_offsets):
     """Jagged flash attention: a max reduction (amax) whose padded scores must be -inf,
@@ -709,7 +747,7 @@ class TestDetectAndGating(unittest.TestCase):
             "foo.min(offsets[seq_idx + 1], tile_q.end)",
             # A different tile's edge is not the enclosing compact tile.
             "min(offsets[seq_idx + 1], tile_k.end)",
-            # Begin edges (sliding windows) are not recognized yet.
+            # A begin edge is the sliding-window form, matched separately.
             "max(offsets[seq_idx], tile_q.begin)",
         ):
             with self.subTest(unsupported=unsupported):
@@ -722,6 +760,161 @@ class TestDetectAndGating(unittest.TestCase):
                 )
                 self.assertFalse(clamped)
                 self.assertEqual(ast.unparse(source_end), unsupported)
+
+    def test_sliding_window_begin_grammar(self):
+        """The begin recognizer accepts exactly ``max(src, tile.begin - W)``."""
+        from helion._compiler.pallas.compact_worklist import _ordered_source_begin
+
+        for accepted, window in (
+            ("max(offsets[seq_idx], tile_q.begin - 16)", 16),
+            ("max(tile_q.begin - 16, offsets[seq_idx])", 16),
+            ("builtins.max(offsets[seq_idx], hl.tile_begin(tile_q) - 4)", 4),
+            # A bare begin is the degenerate zero-lookback window.
+            ("max(offsets[seq_idx], tile_q.begin)", 0),
+        ):
+            with self.subTest(accepted=accepted):
+                source_begin, got = _ordered_source_begin(_expr(accepted), "tile_q")
+                self.assertEqual(got, window)
+                self.assertEqual(ast.unparse(source_begin), "offsets[seq_idx]")
+
+        for unsupported in (
+            # An ordinary source bound.
+            "offsets[seq_idx]",
+            # min() is the end form, not a lookback.
+            "min(offsets[seq_idx], tile_q.begin - 16)",
+            # A different tile's edge.
+            "max(offsets[seq_idx], tile_k.begin - 16)",
+            # Adding to the edge is a lookahead, which the clamp cannot express.
+            "max(offsets[seq_idx], tile_q.begin + 16)",
+            # Neither operand is an edge.
+            "max(offsets[seq_idx], 0)",
+        ):
+            with self.subTest(unsupported=unsupported):
+                source_begin, got = _ordered_source_begin(_expr(unsupported), "tile_q")
+                self.assertIsNone(got)
+                self.assertEqual(ast.unparse(source_begin), unsupported)
+
+        # A non-literal lookback is clearly an attempted window, so it is named
+        # rather than left to the generic host-bound error.  A module global in
+        # particular is read at runtime by the kernel body, so baking it into
+        # the iteration bound would let a rebind mask keys the loop never
+        # visits.
+        for rejected in (
+            "max(offsets[seq_idx], tile_q.begin - WINDOW)",
+            "max(offsets[seq_idx], tile_q.begin - w * 2)",
+            # A negative literal parses as a unary minus, not a Constant.
+            "max(offsets[seq_idx], tile_q.begin - -4)",
+        ):
+            with (
+                self.subTest(rejected=rejected),
+                self.assertRaisesRegex(exc.InvalidConfig, "integer literal"),
+            ):
+                _ordered_source_begin(_expr(rejected), "tile_q")
+
+    def test_sliding_window_accepts_a_kernel_local_window(self):
+        """A name bound inside the kernel is the workaround the error names.
+
+        Prologue assignments are inlined before the begin is matched, so the
+        literal reaches the bound and the body sees the same value -- unlike a
+        module global, which the body would read at runtime.  Function level
+        and grid body both work; the window sits at function level here since
+        that is the more natural place to write it.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(q, k, v, offsets):
+            H = hl.specialize(q.size(1))
+            D = hl.specialize(q.size(2))
+            window = 12
+            out = torch.empty_like(q)
+            for seq_idx in hl.grid(offsets.size(0) - 1):
+                start = offsets[seq_idx]
+                end = offsets[seq_idx + 1]
+                for tile_q in hl.tile(start, end):
+                    q_blk = q[tile_q, :, :].transpose(0, 1)
+                    acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+                    for tile_k in hl.tile(
+                        max(start, tile_q.begin - window), min(end, tile_q.end)
+                    ):
+                        k_blk = k[tile_k, :, :].transpose(0, 1)
+                        v_blk = v[tile_k, :, :].transpose(0, 1)
+                        scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                        delta = (
+                            tile_q.index[None, :, None] - tile_k.index[None, None, :]
+                        )
+                        keep = (delta >= 0) & (delta <= window)
+                        scores = torch.where(keep, scores, 0.0)
+                        acc = torch.baddbmm(acc, scores.to(v.dtype), v_blk)
+                    out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+            return out
+
+        offsets = _offsets([12, 20, 5, 30])
+        length = int(offsets[-1])
+        args = (
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            offsets,
+        )
+        bound = kernel.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        self.assertEqual(plan.ordered_begin_window, 12)
+        code = bound.to_triton_code(_worklist_config([8, 8]))
+        self.assertIn("q_begin_ref[_wid] - 12", code)
+        # No launcher-passed copy of the window: nothing can drift from it.
+        self.assertNotIn("_source_module", code)
+
+    def test_function_level_name_does_not_shadow_a_loop_coordinate(self):
+        """A pre-loop name a loop rebinds must not be inlined into its bounds.
+
+        Function-level assignments reach the compact bounds so a window width
+        can live there, but the owner coordinate is bound by the grid loop:
+        inlining the pre-loop value would rewrite offsets[seq_idx] to
+        offsets[0] and give every owner the same range.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(q, k, v, offsets):
+            H = hl.specialize(q.size(1))
+            D = hl.specialize(q.size(2))
+            out = torch.empty_like(q)
+            seq_idx = 0
+            for seq_idx in hl.grid(offsets.size(0) - 1):
+                start = offsets[seq_idx]
+                end = offsets[seq_idx + 1]
+                for tile_q in hl.tile(start, end):
+                    q_blk = q[tile_q, :, :].transpose(0, 1)
+                    acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+                    for tile_k in hl.tile(start, end):
+                        k_blk = k[tile_k, :, :].transpose(0, 1)
+                        v_blk = v[tile_k, :, :].transpose(0, 1)
+                        scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                        acc = torch.baddbmm(acc, scores.to(v.dtype), v_blk)
+                    out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+            return out
+
+        offsets = _offsets([12, 20, 5])
+        length = int(offsets[-1])
+        args = (
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            torch.randn(length, 4, 128),
+            offsets,
+        )
+        bound = kernel.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        compact = plan.compact_axis
+        self.assertEqual(ast.unparse(compact.base), "offsets[seq_idx]")
+        self.assertEqual(
+            ast.unparse(compact.length),
+            "offsets[seq_idx + 1] - offsets[seq_idx]",
+        )
+        # Still the packed-offsets idiom, which the shadowed form would lose.
+        self.assertEqual(compact.packed_offset_arg, "offsets")
 
     def test_direct_tile_end_requires_matching_begins(self):
         from helion._compiler.pallas.compact_worklist import _ordered_source_end
@@ -1341,6 +1534,51 @@ class TestWorklistLoopDispatch(unittest.TestCase):
             "offsets[seq_idx + 1] - offsets[seq_idx]",
         )
 
+    def test_sliding_window_preserves_source_range(self):
+        args = self._causal_jagged_args()
+        bound = _sliding_window_jagged_kernel.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        self.assertEqual(plan.ordered_begin_window, _SLIDING_WINDOW)
+        self.assertTrue(plan.ordered_end_clamped_to_compact)
+        ordered = plan.ordered_axis
+        assert ordered is not None
+        # Both clamps narrow only the compute range; the resident window and
+        # its refills still cover the whole source range.
+        self.assertEqual(ast.unparse(ordered.base), "offsets[seq_idx]")
+        self.assertEqual(
+            ast.unparse(ordered.length),
+            "offsets[seq_idx + 1] - offsets[seq_idx]",
+        )
+
+    def test_sliding_window_composes_with_loop_types_and_grouping(self):
+        args = self._causal_jagged_args()
+        window_begin = (
+            f"jnp.maximum(k_begin_ref[_wid], q_begin_ref[_wid] - {_SLIDING_WINDOW})"
+        )
+        compute_end = (
+            "jnp.minimum(k_begin_ref[_wid] + k_len_ref[_wid], "
+            "q_begin_ref[_wid] + q_extent_ref[_wid])"
+        )
+        for grouping in (1, 2):
+            for loop_type, marker in (
+                ("unroll", "def _dynamic_unroll_body"),
+                ("fori_loop", "jax.lax.fori_loop"),
+                ("emit_pipeline", "pltpu.emit_pipeline"),
+            ):
+                with self.subTest(grouping=grouping, loop_type=loop_type):
+                    code = _sliding_window_jagged_kernel.bind(args).to_triton_code(
+                        _worklist_config([8, 8], grouping=grouping, loop_type=loop_type)
+                    )
+                    self.assertIn(marker, code)
+                    self.assertIn(window_begin, code)
+                    self.assertIn(compute_end, code)
+                    if loop_type == "unroll":
+                        # Resident reads stay window-relative off the source
+                        # start, so a begin past that start needs no rebasing.
+                        self.assertIn("pl.ds(offset_2 - k_begin_ref[_wid]", code)
+
     def test_dependent_tile_end_composes_with_loop_types_and_grouping(self):
         args = self._causal_jagged_args()
         for grouping in (1, 2):
@@ -1552,6 +1790,22 @@ def _eager_causal_jagged(q, k, v, offsets):
     return out
 
 
+def _eager_sliding_window_jagged(q, k, v, offsets, window=_SLIDING_WINDOW):
+    out = torch.empty_like(q)
+    for s in range(len(offsets) - 1):
+        begin, end = int(offsets[s]), int(offsets[s + 1])
+        qb = q[begin:end].transpose(0, 1)
+        kb = k[begin:end].transpose(0, 1)
+        vb = v[begin:end].transpose(0, 1)
+        scores = torch.bmm(qb, kb.transpose(-2, -1))
+        idx = torch.arange(end - begin)
+        delta = idx[:, None] - idx[None, :]
+        keep = (delta >= 0) & (delta <= window)
+        kept = torch.where(keep, scores, torch.zeros_like(scores))
+        out[begin:end] = torch.bmm(kept, vb).transpose(0, 1)
+    return out
+
+
 def _exact_causal_jagged_inputs(offsets, num_heads, head_dim):
     length = int(offsets[-1])
     q = torch.ones(length, num_heads, head_dim, dtype=torch.float32)
@@ -1738,6 +1992,45 @@ class TestWorklistNumerics(unittest.TestCase):
                     ),
                 )
                 torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    def test_sliding_window_matches_eager(self):
+        H, D, block = 2, 128, 8
+        # Longer than the window, so tiles exist that the lookback excludes
+        # entirely -- the case a plain causal clamp would still visit.  Two
+        # sequences so the second rebases off a nonzero resident-window start.
+        offsets = _offsets([40, 24])
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
+        ref = _eager_sliding_window_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                _, out = code_and_output(
+                    _sliding_window_jagged_kernel,
+                    (q, k, v, offsets.to(DEVICE)),
+                    **_worklist_config(
+                        [block, block], loop_type="unroll", grouping=grouping
+                    ),
+                )
+                torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    @skipIfPallasInterpret(
+        "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
+    )
+    def test_sliding_window_streaming_matches_eager(self):
+        H, D, block = 2, 128, 8
+        offsets = _offsets([40, 13])
+        q, k, v = _exact_causal_jagged_inputs(offsets, H, D)
+        ref = _eager_sliding_window_jagged(q.cpu(), k.cpu(), v.cpu(), offsets)
+        for grouping in (1, 2):
+            for loop_type in ("fori_loop", "emit_pipeline"):
+                with self.subTest(grouping=grouping, loop_type=loop_type):
+                    _, out = code_and_output(
+                        _sliding_window_jagged_kernel,
+                        (q, k, v, offsets.to(DEVICE)),
+                        **_worklist_config(
+                            [block, block], loop_type=loop_type, grouping=grouping
+                        ),
+                    )
+                    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
 
     @skipIfPallasInterpret(
         "dynamic worklist streaming is validated on real TPU, not Pallas interpret"
