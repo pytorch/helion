@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
+from torch._inductor.codegen.simd import constant_repr
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
@@ -39,10 +40,13 @@ from ..aten_lowering import reshape_lowering
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import topk_lowering
+from ..aten_lowering import unsqueeze_lowering
 from ..aten_lowering import view_lowering
+from ..aten_lowering import where_lowering
 from ..compile_environment import CompileEnvironment
 from ..matmul_utils import _emit_pallas_matmul
 from ..matmul_utils import _needs_f32_accumulator
+from . import codegen as pallas_codegen
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
@@ -58,6 +62,144 @@ def codegen_argmin_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return _pallas_argreduce(ctx, node, "argmin")
 
 
+@where_lowering.register_codegen("pallas")
+def codegen_where_pallas(ctx: LoweringContext, node: Node) -> object:
+    env = CompileEnvironment.current()
+    cond, x, y = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+
+    def ensure_ast(value: object) -> ast.AST:
+        if isinstance(value, ast.AST):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return expr_from_string(constant_repr(value))
+        raise AssertionError(f"unsupported where operand: {type(value)!r}")
+
+    cond_ast = ensure_ast(cond)
+    x_ast = ensure_ast(x)
+    y_ast = ensure_ast(y)
+    ShapeDim = int | torch.SymInt
+
+    def tensor_shape(arg: object) -> tuple[ShapeDim, ...] | None:
+        if isinstance(arg, Node):
+            value = arg.meta.get("val")
+            if isinstance(value, torch.Tensor):
+                return cast("tuple[ShapeDim, ...]", tuple(value.size()))
+        return None
+
+    def shapes_match(
+        lhs: tuple[ShapeDim, ...] | None, rhs: tuple[ShapeDim, ...]
+    ) -> bool:
+        if lhs is None or len(lhs) != len(rhs):
+            return False
+        for left, right in zip(lhs, rhs, strict=True):
+            if not env.known_equal(left, right):
+                return False
+        return True
+
+    cond_arg = node.args[0]
+    output_val = node.meta.get("val")
+    if isinstance(cond_arg, Node) and isinstance(output_val, torch.Tensor):
+        cond_val = cond_arg.meta.get("val")
+        if isinstance(cond_val, torch.Tensor) and cond_val.dtype is torch.bool:
+            output_shape = cast("tuple[ShapeDim, ...]", tuple(output_val.size()))
+            branch_asts = ((node.args[1], x_ast), (node.args[2], y_ast))
+            layout_anchor = next(
+                (
+                    branch_ast
+                    for branch_arg, branch_ast in branch_asts
+                    if shapes_match(tensor_shape(branch_arg), output_shape)
+                ),
+                next(
+                    (
+                        branch_ast
+                        for branch_arg, branch_ast in branch_asts
+                        if tensor_shape(branch_arg) is not None
+                    ),
+                    x_ast,
+                ),
+            )
+            numeric_select = pallas_codegen.numeric_where_expr(
+                cond_ast,
+                x_ast,
+                y_ast,
+                output_val.dtype,
+                layout_anchor,
+            )
+            if numeric_select is not None:
+                return numeric_select
+            if not shapes_match(tuple(cond_val.size()), output_shape):
+                cond_ast = pallas_codegen.layout_tied_bf16_mask_expr(
+                    cond_ast,
+                    layout_anchor,
+                )
+                cond_ast = expr_from_string(
+                    "({cond}) == jnp.array(1, dtype=jnp.bfloat16)",
+                    cond=cond_ast,
+                )
+            else:
+                cond_ast = expr_from_string("({cond}) != 0", cond=cond_ast)
+
+    return expr_from_string(
+        env.backend.where_expr("{cond}", "{x}", "{y}"),
+        cond=cond_ast,
+        x=x_ast,
+        y=y_ast,
+    )
+
+
+def _pallas_bool_safe_singleton_index(
+    tensor: ast.AST,
+    input_val: torch.Tensor,
+    args: list[str],
+    singleton_shape: str | None = None,
+) -> ast.AST:
+    index = ", ".join(args)
+    if input_val.dtype is torch.bool and "None" in args:
+        # Mosaic cannot reshape bool vectors directly (jax-ml/jax#37370).
+        if singleton_shape is not None:
+            return pallas_codegen.numeric_mask_reshape_expr(tensor, singleton_shape)
+        tensor = pallas_codegen.numeric_mask_expr(tensor)
+    return expr_from_string(f"{{tensor}}[{index}]", tensor=tensor)
+
+
+def _pallas_singleton_shape(
+    input_val: torch.Tensor,
+    args: list[str],
+    ctx: LoweringContext,
+    *,
+    compacted_args: bool = False,
+) -> str:
+    tile_strategy = ctx.cg.device_function.tile_strategy
+    if compacted_args:
+        input_dims = iter(tile_strategy.shape_dims([*input_val.size()]))
+        shape_dims = ["1" if arg == "None" else next(input_dims) for arg in args]
+        return f"[{', '.join(shape_dims)}]"
+
+    input_dims = iter(input_val.size())
+    shape = [1 if arg == "None" else next(input_dims) for arg in args]
+    return tile_strategy.shape_str(shape)
+
+
+@unsqueeze_lowering.register_codegen("pallas")
+def codegen_unsqueeze_pallas(ctx: LoweringContext, node: Node) -> object:
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor, dim = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    assert isinstance(dim, int)
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_val = input_node.meta["val"]
+    assert isinstance(input_val, torch.Tensor)
+    ndim = input_val.ndim
+    if dim < 0:
+        dim += ndim + 1
+    assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
+    args = [":"] * ndim
+    args.insert(dim, "None")
+    singleton_shape = _pallas_singleton_shape(input_val, args, ctx)
+    return _pallas_bool_safe_singleton_index(tensor, input_val, args, singleton_shape)
+
+
 @squeeze_lowering.register_codegen("pallas")
 @view_lowering.register_codegen("pallas")
 @reshape_lowering.register_codegen("pallas")
@@ -71,12 +213,7 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
     if isinstance(input_node, Node):
         input_val = input_node.meta.get("val")
         if isinstance(input_val, torch.Tensor) and input_val.dtype is torch.bool:
-            # Mosaic cannot reshape bool vectors directly:
-            # https://github.com/jax-ml/jax/issues/37370
-            return expr_from_string(
-                f"(jnp.reshape(({{tensor}}).astype(jnp.int32), {shape_str}) != 0)",
-                tensor=tensor,
-            )
+            tensor = pallas_codegen.numeric_mask_expr(tensor)
     return expr_from_string(f"jnp.reshape({{tensor}}, {shape_str})", tensor=tensor)
 
 
@@ -151,15 +288,21 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     shape = [*val.size()]
     # pyrefly: ignore [missing-attribute]
     input_val = node.args[0].meta["val"]
+    assert isinstance(input_val, torch.Tensor)
     if input_val.ndim != len(shape):
         tile_strategy = ctx.cg.device_function.tile_strategy
         broadcasting = tile_strategy.broadcast_expand_dims(
             tuple(input_val.shape), tuple(shape)
         )
         if broadcasting:
-            tensor = expr_from_string(
-                f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+            singleton_shape = _pallas_singleton_shape(
+                input_val, broadcasting, ctx, compacted_args=True
             )
+            tensor = _pallas_bool_safe_singleton_index(
+                tensor, input_val, broadcasting, singleton_shape
+            )
+    elif input_val.dtype is torch.bool:
+        tensor = pallas_codegen.numeric_mask_expr(tensor)
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"jnp.broadcast_to({{tensor}}, {shape_str})",

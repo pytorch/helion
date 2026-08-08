@@ -151,7 +151,30 @@ scalar_tensor_lowering = register_lowering(
 )
 
 
-where_lowering = register_lowering(torch.ops.aten.where.self)
+_UNKNOWN_MASKED_VALUE = object()
+
+
+def _where_masked_value(node: Node) -> float | bool | None:
+    def branch_value(arg: object) -> object:
+        if isinstance(arg, Node):
+            value = cached_masked_value(arg)
+            return _UNKNOWN_MASKED_VALUE if value is None else value
+        if isinstance(arg, (int, float, bool)):
+            return arg
+        return _UNKNOWN_MASKED_VALUE
+
+    x_value = branch_value(node.args[1])
+    y_value = branch_value(node.args[2])
+    if x_value is not _UNKNOWN_MASKED_VALUE and x_value == y_value:
+        assert isinstance(x_value, (int, float, bool))
+        return x_value
+    return None
+
+
+where_lowering = register_lowering(
+    torch.ops.aten.where.self,
+    masked_value_fn=_where_masked_value,
+)
 
 
 @where_lowering.register_codegen("common")

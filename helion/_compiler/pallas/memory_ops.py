@@ -17,6 +17,7 @@ from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import store
 from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
 from . import codegen as pallas_codegen
 
 if TYPE_CHECKING:
@@ -56,6 +57,8 @@ def _(state: CodegenState) -> None:
     if not is_scatter and state.device_function.carry_tiles:
         if emit_carry_store(state, tensor, subscript, name, idx_str, value):
             return
+    if tensor.dtype is torch.bool:
+        value = CompileEnvironment.current().backend.cast_ast(value, torch.bool)
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
