@@ -41,6 +41,7 @@ from ..ast_extension import statement_from_string
 from ..dtype_utils import cast_ast
 from ..host_function import HostFunction
 from ..indexing_strategy import exact_tile_block_ids
+from ..indexing_strategy import subscript_tile_info
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import analyze_tcgen05_matmul_store_chains
@@ -111,8 +112,12 @@ from .tcgen05_constants import TCGEN05_GROUPED_MODES
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_BLOCK_K_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
@@ -124,6 +129,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -850,6 +856,26 @@ def _rank3_rhs_index_block_id(index: Node, *, reduction: bool | None) -> int | N
     return canonical_block_id
 
 
+def _rank3_rhs_exact_index_block_id(
+    index: Node, *, reduction: bool | None
+) -> int | None:
+    """Return the canonical block axis only for an unshifted tile subscript."""
+    from ..compile_environment import CompileEnvironment
+
+    block_id = _rank3_rhs_index_block_id(index, reduction=reduction)
+    if block_id is None:
+        return None
+    env = CompileEnvironment.current()
+    tile_info = subscript_tile_info(env, index)
+    if (
+        tile_info is None
+        or not env.known_equal(tile_info.offset, 0)
+        or env.canonical_block_id(tile_info.block_id) != block_id
+    ):
+        return None
+    return block_id
+
+
 def _rank3_rhs_safe_group_load(
     cg: GenerateAST,
     group_index: Node,
@@ -1072,7 +1098,7 @@ def _rank3_rhs_segment_lhs_info(
         or not isinstance(extra_mask, Node)
     ):
         return None
-    lhs_k_block_id = _rank3_rhs_index_block_id(indices[1], reduction=None)
+    lhs_k_block_id = _rank3_rhs_exact_index_block_id(indices[1], reduction=None)
     if lhs_k_block_id is None or canonical_block_id(
         lhs_k_block_id
     ) != canonical_block_id(k_block_id):
@@ -1083,6 +1109,7 @@ def _rank3_rhs_segment_lhs_info(
         row_index.op != "call_function"
         or row_index.target not in (operator.add, torch.ops.aten.add.Tensor)
         or len(row_index.args) != 2
+        or row_index.kwargs
         or not all(isinstance(arg, Node) for arg in row_index.args)
     ):
         return None
@@ -1359,8 +1386,8 @@ def _trace_rank3_grouped_rhs_nt_operand(
         segment_group_info = _rank3_rhs_segment_group_load(cg, indices[0])
         if segment_group_info is None:
             return None
-    rhs_n_block_id = _rank3_rhs_index_block_id(indices[1], reduction=False)
-    rhs_k_block_id = _rank3_rhs_index_block_id(indices[2], reduction=None)
+    rhs_n_block_id = _rank3_rhs_exact_index_block_id(indices[1], reduction=False)
+    rhs_k_block_id = _rank3_rhs_exact_index_block_id(indices[2], reduction=None)
     if rhs_n_block_id is None or rhs_k_block_id is None:
         return None
     grouped_k_mask = None
@@ -2496,6 +2523,7 @@ def _prove_rank3_rhs_grouped_mma(
             node,
             segment_lhs,
             segment_group,
+            n_block_id=axes.n_block_id,
             allow_store_extent_metadata=allow_segment_store_extent_metadata,
         )
         if segment_store is None:
@@ -4103,11 +4131,13 @@ def _rank3_rhs_segment_store_info(
     segment_lhs_info: _Rank3RhsSegmentLhsInfo,
     segment_group: _Rank3RhsSegmentGroupInfo | None = None,
     *,
+    n_block_id: int,
     allow_store_extent_metadata: bool = False,
 ) -> _Rank3RhsSegmentStoreInfo | None:
     import operator
 
     from ...language import memory_ops
+    from ..compile_environment import CompileEnvironment
 
     stores = _trace_mma_to_stores(mma_node, cg.codegen_graphs)
     if stores is None or len(stores) != 1:
@@ -4125,8 +4155,15 @@ def _rank3_rhs_segment_store_info(
         not isinstance(index, list | tuple)
         or len(index) != 2
         or not isinstance(index[0], Node)
+        or not isinstance(index[1], Node)
         or not isinstance(extra_mask, Node)
     ):
+        return None
+    env = CompileEnvironment.current()
+    store_n_block_id = _rank3_rhs_exact_index_block_id(index[1], reduction=False)
+    if store_n_block_id is None or env.canonical_block_id(
+        store_n_block_id
+    ) != env.canonical_block_id(n_block_id):
         return None
     store_row = _trace_to_outer_graph_arg(cg, index[0])
     if store_row is not segment_lhs_info.row_index:
@@ -4188,6 +4225,64 @@ def _requested_tcgen05_grouped_schedule(
     if grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM:
         return None
     return Tcgen05Orientation.NM
+
+
+def _append_aligned_smem(offset: int, size: int, alignment: int) -> int:
+    assert offset >= 0 and size >= 0 and alignment > 0
+    return ((offset + alignment - 1) // alignment) * alignment + size
+
+
+def _tcgen05_grouped_worklist_smem_bytes(
+    *,
+    sched_stage_count: int,
+    bm: int,
+    bn: int,
+    bk: int,
+    dtype_bytes: int,
+    ab_stages: int,
+    acc_stages: int,
+    c_stages: int,
+    cluster_m: int,
+) -> int:
+    """Exact ordered SMEM footprint of the host N,M grouped worklist path.
+
+    Keep this in the same order as the ``cute.arch.alloc_smem`` calls emitted
+    by the grouped scheduler and tcgen05 collective.  The BK64/source-224
+    profile intentionally reaches the 227-KiB opt-in cap, so a coarse reserve
+    would reject a valid compiled kernel while omitting even one mailbox,
+    barrier, TensorMap, or alignment pad is unsafe.
+    """
+    assert sched_stage_count > 0 and cluster_m in (1, 2)
+    a_stage_bytes = bm * bk * dtype_bytes
+    b_stage_bytes = bn * bk * dtype_bytes
+    assert a_stage_bytes % cluster_m == 0
+    assert b_stage_bytes % cluster_m == 0
+
+    offset = 0
+    offset = _append_aligned_smem(
+        offset,
+        TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT * sched_stage_count * 4,
+        16,
+    )
+    # TMEM allocator state and accumulator/scheduler pipeline mbarriers.
+    offset = _append_aligned_smem(offset, 4, 4)
+    offset = _append_aligned_smem(offset, 8, 8)
+    offset = _append_aligned_smem(offset, acc_stages * 2 * 8, 8)
+    offset = _append_aligned_smem(offset, sched_stage_count * 2 * 8, 8)
+    # A/B stages, two mutable input TensorMaps, and the AB pipeline barriers.
+    offset = _append_aligned_smem(offset, ab_stages * a_stage_bytes // cluster_m, 128)
+    offset = _append_aligned_smem(offset, ab_stages * b_stage_bytes // cluster_m, 128)
+    offset = _append_aligned_smem(offset, 2 * 128, 128)
+    offset = _append_aligned_smem(offset, ab_stages * 8, 8)
+    # One mutable output TensorMap and the aligned TMA-store ring.
+    offset = _append_aligned_smem(offset, 128, 128)
+    c_smem_bytes = tcgen05_c_smem_bytes_per_cta(
+        epi_tile_m=TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[0],
+        epi_tile_n=TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[1],
+        dtype_bytes=dtype_bytes,
+        c_stages=c_stages,
+    )
+    return _append_aligned_smem(offset, c_smem_bytes, 1024)
 
 
 def _emit_mma_pipeline(
@@ -4789,18 +4884,30 @@ def _emit_mma_pipeline(
         return f"{rhs_arg_name}[{k_expr}, {n_expr}]"
 
     tcgen05_nm_orientation = requested_schedule is Tcgen05Orientation.NM
-    tcgen05_mma_bm = (
-        TCGEN05_GROUPED_WORKLIST_MMA_M_TILE if tcgen05_nm_orientation else bm
-    )
-    tcgen05_mma_bn = (
-        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if tcgen05_nm_orientation else bn
-    )
-    tcgen05_source_bm = (
-        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if tcgen05_nm_orientation else bm
-    )
-    tcgen05_source_bn = (
-        TCGEN05_GROUPED_WORKLIST_MMA_M_TILE if tcgen05_nm_orientation else bn
-    )
+    tcgen05_worklist_source_m_tile: int | None = None
+    if tcgen05_nm_orientation:
+        if bk not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES:
+            return _unsupported_schedule("block_k must be 64 or 128")
+        tcgen05_worklist_source_m_tile = _tcgen05_config_int(
+            df.config,
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+        )
+        if (
+            tcgen05_worklist_source_m_tile
+            not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        ):
+            return _unsupported_schedule(
+                f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY} must be "
+                f"one of {TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}"
+            )
+        tcgen05_mma_bm = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+        tcgen05_mma_bn = tcgen05_worklist_source_m_tile
+        tcgen05_source_bm = tcgen05_worklist_source_m_tile
+        tcgen05_source_bn = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+    else:
+        tcgen05_mma_bm = tcgen05_source_bm = bm
+        tcgen05_mma_bn = tcgen05_source_bn = bn
 
     tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(df.config)
@@ -5327,6 +5434,9 @@ def _emit_mma_pipeline(
     tcgen05_c_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_c_stages", _tcgen05_c_stage_count(bn)
     )
+    tcgen05_acc_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(tcgen05_mma_bn)
+    )
     tcgen05_output_edge_tma_store_fits_smem = (
         tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
     )
@@ -5442,17 +5552,21 @@ def _emit_mma_pipeline(
         worklist_nm_static_checks = {
             "bf16_operands": input_dtype == torch.bfloat16,
             "bf16_store": epi_elem_dtype_str == "cutlass.BFloat16",
-            "tile_256x128x64": bm == 256 and bn == 128 and bk == 64,
+            "tile_256x128x64_or_128": (
+                bm == 256
+                and bn == 128
+                and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            ),
             "n_multiple_32": (
                 rhs_source_n is not None
                 and rhs_source_n > 0
                 and rhs_source_n % TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2] == 0
             ),
-            "k_multiple_64": (
+            "k_multiple_block_k": (
                 lhs_source_k is not None
                 and rhs_source_k is not None
-                and lhs_source_k % 64 == 0
-                and rhs_source_k % 64 == 0
+                and lhs_source_k % bk == 0
+                and rhs_source_k % bk == 0
             ),
             "common_k": (
                 lhs_source_k is not None
@@ -5473,9 +5587,10 @@ def _emit_mma_pipeline(
                 f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} is validated only for "
                 "generated BF16 NT contiguous "
                 "segment-worklist kernels: contiguous A_packed[M,K], "
-                "contiguous B_grouped[G,N,K], common K%64==0, "
+                "contiguous B_grouped[G,N,K], common K%block_k==0, "
                 "N%32==0, "
-                "CtaGroup.TWO 256x128x64, zero accumulator, and identity BF16 "
+                "CtaGroup.TWO 256x128x(64|128), zero accumulator, and "
+                "identity BF16 "
                 "store; failed checks: " + ", ".join(failed_static_checks),
             )
     if tcgen05_grouped_static_persistent_requested:
@@ -5512,7 +5627,7 @@ def _emit_mma_pipeline(
             and tcgen05_cluster_m == 2
             and tcgen05_cluster_n == 1
             and bm == TCGEN05_TWO_CTA_BLOCK_M
-            and bk == 64
+            and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
         )
         grouped_common_k_pair_allowed = (
             tcgen05_grouped_k_mask is not None
@@ -5562,8 +5677,10 @@ def _emit_mma_pipeline(
                 or tcgen05_grouped_dynamic_ab_tensormaps_requested
                 or tcgen05_grouped_worklist_persistent
             ),
-            "dynamic_ab_tensormaps_bk64_only": (
-                not tcgen05_grouped_dynamic_ab_tensormaps_requested or bk == 64
+            "dynamic_ab_tensormaps_supported_bk": (
+                not tcgen05_grouped_dynamic_ab_tensormaps_requested
+                or bk == 64
+                or (requested_schedule is not None and bk == 128)
             ),
             "dynamic_ab_tensormaps_exact_k_sizes": (
                 not tcgen05_grouped_dynamic_ab_tensormaps_requested
@@ -5575,7 +5692,7 @@ def _emit_mma_pipeline(
                 or (
                     tcgen05_grouped_dynamic_ab_tensormaps_requested
                     and (bm == 128 or grouped_worklist_two_cta)
-                    and bk == 64
+                    and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
                 )
             ),
             "no_scheduler_warp": (
@@ -5598,8 +5715,8 @@ def _emit_mma_pipeline(
                 "only for FP16/BF16 rank3 RHS grouped-NT CtaGroup.ONE "
                 "persistent_interleaved static-full 128x(64|128)x(16|32|64|128) "
                 "TMA-load + TMA-store kernels, or the generated segment "
-                "worklist BK64 dynamic-TensorMap variant (including the "
-                "CtaGroup.TWO 256x(64|128)x64 worklist shape), with no "
+                "worklist BK64/BK128 dynamic-TensorMap variant (including the "
+                "CtaGroup.TWO 256x(64|128)x(64|128) worklist shape), with no "
                 "scheduler/C-input/store warp variants; failed checks: "
                 + ", ".join(failed_grouped_checks),
             )
@@ -5613,8 +5730,38 @@ def _emit_mma_pipeline(
                 "cute",
                 f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} requires at least one RHS group",
             )
+        if requested_schedule is Tcgen05Orientation.NM:
+            grouped_smem_capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                lhs_info.source_fake.device
+            )
+            grouped_smem_required = _tcgen05_grouped_worklist_smem_bytes(
+                sched_stage_count=_tcgen05_config_int(
+                    df.config, TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1
+                ),
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                bk=bk,
+                dtype_bytes=input_dtype.itemsize,
+                ab_stages=tcgen05_ab_stage_count_value,
+                acc_stages=tcgen05_acc_stage_count_value,
+                c_stages=tcgen05_c_stage_count_value,
+                cluster_m=tcgen05_cluster_m,
+            )
+            if (
+                grouped_smem_capacity <= 0
+                or grouped_smem_required > grouped_smem_capacity
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped N,M worklist generated allocations "
+                    f"require {grouped_smem_required} bytes of per-CTA "
+                    f"SMEM, exceeding the {grouped_smem_capacity}-byte capacity",
+                )
         tcgen05_grouped_dynamic_ab_tensormap_rank = (
-            3 if tcgen05_grouped_dynamic_ab_tensormaps_requested and bk == 64 else None
+            3
+            if tcgen05_grouped_dynamic_ab_tensormaps_requested
+            and (bk == 64 or (requested_schedule is not None and bk == 128))
+            else None
         )
         tcgen05_grouped_layout_arg_name = df.tensor_arg(grouped_layout_tensor).name
         if tcgen05_grouped_k_mask is not None:
@@ -5733,9 +5880,9 @@ def _emit_mma_pipeline(
                     f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} is validated only "
                     "for generated BF16 NT contiguous "
                     "segment-worklist kernels: contiguous A_packed[M,K], "
-                    "contiguous B_grouped[G,N,K], common K%64==0, "
+                    "contiguous B_grouped[G,N,K], common K%block_k==0, "
                     "N%32==0, "
-                    "CtaGroup.TWO 256x128x64, dynamic A/B/D TensorMaps, "
+                    "CtaGroup.TWO 256x128x(64|128), dynamic A/B/D TensorMaps, "
                     "zero accumulator, and identity BF16 store; failed checks: "
                     + ", ".join(failed_worklist_nm_checks),
                 )
@@ -5863,6 +6010,9 @@ def _emit_mma_pipeline(
             direct_strides=tcgen05_grouped_direct_strides,
             d_mode=tcgen05_grouped_d_mode,
             d_tensormap=tcgen05_grouped_d_tensormap,
+            source_m_tile=(
+                tcgen05_worklist_source_m_tile if tcgen05_nm_orientation else None
+            ),
         )
     if requested_schedule is not None and (
         tcgen05_grouped_plan is None
@@ -6235,9 +6385,6 @@ def _emit_mma_pipeline(
         tcgen05_cta_thread_count = max(tcgen05_cta_thread_count, 4 * 32)
     if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
         df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
-    tcgen05_acc_stage_count_value = _tcgen05_config_int(
-        df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(tcgen05_mma_bn)
-    )
     # PipelineTmaUmma empty barriers are released by the leader CTA with the
     # pipeline's multicast mask. Peer CTAs still advance local consumer state,
     # but they must not add a second empty-barrier arrival: doing so lets the
@@ -6569,7 +6716,8 @@ def _emit_mma_pipeline(
                         "cute",
                         "tcgen05 N,M-oriented explicit store is validated only "
                         "for the BF16 grouped worklist TMA-store "
-                        "path with block_m=256, block_n=128, block_k=64, "
+                        "path with block_m=256, block_n=128, "
+                        "block_k=64 or 128, "
                         "CtaGroup.TWO, and no auxiliary epilogue tensors",
                     )
             elif not (
@@ -7867,6 +8015,11 @@ def _emit_mma_pipeline(
                         "bm": bm,
                         "bn": bn,
                         "bk": bk,
+                        **(
+                            {"source_m_tile": grouped_plan.source_m_tile}
+                            if grouped_plan.source_m_tile is not None
+                            else {}
+                        ),
                         "cluster_m": tcgen05_cluster_m,
                         "cluster_n": tcgen05_cluster_n,
                         **(
@@ -8810,11 +8963,10 @@ def _emit_mma_pipeline(
         if mma_impl == "tcgen05" and tcgen05_use_tma:
             assert tcgen05_plan is not None
             assert tma_warp is not None
-            # The validated explicit two-CTA store-box family uses bk=64 to
-            # match Quack's four logical 2CTA MMA K blocks. Python ``range``
-            # lets the outer K-loop duplicate those issue sites; a CuTe range
-            # with no-unroll metadata keeps that guarded family in one loop
-            # body while normal loops keep their existing range lowering.
+            # The validated explicit two-CTA store-box family uses a CuTe
+            # range with no-unroll metadata so its guarded K-iteration body
+            # remains compact.  The generated N,M worklist admits BK64 and
+            # BK128; other explicit-store families keep their BK64 envelope.
             tcgen05_use_nounroll_k_loop = (
                 any(
                     value is not None
@@ -8826,7 +8978,7 @@ def _emit_mma_pipeline(
                 )
                 and tcgen05_static_full_tiles
                 and tcgen05_is_two_cta
-                and bk == 64
+                and (bk == 64 or nm_worklist)
             )
             tma_kloop_args = _PerKiterTmaArgs(
                 tma_pipeline=tma_pipeline,

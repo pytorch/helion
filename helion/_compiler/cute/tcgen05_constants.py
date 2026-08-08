@@ -463,12 +463,26 @@ TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY = (
 TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY = (
     "tcgen05_grouped_external_direct_strides"
 )
-# Source rows consumed per compact N,M worklist group. This is tied to the
-# schedule's 256x224 source tile and must not leak into general grouped-GEMM
-# tiling decisions.
+# Validated source-row tiles for compact N,M worklist schedules.  The selected
+# tile is carried explicitly by the schedule plan; it is independent of the
+# CTA K tile and must not leak into general grouped-GEMM tiling decisions.
+TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY = (
+    "tcgen05_grouped_worklist_source_m_tile"
+)
 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE = 224
+TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE = 256
+TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES = (64, 128)
+TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES = (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
 TCGEN05_GROUPED_WORKLIST_MMA_M_TILE = 256
 TCGEN05_GROUPED_WORKLIST_STORE_SHAPE = (128, 32, 32)
+# The grouped scheduler publishes CTA M/N, validity, metadata/group indices,
+# problem M/N/K, and the packed-output row start through one Int32 mailbox.
+TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT = 9
+
+
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1
