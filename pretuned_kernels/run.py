@@ -45,6 +45,7 @@ KERNELS = [
     "nvfp4_gemv",
     "nvfp4_gemv_cute",
     "cross_entropy",
+    "attention",
     # Ported from vLLM (vllm/kernels/helion/ops); torch-native baselines.
     "silu_mul_fp8",
     "dynamic_per_token_scaled_fp8_quant",
