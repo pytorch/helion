@@ -10457,45 +10457,126 @@ class TestCuteLowerings(unittest.TestCase):
                 ).to(x.dtype)
             return out
 
-        torch.manual_seed(0)
-        args = (
-            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 384, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(384, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(256, 384, device=DEVICE, dtype=torch.bfloat16),
-        )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
-        with patch_cute_mma_support():
-            bound = cute_matmul_cluster_m2_two_cta_n_edge.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[256, 256, 128],
-                pid_type="persistent_interleaved",
-                tcgen05_cluster_m=2,
-                tcgen05_ab_stages=3,
-                tcgen05_acc_stages=1,
-                tcgen05_c_stages=4,
-                num_warps=4,
-            )
-            bound.set_config(cfg)
-            code = bound.to_triton_code(cfg)
-            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("PipelineTmaUmma.create", code)
-            self.assertNotIn("PipelineTmaStore.create", code)
-            self.assertIn(
-                "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                code,
-            )
-            self.assertIn("tile_offset_1 < cutlass.Int32(384)", code)
-            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
-            self.assertNotIn(total_var, code)
-            out = bound(*args)
-        expected = torch.nn.functional.gelu(
-            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
-            approximate="tanh",
-        ).to(args[0].dtype)
-        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+        for n, expect_tma_store in ((128, False), (384, True)):
+            with self.subTest(n=n):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(128, n, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(n, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(256, n, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_cluster_m2_two_cta_n_edge.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 128],
+                        pid_type="persistent_interleaved",
+                        tcgen05_cluster_m=2,
+                        tcgen05_ab_stages=2,
+                        tcgen05_acc_stages=1,
+                        tcgen05_c_stages=4,
+                        num_warps=4,
+                    )
+                    bound.set_config(cfg)
+                    code = bound.to_triton_code(cfg)
+                    self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                    self.assertIn("PipelineTmaUmma.create", code)
+                    if expect_tma_store:
+                        self.assertIn("PipelineTmaStore.create", code)
+                    else:
+                        self.assertNotIn("PipelineTmaStore.create", code)
+                    self.assertIn(
+                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                        code,
+                    )
+                    self.assertIn(f"tile_offset_1 < cutlass.Int32({n})", code)
+                    total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                    self.assertNotIn(total_var, code)
+                    out = bound(*args)
+                expected = torch.nn.functional.gelu(
+                    1.25 * (args[0] @ args[1]).float()
+                    + 0.5 * args[3]
+                    + args[2],
+                    approximate="tanh",
+                ).to(args[0].dtype)
+                torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_persistent_one_cta_n_edge_rhs_layouts(self) -> None:
+        """One-CTA role-local TMA handles general N edges for both RHS views."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def direct_rhs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute")
+        def transposed_rhs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n, _ = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(
+                        acc,
+                        x[tile_m, tile_k],
+                        y[tile_n, tile_k].T,
+                    )
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 256, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=4,
+            num_warps=4,
+        )
+        for n in (128, 384):
+            for name, kernel in (
+                ("direct", direct_rhs),
+                ("transposed", transposed_rhs),
+            ):
+                with self.subTest(n=n, rhs=name):
+                    torch.manual_seed(0)
+                    x = torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16)
+                    logical_y = torch.randn(
+                        128, n, device=DEVICE, dtype=torch.bfloat16
+                    )
+                    y = logical_y if name == "direct" else logical_y.T.contiguous()
+                    with patch_cute_mma_support():
+                        bound = kernel.bind((x, y))
+                        bound.env.config_spec.cute_tcgen05_search_enabled = True
+                        bound.set_config(config)
+                        code = bound.to_triton_code(config)
+                        self.assertIn("PipelineTmaUmma.create", code)
+                        self.assertIn("while tcgen05_role_local", code)
+                        self.assertNotIn("while tcgen05_work_tile_valid", code)
+                        self.assertNotIn("PipelineTmaStore.create", code)
+                        actual = bound(x, y)
+                    torch.testing.assert_close(
+                        actual,
+                        x @ logical_y,
+                        atol=2e-1,
+                        rtol=1e-2,
+                    )
 
     def test_tcgen05_persistent_cluster_m2_two_cta_double_edge_runtime_correctness(
         self,
@@ -18623,13 +18704,30 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 partition, [self._stmt("final_state += 1")]
             )
 
-        observable_partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+        scalar_load_partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
             role_blocks_inline=[],
             role_blocks_extracted=[],
             shared_body_extracted=[self._stmt("value = tensor.iterator.load()")],
         )
+        self.assertFalse(
+            splitter._tcgen05_shared_loop_has_meaningful_work(
+                scalar_load_partition, []
+            )
+        )
         self.assertTrue(
-            splitter._tcgen05_shared_loop_has_meaningful_work(observable_partition, [])
+            splitter._tcgen05_shared_loop_has_meaningful_work(
+                scalar_load_partition, [self._stmt("cleanup(value)")]
+            )
+        )
+        stateful_load_partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[],
+            shared_body_extracted=[self._stmt("value = state.load()")],
+        )
+        self.assertTrue(
+            splitter._tcgen05_shared_loop_has_meaningful_work(
+                stateful_load_partition, []
+            )
         )
 
     def test_role_local_one_shot_scheduler_omits_tile_loop(self) -> None:
