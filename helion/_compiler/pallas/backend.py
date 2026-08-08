@@ -1538,9 +1538,7 @@ class PallasBackend(Backend):
             from ...runtime.pallas.launcher import _get_vmem_limit_bytes
             from .compact_worklist import build_resident_cache_admission
 
-            # Choose C from the conservative device-reported VMEM budget. The
-            # higher Mosaic compile ceiling used by the runtime is not an
-            # allocation budget.
+            # Choose C from the conservative device-reported VMEM budget.
             admission = build_resident_cache_admission(
                 graphs,
                 plan,
