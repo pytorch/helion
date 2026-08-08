@@ -1139,7 +1139,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="jagged_dense_add_2d",
         )
 
-    @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
@@ -1528,16 +1527,17 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=DEVICE
+        )
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1553,7 +1553,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="jagged_softmax_kernel",
-            block_sizes=[16, 8, 16, 16],
+            block_sizes=[8, 16, 16] if _get_backend() == "pallas" else [16, 8, 16, 16],
         )
 
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
@@ -1712,31 +1712,30 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    def test_grouped_gemm_jagged(self):
-        # Build small jagged grouped GEMM inputs
+    def _grouped_gemm_jagged_args(
+        self,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
         torch.manual_seed(0)
-        G = 3
-        K, N = 64, 64
+        k, n = 64, 70
         dtype = torch.bfloat16
         group_A = [
-            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
-            for i in range(G)
+            torch.randn(m, k, device=DEVICE, dtype=dtype).contiguous()
+            for m in (0, 17, 65)
         ]
-        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+        B_shared = torch.randn(k, n, device=DEVICE, dtype=dtype).contiguous()
 
-        # Pack A and offsets
         M_sizes = [int(a.size(0)) for a in group_A]
         starts = [0]
         for m in M_sizes:
             starts.append(starts[-1] + m)
         group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
         A_packed = torch.cat(group_A, dim=0).contiguous()
-
-        # Reference result
-        expected = torch.cat([a @ B_shared for a in group_A], dim=0)
-
-        # Run kernel and check
         args = (A_packed, B_shared, group_offsets)
+        expected = torch.cat([a @ B_shared for a in group_A], dim=0)
+        return args, expected
+
+    def test_grouped_gemm_jagged(self):
+        args, expected = self._grouped_gemm_jagged_args()
         check_example(
             "grouped_gemm",
             args,
@@ -1744,36 +1743,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
-    @xfailIfPallas("Pallas scatter: multiple indirect dims are not supported")
     def test_grouped_gemm_jagged_persistent(self):
-        # Build small jagged grouped GEMM inputs
-        torch.manual_seed(0)
-        G = 3
-        K, N = 64, 64
-        dtype = torch.bfloat16
-        group_A = [
-            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
-            for i in range(G)
-        ]
-        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
-
-        # Pack A and offsets
-        M_sizes = [int(a.size(0)) for a in group_A]
-        starts = [0]
-        for m in M_sizes:
-            starts.append(starts[-1] + m)
-        group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
-        A_packed = torch.cat(group_A, dim=0).contiguous()
-
-        # Reference result
-        expected = torch.cat([a @ B_shared for a in group_A], dim=0)
-
-        # Run kernel and check
-        args = (
-            A_packed,
-            B_shared,
-            group_offsets,
-        )
+        args, expected = self._grouped_gemm_jagged_args()
         check_example(
             "grouped_gemm",
             args,
@@ -2205,16 +2176,17 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
-    @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=DEVICE
+        )
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -2231,7 +2203,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="jagged_layer_norm_kernel",
-            block_sizes=[4, 8, 8, 8, 8, 8, 8],
+            block_sizes=[8, 8, 8]
+            if _get_backend() == "pallas"
+            else [4, 8, 8, 8, 8, 8, 8],
         )
 
     def test_exp_fwd(self):
