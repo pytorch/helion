@@ -19,6 +19,7 @@ import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 
+from ..._utils import is_scalar_index
 from ...exc import BackendUnsupported
 from ...exc import InvalidConfig
 from ...language import _decorators
@@ -32,12 +33,15 @@ from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _not
 from ...language._tracing_ops import _phi
 from ...language._tracing_ops import _pre_broadcast_tile
+from ...language._tracing_ops import _val_to_sympy
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_sympy_expr
 from ..device_function import find_block_size_symbols
 from ..host_function import HostFunction
+from ..variable_origin import TileBeginOrigin
+from ..variable_origin import TileEndOrigin
 from .plan_tiling import _is_full_slice
 
 log = logging.getLogger(__name__)
@@ -651,6 +655,87 @@ def _classify_loop_tensors(
     return loaded_tensors, stored_tensors
 
 
+def _store_value_matches_destination_shape(
+    fake: torch.Tensor,
+    subscript_meta: list[object],
+    value: object,
+    env: CompileEnvironment,
+) -> bool:
+    if isinstance(value, torch.fx.Node):
+        value = value.meta.get("val")
+    if not isinstance(value, torch.Tensor):
+        return False
+    if not isinstance(subscript_meta, (list, tuple)):
+        return False
+
+    expected: list[int | torch.SymInt] = []
+    tensor_dim = 0
+    for idx in subscript_meta:
+        if idx is None:
+            expected.append(1)
+            continue
+        if tensor_dim >= fake.ndim:
+            return False
+        if is_scalar_index(idx):
+            tensor_dim += 1
+            continue
+        if isinstance(idx, torch.SymInt):
+            expected.append(idx)
+        elif isinstance(idx, slice) and idx == slice(None):
+            expected_size = fake.shape[tensor_dim]
+            if not isinstance(expected_size, (int, torch.SymInt)):
+                return False
+            expected.append(expected_size)
+        else:
+            return False
+        tensor_dim += 1
+    for expected_size in fake.shape[tensor_dim:]:
+        if not isinstance(expected_size, (int, torch.SymInt)):
+            return False
+        expected.append(expected_size)
+
+    if len(expected) != value.ndim:
+        return False
+    for actual, expected_size in zip(value.size(), expected, strict=True):
+        if not env.known_equal(actual, expected_size):
+            return False
+    return True
+
+
+def _loop_exact_store_value_ids(
+    graph_info: object, env: CompileEnvironment
+) -> set[int]:
+    """Return tensor ids whose stores all use exact-shaped RHS values."""
+    from ...language.memory_ops import store as _store_op
+
+    host_tensor_nodes: dict[torch.fx.Node, torch.Tensor] = {}
+    for node in graph_info.graph.nodes:  # type: ignore[union-attr]
+        if node.op == "call_function" and node.target is _host_tensor:
+            if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
+                host_tensor_nodes[node] = node.meta["val"]
+
+    exact_value_ids: set[int] = set()
+    inexact_value_ids: set[int] = set()
+    for node in graph_info.graph.nodes:  # type: ignore[union-attr]
+        if node.op != "call_function" or node.target is not _store_op:
+            continue
+        tensor_node = node.args[0]
+        if not isinstance(tensor_node, torch.fx.Node):
+            continue
+        fake = host_tensor_nodes.get(tensor_node)
+        if fake is None:
+            continue
+        key = id(fake)
+        subscript = _extract_subscript_vals(node.args[1] if len(node.args) >= 2 else ())
+        if len(node.args) >= 3 and _store_value_matches_destination_shape(
+            fake, subscript, node.args[2], env
+        ):
+            exact_value_ids.add(key)
+        else:
+            inexact_value_ids.add(key)
+    return exact_value_ids - inexact_value_ids
+
+
 def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
     """Drop rank-expanding ``None`` entries from a tensor subscript."""
     return [index for index in subscript_meta if index is not None]
@@ -671,6 +756,12 @@ def _same_subscript_index(
         return left == right
     if isinstance(left, torch.SymInt) and isinstance(right, torch.SymInt):
         return env.known_equal(left, right)
+    if isinstance(left, torch.SymInt) and isinstance(right, int):
+        return env.known_equal(left, right)
+    if isinstance(left, int) and isinstance(right, torch.SymInt):
+        return env.known_equal(left, right)
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return left is right
     if isinstance(left, slice) and isinstance(right, slice):
         return all(
             lpart is None
@@ -1136,21 +1227,6 @@ def _loop_dim_infos(
     return infos
 
 
-def _is_static_int(expr: str) -> bool:
-    """True if a begin/end expression string is a compile-time integer constant.
-
-    Used to decide whether a tile loop's ``[begin, end)`` extent is statically
-    known. When it is not (data-dependent bounds — a jagged ``hl.tile(start,
-    end)`` or even ``hl.tile(0, dynamic_end)``), the final tile may be a partial
-    sub-range of the backing tensor, so an output store must clamp its extent.
-    """
-    try:
-        int(expr)
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -1251,9 +1327,9 @@ def _pipeline_begin_alignment(
 ) -> int | None:
     """Return a proven divisor of ``begin_expr``, or ``None``.
 
-    A nested-tile inner loop's begin is its outer loop's ``offset_var``, which is
-    a multiple of the outer block size when that outer loop begins at 0 — so it
-    needs no extra pad. Returns that block size in that case.
+    A nested-tile inner loop's begin is its outer loop's ``offset_var``. Reuse
+    the alignment recorded for that loop, including aligned-enclosing jagged
+    rows; otherwise a zero-based outer loop is aligned to its block size.
     """
     for block_id, loops in state.codegen.active_device_loops.items():
         if not loops:
@@ -1261,9 +1337,13 @@ def _pipeline_begin_alignment(
         if state.codegen.offset_var(block_id) != begin_expr:
             continue
         info = loops[-1].block_id_to_info.get(block_id)
-        # Only sound when the outer loop begins at 0, so the offset is a clean
-        # multiple of the outer block size.
-        if info is None or info.begin_expr not in (0, sympy.Integer(0)):
+        if info is None:
+            return None
+        if isinstance(info.offset_alignment, int) and info.offset_alignment > 0:
+            return info.offset_alignment
+        # Otherwise this is only sound when the outer loop begins at 0, making
+        # the offset a clean multiple of the outer block size.
+        if info.begin_expr not in (0, sympy.Integer(0)):
             return None
         outer_bs = state.device_function.resolved_block_size(block_id)
         return outer_bs if isinstance(outer_bs, int) else None
@@ -2336,19 +2416,506 @@ def _lane_tile(
     return last if isinstance(last, int) else None
 
 
+def _loop_bound_value(
+    state: CodegenState,
+    bounds_arg_index: int,
+    loop_dim_index: int,
+    default: object,
+) -> object:
+    if len(state.proxy_args) <= bounds_arg_index:
+        return default
+    bounds = state.proxy_args[bounds_arg_index]
+    if isinstance(bounds, (list, tuple)):
+        return bounds[loop_dim_index] if loop_dim_index < len(bounds) else default
+    if loop_dim_index == 0:
+        return bounds
+    return default
+
+
 def _loop_dim_is_dynamic(state: CodegenState, i: int) -> bool:
     """Whether loop dim ``i`` has a runtime begin and end (a fully-dynamic jagged
     tile).  The tracing-time form of is_dynamic_bound_tile, used here because the
     device loops are not registered yet.
     """
-    begins, ends = state.proxy_args[1], state.proxy_args[2]
-    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
-        return False
-    begin = begins[i] if i < len(begins) else 0
-    end = ends[i] if i < len(ends) else 0
+    begin = _loop_bound_value(state, 1, i, 0)
+    end = _loop_bound_value(state, 2, i, 0)
     return not isinstance(begin, (int, torch.SymInt)) and not isinstance(
         end, (int, torch.SymInt)
     )
+
+
+def _loop_dim_covers_full_tensor_dim(
+    state: CodegenState,
+    loop_dim_index: int,
+    dim_size: object,
+    env: CompileEnvironment,
+) -> bool:
+    """Whether loop dim ``i`` is proven to cover exactly ``[0, dim_size)``."""
+    if not isinstance(dim_size, (int, torch.SymInt)):
+        return False
+    begin = _loop_bound_value(state, 1, loop_dim_index, 0)
+    end = _loop_bound_value(state, 2, loop_dim_index, 0)
+    if not isinstance(begin, (int, torch.SymInt)) or not env.known_equal(begin, 0):
+        return False
+    if not isinstance(end, (int, torch.SymInt)):
+        return False
+    if env.known_equal(end, dim_size):
+        return True
+    if isinstance(dim_size, int) and isinstance(end, torch.SymInt):
+        end_block_id = env.get_block_id(end)
+        if end_block_id is not None:
+            end_block_size = state.device_function.resolved_block_size(end_block_id)
+            return isinstance(end_block_size, int) and end_block_size == dim_size
+    return False
+
+
+def _loop_dim_ends_at_tensor_dim(
+    state: CodegenState,
+    loop_dim_index: int,
+    dim_size: object,
+    env: CompileEnvironment,
+) -> bool:
+    """Whether loop dim ``i`` is proven to end at ``dim_size``.
+
+    Store loops over a suffix ``[begin, dim_size)`` do not need extent clamping:
+    any full-block spill from the final iteration lands in Helion's ds-padding,
+    and the untouched prefix is either preserved by an in-place/initialized
+    output or intentionally undefined for empty outputs.
+    """
+    if not isinstance(dim_size, (int, torch.SymInt)):
+        return False
+    end = _loop_bound_value(state, 2, loop_dim_index, 0)
+    return isinstance(end, (int, torch.SymInt)) and env.known_equal(end, dim_size)
+
+
+def _symint_origin(value: object) -> object | None:
+    if not isinstance(value, torch.SymInt):
+        return None
+    origin_info = HostFunction.current().expr_to_origin.get(_val_to_sympy(value))
+    return origin_info.origin if origin_info is not None else None
+
+
+def _block_id_is_active_outer_scope(state: CodegenState, block_id: int) -> bool:
+    if state.codegen.active_device_loops.get(block_id):
+        return True
+    grid_state = state.codegen.current_grid_state
+    return grid_state is not None and block_id in grid_state.block_ids
+
+
+def _active_block_id_loop_info(
+    state: CodegenState, block_id: int
+) -> LoopDimInfo | None:
+    loops = state.codegen.active_device_loops.get(block_id)
+    if loops:
+        return loops[-1].block_id_to_info.get(block_id)
+    grid_state = state.codegen.current_grid_state
+    if grid_state is not None and block_id in grid_state.block_ids:
+        return grid_state.block_id_to_info.get(block_id)
+    return None
+
+
+def _sympy_proven_equal(lhs: sympy.Expr, rhs: sympy.Expr) -> bool:
+    if lhs == rhs:
+        return True
+    difference = sympy.Add(lhs, sympy.Mul(sympy.Integer(-1), rhs))
+    if sympy.simplify(difference) == 0:
+        return True
+    return sympy.Eq(lhs, rhs) == sympy.true
+
+
+def _block_id_static_extent(state: CodegenState, block_id: int) -> sympy.Expr | None:
+    info = _active_block_id_loop_info(state, block_id)
+    if info is None or info.end_expr is None:
+        return None
+    end_expr = sympy.sympify(info.end_expr)
+    begin_expr = (
+        sympy.Integer(0) if info.begin_expr is None else sympy.sympify(info.begin_expr)
+    )
+    block_size = CompileEnvironment.current().block_sizes[block_id]
+    if isinstance(block_size.size, (int, torch.SymInt)):
+        extent_expr = sympy.sympify(block_size.numel)
+        if _sympy_proven_equal(end_expr, extent_expr) or _sympy_proven_equal(
+            end_expr - begin_expr, extent_expr
+        ):
+            return extent_expr
+    if _sympy_proven_equal(begin_expr, sympy.Integer(0)):
+        return end_expr
+    return None
+
+
+def _loop_dim_is_current_tile_extent(
+    state: CodegenState,
+    loop_dim_index: int,
+    block_id: int,
+    env: CompileEnvironment,
+) -> bool:
+    """Whether this inner loop is exactly bounded by an enclosing tile."""
+    begin = _loop_bound_value(state, 1, loop_dim_index, 0)
+    end = _loop_bound_value(state, 2, loop_dim_index, 0)
+    begin_origin = _symint_origin(begin)
+    end_origin = _symint_origin(end)
+    if (
+        not isinstance(begin_origin, TileBeginOrigin)
+        or not isinstance(end_origin, TileEndOrigin)
+        or begin_origin.block_id != end_origin.block_id
+    ):
+        return False
+    parent_extent = _block_id_static_extent(state, begin_origin.block_id)
+    if parent_extent is None:
+        return False
+    inner_block_size = state.device_function.resolved_block_size(block_id)
+    if not isinstance(inner_block_size, int):
+        return False
+    if not env.known_multiple(parent_extent, inner_block_size):
+        return False
+    parent_block_size = state.device_function.resolved_block_size(begin_origin.block_id)
+    if not isinstance(parent_block_size, int):
+        return False
+    # The child loop can skip clamping only when every parent iteration extent is
+    # a multiple of the inner block: either there is a single parent iteration,
+    # or the full parent block size is also a multiple.
+    return (
+        isinstance(parent_extent, sympy.Integer)
+        and int(parent_extent) <= parent_block_size
+    ) or parent_block_size % inner_block_size == 0
+
+
+def _store_dim_is_jagged_parent_scoped(
+    state: CodegenState,
+    block_id: int,
+    dim_to_bid: dict[int, int],
+    env: CompileEnvironment,
+) -> bool:
+    if not env.is_jagged_tile(block_id):
+        return False
+    present = set(dim_to_bid.values())
+    return all(
+        parent in present and _block_id_is_active_outer_scope(state, parent)
+        for parent in env.jagged_tile_parent_ids[block_id]
+    )
+
+
+def _store_dim_requires_extent_clamp(
+    state: CodegenState,
+    loop_dim_index: int,
+    dim_size: object,
+    env: CompileEnvironment,
+    block_id: int,
+    dim_to_bid: dict[int, int],
+) -> bool:
+    """True when a tiled store cannot prove it writes the full backing dim."""
+    return not (
+        _loop_dim_covers_full_tensor_dim(state, loop_dim_index, dim_size, env)
+        or _loop_dim_ends_at_tensor_dim(state, loop_dim_index, dim_size, env)
+        or _loop_dim_is_current_tile_extent(state, loop_dim_index, block_id, env)
+        or _store_dim_is_jagged_parent_scoped(state, block_id, dim_to_bid, env)
+    )
+
+
+def _block_id_covers_full_tensor_dim(
+    state: CodegenState,
+    block_id: int,
+    dim_size: object,
+) -> bool:
+    """Whether an active outer/grid block id spans ``[0, dim_size)``."""
+    info = _active_block_id_loop_info(state, block_id)
+    return (
+        info is not None
+        and info.begin_expr in (0, sympy.Integer(0))
+        and isinstance(dim_size, (int, torch.SymInt))
+        and info.is_end_matching(dim_size)
+    )
+
+
+def _store_access_covers_full_tensor(
+    state: CodegenState,
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> bool:
+    """Whether all elements of ``fake`` are overwritten by this store family."""
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    tensor_subscripts = _tensor_dim_subscripts(sub_meta)
+    for dim_idx, dim_size in enumerate(fake.shape):
+        bid = dim_to_bid.get(dim_idx)
+        if bid is not None and bid in block_ids:
+            if not _loop_dim_covers_full_tensor_dim(
+                state,
+                block_ids.index(bid),
+                dim_size,
+                env,
+            ):
+                return False
+            continue
+        if bid is not None:
+            if not _block_id_covers_full_tensor_dim(state, bid, dim_size):
+                return False
+            continue
+        idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
+        if is_scalar_index(idx_meta) or idx_meta != slice(None):
+            return False
+    return True
+
+
+def _store_needs_initial_value_preserved(
+    state: CodegenState,
+    fake: torch.Tensor,
+    store_sub_metas: list[list[object]],
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> bool:
+    # Merged metadata can widen disjoint partial stores to ":".
+    if any(
+        _store_access_covers_full_tensor(state, fake, sub_meta, block_ids, env)
+        for sub_meta in store_sub_metas
+    ):
+        return False
+
+    from .backend import _pallas_empty_allocated_vars
+
+    host_fn = HostFunction.current()
+    tensor_arg = state.device_function.tensor_arg(fake)
+    input_names = {arg.arg for arg in host_fn.args.args}
+    empty_vars = _pallas_empty_allocated_vars(host_fn.body)
+    return (
+        tensor_arg.host_str() in input_names or tensor_arg.host_str() not in empty_vars
+    )
+
+
+def _slice_covers_full_dim(
+    idx: object,
+    dim_size: object,
+    env: CompileEnvironment,
+) -> bool:
+    if not isinstance(idx, slice) or idx.step not in (None, 1):
+        return False
+    if idx == slice(None):
+        return True
+    if not isinstance(dim_size, (int, torch.SymInt)):
+        return False
+    start = 0 if idx.start is None else idx.start
+    stop = dim_size if idx.stop is None else idx.stop
+    if not isinstance(start, (int, torch.SymInt)):
+        return False
+    if not isinstance(stop, (int, torch.SymInt)):
+        return False
+    return env.known_equal(start, 0) and env.known_equal(stop, dim_size)
+
+
+def _store_dim_covers_writeback_dim(
+    store_idx: object,
+    writeback_idx: object,
+    dim_size: object,
+    env: CompileEnvironment,
+) -> bool:
+    if _slice_covers_full_dim(store_idx, dim_size, env):
+        return True
+    if _slice_covers_full_dim(writeback_idx, dim_size, env):
+        return False
+    return _same_subscript_index(store_idx, writeback_idx, env)
+
+
+def _store_subscript_covers_writeback_region(
+    fake: torch.Tensor,
+    store_sub_meta: list[object],
+    writeback_sub_meta: list[object],
+    env: CompileEnvironment,
+) -> bool:
+    store_dims = _tensor_dim_subscripts(store_sub_meta)
+    writeback_dims = _tensor_dim_subscripts(writeback_sub_meta)
+    for dim_idx, dim_size in enumerate(fake.shape):
+        store_idx = _subscript_at_dim(store_dims, dim_idx)
+        writeback_idx = _subscript_at_dim(writeback_dims, dim_idx)
+        if not _store_dim_covers_writeback_dim(store_idx, writeback_idx, dim_size, env):
+            return False
+    return True
+
+
+def _store_writeback_region_meta(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    env: CompileEnvironment,
+) -> list[object]:
+    writeback_meta: list[object] = []
+    tensor_subscripts = _tensor_dim_subscripts(sub_meta)
+    for dim_idx, dim_size in enumerate(fake.shape):
+        idx = _subscript_at_dim(tensor_subscripts, dim_idx)
+        if (
+            isinstance(idx, torch.SymInt)
+            or is_scalar_index(idx)
+            or _slice_covers_full_dim(idx, dim_size, env)
+        ):
+            writeback_meta.append(idx)
+        else:
+            writeback_meta.append(slice(None))
+    return writeback_meta
+
+
+def _multi_store_writeback_lacks_single_cover(
+    fake: torch.Tensor,
+    writeback_sub_meta: list[object],
+    store_sub_metas: list[list[object]],
+    env: CompileEnvironment,
+) -> bool:
+    if len(store_sub_metas) <= 1:
+        return False
+    writeback_region_meta = _store_writeback_region_meta(fake, writeback_sub_meta, env)
+    return not any(
+        _store_subscript_covers_writeback_region(
+            fake, store_sub_meta, writeback_region_meta, env
+        )
+        for store_sub_meta in store_sub_metas
+    )
+
+
+def _exact_dma_store_tensor_ids(
+    state: CodegenState,
+    graph_info: object,
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    stored_tensors: dict[
+        int, tuple[torch.Tensor, torch.fx.Node, list[object], list[list[object]]]
+    ],
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> set[int]:
+    """Find output-only stores that can use exact scratch-DMA writeback."""
+    from .backend import _pallas_empty_allocated_vars
+
+    read_names, write_names = state.device_function.get_tensor_read_write_names()
+    host_fn = HostFunction.current()
+    input_names = {arg.arg for arg in host_fn.args.args}
+    empty_vars = _pallas_empty_allocated_vars(host_fn.body)
+    exact_value_store_ids = _loop_exact_store_value_ids(graph_info, env)
+    result: set[int] = set()
+    for key, (fake, _tensor_node, sub_meta, store_sub_metas) in stored_tensors.items():
+        if key in loaded_tensors:
+            continue
+        tensor_arg = state.device_function.tensor_arg(fake)
+        tensor_names = {tensor_arg.name, tensor_arg.host_str()}
+        if (
+            not tensor_names.isdisjoint(read_names)
+            or tensor_names.isdisjoint(write_names)
+            or tensor_arg.host_str() in input_names
+            or tensor_arg.host_str() not in empty_vars
+            or key not in exact_value_store_ids
+        ):
+            continue
+        if _multi_store_writeback_lacks_single_cover(
+            fake, sub_meta, store_sub_metas, env
+        ):
+            continue
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        needs_second_last_clamp = False
+        unsafe_last_dim_clamp = False
+        for dim_idx, bid in dim_to_bid.items():
+            if bid not in block_ids:
+                continue
+            needs_clamp = _store_dim_requires_extent_clamp(
+                state,
+                block_ids.index(bid),
+                fake.shape[dim_idx],
+                env,
+                bid,
+                dim_to_bid,
+            )
+            if not needs_clamp:
+                continue
+            if dim_idx == fake.ndim - 2:
+                needs_second_last_clamp = True
+            elif dim_idx == fake.ndim - 1:
+                unsafe_last_dim_clamp = True
+        if needs_second_last_clamp and not unsafe_last_dim_clamp:
+            result.add(id(fake))
+    return result
+
+
+def _partial_last_two_store_error() -> BackendUnsupported:
+    return BackendUnsupported(
+        "pallas",
+        "a partial store whose tiled dimension is one of the last two "
+        "(lane/sublane) dimensions is not supported. Mosaic tile alignment "
+        "forbids clamping there, so a partial tile would silently overrun "
+        "adjacent rows. Move the partial dimension to a leading position, "
+        "e.g. [tokens, heads, head_dim]",
+    )
+
+
+def _emit_pipeline_direct_clamped_store_error() -> BackendUnsupported:
+    return BackendUnsupported(
+        "pallas",
+        "initialized or in-place output stores "
+        "that need a clamped tiled extent are not supported. The "
+        "direct output store path cannot clamp the live write extent; "
+        "only the output-only Buffered BlockSpec writeback path can.",
+    )
+
+
+def _reject_partial_last_two_dim_stores(
+    state: CodegenState,
+    stored_tensors: dict[
+        int, tuple[torch.Tensor, torch.fx.Node, list[object], list[list[object]]]
+    ],
+    block_ids: list[int],
+    env: CompileEnvironment,
+    aligned_dim: dict[int, int] | None = None,
+    *,
+    safe_pipelined_store_tensor_ids: set[int] | None = None,
+) -> None:
+    aligned_dim = aligned_dim or {}
+    safe_pipelined_store_tensor_ids = safe_pipelined_store_tensor_ids or set()
+    for fake, _tensor_node, _sub_meta, store_sub_metas in stored_tensors.values():
+        if id(fake) in safe_pipelined_store_tensor_ids:
+            continue
+        for store_sub_meta in store_sub_metas:
+            dim_to_bid = _get_dim_block_ids(store_sub_meta, env)
+            for dim_idx, bid in dim_to_bid.items():
+                if bid not in block_ids or dim_idx < fake.ndim - 2:
+                    continue
+                if bid in aligned_dim and bid in state.device_function.carry_tiles:
+                    # emit_pipeline's aligned-enclosing row path handles this case.
+                    continue
+                if _store_dim_requires_extent_clamp(
+                    state,
+                    block_ids.index(bid),
+                    fake.shape[dim_idx],
+                    env,
+                    bid,
+                    dim_to_bid,
+                ):
+                    raise _partial_last_two_store_error()
+
+
+def _reject_emit_pipeline_direct_clamped_stores(
+    state: CodegenState,
+    stored_tensors: dict[
+        int, tuple[torch.Tensor, torch.fx.Node, list[object], list[list[object]]]
+    ],
+    block_ids: list[int],
+    env: CompileEnvironment,
+    pipelined_store_tensor_ids: set[int],
+) -> None:
+    for key, (fake, _tensor_node, _sub_meta, store_sub_metas) in stored_tensors.items():
+        if key in pipelined_store_tensor_ids:
+            continue
+        if not _store_needs_initial_value_preserved(
+            state, fake, store_sub_metas, block_ids, env
+        ):
+            continue
+        for sub_meta in store_sub_metas:
+            dim_to_bid = _get_dim_block_ids(sub_meta, env)
+            for dim_idx, bid in dim_to_bid.items():
+                if bid not in block_ids:
+                    continue
+                if _store_dim_requires_extent_clamp(
+                    state,
+                    block_ids.index(bid),
+                    fake.shape[dim_idx],
+                    env,
+                    bid,
+                    dim_to_bid,
+                ):
+                    raise _emit_pipeline_direct_clamped_store_error()
 
 
 def _aligned_dim(
@@ -2479,10 +3046,29 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         loaded_tensors,
         stored_tensors,
         block_ids,
+        begin_exprs,
+        iter_step_exprs,
         slice_size_exprs,
         env,
         state,
         copy_in_read_write=False,
+        allow_row_slab_store=True,
+        require_aligned_offsets=True,
+    )
+    safe_pipelined_store_candidates = _exact_dma_store_tensor_ids(
+        state, graph_info, loaded_tensors, stored_tensors, block_ids, env
+    )
+    safe_pipelined_store_ids = pipelined_tensor_ids & safe_pipelined_store_candidates
+    _reject_partial_last_two_dim_stores(
+        state,
+        stored_tensors,
+        block_ids,
+        env,
+        aligned_dim,
+        safe_pipelined_store_tensor_ids=safe_pipelined_store_ids,
+    )
+    _reject_emit_pipeline_direct_clamped_stores(
+        state, stored_tensors, block_ids, env, pipelined_tensor_ids
     )
 
     # Build in_specs and out_specs
@@ -2554,30 +3140,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 )
                 _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 begin_is_zero = begin_expr == "0"
-                end_expr = end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
-                # Whether this loop spans the ENTIRE backing tensor dim, i.e.
-                # ``[0, dim_size)`` with a compile-time-constant extent. Only
-                # then is a full-block store safe: a partial final tile overruns
-                # past ``dim_size`` into padding, which the host-side pad handles.
-                # For any sub-range -- a jagged ``hl.tile(start, end)``, a
-                # ``hl.tile(0, dynamic_end)``, or even a static ``hl.tile(0, k)``
-                # with ``k < dim_size`` -- a full-block store would overrun into
-                # live rows of the tensor, so the extent must be clamped.
-                covers_full_dim = (
-                    begin_is_zero
-                    and _is_static_int(end_expr)
-                    and isinstance(dim_size, int)
-                    and int(end_expr) == dim_size
+                store_requires_clamp = is_store and _store_dim_requires_extent_clamp(
+                    state, bid_idx, dim_size, env, bid, dim_to_bid
                 )
                 # Loads need a dynamic ``pl.ds`` only for a non-zero begin (a
                 # block-aligned index can't express an arbitrary start; the
                 # over-read past ``end`` is zeroed by the inner-loop mask).
-                # Stores need it whenever they target a sub-range (not the full
-                # dim), so the extent can be clamped and a partial final tile
-                # does not overrun live rows. Full-dim, from-zero loops keep the
-                # original block-index codegen (no change).
-                if not begin_is_zero or (is_store and not covers_full_dim):
+                # Stores need it only when their extent must be clamped.
+                if not begin_is_zero or store_requires_clamp:
                     # Dynamic ``pl.ds`` at the true element offset, with a
                     # ``pl.BoundedSlice`` block shape (required for ds-style
                     # index maps). Lifts the "emit_pipeline fails on unaligned
@@ -2587,7 +3158,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         f"({begin_expr}) + ({lambda_params[bid_idx]}) "
                         f"* ({iter_step_expr})"
                     )
-                    if is_store and bid not in state.device_function.carry_tiles:
+                    if (
+                        store_requires_clamp
+                        and bid not in state.device_function.carry_tiles
+                    ):
                         # Clamp the store extent to min(block, end - offset) so a
                         # short final tile writes only its valid rows
                         # [begin, end) instead of overrunning into the next
@@ -3002,8 +3576,10 @@ def _is_supported_contiguous_row_slab_dma(
     vmem_shape: tuple[int, ...],
     env: CompileEnvironment,
     state: CodegenState,
+    *,
+    require_aligned_lane: bool = True,
 ) -> bool:
-    """Whether an otherwise-unaligned load is a contiguous row-slab DMA.
+    """Whether an otherwise-unaligned access is a contiguous row-slab transfer.
 
     ``_check_dma_alignment`` is conservative for shapes like
     ``[TOKEN_BLOCK, H=4, D=128]`` because the second-to-last logical dim is not a
@@ -3011,9 +3587,11 @@ def _is_supported_contiguous_row_slab_dma(
     for row-slab layouts: rows are page-addressed and the full suffix is
     contiguous with an aligned lane dimension.
 
-    Keep this exception narrow: load-only caller, one dynamic-begin/end
-    current-loop row tile, only scalar-selected prefix dims, full-slice suffix,
-    no gathers/scatters/stores.
+    Keep this exception narrow: one dynamic-begin/end current-loop row tile,
+    only scalar-selected prefix dims, full-slice suffix, no gathers/scatters.
+    ``fori_loop``/manual DMA uses it for loads only; emit_pipeline also opts
+    output row-slab stores into the Buffered BlockSpec path so its out_spec can
+    clamp the live extent.
     """
     if not fake.is_floating_point():
         return False
@@ -3049,16 +3627,87 @@ def _is_supported_contiguous_row_slab_dma(
 
     for dim_idx in range(row_dim + 1, fake.ndim):
         idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
-        if idx_meta != slice(None):
-            return False
         if dim_idx in dim_to_bid:
+            suffix_bid = dim_to_bid[dim_idx]
+            dim_size = fake.shape[dim_idx]
+            block_value = state.device_function.resolved_block_size(suffix_bid)
+            if (
+                suffix_bid not in block_ids
+                and isinstance(dim_size, int)
+                and block_value == dim_size
+                and _block_id_covers_full_tensor_dim(state, suffix_bid, dim_size)
+            ):
+                continue
+            return False
+        if idx_meta != slice(None):
             return False
         dim_size = fake.shape[dim_idx]
         if not isinstance(dim_size, int) or vmem_shape[dim_idx] != dim_size:
             return False
 
     lane_dim = fake.shape[-1]
-    return isinstance(lane_dim, int) and lane_dim % 128 == 0
+    if not isinstance(lane_dim, int):
+        return False
+    if lane_dim % 128 == 0:
+        return True
+    return not require_aligned_lane and fake.dtype == torch.float32
+
+
+def _dma_dim_required_alignment(vmem_shape: tuple[int, ...], dim_idx: int) -> int:
+    if len(vmem_shape) >= 2:
+        if dim_idx == len(vmem_shape) - 1:
+            return 128
+        if dim_idx == len(vmem_shape) - 2:
+            return 8
+    elif len(vmem_shape) == 1 and dim_idx == 0:
+        return 128
+    return 1
+
+
+def _dma_offsets_are_aligned(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    tensor_subscripts = _tensor_dim_subscripts(sub_meta)
+    for dim_idx in range(fake.ndim):
+        required = _dma_dim_required_alignment(vmem_shape, dim_idx)
+        if required <= 1:
+            continue
+        bid = dim_to_bid.get(dim_idx)
+        if bid is not None and bid in block_ids:
+            bid_idx = block_ids.index(bid)
+            if not _expr_proven_multiple(
+                begin_exprs[bid_idx], required, state, block_id=bid
+            ):
+                return False
+            if not _expr_proven_multiple(
+                iter_step_exprs[bid_idx], required, state, block_id=bid
+            ):
+                return False
+            continue
+        if bid is not None:
+            grid_loops = state.codegen.active_device_loops.get(bid)
+            if grid_loops and not _expr_proven_multiple(
+                state.codegen.offset_var(bid), required, state, block_id=bid
+            ):
+                return False
+            continue
+
+        idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
+        from helion._utils import is_scalar_index
+
+        if is_scalar_index(idx_meta):
+            offset_expr = state.device_function.literal_expr(idx_meta)
+            if not _expr_proven_multiple(offset_expr, required, state):
+                return False
+    return True
 
 
 def _can_stream_inner_tile(
@@ -3067,13 +3716,30 @@ def _can_stream_inner_tile(
     direction: str,
     block_ids: list[int],
     vmem_shape: tuple[int, ...],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    *,
+    allow_row_slab_store: bool = False,
+    require_aligned_offsets: bool = True,
 ) -> bool:
     """Return whether a loop-local tensor should use the inner streaming path."""
-    if _check_dma_alignment(vmem_shape):
+    if _check_dma_alignment(vmem_shape) and (
+        not require_aligned_offsets
+        or _dma_offsets_are_aligned(
+            fake,
+            sub_meta,
+            block_ids,
+            vmem_shape,
+            begin_exprs,
+            iter_step_exprs,
+            env,
+            state,
+        )
+    ):
         return True
-    if direction != "load":
+    if direction != "load" and not (allow_row_slab_store and direction == "store"):
         return False
     return _is_supported_contiguous_row_slab_dma(
         fake, sub_meta, block_ids, vmem_shape, env, state
@@ -3123,12 +3789,147 @@ def _compute_vmem_shapes(
     return vmem_shapes
 
 
+def _global_loop_bound_expr(value: object) -> str:
+    """Return a proof-only expression for a loop bound seen outside codegen."""
+    if isinstance(value, torch.fx.Node):
+        value = value.meta.get("val", value)
+    if isinstance(value, torch.SymInt):
+        return str(_val_to_sympy(value))
+    if isinstance(value, sympy.Expr):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    # Dynamic scalar tensors have an AST expression only while their caller is
+    # being lowered.  An opaque symbol makes alignment checks fail closed while
+    # still allowing row-slab eligibility, which does not inspect this string.
+    return "__helion_unknown_loop_bound"
+
+
+def _globally_aligned_dma_offsets(
+    caller_graph_id: int,
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    """Prove DMA offset alignment without borrowing another caller's scope."""
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    tensor_subscripts = _tensor_dim_subscripts(sub_meta)
+    for dim_idx in range(fake.ndim):
+        required = _dma_dim_required_alignment(vmem_shape, dim_idx)
+        if required <= 1:
+            continue
+        bid = dim_to_bid.get(dim_idx)
+        if bid is not None and bid in block_ids:
+            bid_idx = block_ids.index(bid)
+            if not _expr_proven_multiple(
+                begin_exprs[bid_idx], required, state, block_id=bid
+            ) or not _expr_proven_multiple(
+                iter_step_exprs[bid_idx], required, state, block_id=bid
+            ):
+                return False
+            continue
+        if bid is not None:
+            # Root-level sibling loops may share the current root grid. Its
+            # offset is common to every sibling call in this root; never borrow
+            # the current root's proof for a nested or different-root caller.
+            root_graph = state.codegen.current_root_graph_info
+            grid_state = state.codegen.current_grid_state
+            if (
+                root_graph is None
+                or caller_graph_id != root_graph.graph_id
+                or grid_state is None
+                or bid not in grid_state.block_ids
+                or not _expr_proven_multiple(
+                    grid_state.strategy.offset_var(bid),
+                    required,
+                    state,
+                    block_id=bid,
+                )
+            ):
+                return False
+            continue
+        idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
+        if is_scalar_index(idx_meta) and not _expr_proven_multiple(
+            _global_loop_bound_expr(idx_meta), required, state
+        ):
+            return False
+    return True
+
+
+def _global_loop_call_variants(
+    graph_id: int,
+    block_ids: list[int],
+    state: CodegenState,
+) -> list[tuple[int, CodegenState, list[str], list[str], list[str]]]:
+    """Recover every call site's bounds and step-derived DMA shape."""
+    device_ir = HostFunction.current().device_ir
+    block_sizes: list[int] = []
+    for block_id in block_ids:
+        block_size = state.device_function.resolved_block_size(block_id)
+        if not isinstance(block_size, int):
+            return []
+        block_sizes.append(block_size)
+
+    variants: list[tuple[int, CodegenState, list[str], list[str], list[str]]] = []
+    for caller_info in device_ir.graphs:
+        for node in caller_info.graph.nodes:
+            if (
+                node.op != "call_function"
+                or node.target not in (_for_loop, _for_loop_step)
+                or not node.args
+                or node.args[0] != graph_id
+            ):
+                continue
+            begins = _extract_subscript_vals(node.args[1])
+            ends = _extract_subscript_vals(node.args[2])
+            if node.target is _for_loop:
+                steps: list[object] = [None] * len(block_ids)
+            else:
+                steps = _extract_subscript_vals(node.args[4])
+            if not (len(begins) == len(ends) == len(steps) == len(block_ids)):
+                return []
+
+            proxy_args = list(node.args)
+            proxy_args[1] = begins
+            proxy_args[2] = ends
+            if node.target is _for_loop_step:
+                proxy_args[4] = steps
+            variant_state = state._replace(fx_node=node, proxy_args=proxy_args)
+            begin_exprs = [_global_loop_bound_expr(begin) for begin in begins]
+            iter_step_exprs = [
+                str(block_size)
+                if _is_default_pallas_loop_step(step)
+                else _global_loop_bound_expr(step)
+                for block_size, step in zip(block_sizes, steps, strict=True)
+            ]
+            slice_size_exprs = [
+                str(block_size) if _is_default_pallas_loop_step(step) else "1"
+                for block_size, step in zip(block_sizes, steps, strict=True)
+            ]
+            variants.append(
+                (
+                    caller_info.graph_id,
+                    variant_state,
+                    begin_exprs,
+                    iter_step_exprs,
+                    slice_size_exprs,
+                )
+            )
+    return variants
+
+
 def _storage_has_globally_compatible_loop_accesses(
     storage_id: int,
     env: CompileEnvironment,
     state: CodegenState,
     *,
     copy_in_read_write: bool,
+    require_aligned_offsets: bool,
 ) -> bool:
     """Whether every graph using a shared storage can use one global HBM route."""
     from ..device_ir import ForLoopGraphInfo
@@ -3137,18 +3938,24 @@ def _storage_has_globally_compatible_loop_accesses(
         return False
 
     device_ir = HostFunction.current().device_ir
+    current_graph_id = state.proxy_arg(0)
+    assert isinstance(current_graph_id, int)
     loop_candidates: list[bool] = []
     alias_storages = env.input_alias_groups.get(storage_id, frozenset((storage_id,)))
     alias_group_size = env.input_alias_group_sizes.get(storage_id, 1)
     accessed_alias_storages: set[int] = set()
     has_stores = False
     has_non_loop_access = False
-    matching_loop_count = 0
-    has_read_write = False
+    top_level_route_count = 0
+    top_level_mutating_route_count = 0
 
     def matches_storage(fake: torch.Tensor) -> bool:
         return id(fake.untyped_storage()) in alias_storages
 
+    classified_accesses: list[
+        tuple[object, dict[int, LoadedTensorInfo], dict[int, StoredTensorInfo], bool]
+    ] = []
+    matching_loop_graph_ids: set[int] = set()
     for graph_info in device_ir.graphs:
         loaded, stored = _classify_loop_tensors(graph_info, state)
         matching_loaded = {
@@ -3157,6 +3964,20 @@ def _storage_has_globally_compatible_loop_accesses(
         matching_stored = {
             key: info for key, info in stored.items() if matches_storage(info[0])
         }
+        classified_accesses.append(
+            (graph_info, matching_loaded, matching_stored, bool(stored))
+        )
+        if isinstance(graph_info, ForLoopGraphInfo) and (
+            matching_loaded or matching_stored
+        ):
+            matching_loop_graph_ids.add(graph_info.graph_id)
+
+    for (
+        graph_info,
+        matching_loaded,
+        matching_stored,
+        graph_has_stores,
+    ) in classified_accesses:
         if not matching_loaded and not matching_stored:
             continue
         accessed_alias_storages.update(
@@ -3169,12 +3990,12 @@ def _storage_has_globally_compatible_loop_accesses(
         if not isinstance(graph_info, ForLoopGraphInfo):
             has_non_loop_access = True
             continue
-        matching_loop_count += 1
         if len(matching_loaded.keys() | matching_stored.keys()) != 1:
             loop_candidates.append(False)
             continue
 
         all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
+        graph_candidate = True
         for key, (fake, _node, sub_meta) in matching_loaded.items():
             if key not in matching_stored:
                 all_tensor_info.append((fake, sub_meta, "load"))
@@ -3184,53 +4005,67 @@ def _storage_has_globally_compatible_loop_accesses(
                 for store_meta in store_metas
             )
             unsafe_read_write = key in matching_loaded and not copy_in_read_write
-            has_read_write = has_read_write or key in matching_loaded
-            if widened_store or unsafe_read_write:
-                loop_candidates.append(False)
-                continue
+            if (
+                widened_store
+                or unsafe_read_write
+                or _multi_store_writeback_lacks_single_cover(
+                    fake, sub_meta, store_metas, env
+                )
+            ):
+                graph_candidate = False
             all_tensor_info.append((fake, sub_meta, "store"))
 
-        block_sizes: list[int] = []
-        for block_id in graph_info.block_ids:
-            block_size = state.device_function.resolved_block_size(block_id)
-            if not isinstance(block_size, int):
-                loop_candidates.append(False)
-                break
-            block_sizes.append(block_size)
-        else:
-            step_variants: list[list[object]] = []
-            for caller_info in device_ir.graphs:
-                for node in caller_info.graph.nodes:
-                    if (
-                        node.op != "call_function"
-                        or node.target not in (_for_loop, _for_loop_step)
-                        or not node.args
-                        or node.args[0] != graph_info.graph_id
-                    ):
-                        continue
-                    if node.target is _for_loop:
-                        step_variants.append([None] * len(graph_info.block_ids))
-                    else:
-                        step_variants.append(_extract_subscript_vals(node.args[4]))
-            if not step_variants:
-                step_variants.append([None] * len(graph_info.block_ids))
-
-            for steps in step_variants:
-                if len(steps) != len(graph_info.block_ids):
-                    loop_candidates.append(False)
-                    continue
-                slice_size_exprs = [
-                    str(block_size) if _is_default_pallas_loop_step(step) else "1"
-                    for block_size, step in zip(block_sizes, steps, strict=True)
-                ]
-                vmem_shapes = _compute_vmem_shapes(
-                    all_tensor_info,
-                    graph_info.block_ids,
-                    slice_size_exprs,
-                    env,
-                    state,
+        variants = _global_loop_call_variants(
+            graph_info.graph_id, graph_info.block_ids, state
+        )
+        if not variants:
+            loop_candidates.append(False)
+            continue
+        for (
+            caller_graph_id,
+            variant_state,
+            begin_exprs,
+            iter_step_exprs,
+            slice_size_exprs,
+        ) in variants:
+            if (
+                caller_graph_id in matching_loop_graph_ids
+                and graph_info.graph_id != current_graph_id
+            ):
+                # Nested accesses reuse and validate the enclosing DMA scratch
+                # when they are lowered; they are not independent HBM routes.
+                continue
+            top_level_route_count += 1
+            top_level_mutating_route_count += int(graph_has_stores)
+            variant_candidate = graph_candidate
+            vmem_shapes = _compute_vmem_shapes(
+                all_tensor_info,
+                graph_info.block_ids,
+                slice_size_exprs,
+                env,
+                variant_state,
+            )
+            variant_candidate = variant_candidate and all(
+                _check_dma_alignment(vmem_shape)
+                and (
+                    not require_aligned_offsets
+                    or _globally_aligned_dma_offsets(
+                        caller_graph_id,
+                        fake,
+                        sub_meta,
+                        graph_info.block_ids,
+                        vmem_shape,
+                        begin_exprs,
+                        iter_step_exprs,
+                        env,
+                        variant_state,
+                    )
                 )
-                loop_candidates.extend(map(_check_dma_alignment, vmem_shapes))
+                for (fake, sub_meta, _direction), vmem_shape in zip(
+                    all_tensor_info, vmem_shapes, strict=True
+                )
+            )
+            loop_candidates.append(variant_candidate)
 
     if alias_group_size > 1 and has_stores:
         raise BackendUnsupported(
@@ -3239,14 +4074,24 @@ def _storage_has_globally_compatible_loop_accesses(
         )
     if len(accessed_alias_storages) > 1 or has_non_loop_access:
         return False
-    if (
-        env.compact_worklist_plan is not None
-        and matching_loop_count > 1
-        and has_read_write
+    # Separate loop-local DMA scratch outputs do not compose into one outer HBM
+    # result: a later sibling can lose or overwrite an earlier writeback. Shared
+    # stores therefore keep the single outer VMEM route.
+    if has_stores and top_level_route_count > 1:
+        return False
+    loop_type = state.config.get("pallas_loop_type")
+    if loop_type == "emit_pipeline" and top_level_mutating_route_count > 1:
+        # Multiple pipelines that mutate outer refs retain the conservative
+        # shared-memory route. Besides avoiding lost updates, this sidesteps a
+        # JAX state-discharge limitation for repeated buffered input refs.
+        return False
+    if env.compact_worklist_plan is not None and (
+        top_level_route_count > 1 or len(loop_candidates) > 1
     ):
         return False
-    # A single loop can still use the current call's row-slab exception. Shared
-    # storage needs the standard alignment in every loop so routing is global.
+    # A single loop uses its local classifier. Shared read-only storage needs
+    # standard shape/offset alignment in every caller; row-slab exceptions are
+    # deliberately local because their outer-scope proof is caller-specific.
     return len(loop_candidates) <= 1 or all(loop_candidates)
 
 
@@ -3266,22 +4111,29 @@ def _classify_pipelined_tensors(
     loaded_tensors: dict[int, LoadedTensorInfo],
     stored_tensors: dict[int, StoredTensorInfo],
     block_ids: list[int],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
     *,
     copy_in_read_write: bool,
+    allow_row_slab_store: bool = False,
+    require_aligned_offsets: bool = True,
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
     """Build (all_tensor_info, vmem_shapes, pipelined_ids) for an inner loop.
 
-    A tensor is eligible for the inner-DMA path (HBM ref + small VMEM scratch
-    in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
+    A tensor is eligible for the inner streaming path (HBM ref + small VMEM
+    scratch in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
 
     * Its inner-block ``vmem_shape`` passes the standard TPU DMA alignment check,
-      or it is a load-only contiguous row-slab layout covered by
-      ``_is_supported_contiguous_row_slab_dma``.
+      or it is a contiguous row-slab layout covered by
+      ``_is_supported_contiguous_row_slab_dma`` (loads by default; stores only
+      when the caller opts in). Standard DMA shapes require aligned offsets;
+      emit_pipeline permits dynamic row offsets only through the narrow
+      contiguous row-slab exception.
     * It is not also accessed at outer scope (i.e. in a root graph,
       between/before/after inner loops).  Pipelining replaces the tensor's
       outer BlockSpec with ``pltpu.HBM`` so the inner loop's BlockSpec can
@@ -3301,6 +4153,10 @@ def _classify_pipelined_tensors(
     outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
 
     all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
+    store_sub_metas = {
+        id(fake): original_sub_metas
+        for fake, _tensor_node, _sub_meta, original_sub_metas in stored_tensors.values()
+    }
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
@@ -3413,8 +4269,37 @@ def _classify_pipelined_tensors(
             # Reuse the enclosing scratch. This preserves pending writes and lets
             # its owner perform the single HBM writeback after the nested loop.
             continue
+        if direction == "store" and _multi_store_writeback_lacks_single_cover(
+            fake,
+            sub_meta,
+            store_sub_metas[id(fake)],
+            env,
+        ):
+            continue
+        if (
+            direction == "store"
+            and not (copy_in_read_write and id(fake) in loaded_tensors)
+            and _store_needs_initial_value_preserved(
+                state,
+                fake,
+                store_sub_metas[id(fake)],
+                block_ids,
+                env,
+            )
+        ):
+            continue
         if not _can_stream_inner_tile(
-            fake, sub_meta, direction, block_ids, vmem_shape, env, state
+            fake,
+            sub_meta,
+            direction,
+            block_ids,
+            vmem_shape,
+            begin_exprs,
+            iter_step_exprs,
+            env,
+            state,
+            allow_row_slab_store=allow_row_slab_store,
+            require_aligned_offsets=require_aligned_offsets,
         ):
             continue
         if not _storage_has_globally_compatible_loop_accesses(
@@ -3422,6 +4307,7 @@ def _classify_pipelined_tensors(
             env,
             state,
             copy_in_read_write=copy_in_read_write,
+            require_aligned_offsets=require_aligned_offsets,
         ):
             continue
         if id(fake) in unsafe_store_ids:
@@ -3652,6 +4538,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         loaded_tensors,
         stored_tensors,
         block_ids,
+        begin_exprs,
+        iter_step_exprs,
         slice_size_exprs,
         env,
         state,
@@ -3700,6 +4588,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 if state.device_function.tensor_arg(_fid_to_fake_o[fid]).host_str()
                 not in _ordered_names
             }
+
+    _reject_partial_last_two_dim_stores(state, stored_tensors, block_ids, env)
 
     from ..device_function import PallasMemorySpace
 
@@ -4209,8 +5099,14 @@ def _(state: CodegenState) -> list[object]:
 
     JAX's tracing model does not support Python ``if`` on traced values.
     We use ``lax.cond(pred, true_fn, false_fn)`` which requires a scalar
-    predicate. Tensor-derived predicates (from tensor loads) are unsupported
-    because TPU block shapes make them vectors at runtime.
+    predicate. Tensor-derived predicates are accepted only when Helion proves
+    they have one element; already-scalar predicates are passed through, and
+    one-element arrays are indexed to scalar form. Bool arrays are widened before
+    indexing because Mosaic cannot squeeze bool vectors directly. Multi-element
+    tensor predicates are rejected because ``lax.cond`` cannot branch
+    elementwise. Bool view/unsqueeze codegen may carry a numeric 0/1 mask under
+    bool metadata, so this boundary explicitly converts nonzero values to a
+    scalar predicate.
     """
     from ..device_ir import ElseGraphInfo
     from ..device_ir import IfGraphInfo
@@ -4356,6 +5252,7 @@ def _(state: CodegenState) -> ast.AST:
                 )
             # Cast bool mask to float before expanding — Mosaic cannot
             # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+            # Downstream numeric_where_expr treats nonzero mask values as true.
             expr = f"({mask_var}.astype(jnp.float32){expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)

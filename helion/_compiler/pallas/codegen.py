@@ -6,11 +6,14 @@ import ast
 import math
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 
 from helion import exc
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.compile_environment import _symint_sympy_expr
+from helion._compiler.pallas.plan_tiling import TilePattern
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
 from helion._utils import is_scalar_index
@@ -999,6 +1002,120 @@ def sliced_value_for_store(
     )
 
 
+def reject_partial_last_two_dim_direct_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    index_parts: list[str],
+) -> None:
+    """Reject direct stores that cannot clamp a partial lane/sublane tile."""
+
+    assert state.fx_node is not None
+    if _tensor_routed_to_dma_scratch(state, tensor):
+        return
+
+    indexing_patterns = _get_indexing_patterns(state, tensor)
+    tensor_dim = 0
+    index_part_idx = 0
+    for idx, pattern in zip(subscript, indexing_patterns, strict=True):
+        if idx is None:
+            continue
+
+        index_part = index_parts[index_part_idx]
+        index_part_idx += 1
+        if (
+            isinstance(pattern, TilePattern)
+            and tensor_dim >= tensor.ndim - 2
+            and _index_part_is_direct_store(index_part)
+            and _bounded_local_owner_block_id(
+                state, pattern.block_id, tensor, tensor_dim
+            )
+            is None
+            and _tile_loop_needs_store_extent_clamp(
+                state, pattern.block_id, tensor, tensor_dim
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "pallas",
+                "a partial store whose tiled dimension is one of the last two "
+                "(lane/sublane) dimensions is not supported; direct Pallas "
+                "stores cannot clamp the live write extent there. Move the "
+                "partial dimension to a leading position, e.g. "
+                "[tokens, heads, head_dim]",
+            )
+        tensor_dim += 1
+
+
+def _index_part_is_direct_store(index_part: str) -> bool:
+    return index_part == ":" or index_part.startswith("pl.ds(")
+
+
+def _tile_loop_needs_store_extent_clamp(
+    state: CodegenState,
+    block_id: int,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+) -> bool:
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return False
+    loop = loops[-1]
+    if state.config.get("pallas_loop_type", "unroll") == "unroll":
+        from helion._compiler.tile_strategy import ForiLoopState
+
+        if isinstance(loop, ForiLoopState):
+            # A dependent Tile.end unroll uses an exact runtime trip count. Its
+            # direct stores are protected by the ordinary ds-padding path, so
+            # they do not need a separate live-extent clamp.
+            return False
+    info = loop.block_id_to_info.get(block_id)
+    if info is None:
+        return False
+    dim_size = tensor.shape[tensor_dim]
+    env = CompileEnvironment.current()
+    block_size = env.block_sizes[block_id]
+    resolved_block_size = state.device_function.resolved_block_size(block_id)
+    if isinstance(resolved_block_size, int) and block_size.known_multiple(
+        resolved_block_size
+    ):
+        return False
+    if (
+        info.begin_expr in (0, sympy.Integer(0))
+        and isinstance(block_size.size, (int, torch.SymInt))
+        and isinstance(dim_size, (int, torch.SymInt))
+        and env.known_equal(block_size.size, dim_size)
+    ):
+        return False
+    if info.begin_expr is None or not isinstance(block_size.size, (int, torch.SymInt)):
+        return True
+    if isinstance(dim_size, torch.SymInt):
+        dim_expr = _symint_sympy_expr(dim_size)
+    elif isinstance(dim_size, int):
+        dim_expr = sympy.Integer(dim_size)
+    else:
+        return True
+    absolute_end = sympy.sympify(info.begin_expr) + block_size.numel
+    return sympy.simplify(absolute_end - dim_expr) != 0
+
+
+def _tile_loop_needs_extent_clamp(
+    state: CodegenState,
+    block_id: int,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+) -> bool:
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return False
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None:
+        return False
+    dim_size = tensor.shape[tensor_dim]
+    if not info.is_end_matching(dim_size):
+        return True
+    return info.begin_expr is not None and info.begin_expr != 0
+
+
 def _tile_needs_mask(
     state: CodegenState,
     block_id: int,
@@ -1012,16 +1129,7 @@ def _tile_needs_mask(
     symbolic size at *tensor_dim*.  This includes data-dependent bounds and
     constexpr sub-ranges.
     """
-    loops = state.codegen.active_device_loops.get(block_id)
-    if not loops:
-        return False
-    info = loops[-1].block_id_to_info.get(block_id)
-    if info is None:
-        return False
-    dim_size = tensor.shape[tensor_dim]
-    if not info.is_end_matching(dim_size):
-        return True
-    return info.begin_expr is not None and info.begin_expr != 0
+    return _tile_loop_needs_extent_clamp(state, block_id, tensor, tensor_dim)
 
 
 def _can_tile_dimension(state: CodegenState, tensor_dim: int) -> bool:

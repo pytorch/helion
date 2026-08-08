@@ -16,13 +16,11 @@ from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
-# TODO(tcombes): JAX Pallas interpret mode can't trace these emit_pipeline
-# kernels.  The jagged reads use a dynamic pl.ds / BoundedSlice BlockSpec, and
-# the static matmul calls pl.program_id inside the pipeline body.  They pass on
-# real TPU; drop the xfail when interpret supports them.
-_XFAIL_INTERPRET = (
-    "emit_pipeline dynamic pl.ds / program_id BlockSpecs unsupported in JAX "
-    "Pallas interpret mode"
+# JAX Pallas interpret mode cannot trace the jagged matmul pipelines below:
+# their dynamic BlockSpecs and ``pl.program_id`` use inside ``emit_pipeline``
+# trigger Ref-discharge errors. They run on real TPU, so keep that coverage.
+_XFAIL_INTERPRET_JAGGED_MATMUL = (
+    "emit_pipeline jagged matmul BlockSpecs unsupported in Pallas interpret mode"
 )
 
 
@@ -104,7 +102,7 @@ def _run(seq_offsets, jagged, dense, block_sizes, kernel=jagged_dense_bmm):
 class TestPallasJaggedCarrySimple(TestCase):
     """Minimal kernels that isolate one carry behaviour each."""
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
     def test_single_group(self, dtype: torch.dtype, kernel) -> None:
@@ -114,7 +112,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
     def test_aligned_groups_carry_dormant(self, dtype: torch.dtype, kernel) -> None:
@@ -124,7 +122,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         self.assertIn("pl.program_id(0) != 0", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
     def test_carry_keeps_both_groups(self, kernel) -> None:
         # Two groups [0, 3) and [3, 16) share the [0, 16) boundary.  With
@@ -141,7 +139,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         )
         torch.testing.assert_close(out, jagged)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_carry_masks_bias_add(self, dtype: torch.dtype) -> None:
         # Additive map across a shared boundary: groups [0, 3) and [3, 16) over-
@@ -169,7 +167,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         )
         torch.testing.assert_close(out, jagged + 1.0)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_carry_separate_outputs(self, dtype: torch.dtype) -> None:
         # Two stores share one jagged tile: each must carry into its own scratch,
@@ -200,7 +198,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         torch.testing.assert_close(o1, jagged + 1.0)
         torch.testing.assert_close(o2, jagged + 2.0)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_carry_scalar_branch_store(self, dtype: torch.dtype) -> None:
         # Two groups take different if/else branches across a shared boundary.
@@ -245,7 +243,7 @@ class TestPallasJaggedCarryBmm(TestCase):
     """The carry across the full configuration matrix (group counts, block vs
     group size, multiple column tiles, the non-matmul map-axis form)."""
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize(
         "offsets",
@@ -264,7 +262,7 @@ class TestPallasJaggedCarryBmm(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
     def test_bmm_block_gt_group(self, dtype: torch.dtype, kernel) -> None:
@@ -273,17 +271,20 @@ class TestPallasJaggedCarryBmm(TestCase):
         _code, out = _run(seq_offsets, jagged, dense, [32, 128, 128], kernel=kernel)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
     def test_bmm_multi_k_tile(self, dtype: torch.dtype, kernel) -> None:
         # K=256 with block_col=128 gives two output-column tiles; the carry stacks
         # the per-column-tile boundaries along its scratch row dim.
         seq_offsets, jagged, dense = _inputs([0, 17, 40, 71], 128, 256, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
+        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("_explicit_indices", 1)[0]
+        self.assertNotIn("jnp.minimum", out_specs)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
     def test_bmm_many_groups(self, dtype: torch.dtype, kernel) -> None:
@@ -294,7 +295,7 @@ class TestPallasJaggedCarryBmm(TestCase):
         self.assertIn("carry", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize(
         "offsets",
@@ -313,7 +314,7 @@ class TestPallasJaggedCarryBmm(TestCase):
         _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     def test_elementwise_map_axis(self) -> None:
         # The non-matmul map-axis store from commit 2 now runs: out[st] = 2 *
         # jagged[st], carried across the shared boundary like the matmul case.
@@ -342,7 +343,7 @@ class TestPallasJaggedCarryBmm(TestCase):
         )
         torch.testing.assert_close(out, jagged * 2)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET_JAGGED_MATMUL)
     @parametrize("dynamic_cols", [True, False])
     def test_dynamic_rows(self, dynamic_cols: bool) -> None:
         @helion.kernel(backend="pallas", static_shapes=False)

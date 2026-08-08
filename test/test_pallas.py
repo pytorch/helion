@@ -1258,13 +1258,249 @@ class TestPallas(TestCase):
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
         starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
         ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
-        with self.assertRaisesRegex(Exception, "lane/sublane"):
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"):
             code_and_output(
                 ragged_last_two_dim,
                 (x, starts, ends),
                 block_sizes=[8],
                 pallas_loop_type="fori_loop",
             )
+
+    def test_fori_loop_last_two_dim_initialized_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_fori_loop_partial_multi_store_preserves_initialized_output(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def partial_multi_store(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            m = x.size(0)
+            for _program in hl.grid(1):
+                for tile in hl.tile(m):
+                    base = x[tile, 0] * 0.0
+                    out[tile, 0] = base + 1.0
+                    out[tile, 1] = base + 2.0
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        expected = torch.zeros_like(x)
+        expected[:, 0] = 1.0
+        expected[:, 1] = 2.0
+
+        code, result = code_and_output(
+            partial_multi_store,
+            (x,),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+
+        self.assertIn("jax.lax.fori_loop", code)
+        torch.testing.assert_close(result, expected)
+
+    def test_fori_loop_last_two_dim_scalar_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_fori_loop_last_two_dim_broadcast_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :].sum(dim=0, keepdim=True)
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    @xfailIfPallasInterpret(
+        "dynamic output pl.ds / pl.BoundedSlice BlockSpecs require real TPU Pallas."
+    )
+    def test_emit_pipeline_last_two_dim_ragged_store_uses_clamped_out_spec(
+        self,
+    ) -> None:
+        """Historical rejection case: emit_pipeline accepts this on real TPU."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor,
+            starts: torch.Tensor,
+            ends: torch.Tensor,
+            values: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                value = values[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + value
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        values = torch.tensor([1.0, 3.0], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            ragged_last_two_dim,
+            (x, starts, ends, values),
+            block_sizes=[8],
+            pallas_loop_type="emit_pipeline",
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BoundedSlice", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.BoundedSlice", out_specs)
+        self.assertIn("pl.ds(", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
+        self.assertRegex(out_specs.split("jnp.minimum(", 1)[1], r"\w+\s*-\s*\(")
+        expected = x.clone()
+        expected[0:4] = x[0:4] + values[0]
+        expected[4:8] = x[4:8] + values[1]
+        torch.testing.assert_close(result, expected)
+
+    def test_emit_pipeline_static_begin_dynamic_end_store_uses_buffered_output(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_begin_dynamic_end(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for seg in hl.grid(lengths.size(0)):
+                end = lengths[seg]
+                for tile in hl.tile(0, end):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        lengths = torch.tensor([4], dtype=torch.int32, device=DEVICE)
+        code = static_begin_dynamic_end.bind((x, lengths)).to_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.BoundedSlice", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
+
+    def test_emit_pipeline_last_two_dim_static_subrange_store_uses_buffered_output(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_subrange(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _seg in hl.grid(1):
+                for tile in hl.tile(0, 8):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code = static_subrange.bind((x,)).to_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.BoundedSlice", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
+
+    def test_empty_output_multi_partial_stores_preserve_prior_store(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def disjoint_partial_stores(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(1)
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for tile in hl.tile(n):
+                    out[32:96, tile, :] = x[32:96, tile, :] * 0.0 + 17.0
+                for tile in hl.tile(n):
+                    out[:32, tile, :] = x[:32, tile, :] + 1.0
+                    out[96:, tile, :] = x[96:, tile, :] + 2.0
+            return out
+
+        x = torch.randn(128, 16, 128, device=DEVICE, dtype=torch.float32)
+        expected = torch.empty_like(x)
+        expected[:32, :, :] = x[:32, :, :] + 1.0
+        expected[32:96, :, :] = 17.0
+        expected[96:, :, :] = x[96:, :, :] + 2.0
+
+        for loop_type in ("emit_pipeline", "fori_loop"):
+            with self.subTest(loop_type=loop_type):
+                code, result = code_and_output(
+                    disjoint_partial_stores,
+                    (x,),
+                    block_sizes=[8, 8],
+                    pallas_loop_type=loop_type,
+                )
+                torch.testing.assert_close(result, expected)
+                if loop_type == "emit_pipeline":
+                    self.assertIn("pltpu.emit_pipeline", code)
+                    self.assertNotIn("out_specs=", code)
+                else:
+                    self.assertIn("jax.lax.fori_loop", code)
+                    self.assertNotIn("pltpu.make_async_copy(out", code)
 
     def test_fori_loop_nested_same_tensor_scratch(self) -> None:
         """A nested RMW reuses its enclosing DMA scratch without a second route."""
@@ -2558,6 +2794,23 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    def test_emit_pipeline_store_keeps_block_sized_outer_tile(self) -> None:
+        # The final outer program starts at a non-zero offset and has a short
+        # tail; the inner M loop also ends with a partial tile.
+        x = torch.randn(6, 12, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(6, 12, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_add_3d,
+            (x, y),
+            block_sizes=[4, 8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pipeline_mode=pl.Buffered", out_specs)
+        torch.testing.assert_close(result, x + y)
+
     def test_full_slice_and_tile_share_dimension(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -2692,6 +2945,77 @@ class TestPallas(TestCase):
         self.assertNotIn("make_async_copy(x.at[", code)
         torch.testing.assert_close(out, x + 1.0)
         torch.testing.assert_close(broadcast, x[:, :1].expand_as(x))
+
+    def test_fori_loop_sibling_stores_use_outer_output_route(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for _ in hl.grid(1):
+                for tile_m, tile_n in hl.tile([m, n]):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
+                for tile_m, tile_n in hl.tile([m, n]):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + 2.0
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[8, 128, 8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertNotIn("pltpu.make_async_copy(out", code)
+        torch.testing.assert_close(result, x + 2.0)
+
+    def test_fori_loop_unaligned_sibling_disables_shared_dma_route(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            out = torch.empty([2], dtype=x.dtype, device=x.device)
+            for _ in hl.grid(1):
+                first = hl.zeros([1], dtype=x.dtype)
+                for tile in hl.tile(n):
+                    first = first + x[tile].sum()
+                out[0:1] = first
+
+                second = hl.zeros([1], dtype=x.dtype)
+                for tile in hl.tile(1, n):
+                    second = second + x[tile].sum()
+                out[1:2] = second
+            return out
+
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertNotIn("_hbm_arg_indices=[0", code)
+        torch.testing.assert_close(result, torch.stack((x.sum(), x[1:].sum())))
+
+    def test_ineligible_parent_disables_nested_dma_route(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                for _parent in hl.tile(1):
+                    bias = x[0, 1]
+                    for tile_m, tile_n in hl.tile([m, n]):
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + bias
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[1, 8, 128],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertNotIn("pltpu.make_async_copy(x", code)
+        torch.testing.assert_close(result, x + x[0, 1])
 
     def test_stepped_sibling_disables_shared_dma_route(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -2937,6 +3261,21 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertNotIn("pl.Buffered", code)
         torch.testing.assert_close(result.cpu(), expected)
+
+    def test_emit_pipeline_partial_rmw_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            for _program in hl.grid(1):
+                for tile in hl.tile(8, 23, block_size=16):
+                    x[tile, :, :] = x[tile, :, :] + 1.0
+            return x
+
+        x = torch.randn(32, 8, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "direct output store path cannot clamp the live write extent",
+        ):
+            fn.bind((x,)).to_code(helion.Config(pallas_loop_type="emit_pipeline"))
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
@@ -4888,6 +5227,194 @@ class TestPallas(TestCase):
             all(extra_pad == 0 for *_, extra_pad in pad_dims),
             f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
         )
+
+    def test_inner_tile_extent_must_divide_parent_before_skip_store_clamp(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty_like(x)
+            for parent in hl.tile(m, block_size=64):
+                for child in hl.tile(parent.begin, parent.end, block_size=48):
+                    out[child, :] = x[child, :] + 1.0
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        code = fn.bind((x,)).to_code(helion.Config(pallas_loop_type="emit_pipeline"))
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("jnp.minimum(", out_specs)
+
+    def test_nonzero_begin_parent_extent_keeps_nested_store_clamp(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for parent in hl.tile(16, 96, block_size=64):
+                for child in hl.tile(parent.begin, parent.end, block_size=32):
+                    out[child, :, :] = x[child, :, :] + 1.0
+            return out
+
+        x = torch.randn(128, 8, 128, device=DEVICE, dtype=torch.float32)
+        code = fn.bind((x,)).to_code(helion.Config(pallas_loop_type="emit_pipeline"))
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("jnp.minimum(", out_specs)
+
+    def test_inner_tile_partial_final_parent_initialized_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for parent in hl.tile(10, 90, block_size=64):
+                for child in hl.tile(parent.begin, parent.end, block_size=32):
+                    out[child, :, :] = x[child, :, :] + 1.0
+            return out
+
+        x = torch.randn(128, 8, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "direct output store path cannot clamp the live write extent",
+        ):
+            fn.bind((x,)).to_code(helion.Config(pallas_loop_type="emit_pipeline"))
+
+    def test_partial_last_two_dim_multi_store_checks_each_store_subscript(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def last_dim(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for _program in hl.grid(1):
+                for tile in hl.tile(0, 96, block_size=64):
+                    out[:, 0] = x[:, 0] + 1.0
+                    out[:, tile] = x[:, tile] + 2.0
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def second_last_dim(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for _program in hl.grid(1):
+                for tile in hl.tile(0, 96, block_size=64):
+                    out[:, 0, :] = x[:, 0, :] + 1.0
+                    out[:, tile, :] = x[:, tile, :] + 2.0
+            return out
+
+        cases = (
+            ("last", last_dim, torch.randn(8, 128, device=DEVICE)),
+            ("second_last", second_last_dim, torch.randn(4, 128, 16, device=DEVICE)),
+        )
+        for name, kernel, x in cases:
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"),
+            ):
+                kernel.bind((x,)).to_code(helion.Config(pallas_loop_type="fori_loop"))
+
+    def test_top_level_partial_last_two_dim_multi_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def last_dim(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(0, 96, block_size=64):
+                out[:, 0] = x[:, 0] + 1.0
+                out[:, tile] = x[:, tile] + 2.0
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def second_last_dim(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(0, 96, block_size=64):
+                out[:, 0, :] = x[:, 0, :] + 1.0
+                out[:, tile, :] = x[:, tile, :] + 2.0
+            return out
+
+        cases = (
+            ("last", last_dim, torch.randn(8, 128, device=DEVICE)),
+            ("second_last", second_last_dim, torch.randn(4, 128, 16, device=DEVICE)),
+        )
+        for name, kernel, x in cases:
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"),
+            ):
+                kernel.bind((x,)).to_code(helion.Config(pallas_loop_type="fori_loop"))
+
+    def test_nonzero_partial_last_two_dim_direct_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for _program in hl.grid(1):
+                for tile in hl.tile(16, 112, block_size=64):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"):
+            fn.bind((x,)).to_code(helion.Config(pallas_loop_type="fori_loop"))
+
+    @xfailIfPallasInterpret(
+        "outer BlockSpec plus inner pipeline uses a dynamic DMA slice in interpret mode"
+    )
+    def test_exact_block_subrange_last_two_dim_direct_store_allowed(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m in hl.tile(0, 64, block_size=16):
+                for tile_n in hl.tile(x.size(2), block_size=128):
+                    out[:, tile_m, tile_n] = x[:, tile_m, tile_n] + 1.0
+            return out
+
+        x = torch.randn(4, 65, 128, device=DEVICE, dtype=torch.float32)
+        expected = torch.zeros_like(x)
+        expected[:, :64, :] = x[:, :64, :] + 1.0
+        for loop_type in ("emit_pipeline", "fori_loop"):
+            with self.subTest(loop_type=loop_type):
+                code, result = code_and_output(
+                    fn,
+                    (x,),
+                    pallas_loop_type=loop_type,
+                )
+                if loop_type == "emit_pipeline":
+                    self.assertIn("pltpu.emit_pipeline", code)
+                    self.assertNotIn("out_specs=", code)
+                else:
+                    self.assertIn("jax.lax.fori_loop", code)
+                    self.assertNotIn("pltpu.make_async_copy(out", code)
+                torch.testing.assert_close(result, expected)
+
+    def test_bounded_inner_tile_uses_outer_blockspec_local_ds(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            m_block = hl.register_block_size(m)
+            out = torch.empty_like(x)
+            for mb_cta in hl.tile(m, block_size=m_block):
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    out[mb, :] = x[mb, :] * 2
+            return out
+
+        x = torch.randn(128, 16, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[64, 32],
+            pallas_loop_type="fori_loop",
+        )
+        match = re.search(r"_block_spec_info=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _block_spec_info in launcher call")
+        block_spec_info = ast.literal_eval(match.group(1))
+        self.assertEqual(
+            block_spec_info,
+            [((64, None), (0, None)), ((64, None), (0, None))],
+        )
+        self.assertRegex(
+            code,
+            r"pl\.ds\(pl\.multiple_of\(offset_\d+ - offset_\d+, "
+            r"_BLOCK_SIZE_\d+\), _BLOCK_SIZE_\d+\)",
+        )
+        torch.testing.assert_close(result, x * 2)
 
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
