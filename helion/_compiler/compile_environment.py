@@ -316,6 +316,7 @@ class CompileEnvironment:
             target_device_capability=target_device_capability(device),
             device=device,
             num_sm=_num_sm,
+            log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
@@ -370,15 +371,17 @@ class CompileEnvironment:
         # signal-pad clamp is symm-mem-specific and left to
         # restrict_pid_types_for_persistent().
         if settings.autotune_force_persistent:
-            self._disallow_nonpersistent_pid_types()
+            self._disallow_nonpersistent_pid_types(
+                reason="autotune_force_persistent is set"
+            )
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
 
-    def _disallow_nonpersistent_pid_types(self) -> None:
+    def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
         for pid_type in ("flat", "xyz"):
-            self.config_spec.disallow_pid_type(pid_type)
+            self.config_spec.disallow_pid_type(pid_type, reason=reason)
 
     def restrict_pid_types_for_persistent(self, args: Sequence[object]) -> None:
         """Restrict to persistent kernels when the kernel needs cross-rank sync.
@@ -411,7 +414,10 @@ class CompileEnvironment:
         if not uses_symm_mem and not self.has_barrier:
             return
 
-        self._disallow_nonpersistent_pid_types()
+        self._disallow_nonpersistent_pid_types(
+            reason="a distributed process group is initialized (persistent "
+            "kernels required)"
+        )
         if uses_symm_mem:
             self._clamp_max_num_sm_multiplier_for_symm_mem()
 

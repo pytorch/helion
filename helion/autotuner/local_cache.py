@@ -308,3 +308,20 @@ class StrictLocalAutotuneCache(LocalAutotuneCache):
     def _generate_key(self) -> StrictAutotuneCacheKey:
         loose_key = super()._generate_key()
         return StrictAutotuneCacheKey(**vars(loose_key))
+
+
+def stable_autotune_hash(autotuner: BaseSearch) -> str | None:
+    """Return the autotuner's stable local-cache hash for this run.
+
+    This is the same hash used as the ``.best_config`` cache filename stem, so
+    artifacts keyed by it line up with the cache entry and differ per
+    kernel/shape. Best-effort: returns ``None`` if the kernel is not cacheable
+    or the key can't be built, so callers must tolerate ``None``.
+    """
+    try:
+        if not autotuner.kernel.is_cacheable():
+            return None
+        return LocalAutotuneCache(autotuner)._generate_key().stable_hash()
+    except Exception:
+        log.debug("Could not compute autotune cache hash", exc_info=True)
+        return None
