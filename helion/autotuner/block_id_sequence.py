@@ -215,6 +215,13 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
             )
         values = [*(values or ())]
         size = len(self)
+        if size == 0:
+            # This tunable has no slots on the current device (e.g.
+            # ``range_warp_specialize`` is CUDA sm_100+ only, so it is empty on
+            # NPU). Silently drop any user-provided values so configs stay
+            # portable across devices instead of raising
+            # "Too many values, expected 0, got N".
+            return []
         if len(values) > size:
             raise InvalidConfig(
                 f"Too many values for config[{name!r}], expected {size}, got {len(values)}"
