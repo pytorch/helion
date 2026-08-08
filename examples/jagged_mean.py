@@ -19,8 +19,10 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # %%
 # Jagged Mean Kernel
@@ -29,7 +31,7 @@ import helion.language as hl
 
 # %%
 @helion.kernel()
-def jagged_mean_kernel(
+def _jagged_mean_kernel_default(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
     x_feature_counts: torch.Tensor,  # [num_rows] - number of features per row
@@ -81,6 +83,51 @@ def jagged_mean_kernel(
             out[tile_b, tile_m] = result
 
     return out
+
+
+@helion.kernel()
+def _jagged_mean_kernel_pallas(
+    x_data: torch.Tensor,
+    x_offsets: torch.Tensor,
+    x_feature_counts: torch.Tensor,
+    max_M: int,
+) -> torch.Tensor:
+    """Compute dense structural output tiles for Pallas."""
+    num_rows = x_offsets.size(0) - 1
+    out = torch.empty([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
+    x_flat = x_data.view(-1)
+
+    for tile_b in hl.tile(num_rows):
+        starts = x_offsets[tile_b]
+        ends = x_offsets[tile_b.index + 1]
+        nnz = ends - starts
+        feature_counts = x_feature_counts[tile_b]
+
+        for tile_m in hl.tile(max_M):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+            for tile_k in hl.jagged_tile(nnz):
+                flat_indices = (starts[:, None] + tile_k.index[None, :])[
+                    :, :, None
+                ] * max_M
+                flat_indices = flat_indices + tile_m.index[None, None, :]
+                row_sums += hl.load(x_flat, [flat_indices]).sum(dim=1)
+
+            nnz_expanded = nnz.to(x_data.dtype)[:, None]
+            feature_mask = tile_m.index[None, :] < feature_counts[:, None]
+            out[tile_b, tile_m] = torch.where(
+                (nnz_expanded > 0) & feature_mask,
+                row_sums / nnz_expanded,
+                0.0,
+            )
+
+    return out
+
+
+jagged_mean_kernel = (
+    _jagged_mean_kernel_pallas
+    if _get_backend() == "pallas"
+    else _jagged_mean_kernel_default
+)
 
 
 # %%
@@ -143,7 +190,7 @@ def jagged_mean_tritonbench(
     """
     x_values = x._values
     # pyrefly: ignore [missing-attribute]
-    x_offsets = x._offsets
+    x_offsets = x._offsets.to(LONG_INT_TYPE)
 
     feature_counts = torch.full(
         (B,),
@@ -171,9 +218,14 @@ def main() -> None:
     num_rows, max_cols = 32, 64
     device = DEVICE
 
-    lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
+    lengths = torch.randint(
+        1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=device
+    )
     x_offsets = torch.cat(
-        [torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(lengths, dim=0)]
+        [
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(lengths, dim=0, dtype=LONG_INT_TYPE),
+        ]
     )
     nnz = int(x_offsets[-1])
     M = 8  # number of features

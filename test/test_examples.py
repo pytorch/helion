@@ -1233,16 +1233,23 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[32768, 1],
             )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1,
+            max_cols + 1,
+            (num_rows,),
+            dtype=LONG_INT_TYPE,
+            device=DEVICE,
+        )
+        if _get_backend() == "pallas":
+            lengths[0] = 0
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1250,6 +1257,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         feature_counts = torch.randint(
             1, M + 1, (num_rows,), dtype=torch.int32, device=DEVICE
         )
+        if _get_backend() == "pallas":
+            feature_counts[1] = 0
         args = (x_data, x_offsets, feature_counts, M)
 
         mod = import_path(EXAMPLES_DIR / "jagged_mean.py")
@@ -1547,7 +1556,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("Pallas rejects the int64 jagged offsets")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
@@ -2053,16 +2062,23 @@ class TestExamples(RefEagerTestBase, TestCase):
         with self.assertRaisesRegex(ValueError, "K bytes must be divisible by 8"):
             mod.nvfp4_gemv_bf16in(bad_k_weight, x_bf16[:-2], weight_scale)
 
-    @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
         M = 8  # number of features
-        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        lengths = torch.randint(
+            1,
+            max_cols + 1,
+            (num_rows,),
+            dtype=LONG_INT_TYPE,
+            device=DEVICE,
+        )
+        if _get_backend() == "pallas":
+            lengths[0] = 0
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -2078,7 +2094,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="jagged_sum_kernel",
-            block_sizes=[16, 8, 16],
+            block_sizes=[8, 16] if _get_backend() == "pallas" else [16, 8, 16],
         )
 
     @skipIfXPU("Timeout on XPU")
