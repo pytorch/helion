@@ -62,8 +62,12 @@ class CuteTcgen05GroupedPlan:
     d_tensormap: str | None = None
     # N,M worklists carry their source-row tile explicitly so runtime metadata
     # validation and launch bounds consume the exact schedule selected by the
-    # compiler.
+    # compiler.  For the device-split variant, ``layout`` names the device
+    # ``split_sizes[G]`` tensor while ``problem_sizes`` and ``starts`` are
+    # kernel-local SMEM tensors.  ``m_size`` lets the launcher derive a safe
+    # static cluster bound without reading split values on the host.
     source_m_tile: int | None = None
+    m_size: int | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
@@ -73,6 +77,11 @@ class CuteTcgen05GroupedPlan:
         )
         assert (self.direct_pointers is None) == (self.direct_strides is None)
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
+        assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+
+    @property
+    def device_split_sizes(self) -> bool:
+        return self.m_size is not None
 
 
 class _CuteTcgen05Orientation(Protocol):

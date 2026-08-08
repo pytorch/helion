@@ -201,8 +201,6 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_M = 5
 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_N = 6
 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
-
-
 if TYPE_CHECKING:
     import sympy
 
@@ -3000,6 +2998,24 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         tile_start_var = device_function.new_var("tcgen05_grouped_selected_tile_start")
         source_tile_m = plan.source_tile_m
+        if grouped.device_split_sizes:
+            remaining_m = (
+                f"max({grouped.problem_m} - {tile_start_var}, cutlass.Int32(0))"
+            )
+            return [
+                statement_from_string(
+                    f"{tile_start_var} = {grouped_cta_tile_idx_m} * "
+                    f"cutlass.Int32({source_tile_m})"
+                ),
+                statement_from_string(
+                    f"{grouped_valid_m} = min(cutlass.Int32({source_tile_m}), "
+                    f"{remaining_m})"
+                ),
+                statement_from_string(
+                    f"{grouped_store_m} = min(cutlass.Int32({source_tile_m}), "
+                    f"{remaining_m})"
+                ),
+            ]
         return [
             statement_from_string(
                 f"{tile_start_var} = {grouped_cta_tile_idx_m} * "
@@ -3455,7 +3471,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         plan = self._tcgen05_plan()
         assert plan is not None and plan.grouped is not None
         grouped = plan.grouped
-        assert grouped.real_groups is not None
         source_tile_m = plan.source_tile_m
         source_tile_n = plan.source_tile_n
         grouped_starts = grouped.starts
@@ -3524,17 +3539,27 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
         def source_m_fast_raster_stmts() -> list[ast.stmt]:
-            source_n_tiles_expr = CompileEnvironment.current().backend.cdiv_expr(
+            backend = CompileEnvironment.current().backend
+            source_n_tiles_expr = backend.cdiv_expr(
                 f"{group_info_var}.problem_shape_m",
                 f"cutlass.Int32({source_tile_n})",
                 is_device=True,
             )
+            source_m_tiles_expr = (
+                backend.cdiv_expr(
+                    f"{group_info_var}.problem_shape_n",
+                    f"cutlass.Int32({source_tile_m})",
+                    is_device=True,
+                )
+                if grouped.device_split_sizes
+                else (
+                    f"{group_info_var}.problem_shape_n // "
+                    f"cutlass.Int32({source_tile_m})"
+                )
+            )
             return [
                 statement_from_string(f"{source_n_tiles_var} = {source_n_tiles_expr}"),
-                statement_from_string(
-                    f"{source_m_tiles_var} = {group_info_var}.problem_shape_n // "
-                    f"cutlass.Int32({source_tile_m})"
-                ),
+                statement_from_string(f"{source_m_tiles_var} = {source_m_tiles_expr}"),
                 create(
                     ast.If,
                     test=expr_from_string(
@@ -5627,6 +5652,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         self, partition: Tcgen05PersistentProgramIDs._PartitionedRoleBody
     ) -> list[ast.stmt]:
         plan = self._tcgen05_plan()
+        device_split_sizes = bool(
+            plan is not None
+            and plan.grouped is not None
+            and plan.grouped.device_split_sizes
+        )
+        if device_split_sizes:
+            return self._tcgen05_unsafe_shared_stmts(partition)
         worklist_metadata = bool(
             plan is not None
             and plan.grouped is not None
