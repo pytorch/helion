@@ -4,6 +4,7 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
+import itertools
 import logging
 import sys
 import threading
@@ -183,7 +184,7 @@ def tensor_descriptor_layout_signature_from_strides(
 
 
 def _make_numel_check(
-    symbols: list[sympy.Basic], expr: sympy.Basic
+    symbols: typing.Sequence[sympy.Basic], expr: sympy.Basic
 ) -> typing.Callable[..., bool]:
     """Evaluate a sympy constraint with concrete block-size values."""
 
@@ -201,6 +202,7 @@ if TYPE_CHECKING:
     from torch._guards import Source
 
     from .. import Config
+    from ..autotuner.config_spec import BlockSizeConstraint
     from ..runtime.settings import Settings
     from .backend import Backend
     from .pallas.compact_worklist import CompactWorklistPlan
@@ -1265,6 +1267,133 @@ class CompileEnvironment:
                 return False
             return bool(res)
         return a == b
+
+    def prepare_tile_reshape(
+        self,
+        input_shape: typing.Sequence[int | torch.SymInt],
+        output_shape: typing.Sequence[int | torch.SymInt],
+    ) -> None:
+        """Record reshape guards involving direct tunable block-size symbols."""
+        if any(isinstance(dim, int) and dim == -1 for dim in output_shape):
+            # PyTorch already handles inferred dimensions. Supporting them here
+            # requires normalizing -1 to an exact symbolic quotient first.
+            return
+
+        input_numel = sympy.prod(_to_sympy(dim) for dim in input_shape)
+        output_numel = sympy.prod(_to_sympy(dim) for dim in output_shape)
+        constraint_expr = sympy.simplify(sympy.Eq(input_numel, output_numel))
+        if constraint_expr is sympy.true or constraint_expr is sympy.false:
+            return
+
+        from ..autotuner.config_spec import BlockSizeConstraint
+
+        block_ids: set[int] = set()
+        config_block_ids = set(self.config_spec.block_sizes.valid_block_ids())
+        for symbol in constraint_expr.free_symbols:
+            if not isinstance(symbol, sympy.Symbol):
+                return
+            block_id = self.get_block_id(symbol)
+            # Accept only direct tunable symbols so this path does not need
+            # block-size alias substitution or canonicalization.
+            if (
+                block_id is None
+                or block_id not in config_block_ids
+                or self.block_sizes[block_id].symbol() != symbol
+            ):
+                return
+            block_ids.add(block_id)
+        ordered_block_ids = tuple(sorted(block_ids))
+        symbols = [
+            self.block_sizes[block_id].symbol() for block_id in ordered_block_ids
+        ]
+        constraint = BlockSizeConstraint(
+            check_fn=_make_numel_check(symbols, constraint_expr),
+            block_ids=ordered_block_ids,
+            expr_str=str(constraint_expr),
+        )
+
+        constraints = [*self.config_spec.block_size_constraints]
+        constraint_exists = any(
+            existing.block_ids == constraint.block_ids
+            and existing.expr_str == constraint.expr_str
+            for existing in constraints
+        )
+        if not constraint_exists:
+            constraints.append(constraint)
+
+        assignment = self._find_block_constraint_assignment(
+            constraints,
+            preferred=shape_env_var_hints(self.shape_env),
+        )
+        if assignment is None:
+            raise exc.InvalidConfig(
+                "No power-of-two block size assignment satisfies reshape "
+                f"constraint: {constraint.expr_str}"
+            )
+
+        if not constraint_exists:
+            self.config_spec.block_size_constraints.append(constraint)
+
+        hints = shape_env_var_hints(self.shape_env)
+        for block_id, value in assignment.items():
+            info = self.block_sizes[block_id]
+            hints[info.symbol()] = sympy.Integer(value)
+            self.config_spec.block_sizes.block_id_lookup(
+                block_id
+            ).autotuner_default = value
+
+    def _find_block_constraint_assignment(
+        self,
+        constraints: typing.Sequence[BlockSizeConstraint],
+        *,
+        preferred: typing.Mapping[sympy.Symbol, sympy.Integer],
+        max_attempts: int = 65536,
+    ) -> dict[int, int] | None:
+        """Find concrete power-of-two block sizes satisfying all shape guards."""
+        block_ids = tuple(
+            sorted(
+                {
+                    block_id
+                    for constraint in constraints
+                    for block_id in constraint.block_ids
+                }
+            )
+        )
+        if not block_ids:
+            return {}
+
+        domains: list[list[int]] = []
+        for block_id in block_ids:
+            spec = self.config_spec.block_sizes.block_id_lookup(block_id)
+            low = max(spec.min_size, 1)
+            high = spec.max_size
+            values = [
+                1 << exponent
+                for exponent in range(low.bit_length() - 1, high.bit_length())
+                if (1 << exponent) >= low
+            ]
+            preferred_value = int(
+                preferred.get(self.block_sizes[block_id].symbol(), values[0])
+            )
+            values.sort(
+                key=lambda value: abs(
+                    (value.bit_length() - 1) - (preferred_value.bit_length() - 1)
+                )
+            )
+            domains.append(values)
+
+        for attempt, values in enumerate(itertools.product(*domains)):
+            if attempt >= max_attempts:
+                break
+            assignment = dict(zip(block_ids, values, strict=True))
+            if all(
+                constraint.check_fn(
+                    *(assignment[block_id] for block_id in constraint.block_ids)
+                )
+                for constraint in constraints
+            ):
+                return assignment
+        return None
 
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
         if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):

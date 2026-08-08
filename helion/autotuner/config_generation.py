@@ -750,7 +750,10 @@ class ConfigGeneration:
             except InvalidConfig:
                 attempts += 1
         # Retry to fill the population to the requested size
-        while len(result) < n and attempts < 64:
+        max_attempts = (
+            max(64, n * 256) if self.config_spec.block_size_constraints else 64
+        )
+        while len(result) < n and attempts < max_attempts:
             with contextlib.suppress(InvalidConfig):
                 result.append(self.unflatten(self.random_flat()))
             attempts += 1

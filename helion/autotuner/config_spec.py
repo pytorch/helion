@@ -103,6 +103,14 @@ class TensorNumelConstraint(NamedTuple):
     expr_str: str
 
 
+class BlockSizeConstraint(NamedTuple):
+    """Compile-time condition that concrete block sizes must satisfy."""
+
+    check_fn: Callable[..., bool]
+    block_ids: tuple[int, ...]
+    expr_str: str
+
+
 class MatmulFact(NamedTuple):
     """Shape facts recorded when matmul requirements are applied."""
 
@@ -638,6 +646,7 @@ class ConfigSpec:
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
+        self.block_size_constraints: list[BlockSizeConstraint] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
             length=0,
@@ -2219,12 +2228,32 @@ class ConfigSpec:
             for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
                 config.pop(key, None)
 
+        self._validate_block_size_constraints(config)
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
         }
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
+
+    def _validate_block_size_constraints(self, config: dict[str, object]) -> None:
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            return
+        for constraint in self.block_size_constraints:
+            values = [
+                self.block_sizes.config_get(block_sizes, block_id)
+                for block_id in constraint.block_ids
+            ]
+            if any(type(value) is not int for value in values):
+                raise InvalidConfig(
+                    f"Unable to evaluate block size constraint: {constraint.expr_str}"
+                )
+            if not constraint.check_fn(*cast("list[int]", values)):
+                raise InvalidConfig(
+                    f"block_sizes violate reshape constraint: {constraint.expr_str}"
+                )
 
     def raise_grid_block_minimums(self) -> None:
         """Raise min_size for grid block dimensions based on problem size.
@@ -2334,7 +2363,8 @@ class ConfigSpec:
         # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
         # the full base defaults so every other key — including user register_tunable defaults — is
         # preserved rather than dropped.
-        merged = dict(self._base_default_config().config)
+        base = self._base_default_config()
+        merged = dict(base.config)
         merged.update(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the
@@ -2343,6 +2373,12 @@ class ConfigSpec:
         # (e.g. benchmark result maps).
         self.normalize(config, _fix_invalid=True)
         self._shrink_for_numel_constraints(config)
+        try:
+            self._validate_block_size_constraints(config.config)
+        except InvalidConfig:
+            config.config["block_sizes"] = [*base.block_sizes]
+            self._shrink_for_numel_constraints(config)
+            self._validate_block_size_constraints(config.config)
         return config
 
     def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
@@ -2731,6 +2767,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
         self.autotuner_min: int = min_size
+        self.autotuner_default: int | None = None
         # Largest power-of-two block that fits inside the dimension. allow_overshoot
         # may raise max_size above this for matmul dims, but the default block size
         # stays clamped to dim_max_size (see _fragment).
@@ -2812,11 +2849,15 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         else:
             default = 1
         low = min(max(self.min_size, self.autotuner_min), self.max_size)
+        if self.autotuner_default is not None:
+            low = min(low, self.autotuner_default)
         # Clamp the default within the dimension so allow_overshoot only widens
         # the autotuner *search*, never the default (non-autotuned) block size.
         # Needed for matmul dims smaller than the heuristic default (e.g. M<16),
         # where the default would otherwise overshoot to a masked tile.
         default = min(default, self.dim_max_size)
+        if self.autotuner_default is not None:
+            default = self.autotuner_default
         return BlockSizeFragment(
             low,
             self.max_size,
