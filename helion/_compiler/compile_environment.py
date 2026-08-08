@@ -305,6 +305,9 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        self.input_alias_groups: dict[int, frozenset[int]] = {}
+        self.input_alias_group_sizes: dict[int, int] = {}
+        self.disable_pallas_dma_for_untracked_aliases = False
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         try:

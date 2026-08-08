@@ -2246,6 +2246,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
+    @xfailIfPallasInterpret(
+        "JAX interpret mode cannot discharge the emit_pipeline VMEM refs"
+    )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
@@ -2314,7 +2317,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
-    @xfailIfPallas("tensor accessed with conflicting tiling patterns")
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
+    )
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
@@ -2358,6 +2364,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfPallasInterpret(
+        "JAX interpret mode cannot discharge the emit_pipeline VMEM refs"
+    )
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")

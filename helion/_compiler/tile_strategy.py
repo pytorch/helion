@@ -1862,6 +1862,15 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_block_ids: dict[str, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    _tensor_to_dma_subscript_meta: dict[str, list[object]] = dataclasses.field(
+        default_factory=dict
+    )
+    _tensor_to_dma_storage_id: dict[str, int] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_access: dict[str, str] = dataclasses.field(default_factory=dict)
+    _initialized_dma_scratch: set[str] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
@@ -1882,6 +1891,15 @@ class ForiLoopState(DeviceLoopOrGridState):
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_block_ids: dict[str, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    _tensor_to_dma_subscript_meta: dict[str, list[object]] = dataclasses.field(
+        default_factory=dict
+    )
+    _tensor_to_dma_storage_id: dict[str, int] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_access: dict[str, str] = dataclasses.field(default_factory=dict)
+    _initialized_dma_scratch: set[str] = dataclasses.field(default_factory=set)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
     _prefetched_load_tensors: set[str] = dataclasses.field(default_factory=set)
 
