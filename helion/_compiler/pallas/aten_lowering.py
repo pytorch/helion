@@ -20,6 +20,7 @@ from torch._inductor.codegen.simd import constant_repr
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..aten_lowering import _env_arg
@@ -39,6 +40,7 @@ from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
+from ..aten_lowering import stack_lowering
 from ..aten_lowering import topk_lowering
 from ..aten_lowering import unsqueeze_lowering
 from ..aten_lowering import view_lowering
@@ -276,6 +278,40 @@ def codegen_permute_pallas(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(
         f"jnp.transpose({{tensor}}, {dims!r})",
         tensor=tensor,
+    )
+
+
+@stack_lowering.register_codegen("pallas")
+def codegen_stack_pallas(ctx: LoweringContext, node: Node) -> object:
+    tensors = node.args[0]
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+
+    assert isinstance(tensors, (list, tuple))
+    if not tensors:
+        raise ValueError("Cannot stack empty tensor list")
+    if not all(isinstance(tensor, Node) for tensor in tensors):
+        raise exc.BackendUnsupported("pallas", "stack inputs")
+    assert isinstance(dim, int)
+
+    tensor_nodes = cast("list[Node] | tuple[Node, ...]", tensors)
+    tensor_asts = [ctx.env[tensor] for tensor in tensor_nodes]
+    output_val = node.meta.get("val")
+    numeric_bool_stack = (
+        isinstance(output_val, torch.Tensor) and output_val.dtype is torch.bool
+    )
+    args: dict[str, ast.AST] = {}
+    items: list[str] = []
+    for i, tensor in enumerate(tensor_asts):
+        assert isinstance(tensor, ast.AST)
+        if numeric_bool_stack:
+            tensor = pallas_codegen.numeric_mask_expr(tensor)
+        name = f"tensor_{i}"
+        args[name] = tensor
+        items.append(f"{{{name}}}")
+
+    return expr_from_string(
+        f"jnp.stack([{', '.join(items)}], axis={dim})",
+        **args,
     )
 
 
