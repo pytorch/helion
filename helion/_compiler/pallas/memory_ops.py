@@ -39,7 +39,7 @@ def _(state: CodegenState) -> None:
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
-    parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
+    parts, none_dims = pallas_codegen.index_parts(state, subscript, tensor)
     value = pallas_codegen.sliced_value_for_store(
         state, tensor, subscript, parts, value
     )
@@ -51,7 +51,7 @@ def _(state: CodegenState) -> None:
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
     is_scatter = isinstance(plan, OneHotScatterPlan)
     if is_scatter:
-        value = emit_scatter_store(state, plan.plan, name, idx_str, value)
+        value = emit_scatter_store(state, plan.plan, name, idx_str, value, none_dims)
     from .ordered_carry import emit_carry_store
 
     if not is_scatter and state.device_function.carry_tiles:

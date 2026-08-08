@@ -15,7 +15,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -89,7 +88,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.make_block_ptr", code)
 
-    @xfailIfPallas("constexpr scalar + None-broadcast unsupported")
     def test_constexpr_index(self):
         @helion.kernel
         def fn(a, idx1):

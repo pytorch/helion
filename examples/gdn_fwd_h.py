@@ -99,6 +99,21 @@ def helion_gdn_fwd_h_tb(
     return lambda: helion_gdn_fwd_h(k, w, u, g, chunk_size)
 
 
+def _orthogonalize_w(w: torch.Tensor) -> torch.Tensor:
+    """Build the constrained ``w`` test input without relying on TPU SVD."""
+    device = w.device
+    w_svd = w.permute(0, 1, 3, 2, 4)
+    if w_svd.device.type == "tpu":
+        w_svd = w_svd.cpu()
+    wu, _, wv = torch.linalg.svd(w_svd, full_matrices=False)
+    w = torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
+    return (
+        w.permute(0, 1, 3, 2, 4)
+        .reshape(w.shape[0], w.shape[1] * w.shape[3], w.shape[2], w.shape[4])
+        .to(device=device, dtype=torch.bfloat16)
+    )
+
+
 # %%
 # Reference Function
 # -------------
@@ -180,13 +195,7 @@ def test(
         device=DEVICE,
     )
     # w = torch.nn.functional.rms_norm(w.to(torch.bfloat16), (dhead,))
-    wu, ws, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
-    w = torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
-    w = (
-        w.permute(0, 1, 3, 2, 4)
-        .reshape(batch, seqlen, nheads, dhead)
-        .to(torch.bfloat16)
-    )
+    w = _orthogonalize_w(w)
     u = torch.randn(batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE)
     u = torch.nn.functional.rms_norm(u, [dstate])
     g = torch.cumsum(

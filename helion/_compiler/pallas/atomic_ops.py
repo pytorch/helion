@@ -27,6 +27,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
+from . import codegen as pallas_codegen
 
 if TYPE_CHECKING:
     import ast
@@ -36,59 +37,63 @@ if TYPE_CHECKING:
 
 def _pallas_atomic_load_prev(
     state: CodegenState,
-) -> tuple[str, str, str]:
+) -> tuple[str, list[str], str, str]:
     """Load previous value for a Pallas atomic op.
 
     On TPU, each kernel instance has exclusive access to its tile, so
     atomics are implemented as regular load-compute-store sequences.
 
-    Returns (tensor_name, index_str, prev_var_name).
+    Returns (tensor_name, index_parts, index_str, prev_var_name).
     """
-    from . import codegen as pallas_codegen
-
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
     assert isinstance(target, torch.Tensor)
     assert isinstance(index, (list, tuple))
+    index = list(index)
 
     host_function = HostFunction.current()
     if target not in host_function.tensor_to_origin:
         raise exc.AtomicOnDeviceTensor("pallas atomic")
 
     name = state.device_function.tensor_arg(target).name
-    index_str, _ = pallas_codegen.index_str(state, index, target)
+    name = pallas_codegen.vmem_name(state, name)
+    index_parts, _ = pallas_codegen.index_parts(state, index, target)
+    index_str = ", ".join(index_parts)
 
     prev_var = state.device_function.new_var("_prev", dce=True)
-    state.codegen.add_statement(
-        statement_from_string(f"{prev_var} = {name}[{index_str}]")
+    prev = expr_from_string(f"{name}[{index_str}]")
+    prev = pallas_codegen._pad_clamped_load_expr(
+        state, index, target, index_parts, prev
     )
-    return name, index_str, prev_var  # pyrefly: ignore[bad-return]
+    state.codegen.add_statement(
+        statement_from_string(f"{prev_var} = {{prev}}", prev=prev)
+    )
+    return name, index_parts, index_str, prev_var
 
 
-def _clamp_atomic_value(state: CodegenState, value_ast: ast.AST) -> ast.AST:
-    """Slice an atomic value operand to the clamped store ref.
-
-    The RMW reads ``_prev`` and stores directly to the (possibly clamped) ref,
-    both dim-shaped, but the loaded value operand is padded to block shape by
-    ``load_expr``.  Slice it back to match, mirroring ``sliced_value_for_store``
-    on the normal store path.  A no-op when the ref is not clamped.
-    """
-    from . import codegen as pallas_codegen
-
+def _pallas_store_update(
+    state: CodegenState,
+    name: str,
+    index_parts: list[str],
+    index_str: str,
+    value: ast.AST,
+) -> None:
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
     assert isinstance(target, torch.Tensor)
     assert isinstance(index, (list, tuple))
-    parts, _ = pallas_codegen.index_parts(state, list(index), target)
-    return pallas_codegen.sliced_value_for_store(
-        state, target, list(index), parts, value_ast
+    value = pallas_codegen.sliced_value_for_store(
+        state, target, index, index_parts, value
+    )
+    state.codegen.add_statement(
+        statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
     )
 
 
 @_decorators.codegen(atomic_add, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
-    value_ast = _clamp_atomic_value(state, _to_ast_values([state.ast_args[2]])[0])
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
+    value_ast = _to_ast_values([state.ast_args[2]])[0]
     target = state.proxy_arg(0)
     assert isinstance(target, torch.Tensor)
     backend = CompileEnvironment.current().backend
@@ -96,113 +101,107 @@ def _(state: CodegenState) -> ast.AST:
     # Cast the sum to the target dtype so the store doesn't fail when
     # the value dtype differs (e.g. float32 accumulator into bfloat16 ref).
     cast = backend.cast_expr(f"{prev_var} + {{value}}", target_dtype)
-    state.codegen.add_statement(
-        statement_from_string(f"{name}[{index_str}] = {cast}", value=value_ast)
+    _pallas_store_update(
+        state,
+        name,
+        index_parts,
+        index_str,
+        expr_from_string(cast, value=value_ast),
     )
     return expr_from_string(prev_var)
 
 
 @_decorators.codegen(atomic_xchg, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
-    value_ast = _clamp_atomic_value(state, _to_ast_values([state.ast_args[2]])[0])
-    state.codegen.add_statement(
-        statement_from_string(f"{name}[{index_str}] = {{value}}", value=value_ast)
-    )
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
+    value_ast = _to_ast_values([state.ast_args[2]])[0]
+    _pallas_store_update(state, name, index_parts, index_str, value_ast)
     return expr_from_string(prev_var)
 
 
 @_decorators.codegen(atomic_and, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
-    value_ast = _clamp_atomic_value(state, _to_ast_values([state.ast_args[2]])[0])
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = {prev_var} & {{value}}", value=value_ast
-        )
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
+    value_ast = _to_ast_values([state.ast_args[2]])[0]
+    _pallas_store_update(
+        state,
+        name,
+        index_parts,
+        index_str,
+        expr_from_string(f"{prev_var} & {{value}}", value=value_ast),
     )
     return expr_from_string(prev_var)
 
 
 @_decorators.codegen(atomic_or, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
-    value_ast = _clamp_atomic_value(state, _to_ast_values([state.ast_args[2]])[0])
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = {prev_var} | {{value}}", value=value_ast
-        )
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
+    value_ast = _to_ast_values([state.ast_args[2]])[0]
+    _pallas_store_update(
+        state,
+        name,
+        index_parts,
+        index_str,
+        expr_from_string(f"{prev_var} | {{value}}", value=value_ast),
     )
     return expr_from_string(prev_var)
 
 
 @_decorators.codegen(atomic_xor, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
-    value_ast = _clamp_atomic_value(state, _to_ast_values([state.ast_args[2]])[0])
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = {prev_var} ^ {{value}}", value=value_ast
-        )
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
+    value_ast = _to_ast_values([state.ast_args[2]])[0]
+    _pallas_store_update(
+        state,
+        name,
+        index_parts,
+        index_str,
+        expr_from_string(f"{prev_var} ^ {{value}}", value=value_ast),
     )
     return expr_from_string(prev_var)
 
 
 @_decorators.codegen(atomic_max, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
-    value_ast = _clamp_atomic_value(state, _to_ast_values([state.ast_args[2]])[0])
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = jnp.maximum({prev_var}, {{value}})",
-            value=value_ast,
-        )
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
+    value_ast = _to_ast_values([state.ast_args[2]])[0]
+    _pallas_store_update(
+        state,
+        name,
+        index_parts,
+        index_str,
+        expr_from_string(f"jnp.maximum({prev_var}, {{value}})", value=value_ast),
     )
     return expr_from_string(prev_var)
 
 
 @_decorators.codegen(atomic_min, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
-    value_ast = _clamp_atomic_value(state, _to_ast_values([state.ast_args[2]])[0])
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = jnp.minimum({prev_var}, {{value}})",
-            value=value_ast,
-        )
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
+    value_ast = _to_ast_values([state.ast_args[2]])[0]
+    _pallas_store_update(
+        state,
+        name,
+        index_parts,
+        index_str,
+        expr_from_string(f"jnp.minimum({prev_var}, {{value}})", value=value_ast),
     )
     return expr_from_string(prev_var)
 
 
 @_decorators.codegen(atomic_cas, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    from . import codegen as pallas_codegen
-
-    target = state.proxy_arg(0)
-    index = state.proxy_arg(1)
-    assert isinstance(target, torch.Tensor)
-    assert isinstance(index, (list, tuple))
-
-    host_function = HostFunction.current()
-    if target not in host_function.tensor_to_origin:
-        raise exc.AtomicOnDeviceTensor("pallas atomic_cas")
-
-    name = state.device_function.tensor_arg(target).name
-    index_str, _ = pallas_codegen.index_str(state, index, target)
-
-    prev_var = state.device_function.new_var("_prev", dce=True)
-    state.codegen.add_statement(
-        statement_from_string(f"{prev_var} = {name}[{index_str}]")
-    )
-
+    name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
     exp_ast, val_ast = _to_ast_values([state.ast_args[2], state.ast_args[3]])
-    exp_ast = _clamp_atomic_value(state, exp_ast)
-    val_ast = _clamp_atomic_value(state, val_ast)
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{name}[{index_str}] = jnp.where({prev_var} == {{exp}}, {{val}}, {prev_var})",
+    _pallas_store_update(
+        state,
+        name,
+        index_parts,
+        index_str,
+        expr_from_string(
+            f"jnp.where({prev_var} == {{exp}}, {{val}}, {prev_var})",
             exp=exp_ast,
             val=val_ast,
-        )
+        ),
     )
     return expr_from_string(prev_var)

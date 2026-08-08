@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
+    from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
@@ -108,6 +109,101 @@ _PallasFlatDecompValue = (
         _PallasLaunchScalar,
     ]
 )
+
+
+def _pallas_empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
+    """Return names allocated by top-level empty/empty_like/new_empty calls."""
+    result: set[str] = set()
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr in ("empty", "empty_like", "new_empty")
+        ):
+            result.add(stmt.targets[0].id)
+    return result
+
+
+def _disable_partial_initialized_store_tiling(graphs: list[GraphInfo]) -> None:
+    """Keep initialized output regions outside a partial grid well-defined."""
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ...language.memory_ops import store
+    from ..compile_environment import CompileEnvironment
+    from ..device_function import DeviceFunction
+    from ..host_function import HostFunction
+    from .plan_tiling import NonePattern
+    from .plan_tiling import TileBeginWithOffsetPattern
+    from .plan_tiling import TilePattern
+
+    env = CompileEnvironment.current()
+    device_fn = DeviceFunction.current()
+    host_fn = HostFunction.current()
+    input_names = {arg.arg for arg in host_fn.args.args}
+    empty_names = _pallas_empty_allocated_vars(host_fn.body)
+
+    def outer_block_id(block_id: int) -> int | None:
+        seen: set[int] = set()
+        while block_id not in seen:
+            seen.add(block_id)
+            try:
+                spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+            except KeyError:
+                # Fixed-size tiles have BlockSizeInfo but no tunable spec.
+                return block_id
+            owner = spec.owner_relative_bounded_by_block_id
+            if owner is None:
+                return block_id
+            block_id = owner
+        return None
+
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in ATOMIC_OPS | {store}:
+                continue
+            tensor_node = node.args[0]
+            if not isinstance(tensor_node, torch.fx.Node):
+                continue
+            tensor = tensor_node.meta.get("val")
+            if not isinstance(tensor, torch.Tensor):
+                continue
+
+            origin = host_fn.tensor_to_origin.get(tensor)
+            name = origin.root_rw_name() if origin is not None else None
+            if name is not None and name not in input_names and name in empty_names:
+                continue
+
+            dim_tilings = device_fn.pallas_tensor_dim_tilings.get(id(tensor))
+            patterns = node.meta.get("indexing_patterns")
+            if dim_tilings is None or not isinstance(patterns, (list, tuple)):
+                continue
+
+            tensor_dim = 0
+            for pattern in patterns:
+                if isinstance(pattern, NonePattern):
+                    continue
+                if tensor_dim >= tensor.ndim:
+                    break
+                if isinstance(pattern, (TilePattern, TileBeginWithOffsetPattern)):
+                    owner = outer_block_id(pattern.block_id)
+                    owner_info = (
+                        env.block_sizes[owner]
+                        if owner is not None and owner < len(env.block_sizes)
+                        else None
+                    )
+                    dim_size = tensor.shape[tensor_dim]
+                    if not (
+                        owner_info is not None
+                        and isinstance(owner_info.size, (int, torch.SymInt))
+                        and isinstance(dim_size, (int, torch.SymInt))
+                        and env.known_equal(owner_info.size, dim_size)
+                    ):
+                        dim_tilings[tensor_dim].can_tile = False
+                tensor_dim += 1
+
+
 _PallasBlockSpecInfo = list[
     tuple[tuple[_PallasLaunchValue, ...], tuple[_PallasFlatDecompValue, ...]] | None
 ]
@@ -534,12 +630,24 @@ class PallasBackend(Backend):
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             from ..compile_environment import CompileEnvironment
 
+            fallback_device = (
+                "'cpu'"
+                if CompileEnvironment.current().settings.pallas_interpret
+                else "'tpu'"
+            )
             if tensor_host_args:
-                device_expr = f"{tensor_host_args[0]}.device"
-            elif CompileEnvironment.current().settings.pallas_interpret:
-                device_expr = "'cpu'"
+                tensor_devices = ", ".join(
+                    f"{tensor_arg}.device" for tensor_arg in tensor_host_args
+                )
+                if len(tensor_host_args) == 1:
+                    tensor_devices += ","
+                device_expr = (
+                    "next((device for device in "
+                    f"({tensor_devices}) if device.type != 'meta'), "
+                    f"{fallback_device})"
+                )
             else:
-                device_expr = "'tpu'"
+                device_expr = fallback_device
             # Scalars are passed as 1-dim tensors (shape [1]) rather than
             # 0-dim tensors (shape []) because TPU Pallas Mosaic lowering
             # requires rank >= 1 for all block specs.  A 0-dim input causes:
@@ -723,6 +831,49 @@ class PallasBackend(Backend):
             self.fake_tensor_loads = []
         self.fake_tensor_loads.append((tensor, index))
 
+    def maybe_specialize_matmul_alignment_dim(
+        self,
+        fake: torch.Tensor,
+        tensor_dim: int,
+        block_id: int | None,
+        env: CompileEnvironment,
+    ) -> None:
+        """Specialize small dynamic matmul dims that need one-tile alignment."""
+        if block_id is None:
+            return
+        dim_size = fake.shape[tensor_dim]
+        if not isinstance(dim_size, torch.SymInt):
+            return
+        block_info = env.block_sizes[block_id]
+        block_size = block_info.size
+        if not isinstance(block_size, torch.SymInt):
+            return
+        if env.shape_env.replace(block_size._sympy_()) != env.shape_env.replace(
+            dim_size._sympy_()
+        ):
+            return
+
+        try:
+            block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+        except KeyError:
+            return
+
+        dim_hint = env.size_hint(dim_size)
+        if dim_hint <= 0 or dim_hint > block_spec.max_size:
+            return
+
+        dim_from_end = fake.ndim - tensor_dim - 1
+        bitwidth = fake.dtype.itemsize * 8
+        required = self._get_pallas_required_alignment(
+            dim_from_end, fake.ndim, bitwidth
+        )
+        if dim_hint >= required:
+            return
+
+        from ..compile_environment import _symint_free_symbols
+
+        env.specialized_vars.update(_symint_free_symbols(dim_size))
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
@@ -745,14 +896,18 @@ class PallasBackend(Backend):
         ``min(block_size, tensor_dim)`` which equals the full array
         dimension -- always valid per TPU rules.
         """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
         from ...autotuner.config_spec import BlockSizeSpec
         from ..ast_extension import ExtendedAST
         from ..compile_environment import BlockSizeInfo
-        from helion._compiler.compile_environment import _to_sympy
-        from helion._compiler.host_function import HostFunction
-        from helion._compiler.type_info import SequenceType
-        from helion._compiler.type_info import TensorType
-        from helion._compiler.type_info import TileIndexType
+        from ..compile_environment import CompileEnvironment
+        from ..compile_environment import _symint_free_symbols
+        from ..compile_environment import _to_sympy
+        from ..host_function import HostFunction
+        from ..type_info import SequenceType
+        from ..type_info import TensorType
+        from ..type_info import TileIndexType
 
         host_func = HostFunction.current()
 
@@ -812,6 +967,9 @@ class PallasBackend(Backend):
                     required_alignment = self.backend._get_pallas_required_alignment(
                         dim_from_end, tensor.ndim, bitwidth
                     )
+                    required_alignment = self.cap_alignment_to_tensor_dim(
+                        tensor, accessed_dim, required_alignment
+                    )
                     self.maybe_update_required_alignment(bid, required_alignment)
 
             def maybe_update_required_alignment(
@@ -823,6 +981,54 @@ class PallasBackend(Backend):
                     self.required_alignments[bid] = max(
                         self.required_alignments[bid], required_alignment
                     )
+
+            def cap_alignment_to_tensor_dim(
+                self,
+                tensor: torch.Tensor,
+                accessed_dim: int,
+                required_alignment: int,
+            ) -> int:
+                from torch._dynamo.source import TensorProperty
+                from torch._dynamo.source import TensorPropertySource
+
+                if accessed_dim < 0 or accessed_dim >= tensor.ndim:
+                    return required_alignment
+                dim = tensor.size(accessed_dim)
+                env = CompileEnvironment.current()
+                if isinstance(dim, int):
+                    dim_size = next_power_of_2(max(dim, 1))
+                    if dim_size < required_alignment and not env.settings.static_shapes:
+                        return required_alignment
+                    return min(required_alignment, dim_size)
+                if not isinstance(dim, torch.SymInt):
+                    return required_alignment
+                dim_expr = env.shape_env.replace(dim._sympy_())
+                specialized = env.specialize_expr(dim_expr)
+                if (
+                    not specialized.free_symbols
+                    and getattr(specialized, "is_integer", None) is True
+                ):
+                    dim_size = next_power_of_2(max(int(specialized), 1))
+                    return min(required_alignment, dim_size)
+                symbols = _symint_free_symbols(dim)
+                sources_by_symbol = [
+                    env.shape_env.var_to_sources.get(symbol, ()) for symbol in symbols
+                ]
+                if not symbols or any(not sources for sources in sources_by_symbol):
+                    return required_alignment
+                if any(
+                    isinstance(source, TensorPropertySource)
+                    and source.prop == TensorProperty.SIZE
+                    for sources in sources_by_symbol
+                    for source in sources
+                ):
+                    return required_alignment
+                if not env._is_static_kernel_shape_expr(dim_expr):
+                    return required_alignment
+                dim_size = next_power_of_2(max(env.size_hint(dim), 1))
+                if dim_size < required_alignment:
+                    env.specialized_vars.update(symbols)
+                return min(required_alignment, dim_size)
 
             def update_requirements_from_fake_tensor_loads(self) -> None:
                 # When tensors are indexed within external lambdas called by the kernel,
@@ -846,6 +1052,9 @@ class PallasBackend(Backend):
                                         dim_from_end, tensor.ndim, bitwidth
                                     )
                                 )
+                                required_alignment = self.cap_alignment_to_tensor_dim(
+                                    tensor, dim, required_alignment
+                                )
                                 self.maybe_update_required_alignment(
                                     info.block_id, required_alignment
                                 )
@@ -853,8 +1062,6 @@ class PallasBackend(Backend):
         analyzer = TensorTiledAccessAnalyzer(self)
         for stmt in host_func.body:
             analyzer.visit(stmt)
-
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
@@ -1665,6 +1872,7 @@ class PallasBackend(Backend):
         env = CompileEnvironment.current()
 
         plan_tiling(graphs, config, tile_strategy)
+        _disable_partial_initialized_store_tiling(graphs)
         build_tensorcore_plans(graphs, config)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is

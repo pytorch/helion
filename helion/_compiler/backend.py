@@ -386,6 +386,16 @@ class Backend(abc.ABC):
         """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
         return
 
+    def maybe_specialize_matmul_alignment_dim(
+        self,
+        fake: torch.Tensor,
+        tensor_dim: int,
+        block_id: int | None,
+        env: CompileEnvironment,
+    ) -> None:
+        """Specialize a symbolic matmul dimension for backend alignment, if needed."""
+        return
+
     def adjust_block_size_constraints(
         self,
         block_specs: list[object],
