@@ -284,7 +284,16 @@ jobs:
           echo "Kernels: ${KERNELS:-all}"
           echo "=========================================="
 
-          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+          # AOTAutotuneCache takes each config from the checked-in
+          # examples/linear/_helion_aot_linear_attention_engine_cuda_sm90.py
+          # instead of autotuning; only sm90 has one, hence the alias gate.
+          AOT_ENV=()
+          if [[ "${{ inputs.alias }}" == "h100" ]]; then
+            AOT_ENV=(HELION_AUTOTUNE_CACHE=AOTAutotuneCache)
+          fi
+
+          env ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+          "${AOT_ENV[@]}" \
           python -m benchmarks.run_linattn \
               "${KERNEL_FLAG[@]}" \
               --output "$TEST_REPORTS_DIR/helionbench.json" \
