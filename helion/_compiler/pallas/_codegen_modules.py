@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from . import aten_lowering  # noqa: F401
 from . import atomic_ops  # noqa: F401
+from . import barrier  # noqa: F401
 from . import creation_ops  # noqa: F401
 from . import gelu_tanh_approx  # noqa: F401
 from . import matmul_ops  # noqa: F401

@@ -723,6 +723,189 @@ def _widened_scalar_load_promotion_dtype(
     return CompileEnvironment.current().backend.dtype_str(torch.float32)
 
 
+def widen_barrier_temp_store_indices(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    index_parts: list[str],
+    value: ast.AST,
+    name: str,
+) -> tuple[list[str], ast.AST]:
+    """Widen a scalar minor-dim temporary store to an aligned full-axis RMW."""
+    if not _is_pallas_barrier_temp_store(state, tensor):
+        return index_parts, value
+    if _tensor_routed_to_dma_scratch(state, tensor):
+        return index_parts, value
+
+    from helion._compiler.device_function import PallasMemorySpace
+
+    if (
+        state.device_function.pallas_memory_space.get(id(tensor))
+        == PallasMemorySpace.SMEM
+    ):
+        return index_parts, value
+
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import OneHotScatterPlan
+
+    patterns = _get_indexing_patterns(state, tensor)
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
+    if isinstance(plan, OneHotScatterPlan):
+        return index_parts, value
+
+    from helion._compiler.pallas.backend import PallasBackend
+
+    backend = CompileEnvironment.current().backend
+    assert isinstance(backend, PallasBackend)
+
+    adjusted = list(index_parts)
+    widened: tuple[int, str, int] | None = None
+    value_dim = 0
+    tensor_dim = 0
+    index_part_idx = 0
+
+    for idx, pattern in zip(subscript, patterns, strict=True):
+        if idx is None:
+            continue
+
+        index_part = adjusted[index_part_idx]
+        dim_size = _concrete_barrier_temp_dim_size(state, tensor.shape[tensor_dim])
+        is_scalar = not _index_part_produces_value_dim(index_part)
+        can_widen = False
+        if is_scalar and dim_size is not None and dim_size > 0:
+            dim_from_end = tensor.ndim - tensor_dim - 1
+            required_alignment = backend._get_pallas_required_alignment(
+                dim_from_end,
+                tensor.ndim,
+                tensor.dtype.itemsize * 8,
+            )
+            can_widen = required_alignment > 1 and dim_size <= required_alignment
+            if can_widen:
+                normalized_index = _normalize_widened_scalar_index(index_part, dim_size)
+                can_widen = normalized_index is not None
+                if normalized_index is not None:
+                    index_part = normalized_index
+
+        if can_widen:
+            if (
+                widened is not None
+                or tensor_dim != tensor.ndim - 1
+                or not isinstance(pattern, ArbitraryIndexPattern)
+            ):
+                return index_parts, value
+            adjusted[index_part_idx] = ":"
+            assert dim_size is not None
+            widened = (value_dim, index_part, dim_size)
+            value_dim += 1
+        elif _index_part_produces_value_dim(index_part):
+            value_dim += 1
+
+        tensor_dim += 1
+        index_part_idx += 1
+
+    if widened is None:
+        return index_parts, value
+
+    value_elements = _store_value_numel(state)
+    axis, index_expr, dim_size = widened
+    if (
+        value_elements is None
+        or value_elements * dim_size * tensor.dtype.itemsize
+        > _FULL_LOAD_SELECT_MAX_BYTES
+    ):
+        return index_parts, value
+
+    current = expr_from_string(f"{name}[{', '.join(adjusted)}]")
+    store_value = expr_from_string(
+        f"jnp.expand_dims({{value}}, axis={axis})",
+        value=value,
+    )
+
+    dtype_str = _pallas_dtype_str(tensor)
+    mask = (
+        f"(({index_expr}) == jnp.arange({dim_size}, dtype=jnp.int32))"
+        f".astype({dtype_str})"
+    )
+    for _ in range(axis):
+        mask = f"jnp.expand_dims({mask}, axis=0)"
+    for _ in range(value_dim - axis - 1):
+        mask = f"jnp.expand_dims({mask}, axis=-1)"
+    value = numeric_mask_select_expr(
+        expr_from_string(mask),
+        store_value,
+        current,
+        tensor.dtype,
+        store_value,
+    )
+    return adjusted, value
+
+
+def _is_pallas_barrier_temp_store(state: CodegenState, tensor: torch.Tensor) -> bool:
+    env = CompileEnvironment.current()
+    if not env.has_barrier:
+        return False
+
+    from helion._compiler.host_function import HostFunction
+
+    host_function = HostFunction.current()
+    if len(host_function.device_ir.phases) <= 1:
+        return False
+    input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+    if id(tensor.untyped_storage()) in input_storages:
+        return False
+    origin = host_function.tensor_to_origin.get(tensor)
+    name = origin.root_rw_name() if origin is not None else None
+    if name is None:
+        return False
+    read_names, write_names = state.device_function.get_tensor_read_write_names()
+    return name in read_names and name in write_names
+
+
+def _concrete_barrier_temp_dim_size(state: CodegenState, dim: object) -> int | None:
+    if isinstance(dim, int):
+        return dim
+    if not isinstance(dim, torch.SymInt):
+        return None
+
+    env = CompileEnvironment.current()
+    expr = _symint_sympy_expr(dim)
+    substitutions = {
+        symbol: value
+        for symbol, tunable_name in env.tunable_symbols.items()
+        if symbol in expr.free_symbols
+        and isinstance((value := state.config.get(tunable_name)), int)
+    }
+    if substitutions:
+        expr = expr.subs(substitutions)
+        assert isinstance(expr, sympy.Expr)
+    if not expr.free_symbols:
+        return int(expr)
+    if env.settings.static_shapes:
+        from helion._compiler.compile_environment import _size_hint_with_tunable_config
+
+        return _size_hint_with_tunable_config(dim, state.config, env)
+    return None
+
+
+def _store_value_numel(state: CodegenState) -> int | None:
+    if state.fx_node is None or len(state.fx_node.args) < 3:
+        return 1
+    value_arg = state.fx_node.args[2]
+    if not isinstance(value_arg, torch.fx.Node):
+        return 1
+    value = value_arg.meta.get("val")
+    if not isinstance(value, torch.Tensor):
+        return 1
+    elements = 1
+    for size in value.shape:
+        concrete_size = _concrete_barrier_temp_dim_size(state, size)
+        if concrete_size is None:
+            return None
+        elements *= concrete_size
+    return elements
+
+
 def _load_feeds_only_immediate_fp32_converts(state: CodegenState) -> bool:
     node = state.fx_node
     if node is None:

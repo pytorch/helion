@@ -192,7 +192,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64, 64, 32],
         )
 
-    @xfailIfPallas("missing barrier implementation")
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
     @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
@@ -212,7 +212,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             split_k=64,
         )
 
-    @xfailIfPallas("missing barrier implementation")
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
     @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
     def test_split_k_barrier_accuracy(self):

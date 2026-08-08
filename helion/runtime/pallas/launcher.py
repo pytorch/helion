@@ -438,7 +438,12 @@ _PallasFlatCopyGuard = tuple[int, int, int, tuple[tuple[int, int], ...]]
 _PallasCopyGuard = tuple[tuple[int, ...], tuple[_PallasFlatCopyGuard, ...]]
 _PallasCopyGuards = dict[int, _PallasCopyGuard]
 _PallasDimensionSemantic = Literal["parallel", "arbitrary"]
-_PallasLauncherCacheKey = tuple[tuple[int, ...], tuple[object, ...] | None]
+_PallasPhaseCaseMetadata = tuple[int, tuple[tuple[int, int, int], ...]]
+_PallasLauncherCacheKey = tuple[
+    tuple[int, ...],
+    tuple[object, ...] | None,
+    _PallasPhaseCaseMetadata | None,
+]
 
 
 def _pallas_tensor_pos_map(
@@ -552,13 +557,19 @@ def _pallas_shared_output_plan(
 
 
 def _pallas_launcher_cache_key(
-    grid: tuple[int, ...], block_spec_info: _BlockSpecInfo | None
+    grid: tuple[int, ...],
+    block_spec_info: _BlockSpecInfo | None,
+    phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
 ) -> _PallasLauncherCacheKey:
     """Return compile-relevant launch metadata for the shared cache."""
     frozen_block_spec_info = (
         tuple(block_spec_info) if block_spec_info is not None else None
     )
-    return grid, cast("tuple[object, ...] | None", frozen_block_spec_info)
+    return (
+        grid,
+        cast("tuple[object, ...] | None", frozen_block_spec_info),
+        phase_case_metadata,
+    )
 
 
 def _pallas_build_block_specs(
@@ -719,7 +730,10 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
         "jnp.int16": jnp.int16,
         "jnp.int8": jnp.int8,
         "jnp.uint8": jnp.uint8,
+        "jnp.uint32": jnp.uint32,
         "jnp.bool_": jnp.bool_,
+        "jnp.complex64": jnp.complex64,
+        "jnp.complex128": jnp.complex128,
     }
 
 
@@ -920,7 +934,9 @@ def _pallas_padded_output_dims_by_arg(
     padded_dims_by_arg: dict[int, list[int]] = {}
     for arg_idx, dim, _bs, _extra in _ds_pad_dims:
         if arg_idx in output_arg_set:
-            padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
+            dims = padded_dims_by_arg.setdefault(arg_idx, [])
+            if dim not in dims:
+                dims.append(dim)
     return padded_dims_by_arg
 
 
@@ -1043,6 +1059,26 @@ def _pallas_collect_outputs(
     return tuple(output_only_results)
 
 
+def _pallas_ds_pad_amounts(
+    args: tuple[object, ...],
+    _ds_pad_dims: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int]]:
+    """Compute max required ds-padding per ``(arg, dim)`` from original shapes."""
+    pad_by_key: dict[tuple[int, int], int] = {}
+    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+        a = args[arg_idx]
+        if not isinstance(a, torch.Tensor):
+            continue
+        pad_amount = (-a.shape[dim]) % block_size + extra_pad
+        if pad_amount == 0:
+            continue
+        key = (arg_idx, dim)
+        pad_by_key[key] = max(pad_by_key.get(key, 0), pad_amount)
+    return [
+        (arg_idx, dim, pad_amount) for (arg_idx, dim), pad_amount in pad_by_key.items()
+    ]
+
+
 def _pallas_apply_ds_padding_fast(
     args: tuple[object, ...],
     _ds_pad_dims: list[tuple[int, int, int, int]],
@@ -1053,12 +1089,9 @@ def _pallas_apply_ds_padding_fast(
     args_list: list[object] | None = None
     orig_output_tensors: dict[int, torch.Tensor] | None = None
     any_padding = False
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+    for arg_idx, dim, pad_amount in _pallas_ds_pad_amounts(args, _ds_pad_dims):
         a = args[arg_idx] if args_list is None else args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
-            continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
             continue
         any_padding = True
         if args_list is None:
@@ -1257,6 +1290,28 @@ def _pallas_copy_guard(guard: _PallasCopyGuard) -> bool | jax.Array:
     return should_copy
 
 
+def _pallas_phase_case_guard(
+    metadata: _PallasPhaseCaseMetadata | None,
+    refs: tuple[object, ...],
+    arg_to_tensor_pos: dict[int, int],
+) -> bool | jax.Array | None:
+    if metadata is None:
+        return None
+
+    from jax.experimental import pallas as pl
+
+    phase_arg_index, case_ranges = metadata
+    phase_ref_pos = arg_to_tensor_pos.get(phase_arg_index)
+    if phase_ref_pos is None:
+        raise RuntimeError("Pallas phase argument is missing from tensor refs")
+    phase_value = refs[phase_ref_pos][0]  # type: ignore[index]
+    pid0 = pl.program_id(0)
+    active: bool | jax.Array = False
+    for phase, start, end in case_ranges:
+        active = active | ((phase_value == phase) & (pid0 >= start) & (pid0 < end))
+    return active
+
+
 def _pallas_make_reordered_kernel(
     pallas_kernel: object,
     args: tuple[object, ...],
@@ -1270,6 +1325,7 @@ def _pallas_make_reordered_kernel(
     skip_inplace_copy: set[int] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _copy_guards: _PallasCopyGuards | None = None,
+    _phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
 
@@ -1293,6 +1349,9 @@ def _pallas_make_reordered_kernel(
     def reordered_kernel(*refs: object) -> None:
         from jax.experimental import pallas as pl
 
+        active_guard = _pallas_phase_case_guard(
+            _phase_case_metadata, refs, arg_to_tensor_pos
+        )
         n_kernel_params = len(args)
         original_order: list[object] = [None] * n_kernel_params
         for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
@@ -1322,7 +1381,17 @@ def _pallas_make_reordered_kernel(
                     _pallas_inplace_copy(in_ref, out_ref, is_smem=is_smem)
             original_order[orig_pos] = out_ref
         extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
-        pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+        if active_guard is not None:
+
+            @pl.when(active_guard)
+            def _run_active_phase_case(
+                original_order: list[object] = original_order,
+                extra_refs: tuple[object, ...] = extra_refs,
+            ) -> None:
+                pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+
+        else:
+            pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
 
     return reordered_kernel
 
@@ -1452,8 +1521,8 @@ def _pallas_apply_ds_padding(
     """Pad tensor args so ``pl.ds(offset, block_size)`` never reads OOB.
 
     ``_ds_pad_dims`` contains ``(arg_index, dim, block_size, extra_pad)``
-    tuples.  The pad amount is ``(-tensor.shape[dim]) % block_size +
-    extra_pad``, where *extra_pad* accounts for non-zero loop begins.
+    tuples.  Multiple requirements for one ``(arg, dim)`` are canonicalized
+    against the original tensor shape before padding is applied.
 
     Returns the padded args tuple and a dict mapping output arg indices
     to their original (unpadded) tensors for post-call copy-back.
@@ -1461,12 +1530,9 @@ def _pallas_apply_ds_padding(
     args_list = list(args)
     orig_output_tensors: dict[int, torch.Tensor] = {}
     output_set = set(_output_indices)
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+    for arg_idx, dim, pad_amount in _pallas_ds_pad_amounts(args, _ds_pad_dims):
         a = args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
-            continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
             continue
         if arg_idx in output_set and arg_idx not in orig_output_tensors:
             orig_output_tensors[arg_idx] = a
@@ -1706,9 +1772,10 @@ def _pallas_compile_jit_fn(
     _hbm_arg_indices: list[int] | None,
     _matmul_dot_general: dict[str, object] | None,
     interpret: bool,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
-    """Build the ``pl.kernel`` jit_fn used by the Pallas launcher.
+    """Build the JAX callable used by the Pallas launcher.
 
     The kernel loop shape is driven entirely by the launcher-observable
     inputs:
@@ -1732,6 +1799,11 @@ def _pallas_compile_jit_fn(
     builds specs from the post-pad shapes.  Returns a
     :class:`_PallasCompileResult` so the torch launcher can wrap the
     jit_fn in a JaxCallable while the JAX-export path calls it directly.
+
+    Pallas multi-root cases and shared in-place output tiles use direct
+    ``pl.pallas_call``. A guarded body inside ``emit_pipeline`` is insufficient
+    because inactive or repeated grid steps still copy their output buffers
+    back to HBM and can overwrite an active update.
     """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
@@ -1814,7 +1886,9 @@ def _pallas_compile_jit_fn(
         for orig_pos, guard in copy_guards.items()
         if orig_pos not in skip_inplace_copy
     }
-    use_direct_call = bool(effective_copy_guards)
+    use_direct_call = _pallas_phase_case_metadata is not None or bool(
+        effective_copy_guards
+    )
     unsupported_hbm_direct_outputs = inplace_positions & skip_inplace_copy
     if use_direct_call and unsupported_hbm_direct_outputs:
         raise NotImplementedError(
@@ -1835,6 +1909,7 @@ def _pallas_compile_jit_fn(
         skip_inplace_copy=skip_inplace_copy,
         _smem_arg_indices=_smem_arg_indices,
         _copy_guards=effective_copy_guards,
+        _phase_case_metadata=_pallas_phase_case_metadata,
     )
 
     out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1965,9 +2040,11 @@ def _pallas_jax_call(
     hbm_arg_indices: list[int] | None,
     smem_arg_indices: list[int] | None,
     interpret: bool,
+    phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     compact: dict[str, object] | None = None,
     orig_shapes: dict[int, tuple[int, ...]] | None = None,
     ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    inplace_result_callback: Callable[[int, object], None] | None = None,
 ) -> list[object]:
     """Drive the shared compile core (``pl.kernel``) + jit_fn on raw ``jax.Array``s
     and return the output JAX array(s).
@@ -1977,6 +2054,10 @@ def _pallas_jax_call(
     and the jax_fn precompiled standalone -- neither touches torch. ``compact``
     carries the compact-worklist kwargs when the kernel uses that lowering.
     """
+    if compact is not None and phase_case_metadata is not None:
+        raise NotImplementedError(
+            "Pallas direct case launches cannot use compact worklists"
+        )
     if compact is not None:
         result = _pallas_compile_compact_jit_fn(
             pallas_kernel,
@@ -2003,6 +2084,7 @@ def _pallas_jax_call(
             _hbm_arg_indices=hbm_arg_indices,
             _matmul_dot_general=None,
             interpret=interpret,
+            _pallas_phase_case_metadata=phase_case_metadata,
         )
 
     jax_inputs = [jax_args[i] for i in result.tensor_arg_indices]
@@ -2019,23 +2101,46 @@ def _pallas_jax_call(
     if not descriptors:
         descriptors = tuple(enumerate(output_indices))
 
-    output_results: list[object] = [jax_results[out_idx] for out_idx, _ in descriptors]
-    output_orig_pos: list[int] = [orig_pos for _, orig_pos in descriptors]
-
     # Slice padded outputs back to their original shapes (ds-pad), reusing the
     # torch fast-path's arg->padded-dims grouping; JAX arrays index identically.
+    padded_dims_by_arg: dict[int, list[int]] = {}
     if ds_pad_dims and orig_shapes:
         padded_dims_by_arg = _pallas_padded_output_dims_by_arg(
             ds_pad_dims, set(orig_shapes.keys())
         )
-        for i, orig_pos in enumerate(output_orig_pos):
-            dims = padded_dims_by_arg.get(orig_pos)
-            orig_shape = orig_shapes.get(orig_pos)
-            if dims and orig_shape is not None:
-                output_results[i] = _pallas_slice_to_orig(
-                    cast("torch.Tensor", output_results[i]),
-                    dims,
-                    cast("torch.Size", orig_shape),
+
+    def _slice_output(out: object, orig_pos: int) -> object:
+        dims = padded_dims_by_arg.get(orig_pos)
+        orig_shape = (orig_shapes or {}).get(orig_pos)
+        if dims and orig_shape is not None:
+            return _pallas_slice_to_orig(
+                cast("torch.Tensor", out),
+                dims,
+                cast("torch.Size", orig_shape),
+            )
+        return out
+
+    output_results = [
+        _slice_output(jax_results[out_idx], orig_pos)
+        for out_idx, orig_pos in descriptors
+    ]
+
+    if inplace_result_callback is not None:
+        output_idx_by_orig_pos = {
+            orig_pos: out_idx for out_idx, orig_pos in enumerate(output_indices)
+        }
+        for orig_pos in result.inplace_positions:
+            tensor_pos = result.arg_to_tensor_pos.get(orig_pos)
+            out_idx = (
+                result.pallas_aliases.get(tensor_pos)
+                if tensor_pos is not None
+                else None
+            )
+            if out_idx is None:
+                out_idx = output_idx_by_orig_pos.get(orig_pos)
+            if out_idx is not None:
+                inplace_result_callback(
+                    orig_pos, _slice_output(jax_results[out_idx], orig_pos)
                 )
 
     return output_results
@@ -2055,13 +2160,13 @@ def _pallas_install_launcher_cache(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
 
-    Builds the ``pl.kernel`` jit_fn via :func:`_pallas_compile_jit_fn`
-    (whose shape is fully determined by the passed-in kwargs — no loop-type
-    discriminator), wraps it in a ``JaxCallable`` (or interpret-mode shim),
-    seeds the ``_LauncherFastPath`` slot, stores the result on
+    Builds the JAX callable via :func:`_pallas_compile_jit_fn` (whose shape is
+    fully determined by the passed-in kwargs), wraps it in a ``JaxCallable``
+    (or interpret-mode shim), seeds the ``_LauncherFastPath`` slot, stores it on
     ``pallas_kernel._pallas_cache``, and returns the freshly-installed cache
     tuple so the caller can fall straight through to the shared invoke.
     """
@@ -2074,7 +2179,9 @@ def _pallas_install_launcher_cache(
         _ensure_cpu_tpu_info()
 
     output_indices = _output_indices if _output_indices is not None else []
-    launcher_cache_key = _pallas_launcher_cache_key(grid, _block_spec_info)
+    launcher_cache_key = _pallas_launcher_cache_key(
+        grid, _block_spec_info, _pallas_phase_case_metadata
+    )
 
     # Build the pallas specs from ds-padded shapes on a throwaway copy so
     # ``args`` stays unpadded for the shared invoke below to pad fresh.
@@ -2096,6 +2203,7 @@ def _pallas_install_launcher_cache(
         _hbm_arg_indices=_hbm_arg_indices,
         _matmul_dot_general=_matmul_dot_general,
         interpret=interpret,
+        _pallas_phase_case_metadata=_pallas_phase_case_metadata,
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret
         ),
@@ -2110,7 +2218,7 @@ def _pallas_install_launcher_cache(
         result.tensor_arg_indices,
         cache_attr=_PALLAS_CACHE_ATTR,
         call_aliases=result.pallas_aliases,
-        trace_key_suffix=f"_{launcher_cache_key[1]!r}",
+        trace_key_suffix=f"_{launcher_cache_key[1:]!r}",
         interpret=interpret,
     )
 
@@ -2190,6 +2298,7 @@ def default_pallas_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     _compact_build_worklist: Callable[..., object] | None = None,
     _compact_offset_arg_indices: list[int] | None = None,
     _compact_metadata_fields: list[str] | None = None,
@@ -2229,6 +2338,10 @@ def default_pallas_launcher(
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
     """
+    if _compact_build_worklist is not None and _pallas_phase_case_metadata is not None:
+        raise NotImplementedError(
+            "Pallas direct case launches cannot use compact worklists"
+        )
     if _compact_build_worklist is not None:
         # Resident-cache correctness backstop: runs EVERY call (the offset arrays are
         # runtime data even when the compiled kernel is cached for this grid), raising
@@ -2243,7 +2356,9 @@ def default_pallas_launcher(
             _compact_ordered_window,
         )
     cache = getattr(pallas_kernel, _PALLAS_CACHE_ATTR, None)
-    launcher_cache_key = _pallas_launcher_cache_key(grid, _block_spec_info)
+    launcher_cache_key = _pallas_launcher_cache_key(
+        grid, _block_spec_info, _pallas_phase_case_metadata
+    )
     if cache is None or cache[6] != launcher_cache_key:
         if _compact_build_worklist is not None:
             cache = _pallas_install_compact_launcher_cache(
@@ -2284,6 +2399,7 @@ def default_pallas_launcher(
                 _ds_pad_dims=_ds_pad_dims,
                 _pallas_interpret=_pallas_interpret,
                 _matmul_dot_general=_matmul_dot_general,
+                _pallas_phase_case_metadata=_pallas_phase_case_metadata,
             )
 
     return _pallas_invoke_cached_launcher(
@@ -2749,7 +2865,7 @@ def _pallas_install_compact_launcher_cache(
         result.tensor_arg_indices,
         cache_attr=_PALLAS_CACHE_ATTR,
         call_aliases=result.pallas_aliases,
-        trace_key_suffix=f"_{launcher_cache_key[1]!r}",
+        trace_key_suffix=f"_{launcher_cache_key[1:]!r}",
         interpret=interpret,
     )
     fast_path = _LauncherFastPath(
@@ -2781,5 +2897,16 @@ def _torch_to_jax(t: torch.Tensor) -> object:
 def _jax_to_torch(
     arr: object, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Convert a JAX array back to a torch.Tensor via DLPack (for interpret mode on CPU)."""
+    """Convert a JAX interpret result back to a torch tensor."""
+    jax_arr = cast("Any", arr)
+    if any(jax_device.platform == "tpu" for jax_device in jax_arr.devices()):
+        # Output-only interpret calls have no input to pin JAX to CPU. On a TPU
+        # host their result can therefore land on TPU, whose arrays do not
+        # support DLPack; stage that uncommon result through a CPU JAX array.
+        # Keeping the host value in JAX preserves dtypes such as bfloat16 that
+        # torch.from_numpy() cannot consume.
+        import jax
+
+        host_arr = jax.device_put(jax.device_get(jax_arr), jax.devices("cpu")[0])
+        return torch.from_dlpack(host_arr).to(dtype=dtype, device=device)
     return torch.from_dlpack(arr).to(dtype=dtype, device=device)

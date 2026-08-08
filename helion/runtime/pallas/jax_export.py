@@ -14,7 +14,7 @@ that wrapper unchanged on JAX inputs, we wrap each input in a
 ``device='meta'`` (so torch operations only touch shape/dtype) but
 which carries the underlying JAX array on the side.  Operations the
 wrapper performs that *return a tensor we will later read back into
-JAX* — ``reshape`` / ``view`` / ``empty_like`` / ``F.pad`` — must be
+JAX* - ``reshape`` / ``view`` / tensor creation factories / ``F.pad`` - must be
 intercepted via ``__torch_function__`` so the JAX side stays in sync.
 Pure-shape introspection (``.size()``, ``.shape``, ``.ndim``,
 ``.dim()``) is left to the meta storage (it carries shape).  Anything
@@ -31,6 +31,7 @@ JAX side correctly.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -39,16 +40,18 @@ import torch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
 
     from ..kernel import Kernel
     from .launcher import _BlockSpecInfo
+    from .launcher import _PallasPhaseCaseMetadata
 
 
-_TORCH_TO_JNP_DTYPE: dict[torch.dtype, object] | None = None
-_JNP_TO_TORCH_DTYPE: dict[object, torch.dtype] | None = None
+_TORCH_TO_JNP_DTYPE: dict[torch.dtype, Any] | None = None
+_JNP_TO_TORCH_DTYPE: dict[Any, torch.dtype] | None = None
 
 
-def _build_dtype_maps() -> tuple[dict[torch.dtype, object], dict[object, torch.dtype]]:
+def _build_dtype_maps() -> tuple[dict[torch.dtype, Any], dict[Any, torch.dtype]]:
     """Return cached torch<->jnp dtype maps, building them on first use.
 
     Built lazily so importing this module never imports JAX (which is
@@ -59,7 +62,7 @@ def _build_dtype_maps() -> tuple[dict[torch.dtype, object], dict[object, torch.d
         return _TORCH_TO_JNP_DTYPE, _JNP_TO_TORCH_DTYPE
     import jax.numpy as jnp
 
-    pairs: list[tuple[torch.dtype, object]] = [
+    pairs: list[tuple[torch.dtype, Any]] = [
         (torch.float32, jnp.float32.dtype),
         (torch.float64, jnp.float64.dtype),
         (torch.float16, jnp.float16.dtype),
@@ -69,7 +72,10 @@ def _build_dtype_maps() -> tuple[dict[torch.dtype, object], dict[object, torch.d
         (torch.int32, jnp.int32.dtype),
         (torch.int64, jnp.int64.dtype),
         (torch.uint8, jnp.uint8.dtype),
+        (torch.uint32, jnp.uint32.dtype),
         (torch.bool, jnp.bool_.dtype),
+        (torch.complex64, jnp.complex64.dtype),
+        (torch.complex128, jnp.complex128.dtype),
     ]
     _TORCH_TO_JNP_DTYPE = dict(pairs)
     _JNP_TO_TORCH_DTYPE = {j: t for t, j in pairs}
@@ -81,6 +87,10 @@ def _jnp_to_torch_dtype(jnp_dtype: object) -> torch.dtype:
     return j2t[jnp_dtype]
 
 
+def _to_int(value: object) -> int:
+    return int(cast("Any", value))
+
+
 class _JaxExportTensor(torch.Tensor):
     """A ``torch.Tensor`` subclass that carries a JAX array on the side.
 
@@ -88,8 +98,8 @@ class _JaxExportTensor(torch.Tensor):
     invoked by the Helion-generated wrapper see correct shape/dtype but
     perform no real compute on the torch side.  ``__torch_function__``
     intercepts the small set of operations the wrapper actually uses
-    (``reshape``/``view``/``empty_like``/``F.pad``) and mirrors them on
-    the JAX array so the JAX side stays in sync.
+    (``reshape``/``view``/tensor creation factories/``F.pad``) and
+    mirrors them on the JAX array so the JAX side stays in sync.
 
     Use ``_JaxExportTensor.from_jax(arr, device=...)`` to construct one;
     use ``adapter._jax_arr`` (or :func:`_unwrap_jax` on a result) to
@@ -130,20 +140,50 @@ class _JaxExportTensor(torch.Tensor):
         if kwargs is None:
             kwargs = {}
 
-        # ``torch.empty_like(adapter, device='meta')`` shows up in
-        # generated wrappers when the kernel allocates an output-only
-        # tensor.  Allocate a JAX-side empty with matching shape/dtype
-        # so the export launcher can use the JAX array as the output
-        # placeholder.
-        if func is torch.empty_like:
+        # Like factories show up in generated wrappers when a kernel allocates
+        # an output or a cross-phase temporary. Mirror the allocation in JAX.
+        like_factories = {
+            torch.empty_like: "empty",
+            torch.zeros_like: "zeros",
+            torch.ones_like: "ones",
+            torch.full_like: "full",
+        }
+        if func in like_factories:
             template = args[0] if args else kwargs.get("input")
             assert isinstance(template, _JaxExportTensor)
-            import jax.numpy as jnp
 
-            new_jax = jnp.empty(
-                tuple(int(s) for s in template._jax_arr.shape),  # type: ignore[union-attr]
-                dtype=template._jax_arr.dtype,  # type: ignore[union-attr]
+            shape = tuple(int(s) for s in template._jax_arr.shape)  # type: ignore[union-attr]
+            dtype_arg = kwargs.get("dtype")
+            if dtype_arg is None:
+                dtype = template._jax_arr.dtype  # type: ignore[union-attr]
+            else:
+                assert isinstance(dtype_arg, torch.dtype)
+                dtype = _torch_to_jnp_dtype(dtype_arg)
+            kind = like_factories[func]
+            fill_value = args[1] if len(args) > 1 else kwargs.get("fill_value")
+            new_jax = _new_jax_array(kind, shape, dtype, fill_value)
+            return cls.from_jax(new_jax, device=template._declared_device)
+
+        new_factories = {
+            torch.Tensor.new_empty: "empty",
+            torch.Tensor.new_zeros: "zeros",
+            torch.Tensor.new_ones: "ones",
+            torch.Tensor.new_full: "full",
+        }
+        if func in new_factories:
+            template = args[0]
+            assert isinstance(template, _JaxExportTensor)
+            kind = new_factories[func]
+            shape_args = args[1:2] if kind == "full" else args[1:]
+            shape = _normalize_creation_shape(shape_args, kwargs)
+            dtype_arg = kwargs.get("dtype")
+            dtype = (
+                template._jax_arr.dtype  # type: ignore[union-attr]
+                if dtype_arg is None
+                else _torch_to_jnp_dtype(cast("torch.dtype", dtype_arg))
             )
+            fill_value = args[2] if len(args) > 2 else kwargs.get("fill_value")
+            new_jax = _new_jax_array(kind, shape, dtype, fill_value)
             return cls.from_jax(new_jax, device=template._declared_device)
 
         # ``q_view = q_in.reshape([...])`` and ``out.view(...)`` are
@@ -221,6 +261,114 @@ def _normalize_shape(
     return rest
 
 
+def _normalize_creation_shape(
+    args: tuple[object, ...], kwargs: dict[str, object]
+) -> tuple[int, ...]:
+    if "size" in kwargs:
+        candidate = kwargs["size"]
+        if isinstance(candidate, (list, tuple, torch.Size)):
+            return tuple(_to_int(s) for s in candidate)
+        return (_to_int(candidate),)
+    if len(args) == 1 and isinstance(args[0], (list, tuple, torch.Size)):
+        return tuple(_to_int(s) for s in args[0])
+    return tuple(_to_int(s) for s in args)
+
+
+def _torch_to_jnp_dtype(torch_dtype: torch.dtype) -> object:
+    t2j, _ = _build_dtype_maps()
+    return t2j[torch_dtype]
+
+
+def _new_jax_array(
+    kind: str,
+    shape: tuple[int, ...],
+    dtype: object,
+    fill_value: object | None = None,
+) -> object:
+    import jax.numpy as jnp
+
+    if kind == "zeros":
+        return jnp.zeros(shape, dtype=cast("Any", dtype))
+    if kind == "ones":
+        return jnp.ones(shape, dtype=cast("Any", dtype))
+    if kind == "full":
+        assert fill_value is not None
+        return jnp.full(shape, cast("Any", fill_value), dtype=cast("Any", dtype))
+    assert kind == "empty"
+    return jnp.empty(shape, dtype=cast("Any", dtype))
+
+
+class _JaxExportAllocationMode(torch.overrides.TorchFunctionMode):
+    """Route wrapper allocations to JAX without patching global torch APIs."""
+
+    _declared_device: torch.device
+
+    def __init__(self, declared_device: torch.device) -> None:
+        super().__init__()
+        self._declared_device = declared_device  # pyrefly: ignore[read-only]
+
+    def _device_matches(self, device: object) -> bool:
+        if device is None or not isinstance(device, (torch.device, int, str)):
+            return False
+        candidate = torch.device(device)
+        return candidate.type == self._declared_device.type and (
+            candidate.index == self._declared_device.index
+            or candidate.index is None
+            or self._declared_device.index is None
+        )
+
+    def __torch_function__(
+        self,
+        func: Callable[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        if kwargs is None:
+            kwargs = {}
+        factories = {
+            torch.empty: "empty",
+            torch.zeros: "zeros",
+            torch.ones: "ones",
+            torch.full: "full",
+        }
+        if func in factories and kwargs.get("out") is None:
+            if self._device_matches(kwargs.get("device")):
+                kind = factories[func]
+                fill_value = (
+                    args[1]
+                    if kind == "full" and len(args) > 1
+                    else kwargs.get("fill_value")
+                )
+                dtype = kwargs.get("dtype")
+                if dtype is None:
+                    dtype = (
+                        torch.tensor(fill_value, device="meta").dtype
+                        if kind == "full"
+                        else torch.get_default_dtype()
+                    )
+                assert isinstance(dtype, torch.dtype)
+                shape_args = args[:1] if kind == "full" else args
+                shape = _normalize_creation_shape(shape_args, kwargs)
+                jax_arr = _new_jax_array(
+                    kind,
+                    shape,
+                    _torch_to_jnp_dtype(dtype),
+                    fill_value,
+                )
+                return _JaxExportTensor.from_jax(jax_arr, device=self._declared_device)
+        return func(*args, **kwargs)
+
+
+@contextmanager
+def _torch_allocation_patch_for_jax_export(
+    declared_device: torch.device,
+) -> Iterator[None]:
+    """Route torch allocations in generated wrappers to JAX-backed adapters."""
+    with _JaxExportAllocationMode(declared_device):
+        yield
+
+
 def _unwrap_jax(obj: object) -> object:
     """Recursively unwrap ``_JaxExportTensor`` instances to JAX arrays."""
     if isinstance(obj, _JaxExportTensor):
@@ -265,7 +413,10 @@ def _tensor_arg_to_jax(arg: object) -> object:
     if isinstance(arg, torch.Tensor):
         import jax.numpy as jnp
 
-        return jnp.asarray(arg.detach().cpu().numpy())
+        return jnp.asarray(
+            arg.detach().cpu().tolist(),
+            dtype=cast("Any", _torch_to_jnp_dtype(arg.dtype)),
+        )
     return arg
 
 
@@ -281,6 +432,7 @@ def default_pallas_jax_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     **kwargs: object,
 ) -> object:
     """Pallas launcher used when running a Helion kernel inside ``jax.jit``.
@@ -309,6 +461,7 @@ def default_pallas_jax_launcher(
     # calls ``F.pad`` on each entry, which the adapter intercepts and
     # mirrors on the JAX side, so no JAX-side duplicate is needed here.
     orig_shapes: dict[int, tuple[int, ...]] = {}
+    orig_output_adapters: dict[int, _JaxExportTensor] = {}
     if _ds_pad_dims:
         for arg_idx, _, _, _ in _ds_pad_dims:
             if arg_idx in orig_shapes:
@@ -317,7 +470,14 @@ def default_pallas_jax_launcher(
             if isinstance(a, _JaxExportTensor):
                 orig_shapes[arg_idx] = tuple(int(s) for s in a._jax_arr.shape)  # type: ignore[union-attr]
 
-        args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
+        args, orig_output_tensors = _pallas_apply_ds_padding(
+            args, output_indices, _ds_pad_dims
+        )
+        orig_output_adapters = {
+            idx: tensor
+            for idx, tensor in orig_output_tensors.items()
+            if isinstance(tensor, _JaxExportTensor)
+        }
 
     device = next(
         (a._declared_device for a in args if isinstance(a, _JaxExportTensor)),
@@ -338,6 +498,10 @@ def default_pallas_jax_launcher(
     # at trace time); the caller must ensure every ordered range <= C.
     compact_build_worklist = kwargs.get("_compact_build_worklist")
     compact: dict[str, object] | None = None
+    if compact_build_worklist is not None and _pallas_phase_case_metadata is not None:
+        raise NotImplementedError(
+            "Pallas direct case launches cannot use compact worklists"
+        )
     if compact_build_worklist is not None:
         compact = {
             "build_worklist": compact_build_worklist,
@@ -356,6 +520,13 @@ def default_pallas_jax_launcher(
             "ordered_window": kwargs.get("_compact_ordered_window", 0),
         }
 
+    def _update_inplace_adapter(orig_pos: int, value: object) -> None:
+        adapter = orig_output_adapters.get(orig_pos)
+        if adapter is None and isinstance(args[orig_pos], _JaxExportTensor):
+            adapter = cast("_JaxExportTensor", args[orig_pos])
+        if adapter is not None:
+            adapter._jax_arr = value
+
     output_results = _pallas_jax_call(
         pallas_kernel,
         grid,
@@ -367,9 +538,11 @@ def default_pallas_jax_launcher(
         hbm_arg_indices=_hbm_arg_indices,
         smem_arg_indices=_smem_arg_indices,
         interpret=interpret,
+        phase_case_metadata=_pallas_phase_case_metadata,
         compact=compact,
         orig_shapes=orig_shapes,
         ds_pad_dims=_ds_pad_dims,
+        inplace_result_callback=_update_inplace_adapter,
     )
 
     if len(output_results) == 1:
@@ -426,7 +599,8 @@ def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:
                 **cast("dict[str, Any]", launch_kwargs),
             )
 
-        result = compiled(*adapter_args, _launcher=_launcher)
+        with _torch_allocation_patch_for_jax_export(device):
+            result = compiled(*adapter_args, _launcher=_launcher)
         return _unwrap_jax(result)
 
     return _runtime_call
