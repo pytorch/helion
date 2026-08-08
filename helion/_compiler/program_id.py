@@ -19,6 +19,7 @@ from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
+from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
@@ -200,7 +201,6 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_M = 5
 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_N = 6
 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
-_TCGEN05_GROUPED_SELECTED_MAILBOX_FIELD_COUNT = 9
 
 
 if TYPE_CHECKING:
@@ -1276,7 +1276,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
     def _tcgen05_work_tile_mailbox_field_count(self) -> int:
         if self._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox():
-            return _TCGEN05_GROUPED_SELECTED_MAILBOX_FIELD_COUNT
+            return TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
         return 4
 
     def _tcgen05_has_validated_role_local_two_cta_runtime(self) -> bool:

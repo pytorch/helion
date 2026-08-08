@@ -40,7 +40,9 @@ from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
-from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
+)
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from ..triton.launcher import get_num_sm
 
@@ -2464,7 +2466,7 @@ def _validate_tcgen05_grouped_worklist_nm(
         return
     lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
     rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+    source_m_tile = _plan_int_value(plan, "source_m_tile")
     expected_store_end = 0
     seen_groups: set[int] = set()
     for row in rows:
@@ -2719,11 +2721,20 @@ def _build_tcgen05_grouped_static_metadata(
     bn = _plan_int_value(plan, "bn")
     bk = _plan_int_value(plan, "bk")
     worklist_nm = _tcgen05_plan_orientation(plan) == "nm"
-    worklist_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if worklist_nm else bm
     n_size = _plan_int_value(plan, "n_size")
     k_total_size = _plan_int_value(plan, "k_total_size")
-    scheduler_bm = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE if worklist_nm else bm
-    scheduler_bn = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if worklist_nm else bn
+    if worklist_nm:
+        worklist_m_tile = _plan_int_value(plan, "source_m_tile")
+        if worklist_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist scheduler requires a validated source M tile",
+            )
+        scheduler_bm = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+        scheduler_bn = worklist_m_tile
+    else:
+        worklist_m_tile = scheduler_bm = bm
+        scheduler_bn = bn
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
     dynamic_d_tensormap = bool(plan.get("dynamic_d_tensormap"))
     direct_pointer_metadata = bool(plan.get("direct_pointer_metadata"))
@@ -2738,10 +2749,11 @@ def _build_tcgen05_grouped_static_metadata(
         raise exc.BackendUnsupported(
             "cute", "tcgen05 N,M orientation requires grouped worklist metadata"
         )
-    if dynamic_ab_tensormaps and bk != 64:
+    if dynamic_ab_tensormaps and bk != 64 and not (worklist_nm and bk == 128):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 grouped dynamic A/B TensorMaps are validated only for BK64",
+            "tcgen05 grouped dynamic A/B TensorMaps are validated only for "
+            "BK64, or BK128 on the N,M worklist path",
         )
     direct_lhs: torch.Tensor | None = None
     direct_rhs: torch.Tensor | None = None

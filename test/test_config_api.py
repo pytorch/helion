@@ -30,6 +30,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -1023,6 +1026,71 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             generation.encode_config(flat)
             self.assertEqual(pid_fragment.pattern_neighbors(flat[pid_index]), ["flat"])
             self.assertEqual(mode_fragment.pattern_neighbors(flat[mode_index]), [None])
+
+    def test_grouped_worklist_source_tile_normalization(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[256, 128, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            tcgen05_grouped_worklist_source_m_tile=256,
+        )
+        spec.normalize(config)
+        self.assertEqual(
+            config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
+            256,
+        )
+
+        for invalid_value in (256.0, True, 225):
+            wrong_type_config = helion.Config(
+                block_sizes=[256, 128, 128],
+                pid_type="persistent_interleaved",
+                tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                tcgen05_grouped_worklist_source_m_tile=256,
+            )
+            wrong_type_config.config[
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+            ] = invalid_value
+            with self.assertRaisesRegex(exc.InvalidConfig, "source_m_tile"):
+                spec.normalize(wrong_type_config)
+
+        invalid = helion.Config(
+            block_sizes=[256, 128, 128],
+            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_DYNAMIC,
+            tcgen05_grouped_worklist_source_m_tile=256,
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "source_m_tile"):
+            spec.normalize(invalid)
+        spec.normalize(invalid, _fix_invalid=True)
+        self.assertNotIn(
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+            invalid.config,
+        )
+
+    def test_grouped_worklist_source_tile_seed_round_trip(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec = self._make_cute_tcgen05_spec()
+        seed = helion.Config(
+            block_sizes=[256, 128, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            tcgen05_grouped_worklist_source_m_tile=256,
+        )
+        spec.compiler_seed_configs = [seed]
+
+        generation = ConfigGeneration(spec)
+        [(flat, normalized)] = generation.seed_flat_config_pairs()
+        self.assertEqual(
+            normalized.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
+            256,
+        )
+        generation.encode_config(flat)
+        round_trip = generation.unflatten(flat)
+        self.assertEqual(
+            round_trip.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
+            256,
+        )
 
     def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
         from helion._compiler.backend import MetalBackend

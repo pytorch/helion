@@ -60,10 +60,17 @@ class CuteTcgen05GroupedPlan:
     direct_strides: str | None = None
     d_mode: Tcgen05GroupedDMode = Tcgen05GroupedDMode.NONE
     d_tensormap: str | None = None
+    # N,M worklists carry their source-row tile explicitly so runtime metadata
+    # validation and launch bounds consume the exact schedule selected by the
+    # compiler.
+    source_m_tile: int | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
         assert (self.orientation is Tcgen05Orientation.NM) == (self.valid_m is not None)
+        assert (self.orientation is Tcgen05Orientation.NM) == (
+            self.source_m_tile is not None
+        )
         assert (self.direct_pointers is None) == (self.direct_strides is None)
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
 
