@@ -276,6 +276,7 @@ class _MmaOperandInfo:
     rhs_k_block_id: int | None = None
     rhs_rank3_grouped_nt: bool = False
     rhs_segment_group: _Rank3RhsSegmentGroupInfo | None = None
+    rhs_packed_group: _Rank3RhsPackedGroupInfo | None = None
 
     @property
     def matrix_rows(self) -> int | torch.SymInt:
@@ -301,6 +302,14 @@ class _MmaOperandInfo:
     @property
     def is_leading_passthrough(self) -> bool:
         return self.leading_passthrough_block_id is not None
+
+    @property
+    def rhs_grouped_leading_block_id(self) -> int | None:
+        if self.rhs_segment_group is not None:
+            return self.rhs_segment_group.segment_block_id
+        if self.rhs_packed_group is not None:
+            return self.rhs_packed_group.group_block_id
+        return None
 
 
 @dataclass(frozen=True)
@@ -332,21 +341,46 @@ class _Rank3RhsSegmentGroupInfo:
 
 
 @dataclass(frozen=True)
-class _Rank3RhsSegmentLhsInfo:
-    segment_start_load: Node
-    actual_m_load: Node
+class _Rank3RhsPackedGroupInfo:
+    """Canonical scalar group id carried by a leading block-size-one axis."""
+
+    group_index: Node
+    group_block_id: int
+
+
+@dataclass(frozen=True)
+class _Rank3RhsPackedSplitInfo:
+    """Proof that compact A rows are partitioned by device split sizes."""
+
+    split_sizes_tensor: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _Rank3RhsLhsScaffold:
+    """Shared row-address and validity structure for packed grouped LHS loads."""
+
+    row_index: Node
+    row_offset: Node
+    valid_m: Node
+    valid_extent: Node
+
+
+@dataclass(frozen=True)
+class _Rank3RhsWorklistLhsInfo:
+    row_start: Node
+    group_m: Node
     row_index: Node
     valid_m: Node
     dependency_nodes: tuple[Node, ...]
 
 
 @dataclass(frozen=True)
-class _Rank3RhsSegmentStoreInfo:
+class _Rank3RhsWorklistStoreInfo:
     store_node: Node
     row_index: Node
     valid_m: Node
     extent_load: Node
-    uses_store_extent_metadata: bool = False
+    uses_scheduler_store_extent: bool = False
 
 
 @dataclass(frozen=True)
@@ -366,12 +400,13 @@ class _Rank3RhsGroupedProof:
     layout_tensor: torch.Tensor
     k_mask: _Rank3RhsGroupedKMaskInfo | None
     tail_epilogue: Tcgen05GroupedTailEpilogueMatch | None
-    segment_lhs: _Rank3RhsSegmentLhsInfo | None
-    segment_store: _Rank3RhsSegmentStoreInfo | None
+    worklist_lhs: _Rank3RhsWorklistLhsInfo | None
+    worklist_store: _Rank3RhsWorklistStoreInfo | None
+    packed_split: _Rank3RhsPackedSplitInfo | None = None
 
     @property
     def is_worklist(self) -> bool:
-        return self.segment_lhs is not None
+        return self.worklist_lhs is not None
 
 
 @dataclass(frozen=True)
@@ -1035,6 +1070,335 @@ def _rank3_rhs_segment_group_load(
     )
 
 
+def _rank3_rhs_packed_group_index(
+    cg: GenerateAST,
+    group_index: Node,
+) -> _Rank3RhsPackedGroupInfo | None:
+    """Recognize ``group_tile.index.sum()`` for a block-size-one group axis."""
+    from ...language import tile_ops
+    from ..compile_environment import CompileEnvironment
+    from ..compile_environment import FixedBlockSizeSource
+
+    root = _trace_to_outer_graph_arg(cg, group_index)
+    if (
+        root.op != "call_function"
+        or root.target is not torch.ops.aten.sum.default
+        or len(root.args) != 1
+        or not isinstance(root.args[0], Node)
+    ):
+        return None
+    tile_index, mask_to = _unwrap_zero_mask_to(root.args[0])
+    if (
+        mask_to is None
+        or tile_index.op != "call_function"
+        or tile_index.target is not tile_ops.tile_index
+        or len(tile_index.args) != 1
+        or not isinstance(tile_index.args[0], Node)
+    ):
+        return None
+    group_block_id = _rank3_rhs_index_block_id(
+        tile_index.args[0],
+        reduction=False,
+    )
+    root_value = root.meta.get("val")
+    tile_value = tile_index.meta.get("val")
+    block_size_source = (
+        CompileEnvironment.current().block_sizes[group_block_id].block_size_source
+        if group_block_id is not None
+        else None
+    )
+    if (
+        group_block_id is None
+        or not isinstance(block_size_source, FixedBlockSizeSource)
+        or block_size_source.value != 1
+        or not isinstance(root_value, torch.Tensor)
+        or root_value.ndim != 0
+        or not isinstance(tile_value, torch.Tensor)
+        or tile_value.ndim != 1
+    ):
+        return None
+    return _Rank3RhsPackedGroupInfo(
+        group_index=root,
+        group_block_id=group_block_id,
+    )
+
+
+def _rank3_rhs_packed_split_load(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    expected_tensor: torch.Tensor | None = None,
+    literal_index: int | None = None,
+    expected_index: Node | None = None,
+) -> tuple[torch.Tensor, Node] | None:
+    root = _trace_to_outer_graph_arg(cg, node)
+    if not _is_unmasked_load(root) or len(root.args) < 2:
+        return None
+    tensor_node = root.args[0]
+    index = root.args[1]
+    if (
+        not isinstance(tensor_node, Node)
+        or not isinstance(index, list | tuple)
+        or len(index) != 1
+    ):
+        return None
+    index_value = index[0]
+    if literal_index is not None and index_value != literal_index:
+        return None
+    if expected_index is not None and (
+        not isinstance(index_value, Node)
+        or _trace_to_outer_graph_arg(cg, index_value) is not expected_index
+    ):
+        return None
+    tensor = tensor_node.meta.get("val")
+    loaded = root.meta.get("val")
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or tensor.ndim != 1
+        or tensor.dtype not in (torch.int32, torch.int64)
+        or (expected_tensor is not None and tensor is not expected_tensor)
+        or not isinstance(loaded, torch.Tensor)
+        or loaded.ndim != 0
+    ):
+        return None
+    return tensor, root
+
+
+def _rank3_rhs_flatten_add_tree(cg: GenerateAST, node: Node) -> tuple[Node, ...]:
+    import operator
+
+    root = _trace_to_outer_graph_arg(cg, node)
+    if (
+        root.op == "call_function"
+        and root.target in (operator.add, torch.ops.aten.add.Tensor)
+        and len(root.args) == 2
+        and not root.kwargs
+        and all(isinstance(arg, Node) for arg in root.args)
+    ):
+        lhs, rhs = cast("tuple[Node, Node]", root.args)
+        return (
+            *_rank3_rhs_flatten_add_tree(cg, lhs),
+            *_rank3_rhs_flatten_add_tree(cg, rhs),
+        )
+    return (root,)
+
+
+def _rank3_rhs_lhs_scaffold(
+    cg: GenerateAST,
+    lhs_info: _MmaOperandInfo,
+    *,
+    m_block_id: int,
+    k_block_id: int,
+) -> _Rank3RhsLhsScaffold | None:
+    """Match ``row_offset + local_m`` guarded by ``local_m < valid_extent``."""
+    import operator
+
+    from ..compile_environment import CompileEnvironment
+
+    indices = lhs_info.load.args[1] if len(lhs_info.load.args) >= 2 else None
+    extra_mask = lhs_info.load.args[2] if len(lhs_info.load.args) >= 3 else None
+    if (
+        not isinstance(indices, list | tuple)
+        or len(indices) != 2
+        or not isinstance(indices[0], Node)
+        or not isinstance(indices[1], Node)
+        or not isinstance(extra_mask, Node)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    lhs_k_block_id = _rank3_rhs_exact_index_block_id(indices[1], reduction=None)
+    if lhs_k_block_id is None or env.canonical_block_id(
+        lhs_k_block_id
+    ) != env.canonical_block_id(k_block_id):
+        return None
+
+    row_index = _trace_to_outer_graph_arg(cg, indices[0])
+    if (
+        row_index.op != "call_function"
+        or row_index.target not in (operator.add, torch.ops.aten.add.Tensor)
+        or len(row_index.args) != 2
+        or row_index.kwargs
+        or not all(isinstance(arg, Node) for arg in row_index.args)
+    ):
+        return None
+    row_args = cast("tuple[Node, Node]", row_index.args)
+    local_m_positions = [
+        index
+        for index, arg in enumerate(row_args)
+        if _is_tile_index_for_block(cg, arg, block_id=m_block_id)
+    ]
+    if len(local_m_positions) != 1:
+        return None
+    row_offset = _trace_to_outer_graph_arg(cg, row_args[1 - local_m_positions[0]])
+
+    mask = _trace_to_outer_graph_arg(cg, extra_mask)
+    valid_m = _rank3_rhs_broadcast_mask_base(mask, broadcast_dim=1)
+    if valid_m is None:
+        return None
+    valid_m = _trace_to_outer_graph_arg(cg, valid_m)
+    if (
+        valid_m.op != "call_function"
+        or valid_m.target not in (operator.lt, torch.ops.aten.lt.Tensor)
+        or len(valid_m.args) != 2
+        or valid_m.kwargs
+        or not all(isinstance(arg, Node) for arg in valid_m.args)
+    ):
+        return None
+    valid_lhs, valid_extent = cast("tuple[Node, Node]", valid_m.args)
+    if not _is_tile_index_for_block(cg, valid_lhs, block_id=m_block_id):
+        return None
+    return _Rank3RhsLhsScaffold(
+        row_index=row_index,
+        row_offset=row_offset,
+        valid_m=valid_m,
+        valid_extent=_trace_to_outer_graph_arg(cg, valid_extent),
+    )
+
+
+def _rank3_rhs_packed_split_lhs_info(
+    cg: GenerateAST,
+    lhs_info: _MmaOperandInfo,
+    rhs_info: _MmaOperandInfo,
+    *,
+    group_count: int,
+    group_block_id: int,
+    m_block_id: int,
+    k_block_id: int,
+) -> tuple[_Rank3RhsWorklistLhsInfo, _Rank3RhsPackedSplitInfo] | None:
+    """Prove compact row addressing from ``split_sizes[group]`` and its prefix."""
+    import operator
+
+    from ..compile_environment import CompileEnvironment
+
+    packed_group = rhs_info.rhs_packed_group
+    if packed_group is None or group_count < 2:
+        return None
+    env = CompileEnvironment.current()
+    canonical_block_id = env.canonical_block_id
+    if canonical_block_id(packed_group.group_block_id) != canonical_block_id(
+        group_block_id
+    ) or canonical_block_id(group_block_id) in (
+        canonical_block_id(m_block_id),
+        canonical_block_id(k_block_id),
+    ):
+        return None
+
+    def block_extent_matches(block_id: int, expected: int | torch.SymInt) -> bool:
+        extent = env.block_sizes[canonical_block_id(block_id)].size
+        return isinstance(extent, int | torch.SymInt) and env.known_equal(
+            extent,
+            expected,
+        )
+
+    rhs_n_block_id = rhs_info.rhs_n_block_id
+    if (
+        lhs_info.source_fake.ndim != 2
+        or rhs_info.source_fake.ndim != 3
+        or rhs_n_block_id is None
+        or not block_extent_matches(
+            packed_group.group_block_id,
+            rhs_info.source_fake.shape[0],
+        )
+        or not block_extent_matches(m_block_id, lhs_info.source_fake.shape[0])
+        or not block_extent_matches(rhs_n_block_id, rhs_info.source_fake.shape[1])
+        or not block_extent_matches(k_block_id, lhs_info.source_fake.shape[1])
+        or not block_extent_matches(k_block_id, rhs_info.source_fake.shape[2])
+    ):
+        return None
+    lhs_scaffold = _rank3_rhs_lhs_scaffold(
+        cg,
+        lhs_info,
+        m_block_id=m_block_id,
+        k_block_id=k_block_id,
+    )
+    if lhs_scaffold is None:
+        return None
+    group_m_loaded = _rank3_rhs_packed_split_load(
+        cg,
+        lhs_scaffold.valid_extent,
+        expected_index=packed_group.group_index,
+    )
+    if group_m_loaded is None:
+        return None
+    split_sizes, group_m_load = group_m_loaded
+    if split_sizes.shape[0] != group_count:
+        return None
+
+    prefix_terms = _rank3_rhs_flatten_add_tree(cg, lhs_scaffold.row_offset)
+    if len(prefix_terms) != group_count - 1:
+        return None
+    scaffold_nodes: list[Node] = [packed_group.group_index, group_m_load]
+    prefix_indices: set[int] = set()
+    for term in prefix_terms:
+        if (
+            term.op != "call_function"
+            or term.target is not torch.ops.aten.where.self
+            or len(term.args) != 3
+            or not isinstance(term.args[0], Node)
+            or not isinstance(term.args[1], Node)
+            or not _is_zero_scalar_node(term.args[2])
+        ):
+            return None
+        condition, true_value = cast("tuple[Node, Node]", term.args[:2])
+        prefix_index = condition.args[1] if len(condition.args) == 2 else None
+        if (
+            condition.op != "call_function"
+            or condition.target not in (operator.gt, torch.ops.aten.gt.Scalar)
+            or len(condition.args) != 2
+            or not isinstance(condition.args[0], Node)
+            or _trace_to_outer_graph_arg(cg, condition.args[0])
+            is not packed_group.group_index
+            or type(prefix_index) is not int
+            or prefix_index not in range(group_count - 1)
+            or prefix_index in prefix_indices
+        ):
+            return None
+        prefix_loaded = _rank3_rhs_packed_split_load(
+            cg,
+            true_value,
+            expected_tensor=split_sizes,
+            literal_index=prefix_index,
+        )
+        if prefix_loaded is None:
+            return None
+        _tensor, prefix_load = prefix_loaded
+        scaffold_nodes.extend((prefix_load, condition))
+        zero = term.args[2]
+        if isinstance(zero, Node):
+            scaffold_nodes.append(zero)
+        scaffold_nodes.append(term)
+        prefix_indices.add(prefix_index)
+    if prefix_indices != set(range(group_count - 1)):
+        return None
+    scaffold_nodes.extend(
+        dependency
+        for dependency in _collect_node_dependencies(lhs_scaffold.row_offset)
+        if dependency.op == "call_function"
+        and isinstance(dependency.meta.get("val"), torch.Tensor)
+        and cast("torch.Tensor", dependency.meta["val"]).ndim == 0
+    )
+    scaffold_nodes.extend(
+        (
+            lhs_scaffold.row_offset,
+            lhs_scaffold.row_index,
+            lhs_scaffold.valid_m,
+        )
+    )
+    dependency_nodes = tuple(dict.fromkeys(scaffold_nodes))
+    return (
+        _Rank3RhsWorklistLhsInfo(
+            row_start=lhs_scaffold.row_offset,
+            group_m=group_m_load,
+            row_index=lhs_scaffold.row_index,
+            valid_m=lhs_scaffold.valid_m,
+            dependency_nodes=dependency_nodes,
+        ),
+        _Rank3RhsPackedSplitInfo(
+            split_sizes_tensor=split_sizes,
+        ),
+    )
+
+
 def _rank3_rhs_broadcast_mask_base(
     condition: Node, *, broadcast_dim: int
 ) -> Node | None:
@@ -1071,9 +1435,7 @@ def _rank3_rhs_segment_lhs_info(
     segment_block_id: int,
     m_block_id: int,
     k_block_id: int,
-) -> _Rank3RhsSegmentLhsInfo | None:
-    import operator
-
+) -> _Rank3RhsWorklistLhsInfo | None:
     from ..compile_environment import CompileEnvironment
 
     if rhs_info.rhs_segment_group is None:
@@ -1088,70 +1450,27 @@ def _rank3_rhs_segment_lhs_info(
         canonical_block_id(k_block_id),
     ):
         return None
-    indices = lhs_info.load.args[1] if len(lhs_info.load.args) >= 2 else None
-    extra_mask = lhs_info.load.args[2] if len(lhs_info.load.args) >= 3 else None
-    if (
-        not isinstance(indices, list | tuple)
-        or len(indices) != 2
-        or not isinstance(indices[0], Node)
-        or not isinstance(indices[1], Node)
-        or not isinstance(extra_mask, Node)
-    ):
+    lhs_scaffold = _rank3_rhs_lhs_scaffold(
+        cg,
+        lhs_info,
+        m_block_id=m_block_id,
+        k_block_id=k_block_id,
+    )
+    if lhs_scaffold is None:
         return None
-    lhs_k_block_id = _rank3_rhs_exact_index_block_id(indices[1], reduction=None)
-    if lhs_k_block_id is None or canonical_block_id(
-        lhs_k_block_id
-    ) != canonical_block_id(k_block_id):
+    loaded_start = _rank3_rhs_segment_metadata_load(
+        cg,
+        lhs_scaffold.row_offset,
+        column=1,
+        expected_tensor=segment_group.metadata_tensor,
+        expected_segment_id=segment_group.segment_id,
+    )
+    if loaded_start is None:
         return None
-
-    row_index = _trace_to_outer_graph_arg(cg, indices[0])
-    if (
-        row_index.op != "call_function"
-        or row_index.target not in (operator.add, torch.ops.aten.add.Tensor)
-        or len(row_index.args) != 2
-        or row_index.kwargs
-        or not all(isinstance(arg, Node) for arg in row_index.args)
-    ):
-        return None
-    row_args = cast("tuple[Node, Node]", row_index.args)
-    segment_start_load = None
-    saw_local_m = False
-    for arg in row_args:
-        if _is_tile_index_for_block(cg, arg, block_id=m_block_id):
-            saw_local_m = True
-            continue
-        loaded = _rank3_rhs_segment_metadata_load(
-            cg,
-            arg,
-            column=1,
-            expected_tensor=segment_group.metadata_tensor,
-            expected_segment_id=segment_group.segment_id,
-        )
-        if loaded is not None:
-            _metadata, _segment_id, segment_start_load = loaded
-            continue
-        return None
-    if segment_start_load is None or not saw_local_m:
-        return None
-
-    mask = _trace_to_outer_graph_arg(cg, extra_mask)
-    valid_m = _rank3_rhs_broadcast_mask_base(mask, broadcast_dim=1)
-    if valid_m is not None:
-        valid_m = _trace_to_outer_graph_arg(cg, valid_m)
-    if (
-        valid_m is None
-        or valid_m.op != "call_function"
-        or valid_m.target not in (operator.lt, torch.ops.aten.lt.Tensor)
-        or len(valid_m.args) != 2
-        or not all(isinstance(arg, Node) for arg in valid_m.args)
-    ):
-        return None
-    valid_lhs, valid_rhs = cast("tuple[Node, Node]", valid_m.args)
-    if not _is_tile_index_for_block(cg, valid_lhs, block_id=m_block_id):
-        return None
+    _metadata, _segment_id, segment_start_load = loaded_start
     loaded_actual_m = _rank3_rhs_segment_metadata_load(
         cg,
-        valid_rhs,
+        lhs_scaffold.valid_extent,
         column=2,
         expected_tensor=segment_group.metadata_tensor,
         expected_segment_id=segment_group.segment_id,
@@ -1159,11 +1478,11 @@ def _rank3_rhs_segment_lhs_info(
     if loaded_actual_m is None:
         return None
     _metadata, _segment_id, actual_m_load = loaded_actual_m
-    return _Rank3RhsSegmentLhsInfo(
-        segment_start_load=segment_start_load,
-        actual_m_load=actual_m_load,
-        row_index=row_index,
-        valid_m=valid_m,
+    return _Rank3RhsWorklistLhsInfo(
+        row_start=segment_start_load,
+        group_m=actual_m_load,
+        row_index=lhs_scaffold.row_index,
+        valid_m=lhs_scaffold.valid_m,
         dependency_nodes=tuple(
             dict.fromkeys(
                 (
@@ -1314,9 +1633,9 @@ def _trace_rank3_grouped_rhs_nt_operand(
     """Recognize ``B_grouped[group, tile_n, tile_k].T`` as logical ``[K, N]``.
 
     This is intentionally narrower than tracing through arbitrary permutes:
-    the source must be a rank-3 tensor load, the first index must be the
-    safe-group expression ``where(load(tile_m.begin) >= 0, load, 0)``, and the
-    only data layout transform is the 2-D NT transpose.
+    the source must be a rank-3 tensor load, the first index must be a proven
+    safe-group, segment-metadata group load, or block-size-one scalar group
+    tile index, and the only data layout transform is the 2-D NT transpose.
     """
     if cg is None:
         return None
@@ -1382,10 +1701,13 @@ def _trace_rank3_grouped_rhs_nt_operand(
         m_block_id=m_block_id,
     )
     segment_group_info = None
+    packed_group_info = None
     if safe_group_info is None:
         segment_group_info = _rank3_rhs_segment_group_load(cg, indices[0])
         if segment_group_info is None:
-            return None
+            packed_group_info = _rank3_rhs_packed_group_index(cg, indices[0])
+            if packed_group_info is None:
+                return None
     rhs_n_block_id = _rank3_rhs_exact_index_block_id(indices[1], reduction=False)
     rhs_k_block_id = _rank3_rhs_exact_index_block_id(indices[2], reduction=None)
     if rhs_n_block_id is None or rhs_k_block_id is None:
@@ -1435,6 +1757,7 @@ def _trace_rank3_grouped_rhs_nt_operand(
         rhs_k_block_id=rhs_k_block_id,
         rhs_rank3_grouped_nt=True,
         rhs_segment_group=segment_group_info,
+        rhs_packed_group=packed_group_info,
     )
 
 
@@ -1791,34 +2114,162 @@ def _apply_owned_scalar_statement_pass_rewrite(
 def _owned_scalar_statement_expr_rewrite_plan(
     cg: GenerateAST,
     replacements: dict[Node, str],
-) -> tuple[tuple[ast.Assign, ast.expr], ...] | None:
-    replacement_plan: list[tuple[ast.Assign, ast.expr]] = []
+    *,
+    cast_then_expr_nodes: tuple[Node, ...] = (),
+) -> tuple[tuple[list[ast.AST], int, ast.Assign, ast.expr | None], ...] | None:
+    import operator
+
+    def name_access_count(
+        statements: list[ast.AST], name: str, context: type[ast.expr_context]
+    ) -> int:
+        return sum(
+            isinstance(candidate, ast.Name)
+            and candidate.id == name
+            and isinstance(candidate.ctx, context)
+            for stmt in statements
+            for candidate in ast.walk(stmt)
+        )
+
+    def is_name(expr: ast.expr, name: str) -> bool:
+        return isinstance(expr, ast.Name) and expr.id == name
+
+    def cast_then_expr_entries(
+        node: Node,
+        entries: list[tuple[list[ast.AST], ast.AST]],
+    ) -> tuple[tuple[list[ast.AST], int, ast.Assign, ast.expr | None], ...] | None:
+        indexed: list[tuple[list[ast.AST], int, ast.Assign]] = []
+        for body, stmt in entries:
+            if not isinstance(stmt, ast.Assign):
+                return None
+            indices = [index for index, existing in enumerate(body) if existing is stmt]
+            if len(indices) != 1:
+                return None
+            indexed.append((body, indices[0], stmt))
+        indexed.sort(key=operator.itemgetter(1))
+        (
+            (cast_body, cast_index, cast_stmt),
+            (
+                result_body,
+                result_index,
+                result_stmt,
+            ),
+        ) = indexed
+        if cast_body is not result_body or result_index != cast_index + 1:
+            return None
+        cast_name = _assignment_target_name(cast_stmt)
+        result_name = _assignment_target_name(result_stmt)
+        cast_call = cast_stmt.value
+        codegen_result = node.meta.get("codegen")
+        if (
+            cast_name is None
+            or result_name is None
+            or cast_name == result_name
+            or not isinstance(cast_call, ast.Call)
+            or len(cast_call.args) != 1
+            or cast_call.keywords
+            or not isinstance(cast_call.func, ast.Attribute)
+            or cast_call.func.attr != "Int32"
+            or not isinstance(cast_call.func.value, ast.Name)
+            or cast_call.func.value.id != "cutlass"
+            or name_access_count(cast_body, cast_name, ast.Store) != 1
+            or name_access_count(cast_body, cast_name, ast.Load) != 1
+            or name_access_count([result_stmt], cast_name, ast.Load) != 1
+            or name_access_count(cast_body, result_name, ast.Store) != 1
+            or not isinstance(codegen_result, ast.Name)
+            or not isinstance(codegen_result.ctx, ast.Load)
+            or codegen_result.id != result_name
+        ):
+            return None
+        if node.target in (operator.add, torch.ops.aten.add.Tensor):
+            if not (
+                isinstance(result_stmt.value, ast.BinOp)
+                and isinstance(result_stmt.value.op, ast.Add)
+                and sum(
+                    is_name(operand, cast_name)
+                    for operand in (result_stmt.value.left, result_stmt.value.right)
+                )
+                == 1
+            ):
+                return None
+        elif node.target in (operator.lt, torch.ops.aten.lt.Tensor):
+            call = result_stmt.value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "lt"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "operator"
+                and len(call.args) == 2
+                and not call.keywords
+                and sum(is_name(arg, cast_name) for arg in call.args) == 1
+            ):
+                return None
+        else:
+            return None
+        return (
+            (cast_body, cast_index, cast_stmt, None),
+            (
+                result_body,
+                result_index,
+                result_stmt,
+                cast("ast.expr", expr_from_string(replacements[node])),
+            ),
+        )
+
+    replacement_plan: list[tuple[list[ast.AST], int, ast.Assign, ast.expr | None]] = []
     seen_stmt_ids: set[int] = set()
     for node, expr in replacements.items():
         entries = cg._statements_by_owner_node_id.get(id(node), ())
         if not entries:
             continue
+        if len(entries) == 2 and node in cast_then_expr_nodes:
+            cast_plan = cast_then_expr_entries(node, entries)
+            if cast_plan is None or any(
+                id(stmt) in seen_stmt_ids for _body, _index, stmt, _value in cast_plan
+            ):
+                return None
+            seen_stmt_ids.update(id(stmt) for _body, _index, stmt, _value in cast_plan)
+            replacement_plan.extend(cast_plan)
+            continue
         if len(entries) != 1:
             return None
-        body, stmt = entries[0]
-        if (
-            not isinstance(stmt, ast.Assign)
-            or _assignment_target_name(stmt) is None
-            or sum(existing is stmt for existing in body) != 1
-            or id(stmt) in seen_stmt_ids
-        ):
-            return None
-        seen_stmt_ids.add(id(stmt))
-        replacement_plan.append((stmt, cast("ast.expr", expr_from_string(expr))))
+        for body, stmt in entries:
+            matching_indices = [
+                index for index, existing in enumerate(body) if existing is stmt
+            ]
+            if (
+                not isinstance(stmt, ast.Assign)
+                or _assignment_target_name(stmt) is None
+                or len(matching_indices) != 1
+                or id(stmt) in seen_stmt_ids
+            ):
+                return None
+            seen_stmt_ids.add(id(stmt))
+            replacement_plan.append(
+                (
+                    body,
+                    matching_indices[0],
+                    stmt,
+                    cast("ast.expr", expr_from_string(expr)),
+                )
+            )
     return tuple(replacement_plan)
 
 
 def _apply_owned_scalar_statement_expr_rewrite(
-    replacement_plan: tuple[tuple[ast.Assign, ast.expr], ...],
+    replacement_plan: tuple[
+        tuple[list[ast.AST], int, ast.Assign, ast.expr | None], ...
+    ],
 ) -> None:
-    for stmt, value in replacement_plan:
-        stmt.value = value
-        ast.fix_missing_locations(stmt)
+    for body, index, stmt, value in replacement_plan:
+        assert body[index] is stmt
+        if value is None:
+            replacement = ast.Pass()
+            ast.fix_missing_locations(replacement)
+            body[index] = replacement
+        else:
+            stmt.value = value
+            ast.fix_missing_locations(stmt)
 
 
 def _tcgen05_pid_initializes_epi_role_tile_counter(pid: object) -> bool:
@@ -2059,9 +2510,10 @@ def _analyze_rank3_rhs_grouped_search_operands(
     if len(device_ir.grid_block_ids) != 1:
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
+    leading_group_block_id = rhs.rhs_grouped_leading_block_id
     segment_block_id = (
-        canonical_block_id(rhs.rhs_segment_group.segment_block_id)
-        if rhs.rhs_segment_group is not None
+        canonical_block_id(leading_group_block_id)
+        if leading_group_block_id is not None
         else None
     )
     n_root_ids = [
@@ -2357,11 +2809,44 @@ def analyze_cute_mma_node(
         if isinstance(cached, _MmaOutputStoreAnalysis):
             output_store_analysis = cached
         if device_ir is not None:
-            output_store_analysis = _analyze_mma_output_stores(
-                node,
-                operands,
-                graphs=device_ir.graphs,
-            )
+            if operands.rhs.rhs_packed_group is not None:
+                graph_view = cast(
+                    "GenerateAST",
+                    _MmaSearchGraphView(device_ir.graphs),
+                )
+                packed_lhs = _rank3_rhs_packed_split_lhs_info(
+                    graph_view,
+                    operands.lhs,
+                    operands.rhs,
+                    group_count=int(operands.rhs.source_fake.shape[0]),
+                    group_block_id=cast(
+                        "int",
+                        operands.leading_passthrough_block_id,
+                    ),
+                    m_block_id=operands.m_block_id,
+                    k_block_id=operands.k_block_id,
+                )
+                if packed_lhs is not None:
+                    worklist_lhs, _packed_split = packed_lhs
+                    worklist_store = _rank3_rhs_worklist_store_info(
+                        graph_view,
+                        node,
+                        worklist_lhs,
+                        n_block_id=operands.n_block_id,
+                    )
+                    if worklist_store is not None:
+                        output_store_analysis = _analyze_packed_split_mma_output_store(
+                            node,
+                            operands,
+                            worklist_store,
+                            graphs=device_ir.graphs,
+                        )
+            else:
+                output_store_analysis = _analyze_mma_output_stores(
+                    node,
+                    operands,
+                    graphs=device_ir.graphs,
+                )
             node.meta[_MMA_OUTPUT_STORE_ANALYSIS_META_KEY] = output_store_analysis
         if output_store_analysis is None:
             return None
@@ -2503,12 +2988,56 @@ def _prove_rank3_rhs_grouped_mma(
     )
 
     segment_group = rhs_info.rhs_segment_group
-    segment_lhs = None
-    segment_store = None
-    if segment_group is not None:
+    worklist_lhs = None
+    worklist_store = None
+    packed_split = None
+    if rhs_info.rhs_packed_group is not None:
+        if grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM:
+            return None
+        packed_group = rhs_info.rhs_packed_group
+        if axes.segment_block_id is None or canonical_block_id(
+            packed_group.group_block_id
+        ) != canonical_block_id(axes.segment_block_id):
+            return None
+        packed_lhs = _rank3_rhs_packed_split_lhs_info(
+            cg,
+            lhs_info,
+            rhs_info,
+            group_count=int(rhs_info.source_fake.shape[0]),
+            group_block_id=axes.segment_block_id,
+            m_block_id=axes.m_block_id,
+            k_block_id=axes.k_block_id,
+        )
+        if packed_lhs is None:
+            return None
+        worklist_lhs, packed_split = packed_lhs
+        worklist_store = _rank3_rhs_worklist_store_info(
+            cg,
+            node,
+            worklist_lhs,
+            n_block_id=axes.n_block_id,
+        )
+        if worklist_store is None:
+            return None
+        if not _rank3_rhs_packed_split_consumers_are_exclusive(
+            cg,
+            rhs_info,
+            worklist_lhs,
+            worklist_store,
+        ):
+            return None
+        # The device scheduler owns the store extent even though it equals the
+        # load extent.  Consume its role-local ``store_m`` value rather than
+        # the scalar source scaffold that is replaced after proof.
+        worklist_store = replace(
+            worklist_store,
+            uses_scheduler_store_extent=True,
+        )
+        layout_tensor = packed_split.split_sizes_tensor
+    elif segment_group is not None:
         if axes.segment_block_id is None:
             return None
-        segment_lhs = _rank3_rhs_segment_lhs_info(
+        worklist_lhs = _rank3_rhs_segment_lhs_info(
             cg,
             lhs_info,
             rhs_info,
@@ -2516,17 +3045,17 @@ def _prove_rank3_rhs_grouped_mma(
             m_block_id=axes.m_block_id,
             k_block_id=axes.k_block_id,
         )
-        if segment_lhs is None:
+        if worklist_lhs is None:
             return None
-        segment_store = _rank3_rhs_segment_store_info(
+        worklist_store = _rank3_rhs_worklist_store_info(
             cg,
             node,
-            segment_lhs,
+            worklist_lhs,
             segment_group,
             n_block_id=axes.n_block_id,
             allow_store_extent_metadata=allow_segment_store_extent_metadata,
         )
-        if segment_store is None:
+        if worklist_store is None:
             return None
         layout_tensor = segment_group.metadata_tensor
     else:
@@ -2554,8 +3083,9 @@ def _prove_rank3_rhs_grouped_mma(
         layout_tensor=layout_tensor,
         k_mask=k_mask,
         tail_epilogue=tail_epilogue,
-        segment_lhs=segment_lhs,
-        segment_store=segment_store,
+        worklist_lhs=worklist_lhs,
+        worklist_store=worklist_store,
+        packed_split=packed_split,
     )
 
 
@@ -3192,7 +3722,7 @@ def prepare_cute_collective_lane_loop_suppression(
                     bk = int(bs)
         if bm is None or bn is None or bk is None:
             continue
-        rhs_rank3_segment_lhs_info: _Rank3RhsSegmentLhsInfo | None = None
+        rhs_rank3_worklist_lhs_info: _Rank3RhsWorklistLhsInfo | None = None
         if rhs_info.rhs_rank3_grouped_nt:
             if m_block_id is None or n_block_id is None or k_block_id is None:
                 continue
@@ -3202,7 +3732,8 @@ def prepare_cute_collective_lane_loop_suppression(
                 continue
             canonical_block_id = env.canonical_block_id
             segment_block_id = None
-            if rhs_info.rhs_segment_group is not None:
+            grouped_leading_block_id = rhs_info.rhs_grouped_leading_block_id
+            if grouped_leading_block_id is not None:
                 segment_block_ids = [
                     bid
                     for bid in grid_state.block_ids
@@ -3215,7 +3746,11 @@ def prepare_cute_collective_lane_loop_suppression(
                 if len(segment_block_ids) != 1:
                     continue
                 segment_block_id = segment_block_ids[0]
-                if cg.device_function.resolved_block_size(segment_block_id) != 1:
+                if (
+                    canonical_block_id(segment_block_id)
+                    != canonical_block_id(grouped_leading_block_id)
+                    or cg.device_function.resolved_block_size(segment_block_id) != 1
+                ):
                     continue
             proof = _prove_rank3_rhs_grouped_mma(
                 cg,
@@ -3234,7 +3769,7 @@ def prepare_cute_collective_lane_loop_suppression(
             rhs_info = proof.rhs
             lhs_fake = lhs_info.logical_fake
             rhs_fake = rhs_info.logical_fake
-            rhs_rank3_segment_lhs_info = proof.segment_lhs
+            rhs_rank3_worklist_lhs_info = proof.worklist_lhs
             if not proof.is_worklist:
                 if (
                     lhs_fake.shape[0] % bm != 0
@@ -3289,8 +3824,8 @@ def prepare_cute_collective_lane_loop_suppression(
                 *rhs_info.collective_dependency_nodes,
                 *(
                     ()
-                    if rhs_rank3_segment_lhs_info is None
-                    else rhs_rank3_segment_lhs_info.dependency_nodes
+                    if rhs_rank3_worklist_lhs_info is None
+                    else rhs_rank3_worklist_lhs_info.dependency_nodes
                 ),
             ),
         )
@@ -4086,6 +4621,50 @@ def _trace_mma_to_store_dtype(
     return next(iter(discovered)) if len(discovered) == 1 else None
 
 
+def _analyze_packed_split_mma_output_store(
+    mma_node: Node,
+    analysis: _MmaOperandAnalysis,
+    worklist_store: _Rank3RhsWorklistStoreInfo,
+    *,
+    graphs: list[GraphInfo],
+) -> _MmaOutputStoreAnalysis | None:
+    """Validate the compact rank-2 identity store for early tcgen05 search."""
+    from ..compile_environment import CompileEnvironment
+
+    store = worklist_store.store_node
+    tensor_node = store.args[0] if store.args else None
+    tensor_fake = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
+    subscripts = store.args[1] if len(store.args) > 1 else None
+    if (
+        not isinstance(tensor_fake, torch.Tensor)
+        or tensor_fake.ndim != 2
+        or tensor_fake.dtype != analysis.lhs.source_fake.dtype
+        or not isinstance(subscripts, list | tuple)
+        or len(subscripts) != 2
+        or not isinstance(subscripts[1], Node)
+    ):
+        return None
+    env = CompileEnvironment.current()
+    store_n_block_id = _rank3_rhs_exact_index_block_id(subscripts[1], reduction=False)
+    if (
+        store_n_block_id is None
+        or env.canonical_block_id(store_n_block_id)
+        != env.canonical_block_id(analysis.n_block_id)
+        or not env.known_equal(tensor_fake.shape[0], analysis.lhs.source_fake.shape[0])
+        or not env.known_equal(tensor_fake.shape[1], analysis.rhs.source_fake.shape[1])
+    ):
+        return None
+    analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+    if (
+        analyzed_stores is None
+        or len(analyzed_stores) != 1
+        or analyzed_stores[0][0] is not store
+        or analyzed_stores[0][1].steps
+    ):
+        return None
+    return _MmaOutputStoreAnalysis(explicit_epi_tile_compatible=True)
+
+
 def _analyze_mma_output_stores(
     mma_node: Node,
     analysis: _MmaOperandAnalysis,
@@ -4125,15 +4704,15 @@ def _analyze_mma_output_stores(
     )
 
 
-def _rank3_rhs_segment_store_info(
+def _rank3_rhs_worklist_store_info(
     cg: GenerateAST,
     mma_node: Node,
-    segment_lhs_info: _Rank3RhsSegmentLhsInfo,
+    worklist_lhs_info: _Rank3RhsWorklistLhsInfo,
     segment_group: _Rank3RhsSegmentGroupInfo | None = None,
     *,
     n_block_id: int,
     allow_store_extent_metadata: bool = False,
-) -> _Rank3RhsSegmentStoreInfo | None:
+) -> _Rank3RhsWorklistStoreInfo | None:
     import operator
 
     from ...language import memory_ops
@@ -4166,16 +4745,16 @@ def _rank3_rhs_segment_store_info(
     ) != env.canonical_block_id(n_block_id):
         return None
     store_row = _trace_to_outer_graph_arg(cg, index[0])
-    if store_row is not segment_lhs_info.row_index:
+    if store_row is not worklist_lhs_info.row_index:
         return None
     store_mask = _trace_to_outer_graph_arg(cg, extra_mask)
     store_valid_m = _rank3_rhs_broadcast_mask_base(store_mask, broadcast_dim=1)
     if store_valid_m is None:
         return None
     store_valid_m = _trace_to_outer_graph_arg(cg, store_valid_m)
-    store_extent_load = segment_lhs_info.actual_m_load
-    uses_store_extent_metadata = False
-    if store_valid_m is not segment_lhs_info.valid_m:
+    store_extent_load = worklist_lhs_info.group_m
+    uses_scheduler_store_extent = False
+    if store_valid_m is not worklist_lhs_info.valid_m:
         if not allow_store_extent_metadata or segment_group is None:
             return None
         if (
@@ -4187,14 +4766,14 @@ def _rank3_rhs_segment_store_info(
             return None
         store_lhs, store_rhs = cast("tuple[Node, Node]", store_valid_m.args)
         if (
-            segment_lhs_info.valid_m.op != "call_function"
-            or segment_lhs_info.valid_m.target
+            worklist_lhs_info.valid_m.op != "call_function"
+            or worklist_lhs_info.valid_m.target
             not in (operator.lt, torch.ops.aten.lt.Tensor)
-            or len(segment_lhs_info.valid_m.args) != 2
-            or not all(isinstance(arg, Node) for arg in segment_lhs_info.valid_m.args)
+            or len(worklist_lhs_info.valid_m.args) != 2
+            or not all(isinstance(arg, Node) for arg in worklist_lhs_info.valid_m.args)
         ):
             return None
-        load_lhs, _load_rhs = cast("tuple[Node, Node]", segment_lhs_info.valid_m.args)
+        load_lhs, _load_rhs = cast("tuple[Node, Node]", worklist_lhs_info.valid_m.args)
         if _trace_to_outer_graph_arg(cg, store_lhs) is not _trace_to_outer_graph_arg(
             cg, load_lhs
         ):
@@ -4209,13 +4788,77 @@ def _rank3_rhs_segment_store_info(
         if loaded_store_extent is None:
             return None
         _metadata, _segment_id, store_extent_load = loaded_store_extent
-        uses_store_extent_metadata = True
-    return _Rank3RhsSegmentStoreInfo(
+        uses_scheduler_store_extent = True
+    return _Rank3RhsWorklistStoreInfo(
         store_node=store_node,
         row_index=store_row,
         valid_m=store_valid_m,
         extent_load=store_extent_load,
-        uses_store_extent_metadata=uses_store_extent_metadata,
+        uses_scheduler_store_extent=uses_scheduler_store_extent,
+    )
+
+
+def _rank3_rhs_packed_split_consumers_are_exclusive(
+    cg: GenerateAST,
+    rhs_info: _MmaOperandInfo,
+    lhs_info: _Rank3RhsWorklistLhsInfo,
+    store_info: _Rank3RhsWorklistStoreInfo,
+) -> bool:
+    """Require every replaced packed-split scalar to serve this MMA/store only."""
+    packed_group = rhs_info.rhs_packed_group
+    if packed_group is None or rhs_info.rhs_group_index is None:
+        return False
+    group_index = packed_group.group_index
+    if _trace_to_outer_graph_arg(cg, rhs_info.rhs_group_index) is not group_index:
+        return False
+
+    group_loop_users = {
+        user for user in group_index.users if _is_tracing_for_loop_node(user)
+    }
+    row_loop_users = {
+        user for user in lhs_info.row_index.users if _is_tracing_for_loop_node(user)
+    }
+    valid_loop_users = {
+        user for user in lhs_info.valid_m.users if _is_tracing_for_loop_node(user)
+    }
+    if (
+        len(group_loop_users) != 1
+        or group_loop_users != row_loop_users
+        or group_loop_users != valid_loop_users
+    ):
+        return False
+    (mma_loop,) = tuple(group_loop_users)
+
+    store_mask = store_info.store_node.args[3]
+    if not isinstance(store_mask, Node):
+        return False
+    store_mask = _trace_to_outer_graph_arg(cg, store_mask)
+    if store_mask is lhs_info.valid_m:
+        valid_store_user = store_info.store_node
+    else:
+        if _rank3_rhs_broadcast_mask_base(
+            store_mask, broadcast_dim=1
+        ) is not lhs_info.valid_m or set(store_mask.users) != {store_info.store_node}:
+            return False
+        valid_store_user = store_mask
+
+    scaffold_nodes = set(lhs_info.dependency_nodes)
+    if not {
+        group_index,
+        lhs_info.group_m,
+        lhs_info.row_start,
+        lhs_info.row_index,
+        lhs_info.valid_m,
+    }.issubset(scaffold_nodes):
+        return False
+    allowed_external_users = {
+        group_index: {mma_loop},
+        lhs_info.row_index: {mma_loop, store_info.store_node},
+        lhs_info.valid_m: {mma_loop, valid_store_user},
+    }
+    return all(
+        set(node.users) - scaffold_nodes == allowed_external_users.get(node, set())
+        for node in scaffold_nodes
     )
 
 
@@ -4234,6 +4877,8 @@ def _append_aligned_smem(offset: int, size: int, alignment: int) -> int:
 
 def _tcgen05_grouped_worklist_smem_bytes(
     *,
+    group_count: int,
+    device_split_sizes: bool,
     sched_stage_count: int,
     bm: int,
     bn: int,
@@ -4244,26 +4889,33 @@ def _tcgen05_grouped_worklist_smem_bytes(
     c_stages: int,
     cluster_m: int,
 ) -> int:
-    """Exact ordered SMEM footprint of the host N,M grouped worklist path.
+    """Exact ordered SMEM footprint of the N,M grouped worklist path.
 
     Keep this in the same order as the ``cute.arch.alloc_smem`` calls emitted
-    by the grouped scheduler and tcgen05 collective.  The BK64/source-224
-    profile intentionally reaches the 227-KiB opt-in cap, so a coarse reserve
-    would reject a valid compiled kernel while omitting even one mailbox,
-    barrier, TensorMap, or alignment pad is unsafe.
+    by the grouped scheduler, optional device metadata setup, and tcgen05
+    collective.
+    The BK64/source-224 profile intentionally reaches the 227-KiB opt-in cap,
+    so a coarse reserve would reject a valid compiled kernel while omitting
+    even one mailbox, barrier, TensorMap, or alignment pad is unsafe.
     """
-    assert sched_stage_count > 0 and cluster_m in (1, 2)
+    assert group_count > 0 and sched_stage_count > 0 and cluster_m in (1, 2)
     a_stage_bytes = bm * bk * dtype_bytes
     b_stage_bytes = bn * bk * dtype_bytes
     assert a_stage_bytes % cluster_m == 0
     assert b_stage_bytes % cluster_m == 0
 
     offset = 0
+    # Scheduler work-tile mailbox, followed by optional device-derived problem
+    # metadata.  Host worklists supply problem sizes and starts from global
+    # wrapper tensors, so they do not allocate either metadata array in SMEM.
     offset = _append_aligned_smem(
         offset,
         TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT * sched_stage_count * 4,
         16,
     )
+    if device_split_sizes:
+        offset = _append_aligned_smem(offset, group_count * 4 * 4, 16)
+        offset = _append_aligned_smem(offset, group_count * 4, 16)
     # TMEM allocator state and accumulator/scheduler pipeline mbarriers.
     offset = _append_aligned_smem(offset, 4, 4)
     offset = _append_aligned_smem(offset, 8, 8)
@@ -4283,6 +4935,113 @@ def _tcgen05_grouped_worklist_smem_bytes(
         c_stages=c_stages,
     )
     return _append_aligned_smem(offset, c_smem_bytes, 1024)
+
+
+def _emit_tcgen05_device_split_sizes_setup(
+    prefix: list[ast.AST],
+    df: DeviceFunction,
+    grouped: CuteTcgen05GroupedPlan,
+    *,
+    n_size: int,
+    k_size: int,
+    split_dtype: torch.dtype,
+) -> None:
+    """Materialize clipped source intervals from device split sizes in SMEM."""
+    assert grouped.device_split_sizes
+    assert grouped.m_size is not None
+    assert split_dtype in (torch.int32, torch.int64)
+    split_int_type = "cutlass.Int64" if split_dtype is torch.int64 else "cutlass.Int32"
+    group_count = int(grouped.count)
+    problem_sizes_ptr = df.new_var("tcgen05_grouped_problem_sizes_smem_ptr")
+    starts_ptr = df.new_var("tcgen05_grouped_starts_smem_ptr")
+    running_start = df.new_var("tcgen05_grouped_running_start")
+    raw_split_value = df.new_var("tcgen05_grouped_raw_split_value")
+    raw_end = df.new_var("tcgen05_grouped_raw_end")
+    source_end = df.new_var("tcgen05_grouped_source_end")
+    visible_start = df.new_var("tcgen05_grouped_visible_start")
+    visible_end = df.new_var("tcgen05_grouped_visible_end")
+    visible_extent = df.new_var("tcgen05_grouped_visible_extent")
+    prefix.extend(
+        [
+            statement_from_string(
+                f"{problem_sizes_ptr} = cute.arch.alloc_smem("
+                f"cutlass.Int32, {group_count * 4}, alignment=16)"
+            ),
+            statement_from_string(
+                f"{grouped.problem_sizes} = cute.make_tensor("
+                f"{problem_sizes_ptr}, cute.make_layout(({group_count}, 4), "
+                "stride=(4, 1)))"
+            ),
+            statement_from_string(
+                f"{starts_ptr} = cute.arch.alloc_smem("
+                f"cutlass.Int32, {group_count}, alignment=16)"
+            ),
+            statement_from_string(
+                f"{grouped.starts} = cute.make_tensor("
+                f"{starts_ptr}, cute.make_layout(({group_count},), stride=(1,)))"
+            ),
+        ]
+    )
+    setup_lines = [
+        "if cute.arch.thread_idx()[0] == 0:",
+        f"    {running_start} = {split_int_type}(0)",
+    ]
+    for group_idx in range(group_count):
+        split_load = (
+            f"({grouped.layout}.iterator + cutlass.Int64({group_idx}) * "
+            f"cutlass.Int64({grouped.layout}.layout.stride[0])).load()"
+        )
+        setup_lines.extend(
+            [
+                f"    {raw_split_value} = {split_int_type}({split_load})",
+                f"    {raw_end} = {running_start} + {raw_split_value}",
+                (
+                    f"    {source_end} = {running_start} + min(max("
+                    f"{raw_split_value}, {split_int_type}(0)), "
+                    f"{split_int_type}({grouped.m_size}))"
+                ),
+                (
+                    f"    {visible_start} = min(max({running_start}, "
+                    f"{split_int_type}(0)), {split_int_type}({grouped.m_size}))"
+                ),
+                (
+                    f"    {visible_end} = min(max({source_end}, {split_int_type}(0)), "
+                    f"{split_int_type}({grouped.m_size}))"
+                ),
+                (
+                    f"    {visible_extent} = max({visible_end} - {visible_start}, "
+                    f"{split_int_type}(0)) if {raw_split_value} > "
+                    f"{split_int_type}(0) else {split_int_type}(0)"
+                ),
+                (
+                    f"    {grouped.starts}[cutlass.Int32({group_idx})] = "
+                    f"cutlass.Int32({visible_start})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    f"cutlass.Int32(0)] = cutlass.Int32({n_size})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    f"cutlass.Int32(1)] = cutlass.Int32({visible_extent})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    f"cutlass.Int32(2)] = cutlass.Int32({k_size})"
+                ),
+                (
+                    f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
+                    "cutlass.Int32(3)] = cutlass.Int32(1)"
+                ),
+                f"    {running_start} = {raw_end}",
+            ]
+        )
+    prefix.extend(
+        [
+            statement_from_string("\n".join(setup_lines)),
+            statement_from_string("cute.arch.sync_threads()"),
+        ]
+    )
 
 
 def _emit_mma_pipeline(
@@ -4493,8 +5252,9 @@ def _emit_mma_pipeline(
     rhs_rank3_group_expr: str | None = None
     rhs_rank3_group_index: Node | None = None
     rhs_rank3_segment_metadata = rhs_info.rhs_segment_group is not None
-    rhs_rank3_segment_lhs_info: _Rank3RhsSegmentLhsInfo | None = None
-    rhs_rank3_segment_store_info: _Rank3RhsSegmentStoreInfo | None = None
+    rhs_rank3_packed_split = rhs_info.rhs_packed_group is not None
+    rhs_rank3_worklist_lhs_info: _Rank3RhsWorklistLhsInfo | None = None
+    rhs_rank3_worklist_store_info: _Rank3RhsWorklistStoreInfo | None = None
     rhs_rank3_grouped_proof: _Rank3RhsGroupedProof | None = None
     tcgen05_grouped_external_direct_pointers_name = cg.device_function.config.get(
         TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
@@ -4706,13 +5466,11 @@ def _emit_mma_pipeline(
         else:
             canonical_block_id = env.canonical_block_id
             if (
-                rhs_rank3_segment_metadata
-                and rhs_info.rhs_segment_group is not None
-                and rhs_info.rhs_n_block_id is not None
-            ):
+                rhs_rank3_segment_metadata or rhs_rank3_packed_split
+            ) and rhs_info.rhs_n_block_id is not None:
                 # Segment metadata already proves the work axis and RHS proves N;
                 # the remaining root axis is M, with exact LHS/store proof below.
-                segment_block_id = rhs_info.rhs_segment_group.segment_block_id
+                segment_block_id = cast("int", rhs_info.rhs_grouped_leading_block_id)
                 segment_canonical = canonical_block_id(segment_block_id)
                 n_canonical = canonical_block_id(rhs_info.rhs_n_block_id)
                 m_candidates = [
@@ -4775,9 +5533,13 @@ def _emit_mma_pipeline(
             return _unsupported_schedule("MMA fx node was unavailable")
         canonical_block_id = env.canonical_block_id
         rhs_rank3_segment_metadata = rhs_info.rhs_segment_group is not None
+        rhs_rank3_packed_split = rhs_info.rhs_packed_group is not None
         segment_block_id = None
-        if rhs_rank3_segment_metadata:
+        if rhs_rank3_segment_metadata or rhs_rank3_packed_split:
             assert grid_state is not None
+            grouped_leading_block_id = cast(
+                "int", rhs_info.rhs_grouped_leading_block_id
+            )
             segment_block_ids = [
                 bid
                 for bid in grid_state.block_ids
@@ -4787,10 +5549,10 @@ def _emit_mma_pipeline(
                     canonical_block_id(n_block_id),
                 )
             ]
-            if len(segment_block_ids) != 1:
-                return _unsupported_schedule(
-                    "segment metadata work axis was not unique"
-                )
+            if len(segment_block_ids) != 1 or canonical_block_id(
+                segment_block_ids[0]
+            ) != canonical_block_id(grouped_leading_block_id):
+                return _unsupported_schedule("grouped leading work axis was not unique")
             segment_block_id = segment_block_ids[0]
             if df.resolved_block_size(segment_block_id) != 1:
                 return _unsupported_schedule(
@@ -4812,8 +5574,9 @@ def _emit_mma_pipeline(
         lhs_info = rhs_rank3_grouped_proof.lhs
         rhs_info = rhs_rank3_grouped_proof.rhs
         rhs_fake = rhs_info.logical_fake
-        rhs_rank3_segment_lhs_info = rhs_rank3_grouped_proof.segment_lhs
-        rhs_rank3_segment_store_info = rhs_rank3_grouped_proof.segment_store
+        rhs_rank3_worklist_lhs_info = rhs_rank3_grouped_proof.worklist_lhs
+        rhs_rank3_worklist_store_info = rhs_rank3_grouped_proof.worklist_store
+        rhs_rank3_packed_split = rhs_rank3_grouped_proof.packed_split is not None
         if rhs_info.rhs_group_index is None:
             return _unsupported_schedule("rank3 RHS group index was missing")
         rhs_rank3_group_index = rhs_info.rhs_group_index
@@ -4825,7 +5588,7 @@ def _emit_mma_pipeline(
     tcgen05_grouped_worklist_static_full_tiles = (
         tcgen05_grouped_static_persistent_requested
         and tcgen05_grouped_dynamic_ab_tensormaps_requested
-        and rhs_rank3_segment_lhs_info is not None
+        and rhs_rank3_worklist_lhs_info is not None
     )
     # tcgen05 epilogues are emitted by `_codegen_cute_store_tcgen05_tile` in
     # `helion/language/memory_ops.py`. Static-full flat kernels and validated
@@ -5501,6 +6264,7 @@ def _emit_mma_pipeline(
     tcgen05_grouped_dynamic_ab_tensormap_rank: int | None = None
     tcgen05_grouped_d_mode = Tcgen05GroupedDMode.NONE
     tcgen05_grouped_worklist_persistent = False
+    tcgen05_grouped_device_split_sizes = False
     tcgen05_grouped_layout_arg_name: str | None = None
     tcgen05_grouped_n_sizes_arg_name: str | None = None
     tcgen05_grouped_k_sizes_arg_name: str | None = None
@@ -5601,11 +6365,17 @@ def _emit_mma_pipeline(
                 "grouped-NT safe-group pattern layout[tile_m.begin]",
             )
         grouped_layout_tensor = rhs_rank3_grouped_proof.layout_tensor
+        tcgen05_grouped_device_split_sizes = (
+            rhs_rank3_grouped_proof.packed_split is not None
+        )
         tcgen05_grouped_worklist_persistent = (
             rhs_rank3_grouped_proof.is_worklist
             and tcgen05_grouped_dynamic_ab_tensormaps_requested
         )
-        if tcgen05_grouped_worklist_persistent:
+        if (
+            tcgen05_grouped_worklist_persistent
+            and not tcgen05_grouped_device_split_sizes
+        ):
             if grouped_layout_tensor.ndim != 2 or grouped_layout_tensor.shape[1] != 4:
                 raise exc.BackendUnsupported(
                     "cute",
@@ -5721,7 +6491,9 @@ def _emit_mma_pipeline(
                 + ", ".join(failed_grouped_checks),
             )
         grouped_count_value = (
-            int(grouped_layout_tensor.shape[0])
+            int(rhs_info.source_fake.shape[0])
+            if tcgen05_grouped_device_split_sizes
+            else int(grouped_layout_tensor.shape[0])
             if tcgen05_grouped_worklist_persistent
             else int(rhs_info.source_fake.shape[0])
         )
@@ -5735,6 +6507,8 @@ def _emit_mma_pipeline(
                 lhs_info.source_fake.device
             )
             grouped_smem_required = _tcgen05_grouped_worklist_smem_bytes(
+                group_count=grouped_count_value,
+                device_split_sizes=tcgen05_grouped_device_split_sizes,
                 sched_stage_count=_tcgen05_config_int(
                     df.config, TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1
                 ),
@@ -5852,10 +6626,10 @@ def _emit_mma_pipeline(
                 )
         if requested_schedule is not None:
             worklist_nm_envelope_checks = {
-                "rank3_segment_metadata": (
-                    rhs_rank3_segment_metadata
-                    and rhs_rank3_segment_lhs_info is not None
-                    and rhs_rank3_segment_store_info is not None
+                "rank3_work_metadata": (
+                    (rhs_rank3_segment_metadata or rhs_rank3_packed_split)
+                    and rhs_rank3_worklist_lhs_info is not None
+                    and rhs_rank3_worklist_store_info is not None
                 ),
                 "worklist_metadata": tcgen05_grouped_worklist_persistent,
                 "dynamic_ab_tensormaps": (
@@ -5950,7 +6724,10 @@ def _emit_mma_pipeline(
         tcgen05_grouped_sched_params = df.new_var("tcgen05_grouped_tile_sched_params")
         tcgen05_grouped_problem_sizes = df.new_var("tcgen05_grouped_problem_sizes")
         tcgen05_grouped_starts = df.new_var("tcgen05_grouped_starts")
-        if tcgen05_grouped_worklist_persistent:
+        if (
+            tcgen05_grouped_worklist_persistent
+            and not tcgen05_grouped_device_split_sizes
+        ):
             tcgen05_grouped_real_groups = df.new_var("tcgen05_grouped_real_groups")
         tcgen05_grouped_metadata_idx = df.new_var("tcgen05_grouped_metadata_idx")
         tcgen05_grouped_group_idx = df.new_var("tcgen05_grouped_group_idx")
@@ -6013,10 +6790,14 @@ def _emit_mma_pipeline(
             source_m_tile=(
                 tcgen05_worklist_source_m_tile if tcgen05_nm_orientation else None
             ),
+            m_size=m_size if tcgen05_grouped_device_split_sizes else None,
         )
     if requested_schedule is not None and (
         tcgen05_grouped_plan is None
-        or tcgen05_grouped_plan.real_groups is None
+        or (
+            tcgen05_grouped_plan.real_groups is None
+            and not tcgen05_grouped_plan.device_split_sizes
+        )
         or tcgen05_grouped_plan.orientation is not requested_schedule
     ):
         raise exc.BackendUnsupported(
@@ -6042,7 +6823,11 @@ def _emit_mma_pipeline(
     nm_worklist = tcgen05_nm_orientation
     rhs_rank3_tma_group_expr = rhs_rank3_group_expr
     rhs_rank3_tma_group_setup: list[str] = []
-    if rhs_rank3_group_index is not None and not rhs_rank3_segment_metadata:
+    if (
+        rhs_rank3_group_index is not None
+        and not rhs_rank3_segment_metadata
+        and not rhs_rank3_packed_split
+    ):
         if (
             mma_impl != "tcgen05"
             or not tcgen05_use_tma_pipeline
@@ -6104,38 +6889,83 @@ def _emit_mma_pipeline(
             cg,
             operand_pass_rewrite_plan,
         )
-    if rhs_rank3_segment_lhs_info is not None:
+    if rhs_rank3_worklist_lhs_info is not None:
         operand_pass_rewrite_plan = _owned_scalar_statement_pass_rewrite_plan(
             cg,
             (lhs_info.load, rhs_info.load),
         )
         if operand_pass_rewrite_plan is None:
             return _unsupported_schedule("segment operand scalar pass rewrite failed")
-        row_index_node = rhs_rank3_segment_lhs_info.row_index
-        valid_m_node = rhs_rank3_segment_lhs_info.valid_m
+        row_index_node = rhs_rank3_worklist_lhs_info.row_index
+        valid_m_node = rhs_rank3_worklist_lhs_info.valid_m
         segment_scalar_replacements = {
             row_index_node: "cutlass.Int32(0)",
             valid_m_node: "cutlass.Boolean(0)",
         }
+        packed_scaffold_pass_rewrite_plan = ()
+        cast_then_expr_nodes: tuple[Node, ...] = ()
         if tcgen05_grouped_worklist_persistent:
-            assert rhs_info.rhs_segment_group is not None
-            segment_scalar_replacements.update(
-                {
-                    rhs_info.rhs_segment_group.group_load: "cutlass.Int32(0)",
-                    rhs_rank3_segment_lhs_info.segment_start_load: "cutlass.Int32(0)",
-                    rhs_rank3_segment_lhs_info.actual_m_load: "cutlass.Int32(0)",
-                }
-            )
-            if rhs_rank3_segment_store_info is not None:
+            if rhs_info.rhs_segment_group is not None:
                 segment_scalar_replacements.update(
                     {
-                        rhs_rank3_segment_store_info.valid_m: "cutlass.Boolean(0)",
-                        rhs_rank3_segment_store_info.extent_load: "cutlass.Int32(0)",
+                        rhs_info.rhs_segment_group.group_load: "cutlass.Int32(0)",
+                        rhs_rank3_worklist_lhs_info.row_start: "cutlass.Int32(0)",
+                        rhs_rank3_worklist_lhs_info.group_m: "cutlass.Int32(0)",
+                    }
+                )
+            else:
+                assert (
+                    rhs_rank3_grouped_proof is not None
+                    and rhs_rank3_grouped_proof.packed_split is not None
+                )
+                if (
+                    rhs_rank3_grouped_proof.packed_split.split_sizes_tensor.dtype
+                    is torch.int64
+                ):
+                    # Int64 split sizes lower these exact proof nodes to an
+                    # Int32 cast followed by the row/mask operation. The
+                    # rewrite helper validates that two-statement shape before
+                    # removing the cast temporary.
+                    cast_then_expr_nodes = (row_index_node, valid_m_node)
+                for scaffold_node in (
+                    rhs_rank3_worklist_lhs_info.row_start,
+                    rhs_rank3_worklist_lhs_info.group_m,
+                ):
+                    scaffold_value = scaffold_node.meta.get("val")
+                    replacement_expr = (
+                        "cutlass.Boolean(0)"
+                        if isinstance(scaffold_value, torch.Tensor)
+                        and scaffold_value.dtype is torch.bool
+                        else "cutlass.Int32(0)"
+                    )
+                    segment_scalar_replacements[scaffold_node] = replacement_expr
+                packed_scaffold_nodes = tuple(
+                    node
+                    for node in rhs_rank3_worklist_lhs_info.dependency_nodes
+                    if node not in segment_scalar_replacements
+                )
+                packed_scaffold_pass_rewrite_plan = (
+                    _owned_scalar_statement_pass_rewrite_plan(
+                        cg,
+                        (),
+                        optional_nodes=packed_scaffold_nodes,
+                    )
+                )
+                if packed_scaffold_pass_rewrite_plan is None:
+                    return _unsupported_schedule(
+                        "packed split scaffold replacement failed"
+                    )
+            if rhs_rank3_worklist_store_info is not None:
+                segment_scalar_replacements.update(
+                    {
+                        rhs_rank3_worklist_store_info.valid_m: "cutlass.Boolean(0)",
+                        rhs_rank3_worklist_store_info.extent_load: "cutlass.Int32(0)",
                     }
                 )
         segment_expr_rewrite_plan = _owned_scalar_statement_expr_rewrite_plan(
             cg,
             segment_scalar_replacements,
+            cast_then_expr_nodes=cast_then_expr_nodes,
         )
         if segment_expr_rewrite_plan is None:
             return _unsupported_schedule("segment scalar scaffold replacement failed")
@@ -6143,12 +6973,17 @@ def _emit_mma_pipeline(
             id(stmt) for _node_id, _body, _index, stmt in operand_pass_rewrite_plan
         }
         if any(
-            id(stmt) in operand_stmt_ids for stmt, _value in segment_expr_rewrite_plan
+            id(stmt) in operand_stmt_ids
+            for _body, _index, stmt, _value in segment_expr_rewrite_plan
         ):
             return _unsupported_schedule("segment scalar rewrite statements overlapped")
         _apply_owned_scalar_statement_pass_rewrite(
             cg,
             operand_pass_rewrite_plan,
+        )
+        _apply_owned_scalar_statement_pass_rewrite(
+            cg,
+            packed_scaffold_pass_rewrite_plan,
         )
         _apply_owned_scalar_statement_expr_rewrite(segment_expr_rewrite_plan)
     if tcgen05_collective_handles_operand_loads:
@@ -6182,6 +7017,19 @@ def _emit_mma_pipeline(
     # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
     prefix = device_loop.outer_prefix
     suffix = device_loop.outer_suffix
+    if tcgen05_grouped_plan is not None and tcgen05_grouped_plan.device_split_sizes:
+        assert (
+            rhs_rank3_grouped_proof is not None
+            and rhs_rank3_grouped_proof.packed_split is not None
+        )
+        _emit_tcgen05_device_split_sizes_setup(
+            prefix,
+            df,
+            tcgen05_grouped_plan,
+            n_size=n_size,
+            k_size=k_total_size,
+            split_dtype=rhs_rank3_grouped_proof.packed_split.split_sizes_tensor.dtype,
+        )
     # This call corresponds to one MMA FX-node lowering. The later
     # register_tcgen05_kloop_owned_stmts slice starts here, so pre-existing
     # K-loop prelude remains outside the cleanup region and later FX-node code
@@ -7955,10 +8803,14 @@ def _emit_mma_pipeline(
                             tcgen05_grouped_external_direct_strides_arg_name,
                         )
                     )
-                grouped_wrapper_params: list[str] = [
-                    grouped_plan.problem_sizes,
-                    grouped_plan.starts,
-                ]
+                grouped_wrapper_params: list[str] = []
+                if not grouped_plan.device_split_sizes:
+                    grouped_wrapper_params.extend(
+                        [
+                            grouped_plan.problem_sizes,
+                            grouped_plan.starts,
+                        ]
+                    )
                 if grouped_plan.real_groups is not None:
                     grouped_wrapper_params.append(grouped_plan.real_groups)
                 if tcgen05_grouped_ab_tensormaps is not None:
@@ -8032,6 +8884,14 @@ def _emit_mma_pipeline(
                             else {}
                         ),
                         "n_size": n_size,
+                        **(
+                            {
+                                "device_split_sizes": True,
+                                "m_size": cast("int", grouped_plan.m_size),
+                            }
+                            if grouped_plan.device_split_sizes
+                            else {}
+                        ),
                         "k_total_size": k_total_size,
                         "problem_sizes_arg": grouped_plan.problem_sizes,
                         "starts_arg": grouped_plan.starts,
@@ -8913,14 +9773,14 @@ def _emit_mma_pipeline(
         if mma_impl == "tcgen05":
             smem_a_store = f"{smem_a_mma}[((_row, _col),)]"
             smem_b_store = f"{smem_b_mma}[((_row, _col),)]"
-        if rhs_rank3_segment_lhs_info is None:
+        if rhs_rank3_worklist_lhs_info is None:
             scalar_load_a_row_setup = f"            _gm = {m_offset_var} + _row\n"
             scalar_load_a_guard = (
                 f"_gm < cutlass.Int32({m_size}) and _gk < cutlass.Int32({k_total_size})"
             )
         else:
-            segment_start_expr = rhs_rank3_segment_lhs_info.segment_start_load.name
-            actual_m_expr = rhs_rank3_segment_lhs_info.actual_m_load.name
+            segment_start_expr = rhs_rank3_worklist_lhs_info.row_start.name
+            actual_m_expr = rhs_rank3_worklist_lhs_info.group_m.name
             scalar_load_a_row_setup = (
                 f"            _segment_m = {m_offset_var} + _row\n"
                 f"            _gm = cutlass.Int32({segment_start_expr}) + _segment_m\n"
@@ -9488,27 +10348,27 @@ def _emit_mma_pipeline(
         segment_store_node: Node | None = None
         segment_store_row_index: Node | None = None
         segment_store_valid_m: Node | None = None
-        if rhs_rank3_segment_store_info is not None:
-            assert rhs_rank3_segment_lhs_info is not None
+        if rhs_rank3_worklist_store_info is not None:
+            assert rhs_rank3_worklist_lhs_info is not None
             segment_store_m_offset = m_offset_var
-            segment_store_start = rhs_rank3_segment_lhs_info.segment_start_load.name
+            segment_store_start = rhs_rank3_worklist_lhs_info.row_start.name
             segment_store_actual_m = (
                 tcgen05_grouped_store_m
                 if (
                     nm_worklist
                     and tcgen05_grouped_store_m
-                    and rhs_rank3_segment_store_info.uses_store_extent_metadata
+                    and rhs_rank3_worklist_store_info.uses_scheduler_store_extent
                 )
-                else rhs_rank3_segment_store_info.extent_load.name
+                else rhs_rank3_worklist_store_info.extent_load.name
             )
             segment_store_valid_m_bound = (
                 tcgen05_grouped_valid_m
                 if nm_worklist and tcgen05_grouped_valid_m
-                else rhs_rank3_segment_lhs_info.actual_m_load.name
+                else rhs_rank3_worklist_lhs_info.group_m.name
             )
-            segment_store_node = rhs_rank3_segment_store_info.store_node
-            segment_store_row_index = rhs_rank3_segment_store_info.row_index
-            segment_store_valid_m = rhs_rank3_segment_store_info.valid_m
+            segment_store_node = rhs_rank3_worklist_store_info.store_node
+            segment_store_row_index = rhs_rank3_worklist_store_info.row_index
+            segment_store_valid_m = rhs_rank3_worklist_store_info.valid_m
         df.cute_state.register_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
