@@ -38,8 +38,18 @@ def deepgemm_benchmark() -> Any:
     )
 
 
+@pytest.fixture(scope="module")
+def kernelgen_problem18_benchmark() -> Any:
+    return _load_script(
+        "kernelgen_problem18.py",
+        "helion_test_kernelgen_problem18",
+    )
+
+
 def test_published_manifests_are_fixed(
-    cutlass_benchmark: Any, deepgemm_benchmark: Any
+    cutlass_benchmark: Any,
+    deepgemm_benchmark: Any,
+    kernelgen_problem18_benchmark: Any,
 ) -> None:
     manifest = (
         tuple(
@@ -54,9 +64,17 @@ def test_published_manifests_are_fixed(
             deepgemm_benchmark.M_ALIGNMENT,
         ),
         deepgemm_benchmark.selected_config().config,
+        (
+            kernelgen_problem18_benchmark.PROBLEM_M,
+            kernelgen_problem18_benchmark.PROBLEM_N,
+            kernelgen_problem18_benchmark.PROBLEM_K,
+            kernelgen_problem18_benchmark.PROBLEM_GROUPS,
+            kernelgen_problem18_benchmark.REGIMES,
+        ),
+        kernelgen_problem18_benchmark.CUTE_CONFIG.config,
     )
     assert hashlib.sha256(repr(manifest).encode()).hexdigest() == (
-        "608089dc016171e07938f1a67c9c42ed56e292a2d99038b8a2410393d7aa8c74"
+        "681552635c704c0037ce98b208626e3c1cbe2cc381ae381f7e8d7a48b371d64e"
     )
 
 
