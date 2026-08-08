@@ -574,7 +574,8 @@ def _classify_loop_tensors(
     """
     from ...language.memory_ops import load as _load_op
     from ...language.memory_ops import store as _store_op
-    from .plan_tiling import TensorIndexPattern
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+    from .tensorcore_plan import OneHotScatterPlan
 
     host_tensor_nodes: dict[torch.fx.Node, torch.Tensor] = {}
     for node in graph_info.graph.nodes:  # type: ignore[union-attr]
@@ -631,10 +632,7 @@ def _classify_loop_tensors(
                     )
                 # Scatter preserves untouched target rows by reading the old
                 # block, so it is a read-modify-write rather than store-only.
-                if any(
-                    isinstance(pattern, TensorIndexPattern)
-                    for pattern in node.meta.get("indexing_patterns", ())
-                ):
+                if isinstance(node.meta.get(TENSORCORE_PLAN_META), OneHotScatterPlan):
                     if key not in loaded_tensors:
                         loaded_tensors[key] = (fake, tensor_node, sub_vals)
                     else:

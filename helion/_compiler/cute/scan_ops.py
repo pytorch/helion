@@ -17,6 +17,21 @@ import torch
 from ... import exc
 from ...language import _decorators
 from ...language.scan_ops import _associative_scan
+from ..scan_ops import SCAN_ARITHMETIC_OPS
+from ..scan_ops import SCAN_ATEN_COMPARISON_OPS
+from ..scan_ops import SCAN_CAST_OP
+from ..scan_ops import SCAN_MAX_OPS
+from ..scan_ops import SCAN_MIN_OPS
+from ..scan_ops import SCAN_WHERE_OPS
+from ..scan_ops import scan_combine_arg
+from ..scan_ops import scan_combine_binary_expression
+from ..scan_ops import scan_combine_check_extra_args
+from ..scan_ops import scan_combine_check_kwargs
+
+_CUTE_SCAN_BINARY_OPS: dict[object, str] = {
+    **SCAN_ARITHMETIC_OPS,
+    **SCAN_ATEN_COMPARISON_OPS,
+}
 
 if TYPE_CHECKING:
     import ast
@@ -163,7 +178,7 @@ def _cute_recover_scan_load(node: object) -> tuple[object, object] | None:
     from .indexing import CuteSortableLoad
     from .indexing import is_cute_shape_chain_target
 
-    passthrough_targets = (torch.ops.prims.convert_element_type.default,)
+    passthrough_targets = (SCAN_CAST_OP,)
     current = node
     seen: set[Node] = set()
     while isinstance(current, Node) and current not in seen:
@@ -231,8 +246,6 @@ def _cute_inline_combine_graph(
     assignment statements (to be spliced inside the scan ``for`` loop) and
     ``out_exprs`` are the output expression strings, one per tuple element.
     """
-    import operator as operator_mod
-
     from ..compile_environment import CompileEnvironment
     from ..device_ir import HelperFunctionGraphInfo
 
@@ -247,36 +260,6 @@ def _cute_inline_combine_graph(
     )
     # Unpacked layout: (left_e0, left_e1, ..., right_e0, right_e1, ...)
     arg_vars = [*left_vars, *right_vars]
-
-    binary_ops: dict[object, str] = {
-        operator_mod.add: "+",
-        torch.add: "+",
-        torch.ops.aten.add.Tensor: "+",
-        torch.ops.aten.add.Scalar: "+",
-        operator_mod.sub: "-",
-        torch.sub: "-",
-        torch.ops.aten.sub.Tensor: "-",
-        torch.ops.aten.sub.Scalar: "-",
-        operator_mod.mul: "*",
-        torch.mul: "*",
-        torch.ops.aten.mul.Tensor: "*",
-        torch.ops.aten.mul.Scalar: "*",
-        torch.ops.aten.eq.Tensor: "==",
-        torch.ops.aten.eq.Scalar: "==",
-        torch.ops.aten.ne.Tensor: "!=",
-        torch.ops.aten.ne.Scalar: "!=",
-        torch.ops.aten.lt.Tensor: "<",
-        torch.ops.aten.lt.Scalar: "<",
-        torch.ops.aten.gt.Tensor: ">",
-        torch.ops.aten.gt.Scalar: ">",
-        torch.ops.aten.le.Tensor: "<=",
-        torch.ops.aten.le.Scalar: "<=",
-        torch.ops.aten.ge.Tensor: ">=",
-        torch.ops.aten.ge.Scalar: ">=",
-    }
-    min_ops = (torch.minimum, torch.ops.aten.minimum.default)
-    max_ops = (torch.maximum, torch.ops.aten.maximum.default)
-    where_ops = (torch.where, torch.ops.aten.where.self)
 
     env_map: dict[object, str] = dict(zip(placeholders, arg_vars, strict=True))
 
@@ -307,27 +290,49 @@ def _cute_inline_combine_graph(
                 "cute", f"associative_scan combine op {node.op}"
             )
         target = node.target
-        if target in binary_ops:
-            lhs = operand(node.args[0])
-            rhs = operand(node.args[1])
-            emit(node, f"({lhs}) {binary_ops[target]} ({rhs})")
-        elif target in where_ops:
-            cond = operand(node.args[0])
-            tval = operand(node.args[1])
-            fval = operand(node.args[2])
+        if target in _CUTE_SCAN_BINARY_OPS:
+            lhs = operand(scan_combine_arg(node, 0, "input", "cute"))
+            rhs = operand(scan_combine_arg(node, 1, "other", "cute"))
+            emit(
+                node,
+                scan_combine_binary_expression(
+                    node, _CUTE_SCAN_BINARY_OPS[target], lhs, rhs, operand, "cute"
+                ),
+            )
+        elif target in SCAN_WHERE_OPS:
+            scan_combine_check_extra_args(node, 3, "cute")
+            scan_combine_check_kwargs(node, "cute", ("condition", "input", "other"))
+            cond = operand(scan_combine_arg(node, 0, "condition", "cute"))
+            tval = operand(scan_combine_arg(node, 1, "input", "cute"))
+            fval = operand(scan_combine_arg(node, 2, "other", "cute"))
             emit(node, env.backend.where_expr(cond, tval, fval))
-        elif target in min_ops:
-            lhs = operand(node.args[0])
-            rhs = operand(node.args[1])
+        elif target in SCAN_MIN_OPS:
+            scan_combine_check_extra_args(node, 2, "cute")
+            scan_combine_check_kwargs(node, "cute", ("input", "other"))
+            lhs = operand(scan_combine_arg(node, 0, "input", "cute"))
+            rhs = operand(scan_combine_arg(node, 1, "other", "cute"))
             emit(node, f"({lhs}) if ({lhs}) < ({rhs}) else ({rhs})")
-        elif target in max_ops:
-            lhs = operand(node.args[0])
-            rhs = operand(node.args[1])
+        elif target in SCAN_MAX_OPS:
+            scan_combine_check_extra_args(node, 2, "cute")
+            scan_combine_check_kwargs(node, "cute", ("input", "other"))
+            lhs = operand(scan_combine_arg(node, 0, "input", "cute"))
+            rhs = operand(scan_combine_arg(node, 1, "other", "cute"))
             emit(node, f"({lhs}) if ({lhs}) > ({rhs}) else ({rhs})")
-        elif target is torch.ops.prims.convert_element_type.default:
-            # Per-lane scalars are already in their storage dtype; treat the
-            # cast as a pass-through (matches the load/store scalar pipeline).
-            env_map[node] = operand(node.args[0])
+        elif target is SCAN_CAST_OP:
+            scan_combine_check_extra_args(node, 2, "cute")
+            scan_combine_check_kwargs(node, "cute", ("a", "dtype"))
+            dtype = scan_combine_arg(node, 1, "dtype", "cute")
+            if not isinstance(dtype, torch.dtype):
+                raise exc.BackendUnsupported(
+                    "cute", f"associative_scan combine dtype {dtype!r}"
+                )
+            emit(
+                node,
+                env.backend.cast_expr(
+                    operand(scan_combine_arg(node, 0, "a", "cute")),
+                    env.backend.dtype_str(dtype),
+                ),
+            )
         else:
             raise exc.BackendUnsupported(
                 "cute", f"associative_scan combine function: {target}"

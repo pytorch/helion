@@ -8,6 +8,7 @@ same eager timing as before.
 
 from __future__ import annotations
 
+import ast
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,11 +28,13 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
+from ..indexing_strategy import SubscriptIndexing
 from . import codegen as pallas_codegen
+from .gather import emit_scatter_add
+from .tensorcore_plan import TENSORCORE_PLAN_META
+from .tensorcore_plan import OneHotScatterPlan
 
 if TYPE_CHECKING:
-    import ast
-
     from ..inductor_lowering import CodegenState
 
 
@@ -90,8 +93,69 @@ def _pallas_store_update(
     )
 
 
+def _validate_pallas_tensor_index_atomic_add_shape(
+    state: CodegenState,
+    target: torch.Tensor,
+    index: list[object] | tuple[object, ...],
+    value: object,
+) -> None:
+    """Reject tensor-indexed Pallas atomic_add shapes we cannot lower."""
+    if not isinstance(value, torch.Tensor):
+        raise exc.BackendUnsupported("pallas", "tensor-indexed atomic_add tensor value")
+    expected_shape = SubscriptIndexing.compute_shape(target, [*index], state)
+    if value.ndim != len(expected_shape):
+        raise exc.BackendUnsupported(
+            "pallas",
+            "tensor-indexed atomic_add value shape must match indexed target shape",
+        )
+
+    env = CompileEnvironment.current()
+    for actual, expected in zip(value.shape, expected_shape, strict=True):
+        if not env.known_equal(actual, expected):
+            raise exc.BackendUnsupported(
+                "pallas",
+                "tensor-indexed atomic_add value shape must match indexed target shape",
+            )
+
+
 @_decorators.codegen(atomic_add, "pallas")
 def _(state: CodegenState) -> ast.AST:
+    tensorcore_plan = (
+        state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
+    )
+    if isinstance(tensorcore_plan, OneHotScatterPlan):
+        if state.fx_node is not None and len(state.fx_node.users) > 0:
+            raise NotImplementedError(
+                "Pallas tensor-indexed atomic_add does not support returning "
+                "previous values"
+            )
+        target = state.proxy_arg(0)
+        index = state.proxy_arg(1)
+        assert isinstance(target, torch.Tensor)
+        assert isinstance(index, (list, tuple))
+        value_proxy = state.proxy_arg(2)
+        plan = tensorcore_plan.plan
+        _validate_pallas_tensor_index_atomic_add_shape(
+            state, target, index, value_proxy
+        )
+        state.device_function.pallas_tensor_index_atomic_target_ids.add(id(target))
+        host_function = HostFunction.current()
+        if target not in host_function.tensor_to_origin:
+            raise exc.AtomicOnDeviceTensor("pallas atomic")
+        value_ast = _to_ast_values([state.ast_args[2]])[0]
+        name = state.device_function.tensor_arg(target).name
+        name = pallas_codegen.vmem_name(state, name)
+        index_parts, none_dims = pallas_codegen.index_parts(state, index, target)
+        value_ast = pallas_codegen.sliced_value_for_store(
+            state, target, index, index_parts, value_ast
+        )
+        index_str = ", ".join(index_parts)
+        update = emit_scatter_add(state, plan, name, index_str, value_ast, none_dims)
+        state.codegen.add_statement(
+            statement_from_string(f"{name}[{index_str}] = {{update}}", update=update)
+        )
+        return ast.Constant(value=None)
+
     name, index_parts, index_str, prev_var = _pallas_atomic_load_prev(state)
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     target = state.proxy_arg(0)

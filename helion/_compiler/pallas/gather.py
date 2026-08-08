@@ -303,12 +303,107 @@ def _scatter_one_hot_name(
     ast_idx = ast_subscripts[plan.indirect_pos]
     assert isinstance(ast_idx, ast.AST)
     idx_name = state.codegen.lift(ast_idx, dce=False, prefix="index").id
+    extent = f"{name}.shape[{plan.indirect_tensor_dim}]"
+    raw_index = f"{idx_name}[...]"
+    normalized_index = (
+        f"jnp.where((({raw_index}) < 0) & (({raw_index}) >= -({extent})), "
+        f"({raw_index}) + ({extent}), ({raw_index}))"
+    )
     # TODO(tcombes): investigate making the metadata into dtype,
     # currently hitting Mosaic issues with bf16 mask.
-    return (
-        f"jax.nn.one_hot({idx_name}[...], "
-        f"{name}.shape[{plan.indirect_tensor_dim}], "
-        "dtype=jnp.float32)"
+    return f"jax.nn.one_hot({normalized_index}, {extent}, dtype=jnp.float32)"
+
+
+def _scatter_source_mask_expr(
+    state: CodegenState,
+    plan: ScatterPlan,
+) -> str | None:
+    """Return a float mask for valid tensor-index source lanes."""
+    from ..compile_environment import CompileEnvironment
+
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    index = subscript[plan.indirect_pos]
+    if not isinstance(index, torch.Tensor):
+        return None
+
+    env = CompileEnvironment.current()
+    index_shape = [*index.size()]
+    mask_exprs: list[str] = []
+    for dim, size in enumerate(index_shape):
+        block_id = env.resolve_block_id(size)
+        if block_id is None or (mask_var := state.codegen.mask_var(block_id)) is None:
+            continue
+        if env.is_jagged_tile(block_id):
+            mask_shape = env.jagged_tile_mask_shapes[block_id]
+            expand = state.tile_strategy.jagged_tile_expand_str(mask_shape, index_shape)
+        else:
+            expand = state.tile_strategy.expand_str(index_shape, dim)
+        expr = f"({mask_var}.astype(jnp.float32){expand})"
+        if expr not in mask_exprs:
+            mask_exprs.append(expr)
+
+    if not mask_exprs:
+        return None
+    return "*".join(mask_exprs)
+
+
+def _scatter_masked_one_hot(
+    state: CodegenState,
+    plan: ScatterPlan,
+    name: str,
+) -> str:
+    oh = _scatter_one_hot_name(state, plan, name)
+    source_mask = _scatter_source_mask_expr(state, plan)
+    if source_mask is None:
+        return oh
+    return f"({oh}) * (({source_mask})[..., None])"
+
+
+def _scatter_dot(mapping: str, value: ast.AST) -> ast.AST:
+    return expr_from_string(
+        "jax.lax.dot_general("
+        f"{mapping}, "
+        "{value}.astype(jnp.float32), "
+        "(((1,), (0,)), ((), ())), "
+        "preferred_element_type=jnp.float32, "
+        "precision=jax.lax.Precision.HIGHEST)",
+        value=value,
+    )
+
+
+def _scatter_add_updates(mapping: str, value: ast.AST) -> ast.AST:
+    """Project additive updates without zero-times-nonfinite contamination."""
+    value_f32 = expr_from_string("{value}.astype(jnp.float32)", value=value)
+    finite_value = expr_from_string(
+        "jnp.where(jnp.isfinite({value}), {value}, jnp.array(0, dtype=jnp.float32))",
+        value=value_f32,
+    )
+    nan_value = expr_from_string(
+        "jnp.isnan({value}).astype(jnp.float32)", value=value_f32
+    )
+    posinf_value = expr_from_string(
+        "jnp.isposinf({value}).astype(jnp.float32)", value=value_f32
+    )
+    neginf_value = expr_from_string(
+        "jnp.isneginf({value}).astype(jnp.float32)", value=value_f32
+    )
+    finite_updates = _scatter_dot(mapping, finite_value)
+    nan_hits = _scatter_dot(mapping, nan_value)
+    posinf_hits = _scatter_dot(mapping, posinf_value)
+    neginf_hits = _scatter_dot(mapping, neginf_value)
+    return expr_from_string(
+        "jnp.where(({nan_hits} > 0) | "
+        "(({posinf_hits} > 0) & ({neginf_hits} > 0)), "
+        "jnp.array(jnp.nan, dtype=jnp.float32), "
+        "jnp.where({posinf_hits} > 0, "
+        "jnp.array(jnp.inf, dtype=jnp.float32), "
+        "jnp.where({neginf_hits} > 0, "
+        "jnp.array(-jnp.inf, dtype=jnp.float32), {finite_updates})))",
+        nan_hits=nan_hits,
+        posinf_hits=posinf_hits,
+        neginf_hits=neginf_hits,
+        finite_updates=finite_updates,
     )
 
 
@@ -341,7 +436,7 @@ def emit_scatter_store(
     """
     for dim in reversed(none_dims):
         value = expr_from_string(f"jnp.squeeze({{value}}, axis={dim})", value=value)
-    oh = _scatter_one_hot_name(state, plan, name)
+    oh = _scatter_masked_one_hot(state, plan, name)
     m = f"jnp.shape({oh})[0]"
     eye = f"jnp.eye({m}, dtype=jnp.float32)"
     is_lane_j_after_i = f"jnp.triu(jnp.ones(({m}, {m}), dtype=jnp.float32), k=1)"
@@ -355,15 +450,8 @@ def emit_scatter_store(
         "(((1,), (0,)), ((), ())))"
     )
     updates = expr_from_string(
-        "jax.lax.dot_general("
-        f"{row_to_lane}, "
-        "{value}.astype(jnp.float32), "
-        "(((1,), (0,)), "
-        "((), ())), "
-        "preferred_element_type=jnp.float32, "
-        "precision=jax.lax.Precision.HIGHEST"
-        f").astype({plan.jnp_dtype})",
-        value=value,
+        f"{{updates}}.astype({plan.jnp_dtype})",
+        updates=_scatter_add_updates(row_to_lane, value),
     )
     mask_expr = (
         "jax.lax.dot_general("
@@ -376,4 +464,25 @@ def emit_scatter_store(
         f"jnp.where({mask_expr}, {{updates}}, {name}[{base_index}])",
         updates=updates,
         value=value,
+    )
+
+
+def emit_scatter_add(
+    state: CodegenState,
+    plan: ScatterPlan,
+    name: str,
+    base_index: str,
+    value: ast.AST,
+    none_dims: list[int],
+) -> ast.AST:
+    """Emit one Pallas program's tensor-indexed additive update block."""
+    for dim in reversed(none_dims):
+        value = expr_from_string(f"jnp.squeeze({{value}}, axis={dim})", value=value)
+    oh = _scatter_masked_one_hot(state, plan, name)
+    mapping = f"jnp.swapaxes({oh}, 0, 1)"
+    updates = _scatter_add_updates(mapping, value)
+    return expr_from_string(
+        f"({name}[{base_index}].astype(jnp.float32) + {{updates}}).astype("
+        f"{plan.jnp_dtype})",
+        updates=updates,
     )

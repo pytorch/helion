@@ -1273,18 +1273,18 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
-    @xfailIfPallas("requires triton module")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
     def test_segment_reduction(self):
-        num_nodes = 100
-        num_edges = 1000
-        num_features = 32
+        num_nodes = 4
+        num_edges = 19
+        num_features = 8
         dtype = torch.float32
 
-        # Create sorted indices for segmented reduction
-        indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
+        # Index zero matches the masked next-index value, so only the explicit
+        # final-element boundary flushes the last partial scan tile.
+        indices = torch.zeros(num_edges, device=DEVICE, dtype=LONG_INT_TYPE)
         input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
 
         args = (indices, input_data, num_nodes)
@@ -1298,6 +1298,27 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="segmented_reduction_helion",
+            block_sizes=[16, 8],
+        )
+
+    @skipIfRefEager(
+        "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
+    )
+    def test_segment_reduction_scan_preserves_large_indices(self) -> None:
+        indices = torch.arange(
+            2**24,
+            2**24 + 128,
+            device=DEVICE,
+            dtype=LONG_INT_TYPE,
+        )
+        input_data = torch.randn(128, 8, device=DEVICE)
+
+        check_example(
+            "segment_reduction",
+            (indices, input_data),
+            input_data,
+            fn_name="segmented_scan_helion",
+            block_sizes=[128, 8],
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
