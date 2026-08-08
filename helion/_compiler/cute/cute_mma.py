@@ -5038,7 +5038,7 @@ def _emit_mma_pipeline(
             "cute",
             f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
             "tcgen05 MMA codegen",
-        )
+    )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=tcgen05_mma_bm,
@@ -5135,12 +5135,16 @@ def _emit_mma_pipeline(
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
         and tcgen05_pid_is_persistent
-        and tcgen05_cluster_m == 2
         and tcgen05_cluster_n_requested == 1
-        and tcgen05_requested_two_cta
         and m_size % bm == 0
         and n_size % bn != 0
         and k_total_size % bk == 0
+        # Both supported tcgen05 CTA protocols can consume a general N
+        # remainder through the role-local TMA producer.
+        and (
+            (tcgen05_cluster_m == 2 and tcgen05_requested_two_cta)
+            or tcgen05_cluster_m == 1
+        )
     )
     if (
         mma_impl == "tcgen05"
@@ -5226,7 +5230,7 @@ def _emit_mma_pipeline(
         tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n == 1
     )
     tcgen05_role_local_n_edge_tma = (
-        tcgen05_n_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+        tcgen05_n_edge_only and tcgen05_cluster_n == 1
     )
     tcgen05_role_local_double_edge_tma = (
         tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n == 1
@@ -5462,9 +5466,20 @@ def _emit_mma_pipeline(
     tcgen05_output_edge_tma_store_fits_smem = (
         tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
     )
+    # ``tcgen05_is_two_cta`` below gates only the hybrid output-store protocol,
+    # not role-local edge-TMA input loading. The mixed full-tile TMA-store plus
+    # edge SIMT-store epilogue is validated for CtaGroup.TWO; enabling its
+    # conditional store-pipeline state and tile counters for one CTA currently
+    # produces IR that NVVM rejects. One-CTA N-edge kernels therefore keep the
+    # predicated SIMT epilogue for every tile. This is an implementation
+    # boundary, not a tcgen05 hardware requirement.
     tcgen05_use_output_edge_tma_store_for_full_tiles = (
         tcgen05_role_local_m_edge_tma
-        or tcgen05_role_local_n_edge_tma
+        or (
+            tcgen05_role_local_n_edge_tma
+            and tcgen05_is_two_cta
+            and n_size >= bn
+        )
         or tcgen05_role_local_double_edge_tma
     ) and tcgen05_output_edge_tma_store_fits_smem
     store_outer_extent = bn if output_column_major else bm

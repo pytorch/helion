@@ -1,5 +1,5 @@
 """
-Auto-generated heuristic for kernels: scale_mm_cute, scale_mm_cute_skinny_m
+Auto-generated heuristic for kernels: scale_mm_cute, scale_mm_cute_skinny_m, scale_mm_cute_swap_ab
 Backend: explicit per-shape table (exact (M, K, N) -> tuned config)
 
 RowWise-scaled FP8 GEMM pretuned on NVIDIA B200 (sm100) for the Helion CuTe
@@ -35,6 +35,7 @@ Provides, for each kernel <k>:
 """
 
 import math
+from typing import Any
 
 import torch
 
@@ -81,6 +82,64 @@ def key_scale_mm_cute_skinny_m(*args) -> int:
 def autotune_scale_mm_cute_skinny_m(*args) -> dict:
     """Config dict for the given args."""
     return _CONFIGS_scale_mm_cute_skinny_m[key_scale_mm_cute_skinny_m(*args)]
+
+
+# === Kernel: scale_mm_cute_swap_ab ===
+_SMALL_M_SWAP_KEYS = [
+    (m, k, n)
+    for m in (2, 8, 16, 32)
+    for k, n in (
+        (4096, 4096),
+        (4096, 256),
+        (2048, 4096),
+        (4096, 6144),
+    )
+]
+
+
+def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
+    if m == 32:
+        block_sizes = [64, 32, 128]
+        ab_stages = 12
+        acc_stages = 1
+    else:
+        block_sizes = [64, 16, 256]
+        ab_stages = 7 if k == 2048 else 9
+        acc_stages = 1
+    pid_type = (
+        "persistent_interleaved"
+        if (m, k, n) == (2, 4096, 256)
+        else "persistent_blocked"
+    )
+    return {
+        "block_sizes": block_sizes,
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": pid_type,
+        "tcgen05_cluster_m": 1,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": ab_stages,
+        "tcgen05_acc_stages": acc_stages,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 1,
+        "tcgen05_persistence_model": "static_persistent",
+    }
+
+
+_KEYS_scale_mm_cute_swap_ab = _SMALL_M_SWAP_KEYS
+
+_CONFIGS_scale_mm_cute_swap_ab = [
+    _small_m_swap_config(*key) for key in _SMALL_M_SWAP_KEYS
+]
+
+
+def key_scale_mm_cute_swap_ab(*args) -> int:
+    return _select(_KEYS_scale_mm_cute_swap_ab, _mkn(args))
+
+
+def autotune_scale_mm_cute_swap_ab(*args) -> dict:
+    return _CONFIGS_scale_mm_cute_swap_ab[key_scale_mm_cute_swap_ab(*args)]
 
 
 # === Kernel: scale_mm_cute ===
