@@ -18,8 +18,10 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 try:
     # pyrefly: ignore [missing-import]
@@ -73,9 +75,9 @@ def reference_jagged_hstu_kernel_pytorch(
         # Apply SiLU activation
         scores = (scores / (1.0 + torch.exp(-scores))) * scale
 
-        # Apply lower triangular mask (causal attention)
-        invalid_mask = torch.tril(torch.ones_like(scores, dtype=torch.bool), diagonal=0)
-        scores = torch.where(invalid_mask, scores, torch.zeros_like(scores))
+        # Apply inclusive lower triangular mask (causal attention)
+        causal_mask = torch.tril(torch.ones_like(scores, dtype=torch.bool), diagonal=0)
+        scores = torch.where(causal_mask, scores, torch.zeros_like(scores))
 
         # Compute and store output
         output_batch = torch.bmm(scores, v_batch)
@@ -91,7 +93,7 @@ def reference_jagged_hstu_kernel_pytorch(
 
 # %%
 @helion.kernel()
-def _helion_jagged_attention_kernel(
+def _helion_jagged_attention_kernel_scalar(
     max_seq_len: int,
     alpha: float,
     q: torch.Tensor,
@@ -103,9 +105,9 @@ def _helion_jagged_attention_kernel(
     scale = 1.0 / max_seq_len
     num_heads = hl.specialize(q.size(1))
     num_batches = hl.specialize(seq_offsets.size(0) - 1)
-    dimV = hl.specialize(v.size(2))
+    dim_v = hl.specialize(v.size(2))
 
-    out = torch.zeros_like(v)
+    out = torch.empty_like(v)
 
     # Tile over batch, head, sequence
     for tile_b, tile_h, tile_q in hl.tile(
@@ -118,9 +120,9 @@ def _helion_jagged_attention_kernel(
         if tile_q.begin < seq_len:
             mask_q = tile_q.index < seq_len
             q_blk = q[tile_q.index + starts, tile_h.begin, :]
-            acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+            acc = hl.zeros([tile_q, dim_v], dtype=torch.float32)
 
-            # Causal attention: only attend to previous tokens
+            # Inclusive causal attention: attend through the current token.
             for tile_kv in hl.tile(0, tile_q.end, block_size=None):
                 mask_kv = tile_kv.index < seq_len
                 k_blk = k[tile_kv.index + starts, tile_h.begin, :]
@@ -132,9 +134,9 @@ def _helion_jagged_attention_kernel(
                     * scale
                 )
 
-                # Apply causal mask: only attend to previous positions
+                # Apply inclusive causal mask.
                 scores = torch.where(
-                    (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
+                    (tile_q.index.unsqueeze(1) >= tile_kv.index.unsqueeze(0))
                     & mask_q[:, None]
                     & mask_kv[None, :],
                     scores,
@@ -143,10 +145,67 @@ def _helion_jagged_attention_kernel(
 
                 acc += torch.matmul(scores.to(v.dtype), v_blk)
 
-            # Store result
-            out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
+            # Store only real rows; padded lanes alias the next packed sequence.
+            dim_v_index = hl.arange(dim_v)
+            hl.store(
+                out,
+                [tile_q.index + starts, tile_h.begin, dim_v_index],
+                acc.to(out.dtype),
+                extra_mask=mask_q[:, None],
+            )
 
     return out
+
+
+@helion.kernel()
+def _helion_jagged_attention_kernel_pallas(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Pallas implementation of HSTU jagged attention, tiled over all heads."""
+    scale = 1.0 / max_seq_len
+    num_heads = hl.specialize(q.size(1))
+    num_batches = hl.specialize(seq_offsets.size(0) - 1)
+    dim_v = hl.specialize(v.size(2))
+
+    out = torch.empty_like(v)
+
+    # Tile each packed sequence's real row range; each program computes all heads.
+    for seq_idx in hl.grid(num_batches):
+        start = seq_offsets[seq_idx]
+        end = seq_offsets[seq_idx + 1]
+
+        for tile_q in hl.tile(start, end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            acc = hl.zeros([num_heads, tile_q, dim_v], dtype=torch.float32)
+
+            # Causal attention: only attend through the current query position.
+            for tile_kv in hl.tile(start, end):
+                k_blk = k[tile_kv, :, :].transpose(0, 1)
+                v_blk = v[tile_kv, :, :].transpose(0, 1)
+
+                scores = torch.bmm(q_blk, k_blk.transpose(-2, -1)) * alpha
+                scores = torch.nn.functional.silu(scores) * scale
+
+                causal_mask = tile_q.index.unsqueeze(1) >= tile_kv.index.unsqueeze(0)
+                scores = torch.where(causal_mask[None, :, :], scores, 0.0)
+
+                acc = acc + torch.bmm(scores.to(v.dtype), v_blk)
+
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+
+    return out
+
+
+_helion_jagged_attention_kernel = (
+    _helion_jagged_attention_kernel_pallas
+    if _get_backend() == "pallas"
+    else _helion_jagged_attention_kernel_scalar
+)
 
 
 # %%
@@ -165,6 +224,7 @@ def ragged_attention_tritonbench(
     max_seq_len: int,
 ) -> Callable[[], torch.Tensor]:
     """Wrapper function for jagged attention kernel"""
+    seq_offsets = seq_offsets.to(LONG_INT_TYPE)
     return lambda: _helion_jagged_attention_kernel(
         max_seq_len=max_seq_len,
         alpha=1.0 / v.size(2) ** 2,
@@ -210,7 +270,7 @@ def test(
     seq_offsets = torch.cat(
         [
             torch.tensor([0], dtype=torch.int32, device=device),
-            torch.cumsum(seq_lengths, dim=0),
+            torch.cumsum(seq_lengths, dim=0, dtype=torch.int32),
         ]
     )
     total_seq_len = int(seq_offsets[-1].item())
