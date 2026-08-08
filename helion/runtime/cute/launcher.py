@@ -231,6 +231,16 @@ def _append_cute_wrapper_plan(
         assert value is None or isinstance(value, str)
         return value
 
+    def plan_optional_order(key: str) -> tuple[int, ...] | None:
+        value = plan.get(key)
+        if value is None:
+            return None
+        assert isinstance(value, (list, tuple))
+        assert all(type(dim) is int for dim in value)
+        order = tuple(int(dim) for dim in value)
+        assert sorted(order) == list(range(len(order)))
+        return order
+
     def append_permuted_cute_tensor_view(
         name: str,
         arg_idx: int,
@@ -265,13 +275,14 @@ def _append_cute_wrapper_plan(
         tensor_name: str | None = None,
         rank3_mnl_tensor: bool = False,
         orientation: str = "mn",
+        column_major: bool = False,
     ) -> None:
         assert len(kernel_args) == 2
         assert orientation in ("mn", "nm")
         worklist_nm_store = orientation == "nm"
         d_store_layout = (
             "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
-            if worklist_nm_store
+            if worklist_nm_store or column_major
             else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
         )
         tensor_expr = tensor_name if tensor_name is not None else f"arg{tensor_idx}"
@@ -648,6 +659,7 @@ def _append_cute_wrapper_plan(
             tensor_name=d_tensor_name,
             rank3_mnl_tensor=bool(plan.get("rank3_mnl_tensor")),
             orientation=_tcgen05_plan_orientation(plan),
+            column_major=bool(plan.get("d_column_major")),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -727,8 +739,8 @@ def _append_cute_wrapper_plan(
     # K-major (column-major / K-contiguous) B. Absent on the MN-major
     # (row-major B) default path.
     b_k_major = bool(plan.get("b_k_major"))
-    lhs_leading_passthrough = bool(plan.get("lhs_leading_passthrough"))
-    rhs_leading_passthrough = bool(plan.get("rhs_leading_passthrough"))
+    lhs_tma_order = plan_optional_order("lhs_tma_order")
+    rhs_tma_order = plan_optional_order("rhs_tma_order")
     rhs_rank3_grouped_nt = bool(plan.get("rhs_rank3_grouped_nt"))
     lhs_rank3_grouped_nt = bool(plan.get("lhs_rank3_grouped_nt"))
     orientation = _tcgen05_plan_orientation(plan)
@@ -776,7 +788,7 @@ def _append_cute_wrapper_plan(
     lhs_tma = f"{tma_atom_a}_lhs_tma"
     lhs_tma_arg = (
         lhs_tma
-        if dynamic_ab_tensormaps or swapped_nm or lhs_leading_passthrough
+        if (dynamic_ab_tensormaps or swapped_nm or lhs_tma_order is not None)
         else f"arg{lhs_idx}"
     )
     rhs_tma = f"{tma_atom_b}_rhs_tma"
@@ -889,12 +901,12 @@ def _append_cute_wrapper_plan(
         swizzle_override=smem_swizzle_b,
         b_k_major=b_k_major,
     )
-    if lhs_leading_passthrough:
-        append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 2, 0))
-    if rhs_leading_passthrough:
-        append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (2, 1, 0))
-    lhs_tma_setup_lines = () if lhs_leading_passthrough else lhs_tma_setup
-    rhs_tma_setup_lines = () if rhs_leading_passthrough else rhs_tma_setup
+    if lhs_tma_order is not None:
+        append_permuted_cute_tensor_view(lhs_tma, lhs_idx, lhs_tma_order)
+    if rhs_tma_order is not None:
+        append_permuted_cute_tensor_view(rhs_tma, rhs_idx, rhs_tma_order)
+    lhs_tma_setup_lines = () if lhs_tma_order is not None else lhs_tma_setup
+    rhs_tma_setup_lines = () if rhs_tma_order is not None else rhs_tma_setup
     body.extend(
         (
             (

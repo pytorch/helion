@@ -19,6 +19,7 @@ from helion._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
 from helion._compiler.cute.device_state import CuteTcgen05StoreValue
+from helion._compiler.cute.device_state import Tcgen05Orientation
 from helion._compiler.cute.tcgen05_lifecycle import Tcgen05LifecycleContext
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
@@ -150,6 +151,26 @@ class _StatementCaptureGenerateAST(GenerateAST):
 
 @onlyBackends(["cute"])
 class TestCuteDeviceFunctionState(unittest.TestCase):
+    def test_tcgen05_store_value_d_store_layout_uses_output_layout(self) -> None:
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(), output_block_ids=(0, 1)
+        )
+
+        self.assertEqual(
+            value.d_store_layout,
+            "cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+        )
+        self.assertEqual(
+            dataclasses.replace(value, output_column_major=True).d_store_layout,
+            "cutlass.utils.layout.LayoutEnum.COL_MAJOR",
+        )
+        self.assertEqual(
+            dataclasses.replace(
+                value, orientation=Tcgen05Orientation.NM
+            ).d_store_layout,
+            "cutlass.utils.layout.LayoutEnum.COL_MAJOR",
+        )
+
     def test_get_tcgen05_store_value_checks_candidate_names(self) -> None:
         state = CuteDeviceFunctionState()
         value = CuteTcgen05StoreValue(
