@@ -31,6 +31,8 @@ from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
+from helion.autotuner import IntegerFragment
+from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 from helion.runtime.pallas.launcher import _pallas_copy_guard
 from helion.runtime.pallas.launcher import _pallas_launcher_cache_key
@@ -671,6 +673,35 @@ def pallas_associative_scan_int64_roundtrip(x: torch.Tensor) -> torch.Tensor:
         out[tile_m, tile_n] = hl.associative_scan(
             pallas_scan_int64_roundtrip_combine, x[tile_m, tile_n], dim=0
         )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_integer_tunable_scale(x: torch.Tensor) -> torch.Tensor:
+    scale = hl.register_tunable("scale", IntegerFragment(1, 8, 3))
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m] = x[tile_m] * scale
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_tunable_prefix_reduction(x: torch.Tensor) -> torch.Tensor:
+    width = hl.register_tunable("width", PowerOfTwoFragment(4, 16, 8))
+    tmp = torch.zeros([x.size(0), width], dtype=x.dtype, device=x.device)
+    out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m] = torch.sum(tmp[tile_m, :] + x[tile_m, None], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_integer_tunable_prefix_reduction(x: torch.Tensor) -> torch.Tensor:
+    width = hl.register_tunable("width", IntegerFragment(3, 9, 5))
+    tmp = torch.zeros([x.size(0), width], dtype=x.dtype, device=x.device)
+    out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m] = torch.sum(tmp[tile_m, :] + x[tile_m, None], dim=-1)
     return out
 
 
@@ -5404,6 +5435,37 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_reduce_non_pow2, (x,), block_size=128)
         expected = torch.nn.functional.softmax(x, dim=-1)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_integer_tunable_non_reduction(self) -> None:
+        x = torch.randn(32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_integer_tunable_scale,
+            (x,),
+            block_size=8,
+            scale=5,
+        )
+        torch.testing.assert_close(result, x * 5)
+
+    def test_tunable_reduction_extent(self) -> None:
+        x = torch.randn(12, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_tunable_prefix_reduction,
+            (x,),
+            block_size=4,
+            width=16,
+        )
+        torch.testing.assert_close(result, x * 16)
+
+    def test_integer_tunable_reduction_extent_uses_selected_config(self) -> None:
+        x = torch.randn(12, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_integer_tunable_prefix_reduction,
+            (x,),
+            block_size=4,
+            width=7,
+        )
+        torch.testing.assert_close(result, x * 7)
+        self.assertIn("width = 7", code)
 
     def test_scalar_access_1D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())

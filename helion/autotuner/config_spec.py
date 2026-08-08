@@ -67,6 +67,7 @@ from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
+from .config_fragment import BaseIntegerFragment
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -85,6 +86,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    import sympy
+
     from .._compiler.backend import Backend
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
@@ -101,6 +104,53 @@ class TensorNumelConstraint(NamedTuple):
     check_fn: Callable[..., bool]
     block_indices: tuple[int, ...]
     expr_str: str
+
+
+class TunableReductionExtent(NamedTuple):
+    """A reduction extent expression backed by tunables and block sizes."""
+
+    expression: sympy.Expr
+    symbol_names: tuple[tuple[sympy.Symbol, str], ...]
+    block_symbol_ids: tuple[tuple[sympy.Symbol, int], ...]
+
+    def evaluate(
+        self,
+        config: Mapping[str, object],
+        fragments: Mapping[str, ConfigSpecFragment],
+        block_specs: BlockIdSequence[BlockSizeSpec],
+    ) -> int:
+        substitutions = {}
+        for symbol, name in self.symbol_names:
+            value = config.get(name, fragments[name].default())
+            if type(value) is not int:
+                raise InvalidConfig(
+                    f"config[{name!r}] must be an integer, got {value!r}"
+                )
+            substitutions[symbol] = value
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            raise InvalidConfig(
+                "block_sizes must be normalized before reduction extents"
+            )
+        for symbol, block_id in self.block_symbol_ids:
+            value = block_specs.config_get(block_sizes, block_id)
+            if type(value) is not int:
+                raise InvalidConfig(
+                    f"Could not resolve block size {block_id} in reduction extent"
+                )
+            substitutions[symbol] = value
+        value = self.expression.xreplace(substitutions)
+        if getattr(value, "free_symbols", ()):
+            raise InvalidConfig(
+                f"Could not resolve tunable reduction extent {self.expression!s}"
+            )
+        extent = int(cast("Any", value))
+        if extent < 0:
+            raise InvalidConfig(
+                f"Tunable reduction extent {self.expression!s} evaluated to {extent}"
+            )
+        # A zero-length logical reduction still needs one masked backend lane.
+        return max(1, extent)
 
 
 class MatmulFact(NamedTuple):
@@ -1597,6 +1647,44 @@ class ConfigSpec:
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
 
+    def _validate_user_defined_tunables(self, config: Mapping[str, object]) -> None:
+        for name, fragment in self.user_defined_tunables.items():
+            if name not in config:
+                continue
+            value = config[name]
+            if isinstance(fragment, BaseIntegerFragment):
+                if type(value) is not int or not fragment.low <= value <= fragment.high:
+                    raise InvalidConfig(
+                        f"config[{name!r}] must be an integer in "
+                        f"[{fragment.low}, {fragment.high}], got {value!r}"
+                    )
+                if isinstance(fragment, PowerOfTwoFragment):
+                    try:
+                        assert_integer_power_of_two(value)
+                    except InvalidConfig:
+                        raise InvalidConfig(
+                            f"config[{name!r}] must be a power of two, got {value!r}"
+                        ) from None
+            elif isinstance(fragment, EnumFragment):
+                valid = any(
+                    type(value) is type(choice) and value == choice
+                    for choice in fragment.choices
+                )
+                if not valid:
+                    raise InvalidConfig(
+                        f"config[{name!r}] must be one of {fragment.choices!r}, "
+                        f"got {value!r}"
+                    )
+
+    def _configured_reduction_extent(
+        self, spec: ReductionLoopSpec, config: Mapping[str, object]
+    ) -> int:
+        if spec.tunable_extent is None:
+            return spec.size_hint
+        return spec.tunable_extent.evaluate(
+            config, self.user_defined_tunables, self.block_sizes
+        )
+
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
     ) -> None:
@@ -1688,6 +1776,8 @@ class ConfigSpec:
                 name, config.get(name, ()), flatten=flatten
             )
 
+        self._validate_user_defined_tunables(config)
+
         # Clamp inner block sizes that are bounded by an outer block
         # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
         # outer's concrete block size for this config is known, and the
@@ -1741,6 +1831,21 @@ class ConfigSpec:
                         new_num_threads[i] = max(num_thread, 1)
                     config["num_threads"] = new_num_threads
 
+        reduction_loops = config.get("reduction_loops")
+        if isinstance(reduction_loops, list):
+            normalized_loops = list(reduction_loops)
+            changed = False
+            for i, spec in enumerate(self.reduction_loops):
+                if i >= len(normalized_loops):
+                    break
+                loop = normalized_loops[i]
+                extent = self._configured_reduction_extent(spec, config)
+                if isinstance(loop, int) and loop >= extent:
+                    normalized_loops[i] = None
+                    changed = True
+            if changed:
+                config["reduction_loops"] = normalized_loops
+
         if self.supports_config_key("num_threads"):
             num_threads = cast("list[int]", config.get("num_threads", []))
             if all(value == 0 for value in num_threads):
@@ -1761,6 +1866,7 @@ class ConfigSpec:
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
+                    extent = self._configured_reduction_extent(spec, config)
                     # Indexed reductions (argmin/argmax) on CuTe must keep
                     # the persistent thread count or rolled chunk within a
                     # single warp, since cute.arch.warp_reduction only
@@ -1771,8 +1877,8 @@ class ConfigSpec:
                         and spec.block_id in self.cute_indexed_reduction_block_ids
                     ):
                         block_threshold = min(block_threshold, 32)
-                    if new_loops[i] is None and spec.size_hint > block_threshold:
-                        new_loops[i] = min(spec.size_hint, block_threshold)
+                    if new_loops[i] is None and extent > block_threshold:
+                        new_loops[i] = min(extent, block_threshold)
                         changed = True
                     elif (
                         new_loops[i] is not None
@@ -1826,7 +1932,8 @@ class ConfigSpec:
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
-                    if new_loops[i] is None and spec.size_hint > available:
+                    extent = self._configured_reduction_extent(spec, config)
+                    if new_loops[i] is None and extent > available:
                         # When other_threads consumes the entire CuTe 1024 thread
                         # budget there is no thread budget left for the reduction
                         # axis. A chunk of 1 is invalid (LoopedReductionStrategy
@@ -1840,7 +1947,7 @@ class ConfigSpec:
                                 f"{other_threads} of {self.max_reduction_threads} "
                                 f"threads)."
                             )
-                        chunk = min(spec.size_hint, available)
+                        chunk = min(extent, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)
                         new_loops[i] = chunk
@@ -2306,6 +2413,16 @@ class ConfigSpec:
         key: str,
         config: dict[str, object],
     ) -> tuple[bool, object]:
+        if key == "reduction_loops" and self.reduction_loops:
+            normalized = dict(config)
+            if "block_size" not in normalized and "block_sizes" not in normalized:
+                normalized["block_sizes"] = self.block_sizes._flat_config(
+                    self, lambda fragment: fragment.default()
+                )
+            if "reduction_loop" not in normalized:
+                normalized["reduction_loops"] = [None] * len(self.reduction_loops)
+            self.normalize(normalized, _fix_invalid=True)
+            return True, normalized["reduction_loops"]
         if self.backend_name == "cute":
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
@@ -2869,23 +2986,29 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         *,
         block_id: int,
         size_hint: int,
+        max_size_hint: int | None = None,
+        tunable_extent: TunableReductionExtent | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
+        self.max_size_hint = max(size_hint, max_size_hint or size_hint)
+        self.tunable_extent = tunable_extent
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
         # - unflatten: flat integer -> Config value via _flat_config()
         # - flatten: Config value -> flat integer via _encode_flat_value()
         low = 8  # TODO(jansel): is smaller needed?
-        high = next_power_of_2(max(low, self.size_hint))
-        default = min(high, 4096)
+        high = next_power_of_2(max(low, self.max_size_hint))
+        default = min(next_power_of_2(max(low, self.size_hint)), 4096)
         # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
         if base.max_reduction_loop is not None:
             force_threshold = base.reduction_loop_force_threshold
             if force_threshold is not None and self.size_hint > force_threshold:
                 default = min(default, base.max_reduction_loop)
+        if self.tunable_extent is not None and default >= self.size_hint:
+            default = high
         return BlockSizeFragment(low, high, default)
 
     def _flat_config(
@@ -2900,7 +3023,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             raise InvalidConfig(
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"
             )
-        if value >= self.size_hint:
+        if self.tunable_extent is not None:
+            if value == high:
+                return None
+        elif value >= self.size_hint:
             return None  # max size becomes persistent reduction
         return value
 
@@ -2939,7 +3065,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # two reductions).  Collapsing to ``None`` here matches the
         # ``_flat_config`` behaviour and keeps the persistent/loop choice in
         # sync regardless of how the value was generated.
-        if isinstance(normalized, int) and normalized >= self.size_hint:
+        if (
+            self.tunable_extent is None
+            and isinstance(normalized, int)
+            and normalized >= self.size_hint
+        ):
             return None
         return normalized
 

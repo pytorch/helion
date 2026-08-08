@@ -22,6 +22,7 @@ from ..language._tracing_ops import _if
 from ..language._tracing_ops import _mask_to
 from ..language._tracing_ops import _phi
 from ..language._tracing_ops import is_for_loop_target
+from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from .inductor_lowering import InductorLowering
@@ -143,24 +144,38 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
         downstream_reduction_cache[node] = result
         return result
 
+    def masks_tunable_reduction_extent(node: torch.fx.Node) -> bool:
+        """Return true when this mask bounds a tunable reduction extent."""
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            return False
+        env = CompileEnvironment.current()
+        tunable_symbols = set(env.tunable_symbols)
+        if not tunable_symbols:
+            return False
+        for size in val.size():
+            block_id = env.resolve_block_id(size)
+            if block_id is None:
+                continue
+            info = env.block_sizes[env.canonical_block_id(block_id)]
+            if not info.reduction or not isinstance(info.size, (int, torch.SymInt)):
+                continue
+            if info.numel.free_symbols & tunable_symbols:
+                return True
+        return False
+
     for node in graph.find_nodes(op="call_function", target=_mask_to):
         input_node, masked_value0 = node.args
         assert isinstance(input_node, torch.fx.Node)
         masked_value1 = cached_masked_value(input_node)
         if masked_value0 == masked_value1:
-            # If the value feeds a reduction and depends on a reduction output,
-            # we must preserve the mask to zero-out padded lanes. For example, in
-            # `test_layer_norm_nonpow2_reduction`, the 1536-wide reduction tile is padded to
-            # the next power of two; the mask keeps those extra lanes at the
-            # neutral value so the mean/variance sums stay correct. Rolled
-            # reductions similarly insert a mask right before the final sum to
-            # discard zero-padded iterations. We need to keep the mask in these
-            # cases otherwise the padded lanes would contribute irrelevant data and
-            # corrupt the reduction result.
-            if feeds_reduction_input(input_node) and depends_on_reduction_output(
-                input_node
-            ):
-                continue
+            # Keep masks that protect padded reduction lanes, including tunable
+            # extents whose storage may be larger than the selected config.
+            if feeds_reduction_input(input_node):
+                if depends_on_reduction_output(input_node):
+                    continue
+                if masks_tunable_reduction_extent(node):
+                    continue
             node.replace_all_uses_with(  # pyrefly: ignore [missing-attribute]
                 input_node
             )
@@ -262,7 +277,6 @@ def defer_pallas_load_masks(graph: torch.fx.Graph) -> None:
     """
     from ..language.memory_ops import load as load_op
     from .aten_lowering import passthrough_masked_value
-    from .compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
 

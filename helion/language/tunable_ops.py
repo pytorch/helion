@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import cast
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -16,6 +18,7 @@ from .._compiler.type_info import TypeInfo
 from .._compiler.type_info import _to_proxy
 from ..autotuner.config_fragment import BaseIntegerFragment
 from ..autotuner.config_fragment import ConfigSpecFragment
+from ..autotuner.config_fragment import EnumFragment
 from ..autotuner.config_fragment import assert_integer_power_of_two
 from ..autotuner.config_spec import VALID_KEYS
 from ..exc import NotInsideKernel
@@ -175,9 +178,35 @@ def _register_tunable_type(
     # register the value for tuning
     env.config_spec.user_defined_tunables[name_val] = fragment_val
 
-    python_type = type(fragment_val.default())
+    default = fragment_val.default()
+    python_type = type(default)
     if not issubclass(python_type, (int, float, bool)):
         raise exc.TunableTypeNotSupported(python_type)
+    if python_type is int:
+        from .._compiler.type_info import SymIntType
+
+        assert isinstance(default, int)
+        value = env.create_unbacked_symint(hint=default)
+        expr = value._sympy_()
+        assert isinstance(expr, sympy.Symbol), (
+            "integer tunables must be represented by a bare symbol"
+        )
+        env.tunable_symbols[expr] = name_val
+        if isinstance(fragment_val, BaseIntegerFragment):
+            env.shape_env.constrain_symbol_range(
+                expr, fragment_val.low, fragment_val.high
+            )
+        elif isinstance(fragment_val, EnumFragment) and all(
+            type(choice) is int for choice in fragment_val.choices
+        ):
+            choices = cast("tuple[int, ...]", fragment_val.choices)
+            assert choices
+            env.shape_env.constrain_symbol_range(
+                expr,
+                min(choices),
+                max(choices),
+            )
+        return SymIntType(origin, value)
     return NumericType.subtype(python_type).new_unbacked(origin)
 
 

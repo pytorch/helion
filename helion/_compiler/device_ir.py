@@ -13,6 +13,7 @@ import re
 import textwrap
 import threading
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
@@ -20,6 +21,7 @@ from typing import Protocol
 from typing import cast
 from unittest.mock import patch
 
+import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
@@ -27,10 +29,14 @@ from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.traceback import preserve_node_meta
 from torch.utils import _pytree as pytree
+from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils._sympy.value_ranges import bound_sympy
 
 from .. import Config
 from .. import exc
 from .. import language as hl
+from ..autotuner.config_fragment import BaseIntegerFragment
+from ..autotuner.config_fragment import EnumFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import CoResidencyGroup
@@ -40,6 +46,7 @@ from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
 from ..autotuner.config_spec import ReductionLoopSpec
+from ..autotuner.config_spec import TunableReductionExtent
 from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
@@ -52,7 +59,9 @@ from .ast_extension import NodeVisitor
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
+from .compile_environment import BlockSizeInfo
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .host_function import HostFunction
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
@@ -127,6 +136,120 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
     return decomp_table
+
+
+def _reduction_loop_spec(
+    env: CompileEnvironment, rdim: BlockSizeInfo
+) -> ReductionLoopSpec:
+    size_hint = rdim.size_hint()
+    max_size_hint = size_hint
+    tunable_extent: TunableReductionExtent | None = None
+    if isinstance(rdim.size, torch.SymInt):
+        expression = rdim.size._sympy_()
+        assert isinstance(expression, sympy.Expr)
+        expression_symbols = {
+            symbol
+            for symbol in expression.free_symbols
+            if isinstance(symbol, sympy.Symbol)
+        }
+        assert len(expression_symbols) == len(expression.free_symbols)
+        symbol_names = tuple(
+            sorted(
+                (
+                    (symbol, name)
+                    for symbol, name in env.tunable_symbols.items()
+                    if symbol in expression_symbols
+                ),
+                key=operator.itemgetter(1),
+            )
+        )
+        if symbol_names:
+            accounted_symbols = {symbol for symbol, _ in symbol_names}
+            block_symbol_ids: list[tuple[sympy.Symbol, int]] = []
+            fixed_substitutions: dict[sympy.Symbol, int] = {}
+            default_substitutions: dict[sympy.Symbol, int] = {}
+            for symbol, name in symbol_names:
+                default = env.config_spec.user_defined_tunables[name].default()
+                assert type(default) is int
+                default_substitutions[symbol] = default
+            symbol_ranges: dict[sympy.Symbol, ValueRanges[sympy.Expr]] = {}
+            for symbol, name in symbol_names:
+                fragment = env.config_spec.user_defined_tunables[name]
+                if isinstance(fragment, BaseIntegerFragment):
+                    symbol_ranges[symbol] = ValueRanges(fragment.low, fragment.high)
+                elif isinstance(fragment, EnumFragment) and all(
+                    type(choice) is int for choice in fragment.choices
+                ):
+                    choices = cast("tuple[int, ...]", fragment.choices)
+                    symbol_ranges[symbol] = ValueRanges(min(choices), max(choices))
+            configured_block_ids = set(env.config_spec.block_sizes.valid_block_ids())
+            for symbol in sorted(
+                expression_symbols - accounted_symbols,
+                key=sympy.default_sort_key,
+            ):
+                if (block_id := env.get_block_id(symbol)) is None:
+                    break
+                if block_id in configured_block_ids:
+                    block_symbol_ids.append((symbol, block_id))
+                    block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+                    block_default = block_spec._fragment(env.config_spec).default()
+                    assert type(block_default) is int
+                    default_substitutions[symbol] = block_default
+                    symbol_ranges[symbol] = ValueRanges(
+                        block_spec.min_size, block_spec.max_size
+                    )
+                else:
+                    source = env.block_sizes[block_id].block_size_source
+                    if not (
+                        isinstance(source, FixedBlockSizeSource)
+                        and isinstance(source.value, int)
+                    ):
+                        break
+                    fixed_substitutions[symbol] = source.value
+                    default_substitutions[symbol] = source.value
+                accounted_symbols.add(symbol)
+            if expression_symbols != accounted_symbols:
+                if env.backend_name == "cute":
+                    raise exc.InvalidConfig(
+                        "A CuTe tunable reduction extent may only depend on integer "
+                        "tunables and compile-time block sizes"
+                    )
+                return ReductionLoopSpec(
+                    block_id=rdim.block_id,
+                    size_hint=size_hint,
+                )
+
+            resolved_expression = expression.xreplace(fixed_substitutions)
+            assert isinstance(resolved_expression, sympy.Expr)
+            tunable_extent = TunableReductionExtent(
+                resolved_expression,
+                symbol_names,
+                tuple(block_symbol_ids),
+            )
+            default_extent = expression.xreplace(default_substitutions)
+            if not getattr(default_extent, "free_symbols", ()):
+                size_hint = max(1, int(cast("Any", default_extent)))
+                max_size_hint = size_hint
+
+            upper = bound_sympy(resolved_expression, symbol_ranges).upper
+            if not isinstance(upper, (int, sympy.Integer)):
+                if env.backend_name == "cute":
+                    raise exc.InvalidConfig(
+                        "A CuTe tunable reduction extent must have a finite integer "
+                        "bound"
+                    )
+                return ReductionLoopSpec(
+                    block_id=rdim.block_id,
+                    size_hint=size_hint,
+                )
+            max_size_hint = max(max_size_hint, int(cast("Any", upper)))
+
+    return ReductionLoopSpec(
+        block_id=rdim.block_id,
+        size_hint=size_hint,
+        max_size_hint=max_size_hint,
+        tunable_extent=tunable_extent,
+    )
 
 
 def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
@@ -995,12 +1118,7 @@ class DeviceIR:
             if used_graphs & graphs_with_rolled_rdim:
                 continue
             if env.backend_name != "pallas":
-                env.config_spec.reduction_loops.append(
-                    ReductionLoopSpec(
-                        block_id=rdim.block_id,
-                        size_hint=rdim.size_hint(),
-                    )
-                )
+                env.config_spec.reduction_loops.append(_reduction_loop_spec(env, rdim))
                 if env.backend_name == "cute":
                     env.config_spec.cute_vector_widths.append(
                         CuteVectorWidthSpec(
