@@ -22,6 +22,8 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
@@ -30,6 +32,7 @@ from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -1382,6 +1385,127 @@ class TestIndexing(RefEagerTestBase, TestCase):
         out2 = torch.empty_like(x2)
         size1_reshape_kernel(x2, out2)
         torch.testing.assert_close(out2, x2)
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    @skipIfCute("CuTe does not support scalar float32 to float8 conversion")
+    @skipIfRefEager("Test validates compiler block-size constraints")
+    def test_tile_reshape_for_grouped_quantization(self):
+        group_size = 128
+
+        def quantize(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            fp8_max = torch.finfo(torch.float8_e4m3fn).max
+            *lead, last = block.shape
+            grouped = block.reshape(*lead, last // 128, 128)
+            amax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale = amax.to(torch.float32) / fp8_max
+            quantized = (grouped.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+            return quantized.reshape(*lead, last), scale.squeeze(-1)
+
+        @helion.kernel(config=helion.Config(block_sizes=[32, group_size], num_warps=4))
+        def grouped_quantize(x: torch.Tensor, recipe):
+            m, n = x.shape
+            out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+            scales = torch.empty((m, n // 128), dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out_local, scale_local = recipe(x[tile_m, tile_n])
+                out[tile_m, tile_n] = out_local
+                scales[tile_m, tile_n.begin // 128] = scale_local.squeeze(-1)
+            return out, scales
+
+        x = torch.randn(64, 256, dtype=torch.bfloat16, device=DEVICE)
+        bound = grouped_quantize.bind((x, quantize))
+        self.assertEqual(bound.config_spec.block_sizes[1].min_size, 1)
+        self.assertEqual(bound.config_spec.block_sizes[1].autotuner_default, group_size)
+        self.assertGreaterEqual(len(bound.config_spec.block_size_constraints), 1)
+        self.assertEqual(bound.config_spec.default_config().block_sizes[1], group_size)
+        generated_configs = ConfigGeneration(bound.config_spec).random_population(10)
+        self.assertEqual(len(generated_configs), 10)
+        self.assertTrue(
+            all(config.block_sizes[1] == group_size for config in generated_configs)
+        )
+        for invalid_n in (64, 256):
+            with self.assertRaisesRegex(
+                helion.exc.InvalidConfig,
+                "block_sizes violate reshape constraint",
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(block_sizes=[32, invalid_n], num_warps=4)
+                )
+        actual_quantized, actual_scales = bound(x, quantize)
+        expected_quantized, expected_scales = quantize(x)
+
+        torch.testing.assert_close(actual_quantized.float(), expected_quantized.float())
+        torch.testing.assert_close(actual_scales, expected_scales)
+
+    @skipIfRefEager("Test validates compiler block-size constraints")
+    def test_tile_reshape_additive_constraint(self):
+        @helion.kernel(config=helion.Config(block_sizes=[2, 2]))
+        def additive_reshape(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                block = x[tile_m, tile_n]
+                m, n = block.shape
+                flat = block.reshape(m + n)
+                out[tile_m, tile_n] = flat.reshape(m, n)
+            return out
+
+        x = torch.randn(4, 4, device=DEVICE)
+        bound = additive_reshape.bind((x,))
+        self.assertEqual(bound.config_spec.default_config().block_sizes, [2, 2])
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "block_sizes violate reshape constraint",
+        ):
+            bound.config_spec.normalize(helion.Config(block_sizes=[4, 4]))
+        torch.testing.assert_close(bound(x), x)
+
+    @skipIfRefEager("Test validates compiler block-size constraints")
+    def test_tile_reshape_modulo_constraint(self):
+        @helion.kernel(config=helion.Config(block_sizes=[4, 128]))
+        def modulo_reshape(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                block = x[tile_m, tile_n]
+                m, n = block.shape
+                reshaped = block.reshape(m, n - n % 128)
+                out[tile_m, tile_n] = reshaped
+            return out
+
+        x = torch.randn(8, 256, device=DEVICE)
+        bound = modulo_reshape.bind((x,))
+        self.assertEqual(
+            bound.config_spec.default_config().block_sizes[1] % 128,
+            0,
+        )
+        generated_configs = ConfigGeneration(bound.config_spec).random_population(10)
+        self.assertEqual(len(generated_configs), 10)
+        self.assertTrue(
+            all(config.block_sizes[1] % 128 == 0 for config in generated_configs)
+        )
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "block_sizes violate reshape constraint",
+        ):
+            bound.config_spec.normalize(helion.Config(block_sizes=[4, 64]))
+        torch.testing.assert_close(bound(x), x)
+
+    @skipIfRefEager("Test validates compiler block-size constraints")
+    def test_tile_reshape_unsatisfiable_constraint(self):
+        @helion.kernel
+        def invalid_reshape(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                block = x[tile_m, tile_n]
+                m, n = block.shape
+                out[tile_m, tile_n] = block.reshape(m + 1, n)
+            return out
+
+        x = torch.randn(4, 4, device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "No power-of-two block size assignment satisfies reshape constraint",
+        ):
+            invalid_reshape.bind((x,))
 
     def test_size1_dimension_variable_tile_range(self):
         """Test tile indexing on size-1 dimensions with variable tile ranges.
