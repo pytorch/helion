@@ -3118,6 +3118,8 @@ def _codegen_cute_store_tcgen05_tile(
         }
         if leading_passthrough_output:
             d_tma_plan["d_leading_passthrough"] = True
+        if tcgen05_value.output_column_major:
+            d_tma_plan["d_column_major"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
         if d_tma_uses_tail_rank3_mnl_tensor:
             tail_d_tma_plan = {
@@ -3400,9 +3402,19 @@ def _codegen_cute_store_tcgen05_tile(
             )
         return static_setup, tile_setup
 
+    # A hybrid TMA/SIMT epilogue reaches SIMT only for edge tiles. A static
+    # output smaller than its selected tile also cannot produce a full tile,
+    # independent of whether its storage is row-major or column-major.
     simt_edge_only = (
         tcgen05_value.tma_store_full_tiles_only
         and not grouped_dynamic_d_tensormap_edge_only
+    )
+    static_m_size = tensor.shape[-2]
+    static_n_size = tensor.shape[-1]
+    simt_edge_only = simt_edge_only or (
+        isinstance(static_m_size, int)
+        and isinstance(static_n_size, int)
+        and (static_m_size < tcgen05_value.bm or static_n_size < tcgen05_value.bn)
     )
     simt_edge_aux_atoms: dict[int, str] = {}
     simt_edge_aux_atom_setup: list[str] = []

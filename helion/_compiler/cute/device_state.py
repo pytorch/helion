@@ -155,6 +155,13 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     segment_store_row_index: Node | None = None
     segment_store_valid_m: Node | None = None
     orientation: Tcgen05Orientation = Tcgen05Orientation.MN
+    output_column_major: bool = False
+
+    @property
+    def d_store_layout(self) -> str:
+        if self.output_column_major:
+            return "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+        return super().d_store_layout
 
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:
@@ -205,6 +212,7 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     c_stage_count: int
     epi_warp_count: int
     ab_load_warp_count: int = 1
+    one_shot_role_scheduler: bool = False
     # Dedicated scheduler warp count for ROLE_LOCAL_WITH_SCHEDULER. Default
     # zero keeps MONOLITHIC's historical role IDs; one adds a scheduler warp
     # after the AB-load warp that publishes work-tile metadata through the

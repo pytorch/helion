@@ -53,6 +53,7 @@ from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
+from helion._compiler.cute.cute_mma import _compose_axis_orders
 from helion._compiler.cute.cute_mma import _decode_cute_mma_target
 from helion._compiler.cute.cute_mma import _emit_sched_pipeline_setup
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
@@ -62,15 +63,18 @@ from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
 from helion._compiler.cute.cute_mma import _mma_loop_is_exclusive
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
+from helion._compiler.cute.cute_mma import _MmaOperandInfo
 from helion._compiler.cute.cute_mma import _MmaRoleCoordinatePlan
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
 from helion._compiler.cute.cute_mma import _new_tcgen05_sched_pipeline_plan
+from helion._compiler.cute.cute_mma import _operand_infos_exclusive_for_mma
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
+from helion._compiler.cute.cute_mma import _unwrap_mma_operand_permute
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
@@ -597,6 +601,117 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def test_mma_operand_matrix_major_tracks_source_order(self) -> None:
+        graph = Graph()
+        load = graph.placeholder("load")
+        row_major = torch.empty_strided((4, 8), (8, 1))
+
+        direct = _MmaOperandInfo(
+            load=load,
+            terminal=load,
+            source_fake=row_major,
+            logical_fake=row_major,
+            block_ids=(0, 1),
+        )
+        transposed = dataclasses.replace(
+            direct,
+            logical_fake=row_major.permute(1, 0),
+            block_ids=(1, 0),
+            source_to_logical_order=(1, 0),
+        )
+
+        self.assertEqual(direct.matrix_major, "row")
+        self.assertEqual(transposed.matrix_major, "col")
+        self.assertEqual((transposed.matrix_rows, transposed.matrix_cols), (8, 4))
+
+        padded_row_major = torch.empty_strided((4, 8), (16, 1))
+        self.assertEqual(
+            dataclasses.replace(
+                direct,
+                source_fake=padded_row_major,
+                logical_fake=padded_row_major.permute(1, 0),
+                block_ids=(1, 0),
+                source_to_logical_order=(1, 0),
+            ).matrix_major,
+            "col",
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "logical_fake shape does not match.*logical order is likely "
+            "incorrect.*report a bug to the Helion maintainers",
+        ):
+            dataclasses.replace(
+                direct,
+                source_to_logical_order=(1, 0),
+            )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "source_to_logical_order must swap exactly the two trailing "
+            "matrix axes",
+        ):
+            dataclasses.replace(
+                direct,
+                source_to_logical_order=(0, 1),
+            )
+
+    def test_unwrap_mma_operand_permute(self) -> None:
+        graph = Graph()
+        load = graph.placeholder("load")
+        transpose = graph.call_function(torch.ops.aten.permute.default, (load, (1, 0)))
+        transpose.meta["val"] = torch.empty(4, 8).mT
+        unsupported = graph.call_function(
+            torch.ops.aten.permute.default, (load, (0, 1))
+        )
+        unsupported.meta["val"] = torch.empty(4, 8)
+
+        self.assertEqual(_unwrap_mma_operand_permute(load), (load, None))
+        self.assertEqual(_unwrap_mma_operand_permute(transpose), (load, (1, 0)))
+        self.assertIsNone(_unwrap_mma_operand_permute(unsupported))
+
+    def test_mma_source_and_tma_orders_are_composed(self) -> None:
+        source_transpose = (1, 0)
+
+        self.assertEqual(
+            _compose_axis_orders(source_transpose, (0, 1)),
+            (1, 0),
+        )
+        self.assertEqual(
+            _compose_axis_orders(source_transpose, (1, 0)),
+            (0, 1),
+        )
+
+    def test_mma_operand_exclusivity_tracks_source_order(self) -> None:
+        graph = Graph()
+        lhs_load = graph.placeholder("lhs_load")
+        rhs_load = graph.placeholder("rhs_load")
+        lhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (lhs_load, (1, 0))
+        )
+        rhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (rhs_load, (1, 0))
+        )
+        mma = graph.call_function(
+            torch.ops.aten.mm.default, (lhs_transpose, rhs_transpose)
+        )
+        source = torch.empty(4, 8)
+        lhs = _MmaOperandInfo(
+            load=lhs_load,
+            terminal=lhs_transpose,
+            source_fake=source,
+            logical_fake=source.mT,
+            source_to_logical_order=(1, 0),
+        )
+        rhs = dataclasses.replace(lhs, load=rhs_load, terminal=rhs_transpose)
+
+        self.assertTrue(_operand_infos_exclusive_for_mma(lhs, rhs, mma))
+        self.assertFalse(
+            _operand_infos_exclusive_for_mma(
+                dataclasses.replace(lhs, terminal=lhs_load), rhs, mma
+            )
+        )
+
     def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
         return SimpleNamespace(
             env={inp: ast.Name(id="x", ctx=ast.Load())},
@@ -718,27 +833,26 @@ class TestCuteLowerings(unittest.TestCase):
     def _role_local_while_source_for_predicate(
         self, code: str, tree: ast.AST, role_predicate: str
     ) -> tuple[str, int, int]:
+        role_blocks: list[ast.If] = []
         matches: list[ast.While] = []
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.If) and ast.unparse(node.test) == role_predicate
             ):
                 continue
+            role_blocks.append(node)
             for role_child in ast.walk(node):
                 if isinstance(
                     role_child, ast.While
                 ) and "tcgen05_role_local" in ast.unparse(role_child.test):
                     matches.append(role_child)
-        self.assertEqual(
-            len(matches),
-            1,
-            "Expected exactly one role-local while for "
-            f"{role_predicate!r}. Generated code:\n{code}",
-        )
-        role_src = ast.get_source_segment(code, matches[0])
+        self.assertEqual(len(role_blocks), 1, code)
+        self.assertLessEqual(len(matches), 1, code)
+        role_node: ast.If | ast.While = matches[0] if matches else role_blocks[0]
+        role_src = ast.get_source_segment(code, role_node)
         self.assertIsNotNone(
             role_src,
-            "Expected parsed role-local while to preserve source extent. "
+            "Expected parsed role-local body to preserve source extent. "
             "Generated code:\n" + code,
         )
         assert role_src is not None
@@ -2060,53 +2174,57 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_persistent_post_loop.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            # ``persistent_blocked`` is normally disallowed for tcgen05
-            # via ``enforce_dot_requirements`` because autotune can still
-            # choose configs that fall back to guarded partial persistent
-            # paths. The codegen itself accepts the explicit config, which
-            # is what this structural test exercises.
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 16],
-                pid_type="persistent_blocked",
-            )
-            code = bound.to_triton_code(cfg)
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_persistent_post_loop.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                # ``persistent_blocked`` is normally disallowed for tcgen05
+                # via ``enforce_dot_requirements`` because autotune can still
+                # choose configs that fall back to guarded partial persistent
+                # paths. The codegen itself accepts the explicit config, which
+                # is what this structural test exercises.
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 16],
+                    pid_type="persistent_blocked",
+                )
+                code = bound.to_triton_code(cfg)
 
-        # Role-local codegen emits one work-tile loop per warp role. Verify
-        # one-shot cleanup follows the last of those loops, rather than being
-        # replayed in any role's per-tile body.
-        tree = ast.parse(code)
-        work_tile_loops = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.While)
-            and (
-                "tcgen05_role_local_" in ast.unparse(node.test)
-                or ast.unparse(node.test) == "tcgen05_work_tile_valid"
-            )
-        ]
-        self.assertTrue(
-            work_tile_loops, "expected at least one persistent work-tile loop"
-        )
-        last_work_tile_line = max(
-            node.end_lineno or node.lineno for node in work_tile_loops
-        )
-        for tag in (
-            "tcgen05_acc_pipeline.producer_tail",
-            "tcgen05_tmem_allocator.free",
-        ):
-            cleanup_calls = [
-                node
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and tag in ast.unparse(node.func)
-            ]
-            self.assertTrue(cleanup_calls, f"expected cleanup call {tag}")
-            self.assertTrue(
-                all(node.lineno > last_work_tile_line for node in cleanup_calls),
-                f"{tag} must follow all work-tile loops",
-            )
+                # Role-local codegen emits one work-tile loop per warp role
+                # unless one-shot is admitted. Cleanup must follow the last
+                # loop in the persistent case and remain present in both.
+                tree = ast.parse(code)
+                work_tile_loops = [
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.While)
+                    and (
+                        "tcgen05_role_local_" in ast.unparse(node.test)
+                        or ast.unparse(node.test) == "tcgen05_work_tile_valid"
+                    )
+                ]
+                self.assertEqual(bool(work_tile_loops), num_sm == 0, code)
+                for tag in (
+                    "tcgen05_acc_pipeline.producer_tail",
+                    "tcgen05_tmem_allocator.free",
+                ):
+                    cleanup_calls = [
+                        node
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Call) and tag in ast.unparse(node.func)
+                    ]
+                    self.assertTrue(cleanup_calls, f"expected cleanup call {tag}")
+                    if work_tile_loops:
+                        last_work_tile_line = max(
+                            node.end_lineno or node.lineno for node in work_tile_loops
+                        )
+                        self.assertTrue(
+                            all(
+                                node.lineno > last_work_tile_line
+                                for node in cleanup_calls
+                            ),
+                            f"{tag} must follow all work-tile loops",
+                        )
 
     def test_tcgen05_persistent_post_loop_runtime_correctness(self) -> None:
         """The role-local persistent kernel runs after omitting its shared loop."""
@@ -2178,29 +2296,32 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_persistent_compile.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 16],
-                pid_type="persistent_blocked",
-            )
-            # The act of generating the Python source already runs the
-            # CuTe DSL preprocessor; the IR verifier runs at first
-            # execution (cute.compile). The code-string checks below pin
-            # the persistent host wrapper shape; runtime coverage for both
-            # z-seeded and tile-advance scheduler paths lives in
-            # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
-            code = bound.to_triton_code(cfg)
-            self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
-            self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
-            from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_persistent_compile.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 16],
+                    pid_type="persistent_blocked",
+                )
+                # The act of generating the Python source already runs the
+                # CuTe DSL preprocessor; the IR verifier runs at first
+                # execution (cute.compile). The code-string checks below pin
+                # the persistent host wrapper shape; runtime coverage for both
+                # z-seeded and tile-advance scheduler paths lives in
+                # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
+                code = bound.to_triton_code(cfg)
+                role_loop = "while tcgen05_role_local_0_work_tile.is_valid_tile"
+                self.assertEqual(role_loop in code, num_sm == 0, code)
+                self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
+                from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
-            self.assertNotIn(
-                Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
-                code,
-            )
-            self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+                self.assertNotIn(
+                    Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
+                    code,
+                )
+                self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
 
     def test_tcgen05_role_local_monolithic_codegen_markers(self) -> None:
         """The retained role-local monolithic seed emits the required
@@ -4770,16 +4891,26 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_persistent_role.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 16],
-                pid_type="persistent_blocked",
-            )
-            bound.set_config(cfg)
-            code = bound.to_triton_code(cfg)
-            out = bound(*args)
+        results: dict[int, tuple[str, torch.Tensor]] = {}
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_persistent_role.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 16],
+                    pid_type="persistent_blocked",
+                )
+                bound.set_config(cfg)
+                generated_code = bound.to_triton_code(cfg)
+                self.assertEqual(
+                    "while tcgen05_role_local" in generated_code,
+                    num_sm == 0,
+                    generated_code,
+                )
+                results[num_sm] = (generated_code, bound(*args))
+
+        code, out = results[0]
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn(
             "tcgen05_tma_store_role_tile = tcgen05_tma_store_role_tile + cutlass.Int32(1)",
@@ -4920,6 +5051,9 @@ class TestCuteLowerings(unittest.TestCase):
             "loop. Generated code:\n" + code,
         )
         torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
+        torch.testing.assert_close(
+            results[148][1], args[0] @ args[1], atol=2e-1, rtol=1e-2
+        )
 
     def test_tcgen05_flat_static_full_uses_tma_store_epilogue(self) -> None:
         """Static-full flat tcgen05 lowers the first G2 TMA-store epilogue.
@@ -5786,10 +5920,9 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
+            self.assertNotIn("while tcgen05_role_local", code)
             self.assertIn(
-                "if True:\n"
-                "                            if _tcgen05_subtile == 0:\n"
-                "                                tcgen05_acc_pipeline.consumer_wait",
+                "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
                 code,
             )
             out = bound(*args)
@@ -9398,10 +9531,7 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             self.assertIn("StaticPersistentTileScheduler.create", code)
-            self.assertIn(
-                "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                code,
-            )
+            self.assertNotIn("while tcgen05_role_local", code)
             self.assertIn(
                 "tcgen05_ab_pipeline_consumer_group = "
                 "cutlass.pipeline.CooperativeGroup("
@@ -9713,7 +9843,7 @@ class TestCuteLowerings(unittest.TestCase):
                         "cutlass.utils.StaticPersistentTileScheduler.create(",
                         code,
                     )
-                    self.assertIn(
+                    self.assertNotIn(
                         "while tcgen05_role_local_0_work_tile.is_valid_tile",
                         code,
                     )
@@ -9929,41 +10059,41 @@ class TestCuteLowerings(unittest.TestCase):
         )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
-        with patch_cute_mma_support():
-            bound = cute_matmul_cluster_m2_two_cta_grid.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[256, 256, 16],
-                l2_groupings=[4],
-                num_sm_multiplier=2,
-                pid_type="persistent_blocked",
-                tcgen05_cluster_m=2,
-            )
-            bound.set_config(cfg)
-            code = bound.to_triton_code(cfg)
-            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn(
-                "tcgen05_role_local_0_tile_sched = "
-                "cutlass.utils.StaticPersistentTileScheduler.create(",
-                code,
-            )
-            self.assertIn("StaticPersistentTileScheduler.create", code)
-            self.assertIn(
-                "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                code,
-            )
-            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
-            self.assertNotIn(total_var, code)
-            launcher_lines = [
-                line
-                for line in code.splitlines()
-                if "_launcher(" in line and "_helion_cute" in line
-            ]
-            self.assertEqual(len(launcher_lines), 1, code)
-            self.assertRegex(launcher_lines[0], r"_launcher\([^,]+,\s*\(2,\s*1,")
-            self.assertIn("_NUM_SM", launcher_lines[0])
-            self.assertRegex(launcher_lines[0], r"//\s*2")
-            self.assertIn("min(", launcher_lines[0])
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_cluster_m2_two_cta_grid.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[256, 256, 16],
+                    l2_groupings=[4],
+                    num_sm_multiplier=2,
+                    pid_type="persistent_blocked",
+                    tcgen05_cluster_m=2,
+                )
+                bound.set_config(cfg)
+                code = bound.to_triton_code(cfg)
+                self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                self.assertIn(
+                    "tcgen05_role_local_0_tile_sched = "
+                    "cutlass.utils.StaticPersistentTileScheduler.create(",
+                    code,
+                )
+                self.assertIn("StaticPersistentTileScheduler.create", code)
+                role_loop = "while tcgen05_role_local_0_work_tile.is_valid_tile"
+                self.assertEqual(role_loop in code, num_sm == 0, code)
+                total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                self.assertNotIn(total_var, code)
+                launcher_lines = [
+                    line
+                    for line in code.splitlines()
+                    if "_launcher(" in line and "_helion_cute" in line
+                ]
+                self.assertEqual(len(launcher_lines), 1, code)
+                self.assertRegex(launcher_lines[0], r"_launcher\([^,]+,\s*\(2,\s*1,")
+                self.assertIn("_NUM_SM", launcher_lines[0])
+                self.assertRegex(launcher_lines[0], r"//\s*2")
+                self.assertIn("min(", launcher_lines[0])
 
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_z_limit_uses_recycling(
         self,
@@ -10138,10 +10268,15 @@ class TestCuteLowerings(unittest.TestCase):
                         "cutlass.utils.StaticPersistentTileScheduler.create(",
                         code,
                     )
-                    self.assertIn(
-                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                        code,
-                    )
+                    # K only changes the inner reduction loop. This 256x256
+                    # output has one logical tile, mapped to one two-CTA
+                    # cluster, so every CTA receives exactly one work tile
+                    # and no role-local scheduler backedge is needed.
+                    if bound.env.config_spec.num_sm >= 2:
+                        self.assertNotIn(
+                            "while tcgen05_role_local_",
+                            code,
+                        )
                     self.assertIn("StaticPersistentTileScheduler.create", code)
                     total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
                     self.assertNotIn(total_var, code)
@@ -11049,6 +11184,84 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cutlass.Float16, 1)", emitted)
         self.assertEqual(
             call_args, ["tma_atom_a", "tma_tensor_a", "tma_atom_b", "tma_tensor_b"]
+        )
+
+    def test_tcgen05_ab_tma_wrapper_plan_uses_explicit_orders(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_ab_tma",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "lhs_tma_order": (1, 0),
+                "rhs_tma_order": (0, 1),
+                "bm": 64,
+                "bn": 16,
+                "bk": 256,
+                "ab_stage_count": 2,
+                "input_dtype": "cutlass.Float8E4M3FN",
+                "acc_dtype": "cutlass.Float32",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+        )
+        emitted = "\n".join(body)
+        self.assertIn(
+            "tma_atom_a_lhs_tma = cute.make_tensor(arg0.iterator, "
+            "layout=cute.make_layout((arg0_shape1, arg0_shape0), "
+            "stride=(arg0_stride1, arg0_stride0)))",
+            emitted,
+        )
+        self.assertIn(
+            "tma_atom_b_rhs_tma = cute.make_tensor(arg1.iterator, "
+            "layout=cute.make_layout((arg1_shape0, arg1_shape1), "
+            "stride=(arg1_stride0, arg1_stride1)))",
+            emitted,
+        )
+
+    def test_tcgen05_ab_tma_wrapper_plan_uses_rank3_orders(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_ab_tma",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "lhs_tma_order": (1, 2, 0),
+                "rhs_tma_order": (2, 1, 0),
+                "bm": 64,
+                "bn": 16,
+                "bk": 32,
+                "ab_stage_count": 2,
+                "input_dtype": "cutlass.Float16",
+                "acc_dtype": "cutlass.Float32",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+        )
+        emitted = "\n".join(body)
+        self.assertIn(
+            "layout=cute.make_layout((arg0_shape1, arg0_shape2, arg0_shape0), "
+            "stride=(arg0_stride1, arg0_stride2, arg0_stride0))",
+            emitted,
+        )
+        self.assertIn(
+            "layout=cute.make_layout((arg1_shape2, arg1_shape1, arg1_shape0), "
+            "stride=(arg1_stride2, arg1_stride1, arg1_stride0))",
+            emitted,
         )
 
     def test_tcgen05_wide_codegen_uses_dense_physical_participant_ids(self) -> None:
@@ -18418,6 +18631,47 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertTrue(
             splitter._tcgen05_shared_loop_has_meaningful_work(observable_partition, [])
         )
+
+    def test_role_local_one_shot_scheduler_omits_tile_loop(self) -> None:
+        from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        plan = CuteTcgen05MatmulPlan(
+            bm=64,
+            bn=64,
+            bk=128,
+            k_tile_count=16,
+            cluster_m=1,
+            is_two_cta=False,
+            uses_role_local_persistent_body=True,
+            uses_cluster_m2_one_cta_role_local_bridge=False,
+            cta_thread_count=192,
+            physical_m_threads=32,
+            acc_stage_count=2,
+            ab_stage_count=2,
+            c_stage_count=2,
+            epi_warp_count=4,
+            one_shot_role_scheduler=True,
+        )
+        splitter._tcgen05_plan = lambda: plan  # type: ignore[method-assign]
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__",
+            stmts=[self._stmt("tma_pipeline.producer_acquire(state)")],
+        )
+
+        emitted = splitter._build_role_local_while(
+            stub_df,
+            self._make_minimal_layout(),
+            role_block,
+            scheduler_var_prefix="one_shot_test",
+        )
+        emitted_src = ast.unparse(emitted)
+
+        self.assertFalse(any(isinstance(node, ast.While) for node in ast.walk(emitted)))
+        self.assertIn("producer_acquire(state)", emitted_src)
+        self.assertNotIn("advance_to_next_work", emitted_src)
+        self.assertNotIn("get_current_work", emitted_src)
 
     def _make_role_local_stubs(self, *, num_pid_dims: int = 2) -> tuple[object, object]:
         """Build a richer device-function stub plus per-pid stubs that
