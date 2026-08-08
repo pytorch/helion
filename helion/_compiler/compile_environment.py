@@ -259,6 +259,8 @@ class CompileEnvironment:
     No config or codegen specific state should be stored here.
     """
 
+    tunable_symbols: dict[sympy.Symbol, str]
+
     def __init__(
         self,
         device: torch.device,
@@ -363,6 +365,7 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
+        self.tunable_symbols = {}
         # The distributed restriction is deferred to
         # restrict_pid_types_for_persistent() so it can gate on a real per-kernel
         # signal after tracing rather than the process-global dist.is_initialized().
