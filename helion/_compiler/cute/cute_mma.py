@@ -6384,6 +6384,10 @@ def _emit_mma_pipeline(
         or tcgen05_role_local_n_edge_tma
         or tcgen05_role_local_double_edge_tma
     ) and tcgen05_output_edge_tma_store_fits_smem
+    store_outer_extent = bn if output_column_major else bm
+    prefer_simt_narrow_store = (
+        input_dtype == torch.float8_e4m3fn and store_outer_extent < 32
+    )
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
     # to rotate c_pipeline stages across work tiles. Static-full CtaGroup.TWO
@@ -6395,6 +6399,7 @@ def _emit_mma_pipeline(
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
+        and not prefer_simt_narrow_store
         and (
             tcgen05_static_full_tiles
             or tcgen05_grouped_worklist_static_full_tiles
