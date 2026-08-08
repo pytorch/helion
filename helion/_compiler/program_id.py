@@ -316,12 +316,29 @@ class ProgramIDs(abc.ABC):
         self, pid_var: str, state: CodegenState
     ) -> list[ast.stmt]:
         """Generate statements to decompose a single PID variable into multiple PID components."""
+        device_pid = state.device_function.pid
+        use_safe_radices = (
+            isinstance(device_pid, ForEachProgramID)
+            and device_pid._uses_pallas_direct_cases()
+        )
+
+        def num_blocks_expr(pid: PIDInfo) -> str:
+            expr = pid.num_pids_expr(is_device=True)
+            if not use_safe_radices:
+                return expr
+            # JAX traces a ``pl.when`` body even when this case has no work.
+            # Keep its PID arithmetic defined while the case guard/grid retain
+            # the exact zero-sized extent.
+            return CompileEnvironment.current().backend.where_expr(
+                f"({expr}) > 0", expr, "1"
+            )
+
         num_blocks = [
             state.device_function.new_var(f"num_blocks_{i}")
             for i in range(len(self.pid_info[:-1]))
         ]
         statements = [
-            statement_from_string(f"{num_block} = {pid.num_pids_expr(is_device=True)}")
+            statement_from_string(f"{num_block} = {num_blocks_expr(pid)}")
             for num_block, pid in zip(num_blocks, self.pid_info[:-1], strict=True)
         ]
         for i, pid in enumerate(self.pid_info):
@@ -337,16 +354,33 @@ class ProgramIDs(abc.ABC):
 
 @dataclasses.dataclass
 class ForEachProgramID(ProgramIDs):
-    """
-    Represent multiple top level for loops in the Helion kernel.  Turns into `if` statements in generated code.
+    """Represent multiple top-level loops in one flattened launch grid.
+
+    Pallas direct cases materialize the full grid so each root can be guarded
+    without mutating its launch PID. Consequently they bypass persistent
+    scheduling and cannot be combined with compact worklists or in-place HBM
+    outputs; those combinations are rejected by the Pallas launcher.
     """
 
     # pyrefly: ignore [bad-override]
     shared_pid_var: str
     cases: list[ProgramIDs] = dataclasses.field(default_factory=list)
     case_phases: list[int] = dataclasses.field(default_factory=list)
+    pallas_direct_cases: bool = False
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list, init=False)
     barrier_after_root: set[int] = dataclasses.field(default_factory=set)
+
+    def _uses_pallas_direct_cases(self) -> bool:
+        return (
+            CompileEnvironment.current().backend.name == "pallas"
+            and self.pallas_direct_cases
+        )
+
+    def case_pid_var(self, device_function: DeviceFunction) -> str:
+        """Return the PID variable a newly generated ForEach case should use."""
+        if self._uses_pallas_direct_cases():
+            return device_function.new_var("pid_case")
+        return self.shared_pid_var
 
     def codegen_pid_init(self) -> list[ast.stmt]:
         # Check if persistent kernels are enabled in config - if so, skip regular initialization
@@ -355,7 +389,11 @@ class ForEachProgramID(ProgramIDs):
 
         current_device_fn = DeviceFunction.current()
         pid_type = current_device_fn.config.get("pid_type", "flat")
-        if isinstance(pid_type, str) and pid_type.startswith("persistent"):
+        if (
+            isinstance(pid_type, str)
+            and pid_type.startswith("persistent")
+            and not self._uses_pallas_direct_cases()
+        ):
             return []
         return [statement_from_string(f"{self.shared_pid_var} = {typed_program_id(0)}")]
 
@@ -379,6 +417,11 @@ class ForEachProgramID(ProgramIDs):
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
         total_expr = self.total_pids_expr(is_device=True)
+        # Pallas direct case launches materialize the complete flattened grid,
+        # so they must not also wrap that grid in a persistent worker loop.
+        if self._uses_pallas_direct_cases():
+            return None
+
         # If there is only one phase, fall back to existing behavior.
         has_phases = len(set(self.case_phases)) > 1
 
@@ -416,6 +459,21 @@ class ForEachProgramID(ProgramIDs):
 
     def codegen(self, state: CodegenState) -> None:
         blocks = self._get_cdiv_blocks(state, exclude_last=True)
+        if self._uses_pallas_direct_cases():
+            case_pid_var = self.cases[-1].shared_pid_var
+            assert case_pid_var is not None and case_pid_var != self.shared_pid_var
+            value = self.shared_pid_var
+            if blocks:
+                env = CompileEnvironment.current()
+                block_expr = env.backend.cast_expr(
+                    f"({'+ '.join(blocks)})", env.index_type()
+                )
+                value = f"{value} - {block_expr}"
+            state.codegen.statements_stack[-1].insert(
+                0,
+                statement_from_string(f"{case_pid_var} = {value}"),
+            )
+            return
         if blocks:
             env = CompileEnvironment.current()
             block_expr = env.backend.cast_expr(
@@ -428,7 +486,7 @@ class ForEachProgramID(ProgramIDs):
 
     def codegen_grid(self) -> ast.AST:
         # Check if any of the pids is a persistent strategy
-        if self.cases[0]._is_persistent():
+        if self.cases[0]._is_persistent() and not self._uses_pallas_direct_cases():
             # Use SM count grid for persistent kernels
             return self.cases[0].codegen_grid()
 
@@ -753,8 +811,8 @@ class L2GroupingProgramIDs(ProgramIDs):
                 terms.append(f"{typed_program_id(i)} * ({multiplier})")
             pid = " + ".join(terms)
         elif isinstance(state.device_function.pid, ForEachProgramID):
-            # For ForEachProgramID, use the shared PID variable
-            pid = state.device_function.pid.shared_pid_var
+            # Pallas direct cases have an immutable-launch-PID-derived local PID.
+            pid = self.shared_pid_var or state.device_function.pid.shared_pid_var
         else:
             # For other strategies (Flat, Persistent), use the virtual_program_id
             pid = self.virtual_program_id

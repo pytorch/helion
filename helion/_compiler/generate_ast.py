@@ -168,6 +168,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+        self._pallas_direct_cases = (
+            CompileEnvironment.current().backend.name == "pallas"
+            and len(func.device_ir.root_ids) > 1
+        )
 
         # Decide once which sibling for-loops need a tl.debug_barrier()
         # to make global writes visible to subsequent reads.
@@ -214,6 +218,54 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if loops := self.active_device_loops[block_idx]:
             return loops[-1].strategy.mask_var(block_idx)
         return None
+
+    def _wrap_pallas_direct_case_body(
+        self,
+        root_id: int,
+        body: list[ast.AST],
+    ) -> None:
+        """Guard each Pallas root body by its immutable launch PID range."""
+        if not self._pallas_direct_cases:
+            return
+        fn_name = self.device_function.new_var(f"helion_case_root_{root_id}")
+        pid = self.device_function.pid
+        assert isinstance(pid, ForEachProgramID)
+        assert root_id < len(pid.cases), "missing Pallas direct case PID metadata"
+        case = pid.cases[root_id]
+        # ``pl.when`` traces inactive bodies. A zero-sized case uses safe,
+        # nonzero PID radices, so tracing its logical empty store against that
+        # physical ref would produce mismatched shapes.
+        if any(info.numel == 0 for info in case.pid_info):
+            case_body = [create(ast.Pass)]
+        else:
+            case_body = list(body) or [create(ast.Pass)]
+        cdivs = [case.total_pids_expr(is_device=True) for case in pid.cases]
+        start = "0" if root_id == 0 else " + ".join(cdivs[:root_id])
+        end = " + ".join(cdivs[: root_id + 1])
+        condition = (
+            f"({pid.shared_pid_var} >= ({start})) & ({pid.shared_pid_var} < ({end}))"
+        )
+        body[:] = [
+            create(
+                ast.FunctionDef,
+                name=fn_name,
+                args=create(
+                    ast.arguments,
+                    posonlyargs=[],
+                    args=[],
+                    vararg=None,
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    kwarg=None,
+                    defaults=[],
+                ),
+                body=case_body,
+                decorator_list=[expr_from_string(f"pl.when({condition})")],
+                type_comment=None,
+                returns=None,
+                type_params=[],
+            )
+        ]
 
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
@@ -1035,13 +1087,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     self.device_function.set_pid(
                         ForEachProgramID(
                             self.device_function.new_var("pid_shared", dce=False),
+                            pallas_direct_cases=self._pallas_direct_cases,
                         )
                     )
                     self.device_function.body.extend(
                         # pyrefly: ignore [missing-attribute]
                         self.device_function.pid.codegen_pid_init()
                     )
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                if (
+                    self._pallas_direct_cases
+                    or node._root_id < len(self.host_function.device_ir.root_ids) - 1
+                ):
                     body = []
                 else:
                     # This is the last top level for, dont emit more if statements
@@ -1139,9 +1195,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.host_function.device_ir.phase_for_root(node._root_id)
                     )
 
+                self._wrap_pallas_direct_case_body(node._root_id, body)
+
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                if self._pallas_direct_cases:
+                    self.device_function.body.extend(body)
+                elif node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     block = (
                         self.device_function.body
                         if self.next_else_block is None

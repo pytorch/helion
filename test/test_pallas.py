@@ -4,11 +4,14 @@ import ast
 import math
 import os
 import re
+import sys
+import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
 from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
@@ -29,6 +32,9 @@ from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
+from helion.runtime.pallas.launcher import _pallas_copy_guard
+from helion.runtime.pallas.launcher import _pallas_launcher_cache_key
+from helion.runtime.pallas.launcher import _pallas_shared_output_plan
 from helion.runtime.settings import is_pallas_interpret
 
 if TYPE_CHECKING:
@@ -95,6 +101,19 @@ def pallas_foreach_output_only(x: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     for tile in hl.tile(x.size(0)):
         out2[tile] = x[tile] * 2.0
     return out1, out2
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_foreach_unequal_outputs(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_x = torch.empty_like(x)
+    out_y = torch.empty_like(y)
+    for tile_x in hl.tile(x.size(0)):
+        out_x[tile_x] = x[tile_x] + 1.0
+    for tile_y in hl.tile(y.size(0)):
+        out_y[tile_y] = y[tile_y] * 2.0
+    return out_x, out_y
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
@@ -434,22 +453,6 @@ def pallas_inner_loop_add_with_nonzero_scalar_access(
     for tile_m in hl.tile(m):
         for tile_n in hl.tile(n):
             out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n] + x[1, 7]
-    return out
-
-
-@helion.kernel(backend="pallas", static_shapes=True)
-def pallas_jagged_segment_add(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    """Outer grid over jagged segments + an inner ``hl.tile(start, end)`` loop
-    whose begin (``offsets[g]``) is an arbitrary runtime offset. A
-    block-aligned BlockSpec index can only address starts that are multiples of
-    the block size, so the emit_pipeline path must slice the segment with a
-    dynamic ``pl.ds`` (``pl.BoundedSlice`` block)."""
-    out = torch.empty_like(x)
-    for g in hl.grid(offsets.size(0) - 1):
-        start = offsets[g]
-        end = offsets[g + 1]
-        for tile in hl.tile(start, end):
-            out[tile, :] = x[tile, :] + 1.0
     return out
 
 
@@ -843,6 +846,163 @@ def kernel_tile_begin_plus_offset_is_elementwise(
     for tile_m in hl.tile(seq_len):
         out[tile_m.begin + 5] = x[tile_m.begin + 5] + 1.0
     return out
+
+
+class TestPallasSharedOutputPlan(TestCase):
+    def test_shared_output_plan_guards_missing_block_spec_info(self) -> None:
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid=(2, 3),
+            tensor_arg_indices=[0],
+            output_only_indices=[],
+            output_indices=[0],
+            inplace_indices={0},
+            block_spec_info=None,
+        )
+
+        self.assertEqual(copy_guards, {0: ((0, 1), ())})
+        self.assertEqual(dimension_semantics, ("arbitrary", "arbitrary"))
+
+    def test_shared_output_plan_guards_scalar_block_spec(self) -> None:
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid=(2,),
+            tensor_arg_indices=[0, 1],
+            output_only_indices=[],
+            output_indices=[1],
+            inplace_indices={1},
+            block_spec_info=[((128,), (0,)), None],
+        )
+
+        self.assertEqual(copy_guards, {1: ((0,), ())})
+        self.assertEqual(dimension_semantics, ("arbitrary",))
+
+    def test_shared_output_plan_normalizes_partial_flat_group(self) -> None:
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid=(8,),
+            tensor_arg_indices=[0],
+            output_only_indices=[],
+            output_indices=[0],
+            inplace_indices={0},
+            block_spec_info=[((1,), ((0, 1, 2),))],
+        )
+
+        self.assertEqual(copy_guards, {0: ((), ((0, 0, 8, ((1, 2),)),))})
+        self.assertEqual(dimension_semantics, ("arbitrary",))
+
+    def test_shared_output_plan_skips_complete_flat_decomposition(self) -> None:
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid=(8,),
+            tensor_arg_indices=[0],
+            output_only_indices=[],
+            output_indices=[0],
+            inplace_indices={0},
+            block_spec_info=[((1, 1), ((0, 1, 2), (0, 2, 4)))],
+        )
+
+        self.assertEqual(copy_guards, {})
+        self.assertEqual(dimension_semantics, ("parallel",))
+
+    def test_shared_output_plan_reconstructs_stride_gapped_flat_group(self) -> None:
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid=(8,),
+            tensor_arg_indices=[0],
+            output_only_indices=[],
+            output_indices=[0],
+            inplace_indices={0},
+            block_spec_info=[((1, 1), ((0, 1, 2), (0, 4, 2)))],
+        )
+
+        guard = copy_guards[0]
+        for pid in range(8):
+            with self.subTest(pid=pid):
+                self.assertEqual(
+                    self._copy_guard_value(guard, {0: pid}),
+                    pid in (0, 1, 4, 5),
+                )
+        self.assertEqual(dimension_semantics, ("arbitrary",))
+
+    def test_copy_guard_ors_same_dim_groups_and_rejects_out_of_group(self) -> None:
+        guard = (
+            (),
+            (
+                (0, 0, 4, ((1, 2),)),
+                (0, 4, 4, ((1, 2),)),
+            ),
+        )
+
+        self.assertTrue(self._copy_guard_value(guard, {0: 1}))
+        self.assertTrue(self._copy_guard_value(guard, {0: 5}))
+        self.assertFalse(self._copy_guard_value(guard, {0: 2}))
+        self.assertFalse(self._copy_guard_value(guard, {0: 8}))
+
+    def test_shared_output_plan_honors_exact_five_tuple_case_ranges(self) -> None:
+        for start, total in ((0, 4), (4, 5)):
+            with self.subTest(start=start, total=total):
+                copy_guards, dimension_semantics = _pallas_shared_output_plan(
+                    grid=(9,),
+                    tensor_arg_indices=[0],
+                    output_only_indices=[],
+                    output_indices=[0],
+                    inplace_indices={0},
+                    block_spec_info=[
+                        ((1,), ((0, 1, total, start, total),)),
+                    ],
+                )
+
+                self.assertEqual(
+                    copy_guards,
+                    {0: ((), ((0, start, total, ((1, total),)),))},
+                )
+                self.assertEqual(dimension_semantics, ("arbitrary",))
+                guard = copy_guards[0]
+                self.assertTrue(self._copy_guard_value(guard, {0: start}))
+                self.assertTrue(self._copy_guard_value(guard, {0: start + total - 1}))
+                self.assertFalse(
+                    self._copy_guard_value(guard, {0: (start + total) % 9})
+                )
+
+    def test_launcher_cache_key_includes_foreach_case_metadata(self) -> None:
+        first = [
+            ((128,), ((0, 1, 1, 0),)),
+            ((128,), ((0, 1, 2, 1),)),
+        ]
+        second = [
+            ((128,), ((0, 1, 2, 0),)),
+            ((128,), ((0, 1, 1, 2),)),
+        ]
+
+        self.assertEqual(
+            _pallas_launcher_cache_key((3,), first),
+            _pallas_launcher_cache_key((3,), list(first)),
+        )
+        self.assertNotEqual(
+            _pallas_launcher_cache_key((3,), first),
+            _pallas_launcher_cache_key((3,), second),
+        )
+
+    def _copy_guard_value(self, guard: Any, pid_by_dim: dict[int, int]) -> bool:
+        jax_mod = types.ModuleType("jax")
+        experimental_mod = types.ModuleType("jax.experimental")
+        pallas_mod = types.ModuleType("jax.experimental.pallas")
+
+        def program_id(dim: int) -> int:
+            return pid_by_dim[dim]
+
+        pallas_module = cast("Any", pallas_mod)
+        experimental_module = cast("Any", experimental_mod)
+        jax_module = cast("Any", jax_mod)
+        pallas_module.program_id = program_id
+        experimental_module.pallas = pallas_mod
+        jax_module.experimental = experimental_mod
+
+        with patch.dict(
+            sys.modules,
+            {
+                "jax": jax_mod,
+                "jax.experimental": experimental_mod,
+                "jax.experimental.pallas": pallas_mod,
+            },
+        ):
+            return bool(_pallas_copy_guard(guard))
 
 
 # Module-level (Helion reads it as a constant, not a closure) so torch.topk's k
@@ -2493,6 +2653,25 @@ class TestPallas(TestCase):
         self.assertIn("one_hot", code)
         self.assertIn("_inplace_indices=", code)
 
+    @xfailIfPallasTpu("Mosaic does not support DMA for scalar outputs")
+    def test_scalar_atomic_add_shared_output_tiles(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_atomic_sum(values: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([], device=values.device, dtype=values.dtype)
+            for rows in hl.tile(values.size(0)):
+                hl.atomic_add(out, [], values[rows, 0].sum())
+            return out
+
+        values = torch.ones(256, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            scalar_atomic_sum,
+            (values,),
+            block_sizes=[128],
+        )
+
+        torch.testing.assert_close(result, values[:, 0].sum())
+        self.assertIn("_block_spec_info=", code)
+
     def test_tensor_index_atomic_add_scalar_middle_dim(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def atomic_add_scalar_middle_dim(
@@ -2557,17 +2736,17 @@ class TestPallas(TestCase):
             for first_m, first_n in hl.tile(values.size()):
                 hl.atomic_add(
                     out,
-                    [indices[first_m], first_n],
+                    [indices[first_m, 0], first_n],
                     values[first_m, first_n],
                 )
             for second_m, second_n in hl.tile(values.size()):
                 other[second_m, second_n] = values[second_m, second_n]
             return out, other
 
-        values = torch.randn(16, 256, device=DEVICE, dtype=torch.float32)
-        indices = torch.zeros(16, device=DEVICE, dtype=torch.int32)
+        values = torch.randn(64, 256, device=DEVICE, dtype=torch.float32)
+        indices = torch.zeros(64, 128, device=DEVICE, dtype=torch.int32)
 
-        with self.assertRaisesRegex(helion.exc.InternalError, "ForEach"):
+        with self.assertRaisesRegex(helion.exc.InternalError, "ForEach grids"):
             code_and_output(
                 foreach_atomic_add,
                 (values, indices),
@@ -4573,29 +4752,83 @@ class TestPallas(TestCase):
         are exact multiples of the block size). Regression test for the
         "emit_pipeline fails on unaligned dims" limitation.
         """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def segment_add(
+            x: torch.Tensor, offsets: torch.Tensor, values: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for group in hl.grid(offsets.size(0) - 1):
+                start = offsets[group]
+                end = offsets[group + 1]
+                value = values[group]
+                for tile in hl.tile(start, end):
+                    out[tile, :, :] = x[tile, :, :] + value
+            return out
+
         # Arbitrary, deliberately non-block-aligned segment bounds covering
-        # [0, 48) so the output is fully written (out = x + 1 everywhere).
-        offsets = torch.tensor([0, 10, 31, 48], device=DEVICE, dtype=torch.int32)
-        x = torch.randn(48, 128, device=DEVICE, dtype=torch.float32)
+        # [0, 48). Segment-specific values make an overrun observable.
+        offset_values = [0, 10, 31, 48]
+        offsets = torch.tensor(offset_values, device=DEVICE, dtype=torch.int32)
+        values = torch.tensor([1.0, 3.0, 7.0], device=DEVICE, dtype=torch.float32)
+        x = torch.randn(48, 4, 128, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(
-            pallas_jagged_segment_add,
-            (x, offsets),
+            segment_add,
+            (x, offsets, values),
             block_sizes=[16],
             pallas_loop_type="emit_pipeline",
         )
         self.assertIn("pltpu.emit_pipeline", code)
-        # The fix: dynamic ds slice + BoundedSlice block for the runtime begin.
         self.assertIn("pl.BoundedSlice", code)
-        self.assertIn("pl.ds(", code)
-        # Load/store asymmetry: the input spec reads a full block (the over-read
-        # past ``end`` is zeroed by the mask), while the output spec clamps its
-        # extent to min(block, end - offset) so a short final tile writes only
-        # its valid rows instead of overrunning into the next segment.
-        in_part, _, out_part = code.partition("out_specs=")
-        self.assertIn("in_specs=", in_part)
-        self.assertNotIn("jnp.minimum", in_part)  # input: full block
-        self.assertIn("jnp.minimum", out_part)  # output: clamped extent
-        torch.testing.assert_close(result, x + 1.0, rtol=1e-5, atol=1e-5)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.ds(", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
+        self.assertRegex(out_specs.split("jnp.minimum(", 1)[1], r"end\s*-")
+        self.assertRegex(code, r"\bout_vmem(?:\[[^\n]*\])?\s*=")
+        self.assertNotRegex(code, r"out\[\s*pl\.ds\(")
+        expected = x.clone()
+        for group in range(len(offset_values) - 1):
+            start, end = offset_values[group], offset_values[group + 1]
+            expected[start:end] = x[start:end] + values[group]
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+    def test_ordered_carry_dma_aligned_output_uses_vmem_relative_save(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_bmm(
+            offsets: torch.Tensor, x: torch.Tensor, w: torch.Tensor
+        ) -> torch.Tensor:
+            length, reduction_size = x.size()
+            output_size = w.size(1)
+            out = torch.empty([length, output_size], dtype=x.dtype, device=x.device)
+            for group in hl.grid(offsets.size(0) - 1):
+                start = offsets[group]
+                end = offsets[group + 1]
+                for rows, cols in hl.tile([start, 0], [end, output_size]):
+                    acc = hl.zeros([rows, cols], dtype=torch.float32)
+                    for reduction in hl.tile(reduction_size):
+                        acc = acc + torch.matmul(x[rows, reduction], w[reduction, cols])
+                    out[rows, cols] = acc.to(out.dtype)
+            return out
+
+        offsets = torch.tensor([0, 10, 33, 40], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(40, 16, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code = jagged_bmm.bind((offsets, x, w)).to_code(
+            helion.Config(block_sizes=[16, 128, 16], pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("out_vmem", code)
+        carry_save_lines = [
+            line
+            for line in code.splitlines()
+            if "jnp.where" in line and "out_vmem[" in line
+        ]
+        self.assertTrue(carry_save_lines, "expected carry save from out_vmem")
+        self.assertTrue(
+            any(" - offset_" in line and "), :]" in line for line in carry_save_lines),
+            "\n".join(carry_save_lines),
+        )
 
     def test_emit_pipeline_static_begin_keeps_block_index(self) -> None:
         """Control: a static (zero-begin) inner loop must NOT switch to the
@@ -5734,32 +5967,74 @@ class TestPallas(TestCase):
         self.assertIn("out1, out2 = _launcher(", code)
 
     def test_foreach_outputs_stay_inplace_and_ordered(self) -> None:
+        config = helion.Config(block_sizes=[128, 128])
         x = torch.randn(256, device=DEVICE, dtype=torch.float32)
-        code = pallas_foreach_output_only.bind((x,)).to_triton_code(
-            helion.Config(block_sizes=[128, 128])
-        )
+        y = torch.randn(384, device=DEVICE, dtype=torch.float32)
+        code = pallas_foreach_unequal_outputs.bind((x, y)).to_triton_code(config)
 
-        self.assertIn("_output_indices=[1, 2]", code)
-        self.assertIn("_inplace_indices=[1, 2]", code)
+        self.assertIn("_output_indices=[1, 3]", code)
+        self.assertIn("_inplace_indices=[1, 3]", code)
         self.assertNotIn("device='meta'", code)
-        self.assertIn("((0, 1, 2, 0),)", code)
-        self.assertIn("((0, 1, 2, 2),)", code)
+        self.assertIn("((0, 1, 2, 0, 2),)", code)
+        self.assertIn("((0, 1, 3, 2, 3),)", code)
+        self.assertGreaterEqual(code.count("@pl.when("), 2)
+        self.assertNotIn("if pid_shared", code)
+        self.assertNotIn("pid_shared -=", code)
 
-        from helion.runtime.pallas.launcher import _pallas_shared_output_plan
+        module = ast.parse(code)
+        shared_pid_stores = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id.startswith("pid_shared")
+        ]
+        self.assertEqual(len(shared_pid_stores), 1)
+        case_guards = [
+            ast.unparse(node.decorator_list[0].args[0])
+            for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and "helion_case_root_" in node.name
+            and node.decorator_list
+            and isinstance(node.decorator_list[0], ast.Call)
+        ]
+        self.assertEqual(len(case_guards), 2)
+        self.assertTrue(all("pid_shared" in guard for guard in case_guards))
 
-        _copy_guards, dim_semantics = _pallas_shared_output_plan(
-            (4,),
-            [0, 1, 2],
+        copy_guards, dim_semantics = _pallas_shared_output_plan(
+            (5,),
+            [0, 1, 2, 3],
             [],
-            [1, 2],
-            {1, 2},
+            [1, 3],
+            {1, 3},
             [
-                ((None,), (None,)),
-                ((128,), ((0, 1, 2, 0),)),
-                ((128,), ((0, 1, 2, 2),)),
+                ((128,), ((0, 1, 2, 0, 2),)),
+                ((128,), ((0, 1, 2, 0, 2),)),
+                ((128,), ((0, 1, 3, 2, 3),)),
+                ((128,), ((0, 1, 3, 2, 3),)),
             ],
         )
+        self.assertEqual(
+            copy_guards,
+            {
+                1: ((), ((0, 0, 2, ((1, 2),)),)),
+                3: ((), ((0, 2, 3, ((1, 3),)),)),
+            },
+        )
         self.assertEqual(dim_semantics, ("arbitrary",))
+
+    def test_foreach_outputs_execute(self) -> None:
+        config = helion.Config(block_sizes=[128, 128])
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(384, device=DEVICE, dtype=torch.float32)
+        compiled = pallas_foreach_unequal_outputs.bind((x, y)).compile_config(config)
+        for seed in range(3):
+            torch.manual_seed(seed)
+            current_x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+            current_y = torch.randn(384, device=DEVICE, dtype=torch.float32)
+            out_x, out_y = compiled(current_x, current_y)
+            torch.testing.assert_close(out_x, current_x + 1.0)
+            torch.testing.assert_close(out_y, current_y * 2.0)
 
     def test_fori_loop_multidim(self) -> None:
         """Test fori_loop with a 2D inner loop (nested iteration)."""
@@ -6485,9 +6760,6 @@ class TestPallas(TestCase):
         with self.assertRaisesRegex(helion.exc.BackendUnsupported, "lane/sublane"):
             fn.bind((x,)).to_code(helion.Config(pallas_loop_type="fori_loop"))
 
-    @xfailIfPallasInterpret(
-        "outer BlockSpec plus inner pipeline uses a dynamic DMA slice in interpret mode"
-    )
     def test_exact_block_subrange_last_two_dim_direct_store_allowed(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -8112,10 +8384,15 @@ class TestPallas(TestCase):
         config = Config(pallas_loop_type="fori_loop")
         code = kernel_with_0d_arg.bind((x, scalar, y)).to_code(config)
 
-        self.assertIn(
-            "_block_spec_info=[((128, 128), (0, 1)), None, ((128, 128), (0, 1)), ((128, 128), (0, 1))]",
-            code,
-        )
+        match = re.search(r"_block_spec_info=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _block_spec_info in launcher call")
+        block_spec_info = ast.literal_eval(match.group(1))
+        tensor_block_spec = ((128, 128), (0, 1))
+        self.assertEqual(len(block_spec_info), 4)
+        self.assertEqual(block_spec_info[0], tensor_block_spec)
+        self.assertIsNone(block_spec_info[1])
+        self.assertEqual(block_spec_info[2], tensor_block_spec)
+        self.assertEqual(block_spec_info[3], tensor_block_spec)
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
