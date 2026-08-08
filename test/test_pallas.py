@@ -1919,6 +1919,30 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + offsets[None, :])
         self.assertIn("jnp.arange", code)
 
+    @xfailIfPallasTpu("Mosaic does not support DMA for bool outputs")
+    def test_bool_relayout_store(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_relayout_store(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=torch.bool, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                mask = (x[tile_m, 0] > 0).view(tile_m.block_size)
+                mask_2d = mask[:, None].expand(tile_m.block_size, tile_n.block_size)
+                out[tile_m, tile_n] = mask_2d
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_relayout_store,
+            (x,),
+            block_sizes=[16, 128],
+        )
+
+        expected = (x[:, :1] > 0).expand_as(result)
+        torch.testing.assert_close(result, expected)
+        self._assert_numeric_mask_reshape(code, r"\[[^\]]*, 1\]")
+        self.assertRegex(code, r"lax\.convert_element_type\([^\n]+, jnp\.bool_\)")
+
     def test_bool_view_expand_where(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def pallas_bool_view_expand_where(x: torch.Tensor) -> torch.Tensor:
@@ -6044,6 +6068,24 @@ class TestPallas(TestCase):
         self.assertNotIn((0, 0, 32, 0), pad_dims)
         self.assertNotIn((1, 0, 32, 0), pad_dims)
 
+    def test_pallas_loop_prefixed_row_slab_f32_d64_no_dma(self) -> None:
+        x = torch.randn(2, 48, 4, 64, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 11, 37], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            pallas_owner_prefixed_row_slab_sum,
+            (x, offsets),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertNotIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertIn("pl.ds(", code)
+        ref = torch.stack(
+            [x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0) for g in range(2)]
+        )
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
     def test_tile_id_per_block_accumulator(self) -> None:
         """Writing to ``out[tile.id, :]`` stores one row per outer grid iter.
 
@@ -6504,6 +6546,27 @@ class TestPallas(TestCase):
             r"_BLOCK_SIZE_\d+\), _BLOCK_SIZE_\d+\)",
         )
         torch.testing.assert_close(result, x * 2)
+
+    def test_nested_bounded_tiles_propagate_alignment_minimum_to_root(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            outer_block = hl.register_block_size(m)
+            out = torch.empty_like(x)
+            for outer in hl.tile(m, block_size=outer_block):
+                for middle in hl.tile(outer.begin, outer.end):
+                    for inner in hl.tile(middle.begin, middle.end):
+                        out[inner, :] = x[inner, :] * 2
+            return out
+
+        x = torch.randn(65, 128, device=DEVICE, dtype=torch.float32)
+        config = helion.Config(
+            block_sizes=[1, 8, 8],
+            pallas_loop_type="fori_loop",
+        )
+        bound = fn.bind((x,))
+        bound.config_spec.normalize(config)
+        self.assertEqual(config["block_sizes"], [8, 8, 8])
 
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
@@ -7996,6 +8059,32 @@ class TestPallas(TestCase):
         )
 
         torch.testing.assert_close(result[:, :, 16:, :], x[:, :, 16:, :])
+
+    def test_emit_pipeline_suffix_store_ending_at_tensor_dim_not_clamped(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def high_rank_suffix_store(x: torch.Tensor) -> torch.Tensor:
+            B, H, M, D = x.size()
+            out = torch.empty_like(x)
+            for tile_b, tile_h in hl.tile([B, H], block_size=[1, 1]):
+                b_idx = tile_b.begin
+                h_idx = tile_h.begin
+                for tile_m in hl.tile(16, M, block_size=128):
+                    out[b_idx, h_idx, tile_m, :] = x[b_idx, h_idx, tile_m, :]
+            return out
+
+        x = torch.randn(2, 8, 250, 128, device=DEVICE, dtype=torch.bfloat16)
+        code = high_rank_suffix_store.bind((x,)).to_code(
+            helion.Config(pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.BoundedSlice", out_specs)
+        self.assertIn("pl.ds(", out_specs)
+        self.assertNotIn("jnp.minimum(", out_specs)
 
     def test_pallas_0d_tensor_arg(self) -> None:
         """0D tensor arguments shouldn't cause positional argument shift in block specs."""

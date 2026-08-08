@@ -1081,14 +1081,14 @@ class PallasBackend(Backend):
             if bid not in analyzer.required_alignments:
                 continue
             requirement_alignment = analyzer.required_alignments[bid]
-            dim_size = next_power_of_2(max(spec.size_hint, 1))
-            # Cap the alignment requirement by the tensor lane dim: when
-            # the dim is smaller than the requirement, the full-dim access
-            # is always aligned at offset 0 so block_size = dim_size is
-            # safe.  When the dim is at least as big as the requirement,
-            # ``min`` returns ``requirement_alignment`` and the strict
-            # floor still applies (used by aot_example.sum_aot, n=256).
-            spec.update_min(min(requirement_alignment, dim_size))
+            if spec.bounded_by_block_id is None:
+                dim_size = next_power_of_2(max(spec.size_hint, 1))
+                # Ordinary dimensions can use their full extent when it is
+                # smaller than the native alignment. Bounded tiles have a
+                # placeholder size_hint of 0; their requirement was already
+                # capped against the backing tensor by the access analyzer.
+                requirement_alignment = min(requirement_alignment, dim_size)
+            spec.update_min(requirement_alignment)
 
         # Propagate alignment minimums from inner tiles to their bounding outer tiles.
         block_specs_by_id = {
@@ -1096,13 +1096,19 @@ class PallasBackend(Backend):
             for spec in block_specs
             if isinstance(spec, BlockSizeSpec)
         }
-        for spec in block_specs_by_id.values():
-            bounded_by = spec.bounded_by_block_id
-            if bounded_by is None:
-                continue
-            outer_spec = block_specs_by_id.get(bounded_by)
-            if outer_spec is not None:
+        changed = True
+        while changed:
+            changed = False
+            for spec in block_specs_by_id.values():
+                bounded_by = spec.bounded_by_block_id
+                if bounded_by is None:
+                    continue
+                outer_spec = block_specs_by_id.get(bounded_by)
+                if outer_spec is None:
+                    continue
+                previous_min = outer_spec.min_size
                 outer_spec.update_min(spec.min_size)
+                changed |= outer_spec.min_size != previous_min
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}

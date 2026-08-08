@@ -286,6 +286,33 @@ def _detect_indexing_pattern(
     raise AssertionError(f"Unrecognized indexing pattern for pallas backend {idx}")
 
 
+def _block_spec_alignment_extent(
+    block_id: int,
+    env: CompileEnvironment,
+    config: Config,
+) -> int | None:
+    """Return the Pallas BlockSpec extent used for alignment checks."""
+
+    owner_block_id = block_id
+    seen: set[int] = set()
+    while owner_block_id not in seen:
+        seen.add(owner_block_id)
+        try:
+            spec = env.config_spec.block_sizes.block_id_lookup(owner_block_id)
+        except KeyError:
+            break
+        owner = spec.owner_relative_bounded_by_block_id
+        if owner is None:
+            break
+        owner_block_id = owner
+    else:
+        # Cycle guard: refuse to infer an alignment extent from owner loops.
+        return None
+
+    block_size = env.block_sizes[owner_block_id].from_config(config)
+    return block_size if isinstance(block_size, int) else None
+
+
 def _update_tiling_decision(
     tensor: torch.Tensor,
     pattern: IndexingPattern,
@@ -346,8 +373,8 @@ def _update_tiling_decision(
         pass
 
     if isinstance(pattern, (TilePattern, TileBeginWithOffsetPattern)):
-        block_size = env.block_sizes[pattern.block_id].from_config(config)
-        if isinstance(block_size, int):
+        alignment_extent = _block_spec_alignment_extent(pattern.block_id, env, config)
+        if alignment_extent is not None:
             from ..compile_environment import CompileEnvironment
 
             backend = CompileEnvironment.current().backend
@@ -360,10 +387,10 @@ def _update_tiling_decision(
             required_alignment = backend._get_pallas_required_alignment(
                 dim_from_end, tensor.ndim, bitwidth
             )
+            dim_size = tensor.shape[tensor_dim]
 
-            if (
-                block_size < tensor.shape[tensor_dim]
-                and block_size % required_alignment != 0
+            if alignment_extent % required_alignment != 0 and (
+                not isinstance(dim_size, int) or alignment_extent < dim_size
             ):
                 _disallow_tiling()
 
