@@ -5980,7 +5980,10 @@ class TestPallas(TestCase):
         H, D = 4, 16
         offsets = torch.tensor([0, 10], device=DEVICE, dtype=torch.int32)
         torch.manual_seed(0)
-        y = torch.randn(H, 10, D, device=DEVICE, dtype=torch.bfloat16)
+        # Keep this mask-placement test directly addressable. A bf16 load
+        # would need a rounded-down window, and the major-dim output store
+        # cannot carry its head rows, so this commit rejects that shape.
+        y = torch.randn(H, 10, D, device=DEVICE, dtype=torch.float32)
 
         code, out = code_and_output(
             opposite,

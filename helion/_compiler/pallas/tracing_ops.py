@@ -3330,15 +3330,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
-
-    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
-    (
-        begin_exprs,
-        iter_step_exprs,
-        slice_size_exprs,
-        _,
-    ) = _pallas_loop_begin_and_step_exprs(state, block_ids, block_size_vars)
+    # Jagged row tiles read (and store) an S-aligned enclosing window, exactly as
+    # on the emit_pipeline path: Mosaic cannot slice a tiled dim at an arbitrary
+    # offset, and the ordered carry stitches the boundary two groups share.
+    window = _plan_inner_loop_window(state, graph_info, block_ids, env)
+    # Prefetching shortens the final loop extent, so mutate a derived copy.
+    grid_parts = list(window.grid_parts)
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
     scratch_names: list[str] = []
@@ -3369,10 +3366,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors,
-        stored_tensors,
+        window.loaded,
+        window.stored,
         block_ids,
-        slice_size_exprs,
+        window.slice_size_exprs,
         env,
         state,
     )
@@ -3442,7 +3439,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             id(input_tensor.untyped_storage()), []
         ).append(input_slot)
     stored_tensor_storages = {
-        id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
+        id(fake.untyped_storage()) for fake, _node, _sub_meta in window.stored.values()
     }
 
     for (fake, sub_meta, direction), vmem_shape in zip(
@@ -3538,9 +3535,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         state,
         strategy,
         block_ids,
-        block_size_vars,
-        begin_exprs,
-        iter_step_exprs,
+        window.block_size_vars,
+        window.begin_exprs,
+        window.iter_step_exprs,
         dim_idx_exprs,
         env,
         body_stmts,
@@ -3550,7 +3547,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         state,
         strategy,
         block_ids,
-        block_size_vars,
+        window.block_size_vars,
         env,
         body_stmts,
         # fori_loop has direct access to the loop variable
@@ -3591,7 +3588,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         ``min(block_size, end - offset)`` and the VMEM side sliced to match, so
         only live rows are written instead of overrunning adjacent regions
         packed in the same tensor; with ``clamp=False`` (loads, dense stores)
-        the VMEM side stays the bare buffer.
+        the VMEM side stays the bare buffer.  A jagged dim that reads an
+        S-aligned window (``aligned_tiles``) keeps its full block on both sides
+        and advertises the alignment with
+        ``_annotate_provable_sublane_alignment``.
         """
         from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
 
@@ -3607,16 +3607,26 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
-                begin_expr = begin_exprs[bid_idx]
-                iter_step_expr = iter_step_exprs[bid_idx]
-                slice_size_expr = slice_size_exprs[bid_idx]
+                begin_expr = window.begin_exprs[bid_idx]
+                iter_step_expr = window.iter_step_exprs[bid_idx]
+                slice_size_expr = window.slice_size_exprs[bid_idx]
                 dim_idx_expr = iteration_indices[bid_idx]
                 offset_expr = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+                annotated_offset_expr = (
+                    _annotate_provable_sublane_alignment(state, bid, offset_expr)
+                    if window.steps_by_block[bid_idx]
+                    else offset_expr
+                )
                 # Mosaic requires the lane (/128) and sublane (/8) VMEM dims to
                 # stay tile-aligned, so only clamp dims outside the last two; a
                 # ragged store on a last-two dim can't clamp and is rejected.
-                if clamp and dim_idx < len(shape) - 2:
-                    end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
+                if clamp and bid in state.device_function.carry_tiles:
+                    # Ordered carry: the window is S-aligned and fixed-size, and
+                    # the store value already has its unowned rows zeroed and the
+                    # shared boundary folded in, so the whole block goes out.
+                    vmem_parts.append(":")
+                elif clamp and dim_idx < len(shape) - 2:
+                    end_expr = window.end_exprs[bid_idx]
                     slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
                     vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
                     vmem_needs_slice = True
@@ -3632,14 +3642,16 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     )
                 else:
                     vmem_parts.append(":")
-                hbm_parts.append(f"pl.ds({offset_expr}, {slice_size_expr})")
+                hbm_parts.append(f"pl.ds({annotated_offset_expr}, {slice_size_expr})")
                 hbm_needs_slice = True
                 _record_loop_pad(state, fake, dim_idx, bid, begin_expr)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
                 if grid_loops:
-                    offset = state.codegen.offset_var(bid)
+                    offset = _annotate_provable_sublane_alignment(
+                        state, bid, state.codegen.offset_var(bid)
+                    )
                     bs_var = state.device_function.block_size_var(bid)
                     if bs_var:
                         hbm_parts.append(f"pl.ds({offset}, {bs_var})")
@@ -3780,15 +3792,15 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 offset_name = strategy.offset_var(bid)
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"{offset_name} = ({begin_exprs[i]}) + "
-                        f"({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
+                        f"{offset_name} = ({window.begin_exprs[i]}) + "
+                        f"({dim_idx_exprs[i]}) * ({window.iter_step_exprs[i]})"
                     )
                 )
 
         if body_prefetch is not None:
             state.codegen.add_statement(body_prefetch)
 
-        for fake, _tensor_node, sub_meta in loaded_tensors.values():
+        for fake, _tensor_node, sub_meta in window.loaded.values():
             hbm_name = state.device_function.tensor_arg(fake).name
             if (
                 hbm_name not in tensor_to_dma_scratch
@@ -3817,7 +3829,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
-        for fake, _tensor_node, sub_meta in stored_tensors.values():
+        for fake, _tensor_node, sub_meta in window.stored.values():
             hbm_name = state.device_function.tensor_arg(fake).name
             if hbm_name not in tensor_to_dma_scratch:
                 continue
