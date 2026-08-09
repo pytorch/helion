@@ -91,8 +91,12 @@ from .tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_MODES
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
+from .tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from .tcgen05_constants import TCGEN05_GROUPED_MODES
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
@@ -173,7 +177,11 @@ class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
 
 
 TCGEN05_GROUPED_DYNAMIC_AB4_STAGE = 4
-TCGEN05_GROUPED_DYNAMIC_AB4_RESERVED_SMEM_BYTES = 8 * 1024
+TCGEN05_GROUPED_DYNAMIC_STAGE_TUPLES = ((4, 2), (8, 4))
+# The generated grouped kernel's non-operand allocations are about 1.6 KiB
+# (pipeline barriers, TensorMap staging, and TMEM bookkeeping). Keep a small
+# margin while still admitting CUTLASS's max-fit AB8/C4 pipeline on B200.
+TCGEN05_GROUPED_DYNAMIC_RESERVED_SMEM_BYTES = 2 * 1024
 
 
 CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
@@ -208,6 +216,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY,
         TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY,
         TCGEN05_GROUPED_MODE_CONFIG_KEY,
+        TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY,
         TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
@@ -216,6 +225,32 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
     }
 )
+
+
+def parse_tcgen05_grouped_static_problem_signature(
+    value: object,
+) -> tuple[tuple[int, int, int], ...]:
+    """Parse ``[group_count, M0, N0, K0, ...]`` from an AOT config."""
+    key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
+    if not isinstance(value, list) or not value:
+        raise InvalidConfig(f"{key} must be a non-empty list of integers")
+    if any(type(item) is not int for item in value):
+        raise InvalidConfig(f"{key} must contain only integers (not booleans)")
+    group_count = value[0]
+    if group_count <= 0 or len(value) != 1 + 3 * group_count:
+        raise InvalidConfig(
+            f"{key} must have the form [group_count, M0, N0, K0, ...] "
+            "with exactly three positive sizes per group"
+        )
+    shapes = tuple(
+        (value[offset], value[offset + 1], value[offset + 2])
+        for offset in range(1, len(value), 3)
+    )
+    if any(size <= 0 for shape in shapes for size in shape):
+        raise InvalidConfig(f"{key} requires every M/N/K size to be positive")
+    return shapes
+
+
 CUTE_TCGEN05_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(
     TCGEN05_STRATEGY_CONFIG_KEYS
 )
@@ -926,6 +961,31 @@ class CuteTcgen05Config:
                     f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}, got "
                     f"{source_m_tile!r}"
                 )
+        signature_key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
+        if signature_key in config:
+            try:
+                parse_tcgen05_grouped_static_problem_signature(config[signature_key])
+            except InvalidConfig:
+                if fix_invalid:
+                    config.pop(signature_key)
+                else:
+                    raise
+            else:
+                if config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) not in (
+                    TCGEN05_GROUPED_MODE_STATIC,
+                    TCGEN05_GROUPED_MODE_DIRECT,
+                    TCGEN05_GROUPED_MODE_DYNAMIC,
+                ):
+                    if fix_invalid:
+                        config.pop(signature_key)
+                    else:
+                        raise InvalidConfig(
+                            f"{signature_key} requires "
+                            f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} to be "
+                            f"{TCGEN05_GROUPED_MODE_STATIC!r}, "
+                            f"{TCGEN05_GROUPED_MODE_DIRECT!r} or "
+                            f"{TCGEN05_GROUPED_MODE_DYNAMIC!r}"
+                        )
         reserved_sms_key = TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
         reserved_sms = config.get(reserved_sms_key)
         if reserved_sms_key in config and (
@@ -1121,13 +1181,12 @@ class CuteTcgen05Config:
         return ab_bytes + c_bytes <= constraints.per_cta_smem_budget_bytes
 
     @staticmethod
-    def _grouped_dynamic_ab4_config_matches(config: dict[str, object]) -> bool:
+    def _grouped_dynamic_deep_config_matches(config: dict[str, object]) -> bool:
         block_sizes = config.get("block_sizes")
         defaults: dict[str, object] = {
             "tcgen05_cluster_m": 1,
             "tcgen05_cluster_n": 1,
             "tcgen05_acc_stages": 2,
-            "tcgen05_c_stages": 2,
             "tcgen05_num_epi_warps": 4,
             TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
                 Tcgen05PersistenceModel.STATIC_PERSISTENT.value
@@ -1139,9 +1198,11 @@ class CuteTcgen05Config:
             TCGEN05_WARP_SPEC_STORE_WARPS_KEY: 0,
         }
         ab_stages = config.get("tcgen05_ab_stages")
+        c_stages = config.get("tcgen05_c_stages", 2)
         return (
             type(ab_stages) is int
-            and ab_stages == TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+            and type(c_stages) is int
+            and (ab_stages, c_stages) in TCGEN05_GROUPED_DYNAMIC_STAGE_TUPLES
             and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
             in TCGEN05_GROUPED_DYNAMIC_MODES
             and isinstance(block_sizes, list)
@@ -1183,25 +1244,29 @@ class CuteTcgen05Config:
             ab_stages=ab_stages,
         )
 
-    def grouped_dynamic_ab4_fits_for_target(
+    def grouped_dynamic_stages_fit_for_target(
         self,
         *,
         dtype_bytes: int,
+        output_dtype_bytes: int,
         device: torch.device,
         bm: int,
         bn: int,
         bk: int,
         cluster_m: int,
+        ab_stages: int,
         c_stages: int,
     ) -> bool:
-        if dtype_bytes != 2:
+        if dtype_bytes != 2 or output_dtype_bytes <= 0:
             return False
-        if (bm, bn, bk, cluster_m, c_stages) != (128, 64, 64, 1, 2):
+        if (bm, bn, bk, cluster_m) != (128, 64, 64, 1):
+            return False
+        if (ab_stages, c_stages) not in TCGEN05_GROUPED_DYNAMIC_STAGE_TUPLES:
             return False
         cap_bytes = self.per_cta_smem_capacity_bytes(device)
         if cap_bytes <= 0:
             return False
-        elem_width = dtype_bytes * 8
+        elem_width = output_dtype_bytes * 8
         epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
             bm,
             bn,
@@ -1213,17 +1278,17 @@ class CuteTcgen05Config:
             bn=bn,
             bk=bk,
             dtype_bytes=dtype_bytes,
-            ab_stages=TCGEN05_GROUPED_DYNAMIC_AB4_STAGE,
+            ab_stages=ab_stages,
             cluster_m=cluster_m,
         )
         c_bytes = tcgen05_c_smem_bytes_per_cta(
             epi_tile_m=epi_tile_m,
             epi_tile_n=epi_tile_n,
-            dtype_bytes=dtype_bytes,
+            dtype_bytes=output_dtype_bytes,
             c_stages=c_stages,
         )
         return (
-            ab_bytes + c_bytes + TCGEN05_GROUPED_DYNAMIC_AB4_RESERVED_SMEM_BYTES
+            ab_bytes + c_bytes + TCGEN05_GROUPED_DYNAMIC_RESERVED_SMEM_BYTES
             <= cap_bytes
         )
 
@@ -1662,7 +1727,7 @@ class CuteTcgen05Config:
         ab_stages = config.get("tcgen05_ab_stages")
         if type(ab_stages) is not int or ab_stages <= 3:
             return
-        if self._grouped_dynamic_ab4_config_matches(config):
+        if self._grouped_dynamic_deep_config_matches(config):
             return
         if self._grouped_worklist_nm_deep_ab_config_matches(config, ab_stages):
             return
@@ -2585,7 +2650,7 @@ class CuteTcgen05Config:
             for key, fragment in optional_fragments.items():
                 if key in config:
                     if key == "tcgen05_ab_stages" and (
-                        self._grouped_dynamic_ab4_config_matches(config)
+                        self._grouped_dynamic_deep_config_matches(config)
                         or self._grouped_worklist_nm_deep_ab_config_matches(
                             config,
                             config[key],

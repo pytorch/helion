@@ -454,6 +454,16 @@ TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS = (
 TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY = "tcgen05_grouped_static_reserved_sms"
 TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES = (0, 2, 3, 4, 5, 8, 16)
 TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX = 1024
+# Exact per-group M/N/K values embedded by an AOT specialization.  The runtime
+# validates these values against the scheduler metadata before launch; codegen
+# can then replace the generic warp-wide group search with constant branches.
+TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY = (
+    "tcgen05_grouped_static_problem_signature"
+)
+# The specialized scheduler emits one constant branch per group in each
+# warp-specialized role. Larger signatures use the generic scheduler to bound
+# generated source and compile time.
+TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS = 8
 # Direct pointer/stride metadata for grouped dynamic TensorMap updates. This
 # keeps A/B/D payload tensors in place and only passes small per-group metadata
 # tensors to generated tcgen05 code.

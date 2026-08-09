@@ -554,13 +554,15 @@ def _tcgen05_grouped_dynamic_bk64_fact(env: CompileEnvironment) -> MatmulFact | 
         and _block_size_value_reachable(spec, 2, 64)
     ):
         return None
-    if not spec._tcgen05_grouped_dynamic_ab4_fits_for_target(
+    if not spec._tcgen05_grouped_dynamic_stages_fit_for_target(
         dtype_bytes=fact.lhs_dtype.itemsize,
+        output_dtype_bytes=fact.lhs_dtype.itemsize,
         device=env.device,
         bm=128,
         bn=64,
         bk=64,
         cluster_m=1,
+        ab_stages=TCGEN05_GROUPED_DYNAMIC_AB4_STAGE,
         c_stages=2,
     ):
         return None

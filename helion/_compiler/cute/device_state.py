@@ -53,6 +53,8 @@ class CuteTcgen05GroupedPlan:
     problem_n: str
     problem_k: str
     global_m_start: str
+    static_problem_shapes: tuple[tuple[int, int, int], ...] | None = None
+    static_group_quota_args: tuple[str, ...] = ()
     real_groups: str | None = None
     valid_m: str | None = None
     store_m: str | None = None
@@ -78,6 +80,12 @@ class CuteTcgen05GroupedPlan:
         assert (self.direct_pointers is None) == (self.direct_strides is None)
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
         assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+        if self.static_problem_shapes is not None:
+            assert self.orientation is Tcgen05Orientation.MN
+            assert self.real_groups is None
+        if self.static_group_quota_args:
+            assert self.static_problem_shapes is not None
+            assert len(self.static_group_quota_args) == len(self.static_problem_shapes)
 
     @property
     def device_split_sizes(self) -> bool:

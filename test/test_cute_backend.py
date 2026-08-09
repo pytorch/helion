@@ -8464,6 +8464,59 @@ class TestCuteBackend(TestCase):
                 torch.empty(1, dtype=torch.int32),
             )
 
+    def test_grouped_static_problem_shapes_runtime_guard(self) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("grouped static problem-shape guard needs CUDA")
+        runtime_mod = importlib.import_module("helion.runtime")
+        base_plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "layout_idx": 0,
+            "n_sizes_idx": 1,
+            "group_count": 2,
+            "bm": 128,
+            "bn": 64,
+            "bk": 128,
+            "n_size": 256,
+            "k_total_size": 128,
+            "problem_sizes_arg": "problem_sizes",
+            "starts_arg": "starts",
+            "total_clusters_arg": "total_clusters",
+        }
+        layout = torch.cat(
+            (
+                torch.zeros(128, dtype=torch.int32, device=DEVICE),
+                torch.ones(128, dtype=torch.int32, device=DEVICE),
+            )
+        )
+        n_sizes = torch.tensor((64, 256), dtype=torch.int32, device=DEVICE)
+        args = (layout, n_sizes)
+        actual_shapes = ((128, 64, 128), (128, 256, 128))
+
+        matching_plan = {**base_plan, "static_problem_shapes": actual_shapes}
+        matching_kernel = type("MatchingDummyCuteKernel", (), {})()
+        matching_kernel._helion_cute_wrapper_plans = [matching_plan]
+        runtime_mod._build_tcgen05_grouped_static_metadata(
+            matching_kernel, matching_plan, args
+        )
+
+        mismatches = (
+            ((64, 64, 128), (128, 256, 128)),
+            ((128, 64, 128), (128, 192, 128)),
+            ((128, 64, 64), (128, 256, 128)),
+        )
+        for expected_shapes in mismatches:
+            with self.subTest(expected_shapes=expected_shapes):
+                plan = {**base_plan, "static_problem_shapes": expected_shapes}
+                cute_kernel = type("MismatchedDummyCuteKernel", (), {})()
+                cute_kernel._helion_cute_wrapper_plans = [plan]
+                with self.assertRaisesRegex(
+                    BackendUnsupported,
+                    "static problem-shape specialization",
+                ):
+                    runtime_mod._build_tcgen05_grouped_static_metadata(
+                        cute_kernel, plan, args
+                    )
+
     def test_grouped_inference_metadata_tracks_value_mutation(self) -> None:
         if DEVICE.type != "cuda":
             self.skipTest("grouped inference metadata test needs CUDA")

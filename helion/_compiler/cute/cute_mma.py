@@ -70,6 +70,7 @@ from .strategies import tcgen05_resolve_epilogue_tile
 from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
 from .tcgen05_config import CuteTcgen05Config
+from .tcgen05_config import parse_tcgen05_grouped_static_problem_signature
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
@@ -111,7 +112,9 @@ from .tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from .tcgen05_constants import TCGEN05_GROUPED_MODES
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_BLOCK_K_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
@@ -3888,6 +3891,7 @@ class _PerKiterTmaArgs:
     static_full_tiles: bool = False
     tma_desc_ptr_a: str | None = None
     tma_desc_ptr_b: str | None = None
+    tma_desc_acquire_fence_src: str | None = None
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
@@ -4021,6 +4025,12 @@ def _build_kloop_pipeline_producer_if(
             f"    {args.tma_pipeline}.producer_acquire("
             f"{args.tma_producer_state}, {args.tma_producer_try_token})\n"
         )
+    if args.tma_desc_acquire_fence_src is not None:
+        assert load_current_tile, (
+            "dynamic TensorMap acquire fences belong to the grouped "
+            "current-tile producer"
+        )
+        src += textwrap.indent(args.tma_desc_acquire_fence_src, "    ") + "\n"
     src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
@@ -5264,6 +5274,16 @@ def _emit_mma_pipeline(
     )
     tcgen05_grouped_external_direct_pointers_arg_name: str | None = None
     tcgen05_grouped_external_direct_strides_arg_name: str | None = None
+    tcgen05_grouped_static_problem_shapes = (
+        parse_tcgen05_grouped_static_problem_signature(signature)
+        if (
+            signature := cg.device_function.config.get(
+                TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
+            )
+        )
+        is not None
+        else None
+    )
     tcgen05_grouped_static_reserved_sms = int(
         cast(
             "Any",
@@ -6280,6 +6300,7 @@ def _emit_mma_pipeline(
     tcgen05_grouped_sched_params: str | None = None
     tcgen05_grouped_problem_sizes: str | None = None
     tcgen05_grouped_starts: str | None = None
+    tcgen05_grouped_static_quota_args: tuple[str, ...] = ()
     tcgen05_grouped_real_groups: str | None = None
     tcgen05_grouped_metadata_idx: str | None = None
     tcgen05_grouped_group_idx: str | None = None
@@ -6485,8 +6506,9 @@ def _emit_mma_pipeline(
                 "only for FP16/BF16 rank3 RHS grouped-NT CtaGroup.ONE "
                 "persistent_interleaved static-full 128x(64|128)x(16|32|64|128) "
                 "TMA-load + TMA-store kernels, or the generated segment "
-                "worklist BK64/BK128 dynamic-TensorMap variant (including the "
-                "CtaGroup.TWO 256x(64|128)x(64|128) worklist shape), with no "
+                "worklist BK64/BK128 or direct BK64 dynamic-TensorMap variant "
+                "(including the CtaGroup.TWO 256x(64|128)x(64|128) worklist "
+                "shape), with no "
                 "scheduler/C-input/store warp variants; failed checks: "
                 + ", ".join(failed_grouped_checks),
             )
@@ -6531,6 +6553,16 @@ def _emit_mma_pipeline(
                     f"require {grouped_smem_required} bytes of per-CTA "
                     f"SMEM, exceeding the {grouped_smem_capacity}-byte capacity",
                 )
+        if (
+            tcgen05_grouped_static_problem_shapes is not None
+            and len(tcgen05_grouped_static_problem_shapes) != grouped_count_value
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY} describes "
+                f"{len(tcgen05_grouped_static_problem_shapes)} groups, but the "
+                f"grouped RHS has {grouped_count_value}",
+            )
         tcgen05_grouped_dynamic_ab_tensormap_rank = (
             3
             if tcgen05_grouped_dynamic_ab_tensormaps_requested
@@ -6679,44 +6711,44 @@ def _emit_mma_pipeline(
             )
             == 2
         )
-        if tcgen05_ab_stage_count_value > 3 and not (
-            nm_deep_ab
-            or (
-                tcgen05_ab_stage_count_value == 4
-                and tcgen05_grouped_dynamic_ab_tensormap_rank is not None
-                and tcgen05_grouped_d_mode is not Tcgen05GroupedDMode.NONE
-                and bm == 128
-                and bn == 64
-                and bk == 64
-                and tcgen05_cluster_m == 1
-                and tcgen05_cluster_n == 1
-                and not tcgen05_is_two_cta
-                and _tcgen05_config_int(
-                    df.config,
-                    "tcgen05_acc_stages",
-                    _tcgen05_acc_stage_count(tcgen05_mma_bn),
-                )
-                == 2
-                and tcgen05_c_stage_count_value == 2
-                and env.config_spec._tcgen05_grouped_dynamic_ab4_fits_for_target(
-                    dtype_bytes=input_dtype.itemsize,
-                    device=lhs_info.source_fake.device,
-                    bm=bm,
-                    bn=bn,
-                    bk=bk,
-                    cluster_m=tcgen05_cluster_m,
-                    c_stages=tcgen05_c_stage_count_value,
-                )
+        grouped_dynamic_deep_ab = (
+            tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+            and tcgen05_grouped_d_mode is not Tcgen05GroupedDMode.NONE
+            and bm == 128
+            and bn == 64
+            and bk == 64
+            and tcgen05_cluster_m == 1
+            and tcgen05_cluster_n == 1
+            and not tcgen05_is_two_cta
+            and _tcgen05_config_int(
+                df.config,
+                "tcgen05_acc_stages",
+                _tcgen05_acc_stage_count(tcgen05_mma_bn),
             )
+            == 2
+            and env.config_spec._tcgen05_grouped_dynamic_stages_fit_for_target(
+                dtype_bytes=input_dtype.itemsize,
+                output_dtype_bytes=(epi_elem_dtype or input_dtype).itemsize,
+                device=lhs_info.source_fake.device,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=tcgen05_cluster_m,
+                ab_stages=tcgen05_ab_stage_count_value,
+                c_stages=tcgen05_c_stage_count_value,
+            )
+        )
+        if tcgen05_ab_stage_count_value > 3 and not (
+            nm_deep_ab or grouped_dynamic_deep_ab
         ):
             raise exc.BackendUnsupported(
                 "cute",
                 f"{TCGEN05_GROUPED_MODE_CONFIG_KEY} admits explicit "
                 "tcgen05_ab_stages>3 only for the generated N,M-oriented "
                 "worklist schedule up to 7 stages within target-device SMEM "
-                "headroom, or tcgen05_ab_stages=4 for the FP16/BF16 rank3 "
-                "grouped-NT dynamic TensorMap BK64 128x64x64 CtaGroup.ONE "
-                "path with cluster_m=cluster_n=1, acc_stages=2, c_stages=2, "
+                "headroom, or an admitted deep pipeline for the FP16/BF16 rank3 "
+                "grouped-NT dynamic TensorMap 128x64x64 CtaGroup.ONE "
+                "path with cluster_m=cluster_n=1, acc_stages=2, "
                 "dynamic D TensorMap, and target-device SMEM headroom",
             )
         tcgen05_grouped_count = str(grouped_count_value)
@@ -6724,6 +6756,15 @@ def _emit_mma_pipeline(
         tcgen05_grouped_sched_params = df.new_var("tcgen05_grouped_tile_sched_params")
         tcgen05_grouped_problem_sizes = df.new_var("tcgen05_grouped_problem_sizes")
         tcgen05_grouped_starts = df.new_var("tcgen05_grouped_starts")
+        if (
+            tcgen05_grouped_static_problem_shapes is not None
+            and len(tcgen05_grouped_static_problem_shapes)
+            <= TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
+        ):
+            tcgen05_grouped_static_quota_args = tuple(
+                df.new_var("tcgen05_grouped_static_quota")
+                for _ in tcgen05_grouped_static_problem_shapes
+            )
         if (
             tcgen05_grouped_worklist_persistent
             and not tcgen05_grouped_device_split_sizes
@@ -6780,6 +6821,8 @@ def _emit_mma_pipeline(
             problem_n=cast("str", tcgen05_grouped_problem_n),
             problem_k=cast("str", tcgen05_grouped_problem_k),
             global_m_start=cast("str", tcgen05_grouped_global_m_start),
+            static_problem_shapes=tcgen05_grouped_static_problem_shapes,
+            static_group_quota_args=tcgen05_grouped_static_quota_args,
             real_groups=tcgen05_grouped_real_groups,
             valid_m=tcgen05_grouped_valid_m,
             store_m=tcgen05_grouped_store_m,
@@ -7421,6 +7464,24 @@ def _emit_mma_pipeline(
         # ``TCGEN05_LEGAL_L2_SWIZZLE_SIZES`` so it is always a positive
         # integer here.
         tcgen05_l2_swizzle_size_value = l2_swizzle_size_from_config(df.config)
+        if (
+            tcgen05_grouped_static_problem_shapes is not None
+            and tcgen05_l2_swizzle_size_value != 1
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY} requires "
+                "tcgen05_l2_swizzle_size=1",
+            )
+        if tcgen05_grouped_static_problem_shapes is not None and any(
+            grouping != 1
+            for grouping in cast("list[int]", df.config.get("l2_groupings", []))
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY} requires "
+                "l2_groupings entries to all equal 1",
+            )
         # Both production callers of ``_emit_mma_pipeline`` propagate
         # an FX node into this codepath (``codegen_cute_mma_dot``
         # passes ``state.fx_node``; the aten-style site passes the
@@ -8828,6 +8889,7 @@ def _emit_mma_pipeline(
                         ]
                     )
                 grouped_wrapper_params.append(grouped_plan.sched_params)
+                grouped_wrapper_params.extend(grouped_plan.static_group_quota_args)
                 df.wrapper_only_params.extend(grouped_wrapper_params)
                 cg.cute_wrapper_plans.append(
                     {
@@ -8864,6 +8926,15 @@ def _emit_mma_pipeline(
                             else {}
                         ),
                         "group_count": int(grouped_plan.count),
+                        **(
+                            {
+                                "static_problem_shapes": (
+                                    grouped_plan.static_problem_shapes
+                                )
+                            }
+                            if grouped_plan.static_problem_shapes is not None
+                            else {}
+                        ),
                         "bm": bm,
                         "bn": bn,
                         "bk": bk,
@@ -8902,6 +8973,15 @@ def _emit_mma_pipeline(
                         ),
                         "sched_params_arg": grouped_plan.sched_params,
                         "total_clusters_arg": tcgen05_grouped_total_clusters,
+                        **(
+                            {
+                                "static_group_quota_args": (
+                                    grouped_plan.static_group_quota_args
+                                )
+                            }
+                            if grouped_plan.static_group_quota_args
+                            else {}
+                        ),
                         **({"orientation": "nm"} if nm_worklist else {}),
                         **(
                             {"worklist_metadata": True}
@@ -9233,10 +9313,6 @@ def _emit_mma_pipeline(
                         f"{tcgen05_matmul_plan.tma_warp_id}, "
                         f"({grouped_tensormap_a_smem_ptr}, "
                         f"{grouped_tensormap_b_smem_ptr}))\n"
-                        f"    {grouped_tensormap_manager}.fence_tensormap_update("
-                        f"{grouped_tensormap_a_ptr})\n"
-                        f"    {grouped_tensormap_manager}.fence_tensormap_update("
-                        f"{grouped_tensormap_b_ptr})\n"
                         f"    {grouped_tensormap_last_group} = "
                         f"{grouped_tensormap_update_idx}"
                     ),
@@ -9880,6 +9956,18 @@ def _emit_mma_pipeline(
                 ),
                 tma_desc_ptr_b=(
                     grouped_tensormap_b_desc_ptr
+                    if tcgen05_grouped_dynamic_ab_tensormaps
+                    else None
+                ),
+                tma_desc_acquire_fence_src=(
+                    (
+                        f"if {grouped_tensormap_group_changed} and "
+                        f"{tma_k_tile} == cutlass.Int32(0):\n"
+                        f"    {grouped_tensormap_manager}.fence_tensormap_update("
+                        f"{grouped_tensormap_a_ptr})\n"
+                        f"    {grouped_tensormap_manager}.fence_tensormap_update("
+                        f"{grouped_tensormap_b_ptr})"
+                    )
                     if tcgen05_grouped_dynamic_ab_tensormaps
                     else None
                 ),

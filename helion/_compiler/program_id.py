@@ -19,6 +19,7 @@ from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
+from .cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
@@ -3031,7 +3032,171 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             ),
         ]
 
-    def _build_grouped_static_role_local_while(
+    def _build_specialized_grouped_static_role_local_while(
+        self,
+        device_function: DeviceFunction,
+        role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
+        *,
+        scheduler_var_prefix: str,
+        dependency_stmts: list[ast.stmt] | None,
+        role_prelude_stmts: list[ast.stmt] | None,
+        initialize_tile_counter: bool,
+    ) -> ast.stmt:
+        """Emit a constant grouped schedule guarded by runtime metadata checks."""
+        assert role_block.role_predicate is not None
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.grouped is not None
+        grouped = plan.grouped
+        shapes = grouped.static_problem_shapes
+        assert shapes is not None
+        assert grouped.real_groups is None
+        assert plan.accumulator_view == "mn"
+        assert plan.cluster_m == 1 and plan.cluster_n == 1
+        assert plan.l2_swizzle_size == 1
+
+        linear_idx = device_function.new_var(
+            f"{scheduler_var_prefix}_static_linear_idx"
+        )
+        local_idx = device_function.new_var(f"{scheduler_var_prefix}_static_local_idx")
+        prelude = [
+            statement_from_string(
+                f"{linear_idx} = cutlass.Int32(cute.arch.block_idx()[2])"
+            ),
+            statement_from_string(f"{local_idx} = cutlass.Int32(0)"),
+        ]
+        tile_counter_var, increment_tile_counter_per_tile = (
+            self._finish_role_local_prelude(
+                device_function,
+                role_block,
+                prelude,
+                role_prelude_stmts=role_prelude_stmts,
+                initialize_tile_counter=initialize_tile_counter,
+            )
+        )
+
+        source_tile_m = plan.source_tile_m
+        source_tile_n = plan.source_tile_n
+        global_m_start = 0
+        group_specs: list[tuple[int, int, int, int, int, int, int]] = []
+        for metadata_idx, (problem_m, problem_n, problem_k) in enumerate(shapes):
+            m_tiles = (problem_m + source_tile_m - 1) // source_tile_m
+            n_tiles = (problem_n + source_tile_n - 1) // source_tile_n
+            group_specs.append(
+                (
+                    metadata_idx,
+                    problem_m,
+                    problem_n,
+                    problem_k,
+                    m_tiles,
+                    n_tiles,
+                    global_m_start,
+                )
+            )
+            global_m_start += m_tiles * source_tile_m
+
+        tile_counts = [m_tiles * n_tiles for *_, m_tiles, n_tiles, _ in group_specs]
+        # Keep every CTA on one group so dynamic TensorMaps are programmed only
+        # once. The device-specific wrapper supplies host-computed quotas, so
+        # each CTA only performs the group dispatch and tile-stride loop.
+        quota_vars = list(grouped.static_group_quota_args)
+        assert len(quota_vars) == len(group_specs)
+
+        group_bodies: list[list[ast.stmt]] = []
+        quota_prefix: list[str] = []
+        for (
+            metadata_idx,
+            problem_m,
+            problem_n,
+            problem_k,
+            m_tiles,
+            _n_tiles,
+            group_m_start,
+        ), tile_count, quota in zip(group_specs, tile_counts, quota_vars, strict=True):
+            block_offset = " + ".join(quota_prefix)
+            local_expr = (
+                linear_idx if not block_offset else f"{linear_idx} - ({block_offset})"
+            )
+            group_prelude = [
+                f"{grouped.metadata_idx} = cutlass.Int32({metadata_idx})",
+                f"{grouped.group_idx} = cutlass.Int32({metadata_idx})",
+                f"{grouped.problem_m} = cutlass.Int32({problem_m})",
+                f"{grouped.problem_n} = cutlass.Int32({problem_n})",
+                f"{grouped.problem_k} = cutlass.Int32({problem_k})",
+                f"{grouped.global_m_start} = cutlass.Int32({group_m_start})",
+                f"{local_idx} = {local_expr}",
+            ]
+            per_tile_body = [
+                statement_from_string(
+                    f"{grouped.cta_tile_idx_m} = {local_idx} % cutlass.Int32({m_tiles})"
+                ),
+                statement_from_string(
+                    f"{grouped.cta_tile_idx_n} = {local_idx} // "
+                    f"cutlass.Int32({m_tiles})"
+                ),
+                statement_from_string(f"pid_0 = {grouped.cta_tile_idx_m}"),
+                statement_from_string(f"pid_1 = {grouped.cta_tile_idx_n}"),
+                statement_from_string(
+                    f"tile_offset_0 = {grouped.global_m_start} + "
+                    f"{grouped.cta_tile_idx_m} * cutlass.Int32({source_tile_m})"
+                ),
+                statement_from_string(
+                    f"tile_offset_1 = {grouped.cta_tile_idx_n} * "
+                    f"cutlass.Int32({source_tile_n})"
+                ),
+                *(
+                    _clone_stmt(stmt)
+                    for stmt in self._grouped_static_dependency_stmts(dependency_stmts)
+                ),
+                *(_clone_stmt(stmt) for stmt in role_block.stmts),
+            ]
+            if tile_counter_var is not None and increment_tile_counter_per_tile:
+                per_tile_body.append(
+                    statement_from_string(
+                        f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
+                    )
+                )
+            per_tile_body.append(
+                statement_from_string(f"{local_idx} = {local_idx} + {quota}")
+            )
+            group_bodies.append(
+                [
+                    *(statement_from_string(line) for line in group_prelude),
+                    create(
+                        ast.While,
+                        test=expr_from_string(
+                            f"{local_idx} < cutlass.Int32({tile_count})"
+                        ),
+                        body=per_tile_body,
+                        orelse=[],
+                    ),
+                ]
+            )
+            quota_prefix.append(quota)
+
+        if len(group_bodies) == 1:
+            prelude.extend(group_bodies[0])
+        else:
+            dispatch: list[ast.stmt] = group_bodies[-1]
+            for index in range(len(group_bodies) - 2, -1, -1):
+                quota_end = " + ".join(quota_vars[: index + 1])
+                dispatch = [
+                    create(
+                        ast.If,
+                        test=expr_from_string(f"{linear_idx} < {quota_end}"),
+                        body=group_bodies[index],
+                        orelse=dispatch,
+                    )
+                ]
+            prelude.extend(dispatch)
+
+        return create(
+            ast.If,
+            test=expr_from_string(role_block.role_predicate),
+            body=prelude,
+            orelse=[],
+        )
+
+    def _build_generic_grouped_static_role_local_while(
         self,
         device_function: DeviceFunction,
         role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
@@ -3165,6 +3330,61 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             test=expr_from_string(role_block.role_predicate),
             body=prelude,
             orelse=[],
+        )
+
+    def _build_grouped_static_role_local_while(
+        self,
+        device_function: DeviceFunction,
+        role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
+        *,
+        scheduler_var_prefix: str,
+        dependency_stmts: list[ast.stmt] | None,
+        role_prelude_stmts: list[ast.stmt] | None = None,
+        initialize_tile_counter: bool = True,
+    ) -> ast.stmt:
+        plan = self._tcgen05_plan()
+        assert plan is not None and plan.grouped is not None
+        shapes = plan.grouped.static_problem_shapes
+        if (
+            shapes is None
+            or len(shapes) > TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
+        ):
+            return self._build_generic_grouped_static_role_local_while(
+                device_function,
+                role_block,
+                scheduler_var_prefix=scheduler_var_prefix,
+                dependency_stmts=dependency_stmts,
+                role_prelude_stmts=role_prelude_stmts,
+                initialize_tile_counter=initialize_tile_counter,
+            )
+
+        specialized = self._build_specialized_grouped_static_role_local_while(
+            device_function,
+            role_block,
+            scheduler_var_prefix=scheduler_var_prefix,
+            dependency_stmts=dependency_stmts,
+            role_prelude_stmts=role_prelude_stmts,
+            initialize_tile_counter=initialize_tile_counter,
+        )
+        generic = self._build_generic_grouped_static_role_local_while(
+            device_function,
+            role_block,
+            scheduler_var_prefix=scheduler_var_prefix,
+            dependency_stmts=dependency_stmts,
+            role_prelude_stmts=(
+                [_clone_stmt(stmt) for stmt in role_prelude_stmts]
+                if role_prelude_stmts is not None
+                else None
+            ),
+            initialize_tile_counter=initialize_tile_counter,
+        )
+        return create(
+            ast.If,
+            test=expr_from_string(
+                f"cute.arch.grid_dim()[2] >= cutlass.Int32({len(shapes)})"
+            ),
+            body=[specialized],
+            orelse=[generic],
         )
 
     def _build_grouped_static_role_local_while_with_scheduler(
