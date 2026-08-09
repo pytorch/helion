@@ -16,6 +16,12 @@ import torch
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "cute"
 PRETUNED_DIR = Path(__file__).resolve().parents[1] / "pretuned_kernels"
+PRETUNED_WORKFLOW = (
+    Path(__file__).resolve().parents[1]
+    / ".github"
+    / "workflows"
+    / "benchmark_pretuned.yml"
+)
 
 
 def _load_path(path: Path, module_name: str) -> Any:
@@ -135,6 +141,11 @@ def deepgemm_heuristic() -> Any:
 @pytest.fixture(scope="module")
 def pretuned_bench() -> Any:
     return _load_path(PRETUNED_DIR / "_bench.py", "helion_test_pretuned_bench")
+
+
+@pytest.fixture(scope="module")
+def pretuned_runner() -> Any:
+    return _load_path(PRETUNED_DIR / "run.py", "helion_test_pretuned_runner")
 
 
 def test_cutlass_timings_use_shared_timer(
@@ -421,6 +432,49 @@ def test_deepgemm_tuner_validates_captured_replay(
     captured = provider._capture_validated_replay(config, candidate)
     assert (captured is not None) is replay_writes_output
     assert failures == ([] if replay_writes_output else [config])
+
+
+def test_pretuned_grouped_kernels_are_registered_for_b200(
+    pretuned_runner: Any,
+) -> None:
+    for name in ("grouped_gemm", "grouped_gemm_deepgemm"):
+        assert name in pretuned_runner.KERNELS
+        assert pretuned_runner._supported_hardware(name) == {"b200"}
+
+
+@pytest.mark.parametrize(
+    ("selected", "expected"),
+    (
+        ("", {"cutlass": True, "deepgemm": True}),
+        ("grouped_gemm", {"cutlass": True, "deepgemm": False}),
+        ("grouped_gemm_deepgemm", {"cutlass": False, "deepgemm": True}),
+        (
+            "grouped_gemm, grouped_gemm_deepgemm",
+            {"cutlass": True, "deepgemm": True},
+        ),
+    ),
+)
+def test_grouped_reference_selection(
+    pretuned_runner: Any,
+    selected: str,
+    expected: dict[str, bool],
+) -> None:
+    assert pretuned_runner.grouped_reference_requirements(selected) == expected
+
+
+def test_grouped_reference_workflow_pins_match_benchmarks(
+    cutlass_benchmark: Any,
+    deepgemm_benchmark: Any,
+) -> None:
+    workflow = PRETUNED_WORKFLOW.read_text()
+    for pin in (
+        cutlass_benchmark.CUTLASS_COMMIT,
+        cutlass_benchmark.CUTLASS_SHA256,
+        deepgemm_benchmark.DEEPGEMM_COMMIT,
+    ):
+        assert pin in workflow
+    assert 'KERNEL_ARGS=(--kernels "$SELECTED_KERNELS")' in workflow
+    assert '"${KERNEL_ARGS[@]}"' in workflow
 
 
 def test_grouped_gemm_aot_training_does_not_load_cutlass(

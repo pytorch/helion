@@ -12,7 +12,8 @@ copy the kernel and its local `_helion_aot_*` heuristic into your code, then
 retune when your target shapes or hardware differ materially from the included
 sweep.
 
-Each kernel module has a `main()` that benchmarks against PyTorch eager.
+Each kernel module has a `main()` that benchmarks against one or more named
+reference baselines.
 
 ## File structure
 
@@ -30,6 +31,8 @@ pretuned_kernels/
 ├── rope/
 ├── scaled_mm/
 ├── scale_mm_cute/                    # B200 CuTe (tcgen05) rowwise FP8 GEMM
+├── grouped_gemm/                     # B200 grouped FP16 GEMM vs CuTeDSL
+├── grouped_gemm_deepgemm/            # B200 grouped BF16 vs DeepGEMM + cuBLAS
 ├── nvfp4_gemv/                       # B200 Triton NVFP4 (W4A4 / W4A16) decode GEMV
 ├── nvfp4_gemv_cute/                  # B200 Helion CuTe NVFP4 decode GEMV
 ├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
@@ -44,7 +47,7 @@ pretuned_kernels/
 Each kernel ships with one heuristic file per supported compute capability.
 At runtime Helion picks the file matching the current GPU.
 
-| Kernel | Shape sweep | PyTorch baseline |
+| Kernel | Shape sweep | Reference baseline |
 |---|---|---|
 | `vector_add` | `2**i for i in range(19, 29)` | `x + y` |
 | `softmax` | Triton tutorial `M=4096, N=128*i for i in range(2, 100)` + realistic long-context shapes | `F.softmax` |
@@ -54,6 +57,8 @@ At runtime Helion picks the file matching the current GPU.
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
 | `scale_mm_cute` | Skinny-M FP8 decode + decoder-layer FP8 W8A8 serving `(M, K, N)` shapes (B200 CuTe backend only) | `torch._scaled_mm` (rowwise) + vLLM CUTLASS |
+| `grouped_gemm` | Seven CUTLASS-example-derived heterogeneous FP16 grouped-NT cases (3--4 GEMMs, including M/N tails; B200 CuTe only) | pinned NVIDIA CUTLASS CuTeDSL kernel |
+| `grouped_gemm_deepgemm` | Eight official DeepGEMM BF16 grouped-NT shapes with deterministic heterogeneous per-group M (B200 CuTe only) | pinned DeepGEMM `m_grouped_bf16_gemm_nt_contiguous` + CUDA's `cublasGemmGroupedBatchedEx` |
 | `nvfp4_gemv` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes (Llama-3 / Qwen projections), W4A4 + W4A16 (B200 Triton backend) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
 | `nvfp4_gemv_cute` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes, W4A4 + W4A16, using Helion kernels compiled with the CuTe backend on B200 | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
 | `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |
@@ -64,12 +69,25 @@ At runtime Helion picks the file matching the current GPU.
 | `silu_and_mul_per_block_quant` | vLLM `(num_tokens, intermediate, group)` shapes | torch-native silu-and-mul + per-block fp8 quant |
 | `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
 
-Every kernel additionally benchmarks against `torch.compile` of the listed
+Most kernels additionally benchmark against `torch.compile` of the listed
 PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
-against the eager reference). The headline speedup is Helion vs the *fastest*
-available baseline, and the dashboard's per-kernel dropdown breaks down Helion's
-speedup over each baseline (`torch`, `torch_compile`, and the vLLM op when
-installed in the nightly).
+against the eager reference). The grouped-GEMM entries instead use the named
+CUDA references in the table. The headline speedup is Helion vs the *fastest*
+available baseline, and the per-kernel dropdown reports every baseline.
+
+`grouped_gemm` compares Helion with the same pinned CUTLASS kernel. Required
+device pointer tables are initialized before graph capture, and both
+implementations are checked against the same pointer-target outputs before
+timing.
+
+`grouped_gemm_deepgemm` is separate because it follows DeepGEMM's BF16 packed-A
+layout and official shape suite rather than the CUTLASS FP16 heterogeneous-M/N/K
+suite. Its AOT flow searches only valid 4--7-stage `worklist_nm` schedules and
+checks them against a PyTorch reference. It also reports cuBLAS on each logical
+group while excluding aligned padding from the common correctness contract.
+Both grouped benchmarks replay pre-captured graphs, clear L2 before every
+measurement, warm the GPU before each case, and rotate/reverse implementation
+order to reduce clock and ordering bias.
 
 The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
 Helion kernel under CUDA graphs against a torch-native (unfused, eager)
@@ -91,13 +109,26 @@ falls back to older compatible CUDA/ROCm capabilities.  For example, on
 
 ## Running benchmarks
 
-Each kernel module has a `main()` that benchmarks the Helion kernel against
-PyTorch eager across the included shape set:
+Each kernel module has a `main()` that benchmarks the Helion kernel against its
+named reference baselines across the included shape set:
 
 ```bash
 cd pretuned_kernels/softmax
 python softmax.py
 ```
+
+The external grouped-GEMM references need explicit pinned checkouts:
+
+```bash
+export HELION_CUTLASS_GROUPED_GEMM_SOURCE=/path/to/CUTLASS/.../grouped_gemm.py
+python -m pretuned_kernels.grouped_gemm.grouped_gemm
+
+export HELION_DEEPGEMM_ROOT=/path/to/built/DeepGEMM
+python -m pretuned_kernels.grouped_gemm_deepgemm.grouped_gemm_deepgemm
+```
+
+The modules report the required commits when either variable is missing; the
+nightly workflow fetches, builds, and verifies those revisions automatically.
 
 ## Adding a heuristic for new hardware
 
