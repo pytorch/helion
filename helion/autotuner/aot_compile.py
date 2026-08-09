@@ -2,9 +2,10 @@
 AOT Standalone Compilation
 ==========================
 
-Generates a standalone ``.py`` file from Helion kernels that has zero
-Helion dependencies at runtime.  The output contains only Triton code,
-a heuristic dispatcher, and standard ``torch`` / ``triton`` imports.
+Generates a standalone ``.py`` file from Helion kernels. Triton output has no
+Helion dependency; backends without a dependency-free launcher export retain
+that launcher import. The output contains generated kernel code and a heuristic
+dispatcher.
 
 Usage::
 
@@ -12,19 +13,72 @@ Usage::
         -- python examples/aot_compile_example.py
 
 Writes ``<source>_<kernel>_standalone.py`` next to each kernel source file.
+Static dispatch keys include tensor dtype, shape, and stride, but never tensor
+contents. Any tensor-derived value that affects generated code must therefore
+also be exposed as a scalar/container argument or checked by the emitted runtime
+wrapper.
 """
 
 from __future__ import annotations
 
 import ast
+import inspect
 import logging
 from pathlib import Path
 import re
+import tempfile
+import textwrap
+
+import torch
 
 from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
 from .._compiler.output_code_utils import dependency_free_runtime_source
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _standalone_value_key(value: object) -> tuple[object, ...]:
+    """Normalize one static call value into a deterministic literal-safe key."""
+    if isinstance(value, torch.Tensor):
+        return (
+            "tensor",
+            str(value.dtype),
+            tuple(value.shape),
+            tuple(value.stride()),
+        )
+    if value is None:
+        return ("none",)
+    if type(value) is bool:
+        return ("bool", value)
+    if type(value) is int:
+        return ("int", value)
+    if type(value) is float:
+        return ("float", value.hex())
+    if type(value) is str:
+        return ("str", value)
+    if isinstance(value, torch.dtype):
+        return ("dtype", str(value))
+    if isinstance(value, torch.device):
+        return ("device", str(value))
+    if type(value) is tuple:
+        return ("tuple", tuple(_standalone_value_key(item) for item in value))
+    if type(value) is list:
+        return ("list", tuple(_standalone_value_key(item) for item in value))
+    if type(value) is dict:
+        items = [
+            (_standalone_value_key(key), _standalone_value_key(item))
+            for key, item in value.items()
+        ]
+        return ("dict", tuple(sorted(items, key=repr)))
+    raise TypeError(
+        "standalone static dispatch does not support "
+        f"{type(value).__qualname__} arguments"
+    )
+
+
+def _standalone_call_key(args: tuple[object, ...]) -> tuple[object, ...]:
+    """Return the static key for signature-normalized positional arguments."""
+    return _standalone_value_key(args)
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +233,17 @@ def generate_standalone_file(
     heuristic_code: str,
     output_dir: Path,
     kernel_source_file: str | None = None,
+    dispatch_keys: list[tuple[object, ...]] | None = None,
 ) -> Path:
     """
-    Generate a single standalone ``.py`` file with no Helion dependencies.
+    Generate one standalone ``.py`` file containing every selected config.
 
-    Each config's symbols get a ``_c<N>`` suffix to avoid collisions.
-    A public ``<kernel>`` function dispatches to the right variant.
+    Backends with a dependency-free launcher produce Helion-free output. CuTe
+    currently retains its Helion runtime launcher import.
+
+    Each config's symbols get a ``_c<N>`` suffix to avoid collisions. Static
+    shape variants can provide ``dispatch_keys`` so the public function rejects
+    uncompiled call signatures instead of applying a shape-incompatible config.
 
     Args:
         kernel_name: Name of the kernel function.
@@ -192,10 +251,22 @@ def generate_standalone_file(
         heuristic_code: Generated heuristic Python source.
         output_dir: Fallback directory when *kernel_source_file* is ``None``.
         kernel_source_file: When set, writes next to the source file.
+        dispatch_keys: Optional static call keys parallel to *triton_codes*.
 
     Returns:
         Path to the generated file.
     """
+    if dispatch_keys is not None:
+        if len(dispatch_keys) != len(triton_codes):
+            raise ValueError("dispatch_keys must match triton_codes")
+        if len(set(dispatch_keys)) != len(dispatch_keys):
+            raise ValueError("dispatch_keys must be unique")
+        ordered = sorted(
+            zip(dispatch_keys, triton_codes, strict=True),
+            key=lambda item: repr(item[0]),
+        )
+        dispatch_keys = [key for key, _code in ordered]
+        triton_codes = [code for _key, code in ordered]
     n = len(triton_codes)
 
     # -- collect imports & bodies -------------------------------------------
@@ -204,11 +275,19 @@ def generate_standalone_file(
     needs_runtime = False
     runtime_source: str | None = None
     runtime_references: set[str] = set()
+    has_helion_deps = False
 
     for i, code in enumerate(triton_codes):
         imports, body = _split_imports_and_body(code)
         for imp in imports:
             if "helion" in imp:
+                if "default_cute_launcher" in imp:
+                    # CuTe does not yet expose a dependency-free launcher. Keep
+                    # its required runtime import instead of silently emitting
+                    # a module whose wrapper references an undefined name.
+                    all_imports.add(imp)
+                    has_helion_deps = True
+                    continue
                 if not _is_supported_helion_import(imp):
                     raise ValueError(
                         f"unsupported Helion import in standalone AOT input: {imp!r}"
@@ -221,6 +300,9 @@ def generate_standalone_file(
         runtime_references.update(references)
         needs_runtime = needs_runtime or bool(references)
         bodies.append(_rename_config_symbols(body, kernel_name, i))
+    if dispatch_keys is not None:
+        all_imports.add("import inspect")
+        all_imports.add("import torch")
 
     if needs_runtime:
         from .._compiler.triton.backend import TritonBackend
@@ -241,7 +323,11 @@ def generate_standalone_file(
     # -- assemble -----------------------------------------------------------
     parts: list[str] = [
         f"# Auto-generated standalone Triton kernel for '{kernel_name}'.",
-        "# No Helion dependency required at runtime.",
+        (
+            "# Uses Helion's CuTe runtime launcher."
+            if has_helion_deps
+            else "# No Helion dependency required at runtime."
+        ),
         "",
         "from __future__ import annotations\n",
     ]
@@ -252,26 +338,67 @@ def generate_standalone_file(
 
     if runtime_source is not None:
         parts.append(runtime_source)
+    if dispatch_keys is not None:
+        parts.extend(
+            [
+                textwrap.dedent(inspect.getsource(_standalone_value_key)),
+                textwrap.dedent(inspect.getsource(_standalone_call_key)),
+            ]
+        )
 
     sep = "=" * 65
     for i, body in enumerate(bodies):
         parts.extend([f"\n# {sep}", f"# Config {i}", f"# {sep}\n", body])
 
-    if n > 1:
+    if n > 1 and dispatch_keys is None:
         # Heuristic dispatch for multi-config
         parts.extend([f"\n# {sep}", "# Heuristic dispatch", f"# {sep}\n"])
         parts.append(_extract_heuristic_body(heuristic_code, kernel_name))
 
-    if n == 1:
-        select_expr = "0"
-    elif f"def key_{kernel_name}(" in heuristic_code:
-        select_expr = f"key_{kernel_name}(*args)"
+    if dispatch_keys is not None:
+        parts.extend([f"\n# {sep}", "# Static call dispatch", f"# {sep}\n"])
+        parts.append("_STANDALONE_VARIANTS = {")
+        for i, key in enumerate(dispatch_keys):
+            parts.append(f"    {key!r}: _{kernel_name}_c{i},")
+        parts.extend(
+            [
+                "}",
+                f"_STANDALONE_SIGNATURE = inspect.signature(_{kernel_name}_c0)",
+                "_STANDALONE_PARAMETER_NAMES = tuple(",
+                "    name",
+                "    for name, parameter in _STANDALONE_SIGNATURE.parameters.items()",
+                "    if parameter.kind in (",
+                "        inspect.Parameter.POSITIONAL_ONLY,",
+                "        inspect.Parameter.POSITIONAL_OR_KEYWORD,",
+                "    )",
+                ")",
+                f"\ndef {kernel_name}(*args, **kwargs):",
+                "    bound = _STANDALONE_SIGNATURE.bind(*args, **kwargs)",
+                "    bound.apply_defaults()",
+                "    key = _standalone_call_key(",
+                "        tuple(bound.arguments[name] for name in _STANDALONE_PARAMETER_NAMES)",
+                "    )",
+                "    try:",
+                "        fn = _STANDALONE_VARIANTS[key]",
+                "    except KeyError:",
+                "        raise ValueError(",
+                '            f"No standalone variant for call signature {key!r}"',
+                "        ) from None",
+                "    return fn(*args, **kwargs)",
+                "",
+            ]
+        )
     else:
-        select_expr = "_predict(_extract_features(*args))"
-    parts.extend([f"\ndef {kernel_name}(*args, **kwargs):", "    return ["])
-    for i in range(n):
-        parts.append(f"        _{kernel_name}_c{i},")
-    parts.extend([f"    ][{select_expr}](*args, **kwargs)", ""])
+        if n == 1:
+            select_expr = "0"
+        elif f"def key_{kernel_name}(" in heuristic_code:
+            select_expr = f"key_{kernel_name}(*args)"
+        else:
+            select_expr = "_predict(_extract_features(*args))"
+        parts.extend([f"\ndef {kernel_name}(*args, **kwargs):", "    return ["])
+        for i in range(n):
+            parts.append(f"        _{kernel_name}_c{i},")
+        parts.extend([f"    ][{select_expr}](*args, **kwargs)", ""])
 
     content = "\n".join(parts)
     _check_kernel_name_not_shadowed(ast.parse(content), [], kernel_name)
@@ -285,6 +412,22 @@ def generate_standalone_file(
     else:
         out_file = output_dir / f"{kernel_name}_standalone.py"
 
-    out_file.write_text(content)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=out_file.parent,
+            prefix=f".{out_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp:
+            temp_path = Path(temp.name)
+            temp.write(content)
+        temp_path.replace(out_file)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     log.info("Standalone file: %s", out_file)
     return out_file
