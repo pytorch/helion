@@ -2057,7 +2057,6 @@ def _fixed_loop_extent(state: CodegenState, loop_dim_index: int) -> int | None:
 def _compute_pipeline_or_dma_extra_pad(
     begin_expr: str,
     bid: int,
-    env: CompileEnvironment,
     state: CodegenState,
     loop_dim_index: int | None = None,
 ) -> int:
@@ -2083,6 +2082,25 @@ def _compute_pipeline_or_dma_extra_pad(
     if alignment is not None and alignment % bs_val == 0:
         return 0
     return bs_val - 1
+
+
+def _record_loop_pad(
+    state: CodegenState,
+    fake: torch.Tensor,
+    dim_idx: int,
+    bid: int,
+    begin_expr: str | None = None,
+    loop_dim_index: int | None = None,
+) -> None:
+    """Record the host-side pad this dim's ``pl.ds`` needs."""
+    from ...language.memory_ops import _record_pad_info
+
+    if begin_expr is None:
+        begin_expr = _active_loop_begin_expr(state, bid)
+    extra_pad = _compute_pipeline_or_dma_extra_pad(
+        begin_expr, bid, state, loop_dim_index
+    )
+    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
 
 
 def _active_loop_begin_expr(state: CodegenState, block_id: int) -> str:
@@ -3331,11 +3349,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 slice_size_expr = slice_size_exprs[bid_idx]
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
-                from ...language.memory_ops import _record_pad_info
-
-                extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state, bid_idx
-                )
                 begin_is_zero = begin_expr == "0"
                 end_expr = end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
@@ -3450,19 +3463,14 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                             f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
                         )
                 if not clamped_to_tensor:
-                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                    _record_loop_pad(state, fake, dim_idx, bid, begin_expr, bid_idx)
             elif bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
                 pid_var = _bid_to_pid_var[bid]
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
-                    from ...language.memory_ops import _record_pad_info
-
-                    extra_pad = _compute_pipeline_or_dma_extra_pad(
-                        _active_loop_begin_expr(state, bid), bid, env, state
-                    )
-                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                    _record_loop_pad(state, fake, dim_idx, bid)
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
@@ -3476,6 +3484,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 )
                 block_shape_parts.append(f"pl.BoundedSlice({block_m})")
                 lambda_parts.append(f"pl.ds({start_expr}, {block_m})")
+                _record_loop_pad(state, fake, dim_idx, bid)
             elif bid is not None and state.codegen.active_device_loops.get(bid):
                 # Outer non-grid device loop -- the HBM ref is pre-sliced via
                 # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
@@ -4724,12 +4733,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                     vmem_parts.append(":")
                 hbm_parts.append(f"pl.ds({offset_expr}, {slice_size_expr})")
                 hbm_needs_slice = True
-                from ...language.memory_ops import _record_pad_info
-
-                extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state, bid_idx
-                )
-                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                _record_loop_pad(state, fake, dim_idx, bid, begin_expr, bid_idx)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
@@ -4774,12 +4778,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                     if bs_var:
                         hbm_parts.append(f"pl.ds({offset}, {bs_var})")
                         hbm_needs_slice = True
-                        from ...language.memory_ops import _record_pad_info
-
-                        extra_pad = _compute_pipeline_or_dma_extra_pad(
-                            _active_loop_begin_expr(state, bid), bid, env, state
-                        )
-                        _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                        _record_loop_pad(state, fake, dim_idx, bid)
                     else:
                         hbm_parts.append(":")
                 else:
