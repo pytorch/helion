@@ -1141,11 +1141,13 @@ def _loop_offset_alignment(
     block_id: int,
     state: CodegenState,
 ) -> int | None:
-    """Return an integer alignment for ``block_id`` offsets, or ``None``.
+    """Return the proven alignment of a loop's offset for ``block_id``, or ``None``.
 
-    For a recorded window, return its sublane alignment if the block size
-    is divisible by it. Without a recorded window, return the block size
-    if the loop begin is block-aligned or its metadata is missing.
+    A loop with step ``block_size`` produces offsets ``begin + i * block_size``.
+    An aligned jagged window proves only its recorded sublane alignment. For any
+    other loop, every offset is block-aligned iff its begin is block-aligned.
+    Return the strongest proven integer alignment, or ``None`` when a runtime
+    begin has no such proof.
     """
     import sympy
 
@@ -1158,15 +1160,20 @@ def _loop_offset_alignment(
     if block_id in state.device_function.aligned_tiles:
         return state.device_function.proven_sublane_alignment(block_id)
 
+    # Without a recorded window alignment, prove block alignment from the
+    # active loop's begin. A block with no active device loop is a grid dim:
+    # its offset is program_id times the block size, so block alignment holds
+    # without a proof.
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         info = loops[-1].block_id_to_info.get(block_id)
-        if info is not None and info.begin_expr is not None:
-            begin = info.begin_expr
-            if not isinstance(begin, (int, sympy.Integer)):
-                return None  # symbolic begin — can't prove alignment
-            if int(begin) % bs_value != 0:
-                return None
+        if info is None or info.begin_expr is None:
+            return None
+        begin = info.begin_expr
+        if not isinstance(begin, (int, sympy.Integer)):
+            return None  # symbolic begin — can't prove alignment
+        if int(begin) % bs_value != 0:
+            return None
 
     return bs_value
 

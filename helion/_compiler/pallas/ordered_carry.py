@@ -1,4 +1,4 @@
-"""Ordered carry for jagged row tiles on the Pallas emit_pipeline path.
+"""Ordered carry for jagged row tiles under emit_pipeline and fori_loop.
 
 A ``hl.tile(s, e)`` with runtime bounds rounds its rows out to a sublane-aligned
 window and masks the extra.  Neighbouring groups then share one boundary,
