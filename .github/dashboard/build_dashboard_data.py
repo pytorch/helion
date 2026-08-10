@@ -27,12 +27,12 @@ RETENTION_DAYS = 365
 # is expected to run on the nightly cron. Stable mapping; the kernel list(s)
 # are parsed from the workflow YAML so dashboard expectations track whatever's
 # currently in the workflow defaults without manual edits. Platforms can draw
-# from multiple inputs: h100 adds `kernels_linattn`, and `tpu` unions
+# from multiple inputs: h100/b200 add `kernels_linattn`, and `tpu` unions
 # run_tpu.py (`kernels_tpu`) with the tritonbench bridge (`kernels_tpu_bridge`),
 # which cover disjoint kernels but share the one `tpu` dashboard column.
 _PLATFORM_KERNELS_INPUT = {
     "h100": ("kernels", "kernels_linattn"),
-    "b200": ("kernels",),
+    "b200": ("kernels", "kernels_linattn"),
     "b200_cute": ("kernels_cute",),
     "mi350x": ("kernels",),
     "tpu": ("kernels_tpu", "kernels_tpu_bridge"),

@@ -169,8 +169,7 @@ class AutotuningLogger:
         self._log_sink.record(entry)
 
     def register_config(self, config: Config) -> str | None:
-        """Return the content-addressed ``config_id`` (registering it on the sink
-        for the ``.meta.jsonl`` record), or ``None`` when no sink is active."""
+        """Return the content-addressed ID when a sink is active."""
 
         if self._log_sink is None:
             return None
@@ -179,8 +178,7 @@ class AutotuningLogger:
     def capture_generated_code(
         self, config_id: str, kernel: _AutotunableKernel, config: Config
     ) -> None:
-        """Capture the config's generated source onto the sink for the
-        ``.meta.jsonl`` record; no-op when no sink is active."""
+        """Capture generated source when a sink is active."""
         if self._log_sink is not None:
             self._log_sink.capture_generated_code(config_id, kernel, config)
 
@@ -313,10 +311,9 @@ class AutotuneLogEntry(NamedTuple):
 
 
 class ConfigEntry(TypedDict):
-    """One per-config entry in the dataset's ``configs`` map."""
-
     config: dict[str, object]
-    generated_code: str | None
+    generated_code: str
+    source_hash: str
 
 
 class AutotuneLogSink:
@@ -346,8 +343,6 @@ class AutotuneLogSink:
         self._source_csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
         self._run_start_time: float | None = None
-        # Per-config dataset entries, flushed to .meta.jsonl at end_run. Unbounded
-        # by design (the R&D dataset keeps every config's full source) -- never cap.
         self._configs: dict[str, ConfigEntry] = {}
 
     def __enter__(self) -> Self:
@@ -413,37 +408,29 @@ class AutotuneLogSink:
         self._configs = {}
 
     def register_config(self, config: Config) -> str | None:
-        """Return a stable ``config_id`` for ``config``: ``sha256`` of the
-        canonical config JSON (sorted keys, compact), 16 hex chars -- the same
-        config always maps to the same id (the CSV<->record join key). Returns
-        ``None`` when the sink is not open. When collecting the dataset, the config
-        is stored under its id for the .meta.jsonl record (identical ids collapse).
-        """
+        """Return the config's stable join key when the sink is open."""
         if self._csv_writer is None:
             return None
         from .search_space_logger import canonical_config_id
 
-        config_id = canonical_config_id(config)
-        if self._collect_dataset and config_id not in self._configs:
-            self._configs[config_id] = {
-                "config": config.config,
-                "generated_code": None,
-            }
-        return config_id
+        return canonical_config_id(config)
 
     def capture_generated_code(
         self, config_id: str, kernel: _AutotunableKernel, config: Config
     ) -> None:
-        """Attach the config's already-compiled source from disk (no re-codegen)."""
-        entry = self._configs.get(config_id)
-        if entry is None or entry.get("generated_code") is not None:
+        if not self._collect_dataset:
+            return
+        if config_id in self._configs:
             return
         path = kernel.get_cached_path(config)
         if path is None:
-            return
-        # generated_code is null only when no cached path exists. A read failure
-        # of a known artifact surfaces (probe/IO errors are not swallowed here).
-        entry["generated_code"] = Path(path).read_text(encoding="utf-8")
+            raise RuntimeError(f"Missing generated artifact for config {config_id}")
+        generated_code = Path(path).read_text(encoding="utf-8")
+        self._configs[config_id] = {
+            "config": config.config,
+            "generated_code": generated_code,
+            "source_hash": hashlib.sha256(generated_code.encode("utf-8")).hexdigest(),
+        }
 
     def record(self, entry: AutotuneLogEntry) -> None:
         if self._csv_writer is None:

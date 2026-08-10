@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib.metadata
 import json
 import os
 from pathlib import Path
 import random
 import tempfile
-from types import ModuleType
 from typing import TYPE_CHECKING
 from typing import cast
 import unittest
@@ -199,8 +199,9 @@ class TestCollectHardwareInfo(TestCase):
             self.assertEqual(
                 set(info["device_props"]), set(_DEVICE_PROPS_ATTRS[info["device_kind"]])
             )
-            sm_attr = _DEVICE_PROPS_ATTRS[info["device_kind"]][0]
-            self.assertIsNotNone(info["device_props"][sm_attr])
+            self.assertTrue(
+                all(isinstance(value, int) for value in info["device_props"].values())
+            )
             self.assertIsNotNone(info["versions"]["triton"])
 
     def test_cpu_device_not_misreported(self) -> None:
@@ -210,24 +211,17 @@ class TestCollectHardwareInfo(TestCase):
         self.assertNotIn("device_props", info)
         self.assertEqual(set(info["versions"]), {"torch", "helion"})
 
+    def test_rocm_omits_cuda_only_optin_shared_memory(self) -> None:
+        self.assertIn("shared_memory_per_block_optin", _DEVICE_PROPS_ATTRS["cuda"])
+        self.assertNotIn("shared_memory_per_block_optin", _DEVICE_PROPS_ATTRS["rocm"])
+
     def test_device_is_required(self) -> None:
         with self.assertRaisesRegex(ValueError, "device"):
             collect_hardware_info(cast("torch.device", None))
 
-    def test_missing_module_version_raises(self) -> None:
-        module_without_version = ModuleType("triton")
-        with (
-            patch(
-                "helion.autotuner._metadata.hardware.importlib.metadata.version",
-                side_effect=importlib.metadata.PackageNotFoundError,
-            ),
-            patch(
-                "helion.autotuner._metadata.hardware.importlib.import_module",
-                return_value=module_without_version,
-            ),
-            self.assertRaises(AttributeError),
-        ):
-            _package_version("triton")
+    def test_missing_distribution_metadata_raises(self) -> None:
+        with self.assertRaises(importlib.metadata.PackageNotFoundError):
+            _package_version("sys")
 
 
 class TestKernelMetadataHardwareInfo(TestCase):
@@ -243,13 +237,19 @@ class TestKernelMetadataHardwareInfo(TestCase):
 class TestAutotuneLogSink(TestCase):
     def test_dataset_logged_when_enabled(self) -> None:
         config = helion.Config(block_sizes=[32], num_warps=4)
+        source = "# generated source\n"
         with tempfile.TemporaryDirectory() as tmp:
+            source_path = Path(tmp) / "compiled_kernel.py"
+            source_path.write_text(source, encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(source_path)
             with AutotuneLogSink(
                 f"{tmp}/run", _metadata(), collect_dataset=True
             ) as sink:
                 sink.start_run()
                 config_id = sink.register_config(config)
                 assert config_id is not None
+                sink.capture_generated_code(config_id, kernel, config)
                 sink.record(
                     AutotuneLogEntry(
                         generation=5,
@@ -283,7 +283,10 @@ class TestAutotuneLogSink(TestCase):
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
         entry = sidecar["configs"][cell("config_id")]
-        self.assertIsNone(entry["generated_code"])
+        self.assertEqual(entry["generated_code"], source)
+        self.assertEqual(
+            entry["source_hash"], hashlib.sha256(source.encode("utf-8")).hexdigest()
+        )
         cfg = helion.Config.from_json(json.dumps(entry["config"]))
         self.assertEqual(cfg.block_sizes, [32])
         self.assertEqual(cell("run_id"), sidecar["run_id"])
@@ -296,8 +299,6 @@ class TestAutotuneLogSink(TestCase):
         collect_dataset: bool = True,
         times: int = 1,
     ) -> dict[str, object] | None:
-        """Run one config through a sink (register + ``capture_generated_code`` x
-        ``times``) and return its written ``configs`` entry (``None`` if not collected)."""
         with tempfile.TemporaryDirectory() as tmp:
             with AutotuneLogSink(
                 f"{tmp}/run", _metadata(), collect_dataset=collect_dataset
@@ -314,7 +315,6 @@ class TestAutotuneLogSink(TestCase):
         return configs.get(config_id)
 
     def test_capture_generated_code_attaches_source_read_once(self) -> None:
-        """Source attaches to the config entry; the file is read at most once."""
         config = helion.Config(block_sizes=[32], num_warps=4)
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "compiled_kernel.py"
@@ -329,26 +329,35 @@ class TestAutotuneLogSink(TestCase):
         )
         kernel.get_cached_path.assert_called_once()
 
-    def test_capture_generated_code_none_when_no_cached_path(self) -> None:
-        """generated_code stays None when the config has no cached artifact path."""
+    def test_uncaptured_config_is_omitted(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                sink.end_run()
+            configs = json.loads(sink.meta_path.read_text())["configs"]
+        self.assertNotIn(config_id, configs)
+
+    def test_capture_generated_code_raises_when_cached_path_missing(self) -> None:
         config = helion.Config(block_sizes=[32])
         kernel = Mock()
         kernel.get_cached_path.return_value = None
-        entry = self._capture_entry(kernel, config)
-        assert entry is not None
-        self.assertIsNone(entry["generated_code"])
-
-    def test_capture_generated_code_raises_when_artifact_unreadable(self) -> None:
-        """A read failure of a known artifact surfaces (beta feature fails loudly)."""
-        config = helion.Config(block_sizes=[32])
-        kernel = Mock()
-        kernel.get_cached_path.return_value = "/nonexistent/dir/compiled_kernel.py"
-        with self.assertRaises(OSError):
+        with self.assertRaisesRegex(RuntimeError, "generated artifact"):
             self._capture_entry(kernel, config)
 
+    def test_capture_generated_code_raises_when_artifact_unreadable(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(Path(tmp) / "missing.py")
+            with self.assertRaises(OSError):
+                self._capture_entry(kernel, config)
+
     def test_capture_generated_code_noop_when_not_collecting(self) -> None:
-        """With collection off there is no configs entry, so the file is never read
-        (no .meta.jsonl is written either)."""
         config = helion.Config(block_sizes=[32])
         kernel = Mock()
         with (
@@ -442,12 +451,16 @@ class TestAutotuneDatasetE2E(TestCase):
                 sm_attr = _DEVICE_PROPS_ATTRS[hw["device_kind"]][0]
                 self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
-            # Each configs entry nests the tested config and its per-config generated
-            # source; generated_code is null when the config has no cached artifact
-            # path (a config that failed to compile is still registered).
             for cfg_entry in record["configs"].values():
-                self.assertIn("config", cfg_entry)
-                self.assertIsInstance(cfg_entry["generated_code"], (str, type(None)))
+                self.assertEqual(
+                    set(cfg_entry), {"config", "generated_code", "source_hash"}
+                )
+                source = cfg_entry["generated_code"]
+                self.assertTrue(source)
+                self.assertEqual(
+                    cfg_entry["source_hash"],
+                    hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                )
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
             if _HAS_NETWORKX:
@@ -459,9 +472,6 @@ class TestAutotuneDatasetE2E(TestCase):
             else:
                 self.assertIsNone(record["ir_graph"])
         self.assertGreater(len(configs_by_id), 0)
-        # generated_code is null only when a config has no cached path, but a real
-        # Triton search compiles at least one config, so at least one is captured.
-        self.assertTrue(any(e["generated_code"] for e in configs_by_id.values()))
 
         rows = list(csv.reader(csv_path.read_text().splitlines()))
         header, data = rows[0], rows[1:]
