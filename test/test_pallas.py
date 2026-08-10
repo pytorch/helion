@@ -986,6 +986,18 @@ class TestPallas(TestCase):
         )
         self.assertGreaterEqual(recall, 0.99)
 
+    def test_topk_recall_target_is_configurable(self) -> None:
+        x = torch.randn(8, 4096, device=DEVICE, dtype=torch.float32)
+        bound = _topk_pallas_kernel.bind((x, 64))
+        code = bound.to_code(
+            helion.Config(
+                block_sizes=[8],
+                pallas_topk_recall_target=1.0,
+            )
+        )
+        self.assertIn("_helion_divide_filter_topk", code)
+        self.assertIn(", 64, 1.0)", code)
+
     def test_gather_lowers_to_take_along_axis(self) -> None:
         @helion.kernel(
             backend="pallas",

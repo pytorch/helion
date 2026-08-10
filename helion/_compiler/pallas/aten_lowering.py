@@ -332,10 +332,24 @@ def codegen_topk_pallas(ctx: LoweringContext, node: Node) -> object:
     assert largest, "pallas topk only supports largest=True"
     _pallas_last_dim(node, dim)
 
+    raw_recall_target = ctx.cg.device_function.config.get(
+        "pallas_topk_recall_target", 0.99
+    )
+    if not isinstance(raw_recall_target, (int, float)):
+        raise TypeError(
+            "pallas_topk_recall_target must be numeric, got "
+            f"{type(raw_recall_target)!r}"
+        )
+    recall_target = float(raw_recall_target)
+    if not 0.0 < recall_target <= 1.0:
+        raise ValueError(
+            f"pallas_topk_recall_target must be in (0, 1], got {recall_target}"
+        )
     result = ctx.cg.device_function.new_var("topk_result")
     ctx.cg.add_statement(
         statement_from_string(
-            f"{result} = _helion_divide_filter_topk({{t}}, {k})", t=tensor
+            f"{result} = _helion_divide_filter_topk({{t}}, {k}, {recall_target!r})",
+            t=tensor,
         )
     )
     # torch.topk returns (values, indices); skip the indices expr when unused.
