@@ -24,17 +24,16 @@ def _die(msg: str) -> NoReturn:
     raise SystemExit(1)
 
 
-def _parse_sim_threshold(raw: str) -> float:
-    """Parse a finite similarity in [0, 1], else use the tested default."""
+def _parse_sim_threshold(raw: str) -> float | None:
+    """Parse a finite similarity in [0, 1]."""
     try:
         value = float(raw.strip())
     except ValueError:
-        return DEFAULT_SIM_THRESHOLD
-    return (
-        value if math.isfinite(value) and 0.0 <= value <= 1.0 else DEFAULT_SIM_THRESHOLD
-    )
+        return None
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
 
 
-def _sim_threshold() -> float:
+def _sim_threshold() -> float | None:
     """Read HELION_RAG_SIM_THRESHOLD as a finite similarity in [0, 1]."""
-    return _parse_sim_threshold(os.environ.get("HELION_RAG_SIM_THRESHOLD", ""))
+    raw = os.environ.get("HELION_RAG_SIM_THRESHOLD")
+    return DEFAULT_SIM_THRESHOLD if raw is None else _parse_sim_threshold(raw)

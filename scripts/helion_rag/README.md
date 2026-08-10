@@ -2,13 +2,11 @@
 
 Helion RAG builds a searchable corpus of Helion CI autotuning artifacts.
 
-You can use the `setup-helion-rag.sh` script to configure the tools in an existing Helion checkout. It validates the Python interpreter and Manifold access, installs the package in editable mode, fetches the corpus for the selected hardware, and builds a local FAISS index.
+Use `setup-helion-rag.sh` to configure an existing Helion checkout. The script validates Python and Manifold access. It then installs the package, fetches the hardware corpus, and builds a local FAISS index.
 
-You don't need any LLM API keys for this. The "RAG" here is purely retrieval-based and searches over CI benchmark artifacts. Lookup results are standalone output: this package does not modify Helion or automatically apply retrieved configurations during execution.
+No LLM API key is required. This package searches CI benchmark artifacts. It does not modify Helion or apply retrieved configs.
 
 ## Package layout
-
-Here's a quick tour of how the codebase is organized:
 
 ```text
 helion_rag/
@@ -23,14 +21,14 @@ helion_rag/
   upload.py         # Uploads zip runs to Manifold atomically
   manifest.py       # Validates and loads manifest.json
   hardware.py       # Figures out the hardware family based on the device string
-  models.py         # Dataclasses for PerfStats, Ref, and ExactEntry
+  models.py         # Saved provenance and exact-match records
   setup_helpers.py  # CLI helpers for the bash setup script (validating, resolving families, checking artifacts, etc.)
   _util.py          # Shared constants and logging helpers
 ```
 
 ## Setup
 
-To get started, run the setup script from the repository root or the `scripts/helion_rag/` directory:
+Run the setup script from the repository root or `scripts/helion_rag/`:
 
 ```bash
 ./setup-helion-rag.sh \
@@ -40,7 +38,7 @@ To get started, run the setup script from the repository root or the `scripts/he
   --hardware-family h100   # This is also auto-detected if you don't specify it
 ```
 
-You can pass `--dry-run` to see what the script plans to do without actually mutating anything, or `--non-interactive` to skip prompts. Run `./setup-helion-rag.sh --help` for the full list of options.
+Use `--dry-run` to validate the setup without changing files. Use `--non-interactive` to disable prompts. Run `./setup-helion-rag.sh --help` for all options.
 
 If a prerequisite check fails, the script exits before fetching or indexing the corpus.
 
@@ -73,13 +71,11 @@ Because the package is installed in editable mode, you'll have access to the `he
 
 ## CLI subcommands
 
-The `helion-rag` command gives you a few different tools:
-
 ```bash
 helion-rag extract          # Unzips benchmark archives, strips generated code, and deduplicates configs
 helion-rag index [--force]  # Builds the FAISS generation index for your hardware family
 helion-rag lookup --kernel-source-file f.py --shapes '...' --dtypes '...' --hardware h100 [--settings-json '{}']
-helion-rag ingest           # Idempotently merges meta.jsonl and csv logs, updates the ledger, and rebuilds the index
+helion-rag ingest           # Copies new meta.jsonl records and rebuilds the index
 helion-rag upload [--dry-run] [--reupload]   # Zips unuploaded runs to Manifold, marking them only if the upload succeeds
 helion-rag setup-helper --help
 helion-rag setup-helper publish-manifest --manifold-base <uri> --family <fam> [--artifact-path p] [--alias a...]
@@ -91,13 +87,13 @@ python -m helion_rag <cmd>  # Alternative module entry point (does the same thin
 
 The standalone `lookup` command searches in three stages:
 
-- **Tier 0 (Exact Match):** Calculates a workload key by hashing the normalized AST source, codegen settings, canonical shapes, dtypes, and hardware family. A matching `exact.json` entry returns the measured-best config.
-- **Tier 1 (Similar Match):** Runs FAISS similarity search over corpus source embeddings and returns the top neighbors with their measured configurations. `HELION_RAG_SIM_THRESHOLD` accepts a finite value in `[0, 1]` and controls the minimum score; invalid values use the default `0.85`.
-- **Tier 2 (Miss):** Reports that no exact or sufficiently similar result was found.
+- **Tier 0 (Exact Match):** Hashes the normalized source, codegen settings, shapes, dtypes, and hardware family. RAG ranks configs by the median of their per-shape medians. A match also returns the source hash and the statistics list. List order matches input-shape order.
+- **Tier 1 (Similar Match):** Searches source embeddings in FAISS and returns measured neighbor configs. `HELION_RAG_SIM_THRESHOLD` sets the minimum finite score in `[0, 1]`. An unset value uses `0.85`.
+- **Tier 2 (Miss):** Reports no match. Invalid workload input or an invalid similarity threshold also returns Tier 2.
 
 The command prints these results as JSON for inspection or use by external tooling. Helion does not consume them automatically.
 
-To keep workload keys in sync with upstream Helion, `_CODEGEN_SETTINGS` and `_codegen_signature` are imported directly from `helion.autotuner.metrics` — a single source of truth, so there is nothing to keep in sync.
+The workload key uses `_CODEGEN_SETTINGS` and `_codegen_signature` from `helion.autotuner.metrics`.
 
 ## Index publication
 
@@ -123,8 +119,8 @@ If you need to add a new family, `setup_helpers.publish_manifest()` will safely 
 
 ## Ingest and upload
 
-- **Ingest:** This command reads `*.meta.jsonl` and `perf.csv` files from your autotune log directory. It joins them by `run_id` and `config_id`, filters out anything that didn't pass, and aggregates the stats (median, mean, n_samples). It writes the result to the local writeback directory as `local-autotune.meta.jsonl` and updates `ledger.json` so we don't ingest the same `run_id` twice. Finally, it can optionally trigger a reindex.
-- **Upload:** This command grabs any unuploaded runs from your logs, builds a `batch-manifest.json`, and zips everything into the uploads directory. It uses `manifold_put` to push to Manifold. To make sure everything is atomic, it only writes the per-run success markers if the upload actually succeeds. If it fails, it throws an error without marking anything as uploaded.
+- **Ingest:** Validates `*.meta.jsonl` records before it writes. It preserves the source hash and ordered per-shape statistics, removes duplicate run IDs, and restores the previous writeback file if indexing fails. It updates the ledger after a successful index build.
+- **Upload:** Packages only unuploaded JSONL records with `batch-manifest.json`. Archive names use a content hash. Success markers are written only after the Manifold upload succeeds.
 
 ## Tests
 
@@ -143,15 +139,15 @@ scripts/helion_rag/tests/
   test_workload_key.py           # Workload key parity, deduplication, and AST checks
 ```
 
-You can run the suite like this:
+Run the suite from the repository root:
+
 ```bash
-cd scripts/helion_rag
-../../.rag-venv/bin/pytest tests -q
+PYTHONPATH=scripts/helion_rag python -m pytest scripts/helion_rag/tests -q
 ```
 
 ## Prerequisites
 
-There are a few things you need to have in place before setting this up. If any of these are missing, the setup script will fail loudly and safely:
+The setup script stops if a required dependency is unavailable:
 
 | Requirement | Why you need it | What to do |
 |---|---|---|

@@ -11,8 +11,10 @@ import ast
 from dataclasses import asdict
 import hashlib
 import json
+import math
 import operator
 from pathlib import Path
+import statistics
 import zipfile
 
 from helion.autotuner.metrics import _CODEGEN_SETTINGS
@@ -33,12 +35,21 @@ def _to_canonical_nested(v):
     )
 
 
+def _literal_sequence(raw: str, name: str) -> list | tuple:
+    value = ast.literal_eval(raw)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a sequence")
+    return value
+
+
 def _canon_shapes(s: str) -> str:
-    return repr(_to_canonical_nested(ast.literal_eval(s)))
+    shapes = _literal_sequence(s, "input_shapes")
+    _perf_stats_count(shapes)
+    return repr(_to_canonical_nested(shapes))
 
 
 def _canon_dtypes(s: str) -> str:
-    return repr(_to_canonical_nested(ast.literal_eval(s)))
+    return repr(_to_canonical_nested(_literal_sequence(s, "dtypes")))
 
 
 def _normalize_kernel_source(src: str) -> str:
@@ -69,6 +80,10 @@ def _workload_key(
 ) -> str:
     """Stable hash of normalized source + shapes + dtypes + settings + family.
     Same at ingest time and query time, unlike Helion run_id which is device-specific."""
+    if not isinstance(kernel_source, str) or not kernel_source.strip():
+        raise ValueError("kernel_source must be non-empty")
+    if not isinstance(settings, dict):
+        raise TypeError("settings must be a dictionary")
     payload = "\x00".join(
         (
             _normalize_kernel_source(kernel_source),
@@ -81,18 +96,64 @@ def _workload_key(
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _ok_configs(configs: dict) -> list:
-    """Keep configs with perf samples, sorted fastest first."""
-    oks = [
-        {
-            "config_id": cid,
-            "config": e.get("config", {}),
-            "median": e["perf_stats"]["median"],
-        }
-        for cid, e in configs.items()
-        if (ps := e.get("perf_stats") or {}).get("n_samples", 0) > 0
-        and ps.get("median") is not None
+def _perf_stats_count(shapes: list | tuple) -> int:
+    if any(not isinstance(item, (list, tuple)) for item in shapes):
+        raise ValueError("input_shapes entries must be sequences")
+    nested = [
+        any(isinstance(item, (list, tuple)) for item in shape_or_case)
+        for shape_or_case in shapes
     ]
+    if any(nested):
+        if not all(nested):
+            raise ValueError("input_shapes has inconsistent nesting")
+        return len(shapes)
+    return 1
+
+
+def _validate_perf_stats(config_id: str, perf_stats: object, expected: int) -> list:
+    if not isinstance(perf_stats, list):
+        raise TypeError(f"config {config_id} perf_stats must be a list")
+    if len(perf_stats) != expected:
+        raise ValueError(
+            f"config {config_id} must have {expected} performance-statistics records"
+        )
+    for stats in perf_stats:
+        if not isinstance(stats, dict):
+            raise TypeError(
+                f"config {config_id} performance statistics must be objects"
+            )
+        for field in ("min", "median", "mean", "p90", "std"):
+            value = stats[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"config {config_id} {field} must be finite")
+        n_samples = stats["n_samples"]
+        if isinstance(n_samples, bool) or not isinstance(n_samples, int):
+            raise TypeError(f"config {config_id} n_samples must be an integer")
+        if n_samples <= 0:
+            raise ValueError(f"config {config_id} n_samples must be positive")
+    return perf_stats
+
+
+def _ok_configs(configs: dict, expected_stats: int) -> list:
+    """Keep configs with perf samples, sorted fastest first."""
+    oks = []
+    for config_id, entry in configs.items():
+        perf_stats = _validate_perf_stats(
+            config_id, entry["perf_stats"], expected_stats
+        )
+        oks.append(
+            {
+                "config_id": config_id,
+                "config": entry["config"],
+                "source_hash": entry["source_hash"],
+                "median": statistics.median(stats["median"] for stats in perf_stats),
+                "perf_stats": perf_stats,
+            }
+        )
     oks.sort(key=operator.itemgetter("median"))
     return oks
 
@@ -101,27 +162,20 @@ def _parse_record(
     record: dict, family: str, source_file: str, top_n: int = DEFAULT_TOP_N
 ) -> dict | None:
     """Turn one meta.jsonl line into index record, or skip if unusable."""
-    oks = _ok_configs(record.get("configs", {}))
+    raw_shapes = _literal_sequence(record["input_shapes"], "input_shapes")
+    shapes = repr(_to_canonical_nested(raw_shapes))
+    dtypes = _canon_dtypes(record["dtypes"])
+    oks = _ok_configs(record["configs"], _perf_stats_count(raw_shapes))
+    run_id = record["run_id"]
     if not oks:
-        _log(f"{source_file}: run {record.get('run_id')} has no ok configs; skipping")
+        _log(f"{source_file}: run {run_id} has no ok configs; skipping")
         return None
-    try:
-        shapes = _canon_shapes(record.get("input_shapes", ""))
-        dtypes = _canon_dtypes(record.get("dtypes", ""))
-    except (SyntaxError, ValueError):
-        # Dynamic-SymInt shapes aren't parseable; skip so one bad record
-        # can't abort the whole corpus load / index build.
-        _log(
-            f"{source_file}: run {record.get('run_id')} has unparsable shapes/dtypes (e.g. dynamic SymInt); skipping"
-        )
-        return None
-    ksrc = record.get("kernel_source", "")
-    run_id = record.get("run_id")
-    key = _workload_key(ksrc, shapes, dtypes, record.get("settings") or {}, family)
+    ksrc = record["kernel_source"]
+    key = _workload_key(ksrc, shapes, dtypes, record["settings"], family)
     ref = Ref(family=family, source_file=source_file, run_id=run_id)
     return {
         "family": family,
-        "kernel_name": record.get("kernel_name", ""),
+        "kernel_name": record["kernel_name"],
         "run_id": run_id,
         "source_file": source_file,
         "input_shapes": shapes,
@@ -179,26 +233,32 @@ def extract_corpus(zips_dir, out_dir) -> int:
     """Unzip benchmark archives, keep only meta.jsonl stripped of generated code.
     Dedupes by content hash per family. Returns number of files written."""
     zips_dir, out_dir = Path(zips_dir).resolve(), Path(out_dir).resolve()
-    seen: dict[tuple[str, str], str] = {}
     written = 0
 
-    def _emit(family: str, base: str, data: bytes, origin: str) -> None:
+    def _emit(family: str, base: str, data: bytes) -> None:
         nonlocal written
         fam_out = out_dir / family
         fam_out.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(data).hexdigest()
-        key = (family, base)
-        if key in seen:
-            if seen[key] == digest:
-                return
-            base = f"{origin}__{base}"
-            _log(
-                f"WARN: {family}/{key[1]} recurs with different content; writing as {base}"
-            )
-            key = (family, base)
-        (fam_out / base).write_bytes(data)
-        seen[key] = digest
-        written += 1
+        candidate = base
+        while True:
+            path = fam_out / candidate
+            try:
+                with path.open("xb") as fh:
+                    fh.write(data)
+            except FileExistsError:
+                if hashlib.sha256(path.read_bytes()).hexdigest() == digest:
+                    return
+                if candidate != base:
+                    raise RuntimeError(f"content-address collision for {path}")
+                candidate = f"{digest}__{base}"
+                _log(
+                    f"WARN: {family}/{base} recurs with different content; "
+                    f"writing as {candidate}"
+                )
+                continue
+            written += 1
+            return
 
     for zf_path in sorted(zips_dir.rglob("*.zip")):
         family = zf_path.relative_to(zips_dir).parts[0]
@@ -209,13 +269,12 @@ def extract_corpus(zips_dir, out_dir) -> int:
                         family,
                         Path(member).name,
                         _strip_generated_code(zf.read(member)),
-                        zf_path.stem,
                     )
     for stray in sorted(zips_dir.rglob("*.meta.jsonl")):
         if out_dir == stray.parent or out_dir in stray.parents:
             continue
         family = stray.relative_to(zips_dir).parts[0]
-        _emit(family, stray.name, _strip_generated_code(stray.read_bytes()), stray.stem)
+        _emit(family, stray.name, _strip_generated_code(stray.read_bytes()))
     return written
 
 
@@ -245,6 +304,8 @@ def _exact_map(records: list) -> dict:
             ExactEntry(
                 best_config=r["best"]["config"],
                 best_config_id=r["best"]["config_id"],
+                source_hash=r["best"]["source_hash"],
+                perf_stats=r["best"]["perf_stats"],
                 run_id=r["run_id"],
                 ref=r["ref"],
                 tier0_eligible=r["tier0_eligible"],

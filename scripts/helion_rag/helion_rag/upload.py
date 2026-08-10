@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 import zipfile
 
 from helion_rag._util import _log
+from helion_rag.corpus import _parse_record
 
 
 def select_unuploaded_runs(
@@ -48,19 +50,23 @@ def record_upload(
     )
 
 
-def _run_ids_from_logs(autotune_log_dir: Path | str) -> list[str]:
-    """Pull ordered unique run IDs from meta jsonl files."""
-    log_dir = Path(autotune_log_dir)
-    seen: dict[str, None] = {}
-    for f in sorted(log_dir.rglob("*.meta.jsonl")):
-        for line in f.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
+def _records_from_logs(log_dir: Path | str) -> list[tuple[Path, list[dict]]]:
+    log_dir = Path(log_dir)
+    files = []
+    for path in sorted(log_dir.rglob("*.meta.jsonl")):
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
                 continue
-            rid = json.loads(line).get("run_id")
-            if rid:
-                seen.setdefault(rid, None)
-    return list(seen)
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise TypeError(f"{path}: metadata record must be an object")
+            run_id = record["run_id"]
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError(f"{path}: run_id must be a non-empty string")
+            records.append(record)
+        files.append((path, records))
+    return files
 
 
 def upload(
@@ -78,9 +84,17 @@ def upload(
     runs_dir = uploads_dir / "uploaded-runs"
     archives_dir = uploads_dir / "uploaded-archives"
 
-    todo = select_unuploaded_runs(
-        _run_ids_from_logs(autotune_log_dir), runs_dir, reupload
+    log_records = _records_from_logs(autotune_log_dir)
+    for path, records in log_records:
+        for record in records:
+            if record["configs"]:
+                _parse_record(record, family, path.name)
+    all_run_ids = list(
+        dict.fromkeys(
+            record["run_id"] for _, records in log_records for record in records
+        )
     )
+    todo = select_unuploaded_runs(all_run_ids, runs_dir, reupload)
     manifest = build_batch_manifest(todo, family, contributor)
     base = {"run_ids": todo, "manifest": manifest}
 
@@ -92,15 +106,32 @@ def upload(
         return {**base, "run_ids": []}
 
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = uploads_dir / f"contrib-{family}-{len(todo)}runs.zip"
+    with tempfile.NamedTemporaryFile(
+        dir=uploads_dir, prefix=".contrib-", suffix=".zip", delete=False
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("batch-manifest.json", json.dumps(manifest, indent=2))
+            todo_set = set(todo)
+            for path, records in log_records:
+                selected = [
+                    record for record in records if record["run_id"] in todo_set
+                ]
+                if selected:
+                    data = "".join(f"{json.dumps(record)}\n" for record in selected)
+                    zf.writestr(str(path.relative_to(autotune_log_dir)), data)
 
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("batch-manifest.json", json.dumps(manifest, indent=2))
-        for ext in ("*.meta.jsonl", "*.csv", "*.log"):
-            for f in sorted(autotune_log_dir.rglob(ext)):
-                zf.write(f, f.relative_to(autotune_log_dir))
+        sha = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
+        archive_path = uploads_dir / f"contrib-{family}-{sha}.zip"
+        if archive_path.exists():
+            tmp_path.unlink()
+        else:
+            tmp_path.replace(archive_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
-    sha = hashlib.sha256(archive_path.read_bytes()).hexdigest()
     res = {**base, "archive_sha256": sha, "archive_path": str(archive_path)}
 
     if not manifold_put:

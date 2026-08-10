@@ -11,18 +11,6 @@ from dataclasses import dataclass
 
 
 @dataclass
-class PerfStats:
-    """Aggregated timing summary for one config across its perf samples."""
-
-    median: float | None
-    mean: float | None
-    min: float | None
-    p90: float | None
-    std: float | None
-    n_samples: int
-
-
-@dataclass
 class Ref:
     """Provenance for a corpus record: where a config came from."""
 
@@ -37,6 +25,8 @@ class ExactEntry:
 
     best_config: dict
     best_config_id: str
+    source_hash: str
+    perf_stats: list[dict[str, float | int]]
     run_id: str | None
     ref: Ref
     tier0_eligible: bool

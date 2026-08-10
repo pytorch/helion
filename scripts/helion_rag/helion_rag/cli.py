@@ -190,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
         if not cfg.hardware_family:
             print("HELION_RAG_HARDWARE_FAMILY must be set for upload", file=sys.stderr)
             return 2
+        if not cfg.autotune_log_dir:
+            print("HELION_RAG_AUTOTUNE_LOG_DIR must be set for upload", file=sys.stderr)
+            return 2
         manifold_put = None
         if not args.dry_run:
             if not cfg.manifold_base:

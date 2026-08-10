@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import examples.add as _add_mod  # type: ignore[import-not-found]
+import importlib
 import inspect
 import sys
 from pathlib import Path
 
-# Ensure repo root (containing examples/) is on path when running pytest from package dir
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-
+_add_mod = importlib.import_module("examples.add")
 _kernel_src = inspect.getsource(_add_mod.add)
 SRC = f"import helion\nimport helion.language as hl\n\n\n{_kernel_src}"
 

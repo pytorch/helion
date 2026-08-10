@@ -44,7 +44,20 @@ def _record(shapes: str, dtypes: str, *, run_id: str, config: dict) -> dict:
         "kernel_source": SRC,
         "settings": {},
         "configs": {
-            "cfg0": {"config": config, "perf_stats": {"median": 0.5, "n_samples": 5}}
+            "cfg0": {
+                "config": config,
+                "source_hash": "source-hash",
+                "perf_stats": [
+                    {
+                        "min": 0.4,
+                        "median": 0.5,
+                        "mean": 0.55,
+                        "p90": 0.7,
+                        "std": 0.1,
+                        "n_samples": 5,
+                    }
+                ],
+            }
         },
     }
 

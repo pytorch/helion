@@ -2,73 +2,13 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-import csv as _csv
-from dataclasses import asdict
 import json
-import math
 from pathlib import Path
-import statistics
+import tempfile
 
-from helion_rag.models import PerfStats
+from helion_rag.corpus import _parse_record
 
-_OK_STATUSES = {"ok", "success", "successful", "pass", "passed"}
 _WRITEBACK_FILE = "local-autotune.meta.jsonl"
-
-
-def is_ok_row(row: dict) -> bool:
-    """True if row status is ok and perf_ms is a finite number."""
-    if str(row.get("status", "")).strip().lower() not in _OK_STATUSES:
-        return False
-    return math.isfinite(float(str(row.get("perf_ms", "")).strip() or "nan"))
-
-
-def join_records(meta_records: list[dict], csv_rows: list[dict]) -> dict:
-    """Join csv perf rows to meta configs by run_id and config_id, keep only ok rows."""
-    valid = {
-        (rec.get("run_id"), cid)
-        for rec in meta_records
-        for cid in (rec.get("configs") or {})
-    }
-    out: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for r in csv_rows:
-        pair = (r.get("run_id"), r.get("config_id"))
-        if pair in valid and None not in pair and is_ok_row(r):
-            out[pair].append(float(r["perf_ms"]))
-    return dict(out)
-
-
-def _percentile(sorted_vals: list[float], q: float) -> float:
-    """Linear interpolation percentile like numpy."""
-    if not sorted_vals:
-        return float("nan")
-    if len(sorted_vals) == 1:
-        return sorted_vals[0]
-    pos = (len(sorted_vals) - 1) * q
-    lo, hi = math.floor(pos), math.ceil(pos)
-    return (
-        sorted_vals[lo]
-        if lo == hi
-        else sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (pos - lo)
-    )
-
-
-def aggregate_perf_stats(perf_ms: list[float]) -> PerfStats:
-    """Summarize list of times into median, mean, min, p90, std and count."""
-    vals = sorted(float(v) for v in perf_ms)
-    n = len(vals)
-    if n == 0:
-        return PerfStats(
-            median=None, mean=None, min=None, p90=None, std=None, n_samples=0
-        )
-    return PerfStats(
-        median=statistics.median(vals),
-        mean=statistics.fmean(vals),
-        min=vals[0],
-        p90=_percentile(vals, 0.90),
-        std=statistics.pstdev(vals) if n > 1 else 0.0,
-        n_samples=n,
-    )
 
 
 def _read_meta_records(log_dir: Path) -> list[dict]:
@@ -78,15 +18,6 @@ def _read_meta_records(log_dir: Path) -> list[dict]:
         text = f.read_text(encoding="utf-8")
         out.extend(json.loads(ln) for ln in text.splitlines() if ln.strip())
     return out
-
-
-def _read_csv_rows(log_dir: Path) -> list[dict]:
-    """Read all csv files under log dir."""
-    rows: list[dict] = []
-    for f in sorted(Path(log_dir).rglob("*.csv")):
-        with f.open(newline="", encoding="utf-8") as fh:
-            rows.extend(_csv.DictReader(fh))
-    return rows
 
 
 def _load_ledger(ledger_path: Path) -> set[str]:
@@ -106,6 +37,30 @@ def _save_ledger(ledger_path: Path, run_ids: set[str]) -> None:
     tmp.replace(p)
 
 
+def _replace_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+        tmp_file.write(data)
+    try:
+        tmp_path.replace(path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _validate_record(record: dict, family: str, source_file: str) -> str:
+    run_id = record["run_id"]
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError(f"{source_file}: run_id must be a non-empty string")
+    configs = record["configs"]
+    if not isinstance(configs, dict):
+        raise TypeError(f"{source_file}: configs must be an object")
+    if configs:
+        _parse_record(record, family, source_file)
+    return run_id
+
+
 def ingest(
     *,
     autotune_log_dir,
@@ -121,61 +76,61 @@ def ingest(
     )
 
     meta_records = _read_meta_records(autotune_log_dir)
-    joined = join_records(meta_records, _read_csv_rows(autotune_log_dir))
-
     processed = _load_ledger(ledger_path)
     out_dir = writeback_dir / family
-    out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / _WRITEBACK_FILE
 
-    newly: list[str] = []
-    with out_file.open("a", encoding="utf-8") as fh:
-        for rec in meta_records:
-            run_id = rec.get("run_id")
-            if not run_id or run_id in processed:
-                continue
-            configs_out = {
-                cid: {
-                    **(
-                        {"generated_code": e["generated_code"]}
-                        if e.get("generated_code")
-                        else {}
-                    ),
-                    "config": e.get("config", {}),
-                    "perf_stats": asdict(aggregate_perf_stats(joined[(run_id, cid)])),
-                }
-                for cid, e in (rec.get("configs") or {}).items()
-                if (run_id, cid) in joined
-            }
-            if not configs_out:
-                continue
-            fh.write(
-                json.dumps(
-                    {
-                        "run_id": run_id,
-                        "kernel_name": rec.get("kernel_name", ""),
-                        "kernel_source": rec.get("kernel_source", ""),
-                        "input_shapes": rec.get("input_shapes", ""),
-                        "dtypes": rec.get("dtypes", ""),
-                        "hardware": rec.get("hardware", ""),
-                        "settings": rec.get("settings", {}),
-                        "configs": configs_out,
-                    }
-                )
-                + "\n"
-            )
-            newly.append(run_id)
+    previous = out_file.read_bytes() if out_file.is_file() else None
+    existing = (
+        [json.loads(line) for line in previous.decode().splitlines() if line.strip()]
+        if previous is not None
+        else []
+    )
 
-    if newly:
-        processed.update(newly)
-        _save_ledger(ledger_path, processed)
-        if reindex:
+    records_by_run_id: dict[str, dict] = {}
+    for record in existing:
+        run_id = _validate_record(record, family, out_file.name)
+        if record["configs"]:
+            records_by_run_id.setdefault(run_id, record)
+    processed.update(records_by_run_id)
+
+    newly: list[str] = []
+    skipped = 0
+    for record in meta_records:
+        run_id = _validate_record(record, family, "autotune log")
+        if not record["configs"]:
+            skipped += 1
+            continue
+        if run_id in processed or run_id in records_by_run_id:
+            skipped += 1
+            continue
+        records_by_run_id[run_id] = record
+        newly.append(run_id)
+
+    output = "".join(
+        f"{json.dumps(record)}\n" for record in records_by_run_id.values()
+    ).encode()
+    if output != previous:
+        _replace_bytes(out_file, output)
+
+    if newly and reindex:
+        try:
             _reindex_family(family, writeback_dir, cfg)
+        except BaseException:
+            if previous is None:
+                out_file.unlink(missing_ok=True)
+            else:
+                _replace_bytes(out_file, previous)
+            raise
+
+    processed.update(newly)
+    if records_by_run_id or processed:
+        _save_ledger(ledger_path, processed)
 
     return {
         "family": family,
         "ingested_run_ids": newly,
-        "skipped": len(processed) - len(newly),
+        "skipped": skipped,
     }
 
 
