@@ -331,6 +331,7 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
+        self.requires_nvshmem = False
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
@@ -887,6 +888,11 @@ class DeviceFunction:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         function_decorator = backend.function_decorator_for_args(param_args)
+        decorators = (
+            [expr_from_string("requires_nvshmem")] if self.requires_nvshmem else []
+        )
+        if function_decorator:
+            decorators.append(expr_from_string(function_decorator))
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
@@ -1007,9 +1013,7 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=kernel_body,
-                    decorator_list=[expr_from_string(function_decorator)]
-                    if function_decorator
-                    else [],
+                    decorator_list=decorators,
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},
@@ -1171,6 +1175,7 @@ class DeviceFunction:
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
+        from helion.language import distributed_ops
         from helion.language import memory_ops
         from helion.language import tile_index
         from helion.language.atomic_ops import ATOMIC_OPS
@@ -1211,6 +1216,22 @@ class DeviceFunction:
                     if name is not None:
                         read_names.add(name)
                         write_names.add(name)
+                elif node.target is distributed_ops.start_async_remote_copy:
+                    if len(node.args) != 7:
+                        raise exc.InternalError(
+                            RuntimeError(
+                                "start_async_remote_copy was not normalized to "
+                                "its seven-argument form"
+                            )
+                        )
+                    src_name = _get_tensor_name(node)
+                    if src_name is not None:
+                        read_names.add(src_name)
+                    dst_arg = node.args[3]
+                    if isinstance(dst_arg, torch.fx.Node):
+                        dst_value = dst_arg.meta.get("val")
+                        if isinstance(dst_value, torch.Tensor):
+                            write_names.add(self.tensor_arg(dst_value).name)
         return read_names, write_names
 
     def __enter__(self) -> None:

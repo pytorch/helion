@@ -88,11 +88,33 @@ def plan_tiling(
     config: Config,
     tile_strategy: TileStrategyDispatch,
 ) -> None:
+    local_access_ids = _collect_local_access_ids(graphs)
     for graph_info in graphs:
-        _analyze_indexing_expressions(graph_info, config)
+        _analyze_indexing_expressions(graph_info, config, local_access_ids)
 
 
-def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None:
+def _collect_local_access_ids(graphs: list[GraphInfo]) -> set[int]:
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+
+    local_access_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+    local_access_ids: set[int] = set()
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in local_access_targets:
+                continue
+            tensor_arg = node.args[0]
+            if isinstance(tensor_arg, torch.fx.Node):
+                tensor = tensor_arg.meta.get("val")
+                if isinstance(tensor, torch.Tensor):
+                    local_access_ids.add(id(tensor))
+    return local_access_ids
+
+
+def _analyze_indexing_expressions(
+    graph_info: GraphInfo, config: Config, local_access_ids: set[int]
+) -> None:
+    from ...language import distributed_ops
     from ...language import memory_ops
     from ...language.atomic_ops import ATOMIC_OPS
 
@@ -100,8 +122,63 @@ def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None
     for node in graph_info.graph.nodes:
         if node.op != "call_function":
             continue
-        if node.target in indexing_targets:
+        if node.target is distributed_ops.start_async_remote_copy:
+            _analyze_remote_copy(node, config, local_access_ids)
+        elif node.target in indexing_targets:
             _analyze_indexing(node, config)
+
+
+def _analyze_remote_copy(
+    node: torch.fx.Node, config: Config, local_access_ids: set[int]
+) -> None:
+    if len(node.args) != 7:
+        raise exc.InternalError(
+            RuntimeError(
+                "start_async_remote_copy was not normalized to its seven-argument form"
+            )
+        )
+    _analyze_remote_operand(node, node.args[0], node.args[1], config, local_access_ids)
+    _analyze_remote_operand(node, node.args[3], node.args[4], config, local_access_ids)
+
+
+def _analyze_remote_operand(
+    node: torch.fx.Node,
+    tensor_arg: object,
+    subscript: object,
+    config: Config,
+    local_access_ids: set[int],
+) -> None:
+    if not isinstance(tensor_arg, torch.fx.Node):
+        raise exc.InternalError(RuntimeError("remote-copy operand is not an FX node"))
+    if not isinstance(subscript, (list, tuple)):
+        raise exc.InternalError(RuntimeError("remote-copy index is not a sequence"))
+    tensor = tensor_arg.meta.get("val")
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.InternalError(RuntimeError("remote-copy operand is not a tensor"))
+
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+
+    device_fn = DeviceFunction.current()
+    tensor_id = id(tensor)
+    if tensor_id not in device_fn.pallas_tensor_dim_tilings:
+        device_fn.pallas_tensor_dim_tilings[tensor_id] = [
+            DimensionTiling() for _ in range(tensor.ndim)
+        ]
+    _analyze_subscript_patterns(
+        tensor,
+        list(subscript),
+        device_fn.pallas_tensor_dim_tilings[tensor_id],
+        node,
+        config,
+    )
+
+    if device_fn.pallas_memory_space.get(tensor_id) != PallasMemorySpace.HBM:
+        device_fn.pallas_memory_space[tensor_id] = (
+            PallasMemorySpace.VMEM
+            if tensor_id in local_access_ids
+            else PallasMemorySpace.HBM
+        )
 
 
 def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
