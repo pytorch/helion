@@ -21,6 +21,8 @@ CPU/TPU cases of :func:`get_num_sm`) lives in thin wrappers in
 from __future__ import annotations
 
 import contextvars
+import math
+import weakref
 
 import torch
 
@@ -159,12 +161,54 @@ def default_launcher(
     *args: object,
     num_warps: int,
     num_stages: int,
+    _remote_copy_signal_dst: torch.Tensor | None = None,
+    _remote_copy_signal_slots_per_program: int = 0,
+    _remote_copy_process_group_name: str | None = None,
+    _remote_barrier_signal_slots_per_program: int = 0,
+    _remote_barrier_process_group_name: str | None = None,
+    _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
-    # For both CUDA and MTIA, use the same kernel execution
+    if _remote_copy_signal_slots_per_program:
+        if _remote_copy_signal_dst is None or _remote_copy_process_group_name is None:
+            raise RuntimeError(
+                "remote-copy completion storage requires a symmetric destination "
+                "and process group"
+            )
+        signal = _get_remote_copy_signal(
+            triton_kernel,
+            _remote_copy_signal_dst,
+            _remote_copy_process_group_name,
+            math.prod(grid) * _remote_copy_signal_slots_per_program,
+        )
+        # Allocation zeroes new pads and receive waits reset consumed slots.
+        # Clearing here could erase a completion sent before this rank launches.
+        args = (*args, signal)
+    if _remote_barrier_signal_slots_per_program:
+        if _remote_barrier_process_group_name is None:
+            raise RuntimeError(
+                "remote-barrier completion storage requires a process group"
+            )
+        signal = _get_remote_barrier_signal(
+            triton_kernel,
+            _remote_barrier_process_group_name,
+            math.prod(grid) * _remote_barrier_signal_slots_per_program,
+        )
+        args = (*args, signal)
+    for slot, (scratch_like, numel_per_program) in enumerate(
+        _remote_copy_scratch_specs
+    ):
+        scratch = _get_remote_copy_scratch(
+            triton_kernel,
+            scratch_like,
+            slot,
+            math.prod(grid) * numel_per_program,
+        )
+        args = (*args, scratch)
+    # For both CUDA and MTIA, use the same kernel execution.
     run_kwargs: dict = {
         "grid": grid,
         "warmup": False,
@@ -179,3 +223,99 @@ def default_launcher(
         *args,
         **run_kwargs,
     )
+
+
+def _get_remote_copy_signal(
+    triton_kernel: object,
+    dst: torch.Tensor,
+    process_group_name: str,
+    required_slots: int,
+) -> torch.Tensor:
+    """Return compiler-owned completion slots from ``dst``'s signal pad."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    cache = vars(triton_kernel).setdefault("_helion_remote_copy_signal_cache", {})
+
+    key = (id(dst), process_group_name)
+    entry = cache.get(key)
+    if entry is not None and entry[0]() is dst:
+        signal_pad = entry[1]
+    else:
+        handle = symm_mem.rendezvous(
+            dst,
+            group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+        )
+        signal_pad = handle.get_signal_pad(handle.rank, dtype=torch.int64)
+
+        def remove_from_cache(_ref: object) -> None:
+            cache.pop(key, None)
+
+        cache[key] = (weakref.ref(dst, remove_from_cache), signal_pad)
+
+    capacity = signal_pad.numel()
+    if required_slots > capacity:
+        raise RuntimeError(
+            "Helion remote copies require "
+            f"{required_slots} int64 completion slots, but the symmetric-memory "
+            f"signal pad has capacity {capacity}. Increase the signal pad size "
+            "before allocating symmetric tensors."
+        )
+    # Reserve from the end so Helion's slots do not overlap PyTorch's standard
+    # low-offset signal-pad protocols.
+    return signal_pad.narrow(0, capacity - required_slots, required_slots)
+
+
+def _get_remote_barrier_signal(
+    triton_kernel: object,
+    process_group_name: str,
+    required_slots: int,
+) -> torch.Tensor:
+    """Return compiler-owned peer-barrier counters from a group workspace."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    cache = vars(triton_kernel).setdefault("_helion_remote_barrier_signal_cache", {})
+    key = (device, process_group_name)
+    entry = cache.get(key)
+    if entry is None:
+        workspace = symm_mem.empty(1, dtype=torch.uint8, device=device)
+        handle = symm_mem.rendezvous(
+            workspace,
+            group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+        )
+        cache[key] = (workspace, handle)
+    else:
+        _, handle = entry
+    signal_pad = handle.get_signal_pad(handle.rank, dtype=torch.int64)
+    capacity = signal_pad.numel()
+    if required_slots > capacity:
+        raise RuntimeError(
+            "Helion remote barriers require "
+            f"{required_slots} int64 completion slots, but the symmetric-memory "
+            f"signal pad has capacity {capacity}. Increase the signal pad size "
+            "before launching the kernel."
+        )
+    return signal_pad.narrow(0, capacity - required_slots, required_slots)
+
+
+def _get_remote_copy_scratch(
+    triton_kernel: object,
+    like: torch.Tensor,
+    slot: int,
+    required_numel: int,
+) -> torch.Tensor:
+    """Return stream-local global scratch for one computed DMA source."""
+    if like.device.type != "cuda":
+        raise RuntimeError("NVSHMEM remote-copy scratch requires a CUDA tensor")
+    stream = torch.cuda.current_stream(like.device)
+    cache = vars(triton_kernel).setdefault("_helion_remote_copy_scratch_cache", {})
+    key = (like.device, like.dtype, stream.cuda_stream, slot)
+    scratch = cache.get(key)
+    if scratch is None or scratch.numel() < required_numel:
+        scratch = torch.empty(
+            required_numel,
+            dtype=like.dtype,
+            device=like.device,
+        )
+        cache[key] = scratch
+    return scratch
