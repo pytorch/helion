@@ -21,7 +21,9 @@ CPU/TPU cases of :func:`get_num_sm`) lives in thin wrappers in
 from __future__ import annotations
 
 import contextvars
+import math
 from typing import TYPE_CHECKING
+import weakref
 
 import torch
 
@@ -415,11 +417,30 @@ def default_launcher(
     *args: object,
     num_warps: int,
     num_stages: int,
+    _remote_copy_signal_dst: torch.Tensor | None = None,
+    _remote_copy_signal_slots_per_program: int = 0,
+    _remote_copy_process_group_name: str | None = None,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: object,
 ) -> object:
     """Launch through Triton, caching resolved binaries for repeat calls."""
+    if _remote_copy_signal_slots_per_program:
+        if _remote_copy_signal_dst is None or _remote_copy_process_group_name is None:
+            raise RuntimeError(
+                "remote-copy completion storage requires a symmetric destination "
+                "and process group"
+            )
+        signal = _get_remote_copy_signal(
+            triton_kernel,
+            _remote_copy_signal_dst,
+            _remote_copy_process_group_name,
+            math.prod(grid) * _remote_copy_signal_slots_per_program,
+        )
+        # Allocation zeroes new pads and receive waits reset consumed slots.
+        # Clearing here could erase a completion sent before this rank launches.
+        args = (*args, signal)
+
     option_key = _prepared_options_key(ptx_options, kwargs)
     can_prepare = (
         option_key is not None
@@ -542,3 +563,43 @@ def default_launcher(
         except Exception:
             pass
     return compiled
+
+
+def _get_remote_copy_signal(
+    triton_kernel: object,
+    dst: torch.Tensor,
+    process_group_name: str,
+    required_slots: int,
+) -> torch.Tensor:
+    """Return compiler-owned completion slots from ``dst``'s signal pad."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    cache = vars(triton_kernel).setdefault("_helion_remote_copy_signal_cache", {})
+
+    key = (id(dst), process_group_name)
+    entry = cache.get(key)
+    if entry is not None and entry[0]() is dst:
+        signal_pad = entry[1]
+    else:
+        handle = symm_mem.rendezvous(
+            dst,
+            group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+        )
+        signal_pad = handle.get_signal_pad(handle.rank, dtype=torch.int64)
+
+        def remove_from_cache(_ref: object) -> None:
+            cache.pop(key, None)
+
+        cache[key] = (weakref.ref(dst, remove_from_cache), signal_pad)
+
+    capacity = signal_pad.numel()
+    if required_slots > capacity:
+        raise RuntimeError(
+            "Helion remote copies require "
+            f"{required_slots} int64 completion slots, but the symmetric-memory "
+            f"signal pad has capacity {capacity}. Increase the signal pad size "
+            "before allocating symmetric tensors."
+        )
+    # Reserve from the end so Helion's slots do not overlap PyTorch's standard
+    # low-offset signal-pad protocols.
+    return signal_pad.narrow(0, capacity - required_slots, required_slots)
