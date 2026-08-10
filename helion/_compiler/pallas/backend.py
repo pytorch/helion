@@ -294,6 +294,7 @@ class PallasBackend(Backend):
             "pallas_loop_type",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
+            "pallas_topk_recall_target",
         }
     )
 
