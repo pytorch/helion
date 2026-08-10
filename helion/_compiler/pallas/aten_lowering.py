@@ -32,6 +32,7 @@ from ..aten_lowering import baddbmm_lowering
 from ..aten_lowering import bmm_lowering
 from ..aten_lowering import constant_pad_nd_lowering
 from ..aten_lowering import expand_lowering
+from ..aten_lowering import gather_lowering
 from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
@@ -164,6 +165,31 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(
         f"jnp.broadcast_to({{tensor}}, {shape_str})",
         tensor=tensor,
+    )
+
+
+@gather_lowering.register_codegen("pallas")
+def codegen_gather_pallas(ctx: LoweringContext, node: Node) -> object:
+    """Lower ``torch.gather`` on resident tensors to ``take_along_axis``."""
+    tensor, dim, index = map_arg(node.args[:3], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    assert isinstance(index, ast.AST)
+    if not isinstance(dim, int):
+        raise TypeError(f"pallas gather requires a static dim, got {dim!r}")
+    ndim = node.meta["val"].ndim
+    if dim < 0:
+        dim += ndim
+    if not 0 <= dim < ndim:
+        raise IndexError(f"gather dim {dim} is out of range for rank {ndim}")
+    sparse_grad = (
+        node.args[3] if len(node.args) > 3 else node.kwargs.get("sparse_grad", False)
+    )
+    if sparse_grad:
+        raise NotImplementedError("pallas gather does not support sparse_grad=True")
+    return expr_from_string(
+        f"jnp.take_along_axis({{tensor}}, {{index}}, axis={dim})",
+        tensor=tensor,
+        index=index,
     )
 
 
