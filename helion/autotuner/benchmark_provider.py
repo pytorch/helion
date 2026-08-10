@@ -1705,6 +1705,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             except BenchmarkSubprocessError as e:
                 self.log.warning(f"{desc} subprocess failed: {e}")
                 timing = None
+            except _BenchmarkContractError:
+                raise
             except Exception as e:
                 e.__traceback__ = None
                 if match_unrecoverable_runtime_error(e):

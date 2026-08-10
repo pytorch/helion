@@ -485,6 +485,7 @@ class _FakeBoundKernel:
         worker_failure_indices: list[int] | None = None,
         unique_sources: int = 0,
         source_deduplications: int = 0,
+        include_perf_stats: bool = True,
     ) -> None:
         self.config_spec = config_spec
         self.settings = SimpleNamespace(
@@ -504,6 +505,7 @@ class _FakeBoundKernel:
         self.worker_failures = len(self.worker_failure_indices)
         self.unique_sources = unique_sources
         self.source_deduplications = source_deduplications
+        self.include_perf_stats = include_perf_stats
 
 
 class _FakeLocalBenchmarkProvider:
@@ -582,7 +584,11 @@ class _FakeLocalBenchmarkProvider:
                 self.kernel.timings[index],
                 self.kernel.statuses[index],  # type: ignore[arg-type]
                 self.kernel.compile_times[index],
-                (_perf_stats(self.kernel.timings[index]),),
+                (
+                    (_perf_stats(self.kernel.timings[index]),)
+                    if self.kernel.include_perf_stats
+                    else ()
+                ),
             )
             for index, config in enumerate(configs)
         ]
@@ -658,6 +664,18 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
             self.assertEqual(desc, f"joint shape {index + 1}")
             self.assertEqual(received[0].block_sizes, [64])
             self.assertIsNot(received[0], configs[0])
+
+    def test_successful_child_without_perf_stats_raises(self) -> None:
+        spec = _make_config_spec()
+        provider, _ = self._make_provider(
+            [
+                _FakeBoundKernel(spec, [1.0], include_perf_stats=False),
+                _FakeBoundKernel(spec, [4.0]),
+            ]
+        )
+
+        with self.assertRaisesRegex(TypeError, "must provide one"):
+            provider.benchmark([Config(block_sizes=[64])])
 
     def test_deduplicated_child_result_is_successful(self) -> None:
         spec = _make_config_spec()

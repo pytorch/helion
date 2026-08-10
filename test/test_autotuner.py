@@ -6916,6 +6916,22 @@ class TestAutotuneBudget(TestCase):
                 helion.Config(block_sizes=[1]), lambda: None
             )
 
+    def test_isolated_stats_contract_failure_propagates(self) -> None:
+        provider = self._make_stub_provider()
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._benchmark_worker = Mock()
+        provider._benchmark_worker.run.return_value = 1.0
+        provider._subprocess_benchmark_enabled = lambda: True
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+                return_value=object(),
+            ),
+            self.assertRaisesRegex(TypeError, "return_mode=.?stats"),
+        ):
+            provider.benchmark_isolated([lambda: None], warmup=1, rep=1)
+
     def test_compiler_seed_alias_marks_source_for_timeout_retry(self) -> None:
         provider = self._make_stub_provider()
         provider.config_spec = SimpleNamespace(
