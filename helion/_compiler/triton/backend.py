@@ -386,6 +386,8 @@ class TritonBackend(Backend):
             "triton_helpers": "from torch._inductor.runtime import triton_helpers",
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
+            "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
+            "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
             "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
             "fast_expf": "from triton.language.extra.libdevice import fast_expf",
@@ -524,6 +526,25 @@ class TritonBackend(Backend):
         out = [*args]
         if has_rng_ops:
             out.append("_rng_seed_buffer")
+        from ..compile_environment import CompileEnvironment
+        from ..device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        if device_fn.triton_remote_copy_signal_slots:
+            signal_dst = device_fn.triton_remote_copy_signal_dst
+            assert signal_dst is not None
+            process_group_name = CompileEnvironment.current().process_group_name
+            if process_group_name is None:
+                raise exc.BackendUnsupported(
+                    "triton", "remote copies require an active process group"
+                )
+            out.extend(
+                [
+                    f"_remote_copy_signal_dst={signal_dst}",
+                    f"_remote_copy_signal_slots_per_program={device_fn.triton_remote_copy_signal_slots}",
+                    f"_remote_copy_process_group_name={process_group_name!r}",
+                ]
+            )
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
