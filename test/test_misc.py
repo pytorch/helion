@@ -735,6 +735,25 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
 
+    def test_builtin_min_max_over_scalar_tensors(self) -> None:
+        """min()/max() mixing a loaded 0-D tensor with an int must pick correctly.
+
+        The Pallas worklist rewrites such a bound into its own metadata, so the
+        traced op is dead there and a min/max mix-up would not show up in those
+        numerics.  Here the value reaches the output.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def clamp_kernel(values):
+            out = torch.zeros_like(values)
+            for i in hl.grid(values.size(0)):
+                out[i] = min(max(values[i], 3), 7)
+            return out
+
+        values = torch.tensor([-5, 0, 3, 4, 7, 9], dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(clamp_kernel, (values,))
+        torch.testing.assert_close(result, values.clamp(3, 7))
+
     def test_torch_tensor_constant_in_kernel(self):
         """Test that torch.tensor() with a constant value works inside a kernel."""
 
@@ -1173,6 +1192,36 @@ class TestTritonExactGelu(RefEagerTestBase, TestCase):
         self.assertIn("tl.bfloat16", code)
 
 
+class TestHelionCutePrinter(TestCase):
+    def test_compound_division_operands_are_parenthesized(self) -> None:
+        import sympy
+        from torch.utils._sympy.functions import CeilDiv
+        from torch.utils._sympy.functions import CleanDiv
+        from torch.utils._sympy.functions import FloorDiv
+        from torch.utils._sympy.functions import PythonMod
+
+        from helion._compiler.cute.printer import cute_texpr
+
+        x = sympy.Symbol("x", integer=True)
+        expressions = (
+            FloorDiv(2 * x + 1, 128),
+            PythonMod(2 * x + 1, 32),
+            sympy.Function.__new__(
+                CleanDiv, 2 * x + 1, sympy.Integer(128), evaluate=False
+            ),
+            sympy.Function.__new__(
+                CeilDiv, 2 * x + 1, sympy.Integer(128), evaluate=False
+            ),
+        )
+        for expression in expressions:
+            rendered = cute_texpr(expression)
+            for value in (0, 31, 64, 129):
+                self.assertEqual(
+                    eval(rendered, {"__builtins__": {}}, {"x": value}),
+                    int(expression.subs(x, value)),
+                )
+
+
 @onlyBackends(["triton"])
 class TestHelionTritonPrinter(TestCase):
     """Tests for the HelionTritonPrinter class."""
@@ -1182,7 +1231,7 @@ class TestHelionTritonPrinter(TestCase):
         import sympy
         from torch.utils._sympy.functions import ToFloat
 
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.triton.printer import HelionTritonPrinter
 
         printer = HelionTritonPrinter()
 
@@ -1205,7 +1254,7 @@ class TestHelionTritonPrinter(TestCase):
         """Test that Float expressions are printed as raw literals."""
         import sympy
 
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.triton.printer import HelionTritonPrinter
 
         printer = HelionTritonPrinter()
 
@@ -1230,7 +1279,7 @@ class TestHelionTritonPrinter(TestCase):
         from torch.utils._sympy.functions import FloorDiv
 
         from helion._compiler.device_function import DeviceFunction
-        from helion._compiler.device_function import HelionTritonPrinter
+        from helion._compiler.triton.printer import HelionTritonPrinter
 
         printer = HelionTritonPrinter()
 

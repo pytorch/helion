@@ -155,6 +155,13 @@ def _env_get_str(var_name: str, default: str) -> str:
     return value
 
 
+def _env_get_str_or_none(var_name: str, default: str | None) -> str | None:
+    value = os.environ.get(var_name)
+    if value is None or (value := value.strip()) == "":
+        return default
+    return value
+
+
 def _get_index_dtype() -> torch.dtype | None:
     value = os.environ.get("HELION_INDEX_DTYPE")
     if value is None or (token := value.strip()) == "":
@@ -339,8 +346,8 @@ def _get_dot_precision() -> DotPrecision:
                 "high": "high",
                 "highest": "highest",
                 "bfloat16": "default",
-                "tensorfloat32": "high",
-                "float32": "highest",
+                "tensorfloat32": "default",
+                "float32": "default",
             },
         )
 
@@ -407,6 +414,9 @@ class _Settings:
             "HELION_AUTOTUNE_FORCE_PERSISTENT",
             False,
         )
+    )
+    distributed: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED", False)
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
@@ -595,6 +605,21 @@ class _Settings:
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
         )
     )
+    autotune_log_search_space: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE", False
+        )
+    )
+    autotune_log_search_space_verbose: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE", False
+        )
+    )
+    autotune_log_search_space_path: str | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_str_or_none, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH", None
+        )
+    )
 
 
 class Settings(_Settings):
@@ -617,10 +642,11 @@ class Settings(_Settings):
             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
-        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, can be 'default', 'high', 'highest' (mapped to JAX precision). Unified mappings exist so that any value can be used on any backend.",
+        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
         "fast_math": (
             "If True, enable fast math approximations (Helion-level and Inductor-level). "
-            "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
+            "May reduce numerical precision and change NaN/Inf behavior. "
+            "Set HELION_FAST_MATH=1 to enable."
         ),
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
@@ -633,6 +659,12 @@ class Settings(_Settings):
         "autotune_force_persistent": (
             "If True, restrict pid_type choices to persistent kernels only during config selection. "
             "Set HELION_AUTOTUNE_FORCE_PERSISTENT=1 to force persistent kernel autotuning globally."
+        ),
+        "distributed": (
+            "Force distributed compilation behavior (persistent-only PID types, signal-pad SM "
+            "limits, and process-group resolution). Normally auto-detected from symmetric-memory "
+            "tensor arguments; set this for distributed kernels whose symmetric memory is not passed "
+            "as a detectable tensor. Set HELION_DISTRIBUTED=1 to force globally."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "
@@ -805,6 +837,22 @@ class Settings(_Settings):
             "to pick configs optimal for the actual fused workload. Default False. "
             "Has no effect unless torch_compile_fusion is also True. "
             "Set HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION=1 to enable globally."
+        ),
+        "autotune_log_search_space": (
+            "If True, log search space analysis after autotuning including which features "
+            "were enabled/disabled, total search space size, and coverage metrics. "
+            "Off by default; set HELION_AUTOTUNE_LOG_SEARCH_SPACE=1 to enable."
+        ),
+        "autotune_log_search_space_verbose": (
+            "If True, additionally log each search-space restriction (disabled pid_types, "
+            "tcgen05 narrowing, etc.) live at INFO the moment it is applied during "
+            "compilation, on top of the end-of-run summary. Implies "
+            "autotune_log_search_space. Off by default; set "
+            "HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE=1 to enable."
+        ),
+        "autotune_log_search_space_path": (
+            "Optional path to save search space analysis JSON. "
+            "Set HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/path/to/analysis.json to save."
         ),
     }
 

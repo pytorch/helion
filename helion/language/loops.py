@@ -416,12 +416,27 @@ def _add_config_choices(
             # L2 grouping now supports 3D+ grids by applying to innermost 2 dimensions
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         if not _allow_use_yz_grid(config_spec, block_ids):
-            config_spec.disallow_pid_type("xyz")
+            config_spec.disallow_pid_type(
+                "xyz",
+                reason="grid does not fit the y/z launch grid (needs 2-3 grid "
+                "dims with known sizes whose product is below the y/z-grid "
+                "limit, get_max_y_grid(); 65535 on NVIDIA)",
+            )
         # Data-dependent bounds require persistent kernels to ensure cudagraphability
         # (the grid size can't be data-dependent for non-persistent kernels)
         if has_data_dependent_bounds:
-            config_spec.disallow_pid_type("flat")
-            config_spec.disallow_pid_type("xyz")
+            config_spec.disallow_pid_type(
+                "flat",
+                reason="data-dependent loop bounds require a persistent kernel "
+                "(non-persistent grid size cannot be data-dependent) for "
+                "cudagraph support",
+            )
+            config_spec.disallow_pid_type(
+                "xyz",
+                reason="data-dependent loop bounds require a persistent kernel "
+                "(non-persistent grid size cannot be data-dependent) for "
+                "cudagraph support",
+            )
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
     else:

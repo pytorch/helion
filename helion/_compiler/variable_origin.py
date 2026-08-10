@@ -30,11 +30,19 @@ if TYPE_CHECKING:
             dynamism: frozenset[str] | None = None,
             is_derefed_cell_contents: bool = False,
         ) -> None: ...
+
+    class TensorProperty:
+        STRIDE: object
+
+    class TensorPropertySource(Source):
+        def __init__(self, base: Source, prop: object, idx: int) -> None: ...
 else:
     from torch._dynamo.source import AttrSource
     from torch._dynamo.source import GetItemSource
     from torch._dynamo.source import GlobalSource
     from torch._dynamo.source import LocalSource
+    from torch._dynamo.source import TensorProperty
+    from torch._dynamo.source import TensorPropertySource
 
 
 @dataclasses.dataclass
@@ -231,6 +239,24 @@ class TensorSizeOrigin(WrappedOrigin):
 
     def to_source(self) -> Source:
         return GetItemSource(AttrSource(self.value.to_source(), "shape"), self.key)
+
+
+@dataclasses.dataclass
+class TensorStrideOrigin(WrappedOrigin):
+    """Origin of one stride from a tensor argument."""
+
+    key: int
+
+    def host_str(self) -> str:
+        return f"{self.value.host_str()}.stride({self.key!r})"
+
+    def suggest_var_name(self) -> str:
+        return f"{self.value.suggest_var_name()}_stride_{self.key}"
+
+    def to_source(self) -> Source:
+        return TensorPropertySource(
+            self.value.to_source(), TensorProperty.STRIDE, self.key
+        )
 
 
 @dataclasses.dataclass

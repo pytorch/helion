@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import enum
 from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import cast
 
 from ... import exc
 
@@ -16,15 +19,105 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopState
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
+    from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 
+class Tcgen05Orientation(enum.Enum):
+    MN = enum.auto()
+    NM = enum.auto()
+
+
+class Tcgen05GroupedDMode(enum.Enum):
+    NONE = enum.auto()
+    ALL_TILES = enum.auto()
+    EDGE_ONLY = enum.auto()
+
+
 @dataclasses.dataclass(frozen=True)
-class CuteTcgen05StoreValue:
+class CuteTcgen05GroupedPlan:
+    orientation: Tcgen05Orientation
+    layout: str
+    count: str
+    sched_params: str
+    problem_sizes: str
+    starts: str
+    metadata_idx: str
+    group_idx: str
+    cta_tile_idx_m: str
+    cta_tile_idx_n: str
+    problem_m: str
+    problem_n: str
+    problem_k: str
+    global_m_start: str
+    real_groups: str | None = None
+    valid_m: str | None = None
+    store_m: str | None = None
+    direct_pointers: str | None = None
+    direct_strides: str | None = None
+    d_mode: Tcgen05GroupedDMode = Tcgen05GroupedDMode.NONE
+    d_tensormap: str | None = None
+
+    def __post_init__(self) -> None:
+        assert (self.valid_m is None) == (self.store_m is None)
+        assert (self.orientation is Tcgen05Orientation.NM) == (self.valid_m is not None)
+        assert (self.direct_pointers is None) == (self.direct_strides is None)
+        assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
+
+
+class _CuteTcgen05Orientation(Protocol):
+    @property
+    def bm(self) -> int: ...
+
+    @property
+    def bn(self) -> int: ...
+
+    @property
+    def orientation(self) -> Tcgen05Orientation: ...
+
+
+class _CuteTcgen05OrientationMixin:
+    def _orientation(self) -> _CuteTcgen05Orientation:
+        return cast("_CuteTcgen05Orientation", self)
+
+    def _is_nm(self) -> bool:
+        return self._orientation().orientation is Tcgen05Orientation.NM
+
+    @property
+    def source_tile_m(self) -> int:
+        orientation = self._orientation()
+        return orientation.bn if self._is_nm() else orientation.bm
+
+    @property
+    def source_tile_n(self) -> int:
+        orientation = self._orientation()
+        return orientation.bm if self._is_nm() else orientation.bn
+
+    @property
+    def accumulator_view(self) -> str:
+        return "nm" if self._is_nm() else "mn"
+
+    @property
+    def output_view(self) -> str:
+        return self.accumulator_view
+
+    @property
+    def d_store_view(self) -> str:
+        return "nm_transposed" if self._is_nm() else "normal"
+
+    @property
+    def d_store_layout(self) -> str:
+        layout = "COL_MAJOR" if self._is_nm() else "ROW_MAJOR"
+        return f"cutlass.utils.layout.LayoutEnum.{layout}"
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     lifecycle_context: Tcgen05LifecycleContext
+    output_block_ids: tuple[int, ...]
     pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
     bm: int = 0
     bn: int = 0
@@ -41,6 +134,8 @@ class CuteTcgen05StoreValue:
     epilogue_rest_mode: str = ""
     tma_store_atom: str = ""
     tma_store_tensor: str = ""
+    tail_tma_store_atom: str = ""
+    tail_tma_store_tensor: str = ""
     role_local_tile_counter: str = ""
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
@@ -52,6 +147,14 @@ class CuteTcgen05StoreValue:
     explicit_epi_tile_m: int | None = None
     explicit_epi_tile_n: int | None = None
     explicit_d_store_box_n: int | None = None
+    segment_store_m_offset: str = ""
+    segment_store_start: str = ""
+    segment_store_actual_m: str = ""
+    segment_store_valid_m_bound: str = ""
+    segment_store_node: Node | None = None
+    segment_store_row_index: Node | None = None
+    segment_store_valid_m: Node | None = None
+    orientation: Tcgen05Orientation = Tcgen05Orientation.MN
 
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:
@@ -77,7 +180,7 @@ class CuteTcgen05StoreValue:
 
 
 @dataclasses.dataclass(frozen=True)
-class CuteTcgen05MatmulPlan:
+class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     """Kernel-wide tcgen05 collective contract selected by CuTe matmul codegen.
 
     The warp-role order is part of the codegen contract: epilogue warps occupy
@@ -128,6 +231,7 @@ class CuteTcgen05MatmulPlan:
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
     flat_role_launch_warp_count: int | None = None
+    grouped: CuteTcgen05GroupedPlan | None = None
     # Per-anchor auxiliary descriptors discovered by the forward FX walker. This
     # is store-fusion metadata, not a collective compatibility field:
     # two matmuls with identical collective parameters but different downstream
@@ -139,14 +243,22 @@ class CuteTcgen05MatmulPlan:
     )
 
     @property
+    def orientation(self) -> Tcgen05Orientation:
+        return self.grouped.orientation if self.grouped else Tcgen05Orientation.MN
+
+    @property
     def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
         """Aux descriptors staged by the C-input warp.
 
-        Exact-shape MxN aux tensors use the SMEM-ring producer. Broadcast
-        row-vector aux tensors stay on the direct per-thread load path so
-        they do not allocate a full-tile ring for a one-dimensional input.
+        Exact-shape rank-2 MxN aux tensors use the SMEM-ring producer.
+        Broadcast row vectors and leading-passthrough rank-3 residuals stay on
+        the direct per-thread load path; the producer scheduler is 2-D only.
         """
-        return tuple(d for d in self.aux_tensor_descriptors if d.broadcast_axis is None)
+        return tuple(
+            d
+            for d in self.aux_tensor_descriptors
+            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+        )
 
     @property
     def is_clc_persistent(self) -> bool:
@@ -266,6 +378,9 @@ class CuteDeviceFunctionState:
 
     def __init__(self) -> None:
         self._tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
+        self._tcgen05_grouped_tail_proofs: dict[
+            torch.fx.Node, Tcgen05GroupedTailEpilogueMatch
+        ] = {}
         self._tcgen05_consumed_store_value_ids: set[int] = set()
         # tcgen05 TMA-store atom/tensor kernel-arg names are allocated once per
         # matmul accumulator. When a single accumulator fans out to multiple
@@ -347,6 +462,21 @@ class CuteDeviceFunctionState:
         self, name: str, value: CuteTcgen05StoreValue
     ) -> None:
         self._tcgen05_store_values[name] = value
+
+    def register_tcgen05_grouped_tail_proof(
+        self, proof: Tcgen05GroupedTailEpilogueMatch
+    ) -> None:
+        if proof.store_node in self._tcgen05_grouped_tail_proofs:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped tail proof must be unique per store node",
+            )
+        self._tcgen05_grouped_tail_proofs[proof.store_node] = proof
+
+    def grouped_tail_proof_for_store(
+        self, store_node: Node
+    ) -> Tcgen05GroupedTailEpilogueMatch | None:
+        return self._tcgen05_grouped_tail_proofs.get(store_node)
 
     def get_tcgen05_store_value(
         self,

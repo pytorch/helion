@@ -23,14 +23,14 @@ import math
 
 import torch
 
-import helion.experimental
+import helion
 import helion.language as hl
 
 # M at or below this uses the skinny-M kernel (mirrors examples/fp8_gemm.py).
 _SKINNY_M_MAX = 1
 
 
-@helion.experimental.aot_kernel(backend="cute", static_shapes=True)
+@helion.aot_kernel(backend="cute", static_shapes=True)
 def scale_mm_cute(
     x: torch.Tensor,  # [M, K] fp8
     y: torch.Tensor,  # [K, N] fp8
@@ -52,7 +52,7 @@ def scale_mm_cute(
     return out
 
 
-@helion.experimental.aot_kernel(backend="cute", static_shapes=True)
+@helion.aot_kernel(backend="cute", static_shapes=True)
 def scale_mm_cute_skinny_m(
     x: torch.Tensor,  # [M, K] fp8
     y: torch.Tensor,  # [K, N] fp8

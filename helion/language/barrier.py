@@ -4,14 +4,12 @@ import inspect
 from typing import TYPE_CHECKING
 
 from .. import exc
-from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.type_info import BarrierResultType
 from .._compiler.type_info import LiteralType
 from . import _decorators
 
 if TYPE_CHECKING:
-    from .._compiler.inductor_lowering import CodegenState
     from .._compiler.variable_origin import Origin
 
 __all__ = ["barrier"]
@@ -39,22 +37,14 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
     # so force persistent kernels (other PID choices are incompatible).
     env.has_barrier = True
     for disallowed in ("flat", "xyz", "persistent_interleaved"):
-        env.config_spec.disallow_pid_type(disallowed)
+        env.config_spec.disallow_pid_type(
+            disallowed,
+            reason="hl.barrier() forces a persistent kernel (sequential phase "
+            "boundary between top-level loops); this pid_type is incompatible",
+        )
 
     # Return None literal with a dedicated marker type.
     return BarrierResultType(origin=origin, value=None)
-
-
-@_decorators.codegen(barrier, "triton")
-def _(state: CodegenState) -> object:
-    # No device code emitted; barrier only affects host-side scheduling.
-    return expr_from_string("None")
-
-
-@_decorators.codegen(barrier, "cute")
-def _(state: CodegenState) -> object:
-    # Marker only; persistent phase synchronization is still unsupported on CuTe.
-    return expr_from_string("None")
 
 
 @_decorators.ref(barrier)

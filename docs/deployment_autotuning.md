@@ -207,6 +207,104 @@ The budget is checked between generations and during the finishing
 phase. In-flight compiling and benchmarking completes before the
 search stops. The default is ``None`` (no budget).
 
+## Search Space Analysis
+
+Helion can log a search space analysis after each autotune run (opt-in, disabled by default). This feature helps you understand:
+
+- **Which features are being searched** — Shows enabled/disabled config keys and why (backend constraints, hardware limits, kernel properties)
+- **Total search space size** — The exact combinatorial product of all search dimensions' cardinalities (an arbitrary-precision integer that can be very large; reported as ``unknown`` only when a dimension's cardinality can't be determined)
+- **Coverage metrics** — How many configs were tested vs. total space
+- **Per-feature exploration** — Exactly how many options of each feature were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
+
+Two verbosity levels are available:
+
+- **Summary** (``autotune_log_search_space``) — the end-of-run report shown below.
+- **Verbose** (``autotune_log_search_space_verbose``) — additionally logs each restriction *live* at ``INFO`` the moment it is applied during compilation, so you can see *why* the search space shrank as it happens. Enabling verbose implies the summary. Example live lines:
+
+  ```
+  Autotuner feature restriction: pid_type='xyz' disabled (data-dependent loop bounds require a persistent kernel ...)
+  Autotuner feature restriction: tcgen05 search narrowed to validated configs (matmul kernel with CuTe tcgen05 backend)
+  ```
+
+### Example Output
+
+```
+============================================================
+Autotune Search Space Analysis
+============================================================
+Search space for flash_attention_fwd:
+  Backend: cute, Hardware: NVIDIA H100
+  Total search space size: 2,457,600
+  Search dimensions: 8
+  Disabled features (12):
+    - num_warps: CuTe backend (uses num_threads)
+    - pallas_loop_type: CuTe backend (no Pallas loops)
+    - epilogue_subtile: flash attention search (disabled)
+  Search algorithm: DifferentialEvolutionSearch
+  Time: 245.3s, Configs tested: 128
+  Configs attempted: 512 (500 valid, 12 invalid, 97.7% valid)
+  Overall search space coverage: 0.005208%
+  Per-feature exploration:
+    Average feature coverage: 31.2%
+    Minimum feature coverage: 8.3%
+    - loop_orders: 12/120 options tested (10.0%)
+    - pid_type: 2/8 options tested (25.0%)
+    - num_threads: 128/256 options tested (50.0%)
+
+  Features with <50% exploration:
+    - loop_orders: only 12 of 120 values tested
+    - pid_type: only 2 of 8 values tested
+
+Search Coverage:
+  Configs tested: 128
+  Total space: 2,457,600
+  Coverage: 0.005208%
+  Search algorithm: DifferentialEvolutionSearch
+  Time elapsed: 245.3s
+```
+
+### Configuration
+
+Control via environment variables or settings:
+
+```bash
+# Enable search space logging (disabled by default)
+export HELION_AUTOTUNE_LOG_SEARCH_SPACE=1
+
+# Additionally log each restriction live as it is applied during compilation
+# (implies HELION_AUTOTUNE_LOG_SEARCH_SPACE=1). Useful for seeing *why* the
+# search space shrank, e.g. which pid_types were disabled and why.
+export HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE=1
+
+# Save analysis to JSON files (also requires HELION_AUTOTUNE_LOG_SEARCH_SPACE=1).
+# The kernel name and autotuner cache hash are injected into the filename stem,
+# so distinct kernels/shapes write separate files instead of overwriting.
+export HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/tmp/analysis.json
+# Creates, per kernel/shape:
+#   /tmp/analysis.<kernel>.<hash>.json  (search space + exploration report)
+```
+
+Or via decorator:
+
+```python
+@helion.kernel(
+    autotune_log_search_space=True,
+    autotune_log_search_space_verbose=True,
+    autotune_log_search_space_path="/tmp/analysis.json",
+)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+### Use Cases
+
+1. **Debugging search quality** — Identify if the search algorithm is getting stuck (e.g., only testing 2 of 8 PID types)
+2. **Budget tuning** — Low overall coverage suggests increasing `autotune_budget_seconds`
+3. **Backend comparison** — Compare search spaces across different backends or hardware
+4. **Constraint validation** — Verify that shape-dependent constraints are working as expected
+
+See :py:mod:`helion.autotuner.search_space_logger` for API details.
+
 ## Remote Autotune Cache
 
 Helion ships an ABC, `RemoteCacheBackend`, so the autotune cache can
@@ -410,6 +508,11 @@ result3 = rms_norm_fwd(torch.randn([2048, 2048], device="cuda"), weight_2048)  #
 Use `hl.specialize()` when a dimension is performance-critical and you want
 it specialized regardless of how the kernel is called.
 
+Tensor strides can be specialized in the same way, for example
+`row_stride = hl.specialize(x.stride(0))`. The stride is inlined in generated
+code and included in the kernel cache key, so inputs with different layouts
+compile separate variants.
+
 ### `torch._dynamo.mark_static()` - External Specialization
 
 Use `torch._dynamo.mark_static()` **before** calling the kernel to specialize
@@ -555,18 +658,18 @@ ship pretuned heuristic files that demonstrate this end-to-end.
 
 ### Quick start: decorate a kernel for AOT
 
-Use {py:func}`helion.experimental.aot_kernel` instead of
+Use {py:func}`helion.aot_kernel` instead of
 {py:func}`helion.kernel`.  The decorator wires the kernel into an
 {py:class}`~helion.autotuner.aot_cache.AOTAutotuneCache`, which is what
 loads the generated heuristic at runtime:
 
 ```python
 import torch
-import helion.experimental
+import helion
 import helion.language as hl
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
@@ -593,7 +696,7 @@ The decorator accepts a few extras:
 
 See [`examples/aot_example.py`](https://github.com/pytorch/helion/blob/main/examples/aot_example.py)
 for runnable demonstrations of each option, and
-[`helion/experimental/aot_kernel.py`](https://github.com/pytorch/helion/blob/main/helion/experimental/aot_kernel.py)
+[`helion/autotuner/aot_kernel.py`](https://github.com/pytorch/helion/blob/main/helion/autotuner/aot_kernel.py)
 for the full decorator reference.
 
 ### Offline workflow: collect → measure → evaluate
@@ -602,7 +705,7 @@ The AOT runner orchestrates a three-phase workflow over a benchmark
 script that exercises the kernel across the shapes you care about:
 
 ```bash
-python -m helion.experimental.aot_runner -- python my_benchmark.py
+python -m helion.autotuner.aot_runner -- python my_benchmark.py
 ```
 
 `my_benchmark.py` is *your* script — it imports the kernel and calls it
@@ -624,7 +727,7 @@ times with different `HELION_AOT_MODE` settings:
    companion list of configs is the output of subset selection from
    the measure phase.
 
-Useful runner flags (run `python -m helion.experimental.aot_runner --help`
+Useful runner flags (run `python -m helion.autotuner.aot_runner --help`
 for the full list):
 
 - `--kernel <name>` — restrict the workflow to specific kernels.
@@ -737,7 +840,7 @@ target.
    actual hardware you are targeting — not the laptop you happen to
    be editing on.
 
-2. **Confirm the kernel uses `@helion.experimental.aot_kernel(...)`**
+2. **Confirm the kernel uses `@helion.aot_kernel(...)`**
    (see *Quick start* above).
 
 3. **Run the AOT workflow.**  Point the runner at any benchmark script
@@ -745,10 +848,10 @@ target.
 
    ```bash
    # Tutorial example: tune layer_norm on the current GPU.
-   python -m helion.experimental.aot_runner -- python pretuned_kernels/layer_norm/layer_norm.py
+   python -m helion.autotuner.aot_runner -- python pretuned_kernels/layer_norm/layer_norm.py
 
    # User-authored kernel: same pattern.
-   python -m helion.experimental.aot_runner -- python my_benchmark.py
+   python -m helion.autotuner.aot_runner -- python my_benchmark.py
    ```
 
    The three phases run back-to-back.  Plan for a long wall-clock —

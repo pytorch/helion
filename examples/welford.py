@@ -48,15 +48,15 @@ def welford(
         acc_m2 = torch.zeros_like(acc_cnt)
 
         for tile_n in hl.tile(n):
-            chunk = x[tile_m, tile_n]
+            valid = tile_n.index < n
+            chunk = x[tile_m, tile_n].to(torch.float32)
             # Count of VALID columns (the divisor): use the true valid count, not the constexpr
             # tile width (over-counts last-tile padding). Cast the mask to int32 BEFORE summing —
             # a bool operand gives CuTe a saturating accumulator (-> NaN).
-            Tn = (tile_n.index < n).to(torch.int32).sum()
-            sum_x = torch.sum(chunk, dim=-1)
-            sum_x2 = torch.sum(chunk * chunk, dim=-1)
-            mean_c = sum_x / Tn
-            m2_c = sum_x2 - (sum_x * sum_x) / Tn
+            Tn = valid.to(torch.int32).sum()
+            mean_c = torch.sum(chunk, dim=-1) / Tn
+            centered = torch.where(valid, chunk - mean_c[:, None], 0.0)
+            m2_c = torch.sum(centered * centered, dim=-1)
 
             delta = mean_c - acc_mean
             new_cnt = acc_cnt + Tn
@@ -70,12 +70,12 @@ def welford(
         rstd_col = rstd_tile[:, None]
 
         for tile_n in hl.tile(n):
-            xi_chuck = x[tile_m, tile_n]
-            w_chuck = weight[tile_n][None, :]
-            b_chuck = bias[tile_n][None, :]
+            xi_chunk = x[tile_m, tile_n].to(torch.float32)
+            w_chunk = weight[tile_n][None, :]
+            b_chunk = bias[tile_n][None, :]
 
-            y = (xi_chuck - mean_col) * rstd_col
-            y = y * w_chuck + b_chuck
+            y = (xi_chunk - mean_col) * rstd_col
+            y = y * w_chunk + b_chunk
 
             out[tile_m, tile_n] = y.to(x.dtype)
     return out

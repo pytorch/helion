@@ -77,6 +77,7 @@ import types
 from typing import Any
 from typing import Callable
 from typing import Iterator
+from typing import Protocol
 from typing import cast
 
 import torch
@@ -86,6 +87,23 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
 ALL_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
 HELION_IMPLS = ("helion-cute", "helion-triton")
+
+
+class _ConfigLike(Protocol):
+    config: dict[str, object]
+
+
+class _ConfigSpecWithFlashSeeds(Protocol):
+    compiler_default_config: object | None
+    compiler_seed_configs: list[_ConfigLike]
+
+    def default_config(self) -> _ConfigLike: ...
+
+
+class _BoundWithConfigSpec(Protocol):
+    @property
+    def config_spec(self) -> _ConfigSpecWithFlashSeeds: ...
+
 
 _FA4_REPO = "https://github.com/Dao-AILab/flash-attention.git"
 _FA4_DEFAULT_REF = "v2.8.3"
@@ -568,9 +586,14 @@ def _shape_dict(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _helion_codegen_markers(code: str) -> dict[str, bool]:
+    tcgen05_prefixes = ("cute.nvgpu.tcgen05.", "cute_tcgen05_flash.")
     return {
-        "uses_tcgen05": "cute.nvgpu.tcgen05.CtaGroup" in code,
-        "uses_tcgen05_two_cta": "cute.nvgpu.tcgen05.CtaGroup.TWO" in code,
+        "uses_tcgen05": any(prefix in code for prefix in tcgen05_prefixes),
+        "uses_tcgen05_two_cta": any(
+            f"{prefix}CtaGroup.TWO" in code for prefix in tcgen05_prefixes
+        )
+        or "is_two_cta=True" in code
+        or "'use_2cta_instrs': True" in code,
         "uses_tma_umma_pipeline": "PipelineTmaUmma.create(" in code,
     }
 
@@ -657,6 +680,23 @@ def _make_helion_config(
             config["block_sizes"] = [1, 128, 128]
     config.update(config_overrides)
     return config, config_overrides
+
+
+def _compiler_flash_seed_config(
+    bound: object, backend: str
+) -> dict[str, object] | None:
+    if backend != "cute":
+        return None
+    config_spec = cast("_BoundWithConfigSpec", bound).config_spec
+    if config_spec.compiler_default_config is not None:
+        default_config = dict(config_spec.default_config().config)
+        if any(key.startswith("cute_flash_") for key in default_config):
+            return default_config
+    for seed in config_spec.compiler_seed_configs:
+        seed_config = dict(seed.config)
+        if any(key.startswith("cute_flash_") for key in seed_config):
+            return seed_config
+    return None
 
 
 def _benchmark_sdpa(args: argparse.Namespace) -> dict[str, Any]:
@@ -962,12 +1002,7 @@ def _benchmark_helion(args: argparse.Namespace) -> dict[str, Any]:
 
     with _scrubbed_argv():
         bound = kernel.bind(kernel_args)
-        compiler_seed_config = (
-            dict(bound.config_spec.default_config().config)
-            if backend == "cute"
-            and bound.config_spec.compiler_default_config is not None
-            else None
-        )
+        compiler_seed_config = _compiler_flash_seed_config(bound, backend)
         fixed_config, config_overrides = _make_helion_config(args, compiler_seed_config)
         notes: list[str] = []
         if bias is not None and backend == "cute":

@@ -1353,6 +1353,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
 
+            def set_compiler_seed_configs(self, configs) -> None:
+                pass
+
             def set_budget_exceeded_fn(self, fn) -> None:
                 pass
 
@@ -1365,7 +1368,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=7,
                     num_compile_failures=1,
+                    num_worker_failures=2,
                     num_accuracy_failures=2,
+                    num_unique_sources=3,
+                    num_source_deduplications=4,
                     num_generations=3,
                 )
                 llm_instances.append(self)
@@ -1395,7 +1401,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=11,
                     num_compile_failures=3,
+                    num_worker_failures=4,
                     num_accuracy_failures=5,
+                    num_unique_sources=5,
+                    num_source_deduplications=6,
                     num_generations=6,
                 )
                 self.seed_configs = None
@@ -1409,7 +1418,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(),
+            config_spec=SimpleNamespace(compiler_seed_timeout_retry_repetitions=None),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)
@@ -1446,7 +1455,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         self.assertEqual(lfbo_instances[0].seed_configs, [Config(num_warps=4)])
         self.assertEqual(search._autotune_metrics.num_configs_tested, 18)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 4)
+        self.assertEqual(search._autotune_metrics.num_worker_failures, 6)
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 7)
+        self.assertEqual(search._autotune_metrics.num_unique_sources, 8)
+        self.assertEqual(search._autotune_metrics.num_source_deduplications, 10)
         self.assertEqual(search._autotune_metrics.num_generations, 9)
         self.assertEqual(search.hybrid_stage_breakdown["llm_seed_configs_tested"], 7)
         self.assertEqual(
@@ -1498,6 +1510,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=4,
                     num_compile_failures=1,
+                    num_worker_failures=1,
                     num_accuracy_failures=0,
                     num_generations=2,
                 )
@@ -1529,6 +1542,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(
                     num_configs_tested=6,
                     num_compile_failures=2,
+                    num_worker_failures=2,
                     num_accuracy_failures=1,
                     num_generations=5,
                 )
@@ -1580,6 +1594,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         )
         self.assertEqual(search._autotune_metrics.num_configs_tested, 10)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 3)
+        self.assertEqual(search._autotune_metrics.num_worker_failures, 3)
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
         self.assertEqual(search._autotune_metrics.num_generations, 7)
 
@@ -1594,6 +1609,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         class FakeBenchmarkProvider:
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
+
+            def set_compiler_seed_configs(self, configs) -> None:
+                pass
 
             def set_budget_exceeded_fn(self, fn) -> None:
                 pass
@@ -1614,7 +1632,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(),
+            config_spec=SimpleNamespace(compiler_seed_timeout_retry_repetitions=None),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)

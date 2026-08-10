@@ -13,7 +13,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from helion.language._gelu_tanh_approx import GELU_ERF_INV_SQRT2
 
 if TYPE_CHECKING:
-    from cutlass._mlir import ir
+    from ._mlir_compat import ir
 
 # Heuristic compile-time cap: the target tcgen05 epilogue fragments are
 # well below this, while larger pointwise tiles should avoid thousands

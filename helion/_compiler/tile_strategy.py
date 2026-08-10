@@ -960,7 +960,7 @@ def _split_lane_loop_with_register_stash(
         frag_by_name[name] = frag
         dtype = _stash_dtype_for_value(name, body, markers)
         decls.append(
-            statement_from_string(f"{frag} = cute.make_fragment({extent}, {dtype})")
+            statement_from_string(f"{frag} = cute.make_rmem_tensor({extent}, {dtype})")
         )
 
     def read_stash_stmts() -> list[ast.AST]:
@@ -1870,7 +1870,9 @@ class ForiLoopState(DeviceLoopOrGridState):
     Uses jax.lax.fori_loop with pltpu.make_async_copy for tensors whose
     inner-block shape passes ``_check_dma_alignment``; tensors that fail
     are kept on their outer BlockSpec and accessed via ``pl.ds`` from the
-    body.  Per-tensor pipelining membership lives in ``_tensor_to_dma_scratch``.
+    body. Per-tensor pipelining membership lives in
+    ``_tensor_to_dma_scratch``; input tensors with an overlapped prefetch are
+    recorded in ``_prefetched_load_tensors``.
     """
 
     body_fn_name: str
@@ -1880,6 +1882,7 @@ class ForiLoopState(DeviceLoopOrGridState):
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
+    _prefetched_load_tensors: set[str] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass

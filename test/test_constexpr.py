@@ -14,6 +14,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -272,6 +273,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile_config not supported in ref eager mode")
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    @skipIfCute("cute backend does not support ConstExpr launcher scalar arguments")
     def test_block_size_constexpr_branch_selects_per_config(self):
         """A branch whose condition depends on a block size must pick the branch
         per-config, not freeze one branch during the single frontend pass
@@ -298,6 +300,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, expected)
 
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    @skipIfCute("cute backend does not support mixed tcgen05 matmul collective plans")
     def test_block_size_constexpr_branch_divergent_shapes(self):
         """Branches selected by a block-size constexpr may use variables with
         different shapes -- e.g. a swap-AB GEMM that transposes its accumulator

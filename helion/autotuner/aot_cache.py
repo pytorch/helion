@@ -38,10 +38,10 @@ from typing import Literal
 import torch
 
 from .._hardware import get_hardware_info
-from ..experimental.aot_kernel import _flatten_key_value
-from ..experimental.aot_kernel import extract_key_features
-from ..experimental.aot_kernel import extract_shape_features
 from ..runtime.config import Config
+from .aot_kernel import _flatten_key_value
+from .aot_kernel import extract_key_features
+from .aot_kernel import extract_shape_features
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
@@ -552,7 +552,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 print(
                     f"[AOT] Warning: No heuristic found for '{kernel_name}'. "
                     f"Using default config. "
-                    f"Use `python -m helion.experimental.aot_runner` to generate tuned configs.",
+                    f"Use `python -m helion.autotuner.aot_runner` to generate tuned configs.",
                     file=sys.stderr,
                 )
         return self.autotuner.config_spec.default_config()
@@ -845,7 +845,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 )
 
         # -- emit standalone file -------------------------------------------
-        from ..experimental.aot_compile import generate_standalone_file
+        from .aot_compile import generate_standalone_file
 
         out_path = generate_standalone_file(
             kernel_name=kernel_name,

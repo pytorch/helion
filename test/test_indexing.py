@@ -11,6 +11,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
 from helion import _compat
+from helion import exc
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
@@ -712,6 +713,34 @@ class TestIndexing(RefEagerTestBase, TestCase):
                         self.assertIn(indexing, code_test)
                         self.assertIn("tl.where", code_test)
                     torch.testing.assert_close(result_test, result_pointer)
+
+    def test_extra_mask_load_size_one_dim(self):
+        """An extra_mask load whose only block index hits a size-1 dimension."""
+
+        @helion.kernel(static_shapes=True)
+        def gather_rows(
+            x: torch.Tensor,
+            base: torch.Tensor,
+            valid: torch.Tensor,
+            out: torch.Tensor,
+        ) -> None:
+            for tile_j, tile_r in hl.tile(
+                [out.size(0), out.size(1)], block_size=[1, None]
+            ):
+                j = tile_j.begin
+                v = tile_r.index < valid[j]
+                xt = hl.load(x, [base[j] + tile_r.index, 0], extra_mask=v)
+                out[tile_j.begin, tile_r] = torch.where(v, xt, 0)
+
+        # x.size(0) == 1 makes the row index fold away, leaving a scalar offset.
+        x = torch.randn(1, 4, device=DEVICE, dtype=HALF_DTYPE)
+        base = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        valid = torch.ones(1, device=DEVICE, dtype=torch.int32)
+        out = x.new_empty(1, 8)
+        code_and_output(gather_rows, (x, base, valid, out), block_size=[8])
+        expected = torch.zeros_like(out)
+        expected[0, 0] = x[0, 0]
+        torch.testing.assert_close(out, expected)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @skipIfRefEager("test checks generated Triton code")
@@ -1777,7 +1806,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src2_result, expected_src2)
         torch.testing.assert_close(dst2_result, expected_dst2)
 
-    @skipIfNormalMode("InternalError: Negative indexes")
+    @xfailIfCute("InternalError: Negative indexes")
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
@@ -1803,9 +1832,43 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
-    )
+    @xfailIfCute("InternalError: Negative indexes")
+    def test_negative_indexing_multidim(self):
+        """Test negative indexing on multiple dimensions: x[-1, -1]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            for _ in hl.grid(1):
+                x[-1, -1] = 42.0
+            return x
+
+        M, N = 64, 128
+        x = torch.zeros([M, N], device=DEVICE)
+        result = kernel(x)
+
+        expected = torch.zeros([M, N], device=DEVICE)
+        expected[-1, -1] = 42.0
+        torch.testing.assert_close(result, expected)
+
+    @xfailIfCute("InternalError: Negative indexes")
+    def test_negative_indexing_with_tile(self):
+        """Test mixed tile and negative index: x[tile, -1]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            (rows,) = x.shape[:1]
+            for tile_r in hl.tile(rows):
+                x[tile_r, -1] = 1.0
+            return x
+
+        M, N = 64, 128
+        x = torch.zeros([M, N], device=DEVICE)
+        result = kernel(x)
+
+        expected = torch.zeros([M, N], device=DEVICE)
+        expected[:, -1] = 1.0
+        torch.testing.assert_close(result, expected)
+
     def test_ellipsis_indexing(self):
         """Test both setter from scalar and getter for [..., i]"""
 
@@ -1830,6 +1893,114 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_dst = torch.ones([2, 3, N], device=DEVICE)
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+    def test_ellipsis_trailing(self):
+        """Test trailing ellipsis: x[i, ...]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[0]
+            for i in hl.grid(N):
+                dst[i, ...] = 1.0
+                src[i, ...] = dst[i, ...]
+            return src, dst
+
+        N = 8
+        src = torch.zeros([N, 4, 16], device=DEVICE)
+        dst = torch.zeros([N, 4, 16], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        expected = torch.ones([N, 4, 16], device=DEVICE)
+        torch.testing.assert_close(src_result, expected)
+        torch.testing.assert_close(dst_result, expected)
+
+    def test_ellipsis_middle(self):
+        """Test middle ellipsis: x[i, ..., j]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            M, N = x.shape[0], x.shape[-1]
+            for i in hl.grid(M):
+                for j in hl.grid(N):
+                    x[i, ..., j] = 42.0
+            return x
+
+        x = torch.zeros([4, 8, 16], device=DEVICE)
+        result = kernel(x)
+
+        expected = torch.full([4, 8, 16], 42.0, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    def test_ellipsis_bare(self):
+        """Test bare ellipsis: x[...]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            for _ in hl.grid(1):
+                x[...] = 7.0
+            return x
+
+        x = torch.zeros([4, 8], device=DEVICE)
+        result = kernel(x)
+
+        expected = torch.full([4, 8], 7.0, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    def test_ellipsis_with_none(self):
+        """Test ellipsis with None (newaxis): x[None, ..., i]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            N = x.shape[-1]
+            for i in hl.grid(N):
+                x[None, ..., i] = 1.0
+            return x
+
+        x = torch.zeros([4, 8], device=DEVICE)
+        result = kernel(x)
+
+        expected = torch.ones([4, 8], device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("Type inference errors are not raised in ref eager mode")
+    def test_ellipsis_multiple_error(self):
+        """Multiple ellipses should raise an error"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            for _ in hl.grid(1):
+                x[..., ...] = 1.0
+            return x
+
+        x = torch.zeros([4, 8], device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.TypeInferenceError,
+            r"an index can only have a single ellipsis",
+        ):
+            code_and_output(kernel, (x,))
+
+    @skipIfRefEager("Type inference errors are not raised in ref eager mode")
+    def test_ellipsis_over_indexing_error(self):
+        """Too many indices with ellipsis should raise an error"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            M, N = x.shape
+            for i in hl.grid(M):
+                for j in hl.grid(N):
+                    for k in hl.grid(1):
+                        x[i, j, k, ...] = 1.0
+            return x
+
+        x = torch.zeros([4, 8], device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.TypeInferenceError,
+            r"too many indices for tensor of dimension 2",
+        ):
+            code_and_output(kernel, (x,))
 
     @skipIfNormalMode(
         "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
@@ -2059,9 +2230,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "InternalError: AssertionError in type_propagation.py - slice indexing error"
-    )
+    @xfailIfCute("incorrect results on cute backend")
     def test_range_slice_dynamic(self):
         """Test both [i:i+1] = scalar and [i] = [i:i+1] patterns"""
 
