@@ -32,6 +32,7 @@ from helion.autotuner.benchmark_provider import _aggregate_multi_shape_timings
 from helion.autotuner.benchmark_provider import _format_selected_multi_shape_measurement
 from helion.autotuner.benchmark_provider import _materialize_multi_shape_config
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
@@ -459,6 +460,17 @@ class _Log:
         pass
 
 
+def _perf_stats(median: float) -> PerfStats:
+    return PerfStats(
+        min=median,
+        median=median,
+        mean=median,
+        p90=median,
+        std=0.0,
+        n_samples=1,
+    )
+
+
 class _FakeBoundKernel:
     def __init__(
         self,
@@ -570,6 +582,7 @@ class _FakeLocalBenchmarkProvider:
                 self.kernel.timings[index],
                 self.kernel.statuses[index],  # type: ignore[arg-type]
                 self.kernel.compile_times[index],
+                (_perf_stats(self.kernel.timings[index]),),
             )
             for index, config in enumerate(configs)
         ]
@@ -622,6 +635,10 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
 
         self.assertEqual([result.perf for result in results], [2.0, 4.0])
         self.assertEqual([result.compile_time for result in results], [0.2, 0.4])
+        self.assertEqual(
+            [[stats.median for stats in result.perf_stats] for result in results],
+            [[1.0, 4.0], [8.0, 2.0]],
+        )
         self.assertIs(results[0].config, configs[0])
         self.assertIs(results[1].config, configs[1])
         self.assertEqual(metrics.num_configs_tested, 2)
