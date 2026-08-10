@@ -67,8 +67,7 @@ def _(state: CodegenState) -> ast.AST:
 
     assert state.fx_node is not None
     if _resident_plan(state.fx_node) is not None:
-        # pyrefly: ignore [missing-attribute]
-        return load._codegen["pallas_ref"](state)
+        return _codegen_resident_load(state)
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -82,8 +81,7 @@ def _(state: CodegenState) -> ast.AST:
     return pallas_codegen.load_expr(state, list(subscript), tensor)
 
 
-@_decorators.codegen(load, "pallas_ref")
-def _(state: CodegenState) -> ast.AST:
+def _codegen_resident_load(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)

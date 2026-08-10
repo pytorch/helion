@@ -67,7 +67,7 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
     from .view_ops import _resident_plan
 
     if _resident_plan(node) is not None:
-        return codegen_view_pallas_ref(ctx, node)
+        return _codegen_resident_view(ctx, node)
 
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
@@ -107,15 +107,11 @@ def codegen_unsqueeze_pallas(ctx: LoweringContext, node: Node) -> object:
     from .view_ops import _resident_plan
 
     if _resident_plan(node) is not None:
-        return codegen_view_pallas_ref(ctx, node)
+        return _codegen_resident_view(ctx, node)
     return unsqueeze_lowering.codegen_impls["common"](ctx, node)
 
 
-@unsqueeze_lowering.register_codegen("pallas_ref")
-@squeeze_lowering.register_codegen("pallas_ref")
-@view_lowering.register_codegen("pallas_ref")
-@reshape_lowering.register_codegen("pallas_ref")
-def codegen_view_pallas_ref(ctx: LoweringContext, node: Node) -> object:
+def _codegen_resident_view(ctx: LoweringContext, node: Node) -> object:
     from .view_ops import maybe_materialize_resident_ref
 
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))

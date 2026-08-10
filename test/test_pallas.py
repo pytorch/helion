@@ -1277,6 +1277,145 @@ class TestPallas(TestCase):
         self.assertNotIn("dynamic_slice_in_dim", code)
         self.assertNotIn("jnp.take", code)
 
+    def test_resident_ref_view_targets_are_explicit(self) -> None:
+        """Resident planning uses a semantic allowlist, not a fake backend."""
+        from helion._compiler.aten_lowering import reshape_lowering
+        from helion._compiler.aten_lowering import squeeze_lowering
+        from helion._compiler.aten_lowering import unsqueeze_lowering
+        from helion._compiler.aten_lowering import view_lowering
+        from helion._compiler.pallas.view_ops import _RESIDENT_REF_ATEN_VIEW_TARGETS
+        from helion.language.memory_ops import load
+        from helion.language.view_ops import subscript
+
+        self.assertEqual(
+            _RESIDENT_REF_ATEN_VIEW_TARGETS,
+            {
+                torch.ops.aten.reshape.default,
+                torch.ops.aten.squeeze.dim,
+                torch.ops.aten.unsqueeze.default,
+                torch.ops.aten.view.default,
+            },
+        )
+        for lowering in (
+            reshape_lowering,
+            squeeze_lowering,
+            unsqueeze_lowering,
+            view_lowering,
+        ):
+            self.assertNotIn("pallas_ref", lowering.codegen_impls)
+        # pyrefly: ignore [missing-attribute]
+        self.assertNotIn("pallas_ref", load._codegen)
+        # pyrefly: ignore [missing-attribute]
+        self.assertNotIn("pallas_ref", subscript._codegen)
+
+    def test_resident_subview_names_unsupported_transform(self) -> None:
+        """A transform that breaks Ref composition is reported where it occurs."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def permute_then_narrow(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    transposed = x_block.permute(1, 0, 2)
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        acc += transposed[:, local.begin, :].float()
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(helion.exc.InvalidIndexingType) as caught:
+            code_and_output(permute_then_narrow, (x, out), pallas_loop_type="fori_loop")
+        self.assertIn("aten.permute.default", str(caught.exception))
+        self.assertIn("aten.reshape.default", str(caught.exception))
+
+    def test_resident_subview_reports_incompatible_view_config(self) -> None:
+        """A physical-layout mismatch rejects only the current config."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def reshape_then_narrow(x: torch.Tensor, out: torch.Tensor) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([4, 64], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    reshaped = x_block.reshape(-1, 4, 64)
+                    live = outer.end - outer.begin
+                    for local in hl.tile(live, block_size=1):
+                        acc += reshaped[local.begin, :, :].float()
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 4, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            r"aten\.(reshape|view)\.default.*two minor dimensions",
+        ):
+            code_and_output(reshape_then_narrow, (x, out), pallas_loop_type="fori_loop")
+
+    def test_resident_subview_recursive_rejection_keeps_config_kind(self) -> None:
+        """A child failure invalidates every tentative ancestor with its cause."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_narrowing(x: torch.Tensor, out: torch.Tensor) -> None:
+            block_t = hl.register_block_size(2, x.size(0))
+            for _request in hl.grid(1):
+                acc = hl.zeros([128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=block_t):
+                    x_block = x[outer, :, :, :]
+                    group = x_block[:, 0, :, :]
+                    head = group[:, 0, :]
+                    acc += head.float().sum(dim=0)
+                out[0, :] = acc.to(out.dtype)
+
+        x = torch.ones(6, 2, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 128, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(
+            nested_narrowing,
+            (x, out),
+            block_sizes=[2],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertNarrowingIsResident(code)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig, "may contain padding.*this config"
+        ):
+            code_and_output(
+                nested_narrowing,
+                (x, out),
+                block_sizes=[4],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_resident_subview_masked_boundary_is_structural(self) -> None:
+        """A masked boundary outranks a simultaneous config-dependent failure."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def masked_then_narrow(
+            x: torch.Tensor, out: torch.Tensor, sink: torch.Tensor
+        ) -> None:
+            for _request in hl.grid(1):
+                acc = hl.zeros([2, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    for local in hl.tile(4, block_size=2):
+                        rows = x_block[local.index, :, :]
+                        incompatible = rows.reshape(-1, 4, 64)
+                        acc += rows[0, :, :].float()
+                        sink[:, :, :] = incompatible
+                out[0, :, :] = acc.to(out.dtype)
+
+        x = torch.ones(8, 2, 128, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(1, 2, 128, device=DEVICE, dtype=torch.float32)
+        sink = torch.empty(2, 4, 64, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidIndexingType,
+            "masked selection.*another narrowing subscript",
+        ):
+            code_and_output(
+                masked_then_narrow, (x, out, sink), pallas_loop_type="fori_loop"
+            )
+
     def test_resident_subview_scalar(self) -> None:
         """One token at a time out of a tile: the shape both target kernels use."""
 
@@ -1539,7 +1678,7 @@ class TestPallas(TestCase):
         torch.testing.assert_close(actual, torch.full_like(actual, 8))
 
     def test_resident_subview_composed_views(self) -> None:
-        """Subview and reshape registrations compose without materializing."""
+        """Subview and reshape transforms compose without materializing."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def composed_views(x: torch.Tensor, initial: torch.Tensor) -> torch.Tensor:
@@ -1648,7 +1787,7 @@ class TestPallas(TestCase):
         # sizes are powers of two, so a run that fits always divides; the width
         # check is the gate that actually varies with config.
         with self.assertRaisesRegex(
-            Exception, "block holds only 2 rows for this config"
+            helion.exc.InvalidConfig, "block holds only 2 rows for this config"
         ):
             code_and_output(
                 divisible, (x, out), block_sizes=[2], pallas_loop_type="fori_loop"

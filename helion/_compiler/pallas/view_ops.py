@@ -1,9 +1,18 @@
 """Pallas view codegen and resident Ref composition.
 
-Per-config planning keeps a direct VMEM load as a Ref while all of its users
-are registered, address-preserving view operations. A view is materialized only
-at its value boundary. Narrowing subscripts therefore lower to ``pl.ds`` on the
-current Ref, including across nested control-flow captures and static reshapes.
+Mosaic cannot dynamically slice a materialized VMEM value, so a narrowing
+subscript must instead read from the ``Ref`` produced by its outer tile load.
+The per-config planner starts at eligible direct loads and walks forward through
+an explicit set of address-preserving views. ``_new_var`` and control-flow
+captures transport the same Ref without changing its address interpretation.
+
+Planning is transactional: annotations are committed only after the complete
+reachable chain is valid. An unsupported value consumer normally terminates a
+chain by materializing the current view, but it is an error when another
+narrowing subscript occurs beyond that boundary. Structural and per-config
+rejections are therefore recorded where planning fails and reported only by the
+final completeness check. Codegen consumes the committed plans; it does not
+decide whether a view is eligible.
 """
 
 from __future__ import annotations
@@ -11,7 +20,6 @@ from __future__ import annotations
 from math import prod
 from typing import TYPE_CHECKING
 from typing import NamedTuple
-from typing import NoReturn
 from typing import cast
 
 import sympy
@@ -39,6 +47,20 @@ if TYPE_CHECKING:
 
 _RESIDENT_PLAN_KEY = "pallas_resident_ref_plan"
 
+# These Aten operations may preserve the address interpretation of a resident
+# Ref. Membership only permits planning; ``_reshape_variants`` still proves the
+# physical shape/layout invariant for every config. Keep this list explicit so
+# adding ordinary Pallas codegen cannot accidentally opt an operation into Ref
+# composition.
+_RESIDENT_REF_ATEN_VIEW_TARGETS = frozenset(
+    {
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+    }
+)
+
 
 class _ResidentVariant(NamedTuple):
     worklist_factor: int
@@ -62,13 +84,23 @@ class _ResidentPlan(NamedTuple):
     selector: _ResidentSelector | None
 
 
+class _ResidentTransform(NamedTuple):
+    variants: tuple[_ResidentVariant, ...]
+    selector: _ResidentSelector | None
+
+
+class _ResidentRejection(NamedTuple):
+    reason: str
+    config_dependent: bool
+
+
 class _PlanningContext(NamedTuple):
     captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]]
     parents: dict[int, torch.fx.Node]
     graph_infos: dict[torch.fx.Graph, GraphInfo]
     config: Config
     placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node]
-    rejections: dict[torch.fx.Node, str]
+    rejections: dict[torch.fx.Node, _ResidentRejection]
 
 
 def _node_value(value: object) -> object:
@@ -281,7 +313,7 @@ def _root_variants(
     producer: torch.fx.Node,
     graph_info: GraphInfo,
     context: _PlanningContext,
-) -> tuple[_ResidentVariant, ...] | None:
+) -> tuple[_ResidentVariant, ...] | _ResidentRejection:
     from .backend import SliceAddressing
     from .backend import _slice_addressing
     from .tensorcore_plan import TENSORCORE_PLAN_META
@@ -290,28 +322,43 @@ def _root_variants(
     tensor = _node_value(producer.args[0])
     value = producer.meta.get("val")
     indices = producer.args[1]
-    if (
-        not isinstance(tensor, torch.Tensor)
-        or not isinstance(value, torch.Tensor)
-        or tensor.ndim != value.ndim
-        or producer.args[2] is not None
-        or not isinstance(indices, (list, tuple))
-        or isinstance(
-            producer.meta.get(TENSORCORE_PLAN_META),
-            OneHotGatherPlan,
+    location = _where(producer)
+    if not isinstance(tensor, torch.Tensor) or not isinstance(value, torch.Tensor):
+        return _ResidentRejection(
+            f"the source load at {location} has no tensor value metadata", False
         )
-    ):
-        return None
+    if tensor.ndim != value.ndim:
+        return _ResidentRejection(
+            f"the source load at {location} changes the tensor rank", False
+        )
+    if producer.args[2] is not None:
+        return _ResidentRejection(
+            f"the source load at {location} has an explicit mask", False
+        )
+    if not isinstance(indices, (list, tuple)):
+        return _ResidentRejection(
+            f"the source load at {location} has unsupported indices", False
+        )
+    if isinstance(producer.meta.get(TENSORCORE_PLAN_META), OneHotGatherPlan):
+        return _ResidentRejection(
+            f"the source load at {location} uses an indirect gather", False
+        )
 
     selected = _narrowed_dims(indices)
     if len(selected) != 1:
-        return None
+        return _ResidentRejection(
+            f"the source load at {location} must tile exactly one dimension, "
+            f"but it tiles {len(selected)}",
+            False,
+        )
     dim = selected[0]
     outer_block_id = CompileEnvironment.current().resolve_block_id(
         _node_value(indices[dim])
     )
     if outer_block_id is None:
-        return None
+        return _ResidentRejection(
+            f"the source load at {location} is not indexed by a tile", False
+        )
 
     full_loop = False
     bounds = _loop_bounds(graph_info, context.parents, outer_block_id)
@@ -330,11 +377,18 @@ def _root_variants(
     variants: list[_ResidentVariant] = []
     for factor in factors:
         shape = _physical_shape(value, context.config, factor)
-        if (
-            shape is None
-            or _slice_addressing(value, dim, shape[-1]) is not SliceAddressing.DIRECT
-        ):
-            return None
+        if shape is None:
+            return _ResidentRejection(
+                f"the source load at {location} has no concrete physical shape "
+                "for this config",
+                True,
+            )
+        if _slice_addressing(value, dim, shape[-1]) is not SliceAddressing.DIRECT:
+            return _ResidentRejection(
+                f"the source load at {location} does not have direct VMEM "
+                "addressing for this config",
+                True,
+            )
         backing = _concrete_size(tensor.shape[dim], context.config, factor)
         full = full_loop and backing is not None and backing % shape[dim] == 0
         validity = None if full else (dim, outer_block_id)
@@ -362,16 +416,12 @@ def _tile_run(index: torch.fx.Node) -> int | None:
     return None
 
 
-def _config_error(node: torch.fx.Node, reason: str) -> NoReturn:
-    raise exc.InvalidConfig(f"resident Ref view at {node.name}: {reason}")
-
-
 def _selector(
     node: torch.fx.Node,
     graph_info: GraphInfo,
     variants: tuple[_ResidentVariant, ...],
     context: _PlanningContext,
-) -> tuple[tuple[_ResidentVariant, ...], _ResidentSelector] | None:
+) -> _ResidentTransform | _ResidentRejection:
     """Validate one contiguous Ref selector and return its output state."""
     from ..device_ir import IfGraphInfo
     from ..type_info import _detect_outer_block_bound
@@ -388,12 +438,22 @@ def _selector(
     if not isinstance(indices, (list, tuple)) or not isinstance(
         input_value, torch.Tensor
     ):
-        return None
+        return _ResidentRejection(
+            f"the selector at {_where(node)} has no tensor indexing metadata", False
+        )
     if any(index is None for index in indices):
-        return None
+        return _ResidentRejection(
+            f"the selector at {_where(node)} adds a dimension; resident Ref "
+            "narrowing does not support None",
+            False,
+        )
     selected = _narrowed_dims(indices)
     if len(selected) != 1:
-        return None
+        return _ResidentRejection(
+            f"the selector at {_where(node)} must narrow exactly one dimension, "
+            f"but it narrows {len(selected)}",
+            False,
+        )
     logical_dim = selected[0]
     index = indices[logical_dim]
     env = CompileEnvironment.current()
@@ -415,7 +475,11 @@ def _selector(
     )
     if source is not None and source.target is torch.ops.prims.iota.default:
         if not isinstance(graph_info, IfGraphInfo) or not source.args:
-            return None
+            return _ResidentRejection(
+                f"the dynamic tail selector at {_where(node)} is not inside its "
+                "matching conditional",
+                False,
+            )
         width = _node_value(source.args[0])
         start = _node_value(source.kwargs.get("start"))
         parent = context.parents.get(graph_info.graph_id)
@@ -426,7 +490,11 @@ def _selector(
             or source.kwargs.get("step") != 1
             or not isinstance(start, torch.SymInt)
         ):
-            return None
+            return _ResidentRejection(
+                f"the dynamic tail selector at {_where(node)} is not a contiguous "
+                "positive iota",
+                False,
+            )
         live = start + width
         detected_outer = exact_outer_live(live)
         outer_block_id = detected_outer if detected_outer is not None else -1
@@ -437,7 +505,11 @@ def _selector(
             or live_expr is None
             or predicate._sympy_() != sympy.Ge(live_expr, width)
         ):
-            return None
+            return _ResidentRejection(
+                f"the dynamic tail selector at {_where(node)} is not guarded by "
+                "its exact live-width predicate",
+                False,
+            )
         selector = _ResidentSelector("tail", logical_dim, -1, start, width, False)
     elif source is not None:
         value = source.meta.get("val")
@@ -445,36 +517,62 @@ def _selector(
         if squeeze:
             origin = _maybe_get_symbol_origin(value)
             if origin is None or not isinstance(origin.origin, TileBeginOrigin):
-                return None
+                return _ResidentRejection(
+                    f"the scalar selector at {_where(node)} is not a tile begin",
+                    False,
+                )
             local_block_id = origin.origin.block_id
         else:
             detected_local = _tile_run(source)
-            local_block_id = detected_local if detected_local is not None else -1
+            if detected_local is None:
+                return _ResidentRejection(
+                    f"the selector at {_where(node)} is not an unshifted tile run",
+                    False,
+                )
+            local_block_id = detected_local
         bounds = _enclosing_loop_bounds(
             graph_info, context.parents, context.graph_infos, local_block_id
         )
         if bounds is None:
-            return None
+            return _ResidentRejection(
+                f"the selector at {_where(node)} is not driven by an enclosing "
+                "tile loop",
+                False,
+            )
         start, end = bounds
         if not isinstance(start, (int, torch.SymInt)) or not env.known_equal(start, 0):
-            return None
+            return _ResidentRejection(
+                f"the selector's tile loop at {_where(node)} must start at zero",
+                False,
+            )
         if isinstance(end, int):
             if end < 1:
-                return None
+                return _ResidentRejection(
+                    f"the selector's tile loop at {_where(node)} is empty", False
+                )
             static_loop_extent = end
         elif not isinstance(end, torch.SymInt):
-            return None
+            return _ResidentRejection(
+                f"the selector's tile loop at {_where(node)} has an unsupported end",
+                False,
+            )
         else:
             detected_outer = exact_outer_live(end)
             outer_block_id = detected_outer if detected_outer is not None else -1
             if outer_block_id < 0:
-                return None
+                return _ResidentRejection(
+                    f"the selector's live extent at {_where(node)} does not match "
+                    "the source tile",
+                    False,
+                )
         selector = _ResidentSelector(
             "tile", logical_dim, local_block_id, -1, -1, not squeeze
         )
     elif isinstance(index, int):
         if index < 0:
-            return None
+            return _ResidentRejection(
+                f"the static selector at {_where(node)} has a negative index", False
+            )
         squeeze = True
         selector = _ResidentSelector("static", logical_dim, -1, index, 1, False)
     elif isinstance(index, slice):
@@ -485,12 +583,18 @@ def _selector(
             or index.start < 0
             or index.stop <= index.start
         ):
-            return None
+            return _ResidentRejection(
+                f"the static selector at {_where(node)} is not a positive "
+                "contiguous slice",
+                False,
+            )
         selector = _ResidentSelector(
             "static", logical_dim, -1, index.start, index.stop - index.start, False
         )
     else:
-        return None
+        return _ResidentRejection(
+            f"the selector at {_where(node)} has unsupported index {index!r}", False
+        )
 
     output: list[_ResidentVariant] = []
     for variant in variants:
@@ -502,7 +606,11 @@ def _selector(
             _slice_addressing(input_value, logical_dim, lane_block)
             is not SliceAddressing.DIRECT
         ):
-            return None
+            return _ResidentRejection(
+                f"the selector at {_where(node)} does not have direct VMEM "
+                "addressing for this config",
+                True,
+            )
         width = (
             _variant_block_size(
                 selector.local_block_id, context.config, variant.worklist_factor
@@ -511,29 +619,53 @@ def _selector(
             else selector.width
         )
         if not isinstance(width, int) or width < 1:
-            _config_error(node, "the selector has no concrete positive width")
+            return _ResidentRejection(
+                f"the selector at {_where(node)} has no concrete positive width "
+                "for this config",
+                True,
+            )
         if squeeze and width != 1:
-            _config_error(node, f"a scalar selector cannot use width {width}")
+            return _ResidentRejection(
+                f"the scalar selector at {_where(node)} cannot use width {width} "
+                "for this config",
+                True,
+            )
         if width > variant.shape[physical_dim]:
-            _config_error(
-                node,
+            return _ResidentRejection(
                 f"the run is {width} wide but the block holds only "
-                f"{variant.shape[physical_dim]} rows for this config",
+                f"{variant.shape[physical_dim]} rows for this config at {_where(node)}",
+                True,
             )
         if selector.kind == "static":
             assert isinstance(selector.begin, int)
             if selector.begin + width > variant.shape[physical_dim]:
-                _config_error(node, "the static run reaches past the resident Ref")
+                return _ResidentRejection(
+                    f"the static run at {_where(node)} reaches past the resident "
+                    "Ref for this config",
+                    True,
+                )
             if variant.live_guard is not None and variant.live_guard[0] == physical_dim:
-                return None
+                return _ResidentRejection(
+                    f"the static selector at {_where(node)} may address padding in "
+                    "the source tile for this config",
+                    True,
+                )
         elif selector.kind == "tile":
             if variant.shape[physical_dim] % width != 0:
-                _config_error(node, "the selector width does not divide the Ref")
+                return _ResidentRejection(
+                    f"the selector width at {_where(node)} does not divide the Ref "
+                    "for this config",
+                    True,
+                )
             if (
                 static_loop_extent >= 0
                 and static_loop_extent != variant.shape[physical_dim]
             ):
-                _config_error(node, "the inner loop does not cover exactly the Ref")
+                return _ResidentRejection(
+                    f"the inner loop at {_where(node)} does not cover exactly the "
+                    "Ref for this config",
+                    True,
+                )
 
         remaining_guard = (
             None
@@ -556,28 +688,58 @@ def _selector(
             )
         )
 
-    return tuple(output), selector
+    return _ResidentTransform(tuple(output), selector)
 
 
 def _reshape_variants(
     node: torch.fx.Node,
     config: Config,
     variants: tuple[_ResidentVariant, ...],
-) -> tuple[_ResidentVariant, ...] | None:
+) -> tuple[_ResidentVariant, ...] | _ResidentRejection:
     value = node.meta.get("val")
-    if not isinstance(value, torch.Tensor) or value.dtype is torch.bool:
-        return None
+    target = str(node.target)
+    location = _where(node)
+    if not isinstance(value, torch.Tensor):
+        return _ResidentRejection(
+            f"{target} at {location} has no tensor value metadata", False
+        )
+    if value.dtype is torch.bool:
+        return _ResidentRejection(
+            f"{target} at {location} cannot preserve a boolean resident Ref", False
+        )
     output: list[_ResidentVariant] = []
     for variant in variants:
         new_shape = _physical_shape(value, config, variant.worklist_factor)
-        if (
-            variant.live_guard is not None
-            or len(variant.shape) < 2
-            or new_shape is None
-            or prod(variant.shape) != prod(new_shape)
-            or variant.shape[-2:] != new_shape[-2:]
-        ):
-            return None
+        if variant.live_guard is not None:
+            return _ResidentRejection(
+                f"{target} at {location} cannot reshape a partially live resident "
+                "Ref for this config",
+                True,
+            )
+        if len(variant.shape) < 2:
+            return _ResidentRejection(
+                f"{target} at {location} requires a resident Ref with at least "
+                "two physical dimensions",
+                False,
+            )
+        if new_shape is None:
+            return _ResidentRejection(
+                f"{target} at {location} has no concrete physical shape for this "
+                "config",
+                True,
+            )
+        if prod(variant.shape) != prod(new_shape):
+            return _ResidentRejection(
+                f"{target} at {location} changes the resident block's physical "
+                "element count for this config",
+                True,
+            )
+        if variant.shape[-2:] != new_shape[-2:]:
+            return _ResidentRejection(
+                f"{target} at {location} changes the resident block's two minor "
+                "dimensions for this config",
+                True,
+            )
         output.append(_ResidentVariant(variant.worklist_factor, new_shape, (), None))
     return tuple(output)
 
@@ -587,28 +749,37 @@ def _registered_transform(
     graph_info: GraphInfo,
     variants: tuple[_ResidentVariant, ...],
     context: _PlanningContext,
-) -> tuple[tuple[_ResidentVariant, ...], _ResidentSelector | None] | None:
-    from ..aten_lowering import AtenLowering
-    from ..inductor_lowering import APIFuncLowering
-
-    lowering = node.meta.get("lowering")
-    if (
-        isinstance(lowering, APIFuncLowering)
-        and lowering.api_func is subscript
-        and "pallas_ref" in lowering.api_func._codegen
-    ):
+) -> _ResidentTransform | _ResidentRejection:
+    if node.target is subscript:
         indices = node.args[1]
         if not isinstance(indices, (list, tuple)):
-            return None
+            return _ResidentRejection(
+                f"hl.subscript at {_where(node)} has unsupported indices", False
+            )
         if not _narrowed_dims(indices):
             output = _reshape_variants(node, context.config, variants)
-            return (output, None) if output is not None else None
+            if isinstance(output, _ResidentRejection):
+                return output
+            return _ResidentTransform(output, None)
         return _selector(node, graph_info, variants, context)
-    # Registration is the opt-in contract for address-preserving Aten views.
-    if isinstance(lowering, AtenLowering) and "pallas_ref" in lowering.codegen_impls:
+
+    if node.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
         output = _reshape_variants(node, context.config, variants)
-        return (output, None) if output is not None else None
-    return None
+        if isinstance(output, _ResidentRejection):
+            return output
+        return _ResidentTransform(output, None)
+
+    supported = ", ".join(
+        [
+            *(sorted(str(target) for target in _RESIDENT_REF_ATEN_VIEW_TARGETS)),
+            "hl.subscript",
+        ]
+    )
+    return _ResidentRejection(
+        f"{node.target} at {_where(node)} is not an address-preserving resident "
+        f"Ref transform; expected one of {supported}",
+        False,
+    )
 
 
 def _effective_users(
@@ -640,7 +811,7 @@ def _effective_users(
 def _mark_rejected_descendants(
     producer: torch.fx.Node,
     context: _PlanningContext,
-    reason: str,
+    rejection: _ResidentRejection,
 ) -> None:
     seen: set[torch.fx.Node] = set()
     stack = [producer]
@@ -650,7 +821,11 @@ def _mark_rejected_descendants(
             continue
         seen.add(node)
         if node.target is subscript and _narrowed_dims(node.args[1]):
-            context.rejections.setdefault(node, reason)
+            existing = context.rejections.get(node)
+            if existing is None or (
+                existing.config_dependent and not rejection.config_dependent
+            ):
+                context.rejections[node] = rejection
         for user, _transports in _effective_users(node, context.captures):
             stack.append(user)
 
@@ -663,7 +838,7 @@ def _analyze_resident_chain(
     context: _PlanningContext,
     annotations: dict[torch.fx.Node, _ResidentPlan],
     root: bool = False,
-) -> bool:
+) -> _ResidentRejection | None:
     users = _effective_users(node, context.captures)
     planned: dict[
         torch.fx.Node,
@@ -673,11 +848,15 @@ def _analyze_resident_chain(
             _ResidentSelector | None,
         ],
     ] = {}
-    unsupported = False
+    unsupported: list[tuple[torch.fx.Node, _ResidentRejection]] = []
     for user, transports in users:
         user_info = context.graph_infos.get(user.graph)
         if user_info is None:
-            unsupported = True
+            rejection = _ResidentRejection(
+                f"the resident Ref crosses an unknown graph at {_where(user)}", False
+            )
+            unsupported.append((user, rejection))
+            _mark_rejected_descendants(user, context, rejection)
             continue
         result = _registered_transform(
             user,
@@ -685,42 +864,84 @@ def _analyze_resident_chain(
             node_variants,
             context,
         )
-        if result is None:
-            unsupported = True
+        if isinstance(result, _ResidentRejection):
+            unsupported.append((user, result))
+            _mark_rejected_descendants(user, context, result)
         else:
-            planned[user] = (transports, *result)
+            planned[user] = (transports, result.variants, result.selector)
 
     if root and (unsupported or not planned):
         if planned and unsupported:
-            blockers = [
-                _where(user) for user, _transports in users if user not in planned
-            ]
-            reason = "the block is also consumed whole at " + ", ".join(blockers[:3])
+            blockers = [_where(user) for user, _rejection in unsupported]
+            rejection = _ResidentRejection(
+                "the block is also consumed whole at " + ", ".join(blockers[:3]),
+                all(item.config_dependent for _user, item in unsupported),
+            )
             for user in planned:
-                _mark_rejected_descendants(user, context, reason)
-        return False
+                _mark_rejected_descendants(user, context, rejection)
+            return rejection
+        if unsupported:
+            return next(
+                (
+                    rejection
+                    for _user, rejection in unsupported
+                    if not rejection.config_dependent
+                ),
+                unsupported[0][1],
+            )
+        return _ResidentRejection(
+            f"the resident load at {_where(node)} has no address-preserving users",
+            False,
+        )
     if not root and (
         (selector is not None and selector.mask) or unsupported or not planned
     ):
+        masked_boundary = selector is not None and selector.mask and bool(planned)
+        if masked_boundary:
+            rejection = _ResidentRejection(
+                f"the masked selection at {_where(node)} must materialize before "
+                "another narrowing subscript",
+                False,
+            )
+            for user in planned:
+                _mark_rejected_descendants(user, context, rejection)
+
         if any(variant.live_guard is not None for variant in node_variants):
-            return False
+            rejection = _ResidentRejection(
+                f"the resident Ref at {_where(node)} may contain padding and "
+                "cannot be materialized for this config",
+                True,
+            )
+            _mark_rejected_descendants(node, context, rejection)
+            return rejection
+
+        if planned and unsupported and not masked_boundary:
+            blockers = [_where(user) for user, _rejection in unsupported]
+            rejection = _ResidentRejection(
+                f"the resident view at {_where(node)} must materialize because "
+                "it is also consumed at " + ", ".join(blockers[:3]),
+                all(item.config_dependent for _user, item in unsupported),
+            )
+            for user in planned:
+                _mark_rejected_descendants(user, context, rejection)
         annotations[node] = _ResidentPlan(True, node_variants, selector)
-        return True
+        return None
 
     annotations[node] = _ResidentPlan(False, node_variants, selector)
     for user, (transports, output, user_spec) in planned.items():
         transport_plan = _ResidentPlan(False, node_variants, None)
         for transport in transports:
             annotations[transport] = transport_plan
-        if not _analyze_resident_chain(
+        rejection = _analyze_resident_chain(
             user,
             output,
             user_spec,
             context=context,
             annotations=annotations,
-        ):
-            return False
-    return True
+        )
+        if rejection is not None:
+            return rejection
+    return None
 
 
 def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
@@ -746,39 +967,60 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
                 _mark_rejected_descendants(
                     producer,
                     context,
-                    "the tensor it reads is also written on device",
+                    _ResidentRejection(
+                        "the tensor it reads is also written on device", False
+                    ),
                 )
                 continue
 
             variants = _root_variants(producer, info, context)
-            if variants is None:
+            if isinstance(variants, _ResidentRejection):
+                _mark_rejected_descendants(producer, context, variants)
                 continue
 
             annotations: dict[torch.fx.Node, _ResidentPlan] = {}
-            if _analyze_resident_chain(
+            rejection = _analyze_resident_chain(
                 producer,
                 variants,
                 None,
                 context=context,
                 annotations=annotations,
                 root=True,
-            ):
+            )
+            if rejection is None:
                 for node, resident_plan in annotations.items():
                     node.meta[_RESIDENT_PLAN_KEY] = resident_plan
+            else:
+                # The plan is transactional. A failure in any child rolls back
+                # every tentative annotation, so carry its cause to all narrowing
+                # nodes that lose their plan rather than letting the final scan
+                # reconstruct a generic structural error.
+                _mark_rejected_descendants(producer, context, rejection)
 
+    # Narrowing is accepted during tracing before its load provenance and config
+    # are known. The load-rooted walk may also stop at a legitimate value boundary,
+    # so only this completeness pass decides whether a recorded failure is fatal.
     for info in graphs:
         for node in info.graph.find_nodes(op="call_function", target=subscript):
             if _resident_plan(node) is not None or not _narrowed_dims(node.args[1]):
                 continue
-            reason = context.rejections.get(node, "it could not be planned")
-            raise exc.InvalidIndexingType(
-                f"Pallas narrowing subscript {node.name} requires a resident Ref, "
-                f"but {str(reason).rstrip('.')}."
+            rejection = context.rejections.get(
+                node,
+                _ResidentRejection(
+                    "its input is not derived from an eligible direct Pallas load",
+                    False,
+                ),
             )
+            message = (
+                f"Pallas narrowing subscript {node.name} requires a resident Ref, "
+                f"but {rejection.reason.rstrip('.')}."
+            )
+            if rejection.config_dependent:
+                raise exc.InvalidConfig(message)
+            raise exc.InvalidIndexingType(message)
 
 
-@_decorators.codegen(subscript, "pallas_ref")
-def _resident_subscript(state: CodegenState) -> ast.AST:
+def _codegen_resident_subscript(state: CodegenState) -> ast.AST:
     assert state.fx_node is not None
     plan = _resident_plan(state.fx_node)
     assert plan is not None
@@ -849,8 +1091,7 @@ def _resident_subscript(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     assert state.fx_node is not None
     if _resident_plan(state.fx_node) is not None:
-        # pyrefly: ignore [missing-attribute]
-        return subscript._codegen["pallas_ref"](state)
+        return _codegen_resident_subscript(state)
     # pyrefly: ignore [missing-attribute]
     return subscript._codegen["common"](state)
 
