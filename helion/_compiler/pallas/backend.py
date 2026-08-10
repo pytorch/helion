@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import enum
+import hashlib
 import inspect
 import math
 from typing import TYPE_CHECKING
@@ -112,6 +113,22 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float8_e5m2fnuz": "jnp.float8_e5m2fnuz",
     "torch.float8_e8m0fnu": "jnp.float8_e8m0fnu",
 }
+
+
+def _automatic_collective_id(fn: Callable[..., object]) -> int:
+    """Return a stable best-effort barrier namespace for a Helion kernel.
+
+    The ID must agree across independent TorchTPU host processes, so Python's
+    randomized hash and process-local allocation order are unsuitable. Source
+    text distinguishes changed or separately defined kernels while the
+    qualified name provides a stable fallback when source is unavailable.
+    """
+    try:
+        source = inspect.getsource(fn)
+    except (OSError, TypeError):
+        source = ""
+    identity = f"{fn.__module__}\0{fn.__qualname__}\0{source}".encode()
+    return int.from_bytes(hashlib.sha256(identity).digest()[:4], "big") & 0x7FFFFFFF
 
 
 class SliceAddressing(enum.Enum):
@@ -292,6 +309,7 @@ class PallasBackend(Backend):
             "flatten_loops",
             "pallas_worklist_grouping",
             "pallas_loop_type",
+            "pallas_collective_id",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
             "pallas_topk_recall_target",
@@ -1248,6 +1266,22 @@ class PallasBackend(Backend):
             scratch_shapes_str = HostFunction.current().literal_expr(scratch_shapes)
             launcher_args.append(f"_scratch_shapes={scratch_shapes_str}")
 
+        if device_fn.requires_remote_copy:
+            launcher_args.append("_uses_remote_copy=True")
+
+        if device_fn.requires_collective_id:
+            collective_id = config.get("pallas_collective_id")
+            if collective_id is None:
+                from ..host_function import HostFunction
+
+                collective_id = _automatic_collective_id(HostFunction.current().fn)
+            if not isinstance(collective_id, int):
+                raise TypeError(
+                    "pallas_collective_id must be an integer, got "
+                    f"{type(collective_id)!r}"
+                )
+            launcher_args.append(f"_collective_id={collective_id!r}")
+
         # Identify which launcher arg positions correspond to pipeline-body
         # tensors (need HBM refs); all others get proper BlockSpecs.
         from ..device_function import TensorArg
@@ -1599,15 +1633,17 @@ class PallasBackend(Backend):
 
 
 # Launcher kwargs that mark a kernel using a Pallas feature the pure-JAX
-# module doesn't emit yet (scratch/VMEM buffers, HBM pass-through, SMEM,
-# dynamic-shape padding, compact-worklist, matmul dot_general).
+# module doesn't emit yet (compact-worklist, matmul dot_general).
 _JAX_UNSUPPORTED_KWARGS = (
+    "_compact_build_worklist",
+    "_matmul_dot_general",
+)
+
+_JAX_REMOTE_COPY_KWARGS = (
     "_scratch_shapes",
     "_hbm_arg_indices",
     "_smem_arg_indices",
     "_ds_pad_dims",
-    "_compact_build_worklist",
-    "_matmul_dot_general",
 )
 
 # Dtypes the Pallas launcher rejects and that JAX would mishandle under x32
@@ -1630,9 +1666,14 @@ class JaxLaunchMeta:
     user_positions: list[int]
     const_slots: dict[int, str]
     block_spec_info: list[Any]
+    scratch_shapes: list[object]
+    hbm_arg_indices: list[int]
+    smem_arg_indices: list[int]
+    ds_pad_dims: list[tuple[int, int, int, int]]
     out_shape_exprs: list[list[str]]
     out_dtypes: list[str]
     interpret: bool
+    collective_id: int | None
     n_args: int
 
 
@@ -1816,10 +1857,10 @@ def capture_jax_launch_metadata(
     ``inputs[i].shape[d]`` expressions rather than baked sample constants. The AST
     builder (:func:`build_jax_fn_ast`) turns this into the emitted entrypoint.
 
-    Kernels using unsupported advanced Pallas features (scratch/pipeline/SMEM,
-    dynamic-shape padding, compact-worklist, or matmul-dot-general) or
-    int64/uint64/float64 args raise ``NotImplementedError``. Caller-owned in-place
-    aliases are captured as static launch metadata.
+    Kernels using unsupported advanced Pallas features or int64/uint64/float64
+    args raise ``NotImplementedError``. Distributed remote-copy kernels capture
+    their scratch descriptors, HBM/SMEM placements, dynamic-shape padding, and
+    in-place aliases as static launch metadata.
 
     Must be called *outside* the fake-tensor env (the capture materializes and runs
     on real tensors).
@@ -1875,7 +1916,10 @@ def capture_jax_launch_metadata(
     compiled(*args, _launcher=_capture)
 
     kw = captured["kwargs"]
-    for name in _JAX_UNSUPPORTED_KWARGS:
+    unsupported_kwargs = list(_JAX_UNSUPPORTED_KWARGS)
+    if not kw.get("_uses_remote_copy"):
+        unsupported_kwargs.extend(_JAX_REMOTE_COPY_KWARGS)
+    for name in unsupported_kwargs:
         if kw.get(name):
             raise NotImplementedError(
                 f"to_code(jax_fn=True) does not support kernels using "
@@ -1926,6 +1970,7 @@ def capture_jax_launch_metadata(
         for p in output_indices
     ]
     interpret = bool(kw.get("_pallas_interpret") or False)
+    collective_id = cast("int | None", kw.get("_collective_id"))
 
     # Derive the grid, output shapes, and shape-derived scalar launch args from the
     # RUNTIME input shapes so a single standalone is correct at every dynamic shape.
@@ -2007,9 +2052,26 @@ def capture_jax_launch_metadata(
         user_positions=user_positions,
         const_slots=const_slots,
         block_spec_info=cast("list[Any]", block_spec_info),
+        scratch_shapes=list(
+            cast("list[object] | None", kw.get("_scratch_shapes")) or []
+        ),
+        hbm_arg_indices=list(
+            cast("list[int] | None", kw.get("_hbm_arg_indices")) or []
+        ),
+        smem_arg_indices=list(
+            cast("list[int] | None", kw.get("_smem_arg_indices")) or []
+        ),
+        ds_pad_dims=list(
+            cast(
+                "list[tuple[int, int, int, int]] | None",
+                kw.get("_ds_pad_dims"),
+            )
+            or []
+        ),
         out_shape_exprs=out_shape_exprs,
         out_dtypes=out_dtypes,
         interpret=interpret,
+        collective_id=collective_id,
         n_args=len(launch_args),
     )
 
@@ -2194,10 +2256,15 @@ def build_jax_fn_ast(
     # nodes). block_spec_info's repr is a list of tuples, so it parses cleanly.
     meta_nodes: list[ast.stmt] = [
         ast.parse(f"_BLOCK_SPEC_INFO = {meta.block_spec_info!r}").body[0],
+        ast.parse(f"_SCRATCH_SHAPES = {meta.scratch_shapes!r}").body[0],
+        ast.parse(f"_HBM_ARG_INDICES = {meta.hbm_arg_indices!r}").body[0],
+        ast.parse(f"_SMEM_ARG_INDICES = {meta.smem_arg_indices!r}").body[0],
+        ast.parse(f"_DS_PAD_DIMS = {meta.ds_pad_dims!r}").body[0],
         ast.parse(f"_OUTPUT_INDICES = {meta.output_indices!r}").body[0],
         ast.parse(f"_INPLACE_INDICES = {meta.inplace_indices!r}").body[0],
         ast.parse(f"_USER_POSITIONS = {meta.user_positions!r}").body[0],
         ast.parse(f"_INTERPRET = {meta.interpret!r}").body[0],
+        ast.parse(f"_COLLECTIVE_ID = {meta.collective_id!r}").body[0],
         ast.parse(f"_N_ARGS = {meta.n_args}").body[0],
     ]
     entrypoint = ast.parse(_jax_entrypoint_source(meta, device_kernel)).body[0]
@@ -2245,6 +2312,14 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        slots[pos] = inp",
         *out_lines,
         *const_lines,
+        "    orig_shapes = {pos: tuple(slots[pos].shape) for pos in _OUTPUT_INDICES}",
+        "    for arg_idx, dim, block_size, extra_pad in _DS_PAD_DIMS:",
+        "        value = slots[arg_idx]",
+        "        pad_amount = (-value.shape[dim]) % block_size + extra_pad",
+        "        if pad_amount:",
+        "            pad_widths = [(0, 0)] * value.ndim",
+        "            pad_widths[dim] = (0, pad_amount)",
+        "            slots[arg_idx] = jnp.pad(value, pad_widths)",
         "    results = _pallas_jax_call(",
         f"        {device_kernel},",
         "        _grid,",
@@ -2252,11 +2327,14 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        output_indices=_OUTPUT_INDICES,",
         "        inplace_indices=_INPLACE_INDICES,",
         "        block_spec_info=_BLOCK_SPEC_INFO,",
-        "        scratch_shapes=None,",
-        "        hbm_arg_indices=None,",
-        "        smem_arg_indices=None,",
+        "        scratch_shapes=_SCRATCH_SHAPES,",
+        "        hbm_arg_indices=_HBM_ARG_INDICES,",
+        "        smem_arg_indices=_SMEM_ARG_INDICES,",
+        "        collective_id=_COLLECTIVE_ID,",
         "        interpret=_INTERPRET,",
         "        compact=None,",
+        "        orig_shapes=orig_shapes,",
+        "        ds_pad_dims=_DS_PAD_DIMS,",
         "    )",
         "    return results[0] if len(results) == 1 else tuple(results)",
     ]
