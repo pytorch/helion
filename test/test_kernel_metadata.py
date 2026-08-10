@@ -559,14 +559,7 @@ class TestAutotuneDatasetE2E(TestCase):
         )
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
 
-        # Every successful (status="ok") CSV row must join -- within its OWN run_id
-        # record -- to a config entry with real benchmark stats. The contract is
-        # that a successful benchmark always yields a PerfStats (n_samples >= 1,
-        # non-None median), never the null sentinel. This is the e2e proof of
-        # return_mode="stats"; it is stronger than "some config has a sample" and
-        # the device-free sink tests (which inject _PERF_STATS) cannot prove it.
-        # Keying by (run_id, config_id) -- not the unioned map -- ensures a broken
-        # per-run join isn't masked by another record carrying the same config.
+        # Each successful CSV row must join to measured stats from the same run.
         status_idx = header.index("status")
         cfg_idx = header.index("config_id")
         run_idx = header.index("run_id")
