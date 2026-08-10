@@ -420,6 +420,42 @@ class TestPallasMultipleOfPromises(TestCase):
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedIndexing(TestCase):
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    def test_rank_expanding_none_needs_no_window(self) -> None:
+        # The None dimension in jagged[None, st, dt] is just for shape
+        # compatibility, and should not preclude compilation.
+        @helion.kernel(backend="pallas")
+        def jagged_copy_expanded(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((B, L, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[g, st, dt] = jagged[None, st, dt].sum(0) * 2.0
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.float32, device=DEVICE)
+        _code, out = code_and_output(
+            jagged_copy_expanded,
+            (seq_offsets, jagged),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        # Check only the rows that each group is storing to. The other rows
+        # get NaNs in interpret mode, so let's skip them.
+        torch.testing.assert_close(out[0, 0:13], jagged[0:13] * 2.0)
+        torch.testing.assert_close(out[1, 13:25], jagged[13:25] * 2.0)
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasJaggedCarryRejects(TestCase):
     """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
 
@@ -501,6 +537,148 @@ class TestPallasJaggedCarryRejects(TestCase):
         ):
             jagged_full_row_store.bind((seq_offsets, jagged, out)).to_code(
                 helion.Config(block_sizes=[16], pallas_loop_type="emit_pipeline")
+            )
+
+    def test_nested_direct_store_under_aligned_window_rejected(self) -> None:
+        # The store sits one loop down; unseen, it overwrites the preceding group.
+        @helion.kernel(backend="pallas")
+        def nested_mixed_dtype_row_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.empty((L, 1, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for ct in hl.tile(0, D):
+                        out[st, 0, ct] = jagged[st, ct].to(torch.float32)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            nested_mixed_dtype_row_store.bind((seq_offsets, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type="emit_pipeline")
+            )
+
+    def test_store_below_while_rejected(self) -> None:
+        # Same store, two graphs down: inside a while body, then the column loop.
+        @helion.kernel(backend="pallas")
+        def while_nested_row_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.empty((L, 1, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    step = torch.zeros([], dtype=torch.int32, device=jagged.device)
+                    while step < 1:
+                        for ct in hl.tile(0, D):
+                            out[st, 0, ct] = jagged[st, ct].to(torch.float32)
+                        step = step + 1
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            while_nested_row_store.bind((seq_offsets, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type="emit_pipeline")
+            )
+
+    def test_shifted_store_through_row_rejected(self) -> None:
+        # Storing to st.index + 1 shifts every row off the row it was read
+        # from, so a group's store can land on a row the previous group owns.
+        # The kernel must be rejected rather than silently corrupt that group.
+        @helion.kernel(backend="pallas")
+        def jagged_shift_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[st.index + 1, dt] = jagged[st, dt] * 2
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            jagged_shift_store.bind((seq_offsets, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type="emit_pipeline")
+            )
+
+    def test_atomic_write_through_row_rejected(self) -> None:
+        # An atomic through the row is a write too, so it needs the same rejection.
+        @helion.kernel(backend="pallas")
+        def jagged_atomic_write(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        hl.atomic_xchg(out, [st, dt], jagged[st, dt] + 1.0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        out = torch.zeros_like(jagged)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            jagged_atomic_write.bind((seq_offsets, jagged, out)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type="emit_pipeline")
+            )
+
+    def test_atomic_beside_carried_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas")
+        def carried_store_plus_atomic(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, atom: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[st, dt] = jagged[st, dt] * 2
+                        hl.atomic_xchg(atom, [st, dt], jagged[st, dt] + 1.0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        atom = torch.zeros_like(jagged)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "an atomic write through a jagged row tile whose slices must be "
+            "sublane-aligned bypasses the ordered carry",
+        ):
+            carried_store_plus_atomic.bind((seq_offsets, jagged, atom)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type="emit_pipeline")
             )
 
     def test_multi_grid_group_rejected(self) -> None:
