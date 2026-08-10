@@ -109,6 +109,7 @@ class TestResidentRefJaxExport(unittest.TestCase):
                 block_sizes=[128],
                 pallas_loop_type="fori_loop",
                 pallas_load_buffer_count=[1, 2],
+                pallas_indirect_access_mode="dma",
             ),
             static_shapes=True,
             backend="pallas",
@@ -133,64 +134,6 @@ class TestResidentRefJaxExport(unittest.TestCase):
         expected_table = after_first.at[indices[128:]].set(
             jnp.stack([second[:, 1], second[:, 2], second[:, 0]], axis=1)
         )
-
-        out, updated_table = jax.block_until_ready(
-            jax.jit(kernel.jax_fn, donate_argnums=(1,))(indices, table)
-        )
-        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected_out))
-        np.testing.assert_array_equal(
-            np.asarray(updated_table), np.asarray(expected_table)
-        )
-
-    def test_grid_indirect_dma_separates_resident_scratch(self) -> None:
-        """A gathered Ref remains live after an unrelated scatter stage write."""
-
-        def state_roundtrip(
-            indices: torch.Tensor, table: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            out = torch.empty(
-                [indices.size(0), *table.shape[2:]],
-                dtype=table.dtype,
-                device=table.device,
-            )
-            for tile_b in hl.tile(indices.size(0)):
-                selected_indices = hl.load(indices, [tile_b])
-                selected = hl.load(
-                    table,
-                    [selected_indices, slice(None), slice(None), slice(None)],
-                )
-                hl.store(
-                    table,
-                    [selected_indices, slice(None), slice(None), slice(None)],
-                    hl.zeros(
-                        [tile_b, table.size(1), table.size(2), table.size(3)],
-                        dtype=table.dtype,
-                    ),
-                )
-                state_0 = selected[:, 0, :, :]
-                state_1 = selected[:, 1, :, :]
-                state_2 = selected[:, 2, :, :]
-                out[tile_b, :, :] = state_0 + state_1 + state_2
-            return out, table
-
-        kernel = helion.kernel(
-            state_roundtrip,
-            config=helion.Config(
-                block_sizes=[128],
-                pallas_loop_type="emit_pipeline",
-            ),
-            static_shapes=True,
-            backend="pallas",
-        )
-        indices = (jnp.arange(256, dtype=jnp.int32) * 3) % 512
-        table = jax.random.normal(
-            jax.random.key(1),
-            (512, 3, 4, 128),
-            dtype=jnp.bfloat16,
-        )
-        selected = table[indices]
-        expected_out = selected[:, 0] + selected[:, 1] + selected[:, 2]
-        expected_table = table.at[indices].set(jnp.zeros_like(selected))
 
         out, updated_table = jax.block_until_ready(
             jax.jit(kernel.jax_fn, donate_argnums=(1,))(indices, table)

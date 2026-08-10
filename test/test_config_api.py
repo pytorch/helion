@@ -88,6 +88,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pallas_load_buffer_count": st.lists(
                 st.integers(min_value=1, max_value=2), max_size=4
             ),
+            "pallas_indirect_access_mode": st.sampled_from(["dma", "one_hot"]),
             "load_eviction_policies": st.lists(
                 st.sampled_from(["", "first", "last"]), max_size=4
             ),
@@ -126,6 +127,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "range_flattens",
                     "static_ranges",
                     "pallas_load_buffer_count",
+                    "pallas_indirect_access_mode",
                     "load_eviction_policies",
                     "load_cache_modifiers",
                     "store_cache_modifiers",

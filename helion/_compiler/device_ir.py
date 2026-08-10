@@ -3424,6 +3424,151 @@ def _count_device_atomics(device_ir: DeviceIR) -> int:
     return atomic_count
 
 
+def _tensor_index_positions(node: torch.fx.Node) -> list[int]:
+    subscript = node.args[1] if len(node.args) > 1 else None
+    if not isinstance(subscript, (list, tuple)):
+        return []
+    return [
+        position
+        for position, index in enumerate(subscript)
+        if isinstance(index, torch.fx.Node)
+        and isinstance(index.meta.get("val"), torch.Tensor)
+    ]
+
+
+def _pallas_dma_owner_block_extents(
+    device_ir: DeviceIR,
+) -> dict[int, dict[int, int]]:
+    """Return static scheduler extents used by indirect DMA admission."""
+    env = CompileEnvironment.current()
+    result: dict[int, dict[int, int]] = {}
+    for root_id, block_ids in zip(
+        device_ir.root_ids, device_ir.grid_block_ids, strict=True
+    ):
+        try:
+            result[root_id] = {
+                block_id: int(env.block_sizes[block_id].numel) for block_id in block_ids
+            }
+        except (TypeError, ValueError):
+            continue
+
+    for owner in device_ir.graphs:
+        if not isinstance(owner, RootGraphInfo):
+            continue
+        for node in owner.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                _tracing_ops._for_loop,
+                _tracing_ops._for_loop_step,
+            ):
+                continue
+            graph_id = node.args[0]
+            if not isinstance(graph_id, int) or graph_id >= len(device_ir.graphs):
+                continue
+            graph_info = device_ir.graphs[graph_id]
+            if (
+                not isinstance(graph_info, ForLoopGraphInfo)
+                or len(graph_info.block_ids) != 1
+            ):
+                continue
+            begins = node.args[1]
+            ends = node.args[2]
+            if (
+                not isinstance(begins, (list, tuple))
+                or not isinstance(ends, (list, tuple))
+                or len(begins) != 1
+                or len(ends) != 1
+            ):
+                continue
+            begin = (
+                begins[0].meta.get("val")
+                if isinstance(begins[0], torch.fx.Node)
+                else begins[0]
+            )
+            end = (
+                ends[0].meta.get("val")
+                if isinstance(ends[0], torch.fx.Node)
+                else ends[0]
+            )
+            if not isinstance(begin, (int, torch.SymInt)) or not isinstance(
+                end, (int, torch.SymInt)
+            ):
+                continue
+            try:
+                extent = int(end) - int(begin)
+            except (TypeError, ValueError):
+                continue
+            if node.target is _tracing_ops._for_loop_step:
+                steps = node.args[4]
+                if not isinstance(steps, (list, tuple)) or len(steps) != 1:
+                    continue
+                step = (
+                    steps[0].meta.get("val")
+                    if isinstance(steps[0], torch.fx.Node)
+                    else steps[0]
+                )
+                if step not in (0, 1):
+                    continue
+            result[graph_id] = {graph_info.block_ids[0]: extent}
+    return result
+
+
+def _pallas_indirect_access_modes(device_ir: DeviceIR) -> tuple[str, ...]:
+    """Return kernel-wide indirect access modes worth exposing to autotuning."""
+    from ..language import memory_ops
+    from .pallas.gather import DMA_GROUP_CAPABLE_META
+    from .pallas.gather import one_hot_full_tensor_fits_vmem
+    from .pallas.tracing_ops import structural_dma_group_nodes
+    from .pallas.view_ops import indirect_loads_requiring_resident_refs
+
+    required_dma_loads = indirect_loads_requiring_resident_refs(device_ir.graphs)
+    config_spec = CompileEnvironment.current().config_spec
+    block_size_ranges = {
+        spec.block_id: (
+            min(max(spec.min_size, spec.autotuner_min), spec.max_size),
+            spec.max_size,
+        )
+        for spec in config_spec.block_sizes
+    }
+    dma_group_nodes = structural_dma_group_nodes(
+        device_ir.graphs,
+        _pallas_dma_owner_block_extents(device_ir),
+        block_size_ranges,
+    )
+    for node in dma_group_nodes:
+        node.meta[DMA_GROUP_CAPABLE_META] = True
+    config_spec.pallas_indirect_dma_requires_fori = any(
+        isinstance(graph_info, ForLoopGraphInfo)
+        and any(node in dma_group_nodes for node in graph_info.graph.nodes)
+        for graph_info in device_ir.graphs
+    )
+    has_indirect_access = False
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
+                continue
+            indirect_positions = _tensor_index_positions(node)
+            if not indirect_positions:
+                continue
+            has_indirect_access = True
+
+    if not has_indirect_access:
+        return ()
+    dma_legal = bool(dma_group_nodes) and required_dma_loads <= dma_group_nodes
+    one_hot_legal = not required_dma_loads and all(
+        (tensor := _accessed_tensor_fake(node)) is None
+        or one_hot_full_tensor_fits_vmem(tensor)
+        for node in dma_group_nodes
+    )
+    if dma_legal and one_hot_legal:
+        return ("one_hot", "dma")
+    if dma_legal:
+        return ("dma",)
+    return ("one_hot",) if one_hot_legal else ()
+
+
 def _register_load_store_tunables(
     total_load_count: int,
     loads_without_eviction_policy: int,
@@ -3758,6 +3903,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
+            )
+        if config_spec.supports_config_key("pallas_indirect_access_mode"):
+            config_spec.pallas_indirect_access_modes = _pallas_indirect_access_modes(
+                device_ir
             )
         load_count = sum(f.kind == "load" for f in memory_op_facts)
         _register_load_store_tunables(

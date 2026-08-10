@@ -314,8 +314,7 @@ def _root_variants(
     dma_group = _indirect_dma_group(producer)
     if dma_group is not None:
         shape = _physical_shape(value, context.config, 1)
-        expected = (dma_group.group_count, *dma_group.member_shape)
-        if shape is None or shape != expected:
+        if shape is None or shape != dma_group.transfer_shape:
             return None
         return (_ResidentVariant(1, shape, (), None),)
 
@@ -598,12 +597,7 @@ def _reshape_variants(
     return tuple(output)
 
 
-def _registered_transform(
-    node: torch.fx.Node,
-    graph_info: GraphInfo,
-    variants: tuple[_ResidentVariant, ...],
-    context: _PlanningContext,
-) -> tuple[tuple[_ResidentVariant, ...], _ResidentSelector | None] | None:
+def _registered_transform_kind(node: torch.fx.Node) -> str | None:
     from ..aten_lowering import AtenLowering
     from ..inductor_lowering import APIFuncLowering
 
@@ -613,6 +607,20 @@ def _registered_transform(
         and lowering.api_func is subscript
         and "pallas_ref" in lowering.api_func._codegen
     ):
+        return "subscript"
+    if isinstance(lowering, AtenLowering) and "pallas_ref" in lowering.codegen_impls:
+        return "view"
+    return None
+
+
+def _registered_transform(
+    node: torch.fx.Node,
+    graph_info: GraphInfo,
+    variants: tuple[_ResidentVariant, ...],
+    context: _PlanningContext,
+) -> tuple[tuple[_ResidentVariant, ...], _ResidentSelector | None] | None:
+    kind = _registered_transform_kind(node)
+    if kind == "subscript":
         indices = node.args[1]
         if not isinstance(indices, (list, tuple)):
             return None
@@ -621,7 +629,7 @@ def _registered_transform(
             return (output, None) if output is not None else None
         return _selector(node, graph_info, variants, context)
     # Registration is the opt-in contract for address-preserving Aten views.
-    if isinstance(lowering, AtenLowering) and "pallas_ref" in lowering.codegen_impls:
+    if kind == "view":
         output = _reshape_variants(node, context.config, variants)
         return (output, None) if output is not None else None
     return None
@@ -651,6 +659,39 @@ def _effective_users(
         for placeholder, _parent in edges:
             stack.append((placeholder, (*transports, placeholder)))
     return results
+
+
+def indirect_loads_requiring_resident_refs(
+    graphs: list[GraphInfo],
+) -> set[torch.fx.Node]:
+    """Find loads whose registered view chains contain a narrowing subscript."""
+    captures, _parents, _placeholder_to_outer = _capture_edges(graphs)
+    required: set[torch.fx.Node] = set()
+    for info in graphs:
+        for producer in info.graph.find_nodes(op="call_function", target=load):
+            subscript = producer.args[1] if len(producer.args) > 1 else None
+            if not isinstance(subscript, (list, tuple)) or not any(
+                isinstance(index, torch.fx.Node)
+                and isinstance(index.meta.get("val"), torch.Tensor)
+                for index in subscript
+            ):
+                continue
+            seen: set[torch.fx.Node] = set()
+            stack = [producer]
+            while stack and producer not in required:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                for user, _transports in _effective_users(current, captures):
+                    kind = _registered_transform_kind(user)
+                    if kind is None:
+                        continue
+                    if kind == "subscript" and _narrowed_dims(user.args[1]):
+                        required.add(producer)
+                        break
+                    stack.append(user)
+    return required
 
 
 def _mark_rejected_descendants(
@@ -755,10 +796,11 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
     for info in graphs:
         for producer in info.graph.find_nodes(op="call_function", target=load):
             tensor = _node_value(producer.args[0])
+            dma_group = _indirect_dma_group(producer)
             if (
                 isinstance(tensor, torch.Tensor)
                 and id(tensor.untyped_storage()) in mutated_storages
-                and _indirect_dma_group(producer) is None
+                and dma_group is None
             ):
                 _mark_rejected_descendants(
                     producer,
@@ -780,6 +822,11 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
                 annotations=annotations,
                 root=True,
             ):
+                if (
+                    dma_group is not None
+                    and config.get("pallas_indirect_access_mode", "one_hot") != "dma"
+                ):
+                    continue
                 for node, resident_plan in annotations.items():
                     node.meta[_RESIDENT_PLAN_KEY] = resident_plan
 

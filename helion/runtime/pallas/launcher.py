@@ -1448,36 +1448,6 @@ def _pallas_kernel_scratch_kwarg(pl: object) -> str:
     )
 
 
-def _pallas_hbm_alias_call_jit_fn(
-    pl: object,
-    pltpu: object,
-    reordered_kernel: object,
-    *,
-    out_shape_arg: object,
-    grid: tuple[int, ...],
-    in_specs: list[object],
-    out_specs: object,
-    scratch_shapes: list[object],
-    input_output_aliases: dict[int, int],
-    interpret: bool,
-) -> object:
-    """Launch raw-HBM in-place outputs with explicit Pallas aliasing."""
-    return pl.pallas_call(  # type: ignore[union-attr]
-        reordered_kernel,
-        out_shape=out_shape_arg,
-        grid=grid,
-        in_specs=in_specs,
-        out_specs=out_specs,
-        scratch_shapes=scratch_shapes,
-        input_output_aliases=input_output_aliases,
-        compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-            dimension_semantics=("arbitrary",) * len(grid),
-            vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
-        ),
-        interpret=interpret,
-    )
-
-
 def _pallas_pl_kernel_jit_fn(
     pl: object,
     pltpu: object,
@@ -1759,16 +1729,18 @@ def _pallas_compile_jit_fn(
             and _output_indices[output_pos] == tensor_arg_indices[input_pos]
         }
         if preserve_hbm_aliases and hbm_aliases:
-            jit_fn = _pallas_hbm_alias_call_jit_fn(
-                pl,
-                pltpu,
+            jit_fn = pl.pallas_call(  # type: ignore[union-attr]
                 reordered_kernel,
-                out_shape_arg=out_shape_arg,
+                out_shape=out_shape_arg,
                 grid=grid,
                 in_specs=launch_in_specs,  # pyrefly: ignore[bad-argument-type]
                 out_specs=launch_out_specs,
                 scratch_shapes=scratch_shapes,
                 input_output_aliases=pallas_aliases,
+                compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                    dimension_semantics=("arbitrary",) * len(grid),
+                    vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
+                ),
                 interpret=interpret,
             )
             return _PallasCompileResult(

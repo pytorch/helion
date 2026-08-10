@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
-    pallas_codegen.emit_memory_op_prefix(state)
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -74,8 +73,6 @@ def _(state: CodegenState) -> None:
 
 @_decorators.codegen(load, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    pallas_codegen.emit_memory_op_prefix(state)
-
     from .view_ops import _resident_plan
 
     assert state.fx_node is not None

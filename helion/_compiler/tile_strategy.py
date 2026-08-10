@@ -1886,9 +1886,6 @@ class ForiLoopState(DeviceLoopOrGridState):
     _memory_op_to_dma_scratch: dict[torch.fx.Node, tuple[str, int]] = dataclasses.field(
         default_factory=dict
     )
-    _memory_op_prefix: dict[torch.fx.Node, list[ast.stmt]] = dataclasses.field(
-        default_factory=dict
-    )
 
 
 @dataclasses.dataclass

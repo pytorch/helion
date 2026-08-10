@@ -421,6 +421,7 @@ def _resolve_tensor_index_patterns(
         from .gather import build_gather_plan
 
         plan = build_gather_plan(
+            node,
             tensor,
             subscript,
             positions,
@@ -436,6 +437,7 @@ def _resolve_tensor_index_patterns(
         from .gather import build_scatter_plan
 
         plan = build_scatter_plan(
+            node,
             tensor,
             subscript,
             positions,

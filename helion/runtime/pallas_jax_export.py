@@ -269,7 +269,7 @@ def _tensor_arg_to_jax(arg: object) -> object:
             torch_to_jnp, _ = _build_dtype_maps()
             return jnp.empty(
                 tuple(int(size) for size in arg.shape),
-                dtype=torch_to_jnp[arg.dtype],
+                dtype=cast("Any", torch_to_jnp[arg.dtype]),
             )
         return jnp.asarray(arg.detach().cpu().numpy())
     return arg

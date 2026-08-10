@@ -951,16 +951,3 @@ def grid_memory_op_dma_binding(state: CodegenState) -> tuple[str, str] | None:
     if node is None:
         return None
     return state.device_function.pallas_grid_dma_bindings.get(node)
-
-
-def emit_memory_op_prefix(state: CodegenState) -> None:
-    """Emit scheduler statements that must precede this memory operation."""
-    node = state.fx_node
-    if node is None:
-        return
-    found = _memory_op_fori_binding(state)
-    if found is None:
-        return
-    loop, _binding = found
-    for statement in loop._memory_op_prefix.pop(node, ()):
-        state.codegen.add_statement(statement)
