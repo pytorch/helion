@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -236,13 +237,19 @@ class TestKernelMetadataHardwareInfo(TestCase):
 class TestAutotuneLogSink(TestCase):
     def test_dataset_logged_when_enabled(self) -> None:
         config = helion.Config(block_sizes=[32], num_warps=4)
+        source = "# generated source\n"
         with tempfile.TemporaryDirectory() as tmp:
+            source_path = Path(tmp) / "compiled_kernel.py"
+            source_path.write_text(source, encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(source_path)
             with AutotuneLogSink(
                 f"{tmp}/run", _metadata(), collect_dataset=True
             ) as sink:
                 sink.start_run()
                 config_id = sink.register_config(config)
                 assert config_id is not None
+                sink.capture_generated_code(config_id, kernel, config)
                 sink.record(
                     AutotuneLogEntry(
                         generation=5,
@@ -275,10 +282,94 @@ class TestAutotuneLogSink(TestCase):
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
-        stored = sidecar["configs"][cell("config_id")]
-        cfg = helion.Config.from_json(json.dumps(stored))
+        entry = sidecar["configs"][cell("config_id")]
+        self.assertEqual(entry["generated_code"], source)
+        self.assertEqual(
+            entry["source_hash"], hashlib.sha256(source.encode("utf-8")).hexdigest()
+        )
+        cfg = helion.Config.from_json(json.dumps(entry["config"]))
         self.assertEqual(cfg.block_sizes, [32])
         self.assertEqual(cell("run_id"), sidecar["run_id"])
+
+    def _capture_entry(
+        self,
+        kernel: Mock,
+        config: helion.Config,
+        *,
+        collect_dataset: bool = True,
+        times: int = 1,
+    ) -> dict[str, object] | None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=collect_dataset
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                for _ in range(times):
+                    sink.capture_generated_code(config_id, kernel, config)
+                sink.end_run()
+            configs = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )["configs"]
+        return configs.get(config_id)
+
+    def test_capture_generated_code_attaches_source_read_once(self) -> None:
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "compiled_kernel.py"
+            src.write_text("# generated triton source\n", encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(src)
+            entry = self._capture_entry(kernel, config, times=2)
+        assert entry is not None
+        self.assertEqual(entry["generated_code"], "# generated triton source\n")
+        self.assertEqual(
+            helion.Config.from_json(json.dumps(entry["config"])).block_sizes, [32]
+        )
+        kernel.get_cached_path.assert_called_once()
+
+    def test_uncaptured_config_is_omitted(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                sink.end_run()
+            configs = json.loads(sink.meta_path.read_text())["configs"]
+        self.assertNotIn(config_id, configs)
+
+    def test_capture_generated_code_raises_when_cached_path_missing(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        kernel = Mock()
+        kernel.get_cached_path.return_value = None
+        with self.assertRaisesRegex(RuntimeError, "generated artifact"):
+            self._capture_entry(kernel, config)
+
+    def test_capture_generated_code_raises_when_artifact_unreadable(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(Path(tmp) / "missing.py")
+            with self.assertRaises(OSError):
+                self._capture_entry(kernel, config)
+
+    def test_capture_generated_code_noop_when_not_collecting(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        kernel = Mock()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            AutotuneLogSink(f"{tmp}/run", _metadata(), collect_dataset=False) as sink,
+        ):
+            sink.start_run()
+            config_id = sink.register_config(config)
+            assert config_id is not None
+            sink.capture_generated_code(config_id, kernel, config)
+            sink.end_run()
+        kernel.get_cached_path.assert_not_called()
 
     def test_failed_tune_does_not_write_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -360,6 +451,16 @@ class TestAutotuneDatasetE2E(TestCase):
                 sm_attr = _DEVICE_PROPS_ATTRS[hw["device_kind"]][0]
                 self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
+            for cfg_entry in record["configs"].values():
+                self.assertEqual(
+                    set(cfg_entry), {"config", "generated_code", "source_hash"}
+                )
+                source = cfg_entry["generated_code"]
+                self.assertTrue(source)
+                self.assertEqual(
+                    cfg_entry["source_hash"],
+                    hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                )
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
             if _HAS_NETWORKX:
@@ -378,13 +479,14 @@ class TestAutotuneDatasetE2E(TestCase):
         config_id = data[0][header.index("config_id")]
         self.assertIn(config_id, configs_by_id)
         self.assertIn(data[0][header.index("run_id")], run_ids)
-        decoded_config = helion.Config.from_json(json.dumps(configs_by_id[config_id]))
+        decoded_config = helion.Config.from_json(
+            json.dumps(configs_by_id[config_id]["config"])
+        )
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
 
 
 class TestIrGraphDegradation(TestCase):
     def test_ir_graph_none_without_device_ir(self) -> None:
-        # cpu device for a host-independent hardware_info probe; see _metadata().
         meta = KernelMetadata(
             kernel_name="k", kernel_source="src", _device=torch.device("cpu")
         )
