@@ -5808,6 +5808,64 @@ class TestPallasJaxFn(TestCase):
         ref = float(jnp.sum(ref_out))
         self.assertAlmostEqual(result, ref, places=2)
 
+    def test_jax_fn_rebinds_inplace_output(self) -> None:
+        """A mutated input must surface as a new JAX value after launch."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def increment_inplace(x: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + 1.0
+            return x
+
+        f = jax.jit(increment_inplace.jax_fn)
+        x = jnp.zeros((128, 128), dtype=jnp.float32)
+        result = jax.block_until_ready(f(x))
+        self.assertTrue(bool(jnp.all(result == 1.0)))
+
+    def test_jax_standalone_captures_inplace_scratch_and_output_only(self) -> None:
+        """Metadata capture mirrors the launcher's output-only return contract."""
+        import sys
+        import types
+
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def mutate_and_scale(x: torch.Tensor, scratch: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                scratch[tile] = x[tile] + 1.0
+                out[tile] = scratch[tile] * 2.0
+            return out
+
+        sample = torch.zeros(128, 128, device=DEVICE)
+        code = mutate_and_scale.bind((sample, torch.empty_like(sample))).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+        name = "precompiled_mixed_alias_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, name, "exec"), module.__dict__)
+            x = jnp.zeros((128, 128), dtype=jnp.float32)
+            out = jax.block_until_ready(
+                jax.jit(module.mutate_and_scale)(x, jnp.empty_like(x))
+            )
+            self.assertTrue(bool(jnp.all(out == 2.0)))
+        finally:
+            sys.modules.pop(name, None)
+
 
 class TestPallasPrinter(TestCase):
     def test_pallas_texpr_mod(self) -> None:
