@@ -281,6 +281,8 @@ def default_pallas_jax_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _collective_id: int | None = None,
+    _uses_remote_copy: bool = False,
     **kwargs: object,
 ) -> object:
     """Pallas launcher used when running a Helion kernel inside ``jax.jit``.
@@ -368,6 +370,7 @@ def default_pallas_jax_launcher(
         scratch_shapes=_scratch_shapes,
         hbm_arg_indices=_hbm_arg_indices,
         smem_arg_indices=_smem_arg_indices,
+        collective_id=_collective_id,
         interpret=interpret,
         compact=compact,
         orig_shapes=orig_shapes,

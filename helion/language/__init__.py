@@ -19,6 +19,9 @@ from .creation_ops import full as full
 from .creation_ops import zeros as zeros
 from .debug_ops import breakpoint as breakpoint  # noqa: A004
 from .device_print import device_print as device_print
+from .distributed_ops import AsyncCopyDescriptor as AsyncCopyDescriptor
+from .distributed_ops import make_async_remote_copy as make_async_remote_copy
+from .distributed_ops import remote_barrier as remote_barrier
 from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
 from .inline_triton_ops import inline_triton as inline_triton
 from .inline_triton_ops import triton_kernel as triton_kernel
