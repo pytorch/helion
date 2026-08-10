@@ -986,6 +986,22 @@ class TestPallas(TestCase):
         )
         self.assertGreaterEqual(recall, 0.99)
 
+    def test_gather_lowers_to_take_along_axis(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            config=helion.Config(block_sizes=[8]),
+        )
+        def gather_kernel(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(index, dtype=x.dtype)
+            for rows in hl.tile(x.size(0)):
+                out[rows, :] = torch.gather(x[rows, :], 1, index[rows, :])
+            return out
+
+        x = torch.randn(8, 256, device=DEVICE, dtype=torch.float32)
+        index = torch.randint(0, 256, (8, 64), device=DEVICE, dtype=torch.int32)
+        code = gather_kernel.bind((x, index)).to_code()
+        self.assertIn("jnp.take_along_axis", code)
+
     @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
     def test_topk_bf16_vocab_reduction(self) -> None:
         """bf16 input: the (rows, vocab) reduction buffer stays bf16 (halves the
