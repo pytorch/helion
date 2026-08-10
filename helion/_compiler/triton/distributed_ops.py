@@ -132,8 +132,8 @@ def _prepare_remote_copy(state: CodegenState, *, start: bool) -> ast.AST:
         )
         start_statement = statement_from_string(
             "nvshmem.putmem_signal_block("
-            f"{dst_ptr}, {src_ptr}, ({numel}) * {src.element_size()}, "
-            f"{signal_name}, 1, 0, {{device_id}})",
+            f"{dst_ptr}, {src_ptr}, tl.cast(({numel}) * {src.element_size()}, tl.int64), "
+            f"{signal_name}, tl.cast(1, tl.uint64), 0, {{device_id}})",
             device_id=device_id,
             **src_placeholders,
             **dst_placeholders,
