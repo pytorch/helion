@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import random
 import tempfile
-from types import ModuleType
 from typing import TYPE_CHECKING
 from typing import cast
 import unittest
@@ -199,8 +198,9 @@ class TestCollectHardwareInfo(TestCase):
             self.assertEqual(
                 set(info["device_props"]), set(_DEVICE_PROPS_ATTRS[info["device_kind"]])
             )
-            sm_attr = _DEVICE_PROPS_ATTRS[info["device_kind"]][0]
-            self.assertIsNotNone(info["device_props"][sm_attr])
+            self.assertTrue(
+                all(isinstance(value, int) for value in info["device_props"].values())
+            )
             self.assertIsNotNone(info["versions"]["triton"])
 
     def test_cpu_device_not_misreported(self) -> None:
@@ -214,20 +214,9 @@ class TestCollectHardwareInfo(TestCase):
         with self.assertRaisesRegex(ValueError, "device"):
             collect_hardware_info(cast("torch.device", None))
 
-    def test_missing_module_version_raises(self) -> None:
-        module_without_version = ModuleType("triton")
-        with (
-            patch(
-                "helion.autotuner._metadata.hardware.importlib.metadata.version",
-                side_effect=importlib.metadata.PackageNotFoundError,
-            ),
-            patch(
-                "helion.autotuner._metadata.hardware.importlib.import_module",
-                return_value=module_without_version,
-            ),
-            self.assertRaises(AttributeError),
-        ):
-            _package_version("triton")
+    def test_missing_distribution_metadata_raises(self) -> None:
+        with self.assertRaises(importlib.metadata.PackageNotFoundError):
+            _package_version("sys")
 
 
 class TestKernelMetadataHardwareInfo(TestCase):
