@@ -333,7 +333,7 @@ class BaseSearch(BaseAutotuner):
             tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
             input_shapes = str([tuple(t.shape) for t in tensors])
             dtypes = str([str(t.dtype) for t in tensors])
-        device = extract_device(self.args)
+        device = self.kernel.env.device
         hardware = get_device_name(device) or ""
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=kernel_name,

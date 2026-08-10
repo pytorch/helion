@@ -5,6 +5,7 @@ import functools
 import hashlib
 import time
 from typing import TYPE_CHECKING
+from typing import cast
 
 from .._compat import get_device_name
 
@@ -119,10 +120,13 @@ class KernelMetadata:
     _device_ir: DeviceIR | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
-    # Source ref for the lazy ``hardware_info`` snapshot; repr/compare/hash off.
     _device: torch.device | None = dataclasses.field(
-        default=None, repr=False, compare=False, hash=False
+        kw_only=True, repr=False, compare=False, hash=False
     )
+
+    def __post_init__(self) -> None:
+        if self._device is None:
+            raise ValueError("device is required for kernel metadata")
 
     @functools.cached_property
     def run_id(self) -> str:
@@ -147,7 +151,7 @@ class KernelMetadata:
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
             "dtypes": self.dtypes,
-            "hardware_info": collect_hardware_info(self._device),
+            "hardware_info": collect_hardware_info(cast("torch.device", self._device)),
             "settings": self.settings,
             "ir_graph": self.ir_graph,
         }
