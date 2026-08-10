@@ -331,11 +331,18 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
+        self.requires_nvshmem = False
         self.requires_collective_id = False
         self.requires_remote_copy = False
         # Descriptor lifecycle operations may live in nested control-flow
         # graphs. Backends resolve them through this compiler-owned table.
         self.remote_copy_descriptors: dict[int, object] = {}
+        # Triton/NVSHMEM receive completion is hidden from the frontend. The
+        # lowering appends one compiler-managed signal-pad pointer to the kernel
+        # signature and assigns one slot per receive-wait descriptor.
+        self.triton_remote_copy_signal_arg: str | None = None
+        self.triton_remote_copy_signal_dst: str | None = None
+        self.triton_remote_copy_signal_slots = 0
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
@@ -892,6 +899,11 @@ class DeviceFunction:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         function_decorator = backend.function_decorator_for_args(param_args)
+        decorators = (
+            [expr_from_string("requires_nvshmem")] if self.requires_nvshmem else []
+        )
+        if function_decorator:
+            decorators.append(expr_from_string(function_decorator))
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
@@ -1012,9 +1024,7 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=kernel_body,
-                    decorator_list=[expr_from_string(function_decorator)]
-                    if function_decorator
-                    else [],
+                    decorator_list=decorators,
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},

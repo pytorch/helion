@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import contextlib
+from datetime import timedelta
 import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import sys
 from typing import TYPE_CHECKING
+from typing import ClassVar
 from typing import TypeVar
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+from torch.testing._internal.common_distributed import MultiProcessTestCase
 
 import helion
 import helion.language as hl
@@ -269,6 +275,161 @@ def _route_forward_then_consume(
         for token in hl.tile(routed.size(3), block_size=8):
             output[:, :, :, token, :] = routed[:, :, :, token, :] + 1
     return routed, output
+
+
+@unittest.skipUnless(
+    torch.version.cuda is not None and torch.cuda.device_count() >= 4,
+    "requires four NVIDIA CUDA devices",
+)
+@onlyBackends(["triton"])
+class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
+    """Execute the Triton lowering with four NVSHMEM-connected GPUs."""
+
+    _nvshmem_env: ClassVar[dict[str, str]] = {
+        "NVSHMEM_SYMMETRIC_SIZE": "1G",
+        "NVSHMEM_DISABLE_NVLS": "1",
+        "NCCL_NVLS_ENABLE": "0",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._class_stack = contextlib.ExitStack()
+        cls._class_stack.enter_context(patch.dict(os.environ, cls._nvshmem_env))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._class_stack.close()
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._spawn_processes()
+
+    def tearDown(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        super().tearDown()
+
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(f"cuda:{self.rank}")
+
+    def _init_process(self) -> None:
+        torch.cuda.set_device(self.device)
+        store = dist.FileStore(self.file_name, self.world_size)
+        dist.init_process_group(
+            backend="nccl",
+            world_size=self.world_size,
+            rank=self.rank,
+            store=store,
+            device_id=self.device,
+        )
+        torch.distributed.distributed_c10d._set_pg_timeout(
+            timedelta(seconds=60), dist.group.WORLD
+        )
+        symm_mem.set_backend("NVSHMEM")
+
+    def _cleanup_process(self) -> None:
+        torch.cuda.synchronize()
+        dist.barrier()
+        dist.destroy_process_group()
+
+    def _make_symmetric_buffer(self, shape: tuple[int, ...]) -> torch.Tensor:
+        dst = symm_mem.empty(*shape, dtype=torch.float32, device=self.device)
+        group = dist.group.WORLD
+        assert group is not None
+        dst_handle = symm_mem.rendezvous(dst, group=group)
+        self.assertEqual(dst_handle.world_size, self.world_size)
+        return dst
+
+    def test_one_shot_remote_copy(self) -> None:
+        self._init_process()
+        try:
+            src = torch.from_numpy(_rank_values(self.rank)).to(self.device)
+            src = src.reshape(1, 1, _WIDTH)
+            dst = self._make_symmetric_buffer((1, 2, _WIDTH))
+            peers = torch.tensor(
+                [[(self.rank + 1) % self.world_size]],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            slots = torch.full(
+                (1, 1), _REMOTE_SLOT, dtype=torch.int32, device=self.device
+            )
+            expected = torch.from_numpy(
+                _expected_cyclic_destination(self.world_size)[self.rank]
+            ).to(self.device)
+            for _invocation in range(2):
+                dst.fill_(-1)
+                dist.barrier()
+                result = _one_shot_remote_copy(src, dst, peers, slots)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(result[0], expected)
+        finally:
+            self._cleanup_process()
+
+    def test_reused_descriptor_pipeline(self) -> None:
+        self._init_process()
+        try:
+            src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
+            src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
+            dst = self._make_symmetric_buffer(src.shape)
+            peers = torch.tensor(
+                [
+                    [
+                        (self.rank + 1) % self.world_size,
+                        (self.rank - 1) % self.world_size,
+                    ]
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            expected = torch.from_numpy(
+                _expected_pipeline_destination(self.world_size)[self.rank]
+            ).to(self.device)
+            for _invocation in range(2):
+                dst.fill_(-1)
+                dist.barrier()
+                result = _reused_descriptor_pipeline_copy(src, dst, peers)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(result[0], expected)
+        finally:
+            self._cleanup_process()
+
+    def test_ring_all_gather(self) -> None:
+        self._init_process()
+        try:
+            gathered = self._make_symmetric_buffer(
+                (self.world_size, 1, _GATHER_ROWS, _WIDTH)
+            )
+            peers = torch.from_numpy(_ring_peers(self.rank, self.world_size)).to(
+                self.device
+            )
+            slots = torch.from_numpy(_ring_slots(self.rank, self.world_size)).to(
+                self.device
+            )
+            local_values = (
+                torch.from_numpy(_rank_gather_values(self.rank))
+                .to(self.device)
+                .unsqueeze(0)
+            )
+            expected = torch.from_numpy(_expected_all_gather(self.world_size)).to(
+                self.device
+            )
+            for _invocation in range(2):
+                gathered.fill_(-1)
+                dist.barrier()
+                result = _ring_all_gather(local_values, gathered, peers, slots)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(result[:, 0], expected)
+        finally:
+            self._cleanup_process()
 
 
 @onlyBackends(["pallas"])
