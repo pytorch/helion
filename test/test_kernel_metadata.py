@@ -210,6 +210,10 @@ class TestCollectHardwareInfo(TestCase):
         self.assertNotIn("device_props", info)
         self.assertEqual(set(info["versions"]), {"torch", "helion"})
 
+    def test_rocm_omits_cuda_only_optin_shared_memory(self) -> None:
+        self.assertIn("shared_memory_per_block_optin", _DEVICE_PROPS_ATTRS["cuda"])
+        self.assertNotIn("shared_memory_per_block_optin", _DEVICE_PROPS_ATTRS["rocm"])
+
     def test_device_is_required(self) -> None:
         with self.assertRaisesRegex(ValueError, "device"):
             collect_hardware_info(cast("torch.device", None))

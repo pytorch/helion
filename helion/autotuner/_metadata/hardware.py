@@ -44,7 +44,6 @@ def _hardware_identity(
     return hw.device_kind, hw.hardware_name, hw.compute_capability
 
 
-# CUDA and ROCm both use the torch.cuda properties object.
 _CUDA_PROPS_ATTRS: tuple[str, ...] = (
     "multi_processor_count",
     "max_threads_per_multi_processor",
@@ -56,9 +55,19 @@ _CUDA_PROPS_ATTRS: tuple[str, ...] = (
     "total_memory",
     "L2_cache_size",
 )
+_ROCM_PROPS_ATTRS: tuple[str, ...] = (
+    "multi_processor_count",
+    "max_threads_per_multi_processor",
+    "max_threads_per_block",
+    "warp_size",
+    "shared_memory_per_block",
+    "regs_per_multiprocessor",
+    "total_memory",
+    "L2_cache_size",
+)
 _DEVICE_PROPS_ATTRS: dict[str, tuple[str, ...]] = {
     "cuda": _CUDA_PROPS_ATTRS,
-    "rocm": _CUDA_PROPS_ATTRS,
+    "rocm": _ROCM_PROPS_ATTRS,
     "xpu": (
         "max_compute_units",
         "max_work_group_size",
