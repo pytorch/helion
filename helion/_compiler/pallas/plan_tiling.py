@@ -83,16 +83,98 @@ class DimensionTiling:
     block_ids: list[int] = field(default_factory=list)
 
 
+REMOTE_SRC_INDEXING_PATTERNS = "pallas_remote_src_indexing_patterns"
+REMOTE_DST_INDEXING_PATTERNS = "pallas_remote_dst_indexing_patterns"
+
+
 def plan_tiling(
     graphs: list[GraphInfo],
     config: Config,
     tile_strategy: TileStrategyDispatch,
 ) -> None:
+    graph_lookup = {graph_info.graph_id: graph_info for graph_info in graphs}
+    parent_ids = _collect_control_flow_parent_ids(graphs)
     for graph_info in graphs:
-        _analyze_indexing_expressions(graph_info, config)
+        local_access_keys = _collect_local_access_keys_with_ancestors(
+            graph_info, graph_lookup, parent_ids
+        )
+        _analyze_indexing_expressions(graph_info, config, local_access_keys)
 
 
-def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None:
+def _tensor_origin_key(tensor: torch.Tensor) -> str | int:
+    from ..host_function import HostFunction
+
+    origin = HostFunction.current().tensor_to_origin.get(tensor)
+    return origin.host_str() if origin is not None else id(tensor)
+
+
+def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+
+    local_access_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+    local_access_keys: set[str | int] = set()
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target not in local_access_targets:
+            continue
+        tensor_arg = node.args[0]
+        if isinstance(tensor_arg, torch.fx.Node):
+            tensor = tensor_arg.meta.get("val")
+            if isinstance(tensor, torch.Tensor):
+                local_access_keys.add(_tensor_origin_key(tensor))
+    return local_access_keys
+
+
+def _collect_control_flow_parent_ids(graphs: list[GraphInfo]) -> dict[int, int]:
+    from ...language import _tracing_ops
+
+    parent_ids: dict[int, int] = {}
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            child_ids: tuple[object, ...] = ()
+            if _tracing_ops.is_for_loop_target(node.target):
+                child_ids = node.args[:1]
+            elif node.target is _tracing_ops._if:
+                child_ids = node.args[1:3]
+            elif node.target is _tracing_ops._while_loop:
+                child_ids = node.args[:2]
+            for child_id in child_ids:
+                if isinstance(child_id, int):
+                    parent_ids.setdefault(child_id, graph_info.graph_id)
+    return parent_ids
+
+
+def _collect_local_access_keys_with_ancestors(
+    graph_info: GraphInfo,
+    graph_lookup: dict[int, GraphInfo],
+    parent_ids: dict[int, int],
+) -> set[str | int]:
+    """Find local accesses visible to one nested control-flow graph.
+
+    A child loop may communicate through a tensor initialized by its parent, so
+    parent accesses keep that tensor in the resident VMEM view. Accesses in a
+    sibling or later root do not: those require an HBM-backed destination that
+    survives between control-flow regions.
+    """
+    result: set[str | int] = set()
+    current = graph_info
+    visited: set[int] = set()
+    while current.graph_id not in visited:
+        visited.add(current.graph_id)
+        result.update(_collect_local_access_keys(current.graph))
+        parent_id = parent_ids.get(current.graph_id)
+        if parent_id is None:
+            break
+        current = graph_lookup[parent_id]
+    return result
+
+
+def _analyze_indexing_expressions(
+    graph_info: GraphInfo, config: Config, local_access_keys: set[str | int]
+) -> None:
+    from ...language import distributed_ops
     from ...language import memory_ops
     from ...language.atomic_ops import ATOMIC_OPS
 
@@ -100,8 +182,91 @@ def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None
     for node in graph_info.graph.nodes:
         if node.op != "call_function":
             continue
-        if node.target in indexing_targets:
+        if node.target is distributed_ops.make_async_remote_copy:
+            _analyze_remote_copy(node, config, local_access_keys)
+        elif node.target in indexing_targets:
             _analyze_indexing(node, config)
+
+
+def _analyze_remote_copy(
+    node: torch.fx.Node, config: Config, local_access_keys: set[str | int]
+) -> None:
+    if len(node.args) != 5:
+        raise exc.InternalError(
+            RuntimeError("remote copy was not normalized to its five-argument form")
+        )
+    _analyze_remote_operand(
+        node,
+        node.args[0],
+        node.args[1],
+        config,
+        local_access_keys,
+        REMOTE_SRC_INDEXING_PATTERNS,
+        is_destination=False,
+    )
+    _analyze_remote_operand(
+        node,
+        node.args[3],
+        node.args[4],
+        config,
+        local_access_keys,
+        REMOTE_DST_INDEXING_PATTERNS,
+        is_destination=True,
+    )
+
+
+def _analyze_remote_operand(
+    node: torch.fx.Node,
+    tensor_arg: object,
+    subscript: object,
+    config: Config,
+    local_access_keys: set[str | int],
+    metadata_key: str,
+    *,
+    is_destination: bool,
+) -> None:
+    if not isinstance(tensor_arg, torch.fx.Node):
+        raise exc.InternalError(RuntimeError("remote-copy operand is not an FX node"))
+    if not isinstance(subscript, (list, tuple)):
+        raise exc.InternalError(RuntimeError("remote-copy index is not a sequence"))
+    tensor = tensor_arg.meta.get("val")
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.InternalError(RuntimeError("remote-copy operand is not a tensor"))
+
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+
+    device_fn = DeviceFunction.current()
+    tensor_id = id(tensor)
+    tensor_key = _tensor_origin_key(tensor)
+    if tensor_id not in device_fn.pallas_tensor_dim_tilings:
+        device_fn.pallas_tensor_dim_tilings[tensor_id] = [
+            DimensionTiling() for _ in range(tensor.ndim)
+        ]
+    node.meta[metadata_key] = _analyze_subscript_patterns(
+        tensor,
+        list(subscript),
+        device_fn.pallas_tensor_dim_tilings[tensor_id],
+        node,
+        config,
+    )
+
+    if is_destination and tensor_key not in local_access_keys:
+        # A destination that is not locally accessed by this graph must retain
+        # a persistent HBM allocation. This includes route-in-one-loop,
+        # consume-in-a-later-loop pipelines. Once any graph needs persistence,
+        # later local accesses must not downgrade the tensor to VMEM.
+        device_fn.pallas_memory_space[tensor_id] = PallasMemorySpace.HBM
+    elif device_fn.pallas_memory_space.get(tensor_id) != PallasMemorySpace.HBM:
+        # When the same graph both communicates through and computes from a
+        # tensor, its BlockSpec is the symmetric resident region addressed by
+        # the remote copy. Keeping that region in VMEM avoids an unnecessary
+        # HBM round trip and permits immediate consumption after the DMA wait.
+        device_fn.pallas_memory_space[tensor_id] = (
+            PallasMemorySpace.VMEM
+            if tensor_key in local_access_keys
+            else PallasMemorySpace.HBM
+        )
 
 
 def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
