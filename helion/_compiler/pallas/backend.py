@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     import sympy
     from torch._inductor.ops_handler import OpsHandler
 
+    from ...autotuner.benchmarking import BenchTimes
     from ...autotuner.config_fragment import ConfigSpecFragment
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
@@ -729,7 +730,7 @@ class PallasBackend(Backend):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+    def get_do_bench(self) -> Callable[..., BenchTimes]:
         from ...autotuner.benchmarking import do_bench_generic
 
         return do_bench_generic
@@ -1533,7 +1534,7 @@ class PallasBackend(Backend):
         if config.get("pallas_loop_type", "unroll") == "unroll" and (
             plan.ordered_axis is not None
         ):
-            import jax.experimental.pallas.tpu as pltpu
+            import jax.experimental.pallas.tpu as pltpu  # pyrefly: ignore[missing-import]
 
             from ...runtime.pallas.launcher import _get_vmem_limit_bytes
             from .compact_worklist import build_resident_cache_admission

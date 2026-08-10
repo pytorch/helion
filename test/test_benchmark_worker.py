@@ -42,6 +42,7 @@ from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
+from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.benchmarking import do_bench_generic
 from helion.autotuner.kernel_args import load_trusted_kernel_args
 from helion.autotuner.metrics import AutotuneMetrics
@@ -458,7 +459,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 Config(), cast("CompiledConfig", object())
             )
 
-        self.assertEqual(result, math.inf)
+        self.assertIsNone(result)
         self.assertEqual(provider._last_benchmark_failure_status, "timeout")
         self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
         self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
@@ -525,7 +526,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 cast("CompiledConfig", object()),
             )
 
-        self.assertEqual(result, math.inf)
+        self.assertIsNone(result)
         self.assertEqual(run_job.call_count, 2)
         self.assertEqual(provider._last_benchmark_failure_status, "timeout")
         self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
@@ -553,7 +554,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 cast("CompiledConfig", object()),
             )
 
-        self.assertEqual(result, math.inf)
+        self.assertIsNone(result)
         run_job.assert_called_once()
         provider.budget_exceeded_fn.assert_called_once_with()
         self.assertEqual(provider._last_benchmark_failure_status, "timeout")
@@ -579,7 +580,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 cast("CompiledConfig", object()),
             )
 
-        self.assertEqual(result, math.inf)
+        self.assertIsNone(result)
         run_job.assert_called_once()
         self.assertEqual(provider._last_benchmark_failure_status, "timeout")
 
@@ -601,7 +602,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 Config(), cast("CompiledConfig", object())
             )
 
-        self.assertEqual(result, math.inf)
+        self.assertIsNone(result)
         self.assertEqual(provider._last_benchmark_failure_status, "error")
         self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
         self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
@@ -612,7 +613,15 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider.settings = Settings(autotune_benchmark_timeout=17)
         provider._precompile_args_path = "/tmp/args.pt"
         provider._benchmark_worker = Mock()
-        provider._benchmark_worker.run.return_value = 1.25
+        stats = PerfStats(
+            min=1.0,
+            median=1.25,
+            mean=1.2,
+            p90=1.3,
+            std=0.1,
+            n_samples=3,
+        )
+        provider._benchmark_worker.run.return_value = stats
         provider._subprocess_benchmark_uses_wall_clock = lambda: True
 
         with patch(
@@ -626,7 +635,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 fixed_repetitions=3,
             )
 
-        self.assertEqual(result, 1.25)
+        self.assertEqual(result, stats)
         provider._benchmark_worker.run.assert_called_once()
         job = provider._benchmark_worker.run.call_args.args[0]
         self.assertEqual(job.fixed_repetitions, 3)
@@ -639,6 +648,49 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider._subprocess_benchmark_enabled = lambda: True
 
         self.assertFalse(provider._subprocess_accuracy_check_enabled())
+
+    def test_benchmark_job_stats_mode_returns_perf_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((), args_path)
+            result = BenchmarkJob(
+                fn_spec=SerializedCompiledFunction(
+                    function_name="call",
+                    source_code="def call():\n    return None\n",
+                    filename=None,
+                    module_name=None,
+                ),
+                args_path=str(args_path),
+                use_wall_clock=True,
+                return_mode="stats",
+                fixed_repetitions=3,
+            )()
+
+        assert isinstance(result, PerfStats)
+        self.assertEqual(result.n_samples, 3)
+
+    def test_benchmark_job_stats_mode_rejects_scalar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((), args_path)
+            with (
+                patch(
+                    "helion.autotuner.benchmark_job.do_bench_generic",
+                    return_value=1.25,
+                ),
+                self.assertRaisesRegex(TypeError, "return_mode=.?stats"),
+            ):
+                BenchmarkJob(
+                    fn_spec=SerializedCompiledFunction(
+                        function_name="call",
+                        source_code="def call():\n    return None\n",
+                        filename=None,
+                        module_name=None,
+                    ),
+                    args_path=str(args_path),
+                    use_wall_clock=True,
+                    return_mode="stats",
+                )()
 
     def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -989,10 +1041,11 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         RandomSearch(bound_kernel, args, 20).autotune()
 
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
-    def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
-        # Patches _benchmark_function_subprocess to return inf for a
-        # fraction of configs, simulating BenchmarkTimeout / worker death;
-        # autotune must still pick a best config from the rest.
+    def test_autotune_continues_when_subprocess_reports_failure(self) -> None:
+        # Patches _benchmark_function_subprocess to return None (the
+        # "benchmark failed, skip this config" sentinel) for a fraction of
+        # configs, simulating BenchmarkTimeout / worker death; autotune must
+        # still pick a best config from the rest.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -1003,13 +1056,13 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             self: LocalBenchmarkProvider,
             config: Config,
             fn: CompiledConfig,
-        ) -> float | None:
+        ) -> object:
             call_count[0] += 1
             if call_count[0] % 3 == 0:
                 call_count[1] += 1
                 self._last_benchmark_failure_status = "timeout"
                 self._autotune_metrics.num_worker_failures += 1
-                return math.inf
+                return None
             return original(self, config, fn)
 
         examples_dir = Path(__file__).parent.parent / "examples"

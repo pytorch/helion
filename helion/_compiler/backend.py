@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import abc
-import ast
 import dataclasses
 import functools
 import logging
@@ -36,6 +35,7 @@ if TYPE_CHECKING:
 
     from torch._inductor.ops_handler import OpsHandler
 
+    from ..autotuner.benchmarking import BenchTimes
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
     from ..autotuner.config_spec import ConfigSpec
@@ -411,13 +411,15 @@ class Backend(abc.ABC):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
+    def get_do_bench(self) -> Callable[..., BenchTimes] | None:
         """Return the benchmarking function for this backend.
 
         The default returns ``None`` which causes the autotuner to use the
         module-level ``do_bench`` (patchable by tests).  Backends that need
         a different timing mechanism (e.g., Pallas/TPU) should override
         this to return their own function.
+
+        Overrides must honor ``return_mode="stats"`` by returning ``PerfStats``.
         """
         return None
 

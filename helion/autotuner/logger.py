@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .benchmarking import PerfStats
     from .metrics import KernelMetadata
 
 else:
@@ -176,11 +177,15 @@ class AutotuningLogger:
         return self._log_sink.register_config(config)
 
     def capture_generated_code(
-        self, config_id: str, kernel: _AutotunableKernel, config: Config
+        self,
+        config_id: str,
+        kernel: _AutotunableKernel,
+        config: Config,
+        perf_stats: tuple[PerfStats, ...],
     ) -> None:
         """Capture generated source when a sink is active."""
         if self._log_sink is not None:
-            self._log_sink.capture_generated_code(config_id, kernel, config)
+            self._log_sink.capture_generated_code(config_id, kernel, config, perf_stats)
 
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
         self._log_sink = sink
@@ -314,6 +319,7 @@ class ConfigEntry(TypedDict):
     config: dict[str, object]
     generated_code: str
     source_hash: str
+    perf_stats: list[dict[str, float | int]]
 
 
 class AutotuneLogSink:
@@ -416,11 +422,19 @@ class AutotuneLogSink:
         return canonical_config_id(config)
 
     def capture_generated_code(
-        self, config_id: str, kernel: _AutotunableKernel, config: Config
+        self,
+        config_id: str,
+        kernel: _AutotunableKernel,
+        config: Config,
+        perf_stats: tuple[PerfStats, ...],
     ) -> None:
         if not self._collect_dataset:
             return
+        if not perf_stats:
+            raise RuntimeError(f"Missing performance statistics for config {config_id}")
+        serialized_stats = [stats.to_dict() for stats in perf_stats]
         if config_id in self._configs:
+            self._configs[config_id]["perf_stats"] = serialized_stats
             return
         path = kernel.get_cached_path(config)
         if path is None:
@@ -430,6 +444,7 @@ class AutotuneLogSink:
             "config": config.config,
             "generated_code": generated_code,
             "source_hash": hashlib.sha256(generated_code.encode("utf-8")).hexdigest(),
+            "perf_stats": serialized_stats,
         }
 
     def record(self, entry: AutotuneLogEntry) -> None:

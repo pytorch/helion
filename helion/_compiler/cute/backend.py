@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
     from torch._inductor.ops_handler import OpsHandler
 
+    from ...autotuner.benchmarking import BenchTimes
     from ...autotuner.config_priors import ValuePrior
     from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
@@ -1053,7 +1054,7 @@ class CuteBackend(Backend):
             return "warn"
         return None
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+    def get_do_bench(self) -> Callable[..., BenchTimes]:
         # The default Triton do_bench uses CUDA events that mis-time the CuTe
         # path on Blackwell - launches show up as ~5ms when the kernel is
         # actually 250ms+. Use synchronized wall-clock timing instead so

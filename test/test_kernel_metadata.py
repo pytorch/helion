@@ -28,6 +28,7 @@ from helion.autotuner._metadata.hardware import _package_version
 from helion.autotuner._metadata.hardware import collect_hardware_info
 from helion.autotuner._metadata.ir_features import _has_networkx_node_link
 from helion.autotuner.base_search import _warn_dataset_without_log
+from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuneLogSink
@@ -37,6 +38,7 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from helion._compiler.device_ir import DeviceIR
+    from helion.autotuner.logger import ConfigEntry
 
 _LEAN_CSV_HEADER = [
     "run_id",
@@ -69,6 +71,24 @@ _HARDWARE_INFO_REQUIRED_KEYS = set(HardwareInfoRecord.__required_keys__)
 
 # Mirrors the extractor gate: missing networkx should degrade to None, not fail E2E.
 _HAS_NETWORKX = _has_networkx_node_link()
+
+_PERF_STATS_KEYS = {"min", "median", "mean", "p90", "std", "n_samples"}
+_PERF_STATS = PerfStats(
+    min=1.0,
+    median=1.1,
+    mean=1.2,
+    p90=1.3,
+    std=0.1,
+    n_samples=50,
+)
+_PERF_STATS_2 = PerfStats(
+    min=2.0,
+    median=2.1,
+    mean=2.2,
+    p90=2.3,
+    std=0.2,
+    n_samples=60,
+)
 
 
 @helion.kernel(config=helion.Config(block_sizes=[16]))
@@ -249,7 +269,7 @@ class TestAutotuneLogSink(TestCase):
                 sink.start_run()
                 config_id = sink.register_config(config)
                 assert config_id is not None
-                sink.capture_generated_code(config_id, kernel, config)
+                sink.capture_generated_code(config_id, kernel, config, (_PERF_STATS,))
                 sink.record(
                     AutotuneLogEntry(
                         generation=5,
@@ -287,6 +307,7 @@ class TestAutotuneLogSink(TestCase):
         self.assertEqual(
             entry["source_hash"], hashlib.sha256(source.encode("utf-8")).hexdigest()
         )
+        self.assertEqual(entry["perf_stats"], [_PERF_STATS.to_dict()])
         cfg = helion.Config.from_json(json.dumps(entry["config"]))
         self.assertEqual(cfg.block_sizes, [32])
         self.assertEqual(cell("run_id"), sidecar["run_id"])
@@ -307,7 +328,9 @@ class TestAutotuneLogSink(TestCase):
                 config_id = sink.register_config(config)
                 assert config_id is not None
                 for _ in range(times):
-                    sink.capture_generated_code(config_id, kernel, config)
+                    sink.capture_generated_code(
+                        config_id, kernel, config, (_PERF_STATS,)
+                    )
                 sink.end_run()
             configs = json.loads(
                 sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
@@ -367,7 +390,7 @@ class TestAutotuneLogSink(TestCase):
             sink.start_run()
             config_id = sink.register_config(config)
             assert config_id is not None
-            sink.capture_generated_code(config_id, kernel, config)
+            sink.capture_generated_code(config_id, kernel, config, (_PERF_STATS,))
             sink.end_run()
         kernel.get_cached_path.assert_not_called()
 
@@ -388,6 +411,48 @@ class TestAutotuneLogSink(TestCase):
             self.assertIs(raised.exception, original_error)
             self.assertIsNone(logger._log_sink)
             self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
+
+
+class TestPerfStats(TestCase):
+    def _capture(
+        self, measurements: tuple[tuple[PerfStats, ...], ...]
+    ) -> dict[str, object]:
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = Path(tmp) / "compiled_kernel.py"
+            source_path.write_text("source", encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(source_path)
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                for perf_stats in measurements:
+                    sink.capture_generated_code(config_id, kernel, config, perf_stats)
+                sink.end_run()
+            record = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+        return record["configs"][config_id]
+
+    def test_perf_stats_recorded_for_each_shape(self) -> None:
+        entry = self._capture(((_PERF_STATS, _PERF_STATS_2),))
+
+        self.assertEqual(
+            entry["perf_stats"],
+            [_PERF_STATS.to_dict(), _PERF_STATS_2.to_dict()],
+        )
+
+    def test_last_successful_perf_stats_win(self) -> None:
+        entry = self._capture(((_PERF_STATS,), (_PERF_STATS_2,)))
+
+        self.assertEqual(entry["perf_stats"], [_PERF_STATS_2.to_dict()])
+
+    def test_empty_perf_stats_raise(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "performance statistics"):
+            self._capture(((),))
 
 
 @onlyBackends(["triton"])
@@ -432,7 +497,10 @@ class TestAutotuneDatasetE2E(TestCase):
         self.assertTrue(csv_path.exists())
         self.assertTrue(meta_path.exists())
 
-        configs_by_id: dict[str, object] = {}
+        # Union the per-run configs maps and run_ids from the sidecar records, and
+        # keep a per-run-id view so CSV rows can be joined to their own record.
+        configs_by_id: dict[str, ConfigEntry] = {}
+        configs_by_run_id: dict[str, dict[str, ConfigEntry]] = {}
         run_ids: set[str] = set()
         meta_lines = [
             line for line in meta_path.read_text().splitlines() if line.strip()
@@ -451,9 +519,11 @@ class TestAutotuneDatasetE2E(TestCase):
                 sm_attr = _DEVICE_PROPS_ATTRS[hw["device_kind"]][0]
                 self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
-            for cfg_entry in record["configs"].values():
+            record_configs = cast("dict[str, ConfigEntry]", record["configs"])
+            for cfg_entry in record_configs.values():
                 self.assertEqual(
-                    set(cfg_entry), {"config", "generated_code", "source_hash"}
+                    set(cfg_entry),
+                    {"config", "generated_code", "source_hash", "perf_stats"},
                 )
                 source = cfg_entry["generated_code"]
                 self.assertTrue(source)
@@ -461,7 +531,12 @@ class TestAutotuneDatasetE2E(TestCase):
                     cfg_entry["source_hash"],
                     hashlib.sha256(source.encode("utf-8")).hexdigest(),
                 )
-            configs_by_id.update(record["configs"])
+                self.assertTrue(cfg_entry["perf_stats"])
+                for stats in cfg_entry["perf_stats"]:
+                    self.assertEqual(set(stats), _PERF_STATS_KEYS)
+                    self.assertGreaterEqual(stats["n_samples"], 1)
+            configs_by_id.update(record_configs)
+            configs_by_run_id.setdefault(record["run_id"], {}).update(record_configs)
             run_ids.add(record["run_id"])
             if _HAS_NETWORKX:
                 ir = record["ir_graph"]
@@ -483,6 +558,20 @@ class TestAutotuneDatasetE2E(TestCase):
             json.dumps(configs_by_id[config_id]["config"])
         )
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
+
+        # Each successful CSV row must join to measured stats from the same run.
+        status_idx = header.index("status")
+        cfg_idx = header.index("config_id")
+        run_idx = header.index("run_id")
+        ok_rows = [row for row in data if row[status_idx] == "ok"]
+        self.assertTrue(ok_rows)
+        for row in ok_rows:
+            row_run_id, row_cfg_id = row[run_idx], row[cfg_idx]
+            self.assertIn(row_run_id, configs_by_run_id)
+            self.assertIn(row_cfg_id, configs_by_run_id[row_run_id])
+            stats_by_shape = configs_by_run_id[row_run_id][row_cfg_id]["perf_stats"]
+            self.assertEqual(len(stats_by_shape), 1)
+            self.assertGreaterEqual(stats_by_shape[0]["n_samples"], 1)
 
 
 class TestIrGraphDegradation(TestCase):

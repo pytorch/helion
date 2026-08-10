@@ -32,6 +32,7 @@ from helion.autotuner.benchmark_provider import _aggregate_multi_shape_timings
 from helion.autotuner.benchmark_provider import _format_selected_multi_shape_measurement
 from helion.autotuner.benchmark_provider import _materialize_multi_shape_config
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
@@ -459,6 +460,17 @@ class _Log:
         pass
 
 
+def _perf_stats(median: float) -> PerfStats:
+    return PerfStats(
+        min=median,
+        median=median,
+        mean=median,
+        p90=median,
+        std=0.0,
+        n_samples=1,
+    )
+
+
 class _FakeBoundKernel:
     def __init__(
         self,
@@ -473,6 +485,7 @@ class _FakeBoundKernel:
         worker_failure_indices: list[int] | None = None,
         unique_sources: int = 0,
         source_deduplications: int = 0,
+        include_perf_stats: bool = True,
     ) -> None:
         self.config_spec = config_spec
         self.settings = SimpleNamespace(
@@ -492,6 +505,7 @@ class _FakeBoundKernel:
         self.worker_failures = len(self.worker_failure_indices)
         self.unique_sources = unique_sources
         self.source_deduplications = source_deduplications
+        self.include_perf_stats = include_perf_stats
 
 
 class _FakeLocalBenchmarkProvider:
@@ -570,6 +584,11 @@ class _FakeLocalBenchmarkProvider:
                 self.kernel.timings[index],
                 self.kernel.statuses[index],  # type: ignore[arg-type]
                 self.kernel.compile_times[index],
+                (
+                    (_perf_stats(self.kernel.timings[index]),)
+                    if self.kernel.include_perf_stats
+                    else ()
+                ),
             )
             for index, config in enumerate(configs)
         ]
@@ -622,6 +641,10 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
 
         self.assertEqual([result.perf for result in results], [2.0, 4.0])
         self.assertEqual([result.compile_time for result in results], [0.2, 0.4])
+        self.assertEqual(
+            [[stats.median for stats in result.perf_stats] for result in results],
+            [[1.0, 4.0], [8.0, 2.0]],
+        )
         self.assertIs(results[0].config, configs[0])
         self.assertIs(results[1].config, configs[1])
         self.assertEqual(metrics.num_configs_tested, 2)
@@ -641,6 +664,18 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
             self.assertEqual(desc, f"joint shape {index + 1}")
             self.assertEqual(received[0].block_sizes, [64])
             self.assertIsNot(received[0], configs[0])
+
+    def test_successful_child_without_perf_stats_raises(self) -> None:
+        spec = _make_config_spec()
+        provider, _ = self._make_provider(
+            [
+                _FakeBoundKernel(spec, [1.0], include_perf_stats=False),
+                _FakeBoundKernel(spec, [4.0]),
+            ]
+        )
+
+        with self.assertRaisesRegex(TypeError, "must provide one"):
+            provider.benchmark([Config(block_sizes=[64])])
 
     def test_deduplicated_child_result_is_successful(self) -> None:
         spec = _make_config_spec()

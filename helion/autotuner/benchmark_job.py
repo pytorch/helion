@@ -5,11 +5,13 @@ from __future__ import annotations
 import dataclasses
 import functools
 from typing import TYPE_CHECKING
-from typing import cast
+from typing import Literal
 
 import torch
 
 from .accuracy import assert_close
+from .benchmarking import PerfStats
+from .benchmarking import _BenchmarkContractError
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
@@ -29,9 +31,10 @@ class BenchmarkJob:
     warmup: int = 1
     rep: int = 50
     use_wall_clock: bool = False
+    return_mode: Literal["median", "stats"] = "median"
     fixed_repetitions: int | None = None
 
-    def __call__(self) -> float:
+    def __call__(self) -> float | PerfStats:
         # Subprocess inherits parent stderr; capture so Triton runtime
         # diagnostics don't leak to the user's terminal.
         with capture_output():
@@ -39,27 +42,35 @@ class BenchmarkJob:
             try:
                 args = load_trusted_kernel_args(self.args_path)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
-                # return_mode="median" guarantees a float return.
                 benchmark_fn = functools.partial(fn, *args)
                 if self.fixed_repetitions is None:
                     result = bench(
                         benchmark_fn,
-                        return_mode="median",
+                        return_mode=self.return_mode,
                         warmup=self.warmup,
                         rep=self.rep,
                     )
                 else:
                     result = bench(
                         benchmark_fn,
-                        return_mode="median",
+                        return_mode=self.return_mode,
                         warmup=self.warmup,
                         rep=self.rep,
                         fixed_repetitions=self.fixed_repetitions,
                     )
-                return cast(
-                    "float",
-                    result,
-                )
+                if self.return_mode == "stats":
+                    if not isinstance(result, PerfStats):
+                        raise _BenchmarkContractError(
+                            "return_mode='stats' expected do_bench to return a "
+                            f"PerfStats, got {type(result).__name__}"
+                        )
+                    return result
+                if not isinstance(result, float):
+                    raise _BenchmarkContractError(
+                        "return_mode='median' expected do_bench to return a "
+                        f"float, got {type(result).__name__}"
+                    )
+                return result
             finally:
                 _unload_compiled_fn(fn)
 

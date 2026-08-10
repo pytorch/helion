@@ -14,6 +14,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion.autotuner.benchmarking import PerfStats
 import helion.language as hl
 
 
@@ -182,7 +183,16 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 call_count[0] += 1
                 if call_count[0] == 2:  # Fail on second config
                     raise PTXASError("Mocked PTXAS error")
-                return 1.0  # Return a valid benchmark time for the first config
+                # The autotune path requests return_mode="stats", so a successful
+                # bench returns a PerfStats (not a scalar) for the first config.
+                return PerfStats(
+                    min=1.0,
+                    median=1.0,
+                    mean=1.0,
+                    p90=1.0,
+                    std=0.0,
+                    n_samples=1,
+                )
 
             with self.capture_output() as output_capture:
                 with mock.patch(
