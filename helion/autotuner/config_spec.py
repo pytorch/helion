@@ -11,6 +11,7 @@ import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Iterator
 from typing import NamedTuple
 from typing import cast
 
@@ -91,6 +92,58 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
 
 log = logging.getLogger(__name__)
+
+
+def _live_log_restriction(feature: str, reason: str, verbose: bool) -> None:
+    """Log a search-space restriction live (at INFO), best-effort.
+
+    ``verbose`` is the owning :class:`ConfigSpec`'s
+    ``log_restrictions_verbose`` flag (sourced from
+    ``Settings.autotune_log_search_space_verbose``); when False this is a no-op
+    so restrictions applied outside verbose autotuning stay quiet.
+
+    Purely diagnostic: any failure here must never disrupt compilation or the
+    autotuner loop.
+    """
+    try:
+        if verbose and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: %s (%s)",
+                feature,
+                reason,
+            )
+    except Exception:
+        log.debug("Failed to log search-space restriction", exc_info=True)
+
+
+def _record_restriction(
+    store: list[tuple[str, str]],
+    feature: str,
+    reason: str | None,
+    verbose: bool,
+) -> None:
+    """Record a search-space restriction and, when verbose, log it live.
+
+    ``verbose`` is the owning :class:`ConfigSpec`'s
+    ``log_restrictions_verbose`` flag.
+
+    Purely diagnostic: any failure here must never disrupt compilation or the
+    autotuner loop, so the whole body is best-effort.
+    """
+    if reason is None:
+        return
+    try:
+        pair = (feature, reason)
+        # De-duplicate: a shared ConfigSpec can see the same restriction applied
+        # once per matmul op (enforce_dot_requirements runs per dot node), which
+        # would otherwise emit duplicate summary lines. Preserve first-occurrence
+        # order (the field's documented contract).
+        if pair not in store:
+            store.append(pair)
+    except Exception:
+        log.debug("Failed to record search-space restriction", exc_info=True)
+    _live_log_restriction(feature, reason, verbose)
+
 
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
 
@@ -569,6 +622,20 @@ def get_valid_store_cache_modifiers(backend_name: str) -> tuple[str, ...]:
     return ("",)
 
 
+class SearchDimensionInfo(NamedTuple):
+    """One tunable search dimension described from the config spec.
+
+    ``cardinality`` is the number of distinct values (``None`` if unknown /
+    unbounded); ``values`` are the explicit choices when cheaply enumerable.
+    """
+
+    name: str
+    cardinality: int | None
+    values: list[object] | None
+    is_sequence: bool
+    num_items: int
+
+
 class ConfigSpec:
     def __init__(
         self,
@@ -580,9 +647,17 @@ class ConfigSpec:
         | None = _TARGET_DEVICE_CAPABILITY_UNSET,
         device: torch.device | None = None,
         num_sm: int | None = None,
+        log_restrictions_verbose: bool = False,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        # When True, search-space restriction decisions are logged live (at
+        # INFO) the moment they are applied, in addition to being recorded for
+        # the end-of-run summary. Sourced from
+        # ``Settings.autotune_log_search_space_verbose`` by the compile path
+        # (see CompileEnvironment); left False otherwise so restrictions applied
+        # outside verbose autotuning stay quiet.
+        self.log_restrictions_verbose = log_restrictions_verbose
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
@@ -635,6 +710,12 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        # Why each disabled pid_type was removed, for search-space logging.
+        self.disallowed_pid_type_reasons: dict[str, str] = {}
+        # (feature, reason) pairs for every non-pid_type search-space restriction
+        # (currently the tcgen05 narrowing applied per matmul), for search-space
+        # logging. De-duplicated; ordered by first occurrence.
+        self.restriction_reasons: list[tuple[str, str]] = []
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
@@ -797,13 +878,27 @@ class ConfigSpec:
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
 
-    def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
-        """Disallow a pid_type from being used in the config."""
+    def disallow_pid_type(
+        self, pid_type: PidTypeLiteral, reason: str | None = None
+    ) -> None:
+        """Disallow a pid_type from being used in the config.
 
+        ``reason`` explains why the pid_type is unavailable for this kernel; it is
+        recorded (first reason wins) and surfaced by the search-space logger. When
+        verbose search-space logging is enabled it is also logged live.
+        """
+
+        newly_disabled = pid_type in self.allowed_pid_types
+        if newly_disabled and reason is not None:
+            self.disallowed_pid_type_reasons.setdefault(pid_type, reason)
         self.allowed_pid_types = tuple(
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
+        if newly_disabled and reason is not None and self.log_restrictions_verbose:
+            _live_log_restriction(
+                f"pid_type={pid_type!r} disabled", reason, self.log_restrictions_verbose
+            )
 
     @property
     def cute_tcgen05_search_enabled(self) -> bool:
@@ -1513,6 +1608,7 @@ class ConfigSpec:
         allow_cluster_m2_fp8_small_grid: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        reason: str | None = None,
     ) -> None:
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
             allow_persistent_pid_types=allow_persistent_pid_types,
@@ -1522,6 +1618,12 @@ class ConfigSpec:
             allow_cluster_m2_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
+        )
+        _record_restriction(
+            self.restriction_reasons,
+            "tcgen05 search narrowed to validated configs",
+            reason,
+            self.log_restrictions_verbose,
         )
 
     def supports_config_key(self, key: str) -> bool:
@@ -2362,6 +2464,37 @@ class ConfigSpec:
         shrink_block_sizes_for_numel_constraints(
             self.tensor_numel_constraints, block_sizes, min_sizes
         )
+
+    def iter_search_dimensions(
+        self, value_limit: int = 100
+    ) -> Iterator[SearchDimensionInfo]:
+        """Yield one :class:`SearchDimensionInfo` per tunable field.
+
+        Public entry point for describing the search space. Scalar fragments
+        report their own ``cardinality()``/``search_values()``; a
+        ``BlockIdSequence`` reports the product of its per-item cardinalities.
+        Fields whose sizing depends on ConfigSpec-level state rather than the
+        fragment (e.g. ``pid_type``, ``num_stages``) are left to the caller.
+        """
+        from .block_id_sequence import BlockIdSequence
+
+        for name, field in self._flat_fields().items():
+            if isinstance(field, BlockIdSequence):
+                yield SearchDimensionInfo(
+                    name=name,
+                    cardinality=field.cardinality(self),
+                    values=None,
+                    is_sequence=True,
+                    num_items=len(field),
+                )
+            else:
+                yield SearchDimensionInfo(
+                    name=name,
+                    cardinality=field.cardinality(),
+                    values=field.search_values(value_limit),
+                    is_sequence=False,
+                    num_items=0,
+                )
 
     def _flat_fields(
         self,
