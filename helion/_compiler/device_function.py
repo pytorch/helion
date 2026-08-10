@@ -332,11 +332,22 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
+        self.requires_nvshmem = False
         self.requires_collective_id = False
         self.requires_remote_copy = False
         # Descriptor lifecycle operations may live in nested control-flow
         # graphs. Backends resolve them through this compiler-owned table.
         self.remote_copy_descriptors: dict[int, object] = {}
+        # Triton/NVSHMEM receive completion is hidden from the frontend. The
+        # lowering appends one compiler-managed signal-pad pointer to the kernel
+        # signature and assigns one slot per receive-wait descriptor.
+        self.triton_remote_copy_signal_arg: str | None = None
+        self.triton_remote_copy_signal_dst: str | None = None
+        self.triton_remote_copy_signal_slots = 0
+        # NVSHMEM takes pointer sources. Computed Triton tiles are materialized
+        # into compiler-owned global scratch before the transfer starts.
+        self.triton_remote_copy_scratch_args: list[str] = []
+        self.triton_remote_copy_scratch_specs: list[tuple[str, str]] = []
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
@@ -889,7 +900,20 @@ class DeviceFunction:
         # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
         for scratch_arg in self._scratch_args:
             args.append(create_arg(scratch_arg.name))
-        args.extend(create_arg(name) for name in self.wrapper_only_params)
+        # Remote-copy arguments are supplied by the Triton launcher rather than
+        # the generated host wrapper. Keep their signature order aligned with
+        # the launcher's canonical signal-then-scratch append order, independent
+        # of which descriptor kind the kernel encounters first.
+        remote_copy_params = set(self.triton_remote_copy_scratch_args)
+        if self.triton_remote_copy_signal_arg is not None:
+            remote_copy_params.add(self.triton_remote_copy_signal_arg)
+        wrapper_only_params = [
+            name for name in self.wrapper_only_params if name not in remote_copy_params
+        ]
+        if self.triton_remote_copy_signal_arg is not None:
+            wrapper_only_params.append(self.triton_remote_copy_signal_arg)
+        wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
+        args.extend(create_arg(name) for name in wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -908,6 +932,11 @@ class DeviceFunction:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         function_decorator = backend.function_decorator_for_args(param_args)
+        decorators = (
+            [expr_from_string("requires_nvshmem")] if self.requires_nvshmem else []
+        )
+        if function_decorator:
+            decorators.append(expr_from_string(function_decorator))
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
@@ -1028,9 +1057,7 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=kernel_body,
-                    decorator_list=[expr_from_string(function_decorator)]
-                    if function_decorator
-                    else [],
+                    decorator_list=decorators,
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},
