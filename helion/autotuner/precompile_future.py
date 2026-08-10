@@ -3,7 +3,9 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import importlib.util
 import inspect
+import linecache
 import multiprocessing as mp
 from multiprocessing import connection
 import os
@@ -25,6 +27,7 @@ import uuid
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import synchronize_device
 from .kernel_args import load_trusted_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
@@ -99,6 +102,14 @@ class SerializedCompiledFunction:
     source_code: str
     filename: str | None
     module_name: str | None
+    source_hash: str | None = None
+    # (origin_module_name, origin_file_path) for every kernel-source module the
+    # generated code imports (e.g. `import <origin> as _source_module` for a
+    # module-global like a dtype constant). The worker re-registers these from
+    # their files before exec so the import resolves even when the origin module
+    # name is not importable in a fresh process (notebook / exec / import-by-path
+    # kernels, whose synthetic module name only exists in the parent).
+    source_modules: list[tuple[str, str]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -134,31 +145,163 @@ def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
                 source_code = inspect.getsource(module)
     if source_code is None:
         raise RuntimeError("Unable to capture source for compiled kernel")
+    source_hash: str | None = None
+    fn_globals = getattr(fn, "__globals__", None)
+    if isinstance(fn_globals, dict):
+        kernel = fn_globals.get(f"_helion_{fn.__name__}")
+        value = getattr(kernel, "_helion_cute_source_hash", None)
+        if isinstance(value, str):
+            source_hash = value
     return SerializedCompiledFunction(
         function_name=fn.__name__,
         source_code=source_code,
         filename=filename,
         module_name=module_name,
+        source_hash=source_hash,
+        source_modules=_collect_source_modules(module),
     )
 
 
+def _collect_source_modules(module: types.ModuleType | None) -> list[tuple[str, str]]:
+    """Capture (name, file) for every kernel-origin module the generated module
+    imports into its globals.
+
+    Helion codegen emits ``import <origin> as _source_module`` (and
+    ``_global_source<N>`` for other modules) whenever the kernel references a
+    module-global. The worker re-execs the generated source in a fresh process,
+    so any such import must resolve there. A kernel defined in a normal importable
+    module is fine, but one loaded by path / exec / notebook lives under a
+    synthetic module name that only exists in the parent process. Shipping the
+    origin module's real file lets the worker re-register it under the same name.
+    """
+    if module is None:
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for value in vars(module).values():
+        if not isinstance(value, types.ModuleType):
+            continue
+        name = getattr(value, "__name__", None)
+        file = getattr(value, "__file__", None)
+        if not isinstance(name, str) or name in seen:
+            continue
+        if not isinstance(file, str) or not os.path.exists(file):
+            continue
+        # Skip modules a fresh worker can import on its own (real packages like
+        # torch/triton, or an example on PYTHONPATH) -- shipping/re-exec'ing them
+        # would be wasteful or harmful. A by-path / notebook / exec module lives
+        # under a synthetic name that only the parent's sys.modules knows about,
+        # so it is NOT freshly importable and gets shipped with its real file.
+        if _is_freshly_importable(name, file):
+            continue
+        seen.add(name)
+        out.append((name, file))
+    return out
+
+
+def _is_freshly_importable(name: str, loaded_file: str) -> bool:
+    """Would a fresh process import ``name`` and get the file we actually loaded?
+
+    ``importlib.util.find_spec`` normally returns the cached ``sys.modules``
+    entry, which would mask synthetic by-path modules. Temporarily drop the
+    cached entry (restoring it afterwards) so the lookup reflects what a worker
+    -- with an empty module cache -- would resolve.
+    """
+    saved = sys.modules.pop(name, None)
+    try:
+        spec = importlib.util.find_spec(name)
+    except Exception:
+        spec = None
+    finally:
+        if saved is not None:
+            sys.modules[name] = saved
+    origin = getattr(spec, "origin", None)
+    if not isinstance(origin, str):
+        return False
+    return os.path.realpath(origin) == os.path.realpath(loaded_file)
+
+
+def _register_source_module(name: str, file: str) -> None:
+    """Re-register a kernel-origin module from its file under ``name`` so the
+    generated code's ``import <name> as _source_module`` resolves in the worker.
+
+    No-op if the name is already present (e.g. a real importable package the
+    serializer chose not to ship, or a sibling job already loaded it)."""
+    if name in sys.modules:
+        return
+    spec = importlib.util.spec_from_file_location(name, file)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec so self-references / decorators resolve by name.
+    sys.modules[name] = module
+    # Leave a best-effort partial module rather than crashing the worker; if the
+    # import is actually needed the generated exec will surface a clear error.
+    with contextlib.suppress(Exception):
+        spec.loader.exec_module(module)
+
+
 def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
+    for origin_name, origin_file in fn_spec.source_modules:
+        _register_source_module(origin_name, origin_file)
     module_name = f"_helion_autotune_subprocess_{uuid.uuid4().hex}"
     module = types.ModuleType(module_name)
     module.__file__ = fn_spec.filename or "<helion-autotune-subprocess>"
     module.__loader__ = None
     module.__package__ = None
     sys.modules[module_name] = module
-    exec(
-        compile(fn_spec.source_code, module.__file__, "exec"),
-        module.__dict__,
-    )
-    fn = getattr(module, fn_spec.function_name, None)
-    if fn is None:
-        raise RuntimeError(
-            f"Unable to locate compiled kernel '{fn_spec.function_name}' in generated module"
+    try:
+        exec(
+            compile(fn_spec.source_code, module.__file__, "exec"),
+            module.__dict__,
         )
-    return fn
+        fn = getattr(module, fn_spec.function_name, None)
+        if fn is None:
+            raise RuntimeError(
+                f"Unable to locate compiled kernel '{fn_spec.function_name}' "
+                "in generated module"
+            )
+        cute_kernel = module.__dict__.get(f"_helion_{fn_spec.function_name}")
+        if cute_kernel is not None and fn_spec.source_hash is not None:
+            # Backend annotation is runtime metadata and is not present in the
+            # generated source. Carry the parent's exact value because
+            # PyCodeCache treats strip-equivalent source as one file key.
+            with contextlib.suppress(AttributeError, TypeError):
+                cute_kernel._helion_cute_source_hash = fn_spec.source_hash
+        return fn
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+
+
+def _unload_compiled_fn(fn: CompiledConfig) -> None:
+    """Release caches and the temporary module created by ``_load_compiled_fn``."""
+    clear_jit_fast_path_caches(fn)
+    module_name = getattr(fn, "__module__", "")
+    if module_name.startswith("_helion_autotune_subprocess_"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            cute_kernel = module.__dict__.get(f"_helion_{fn.__name__}")
+            if cute_kernel is not None:
+                launchers = getattr(
+                    cute_kernel, "_helion_cute_compiled_launchers", None
+                )
+                if isinstance(launchers, dict):
+                    for launcher in launchers.values():
+                        jit_func = getattr(launcher, "_jit_func", None)
+                        wrapped = getattr(jit_func, "__wrapped__", jit_func)
+                        code = getattr(wrapped, "__code__", None)
+                        filename = getattr(code, "co_filename", "")
+                        if filename.startswith("<helion_cute_launcher:"):
+                            linecache.cache.pop(filename, None)
+                for cache_name in (
+                    "_helion_cute_compiled_launchers",
+                    "_helion_cute_launch_arg_cache",
+                ):
+                    cache = getattr(cute_kernel, cache_name, None)
+                    if isinstance(cache, dict):
+                        cache.clear()
+        sys.modules.pop(module_name, None)
 
 
 def _run_kernel_in_subprocess_spawn(
@@ -175,7 +318,8 @@ def _run_kernel_in_subprocess_spawn(
         assert isinstance(args, (tuple, list))
         synchronize_device()
         with capture_output() as _cap:
-            fn(*args)
+            # Keep asynchronous device buffers alive until execution completes.
+            _output = fn(*args)
         synchronize_device()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:

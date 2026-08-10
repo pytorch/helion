@@ -10,7 +10,6 @@ from .. import exc
 from . import _decorators
 
 if TYPE_CHECKING:
-    from .._compiler.inductor_lowering import CodegenState
     from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
@@ -45,11 +44,6 @@ def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
     ):
         raise exc.BreakpointInDeviceLoopRequiresInterpret
     return LiteralType(origin, None)
-
-
-@_decorators.codegen(breakpoint, "triton")
-def _(state: CodegenState) -> None:
-    state.add_statement("breakpoint()")
 
 
 @_decorators.ref(breakpoint)

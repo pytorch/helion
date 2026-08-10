@@ -26,7 +26,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
-from helion.runtime.triton_helpers import triton_wait_signal
+from helion.runtime.triton.helpers import triton_wait_signal
 
 
 @triton.jit

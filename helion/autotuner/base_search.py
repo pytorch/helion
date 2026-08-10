@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
@@ -33,7 +34,9 @@ from ..runtime.settings import _env_get_int
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import LocalBenchmarkProvider
+from .benchmark_provider import MultiShapeBenchmarkProvider
 from .benchmark_provider import _clone_args
+from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _unset_fn
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
@@ -57,6 +60,7 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
+    from .search_space_logger import SearchSpaceTracker
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
@@ -270,6 +274,21 @@ class BaseSearch(BaseAutotuner):
         self._benchmarked_members: dict[Config, PopulationMember] = {}
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
+        self._search_space_tracker: SearchSpaceTracker | None = None
+
+    @property
+    def performance_unit(self) -> Literal["ms", "ratio"]:
+        args = getattr(self, "args", ())
+        if isinstance(args, _MultiShapeAutotuneArgs) and args.relative_to is not None:
+            return "ratio"
+        return "ms"
+
+    @property
+    def performance_suffix(self) -> str:
+        return "x" if self.performance_unit == "ratio" else "ms"
+
+    def format_performance(self, value: float) -> str:
+        return f"{value:.4f}{self.performance_suffix}"
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -294,19 +313,65 @@ class BaseSearch(BaseAutotuner):
             except OSError:
                 self.log.debug("Failed to read Helion kernel source", exc_info=True)
         kernel_name = getattr(kernel_obj, "name", "")
-        tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
-        input_shapes = str([tuple(t.shape) for t in tensors])
-        dtypes = str([str(t.dtype) for t in tensors])
-        device = extract_device(self.args)
+        if isinstance(self.args, _MultiShapeAutotuneArgs):
+            case_tensors = []
+            for _, case_args in self.args.cases:
+                leaves, _ = tree_flatten(case_args)
+                case_tensors.append(
+                    [value for value in leaves if isinstance(value, torch.Tensor)]
+                )
+            input_shapes = str(
+                [
+                    [tuple(tensor.shape) for tensor in tensors]
+                    for tensors in case_tensors
+                ]
+            )
+            dtypes = str(
+                [[str(tensor.dtype) for tensor in tensors] for tensors in case_tensors]
+            )
+        else:
+            tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
+            input_shapes = str([tuple(t.shape) for t in tensors])
+            dtypes = str([str(t.dtype) for t in tensors])
+        device = self.kernel.env.device
         hardware = get_device_name(device) or ""
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
+            dtypes=dtypes,
             hardware=hardware,
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
+        # Analyze search space if logging is enabled. Diagnostic only; a failure
+        # must not prevent autotuning from running. Verbose logging implies the
+        # summary, so either setting enables the analysis.
+        if (
+            self.settings.autotune_log_search_space
+            or self.settings.autotune_log_search_space_verbose
+        ):
+            try:
+                from .search_space_logger import SearchSpaceTracker
+                from .search_space_logger import analyze_search_space
+
+                hardware_spec, specialization_key = (
+                    self._get_current_hardware_and_specialization()
+                )
+                report = analyze_search_space(
+                    self.config_spec,
+                    kernel_name=kernel_name,
+                    specialization_key=specialization_key,
+                    hardware=hardware_spec,
+                )
+                self._search_space_tracker = SearchSpaceTracker(report)
+            except Exception:
+                self.log.warning(
+                    "Search space analysis setup failed; the end-of-run summary "
+                    "will be skipped (autotuning continues normally)",
+                    exc_info=True,
+                )
+                self._search_space_tracker = None
         host_function = getattr(self.kernel, "host_function", None)
         self._kernel_metadata: KernelMetadata = KernelMetadata(
             kernel_name=kernel_name,
@@ -317,7 +382,12 @@ class BaseSearch(BaseAutotuner):
             _device_ir=getattr(host_function, "_device_ir", None),
             _device=device,
         )
-        self.benchmark_provider = self._benchmark_provider_cls(
+        provider_cls = (
+            MultiShapeBenchmarkProvider
+            if isinstance(self.args, _MultiShapeAutotuneArgs)
+            else self._benchmark_provider_cls
+        )
+        self.benchmark_provider = provider_cls(
             kernel=self.kernel,
             settings=self.settings,
             config_spec=self.config_spec,
@@ -325,6 +395,15 @@ class BaseSearch(BaseAutotuner):
             log=self.log,
             autotune_metrics=self._autotune_metrics,
         )
+        if self.config_spec.compiler_seed_timeout_retry_repetitions is not None:
+            seed_config_gen = self.config_spec.create_config_generation(
+                overrides=self.settings.autotune_config_overrides or None,
+                advanced_controls_files=self.settings.autotune_search_acf or None,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+            self.benchmark_provider.set_compiler_seed_configs(
+                [config for _flat, config in seed_config_gen.seed_flat_config_pairs()]
+            )
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _is_restricted_search(self) -> bool:
@@ -461,6 +540,17 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries, one per input config.
         """
         passing_configs, passing_indices = self._apply_config_filter(configs)
+        # Record configs for exploration tracking. Diagnostic only; must never
+        # interfere with benchmarking.
+        if self._search_space_tracker is not None:
+            try:
+                for config in passing_configs:
+                    self._search_space_tracker.record_config(config)
+            except Exception:
+                self.log.debug(
+                    "Exploration tracking failed; continuing autotuning",
+                    exc_info=True,
+                )
         inner_results = self.benchmark_provider.benchmark(passing_configs, desc=desc)
 
         if len(passing_indices) == len(configs):
@@ -506,6 +596,18 @@ class BaseSearch(BaseAutotuner):
         """
         return self.benchmark_batch([config])[0]
 
+    def _generation_invalid_config_count(self) -> int:
+        """Number of candidate configs rejected as InvalidConfig during search.
+
+        These are candidates that a config fragment / normalize step ruled out
+        before they could be benchmarked (so they never reach the exploration
+        tracker's valid-config path). The base implementation reports zero;
+        subclasses that own a :class:`ConfigGeneration` expose its running
+        count so the search-space logger can report explored-invalid alongside
+        explored-valid.
+        """
+        return 0
+
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
         Perform autotuning to find the best configuration.
@@ -546,10 +648,19 @@ class BaseSearch(BaseAutotuner):
             exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
             self.benchmark_provider.setup()
             exit_stack.callback(self.benchmark_provider.cleanup)
+            best: Config | None = None
             try:
                 best = self._autotune()
+                if isinstance(
+                    self.benchmark_provider, MultiShapeBenchmarkProvider
+                ) and isinstance(self.args, _MultiShapeAutotuneArgs):
+                    if not self.benchmark_provider.has_valid_measurement(best):
+                        raise exc.NoConfigFound
+                    if not self.args.defer_selected_log:
+                        self.benchmark_provider.log_selected(best)
             finally:
-                self._finalize_autotune_metrics()
+                self._finalize_autotune_metrics(best)
+        assert best is not None
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
 
@@ -571,6 +682,58 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to compile failures."
             )
+        if self._autotune_metrics.num_worker_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_worker_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed in "
+                "isolated benchmark workers."
+            )
+        # Log search space analysis. This is purely diagnostic; any failure
+        # here (analysis, logging, or writing report files) must never block or
+        # crash autotuning, so the whole block is best-effort.
+        if (
+            self.settings.autotune_log_search_space
+            or self.settings.autotune_log_search_space_verbose
+        ):
+            try:
+                from .local_cache import stable_autotune_hash
+                from .search_space_logger import log_search_space_comparison
+
+                tracker = self._search_space_tracker
+                if tracker is None:
+                    from .search_space_logger import SearchSpaceTracker
+                    from .search_space_logger import analyze_search_space
+
+                    hardware_spec, specialization_key = (
+                        self._get_current_hardware_and_specialization()
+                    )
+                    tracker = SearchSpaceTracker(
+                        analyze_search_space(
+                            self.config_spec,
+                            kernel_name=self._autotune_metrics.kernel_name,
+                            specialization_key=specialization_key,
+                            hardware=hardware_spec,
+                        )
+                    )
+                tracker.record_invalid(self._generation_invalid_config_count())
+                report = tracker.finish(
+                    search_algorithm=type(self).__name__,
+                    elapsed_seconds=end - start,
+                )
+                log_search_space_comparison(self.log._logger, report)
+                if self.settings.autotune_log_search_space_path:
+                    saved_path = report.save(
+                        self.settings.autotune_log_search_space_path,
+                        stable_autotune_hash(self),
+                    )
+                    if saved_path:
+                        self.log(f"Search space analysis saved to: {saved_path}")
+            except Exception:
+                self.log.warning(
+                    "Search space logging failed; the end-of-run summary was not "
+                    "emitted (autotuning result is unaffected)",
+                    exc_info=True,
+                )
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")
@@ -699,9 +862,17 @@ class BaseSearch(BaseAutotuner):
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
 
-    def _finalize_autotune_metrics(self) -> None:
+    def _finalize_autotune_metrics(self, best_config: Config | None = None) -> None:
+        best_perf = self.best_perf_so_far
+        if self.performance_unit == "ratio":
+            best_perf = (
+                self.benchmark_provider.raw_latency(best_config)
+                if best_config is not None
+                and isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider)
+                else inf
+            )
         self._autotune_metrics.best_perf_ms = (
-            self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+            best_perf if math.isfinite(best_perf) else 0.0
         )
         self._autotune_metrics.finalize()
         _run_post_autotune_hooks(self._autotune_metrics)
@@ -742,7 +913,13 @@ class PopulationMember:
     flat_values: FlatConfig
     config: Config
     status: Literal[
-        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "unknown"
+        "ok",
+        "error",
+        "timeout",
+        "peer_compilation_fail",
+        "filtered",
+        "deduplicated",
+        "unknown",
     ] = "unknown"
     compile_time: float | None = None
 
@@ -803,6 +980,9 @@ class PopulationBasedSearch(BaseSearch):
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
         )
+
+    def _generation_invalid_config_count(self) -> int:
+        return self.config_gen.invalid_config_count
 
     @classmethod
     def get_kwargs_from_profile(
@@ -871,8 +1051,8 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             A population member with the benchmark results.
         """
-        config = self.config_gen.unflatten(flat_values)
-        member = PopulationMember(_unset_fn, [], flat_values, config)
+        canonical_flat, config = self.config_gen.canonicalize_flat(flat_values)
+        member = PopulationMember(_unset_fn, [], canonical_flat, config)
         self.benchmark_population([member], desc="Benchmarking")
         return member
 
@@ -926,10 +1106,11 @@ class PopulationBasedSearch(BaseSearch):
             configuration is invalid.
         """
         try:
-            config = self.config_gen.unflatten(flat_values)
+            canonical_flat, config = self.config_gen.canonicalize_flat(flat_values)
         except exc.InvalidConfig:
+            self.config_gen.invalid_config_count += 1
             return None
-        return PopulationMember(_unset_fn, [], flat_values, config)
+        return PopulationMember(_unset_fn, [], canonical_flat, config)
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
@@ -1061,7 +1242,8 @@ class PopulationBasedSearch(BaseSearch):
         """
         results = self.benchmark_batch([m.config for m in members], desc=desc)
         for member, result in zip(members, results, strict=True):
-            assert result.config is member.config
+            member.config = result.config
+            member.flat_values = self.config_gen.flatten(result.config)
             member.perfs.append(result.perf)
             member.fn = result.fn
             member.status = result.status
@@ -1101,7 +1283,11 @@ class PopulationBasedSearch(BaseSearch):
             # cannot change this key's hash (-> KeyError on prune / orphaned
             # entries) or the config recompiled during final verification.
             snapshot = copy.deepcopy(config)
-            target[snapshot] = dataclasses.replace(member, config=snapshot)
+            target[snapshot] = dataclasses.replace(
+                member,
+                flat_values=copy.deepcopy(member.flat_values),
+                config=snapshot,
+            )
 
     def _prune_benchmarked_members(self, top_k: int) -> None:
         if len(self._benchmarked_members) <= top_k:
@@ -1313,7 +1499,8 @@ class PopulationBasedSearch(BaseSearch):
         if after.config != before.config:
             self.log(
                 "Final verification selected a different config: "
-                f"{before.perf:.4f}ms -> {after.perf:.4f}ms"
+                f"{self.format_performance(before.perf)} -> "
+                f"{self.format_performance(after.perf)}"
             )
         return after
 
@@ -1365,6 +1552,17 @@ class PopulationBasedSearch(BaseSearch):
             desc: Description for the progress bar.
         """
         if len(members) < 2:
+            return
+        if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
+            provider_timings = self.benchmark_provider.rebenchmark(
+                [member.config for member in members],
+                [member.perf for member in members],
+                desc=desc,
+            )
+            for member, timing in zip(members, provider_timings, strict=True):
+                member.perfs.append(timing)
+                if timing < self.best_perf_so_far:
+                    self.best_perf_so_far = timing
             return
 
         # Size the in-process repeat from the candidates being rechecked. A
@@ -1606,8 +1804,10 @@ class PopulationBasedSearch(BaseSearch):
                 delta_pct = (delta / current_perf * 100) if current_perf != 0 else 0
                 status = "ok" if candidate.perf <= current_perf else "worse"
                 self.log.debug(
-                    f"  reset to {candidate.config}: {candidate.perf:.4f}ms "
-                    f"(delta={delta:+.4f}ms, {delta_pct:+.1f}%) [{status}]"
+                    f"  reset to {candidate.config}: "
+                    f"{self.format_performance(candidate.perf)} "
+                    f"(delta={delta:+.4f}{self.performance_suffix}, "
+                    f"{delta_pct:+.1f}%) [{status}]"
                 )
 
             # Collect all single-attribute resets that maintained performance
@@ -1644,7 +1844,8 @@ class PopulationBasedSearch(BaseSearch):
 
             if simplified:
                 self.log(
-                    f"Finishing round {round_num}: simplified to {current.config}, perf={current.perf:.4f}ms"
+                    f"Finishing round {round_num}: simplified to {current.config}, "
+                    f"perf={self.format_performance(current.perf)}"
                 )
             else:
                 self.log(
@@ -1652,12 +1853,17 @@ class PopulationBasedSearch(BaseSearch):
                 )
                 break
 
-        # Minimize the final config by removing values that match defaults
-        minimal_config = current.config.minimize(self.config_spec)
+        # Multi-shape winners must stay explicit: minimizing can collapse an
+        # optional tuned reset and a compiler-promoted default to the same key.
+        minimal_config = (
+            current.config
+            if isinstance(self.args, _MultiShapeAutotuneArgs)
+            else current.config.minimize(self.config_spec)
+        )
         current = PopulationMember(
             fn=current.fn,
             perfs=current.perfs,
-            flat_values=current.flat_values,
+            flat_values=self.config_gen.flatten(minimal_config),
             config=minimal_config,
             status=current.status,
             compile_time=current.compile_time,
@@ -1724,7 +1930,7 @@ class PopulationBasedSearch(BaseSearch):
         if best_member is not best:
             self.log(
                 f"Final-pick re-picked {best_member.config} "
-                f"({best_member.perf:.4f}ms) over {best.config}"
+                f"({self.format_performance(best_member.perf)}) over {best.config}"
             )
         self.best_perf_so_far = min(self.best_perf_so_far, best_member.perf)
         return best_member
@@ -1755,7 +1961,15 @@ class PopulationBasedSearch(BaseSearch):
         # real searches always have them.
         settings = getattr(self, "settings", None)
         config_spec = getattr(self, "config_spec", None)
-        if settings is None or config_spec is None or not settings.static_shapes:
+        if (
+            isinstance(
+                getattr(self, "benchmark_provider", None),
+                MultiShapeBenchmarkProvider,
+            )
+            or settings is None
+            or config_spec is None
+            or not settings.static_shapes
+        ):
             return None
         return config_spec.backend.get_paired_device_micros_bench()
 

@@ -15,6 +15,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -198,7 +199,6 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    @xfailIfPallas("hl.split/hl.join not supported on pallas")
     def test_split_join_roundtrip(self):
         @helion.kernel(config={"block_size": 64})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -217,7 +217,6 @@ class TestViews(RefEagerTestBase, TestCase):
             self.assertIn("tl.split", code)
             self.assertIn("tl.join", code)
 
-    @xfailIfPallas("hl.join not supported on pallas")
     def test_join_broadcast_scalar(self):
         @helion.kernel(config={"block_size": 64})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -297,7 +296,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    @xfailIfPallas("triton.next_power_of_2 in generated host code crashes pallas")
     def test_reshape_sum(self):
         @helion.kernel(static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -387,7 +385,6 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     @skipIfRefEager("ref eager does not support lifted variable")
-    @xfailIfPallas("hl.split and tl.reshape not supported on pallas")
     def test_view_blocksize_constexpr(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def foo(x: torch.Tensor) -> torch.Tensor:
@@ -408,7 +405,9 @@ class TestViews(RefEagerTestBase, TestCase):
             self.assertIn("tl.reshape", code)
 
     @skipIfRefEager("ref eager does not support lifted variable")
-    @xfailIfPallas("hl.split and tl.reshape not supported on pallas")
+    @xfailIfPallasTpu(
+        "Mosaic does not support reshaping a 1D vector to [..., 2] on TPU"
+    )
     def test_view_blocksize_constexpr_pairsum(self):
         # The split-over-view + compacted-store machinery exercised by
         # ``test_view_blocksize_constexpr`` (which only checks codegen shape)

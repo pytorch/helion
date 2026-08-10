@@ -283,7 +283,11 @@ class HostFunction:
         if isinstance(expr, list):
             return "[" + ", ".join(self.literal_expr(x) for x in expr) + "]"
         if isinstance(expr, tuple):
-            return "(" + ", ".join(self.literal_expr(x) for x in expr) + ", )"
+            if not expr:
+                return "()"
+            if len(expr) == 1:
+                return f"({self.literal_expr(expr[0])},)"
+            return "(" + ", ".join(self.literal_expr(x) for x in expr) + ")"
         return repr(expr)
 
     def debug_str(self) -> str:

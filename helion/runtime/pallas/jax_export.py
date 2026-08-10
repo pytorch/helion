@@ -40,8 +40,8 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from . import _BlockSpecInfo
-    from .kernel import Kernel
+    from ..kernel import Kernel
+    from .launcher import _BlockSpecInfo
 
 
 _TORCH_TO_JNP_DTYPE: dict[torch.dtype, object] | None = None
@@ -251,6 +251,24 @@ def _device_for_jax_export() -> torch.device:
     return torch.device("cpu")
 
 
+def _tensor_arg_to_jax(arg: object) -> object:
+    """Return the JAX array for a kernel tensor argument.
+
+    Most tensor args are ``_JaxExportTensor`` adapters carrying the caller's JAX
+    array. Helion can also lift Python scalar constants used in the kernel body
+    (e.g. an epsilon threshold or a ``-inf`` mask fill) into ``torch.tensor([...])``
+    device constants in the generated host wrapper; those arrive as plain torch
+    tensors (not adapters), so materialize them as JAX arrays here.
+    """
+    if isinstance(arg, _JaxExportTensor):
+        return arg._jax_arr
+    if isinstance(arg, torch.Tensor):
+        import jax.numpy as jnp
+
+        return jnp.asarray(arg.detach().cpu().numpy())
+    return arg
+
+
 def default_pallas_jax_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -276,12 +294,9 @@ def default_pallas_jax_launcher(
     output(s) as ``_JaxExportTensor`` so the Helion wrapper's trailing
     reshape/view operations stay traceable.
     """
-    from . import _pallas_apply_ds_padding
-    from . import _pallas_compile_jit_fn
-    from . import _pallas_output_only_descriptors
-    from . import _pallas_padded_output_dims_by_arg
-    from . import _pallas_slice_to_orig
-    from .settings import is_pallas_interpret
+    from ..settings import is_pallas_interpret
+    from .launcher import _pallas_apply_ds_padding
+    from .launcher import _pallas_jax_call
 
     interpret = (
         _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
@@ -309,95 +324,53 @@ def default_pallas_jax_launcher(
         _device_for_jax_export(),
     )
 
-    # Compact-worklist kernels are discriminated by the presence of the
-    # ``_compact_build_worklist`` launcher kwarg, which is emitted by
-    # codegen only for that lowering.
+    # Unwrap the adapters to raw JAX arrays and drive the shared launch core.
+    # The ``_JaxExportTensor`` adapter is only needed by the torch-flavored host
+    # wrapper (reshape/empty_like/pad); ``_pallas_jax_call`` (the same path the
+    # precompiled standalone uses) runs the duck-typed compile core + pl.kernel
+    # jit_fn on raw JAX arrays.
+    core_args = tuple(_tensor_arg_to_jax(a) for a in args)
+
+    # Compact-worklist kernels are discriminated by ``_compact_build_worklist``
+    # (emitted by codegen only for that lowering). Resident caching note: on this
+    # jit path the window IS applied but the host overflow guard is NOT run (the
+    # offsets are jit tracers, so a per-source range > window C cannot be checked
+    # at trace time); the caller must ensure every ordered range <= C.
     compact_build_worklist = kwargs.get("_compact_build_worklist")
+    compact: dict[str, object] | None = None
     if compact_build_worklist is not None:
-        from . import _pallas_compile_compact_jit_fn
+        compact = {
+            "build_worklist": compact_build_worklist,
+            "offset_arg_indices": kwargs.get("_compact_offset_arg_indices") or [],
+            "metadata_fields": kwargs.get("_compact_metadata_fields") or [],
+            "owner_ref_pos": kwargs.get("_compact_owner_ref_pos", 0),
+            "num_scalar_prefetch": kwargs.get("_compact_num_scalar_prefetch", 0),
+            "aligned_arg_indices": kwargs.get("_compact_aligned_arg_indices") or [],
+            "tile_start_ref_pos": kwargs.get("_compact_tile_start_ref_pos", 1),
+            "compact_block": kwargs.get("_compact_block", 1),
+            "ordered_aligned_arg_indices": kwargs.get(
+                "_compact_ordered_aligned_arg_indices"
+            )
+            or [],
+            "range_start_ref_pos": kwargs.get("_compact_range_start_ref_pos", -1),
+            "ordered_window": kwargs.get("_compact_ordered_window", 0),
+        }
 
-        result = _pallas_compile_compact_jit_fn(
-            pallas_kernel,
-            args,
-            _output_indices=output_indices,
-            _inplace_indices=_inplace_indices,
-            _block_spec_info=_block_spec_info,
-            _scratch_shapes=_scratch_shapes,
-            _smem_arg_indices=_smem_arg_indices,
-            _hbm_arg_indices=_hbm_arg_indices,
-            build_worklist=cast("Any", compact_build_worklist),
-            offset_arg_indices=cast(
-                "Any", kwargs.get("_compact_offset_arg_indices") or []
-            ),
-            metadata_fields=cast("Any", kwargs.get("_compact_metadata_fields") or []),
-            owner_ref_pos=cast("Any", kwargs.get("_compact_owner_ref_pos", 0)),
-            num_scalar_prefetch=cast(
-                "Any", kwargs.get("_compact_num_scalar_prefetch", 0)
-            ),
-            aligned_arg_indices=cast(
-                "Any", kwargs.get("_compact_aligned_arg_indices") or []
-            ),
-            tile_start_ref_pos=cast(
-                "Any", kwargs.get("_compact_tile_start_ref_pos", 1)
-            ),
-            compact_block=cast("Any", kwargs.get("_compact_block", 1)),
-            interpret=interpret,
-        )
-    else:
-        result = _pallas_compile_jit_fn(
-            pallas_kernel,
-            grid,
-            args,
-            _output_indices=output_indices,
-            _inplace_indices=_inplace_indices,
-            _block_spec_info=_block_spec_info,
-            _smem_arg_indices=_smem_arg_indices,
-            _scratch_shapes=_scratch_shapes,
-            _hbm_arg_indices=_hbm_arg_indices,
-            _matmul_dot_general=None,
-            interpret=interpret,
-        )
-
-    jax_inputs = [
-        cast("_JaxExportTensor", args[i])._jax_arr for i in result.tensor_arg_indices
-    ]
-    jax_results = result.jit_fn(*jax_inputs)  # type: ignore[operator]
-    if not isinstance(jax_results, (tuple, list)):
-        jax_results = (jax_results,)
-
-    # Same descriptor list the torch fast-path uses (see
-    # ``_LauncherFastPath.output_only_descriptors``).  In-place positions
-    # would normally alias back into a torch tensor on the torch path — but
-    # JAX has no in-place mutation, so when every output is in-place we
-    # surface them as fresh JAX values instead of returning ``None``.
-    descriptors = _pallas_output_only_descriptors(
-        output_indices, result.arg_to_tensor_pos
+    output_results = _pallas_jax_call(
+        pallas_kernel,
+        grid,
+        core_args,
+        output_indices=output_indices,
+        inplace_indices=_inplace_indices,
+        block_spec_info=_block_spec_info,
+        scratch_shapes=_scratch_shapes,
+        hbm_arg_indices=_hbm_arg_indices,
+        smem_arg_indices=_smem_arg_indices,
+        interpret=interpret,
+        compact=compact,
+        orig_shapes=orig_shapes,
+        ds_pad_dims=_ds_pad_dims,
     )
-    if not descriptors:
-        descriptors = tuple(enumerate(output_indices))
-
-    output_results: list[object] = [jax_results[out_idx] for out_idx, _ in descriptors]
-    output_orig_pos: list[int] = [orig_pos for _, orig_pos in descriptors]
-
-    # Slice padded output results back to their original shapes via the
-    # same ``arg → padded dims`` grouping the torch fast-path uses
-    # (see ``_LauncherFastPath.padded_output_dims_by_arg``); we just
-    # slice on JAX arrays via the shared ``_pallas_slice_to_orig`` helper.
-    if _ds_pad_dims and orig_shapes:
-        padded_dims_by_arg = _pallas_padded_output_dims_by_arg(
-            _ds_pad_dims, set(orig_shapes.keys())
-        )
-        for i, orig_pos in enumerate(output_orig_pos):
-            dims = padded_dims_by_arg.get(orig_pos)
-            orig_shape = orig_shapes.get(orig_pos)
-            if dims and orig_shape is not None:
-                output_results[i] = _pallas_slice_to_orig(
-                    cast(
-                        "torch.Tensor", output_results[i]
-                    ),  # JAX arrays index identically
-                    dims,
-                    cast("torch.Size", orig_shape),
-                )
 
     if len(output_results) == 1:
         return _JaxExportTensor.from_jax(output_results[0], device=device)

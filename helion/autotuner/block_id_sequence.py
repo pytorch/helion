@@ -154,6 +154,16 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         """Return structural metadata for fingerprinting."""
         return (len(self), *(len(item.block_ids) for item in self._data))
 
+    def cardinality(self, base: ConfigSpec) -> int | None:
+        """Product of the per-item fragment cardinalities, or None if unknown."""
+        total = 1
+        for item in self._data:
+            item_card = item._fragment(base).cardinality()
+            if item_card is None:
+                return None
+            total *= item_card
+        return total
+
     def _flat_key_info(self) -> tuple[int, bool]:
         """Return (num_flat_entries, is_sequence) for flat_key_layout().
 

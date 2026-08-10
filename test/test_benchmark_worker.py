@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import dataclasses
+import linecache
 import math
 import multiprocessing as mp
+from multiprocessing.connection import Connection
 import os
 from pathlib import Path
 import pickle
 import random
 import signal
+import sys
 import tempfile
 import time
+from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -27,6 +31,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
@@ -37,10 +42,16 @@ from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
+from helion.autotuner.benchmarking import do_bench_generic
 from helion.autotuner.kernel_args import load_trusted_kernel_args
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
+from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _run_kernel_in_subprocess_spawn
+from helion.autotuner.precompile_future import _serialize_compiled_fn
+from helion.autotuner.precompile_future import _unload_compiled_fn
 from helion.autotuner.random_search import RandomSearch
+from helion.runtime import _create_cute_wrapper
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 
@@ -94,6 +105,110 @@ class _ReturnValue:
 
 
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
+    @skipUnlessCuteAvailable("_create_cute_wrapper requires the CuTe DSL")
+    def test_cute_wrapper_failure_does_not_leak_linecache(self) -> None:
+        launcher_filenames_before = {
+            filename
+            for filename in linecache.cache
+            if filename.startswith("<helion_cute_launcher:")
+        }
+
+        with (
+            patch("builtins.exec", side_effect=RuntimeError("decoration failed")),
+            self.assertRaisesRegex(RuntimeError, "decoration failed"),
+        ):
+            _create_cute_wrapper(object(), (), (32, 1, 1))
+
+        launcher_filenames_after = {
+            filename
+            for filename in linecache.cache
+            if filename.startswith("<helion_cute_launcher:")
+        }
+        self.assertEqual(launcher_filenames_after, launcher_filenames_before)
+
+    def test_compiled_fn_restores_cute_source_hash_and_unloads(self) -> None:
+        launcher_filename = "<helion_cute_launcher:test>"
+        source = (
+            "class Kernel:\n"
+            "    pass\n"
+            f"exec(compile('def launcher():\\n    pass\\n', {launcher_filename!r}, 'exec'))\n"
+            "class Launcher:\n"
+            "    pass\n"
+            "compiled_launcher = Launcher()\n"
+            "compiled_launcher._jit_func = launcher\n"
+            "_helion_call = Kernel()\n"
+            "_helion_call._helion_cute_compiled_launchers = "
+            "{'compiled': compiled_launcher}\n"
+            "_helion_call._helion_cute_launch_arg_cache = {'args': object()}\n"
+            "def call():\n"
+            "    return _helion_call._helion_cute_source_hash\n"
+        )
+        expected_hash = "parent-source-hash"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "compiled_module.py"
+            path.write_text(source)
+            source_module = ModuleType("_test_compiled_module")
+            source_module.__file__ = str(path)
+            sys.modules[source_module.__name__] = source_module
+            try:
+                exec(compile(source, str(path), "exec"), source_module.__dict__)
+                source_module._helion_call._helion_cute_source_hash = expected_hash
+                fn_spec = _serialize_compiled_fn(source_module.call)
+            finally:
+                sys.modules.pop(source_module.__name__, None)
+
+        fn = _load_compiled_fn(fn_spec)
+        module_name = fn.__module__
+        loaded_module = sys.modules[module_name]
+        cute_kernel = loaded_module._helion_call
+        self.assertEqual(fn_spec.source_hash, expected_hash)
+        self.assertEqual(fn(), expected_hash)
+        self.assertIn(module_name, sys.modules)
+        linecache.cache[launcher_filename] = (0, None, [], launcher_filename)
+
+        _unload_compiled_fn(fn)
+        self.assertNotIn(module_name, sys.modules)
+        self.assertEqual(cute_kernel._helion_cute_compiled_launchers, {})
+        self.assertEqual(cute_kernel._helion_cute_launch_arg_cache, {})
+        self.assertNotIn(launcher_filename, linecache.cache)
+
+    def test_compiled_fn_unload_clears_triton_fast_path_cache(self) -> None:
+        source = (
+            "class Kernel:\n"
+            "    def __init__(self):\n"
+            "        self.cleared = False\n"
+            "    def clear_fast_path_caches(self):\n"
+            "        self.cleared = True\n"
+            "_helion_call = Kernel()\n"
+            "def call():\n"
+            "    pass\n"
+        )
+        fn_spec = SerializedCompiledFunction("call", source, None, None)
+        fn = _load_compiled_fn(fn_spec)
+        kernel = fn.__globals__["_helion_call"]
+
+        _unload_compiled_fn(fn)
+
+        self.assertTrue(kernel.cleared)
+
+    def test_compiled_fn_load_failure_does_not_leak_module(self) -> None:
+        module_prefix = "_helion_autotune_subprocess_"
+        modules_before = {
+            name for name in sys.modules if name.startswith(module_prefix)
+        }
+        fn_spec = SerializedCompiledFunction(
+            function_name="call",
+            source_code="raise RuntimeError('load failed')\n",
+            filename=None,
+            module_name=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "load failed"):
+            _load_compiled_fn(fn_spec)
+
+        modules_after = {name for name in sys.modules if name.startswith(module_prefix)}
+        self.assertEqual(modules_after, modules_before)
+
     def test_benchmark_job_can_use_wall_clock_bench(self) -> None:
         fn = _ReturnValue(torch.empty(()))
 
@@ -123,6 +238,85 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         load_args.assert_called_once_with("/tmp/args.pt")
         event_bench.assert_not_called()
         wall_clock_bench.assert_called_once()
+        self.assertNotIn("fixed_repetitions", wall_clock_bench.call_args.kwargs)
+
+    def test_wall_clock_fixed_repetitions_run_setup_and_measurements(self) -> None:
+        invocation_count = 0
+
+        def fn() -> None:
+            nonlocal invocation_count
+            invocation_count += 1
+
+        with (
+            patch("helion.autotuner.benchmarking.synchronize_device"),
+            patch(
+                "helion.autotuner.benchmarking._make_l2_cache_clearer",
+                return_value=lambda: None,
+            ),
+        ):
+            result = do_bench_generic(
+                fn,
+                warmup=1,
+                rep=50,
+                return_mode="median",
+                fixed_repetitions=3,
+            )
+
+        self.assertEqual(invocation_count, 4)
+        self.assertTrue(math.isfinite(cast("float", result)))
+
+    def test_benchmark_job_forwards_fixed_repetitions(self) -> None:
+        fn = _ReturnValue(torch.empty(()))
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=(),
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.do_bench_generic",
+                return_value=1.25,
+            ) as wall_clock_bench,
+        ):
+            result = BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+                use_wall_clock=True,
+                fixed_repetitions=1,
+            )()
+
+        self.assertEqual(result, 1.25)
+        self.assertEqual(wall_clock_bench.call_args.kwargs["fixed_repetitions"], 1)
+
+    def test_benchmark_job_unloads_module_after_failure(self) -> None:
+        fn = _ReturnValue(torch.empty(()))
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=(),
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.do_bench",
+                side_effect=RuntimeError("benchmark failed"),
+            ),
+            patch("helion.autotuner.benchmark_job._unload_compiled_fn") as unload_fn,
+            self.assertRaisesRegex(RuntimeError, "benchmark failed"),
+        ):
+            BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+            )()
+
+        unload_fn.assert_called_once_with(fn)
 
     def test_accuracy_check_job_passes(self) -> None:
         fn = _ReturnValue(torch.tensor([1.0]))
@@ -246,6 +440,198 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         _, kwargs = provider._benchmark_worker.run.call_args
         self.assertEqual(kwargs["timeout"], 17.0)
 
+    def test_benchmark_timeout_has_worker_metric_and_status(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=BenchmarkTimeout("timed out"),
+        ) as run_job:
+            result = provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(result, math.inf)
+        self.assertEqual(provider._last_benchmark_failure_status, "timeout")
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
+        run_job.assert_called_once()
+
+    def test_compiler_seed_timeout_retries_with_three_repetitions(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_accuracy_check=False)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=3
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        fn = cast("CompiledConfig", object())
+        config = Config()
+        provider.set_compiler_seed_configs([config])
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=(BenchmarkTimeout("timed out"), 2.75),
+        ) as run_job:
+            result = provider._benchmark_function_subprocess(
+                config,
+                fn,
+            )
+
+        self.assertEqual(result, 2.75)
+        self.assertEqual(
+            run_job.call_args_list,
+            [
+                unittest.mock.call(fn, warmup=1, rep=50),
+                unittest.mock.call(
+                    fn,
+                    warmup=1,
+                    rep=50,
+                    fixed_repetitions=3,
+                ),
+            ],
+        )
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 0)
+
+    def test_compiler_seed_retry_timeout_is_one_worker_failure(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=3
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+        config = Config()
+        provider.set_compiler_seed_configs([config])
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=(
+                BenchmarkTimeout("first timeout"),
+                BenchmarkTimeout("retry timeout"),
+            ),
+        ) as run_job:
+            result = provider._benchmark_function_subprocess(
+                config,
+                cast("CompiledConfig", object()),
+            )
+
+        self.assertEqual(result, math.inf)
+        self.assertEqual(run_job.call_count, 2)
+        self.assertEqual(provider._last_benchmark_failure_status, "timeout")
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
+
+    def test_compiler_seed_timeout_does_not_retry_after_budget(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=3
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+        provider.budget_exceeded_fn = Mock(return_value=True)
+        config = Config()
+        provider.set_compiler_seed_configs([config])
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=BenchmarkTimeout("timed out"),
+        ) as run_job:
+            result = provider._benchmark_function_subprocess(
+                config,
+                cast("CompiledConfig", object()),
+            )
+
+        self.assertEqual(result, math.inf)
+        run_job.assert_called_once()
+        provider.budget_exceeded_fn.assert_called_once_with()
+        self.assertEqual(provider._last_benchmark_failure_status, "timeout")
+
+    def test_disabled_compiler_seed_timeout_retry_does_not_run(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+        config = Config()
+        provider.set_compiler_seed_configs([config])
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=BenchmarkTimeout("timed out"),
+        ) as run_job:
+            result = provider._benchmark_function_subprocess(
+                config,
+                cast("CompiledConfig", object()),
+            )
+
+        self.assertEqual(result, math.inf)
+        run_job.assert_called_once()
+        self.assertEqual(provider._last_benchmark_failure_status, "timeout")
+
+    def test_benchmark_worker_death_has_error_status(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+
+        with patch.object(
+            provider,
+            "_run_subprocess_benchmark_job",
+            side_effect=BenchmarkWorkerDied("worker exited"),
+        ) as run_job:
+            result = provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(result, math.inf)
+        self.assertEqual(provider._last_benchmark_failure_status, "error")
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
+        run_job.assert_called_once()
+
+    def test_fixed_repetition_job_uses_existing_benchmark_timeout(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._benchmark_worker = Mock()
+        provider._benchmark_worker.run.return_value = 1.25
+        provider._subprocess_benchmark_uses_wall_clock = lambda: True
+
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            result = provider._run_subprocess_benchmark_job(
+                cast("CompiledConfig", object()),
+                warmup=1,
+                rep=50,
+                fixed_repetitions=3,
+            )
+
+        self.assertEqual(result, 1.25)
+        provider._benchmark_worker.run.assert_called_once()
+        job = provider._benchmark_worker.run.call_args.args[0]
+        self.assertEqual(job.fixed_repetitions, 3)
+        self.assertEqual(provider._benchmark_worker.run.call_args.kwargs["timeout"], 17)
+
     def test_subprocess_accuracy_check_skips_mutated_args(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings()
@@ -298,6 +684,57 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                     process.kill()
                     process.join(timeout=5)
 
+    def test_spawn_loads_source_module_from_file(self) -> None:
+        # Regression: a kernel loaded by path / notebook / exec lives under a
+        # synthetic module name that only the parent's sys.modules knows about.
+        # The generated code does `import <synthetic> as _source_module` for its
+        # module-globals; a fresh spawn worker cannot import that name. The
+        # serializer ships the origin module's real file in `source_modules` and
+        # the worker re-registers it before exec, so the import resolves.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            # The "origin" kernel module (only present here on disk, never on the
+            # worker's import path under this name).
+            origin_name = "helion_test_synthetic_origin_xyz"
+            origin_file = tmp_path / "origin.py"
+            origin_file.write_text("MAGIC = 4321\n", encoding="utf-8")
+            args_path = tmp_path / "args.pt"
+            result_path = tmp_path / "result.pkl"
+            torch.save((), args_path)
+            # Generated code references the origin via `_source_module`, exactly
+            # like Helion codegen emits for a module-global.
+            source_code = (
+                f"import {origin_name} as _source_module\n"
+                "def call_arg():\n"
+                "    assert _source_module.MAGIC == 4321\n"
+                "    return _source_module.MAGIC\n"
+            )
+            fn_spec = SerializedCompiledFunction(
+                function_name="call_arg",
+                source_code=source_code,
+                filename="<test_spawn_loads_source_module_from_file>",
+                module_name=None,
+                source_modules=[(origin_name, str(origin_file))],
+            )
+            process = mp.get_context("spawn").Process(
+                target=_run_kernel_in_subprocess_spawn,
+                args=(fn_spec, str(args_path), str(result_path), "@test"),
+            )
+            process.start()
+            try:
+                process.join(timeout=30)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+                self.assertEqual(process.exitcode, 0)
+                with result_path.open("rb") as f:
+                    result = pickle.load(f)
+                self.assertEqual(result, {"status": "ok"})
+            finally:
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+
     def test_timeout_kills_worker(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -307,6 +744,29 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertLess(time.time() - t0, 15.0)
             self.assertFalse(worker.alive())
             # Next call respawns.
+            self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
+        finally:
+            worker.shutdown()
+
+    def test_watchdog_kills_worker_when_poll_timeout_is_ignored(self) -> None:
+        original_poll = Connection.poll
+
+        def poll_until_ready(
+            self: Connection,
+            timeout: float | None = None,
+        ) -> bool:
+            return original_poll(self, None)
+
+        worker = BenchmarkWorker()
+        try:
+            t0 = time.time()
+            with (
+                patch.object(Connection, "poll", poll_until_ready),
+                self.assertRaises(BenchmarkTimeout),
+            ):
+                worker.run(_Sleep(60), timeout=0.5)
+            self.assertLess(time.time() - t0, 15.0)
+            self.assertFalse(worker.alive())
             self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
             worker.shutdown()
@@ -547,7 +1007,8 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             call_count[0] += 1
             if call_count[0] % 3 == 0:
                 call_count[1] += 1
-                self._autotune_metrics.num_compile_failures += 1
+                self._last_benchmark_failure_status = "timeout"
+                self._autotune_metrics.num_worker_failures += 1
                 return math.inf
             return original(self, config, fn)
 
@@ -569,10 +1030,12 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             "_benchmark_function_subprocess",
             maybe_fail,
         ):
-            RandomSearch(bound_kernel, args, 20).autotune()
+            search = RandomSearch(bound_kernel, args, 20)
+            search.autotune()
 
         self.assertGreaterEqual(call_count[0], 6)
         self.assertGreaterEqual(call_count[1], 2)
+        self.assertEqual(search._autotune_metrics.num_worker_failures, call_count[1])
 
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:

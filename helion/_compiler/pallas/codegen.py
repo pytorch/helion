@@ -8,10 +8,15 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
+from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from torch.fx.node import Node
+
+    from helion._compiler.aten_lowering import LoweringContext
     from helion._compiler.inductor_lowering import CodegenState
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
@@ -21,9 +26,10 @@ def load_expr(
     subscript: list[object],
     tensor: torch.Tensor,
 ) -> ast.AST:
-    """Pallas load codegen: normal path, or indirect gather if ``plan_tiling`` flagged it."""
+    """Emit a normal load or a selected TensorCore gather plan."""
     from helion._compiler.pallas.gather import emit_gather
-    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+    from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
     name = state.device_function.tensor_arg(tensor).name
     name = vmem_name(state, name)
@@ -32,22 +38,66 @@ def load_expr(
     device_fn.device_memory_op_index += 1
 
     assert state.fx_node is not None
-    patterns = state.fx_node.meta.get("indexing_patterns") or ()
-    for pattern in patterns:
-        if isinstance(pattern, IndirectGatherPattern):
-            return emit_gather(state, pattern.plan, name)
+    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, OneHotGatherPlan):
+        return emit_gather(state, plan.plan, name)
 
-    idx_str, none_dims = index_str(state, subscript, tensor)
+    parts, none_dims = index_parts(state, subscript, tensor)
+    scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
+    if scalar_load is None:
+        result = expr_from_string(f"{name}[{', '.join(parts)}]")
+        result = _padded_value_for_load(state, tensor, subscript, parts, result)
+    else:
+        result = emit_vmem_scalar_load(tensor, name, parts, scalar_load)
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
-        result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
-    else:
-        result = expr_from_string(f"{name}[{idx_str}]")
+        result = expr_from_string(
+            "{result} * ({mask})", result=result, mask=expr_from_string(mask_expr)
+        )
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def maybe_codegen_resident_prep_cache_read(
+    ctx: LoweringContext, node: Node
+) -> ast.AST | None:
+    """Return a prep-cache read for an active resident-prep descriptor, if any."""
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.generate_ast import GenerateAST
+    from helion._compiler.pallas.compact_worklist import metadata_ref_for_field
+
+    if not isinstance(ctx.cg, GenerateAST):
+        return None
+    lowering = ctx.cg.resident_prep_lowering_for_node(node)
+    if lowering is None:
+        return None
+    env = CompileEnvironment.current()
+    decision = env.compact_worklist_resident_cache_decision
+    plan = env.compact_worklist_plan
+    if (
+        decision is None
+        or not decision.active
+        or plan is None
+        or plan.ordered_axis is None
+    ):
+        return None
+    ordered_block_id = plan.ordered_axis.block_id
+    block_size = ctx.cg.device_function.block_size_var(ordered_block_id)
+    if block_size is None:
+        return None
+    assert decision.resident_key_fields == ("range_start",)
+    offset = ctx.cg.offset_var(ordered_block_id)
+    range_start_ref = f"{metadata_ref_for_field(plan, 'range_start')}[_wid]"
+    local_ordered = f"pl.ds(({offset}) - ({range_start_ref}), {block_size})"
+    rank = len(lowering.hoist.perm)
+    window_elts = [local_ordered]
+    window_elts.extend(":" for _ in range(rank - 1))
+    read = f"{lowering.cache_name}[{', '.join(window_elts[p] for p in lowering.hoist.perm)}]"
+    return expr_from_string(read)
 
 
 def _load_mask_expr(
@@ -115,7 +165,13 @@ def _load_mask_expr(
                 if mask_var is not None:
                     if dtype_str is None:
                         dtype_str = env.backend.dtype_str(tensor.dtype)
-                    expand = state.tile_strategy.expand_str(output_sizes, out_dim)
+                    if env.is_jagged_tile(block_id):
+                        mask_shape = env.jagged_tile_mask_shapes[block_id]
+                        expand = state.tile_strategy.jagged_tile_expand_str(
+                            mask_shape, output_sizes
+                        )
+                    else:
+                        expand = state.tile_strategy.expand_str(output_sizes, out_dim)
                     expr = f"({mask_var}.astype({dtype_str}){expand})"
                     mask_exprs.append(expr)
 
@@ -180,6 +236,72 @@ def _tensor_routed_to_fori_scratch(state: CodegenState, tensor: torch.Tensor) ->
     return isinstance(loop, ForiLoopState)
 
 
+def _clamped_dims(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    index_parts: list[str],
+) -> list[tuple[int, int] | None]:
+    """Per consumed tensor dim: ``(dim_size, block_size)`` where the launcher's
+    BlockSpec clamp makes the kernel ref smaller than the tile, else ``None``.
+
+    The launcher clamps each BlockSpec dimension to
+    ``min(block_size, tensor.shape[d])``.  Only grid-tiled dimensions that
+    produce ``:`` in the generated Pallas index are affected; dimensions
+    indexed via ``pl.ds()`` are ds-padded instead of clamped.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    assert state.fx_node is not None
+    patterns = state.fx_node.meta.get("indexing_patterns")
+    if patterns is None:
+        return []
+
+    # Patterns that consume a tensor dim without it surviving into the value's
+    # shape (a scalar/offset index squeezes that dim) get no clamp entry -- the
+    # value has no such dimension to slice or pad.
+    squeezing_patterns = (
+        ArbitraryIndexPattern,
+        TileIndexWithOffsetPattern,
+        TileBeginWithOffsetPattern,
+    )
+
+    env = CompileEnvironment.current()
+    clamps: list[tuple[int, int] | None] = []
+    tensor_dim = 0
+    index_part_idx = 0
+
+    for idx, pattern in zip(subscript, patterns, strict=True):
+        if idx is None:
+            continue
+
+        index_part = index_parts[index_part_idx]
+        index_part_idx += 1
+        if isinstance(pattern, squeezing_patterns):
+            tensor_dim += 1
+            continue
+
+        clamp = None
+        if isinstance(pattern, TilePattern) and index_part == ":":
+            block_size = env.block_sizes[pattern.block_id].from_config(state.config)
+            dim_size = tensor.shape[tensor_dim]
+            if (
+                isinstance(block_size, int)
+                and isinstance(dim_size, int)
+                and dim_size < block_size
+            ):
+                clamp = (dim_size, block_size)
+
+        clamps.append(clamp)
+        tensor_dim += 1
+
+    return clamps
+
+
 def sliced_value_for_store(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -202,49 +324,47 @@ def sliced_value_for_store(
     VMEM scratch (not a clamped ref), so the value stays block-shaped and the
     writeback DMA clamps the extent instead (see ``_build_dma_slices``).
     """
-    from helion._compiler.compile_environment import CompileEnvironment
-    from helion._compiler.pallas.plan_tiling import TilePattern
-
-    assert state.fx_node is not None
-    patterns = state.fx_node.meta.get("indexing_patterns")
-    if patterns is None:
-        return value
-
     if _tensor_routed_to_fori_scratch(state, tensor):
         return value
 
-    env = CompileEnvironment.current()
-    slices: list[str] = []
-    needs_slice = False
-    tensor_dim = 0
+    clamps = _clamped_dims(state, tensor, subscript, index_parts)
+    if not any(clamps):
+        return value
 
-    index_part_idx = 0
-    for idx, pattern in zip(subscript, patterns, strict=True):
-        if idx is None:
-            continue
+    slices = [":" if c is None else f":{c[0]}" for c in clamps]
+    return expr_from_string(
+        f"{{value}}[{', '.join(slices)}]",
+        value=value,
+    )
 
-        value_slice = ":"
-        index_part = index_parts[index_part_idx]
-        index_part_idx += 1
-        if isinstance(pattern, TilePattern) and index_part == ":":
-            block_size = env.block_sizes[pattern.block_id].from_config(state.config)
-            dim_size = tensor.shape[tensor_dim]
-            if (
-                isinstance(block_size, int)
-                and isinstance(dim_size, int)
-                and dim_size < block_size
-            ):
-                value_slice = f":{dim_size}"
-                needs_slice = True
 
-        slices.append(value_slice)
-        tensor_dim += 1
+def _padded_value_for_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    index_parts: list[str],
+    value: ast.AST,
+) -> ast.AST:
+    """Zero-pad loads from clamped refs (see ``_clamped_dims``) to block
+    shape, so they compose with block-shaped values and OOB positions read 0.
 
-    if not needs_slice:
+    Exempt: scratch-routed tensors (pipeline/fori DMA scratches are
+    block-sized, not clamped) and size-1 dims (they broadcast; zero-padding
+    would break that).
+    """
+    name = state.codegen.device_function.tensor_arg(tensor).name
+    if _find_dma_scratch_loop(state, name)[0] is not None:
+        return value
+
+    clamps = _clamped_dims(state, tensor, subscript, index_parts)
+    pads = [
+        "(0, 0)" if c is None or c[0] <= 1 else f"(0, {c[1] - c[0]})" for c in clamps
+    ]
+    if all(p == "(0, 0)" for p in pads):
         return value
 
     return expr_from_string(
-        f"{{value}}[{', '.join(slices)}]",
+        f"jnp.pad({{value}}, ({', '.join(pads)},))",
         value=value,
     )
 
@@ -398,8 +518,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
-    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
-    from helion._compiler.pallas.plan_tiling import IndirectScatterPattern
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -427,16 +546,18 @@ def _generated_index_code(
             pattern, idx, state, subscript_index, in_pipeline
         )
 
-    if isinstance(pattern, IndirectGatherPattern):
-        # The gather emitter consumes the tensor index and projects the full
-        # resident table axis through one-hot, so normal load codegen must
-        # expose that axis instead of indexing it a second time.
-        return ":"
+    if isinstance(pattern, TensorIndexPattern):
+        from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+        from helion._compiler.pallas.tensorcore_plan import TensorCorePlan
 
-    if isinstance(pattern, IndirectScatterPattern):
-        # The scatter emitter consumes the tensor index and projects source lanes
-        # through one-hot matrices, so normal store codegen must expose the full
-        # resident target axis instead of indexing it a second time.
+        assert state.fx_node is not None
+        plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+        assert (
+            isinstance(plan, TensorCorePlan)
+            and subscript_index in plan.indirect_positions
+        ), "TensorCore plan does not handle a tensor-valued index"
+        # The plan consumes the tensor index, so ordinary indexing must expose
+        # the full tensor axis instead of applying the index a second time.
         return ":"
 
     raise RuntimeError(
@@ -589,7 +710,7 @@ def _is_compact_aligned_load(
 ) -> bool:
     """True if *tensor* is a compact-tile aligned-load or exact-store tensor.
 
-    Both get a per-tile ``pl.Element`` BlockSpec sliced at ``tile_start`` (Pallas
+    Both get a per-tile window BlockSpec sliced at ``tile_start`` (Pallas
     double-buffers the load's prefetch and the store's write-back), so the body
     accesses the whole sliced block at local offset 0.
     """
@@ -605,6 +726,35 @@ def _is_compact_aligned_load(
         p.kind in ("compact_aligned_load", "compact_exact_store") and p.arg_name == host
         for p in plan.tensor_policies
     )
+
+
+def _is_ordered_aligned_load(
+    state: CodegenState, block_id: int, tensor: torch.Tensor | None
+) -> bool:
+    """True if *tensor* is a resident ordered reduction operand.
+
+    Resident operands get a per-range ``C``-row window keyed on
+    ``range_start`` (not tile_start), so the fori body reads at the LOCAL
+    ordered-tile offset ``offset - range_start`` rather than the absolute offset.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    if tensor is None:
+        return False
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None or plan.ordered_axis is None:
+        return False
+    if block_id != plan.ordered_axis.block_id:
+        return False
+    # Only active resident ordered operands read the resident window at the local
+    # (offset - range_start) offset.  Consume the cached ResidentCacheDecision
+    # the loop router also uses; inactive means the ordered loop streams and no
+    # resident window exists.
+    decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
+    if decision is None or not decision.active:
+        return False
+    host = state.device_function.tensor_arg(tensor).host_str()
+    return host in decision.resident_operands
 
 
 def _ds_expr(
@@ -627,11 +777,25 @@ def _ds_expr(
     if block_size is None:
         return ":"
     # compact_aligned_load: the tensor is a per-tile sliced BlockSpec block (the
-    # launcher slices it to one tile at tile_start via pl.Element, so Pallas
+    # launcher slices it to one tile at tile_start, so Pallas
     # double-buffers it across work items).  The body therefore reads the whole
     # sliced block at local offset 0, not the absolute tile_start.
     if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
         return f"pl.ds(0, {block_size})"
+    # Resident ordered operand: C-row window at range_start, so read
+    # at the LOCAL offset within the window (absolute offset - range_start).
+    if not tile_offset and _is_ordered_aligned_load(state, block_id, tensor):
+        from helion._compiler.compile_environment import CompileEnvironment
+        from helion._compiler.pallas.compact_worklist import metadata_ref_for_field
+
+        env = CompileEnvironment.current()
+        plan = env.compact_worklist_plan
+        assert plan is not None
+        decision = env.compact_worklist_resident_cache_decision
+        assert decision is not None
+        assert decision.resident_key_fields == ("range_start",)
+        begin_ref = f"{metadata_ref_for_field(plan, 'range_start')}[_wid]"
+        return f"pl.ds(({offset}) - ({begin_ref}), {block_size})"
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
@@ -727,5 +891,9 @@ def _loop_offset_alignment(
 
 def vmem_name(state: CodegenState, name: str) -> str:
     """Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop."""
-    _loop, ref = _find_dma_scratch_loop(state, name)
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    loop, ref = _find_dma_scratch_loop(state, name)
+    if isinstance(loop, ForiLoopState) and name in loop._prefetched_load_tensors:
+        return f"{ref}.at[{loop.loop_var_name} % 2]"
     return ref

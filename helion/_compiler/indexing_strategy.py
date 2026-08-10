@@ -57,6 +57,106 @@ class TileWithOffsetInfo(NamedTuple):
         )
 
 
+def subscript_tile_info(
+    env: CompileEnvironment, subscript: object
+) -> TileWithOffsetInfo | None:
+    """Return a subscript's tile axis and offset from its FX provenance."""
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    metadata = subscript.meta.get("tile_with_offset")
+    if isinstance(metadata, dict):
+        block_id = metadata.get("block_id")
+        offset = metadata.get("offset", 0)
+        block_size = metadata.get("block_size")
+        if isinstance(block_id, int) and isinstance(offset, (int, torch.SymInt)):
+            return TileWithOffsetInfo(block_id, offset, block_size)
+        return None
+    block_id = env.resolve_block_id(subscript.meta.get("val"))
+    if block_id is None:
+        return None
+    return TileWithOffsetInfo(block_id, 0)
+
+
+def subscript_index_scale(
+    env: CompileEnvironment, subscript: object
+) -> tuple[int | None, int]:
+    """``(block_id, index_scale)`` for one load/store subscript position.
+
+    ``index_scale`` is the tile-index multiplier in the ADDRESS expression
+    (``x[tile]`` -> 1, ``x[2 * tile.index]`` -> 2): the GATHER stride, distinct from
+    the accessed tensor's ``.stride()`` (a layout property, already recorded as
+    ``MemoryOpFact.subscript_strides``). A stride-k gather touches k sectors per
+    useful sector, which no layout stride can express.
+
+    The block-id is returned alongside because a scaled subscript loses its tile
+    provenance: ``subscript_tile_info`` reads ``meta["tile_with_offset"]``, set for
+    ``tile_index + const`` but not ``tile_index * const``. Walking the affine chain
+    here recovers both. Non-affine forms return ``(None, 1)`` -- assume coalesced
+    rather than guess a penalty.
+    """
+    info = subscript_tile_info(env, subscript)
+    if info is not None:
+        return info.block_id, 1
+    if not isinstance(subscript, torch.fx.Node):
+        return None, 1
+    scale = 1
+    node: torch.fx.Node = subscript
+    # Bounded walk down an affine chain; the idiomatic form is 1-2 links deep.
+    for _ in range(8):
+        target = node.target
+        args = node.args
+        if target is torch.ops.aten.mul.Tensor and len(args) == 2:
+            factor = args[1]
+            operand = args[0]
+            if not isinstance(factor, int):
+                # x * tile form: the int may be on either side.
+                factor, operand = operand, factor
+            if (
+                isinstance(factor, int)
+                and factor >= 1
+                and isinstance(operand, torch.fx.Node)
+            ):
+                scale *= factor
+                node = operand
+                continue
+            return None, 1
+        if target is torch.ops.aten.add.Tensor and len(args) == 2:
+            offset, operand = args[1], args[0]
+            if not isinstance(offset, int):
+                offset, operand = operand, offset
+            if isinstance(offset, int) and isinstance(operand, torch.fx.Node):
+                node = operand
+                continue
+            return None, 1
+        # Reached the base of the chain: either a tile-provenance node or a
+        # ``tile_index`` HOP whose own argument carries the provenance.
+        base = subscript_tile_info(env, node)
+        if base is not None:
+            return base.block_id, scale
+        inner = args[0] if args else None
+        if isinstance(inner, torch.fx.Node):
+            base = subscript_tile_info(env, inner)
+            if base is not None:
+                return base.block_id, scale
+            node = inner
+            continue
+        return None, 1
+    return None, 1
+
+
+def exact_tile_block_ids(
+    env: CompileEnvironment, subscripts: Sequence[object]
+) -> tuple[int, ...] | None:
+    """Return ordered tile block IDs when every subscript has zero offset."""
+    block_ids: list[int] = []
+    for subscript in subscripts:
+        info = subscript_tile_info(env, subscript)
+        if info is None or not env.known_equal(info.offset, 0):
+            return None
+        block_ids.append(info.block_id)
+    return tuple(block_ids)
+
+
 def _get_padded_iota_original_length(
     state: CodegenState, index_position: int
 ) -> int | None:
@@ -591,8 +691,20 @@ class PointerIndexingStrategy(IndexingStrategy):
             else:
                 extra = ", other=0"
         name = state.device_function.tensor_arg(fake_tensor).name
-        # Optional hint for the allowlisted blocked-gather pattern.
         offset_ast = indexing.index_expr
+        if indexing.has_mask() and not indexing.block_shaped_offset:
+            # The size-1 dimensions dropped every block shaped term from the
+            # offset, and Triton cannot mask a scalar pointer. Add a block shaped
+            # zero to restore the shape without changing the offset.
+            env = CompileEnvironment.current()
+            shape_str = state.tile_strategy.shape_str(
+                SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+            )
+            offset_ast = expr_from_string(
+                f"{{offset}} + {env.backend.zeros_expr(shape_str, env.index_type())}",
+                offset=offset_ast,
+            )
+        # Optional hint for the allowlisted blocked-gather pattern.
         try:
             contiguity = _PointerLoadContiguity(state, fake_tensor, subscript).derive()
         except Exception:
@@ -645,67 +757,28 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
+        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+
         # Check if the pointer is effectively scalar but the value has dimensions.
         # This happens when all block-indexed dimensions have size 1 in the target tensor.
         # In this case, we need to reshape the value to scalar to match the pointer.
-        env = CompileEnvironment.current()
-        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
-
-        # Determine if pointer has any block dimensions by checking if any block index
-        # targets a non-size-1 tensor dimension. We need to match the logic in
-        # SubscriptIndexing.create which skips dimensions where fake_tensor.size(i) == 1.
-        pointer_has_block_dims = False
-        tensor_dim = 0
-        k_index = 0
-        for k in subscript:
-            if k is None:
-                # None adds a dimension to output, not from tensor
-                pass
-            elif isinstance(k, int):
-                # Scalar int index - consumes tensor dim but adds scalar to pointer
-                tensor_dim += 1
-            elif _get_tile_with_offset_info(
-                k, state.fx_node, k_index
-            ) is not None or isinstance(k, torch.Tensor):
-                # Tensor index (tile.index + offset or regular tensor) - block index
-                if not env.known_equal(fake_tensor.size(tensor_dim), 1):
-                    pointer_has_block_dims = True
-                tensor_dim += 1
-                k_index += 1
-            elif isinstance(k, torch.SymInt):
-                # SymInt can be block index (with BlockSizeOrigin) or scalar
-                symbol = _symint_expr(k)
-                origin = None
-                if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().expr_to_origin.get(symbol)
-                if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    # Block index
-                    if not env.known_equal(fake_tensor.size(tensor_dim), 1):
-                        pointer_has_block_dims = True
-                # Both block and scalar SymInt consume a tensor dimension
-                tensor_dim += 1
-                k_index += 1
-            elif isinstance(k, slice):
-                # Slice - adds block dimension if slice_size > 1
-                size = fake_tensor.size(tensor_dim)
-                slice_size = compute_slice_size(k, size)
-                if not env.known_equal(slice_size, 1):
-                    if not env.known_equal(fake_tensor.size(tensor_dim), 1):
-                        pointer_has_block_dims = True
-                tensor_dim += 1
-                k_index += 1
-
-        # If pointer is scalar but output_size has dimensions, reshape value to scalar.
-        # Skip reshaping for scalar constants which don't have shape.
         backend = CompileEnvironment.current().backend
+        needs_squeeze = bool(output_size)
         if (
-            not pointer_has_block_dims
-            and output_size
-            and not isinstance(value, ast.Constant)
+            not needs_squeeze
+            and state.fx_node is not None
+            and len(state.fx_node.args) > 2
         ):
-            # Pointer is scalar but value may have shape - squeeze to scalar
-            reshape = backend.reshape_expr("{value}", "[]")
-            value = expr_from_string(reshape, value=value)
+            value_node = state.fx_node.args[2]
+            if isinstance(value_node, torch.fx.Node):
+                val_meta = value_node.meta.get("val")
+                needs_squeeze = isinstance(val_meta, torch.Tensor) and val_meta.ndim > 0
+        if (
+            not indexing.block_shaped_offset
+            and not isinstance(value, ast.Constant)
+            and needs_squeeze
+        ):
+            value = expr_from_string(backend.reshape_expr("{value}", "[]"), value=value)
 
         offset_expr = indexing.index_expr
         # If dimensions need broadcasting for store, broadcast the pointer
@@ -1304,6 +1377,9 @@ class PerDimIndexing:
     mask_expr: ast.AST
     broadcast_dims: tuple[tuple[int, int | torch.SymInt], ...]
     output_size: list[int | torch.SymInt]
+    # Per tensor dimension, whether that dimension's index is block shaped (a
+    # tile/tensor index rather than a scalar). Parallel to dim_index_exprs.
+    block_dims: tuple[bool, ...] = ()
 
     def has_mask(self) -> bool:
         return not (
@@ -1325,6 +1401,10 @@ class SubscriptIndexing(NamedTuple):
     # index variables (x_epilogue{i}_{d}) that Inductor's store_output() uses
     # to build broadcast-aware range tree entries.
     dim_index_exprs: tuple[str, ...] = ()
+    # Whether index_expr is block shaped. False when every block index landed on
+    # a size-1 dimension, since those terms are dropped from the offset sum and
+    # what remains is scalar.
+    block_shaped_offset: bool = True
 
     def has_mask(self) -> bool:
         return not (
@@ -1443,6 +1523,8 @@ class SubscriptIndexing(NamedTuple):
         tile_strategy = state.tile_strategy
         output_idx = 0
         index_values: list[str] = []
+        # Parallel to index_values: whether that dimension's index is block shaped.
+        block_dims: list[bool] = []
         mask_values: dict[str, None] = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
@@ -1566,7 +1648,10 @@ class SubscriptIndexing(NamedTuple):
             if k is None:
                 output_idx += 1
             elif isinstance(k, int):
-                index_values.append(repr(k))
+                if k < 0:
+                    k += fake_value.size(len(index_values))
+                block_dims.append(False)
+                index_values.append(state.device_function.literal_expr(k))
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, n)
             ) is not None:
@@ -1575,6 +1660,7 @@ class SubscriptIndexing(NamedTuple):
                 full_block_size = env.block_sizes[env.canonical_block_id(block_id)].var
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 i = len(index_values)
+                block_dims.append(True)
                 if tile_info.block_size is not None and not env.known_equal(
                     tile_info.block_size, full_block_size
                 ):
@@ -1616,6 +1702,7 @@ class SubscriptIndexing(NamedTuple):
                     index_var = state.codegen.index_var(block_id)
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
+                    block_dims.append(True)
                     index_values.append(f"({index_var}){expand}")
                     if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
                         fake_value.size(i)
@@ -1643,6 +1730,7 @@ class SubscriptIndexing(NamedTuple):
                         val = state.codegen.lift(ast_index[n], prefix="index").id
                     else:
                         val = state.device_function.literal_expr(k)
+                    block_dims.append(False)
                     index_values.append(f"({val})")
             elif isinstance(k, slice):
                 expand = tile_strategy.expand_str(output_size, output_idx)
@@ -1666,12 +1754,14 @@ class SubscriptIndexing(NamedTuple):
                                 state, block_idx, slice_size, dtype
                             )
                         # Generate strided index: start + index * step
+                        block_dims.append(True)
                         index_values.append(
                             f"({start} + ({base_index_expr}) * {step}){expand}"
                         )
                         if mask_expr is not None:
                             mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
+                        block_dims.append(False)
                         index_values.append(f"{start}{expand}")
                 else:
                     slice_size = compute_slice_size(k, size)
@@ -1686,11 +1776,13 @@ class SubscriptIndexing(NamedTuple):
                                 state, block_idx, slice_size, dtype
                             )
                         start_expr = state.device_function.literal_expr(start)
+                        block_dims.append(True)
                         index_values.append(f"({start_expr} + ({index_var})){expand}")
                         if mask_expr is not None:
                             mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
                         start_expr = state.device_function.literal_expr(start)
+                        block_dims.append(False)
                         index_values.append(f"{start_expr}{expand}")
                 output_idx += 1
             elif isinstance(k, torch.Tensor):
@@ -1703,6 +1795,7 @@ class SubscriptIndexing(NamedTuple):
                     idx_val, new_masks = handle_broadcast_tensor(
                         n, k, index_var, output_idx
                     )
+                    block_dims.append(True)
                     index_values.append(idx_val)
                     mask_values.update(new_masks)
                     if k is tensor_indexers[0]:
@@ -1714,6 +1807,7 @@ class SubscriptIndexing(NamedTuple):
                     if k.ndim < len(output_size)
                     else ""
                 )
+                block_dims.append(True)
                 index_values.append(f"({index_var}){expand}")
                 mask_block_id = (
                     env.get_block_id(output_size[output_idx])
@@ -1732,6 +1826,7 @@ class SubscriptIndexing(NamedTuple):
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
         assert len(index_values) == fake_value.ndim
+        assert len(block_dims) == len(index_values)
 
         kwargs = {}
         if extra_mask is not None:
@@ -1742,6 +1837,7 @@ class SubscriptIndexing(NamedTuple):
             expr_from_string("&".join(mask_values) or "None", **kwargs),
             tuple(size1_broadcast_dims),
             output_size,
+            tuple(block_dims),
         )
 
     @staticmethod
@@ -1760,19 +1856,25 @@ class SubscriptIndexing(NamedTuple):
         def _is_size_one(size: int | torch.SymInt) -> bool:
             return env.known_equal(size, 1)
 
+        # A size-1 dimension contributes offset 0, so its term is dropped. That
+        # also drops its shape, so track whether a block shaped term survives.
         index_expr = []
+        block_shaped = False
         for i, idx in enumerate(per_dim.dim_index_exprs):
             if not _is_size_one(fake_value.size(i)):
                 stride = state.device_function.tensor_stride(fake_value, i).name
                 index_expr.append(f"{idx} * {stride}")
+                block_shaped |= per_dim.block_dims[i]
         if not index_expr:
             shape_str = state.tile_strategy.shape_str(per_dim.output_size)
             index_expr.append(env.backend.zeros_expr(shape_str, dtype))
+            block_shaped = bool(per_dim.output_size)
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
             per_dim.mask_expr,
             per_dim.broadcast_dims,
             per_dim.dim_index_exprs,
+            block_shaped,
         )
 
 
@@ -1974,7 +2076,9 @@ class BlockedSubscriptIndexing:
             if k is None:
                 pass  # handled by reshaped_size
             elif isinstance(k, int):
-                res.offsets.append(repr(k))
+                if k < 0:
+                    k += fake_value.size(len(res.offsets))
+                res.offsets.append(state.device_function.literal_expr(k))
                 res.block_shape.append(1)
             elif (
                 tile_info := _get_tile_with_offset_info(k, state.fx_node, n)

@@ -385,7 +385,7 @@ x.size()
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
 x.stride()
     attr5 = 
-    # Call: LiteralType(5) SourceOrigin(location=<SourceLocation all_ast_nodes.py:N>)
+    # Call: LiteralType(5) TensorStrideOrigin(value=ArgumentOrigin(name='x'), key=0)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='stride')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
 x.stride(

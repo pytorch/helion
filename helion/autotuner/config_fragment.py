@@ -106,6 +106,22 @@ class ConfigSpecFragment:
         """
         raise NotImplementedError
 
+    def cardinality(self) -> int | None:
+        """Number of distinct values this fragment can take during search.
+
+        Returns ``None`` when the count is unbounded or unknown. Used by the
+        search-space logger to describe the size of a tunable dimension.
+        """
+        return None
+
+    def search_values(self, limit: int = 100) -> list[object] | None:
+        """Explicit distinct search values when cheaply enumerable within ``limit``.
+
+        Returns ``None`` when the values aren't usefully enumerable or exceed
+        ``limit``.
+        """
+        return None
+
 
 @dataclasses.dataclass
 class PermutationFragment(ConfigSpecFragment):
@@ -137,6 +153,9 @@ class PermutationFragment(ConfigSpecFragment):
 
     def dim(self) -> int:
         return self.length
+
+    def cardinality(self) -> int | None:
+        return math.factorial(self.length)
 
     def encode(self, value: object) -> list[float]:
         assert isinstance(value, list)
@@ -185,6 +204,15 @@ class BaseIntegerFragment(ConfigSpecFragment):
         assert isinstance(value, int)
         return [float(value)]
 
+    def cardinality(self) -> int | None:
+        return self.high - self.low + 1
+
+    def search_values(self, limit: int = 100) -> list[object] | None:
+        card = self.cardinality()
+        if card is None or card > limit:
+            return None
+        return list(range(self.low, self.high + 1))
+
 
 class PowerOfTwoFragment(BaseIntegerFragment):
     def random(self) -> int:
@@ -232,6 +260,17 @@ class PowerOfTwoFragment(BaseIntegerFragment):
                 f"Expected positive value for PowerOfTwoFragment, got {value}"
             )
         return [math.log2(float(value))]
+
+    def cardinality(self) -> int | None:
+        return self.high.bit_length() - self.low.bit_length() + 1
+
+    def search_values(self, limit: int = 100) -> list[object] | None:
+        values = [
+            1 << e for e in range(self.low.bit_length() - 1, self.high.bit_length())
+        ]
+        if len(values) > limit:
+            return None
+        return list(values)
 
 
 class IntegerFragment(BaseIntegerFragment):
@@ -301,6 +340,15 @@ class EnumFragment(ConfigSpecFragment):
     def dim(self) -> int:
         return len(self.choices)
 
+    def cardinality(self) -> int | None:
+        return len(self._active_choices())
+
+    def search_values(self, limit: int = 100) -> list[object] | None:
+        active = self._active_choices()
+        if len(active) > limit:
+            return None
+        return list(active)
+
     def fingerprint(self) -> FragmentFingerprint:
         if self.search_choices is None:
             return ("enum", *(repr(choice) for choice in self.choices))
@@ -343,6 +391,12 @@ class BooleanFragment(ConfigSpecFragment):
 
     def dim(self) -> int:
         return 1
+
+    def cardinality(self) -> int | None:
+        return 2
+
+    def search_values(self, limit: int = 100) -> list[object] | None:
+        return [False, True]
 
     def encode(self, value: object) -> list[float]:
         """Encode enum values as their index."""
@@ -400,6 +454,16 @@ class NumThreadsFragment(ConfigSpecFragment):
 
     def dim(self) -> int:
         return 1
+
+    def cardinality(self) -> int | None:
+        # "0" (auto) plus every power of two up to ``high``.
+        return 1 + self.high.bit_length()
+
+    def search_values(self, limit: int = 100) -> list[object] | None:
+        values: list[object] = [0, *(1 << e for e in range(self.high.bit_length()))]
+        if len(values) > limit:
+            return None
+        return values
 
     def encode(self, value: object) -> list[float]:
         if value == 0:
@@ -465,6 +529,12 @@ class ListOf(ConfigSpecFragment):
 
     def dim(self) -> int:
         return self.length * self.inner.dim()
+
+    def cardinality(self) -> int | None:
+        inner = self.inner.cardinality()
+        if inner is None:
+            return None
+        return inner**self.length
 
     def encode(self, value: object) -> list[float]:
         assert isinstance(value, list)

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import ast
+import dataclasses
 from itertools import zip_longest
-from typing import TYPE_CHECKING
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 
 from .. import exc
 from .._compat import min_dot_size
@@ -13,18 +11,7 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
 from .._compiler.compile_environment import shape_env_var_hints
-from .._compiler.cute.indexing import CutePackedAffineLoad
-from .._compiler.cute.indexing import CutePackedTerms
-from .._compiler.cute.matmul_fallback import _emit_cute_matmul
-from .._compiler.cute.matmul_utils import cute_lower_rhs_for_matmul
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
-from .._compiler.cute.matmul_utils import cute_outer_accumulator_dtype
-from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
-from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
-from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
-from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
-from .._compiler.cute.strategies import is_pure_matmul_role_lifecycle_config
-from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -32,15 +19,8 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BL
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
-from .._compiler.matmul_utils import _emit_pallas_matmul
-from .._compiler.matmul_utils import _emit_tl_dot_scaled
-from .._compiler.matmul_utils import _needs_f32_accumulator
-from .._compiler.matmul_utils import emit_tl_dot_with_padding
 from ..autotuner.config_spec import MatmulFact
 from . import _decorators
-
-if TYPE_CHECKING:
-    from .._compiler.inductor_lowering import CodegenState
 
 
 def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int | None:
@@ -57,24 +37,20 @@ def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int 
     return int(expr)
 
 
+def _dot_result_shape(
+    mat1: torch.Tensor, mat2: torch.Tensor
+) -> list[int | torch.SymInt]:
+    """Return the broadcasted ``[..., M, N]`` result shape for ``hl.dot``."""
+    batch_shape = torch.broadcast_shapes(mat1.shape[:-2], mat2.shape[:-2])
+    return [*batch_shape, mat1.shape[-2], mat2.shape[-1]]
+
+
 def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) -> bool:
     if not isinstance(fx_node, torch.fx.Node):
         fx_node = getattr(fx_node, "fx_node", fx_node)
     if not isinstance(fx_node, torch.fx.Node):
         fx_node = None
     return cute_outer_accumulates_result(fx_node, is_acc_none=is_acc_none)
-
-
-def _requested_pure_matmul_role_lifecycle(state: CodegenState) -> bool:
-    return is_pure_matmul_role_lifecycle_config(state.device_function.config)
-
-
-def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
-    return bool(
-        state.device_function.config.get(
-            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False
-        )
-    )
 
 
 def _cuda_num_sms_or_zero(device: torch.device) -> int:
@@ -144,18 +120,6 @@ def dot(
         >>> result = hl.dot(a, b, acc=acc)  # int8 x int8 -> int32
     """
     raise exc.NotInsideKernel
-
-
-def _cute_mma_matches_dot_semantics(
-    lhs_dtype: torch.dtype,
-    rhs_dtype: torch.dtype,
-    acc_dtype: torch.dtype | None,
-    out_dtype: torch.dtype | None,
-) -> bool:
-    """Return True when fixed-f32 MMA accumulation matches hl.dot semantics."""
-    if not _needs_f32_accumulator(lhs_dtype, rhs_dtype):
-        return True
-    return out_dtype in (None, torch.float32) and acc_dtype in (None, torch.float32)
 
 
 @_decorators.prepare_args(dot)
@@ -238,8 +202,7 @@ def _(
                 )
 
         # Check accumulator shape compatibility
-        expected_shape = list(mat1.shape)
-        expected_shape[-1] = mat2.shape[-1]
+        expected_shape = _dot_result_shape(mat1, mat2)
 
         if acc.ndim not in (2, 3):
             raise ValueError(f"hl.dot: acc must be 2D or 3D tensor, got {acc.ndim}D")
@@ -249,34 +212,50 @@ def _(
                 f"hl.dot: acc shape {list(acc.shape)} incompatible with result shape {expected_shape}"
             )
 
-    # Apply min-dot-size constraints so autotuner won't pick invalid block_size
+    # Apply min-dot-size constraints so autotuning cannot select an invalid tile.
+    # Leading-passthrough tcgen05 search is intentionally not inferred from rank:
+    # the DeviceIR post-pass opens it only after the same structural analyzer
+    # used by codegen accepts the operands.
     enforce_dot_requirements(mat1, mat2)
 
     return (mat1, mat2, acc, out_dtype)
 
 
-def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
-    """Update config-spec min/max sizes for a dot/matmul.
-
-    This ensures the autotuner does not select block sizes below the hardware
-    minimums for the current device and dtypes, and constrains the batch
-    dimension block size to 1 for 3D operands since Triton does not support
-    3D dot operations.
-    """
-
-    # Last two dims are used for matmul
-    lshape = lhs.size()
-    rshape = rhs.size()
-    m, k = lshape[-2], lshape[-1]
-    k2, n = rshape[-2], rshape[-1]
+def _dot_dimensions(
+    lhs: torch.Tensor, rhs: torch.Tensor
+) -> tuple[int | torch.SymInt, int | torch.SymInt, int | torch.SymInt]:
+    """Return the M, N, and K problem extents for a dot."""
+    m, k = lhs.shape[-2:]
+    k2, n = rhs.shape[-2:]
     assert k == k2, f"Mismatched K dimensions for dot: {k} vs {k2}"
+    return m, n, k
+
+
+def _static_problem_extent(
+    env: CompileEnvironment, size: int | torch.SymInt
+) -> int | None:
+    block_idx = env.get_block_id(size)
+    if block_idx is not None:
+        block_size = env.block_sizes[block_idx].size
+        if isinstance(block_size, (int, torch.SymInt)):
+            return _static_dim_value(env, block_size)
+    return _static_dim_value(env, size)
+
+
+def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
+    """Record a matmul fact and apply backend-independent dot constraints."""
+    m, n, k = _dot_dimensions(lhs, rhs)
 
     from ..autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
 
-    a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
     env = CompileEnvironment.current()
+    a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
     # M and N are the output tile dims; K is the contraction loop.
-    for shape, min_size, is_output_dim in ((m, a, True), (n, b, True), (k, c, False)):
+    for shape, min_size, is_output_dim in (
+        (m, a, True),
+        (n, b, True),
+        (k, c, False),
+    ):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
             # On Pallas, clamp min to the tensor dimension so we don't
@@ -291,10 +270,8 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 except KeyError:
                     pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
-            # Let the autotuner try output (M/N) block sizes larger than a small
-            # matmul dimension: the masked rows/cols map to a more efficient MMA
-            # tile. Out-of-bounds masking is a Triton feature, so other backends
-            # keep the dimension-sized ceiling.
+            # Let the autotuner try output block sizes larger than a small matmul
+            # dimension: masked rows/cols can map to a more efficient MMA tile.
             if is_output_dim and env.backend_name == "triton":
                 try:
                     spec = env.config_spec.block_sizes.block_id_lookup(block_idx)
@@ -303,23 +280,6 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 else:
                     spec.allow_overshoot(SMALL_DIM_BLOCK_SIZE_OVERSHOOT)
 
-    # Blackwell tcgen05 matmuls require an explicit MxNxK tile family that the
-    # generic power-of-two search space rarely reaches on its own. Reuse the
-    # same block-size constraint path as Triton/Pallas so CuTe matmul search
-    # space shaping lives in one place. On current B200 runs the stable family
-    # now scales well past N=8, with N=256 outperforming the earlier narrow
-    # clamp on large bf16/f16 GEMMs.
-    def static_problem_extent(size: int | torch.SymInt) -> int | None:
-        block_idx = env.get_block_id(size)
-        if block_idx is not None:
-            block_size = env.block_sizes[block_idx].size
-            if isinstance(block_size, (int, torch.SymInt)):
-                return _static_dim_value(env, block_size)
-        return _static_dim_value(env, size)
-
-    static_m = static_problem_extent(m)
-    static_n = static_problem_extent(n)
-    static_k = static_problem_extent(k)
     env.config_spec.matmul_facts.append(
         MatmulFact(
             lhs_ndim=lhs.ndim,
@@ -327,224 +287,236 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             m_block_id=env.get_block_id(m),
             n_block_id=env.get_block_id(n),
             k_block_id=env.get_block_id(k),
-            static_m=static_m,
-            static_n=static_n,
-            static_k=static_k,
+            static_m=_static_problem_extent(env, m),
+            static_n=_static_problem_extent(env, n),
+            static_k=_static_problem_extent(env, k),
             lhs_dtype=lhs.dtype,
             rhs_dtype=rhs.dtype,
         )
     )
-    # tcgen05 MMA-K is 16 elements for BF16/FP16 but 32 for FP8 (e4m3); the
-    # block_k search granularity and minimum must follow the active dtype.
+
+    # Triton only supports 2D dot operations. Constrain each leading axis from
+    # a rank-3 operand to one element so codegen can squeeze it before tl.dot.
+    # Pallas uses jnp.dot_general and handles leading axes natively.
+    if (lhs.ndim == 3 or rhs.ndim == 3) and env.backend_name != "pallas":
+        leading_dims = []
+        if lhs.ndim == 3:
+            leading_dims.append(lhs.shape[0])
+        if rhs.ndim == 3:
+            leading_dims.append(rhs.shape[0])
+        for leading_dim in leading_dims:
+            block_idx = env.get_block_id(leading_dim)
+            if block_idx is not None:
+                env.block_sizes[block_idx].update_max_block(1)
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteTcgen05SearchPlan:
+    """Side-effect-free tcgen05 search limits for one MMA candidate."""
+
+    m: int | torch.SymInt
+    n: int | torch.SymInt
+    k: int | torch.SymInt
+    static_m: int
+    static_n: int
+    static_k: int
+    leading_work_multiplier: int
+    is_fp8: bool
+    mma_k: int
+    max_tcgen05_m: int
+    max_tcgen05_n: int
+    max_search_m: int
+    max_search_n: int
+    max_search_k: int
+    min_search_m: int
+
+
+def plan_cute_tcgen05_search(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    has_leading_passthrough: bool,
+) -> CuteTcgen05SearchPlan | None:
+    """Return search limits without mutating the shared ``ConfigSpec``."""
+    m, n, k = _dot_dimensions(lhs, rhs)
+    env = CompileEnvironment.current()
+    static_m = _static_problem_extent(env, m)
+    static_n = _static_problem_extent(env, n)
+    static_k = _static_problem_extent(env, k)
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     mma_k = 32 if is_fp8 else 16
     if (
-        env.backend_name == "cute"
-        and lhs.ndim == 2
-        and rhs.ndim == 2
-        and lhs.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-        and rhs.dtype == lhs.dtype
-        and static_m is not None
-        and static_n is not None
-        and static_k is not None
-        and static_m >= 64
-        and static_n >= 8
-        and static_k >= mma_k
+        env.backend_name != "cute"
+        or lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        or rhs.dtype != lhs.dtype
+        or static_m is None
+        or static_n is None
+        or static_k is None
+        or static_m < 64
+        or static_n < 8
+        or static_k < mma_k
     ):
-        from .._compiler.cute.mma_support import get_cute_mma_support
+        return None
 
-        support = get_cute_mma_support()
-        tcgen05_supported = support.tcgen05_f8 if is_fp8 else support.tcgen05_f16bf16
-        if tcgen05_supported:
+    from .._compiler.cute.mma_support import get_cute_mma_support
 
-            def pow2_floor_at_least(value: int, minimum: int) -> int:
-                return 1 << (max(minimum, value).bit_length() - 1)
+    support = get_cute_mma_support()
+    if not (support.tcgen05_f8 if is_fp8 else support.tcgen05_f16bf16):
+        return None
 
-            max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
-            max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
-            # Larger tile_k packs more cute.gemm instructions per K loop
-            # iteration on tcgen05 (mma instruction K is fixed at 16 for
-            # BF16/FP16, 32 for FP8). Cap at 128 to keep AB SMEM staging
-            # budget sane.
-            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, mma_k))
-            max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
-            max_search_n = max_tcgen05_n
-            max_search_k = max_tcgen05_k
-            min_search_m = 128 if max_tcgen05_m >= 256 else 64
-            two_cta_m_edge = static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
-            two_cta_n_edge = static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
-            two_cta_k_tail = static_k % max_search_k != 0
-            if static_m % max_search_m != 0 and static_n % max_search_n != 0:
-                # Flat tcgen05 cluster_m=1 kernels now handle partial M and
-                # partial N output tiles in the SIMT edge epilogue. Keep N
-                # wide so edge-heavy shapes such as 5000x5000 do not collapse
-                # to block_n=8. M still caps at 128 because block_m=256 is
-                # validated through the cluster_m=2 CtaGroup.TWO path, which
-                # remains gated to static-full persistent kernels below.
-                max_search_m = min(max_search_m, 128)
-            spec = env.config_spec
-            spec.cute_tcgen05_search_enabled = True
-            # Persistent pid types may re-enter autotune only if every
-            # power-of-two block-size candidate in the tcgen05 search space
-            # is a static full tile. Since each candidate divides the maximum
-            # power-of-two candidate, checking the maximum per axis is enough.
-            # Multi-root kernels are rejected later once device IR root count
-            # is known.
-            allow_full_tile_persistent_pid_types = (
-                static_m % max_search_m == 0
-                and static_n % max_search_n == 0
-                and static_k % max_search_k == 0
-            )
-            # ``tcgen05_cluster_m`` is searched independently from bk. Expose
-            # 2 when at least the largest searched bk fits the cap; smaller
-            # invalid bk samples fall back to cluster_m=1 during normalization.
-            max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
-            allow_full_tile_cluster_m2_search = (
-                allow_full_tile_persistent_pid_types
-                and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
-                and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
-                and static_k <= max_cluster_m2_search_k
-            )
-            # Admit only the validated large double-output-edge + K-tail
-            # CtaGroup.TWO family: 256x256x128, persistent_interleaved.
-            # Smaller edge-heavy shapes continue using the established flat
-            # SIMT-edge fallback.
-            allow_edge_cluster_m2_search = (
-                not allow_full_tile_persistent_pid_types
-                and max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
-                and max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
-                and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-                and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-                and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-                and static_k <= max_cluster_m2_search_k
-                and two_cta_m_edge
-                and two_cta_n_edge
-                and two_cta_k_tail
-            )
-            # fp8 small-grid CtaGroup.TWO family: the fp8-validated bm=128
-            # (per-CTA 64xbn) 2-CTA tile keeps the 2-CTA A-multicast but needs
-            # only a 128x128 cluster tile, so it admits small/wave-limited fp8
-            # GEMMs (e.g. 512x2048x4096) that the bm=256 full tile underfills.
-            # Gated to fp8 + static-full persistent (same envelope as the full
-            # tile) and only requires the search space to reach bm/bn=128.
-            allow_fp8_small_grid_cluster_m2_search = (
-                is_fp8
-                and allow_full_tile_persistent_pid_types
-                and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
-                and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
-                and static_k <= max_cluster_m2_search_k
-            )
-            allow_cluster_m2_search = (
-                allow_full_tile_cluster_m2_search
-                or allow_edge_cluster_m2_search
-                or allow_fp8_small_grid_cluster_m2_search
-            )
-            # Small-shape wave-quantization gate. Suppress cluster_m=2 search
-            # only for genuinely tiny problems that cannot fill a meaningful
-            # fraction of the device; below that the persistent warp-spec
-            # prologue dominates and cluster_m=1 wins. The original gate used
-            # ``num_sms // 2`` (one full wave of 2-SM cluster slots), but that
-            # was calibrated for the DEFAULT-layout cluster_m=2 path. The
-            # generalized TVM-FFI direct entry (see
-            # ``CuteTcgen05ClusterM2FfiHeuristic``) has a much lower launch +
-            # epilogue overhead, which shifts the cluster_m=1/2 crossover well
-            # below one wave: full-autotune A/B on B200 shows cluster_m=2 + FFI
-            # winning at 64 work clusters (1024x4096x1024 and 2048^3, ~64
-            # clusters on the 148-SM B200 = 0.86 of a wave) by 7-21% over
-            # cluster_m=1. Use ``num_sms // 4`` so those validated shapes are
-            # admitted on current and larger Blackwell SKUs while still
-            # suppressing the truly tiny shapes (fewer than a quarter-wave of
-            # cluster slots) that have no FFI coverage. ``num_sms == 0`` (non-CUDA / mocked) keeps search
-            # live. See cute_plan.md §7.6.3.2 for the original NCU rationale.
-            if allow_cluster_m2_search:
-                num_sms_for_cm2_threshold = _cuda_num_sms_or_zero(lhs.device)
-                if num_sms_for_cm2_threshold > 0:
-                    # Count work clusters with the smallest reachable cluster
-                    # tile so the gate reflects the actual parallelism. The fp8
-                    # small-grid family forms 128x128 clusters (4x as many tiles
-                    # as the 256x256 full tile), so a shape that underfills the
-                    # full tile can still fill the device via small-grid.
-                    if allow_fp8_small_grid_cluster_m2_search:
-                        cm2_cluster_m = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
-                        cm2_cluster_n = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
-                    else:
-                        cm2_cluster_m = TCGEN05_TWO_CTA_BLOCK_M
-                        cm2_cluster_n = TCGEN05_TWO_CTA_BLOCK_N
-                    cm2_work_clusters = (static_m // cm2_cluster_m) * (
-                        static_n // cm2_cluster_n
-                    )
-                    cm2_min_clusters = num_sms_for_cm2_threshold // 4
-                    if cm2_work_clusters < cm2_min_clusters:
-                        allow_cluster_m2_search = False
-                        allow_fp8_small_grid_cluster_m2_search = False
-            # Narrow the autotune search to tcgen05 configs that have been
-            # validated to compile and run correctly on B200. Static full-tile
-            # single-root role-local persistent kernels have coverage, so the
-            # helper keeps persistent pid types when all search block sizes
-            # are full tiles. ``cluster_m=2`` re-enters search for static-full
-            # CtaGroup.TWO problems and for the large validated double-edge +
-            # K-tail family whose search space can form 256x256 tiles within
-            # the K-tile cap. Search-time
-            # normalization projects cluster_m=2 products onto that validated
-            # tile/pid shape and caps cluster_m=1 persistent products at
-            # tcgen05-supported M tiles so search does not fall through the
-            # universal fallback. ``num_epi_warps != 4`` remains excluded
-            # because only 4 is validated correct; 1 and 2 are directly
-            # verified to produce wrong output and 3 is unsafe by extension.
-            # The num_epi_warps restriction also tightens normalize() so an
-            # explicit user config that bypasses autotune raises
-            # ``InvalidConfig`` rather than silently miscomputing — there is
-            # no loud crash for this failure mode.
-            # Admit ``tcgen05_ab_stages=3`` into search whenever the
-            # active dtype is BF16/FP16 — the matmul path's outer guard
-            # already proved that. The per-CTA SMEM-budget gate inside
-            # ``allow_tcgen05_ab_stages_three_search`` queries
-            # ``lhs.device`` (not the host's current CUDA device) so a
-            # multi-GPU / heterogeneous setup cannot accidentally enable
-            # an over-budget config or suppress the canonical seed. If
-            # the target device's SMEM optin cap is below the B200
-            # envelope the gate keeps search at ``max=2``, and the
-            # per-config search-time fixup demotes over-budget ``ab=3``
-            # samples back to ``ab=2``. cute_plan.md §7.0 documents the
-            # canonical 4096^3 acceptance criterion.
-            ab_dtype_bytes = lhs.dtype.itemsize
-            spec.narrow_tcgen05_autotune_to_validated_configs(
-                allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
-                allow_cluster_m2_search=allow_cluster_m2_search,
-                cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
-                allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
-                allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
-                ab_stages_three_dtype_bytes=ab_dtype_bytes,
-                ab_stages_three_device=lhs.device,
-            )
-            for axis_name, shape, max_size in (
-                ("m", m, max_search_m),
-                ("n", n, max_search_n),
-                ("k", k, max_search_k),
-            ):
-                block_idx = env.get_block_id(shape)
-                if block_idx is None:
-                    continue
-                if axis_name == "k":
-                    min_size = mma_k
-                elif axis_name == "m":
-                    min_size = min_search_m
-                else:
-                    min_size = 8
-                env.block_sizes[block_idx].update_min_block(
-                    min_size, allow_flattened=True
-                )
-                env.block_sizes[block_idx].update_max_block(max_size)
+    def pow2_floor_at_least(value: int, minimum: int) -> int:
+        return 1 << (max(minimum, value).bit_length() - 1)
 
-    # Triton only supports 2D dot operations.  When the operands are 3D
-    # (batched matmul), constrain the batch dimension block size to 1 so
-    # the codegen can squeeze it away before emitting tl.dot.
-    # Pallas uses jnp.dot_general which handles batched matmul natively.
-    if len(lshape) == 3 and env.backend_name != "pallas":
-        for batch_dim in (lshape[0], rshape[0]):
-            block_idx = env.get_block_id(batch_dim)
-            if block_idx is not None:
-                env.block_sizes[block_idx].update_max_block(1)
+    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
+    max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
+    max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+    max_search_n = max_tcgen05_n
+    max_search_k = min(128, pow2_floor_at_least(static_k, mma_k))
+    min_search_m = 128 if max_tcgen05_m >= 256 else 64
+    leading_work_multiplier = 1
+    if has_leading_passthrough:
+        leading_operand = lhs if lhs.ndim == 3 else rhs
+        static_leading = _static_problem_extent(env, leading_operand.shape[0])
+        if static_leading is not None:
+            leading_work_multiplier = max(static_leading, 1)
+        if static_m % min_search_m != 0:
+            min_search_m = 64
+        max_search_m = min(max_search_m, static_m & -static_m)
+        max_search_n = min(max_search_n, static_n & -static_n)
+        max_search_k = min(max_search_k, static_k & -static_k)
+        if max_search_m < min_search_m or max_search_n < 8 or max_search_k < mma_k:
+            return None
+    if static_m % max_search_m != 0 and static_n % max_search_n != 0:
+        max_search_m = min(max_search_m, 128)
+    return CuteTcgen05SearchPlan(
+        m=m,
+        n=n,
+        k=k,
+        static_m=static_m,
+        static_n=static_n,
+        static_k=static_k,
+        leading_work_multiplier=leading_work_multiplier,
+        is_fp8=is_fp8,
+        mma_k=mma_k,
+        max_tcgen05_m=max_tcgen05_m,
+        max_tcgen05_n=max_tcgen05_n,
+        max_search_m=max_search_m,
+        max_search_n=max_search_n,
+        max_search_k=max_search_k,
+        min_search_m=min_search_m,
+    )
+
+
+def enable_cute_tcgen05_search(
+    lhs: torch.Tensor,
+    *,
+    plan: CuteTcgen05SearchPlan,
+    m_block_id: int,
+    n_block_id: int,
+    k_block_id: int,
+    input_dtype: torch.dtype,
+    has_leading_passthrough: bool,
+    explicit_epi_tile_compatible: bool,
+) -> None:
+    """Apply one preflighted tcgen05 search plan to the shared config."""
+    env = CompileEnvironment.current()
+    spec = env.config_spec
+    spec.register_cute_tcgen05_mma_analysis(
+        m_block_id=m_block_id,
+        n_block_id=n_block_id,
+        k_block_id=k_block_id,
+        input_dtype=input_dtype,
+        has_leading_passthrough=has_leading_passthrough,
+        explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+    )
+    static_m = plan.static_m
+    static_n = plan.static_n
+    static_k = plan.static_k
+    max_search_m = plan.max_search_m
+    max_search_n = plan.max_search_n
+    max_search_k = plan.max_search_k
+    spec.cute_tcgen05_search_enabled = True
+    allow_full_tile_persistent_pid_types = (
+        static_m % max_search_m == 0
+        and static_n % max_search_n == 0
+        and static_k % max_search_k == 0
+    )
+    max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
+    allow_full_tile_cluster_m2_search = (
+        allow_full_tile_persistent_pid_types
+        and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
+        and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+        and static_k <= max_cluster_m2_search_k
+    )
+    allow_edge_cluster_m2_search = (
+        not has_leading_passthrough
+        and not allow_full_tile_persistent_pid_types
+        and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
+        and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
+        and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+        and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+        and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+        and static_k <= max_cluster_m2_search_k
+        and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+        and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+        and static_k % max_search_k != 0
+    )
+    allow_fp8_small_grid_cluster_m2_search = (
+        not has_leading_passthrough
+        and plan.is_fp8
+        and allow_full_tile_persistent_pid_types
+        and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+        and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+        and static_k <= max_cluster_m2_search_k
+    )
+    allow_cluster_m2_search = (
+        allow_full_tile_cluster_m2_search
+        or allow_edge_cluster_m2_search
+        or allow_fp8_small_grid_cluster_m2_search
+    )
+    if allow_cluster_m2_search:
+        num_sms = _cuda_num_sms_or_zero(lhs.device)
+        if num_sms > 0:
+            if allow_fp8_small_grid_cluster_m2_search:
+                cluster_m = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+                cluster_n = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            else:
+                cluster_m = TCGEN05_TWO_CTA_BLOCK_M
+                cluster_n = TCGEN05_TWO_CTA_BLOCK_N
+            work_clusters = (
+                plan.leading_work_multiplier
+                * (static_m // cluster_m)
+                * (static_n // cluster_n)
+            )
+            if work_clusters < num_sms // 4:
+                allow_cluster_m2_search = False
+                allow_fp8_small_grid_cluster_m2_search = False
+    spec.narrow_tcgen05_autotune_to_validated_configs(
+        allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
+        allow_cluster_m2_search=allow_cluster_m2_search,
+        cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
+        allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
+        allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
+        ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
+        ab_stages_three_device=lhs.device,
+        reason="matmul kernel with CuTe tcgen05 backend",
+    )
+    for axis_name, shape, max_size in (
+        ("m", plan.m, max_search_m),
+        ("n", plan.n, max_search_n),
+        ("k", plan.k, max_search_k),
+    ):
+        block_idx = env.get_block_id(shape)
+        if block_idx is None:
+            continue
+        if axis_name == "k":
+            min_size = plan.mma_k
+        elif axis_name == "m":
+            min_size = plan.min_search_m
+        else:
+            min_size = 8
+        env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
+        env.block_sizes[block_idx].update_max_block(max_size)
 
 
 @_decorators.register_fake(dot)
@@ -554,9 +526,7 @@ def _(
     acc: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    # Matrix multiplication shape computation
-    result_shape = list(mat1.shape)
-    result_shape[-1] = mat2.shape[-1]
+    result_shape = _dot_result_shape(mat1, mat2)
 
     if acc is not None:
         return acc.new_empty(result_shape)
@@ -564,248 +534,6 @@ def _(
     # Determine output dtype using the helper function
     resolved_out_dtype = out_dtype or _compute_out_dtype(mat1.dtype, mat2.dtype)
     return torch.empty(result_shape, dtype=resolved_out_dtype, device=mat1.device)
-
-
-@_decorators.codegen(dot, "triton")
-def _(state: CodegenState) -> object:
-    # Get the AST representations of our arguments
-    lhs_ast = state.ast_arg(0)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
-    assert isinstance(rhs_ast, ast.AST)
-
-    # Get the dtypes of the inputs from proxy args
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor), "lhs_proxy must be a FakeTensor"
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor), "rhs_proxy must be a FakeTensor"
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
-
-    lhs_dtype = lhs_proxy.dtype
-    rhs_dtype = rhs_proxy.dtype
-    acc_dtype: torch.dtype | None = None
-    if acc_proxy is not None:
-        assert isinstance(acc_proxy, FakeTensor), "acc_proxy must be a FakeTensor"
-        acc_dtype = acc_proxy.dtype
-
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype), (
-            "out_dtype must be a torch.dtype"
-        )
-        out_dtype = out_dtype_proxy
-
-    # Check if accumulator is None
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-
-    lhs_shape: list[int | torch.SymInt] = list(lhs_proxy.shape)
-    rhs_shape: list[int | torch.SymInt] = list(rhs_proxy.shape)
-    acc_shape: list[int | torch.SymInt] | None = (
-        list(acc_proxy.shape) if acc_proxy is not None else None
-    )
-    acc_arg = None if is_acc_none else acc_ast
-    acc_dtype_arg = acc_dtype if not is_acc_none else None
-
-    # Perform dot with optional padding
-    return emit_tl_dot_with_padding(
-        lhs_ast,
-        rhs_ast,
-        acc_arg,
-        lhs_dtype,
-        rhs_dtype,
-        acc_dtype=acc_dtype_arg,
-        lhs_shape=lhs_shape,
-        rhs_shape=rhs_shape,
-        acc_shape=acc_shape,
-        out_dtype=out_dtype,
-    )
-
-
-@_decorators.codegen(dot, "cute")
-def _(state: CodegenState) -> object:
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor)
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor)
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
-
-    lhs_ast = state.ast_args[0]
-    if isinstance(lhs_ast, int | float | bool | None):
-        lhs_ast = ast.Constant(value=lhs_ast)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
-
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-
-    acc_dtype: torch.dtype | None = None
-    if not is_acc_none:
-        assert isinstance(acc_proxy, FakeTensor)
-        acc_dtype = acc_proxy.dtype
-        if lhs_proxy.dtype == torch.float32 and rhs_proxy.dtype == torch.float32:
-            if acc_dtype == torch.float16:
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "hl.dot(float32, float32, acc=float16) is not supported on CuTe; use a float32 accumulator or cast after the dot",
-                )
-
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype)
-        out_dtype = out_dtype_proxy
-
-    # Try MMA path first for configurations whose dtype semantics match fp32 MMA.
-    if _cute_mma_matches_dot_semantics(
-        lhs_proxy.dtype, rhs_proxy.dtype, acc_dtype, out_dtype
-    ):
-        from .._compiler.cute.cute_mma import codegen_cute_mma_dot
-
-        result = codegen_cute_mma_dot(state)
-        if result is not None:
-            return result
-
-    resolved_out_dtype = out_dtype or _compute_out_dtype(
-        lhs_proxy.dtype,
-        rhs_proxy.dtype,
-        acc_dtype,
-    )
-    outer_acc_dtype = cute_outer_accumulator_dtype(
-        state.fx_node,
-        is_acc_none=is_acc_none,
-    )
-    effective_out_dtype = cute_outer_accumulator_out_dtype(
-        resolved_out_dtype,
-        outer_acc_dtype,
-    )
-    k_block_id = cute_resolve_active_matmul_k_block_id(
-        state.codegen,
-        lhs_proxy.shape[-1],
-        rhs_proxy.shape[-2],
-        rhs_proxy.shape[-1],
-    )
-    packed_rhs = None
-    if (
-        k_block_id is None
-        and state.fx_node is not None
-        and len(state.fx_node.args) >= 2
-        and isinstance(rhs_node := state.fx_node.args[1], torch.fx.Node)
-    ):
-        rhs_ast, packed_rhs = cute_lower_rhs_for_matmul(
-            state.env,
-            lhs_ast,
-            rhs_node,
-            rhs_ast,
-        )
-    if k_block_id is None and packed_rhs is not None:
-        packed_nodes, _ = packed_rhs
-        packed_node = packed_nodes[0]
-        k_block_id = cute_resolve_active_block_id(
-            state.codegen, packed_node.meta["val"].shape[0]
-        )
-    assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
-    static_k_extent = None
-    if k_block_id is None and state.fx_node is not None:
-        lhs_node = state.fx_node.args[0] if len(state.fx_node.args) > 0 else None
-        rhs_node = state.fx_node.args[1] if len(state.fx_node.args) > 1 else None
-        if isinstance(lhs_node, torch.fx.Node) and isinstance(rhs_node, torch.fx.Node):
-            static_k_extent = cute_static_k_invariant_extent(lhs_node, rhs_node)
-    env = CompileEnvironment.current()
-    static_lhs_k = _static_dim_value(env, lhs_proxy.shape[-1])
-    static_rhs_k = _static_dim_value(env, rhs_proxy.shape[-2])
-    k_is_one = static_lhs_k == 1 and static_rhs_k == 1
-    if static_k_extent is None and k_block_id is None and not k_is_one:
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
-    if _requested_pure_matmul_role_lifecycle(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
-            "to lower through the tcgen05 K-loop path",
-        )
-    if _requested_tcgen05_flat_role_coordinates(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
-            "hl.dot to lower through the tcgen05 K-loop path",
-        )
-    dot_lhs_node = (
-        state.fx_node.args[0]
-        if state.fx_node is not None and len(state.fx_node.args) > 0
-        else None
-    )
-    dot_rhs_node = (
-        state.fx_node.args[1]
-        if state.fx_node is not None and len(state.fx_node.args) > 1
-        else None
-    )
-    dot_acc_node = (
-        state.fx_node.args[2]
-        if state.fx_node is not None and len(state.fx_node.args) > 2
-        else None
-    )
-    return _emit_cute_matmul(
-        state.codegen,
-        lhs_ast,
-        rhs_ast,
-        accumulate_in_lane_loop=not cute_outer_accumulates_result(
-            state.fx_node,
-            is_acc_none=is_acc_none,
-        ),
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        acc=None if is_acc_none else acc_ast,
-        out_dtype=effective_out_dtype,
-        acc_dtype=acc_dtype,
-        lhs_dtype=lhs_proxy.dtype,
-        rhs_dtype=rhs_proxy.dtype,
-        lhs_node=dot_lhs_node,
-        rhs_node=dot_rhs_node,
-        acc_node=None if is_acc_none else dot_acc_node,
-    )
-
-
-@_decorators.codegen(dot, "pallas")
-def _(state: CodegenState) -> object:
-    lhs_ast = state.ast_arg(0)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor)
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor)
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
-
-    lhs_dtype = lhs_proxy.dtype
-    rhs_dtype = rhs_proxy.dtype
-    need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
-
-    # Determine the accumulator AST (None if acc argument is None)
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-    acc = None if is_acc_none else acc_ast
-
-    # Determine desired output dtype
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype)
-        out_dtype = out_dtype_proxy
-    elif acc_proxy is not None and isinstance(acc_proxy, FakeTensor):
-        out_dtype = acc_proxy.dtype
-
-    return _emit_pallas_matmul(
-        lhs_ast,
-        rhs_ast,
-        acc=acc,
-        need_f32_acc=need_f32_acc,
-        out_dtype=out_dtype,
-        lhs_ndim=lhs_proxy.ndim,
-    )
 
 
 @_decorators.ref(dot)
@@ -997,39 +725,6 @@ def _(
         return acc.new_empty(result_shape)
     resolved_dtype = out_dtype or torch.float32
     return torch.empty(result_shape, dtype=resolved_dtype, device=mat1.device)
-
-
-@_decorators.codegen(dot_scaled, "triton")
-def _(state: CodegenState) -> object:
-    lhs_ast = state.ast_arg(0)  # mat1
-    lhs_scale_ast = state.ast_arg(1)  # mat1_scale
-    lhs_format = state.proxy_args[2]  # "e2m1" etc (string, not AST)
-    assert isinstance(lhs_format, str), "lhs_format must be a string"
-    rhs_ast = state.ast_arg(3)  # mat2
-    rhs_scale_ast = state.ast_arg(4)  # mat2_scale
-    rhs_format = state.proxy_args[5]  # "e2m1" etc (string, not AST)
-    assert isinstance(rhs_format, str), "rhs_format must be a string"
-    acc_ast = state.ast_arg(6)  # acc
-    out_dtype_proxy = state.proxy_args[7] if len(state.proxy_args) > 7 else None
-
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype), (
-            "out_dtype must be a torch.dtype"
-        )
-        out_dtype = out_dtype_proxy
-
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-    return _emit_tl_dot_scaled(
-        lhs_ast,
-        lhs_scale_ast,
-        lhs_format,
-        rhs_ast,
-        rhs_scale_ast,
-        rhs_format,
-        acc=None if is_acc_none else acc_ast,
-        out_dtype=out_dtype,
-    )
 
 
 @_decorators.ref(dot_scaled)

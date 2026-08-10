@@ -3,13 +3,16 @@ from __future__ import annotations
 from . import _compat as _compat_module  # noqa: F401  # side-effect import
 from . import _logging
 from . import exc
+from . import experimental as experimental  # keep helion.experimental importable
 from . import language
 from . import runtime
 from ._utils import cdiv
 from ._utils import next_power_of_2
+from .autotuner import aot_kernel
 from .autotuner import from_cache
 from .runtime import Config
 from .runtime import Kernel
+from .runtime import OutputCodeOptions
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
 from .runtime.settings import RefMode
@@ -18,8 +21,10 @@ from .runtime.settings import Settings
 __all__ = [
     "Config",
     "Kernel",
+    "OutputCodeOptions",
     "RefMode",
     "Settings",
+    "aot_kernel",
     "cdiv",
     "exc",
     "from_cache",

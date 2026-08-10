@@ -107,7 +107,7 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
 #       ],
 #       _triton_range_id_data_partition_factor=0,
 #       _triton_range_value_data_partition_factor=0,
-#       _triton_config_maxRegAutoWS=196,
+#       _triton_config_maxRegAutoWS=200,
 #   )
 # pyrefly: ignore [no-matching-overload]
 @helion.kernel(
@@ -302,13 +302,13 @@ def _bwd_preprocess(o_in: torch.Tensor, do_in: torch.Tensor) -> torch.Tensor:
 #           ["opndA,smem,1,8", "opndD,tmem,1,11"],
 #           ["opndA,tmem,1,5", "opndD,tmem,1,10"],
 #       ],
-#       _triton_config_maxRegAutoWS=188,
+#       _triton_config_maxRegAutoWS=192,
 #   )
 #
 # The AutoWS variant also registers:
 #   hl.register_tunable(
 #       "_triton_config_maxRegAutoWS",
-#       EnumFragment(choices=(160, 168, 176, 184, 188, 192, 196)),
+#       EnumFragment(choices=(160, 168, 176, 184, 192, 200)),
 #   )
 #
 # pyrefly: ignore [no-matching-overload]
