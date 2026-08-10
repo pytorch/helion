@@ -11,6 +11,7 @@ import torch
 
 from .accuracy import assert_close
 from .benchmarking import PerfStats
+from .benchmarking import _BenchmarkContractError
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
@@ -59,13 +60,13 @@ class BenchmarkJob:
                     )
                 if self.return_mode == "stats":
                     if not isinstance(result, PerfStats):
-                        raise TypeError(
+                        raise _BenchmarkContractError(
                             "return_mode='stats' expected do_bench to return a "
                             f"PerfStats, got {type(result).__name__}"
                         )
                     return result
                 if not isinstance(result, float):
-                    raise TypeError(
+                    raise _BenchmarkContractError(
                         "return_mode='median' expected do_bench to return a "
                         f"float, got {type(result).__name__}"
                     )

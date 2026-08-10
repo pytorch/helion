@@ -1,20 +1,14 @@
-"""Hardware and runtime metadata for autotuning datasets.
-
-Identity and version probes are strict. Numeric device properties are best-effort.
-"""
+"""Hardware and runtime metadata for autotuning datasets."""
 
 from __future__ import annotations
 
 import importlib.metadata
-import logging
 import platform
 from typing import TypedDict
 
 import torch
 
 from ..._hardware import get_hardware_info
-
-logger = logging.getLogger(__name__)
 
 
 class _HardwareInfoBase(TypedDict):
@@ -29,12 +23,15 @@ class HardwareInfoRecord(_HardwareInfoBase, total=False):
     """``total=False`` keeps ``device_props`` optional; a single-class ``NotRequired``
     does not, being inert under ``from __future__ import annotations``."""
 
-    # GPU-only; keys are the raw per-backend get_device_properties attr names.
-    device_props: dict[str, int | None]
+    # Accelerator-only; keys are raw per-backend get_device_properties attr names.
+    device_props: dict[str, int]
 
 
 def _cpu_name() -> str:
-    return platform.machine() or "cpu"
+    name = platform.machine()
+    if not name:
+        raise RuntimeError("platform.machine() returned an empty CPU name")
+    return name
 
 
 def _hardware_identity(
@@ -47,7 +44,6 @@ def _hardware_identity(
     return hw.device_kind, hw.hardware_name, hw.compute_capability
 
 
-# CUDA and ROCm both use the torch.cuda properties object.
 _CUDA_PROPS_ATTRS: tuple[str, ...] = (
     "multi_processor_count",
     "max_threads_per_multi_processor",
@@ -59,9 +55,19 @@ _CUDA_PROPS_ATTRS: tuple[str, ...] = (
     "total_memory",
     "L2_cache_size",
 )
+_ROCM_PROPS_ATTRS: tuple[str, ...] = (
+    "multi_processor_count",
+    "max_threads_per_multi_processor",
+    "max_threads_per_block",
+    "warp_size",
+    "shared_memory_per_block",
+    "regs_per_multiprocessor",
+    "total_memory",
+    "L2_cache_size",
+)
 _DEVICE_PROPS_ATTRS: dict[str, tuple[str, ...]] = {
     "cuda": _CUDA_PROPS_ATTRS,
-    "rocm": _CUDA_PROPS_ATTRS,
+    "rocm": _ROCM_PROPS_ATTRS,
     "xpu": (
         "max_compute_units",
         "max_work_group_size",
@@ -73,6 +79,7 @@ _DEVICE_PROPS_ATTRS: dict[str, tuple[str, ...]] = {
 _GPU_BACKENDS: frozenset[str] = frozenset(_DEVICE_PROPS_ATTRS)
 
 _BACKEND_PACKAGES: dict[str, tuple[str, ...]] = {
+    "cpu": (),
     "cuda": ("triton",),
     "rocm": ("triton",),
     "xpu": ("triton",),  # XPU codegen goes through triton
@@ -81,11 +88,14 @@ _BACKEND_PACKAGES: dict[str, tuple[str, ...]] = {
 
 
 def _package_version(name: str) -> str:
-    """Read distribution metadata, falling back for ROCm's Triton package."""
-    try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        return importlib.import_module(name).__version__
+    """Read required package distribution metadata."""
+    return importlib.metadata.version(name)
+
+
+def _toolkit_version(name: str, version: str | None) -> str:
+    if version is None:
+        raise RuntimeError(f"torch.version.{name} is unavailable")
+    return str(version)
 
 
 def _hardware_versions(device_kind: str) -> dict[str, str]:
@@ -93,39 +103,33 @@ def _hardware_versions(device_kind: str) -> dict[str, str]:
         "torch": torch.__version__,
         "helion": importlib.metadata.version("helion"),
     }
-    if device_kind in _GPU_BACKENDS:
-        toolkit_key = "hip" if device_kind == "rocm" else device_kind
-        toolkit = getattr(torch.version, toolkit_key)
-        if toolkit is None:
-            raise RuntimeError(f"torch.version.{toolkit_key} is unavailable")
-        versions[toolkit_key] = str(toolkit)
-    for name in _BACKEND_PACKAGES.get(device_kind, ()):
-        versions[name] = _package_version(name)
+    if device_kind == "cuda":
+        versions["cuda"] = _toolkit_version("cuda", torch.version.cuda)
+    elif device_kind == "rocm":
+        versions["hip"] = _toolkit_version("hip", torch.version.hip)
+    elif device_kind == "xpu":
+        versions["xpu"] = _toolkit_version("xpu", torch.version.xpu)
+    for name in _BACKEND_PACKAGES[device_kind]:
+        if (device_kind, name) == ("rocm", "triton"):
+            try:
+                versions[name] = _package_version(name)
+            except importlib.metadata.PackageNotFoundError:
+                versions[name] = importlib.import_module(name).__version__
+        else:
+            versions[name] = _package_version(name)
     return versions
 
 
-def _device_props(
-    device: torch.device, device_kind: str
-) -> dict[str, int | None] | None:
-    """Return backend-native numeric properties, using ``None`` when unavailable."""
-    attrs = _DEVICE_PROPS_ATTRS.get(device_kind)
-    if attrs is None:
+def _device_props(device: torch.device, device_kind: str) -> dict[str, int] | None:
+    """Return required backend-native numeric properties for accelerators."""
+    if device_kind in ("cpu", "tpu"):
         return None
-    props: object | None = None
-    try:
-        if device_kind in ("cuda", "rocm") and torch.cuda.is_available():
-            dev = device if device.type == "cuda" else torch.device("cuda:0")
-            props = torch.cuda.get_device_properties(dev)
-        elif (
-            device_kind == "xpu"
-            and getattr(torch, "xpu", None) is not None
-            and torch.xpu.is_available()
-        ):
-            dev = device if device.type == "xpu" else torch.device("xpu:0")
-            props = torch.xpu.get_device_properties(dev)
-    except Exception:
-        logger.debug("device property probe failed", exc_info=True)
-    return {name: getattr(props, name, None) for name in attrs}
+    attrs = _DEVICE_PROPS_ATTRS[device_kind]
+    if device_kind in ("cuda", "rocm"):
+        props = torch.cuda.get_device_properties(device)
+    else:
+        props = torch.xpu.get_device_properties(device)
+    return {name: getattr(props, name) for name in attrs}
 
 
 def collect_hardware_info(device: torch.device) -> HardwareInfoRecord:

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib.metadata
 import json
 import os
 from pathlib import Path
 import random
 import tempfile
-from types import ModuleType
 from typing import TYPE_CHECKING
 from typing import cast
 import unittest
@@ -37,8 +37,6 @@ from helion.autotuner.metrics import KernelMetadata
 import helion.language as hl
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from helion._compiler.device_ir import DeviceIR
     from helion.autotuner.logger import ConfigEntry
 
@@ -73,6 +71,24 @@ _HARDWARE_INFO_REQUIRED_KEYS = set(HardwareInfoRecord.__required_keys__)
 
 # Mirrors the extractor gate: missing networkx should degrade to None, not fail E2E.
 _HAS_NETWORKX = _has_networkx_node_link()
+
+_PERF_STATS_KEYS = {"min", "median", "mean", "p90", "std", "n_samples"}
+_PERF_STATS = PerfStats(
+    min=1.0,
+    median=1.1,
+    mean=1.2,
+    p90=1.3,
+    std=0.1,
+    n_samples=50,
+)
+_PERF_STATS_2 = PerfStats(
+    min=2.0,
+    median=2.1,
+    mean=2.2,
+    p90=2.3,
+    std=0.2,
+    n_samples=60,
+)
 
 
 @helion.kernel(config=helion.Config(block_sizes=[16]))
@@ -203,8 +219,9 @@ class TestCollectHardwareInfo(TestCase):
             self.assertEqual(
                 set(info["device_props"]), set(_DEVICE_PROPS_ATTRS[info["device_kind"]])
             )
-            sm_attr = _DEVICE_PROPS_ATTRS[info["device_kind"]][0]
-            self.assertIsNotNone(info["device_props"][sm_attr])
+            self.assertTrue(
+                all(isinstance(value, int) for value in info["device_props"].values())
+            )
             self.assertIsNotNone(info["versions"]["triton"])
 
     def test_cpu_device_not_misreported(self) -> None:
@@ -214,24 +231,17 @@ class TestCollectHardwareInfo(TestCase):
         self.assertNotIn("device_props", info)
         self.assertEqual(set(info["versions"]), {"torch", "helion"})
 
+    def test_rocm_omits_cuda_only_optin_shared_memory(self) -> None:
+        self.assertIn("shared_memory_per_block_optin", _DEVICE_PROPS_ATTRS["cuda"])
+        self.assertNotIn("shared_memory_per_block_optin", _DEVICE_PROPS_ATTRS["rocm"])
+
     def test_device_is_required(self) -> None:
         with self.assertRaisesRegex(ValueError, "device"):
             collect_hardware_info(cast("torch.device", None))
 
-    def test_missing_module_version_raises(self) -> None:
-        module_without_version = ModuleType("triton")
-        with (
-            patch(
-                "helion.autotuner._metadata.hardware.importlib.metadata.version",
-                side_effect=importlib.metadata.PackageNotFoundError,
-            ),
-            patch(
-                "helion.autotuner._metadata.hardware.importlib.import_module",
-                return_value=module_without_version,
-            ),
-            self.assertRaises(AttributeError),
-        ):
-            _package_version("triton")
+    def test_missing_distribution_metadata_raises(self) -> None:
+        with self.assertRaises(importlib.metadata.PackageNotFoundError):
+            _package_version("sys")
 
 
 class TestKernelMetadataHardwareInfo(TestCase):
@@ -247,13 +257,19 @@ class TestKernelMetadataHardwareInfo(TestCase):
 class TestAutotuneLogSink(TestCase):
     def test_dataset_logged_when_enabled(self) -> None:
         config = helion.Config(block_sizes=[32], num_warps=4)
+        source = "# generated source\n"
         with tempfile.TemporaryDirectory() as tmp:
+            source_path = Path(tmp) / "compiled_kernel.py"
+            source_path.write_text(source, encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(source_path)
             with AutotuneLogSink(
                 f"{tmp}/run", _metadata(), collect_dataset=True
             ) as sink:
                 sink.start_run()
                 config_id = sink.register_config(config)
                 assert config_id is not None
+                sink.capture_generated_code(config_id, kernel, config, (_PERF_STATS,))
                 sink.record(
                     AutotuneLogEntry(
                         generation=5,
@@ -287,7 +303,11 @@ class TestAutotuneLogSink(TestCase):
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
         entry = sidecar["configs"][cell("config_id")]
-        self.assertIsNone(entry["generated_code"])
+        self.assertEqual(entry["generated_code"], source)
+        self.assertEqual(
+            entry["source_hash"], hashlib.sha256(source.encode("utf-8")).hexdigest()
+        )
+        self.assertEqual(entry["perf_stats"], [_PERF_STATS.to_dict()])
         cfg = helion.Config.from_json(json.dumps(entry["config"]))
         self.assertEqual(cfg.block_sizes, [32])
         self.assertEqual(cell("run_id"), sidecar["run_id"])
@@ -300,8 +320,6 @@ class TestAutotuneLogSink(TestCase):
         collect_dataset: bool = True,
         times: int = 1,
     ) -> dict[str, object] | None:
-        """Run one config through a sink (register + ``capture_generated_code`` x
-        ``times``) and return its written ``configs`` entry (``None`` if not collected)."""
         with tempfile.TemporaryDirectory() as tmp:
             with AutotuneLogSink(
                 f"{tmp}/run", _metadata(), collect_dataset=collect_dataset
@@ -310,7 +328,9 @@ class TestAutotuneLogSink(TestCase):
                 config_id = sink.register_config(config)
                 assert config_id is not None
                 for _ in range(times):
-                    sink.capture_generated_code(config_id, kernel, config)
+                    sink.capture_generated_code(
+                        config_id, kernel, config, (_PERF_STATS,)
+                    )
                 sink.end_run()
             configs = json.loads(
                 sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
@@ -318,7 +338,6 @@ class TestAutotuneLogSink(TestCase):
         return configs.get(config_id)
 
     def test_capture_generated_code_attaches_source_read_once(self) -> None:
-        """Source attaches to the config entry; the file is read at most once."""
         config = helion.Config(block_sizes=[32], num_warps=4)
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "compiled_kernel.py"
@@ -333,26 +352,35 @@ class TestAutotuneLogSink(TestCase):
         )
         kernel.get_cached_path.assert_called_once()
 
-    def test_capture_generated_code_none_when_no_cached_path(self) -> None:
-        """generated_code stays None when the config has no cached artifact path."""
+    def test_uncaptured_config_is_omitted(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                sink.end_run()
+            configs = json.loads(sink.meta_path.read_text())["configs"]
+        self.assertNotIn(config_id, configs)
+
+    def test_capture_generated_code_raises_when_cached_path_missing(self) -> None:
         config = helion.Config(block_sizes=[32])
         kernel = Mock()
         kernel.get_cached_path.return_value = None
-        entry = self._capture_entry(kernel, config)
-        assert entry is not None
-        self.assertIsNone(entry["generated_code"])
-
-    def test_capture_generated_code_raises_when_artifact_unreadable(self) -> None:
-        """A read failure of a known artifact surfaces (beta feature fails loudly)."""
-        config = helion.Config(block_sizes=[32])
-        kernel = Mock()
-        kernel.get_cached_path.return_value = "/nonexistent/dir/compiled_kernel.py"
-        with self.assertRaises(OSError):
+        with self.assertRaisesRegex(RuntimeError, "generated artifact"):
             self._capture_entry(kernel, config)
 
+    def test_capture_generated_code_raises_when_artifact_unreadable(self) -> None:
+        config = helion.Config(block_sizes=[32])
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(Path(tmp) / "missing.py")
+            with self.assertRaises(OSError):
+                self._capture_entry(kernel, config)
+
     def test_capture_generated_code_noop_when_not_collecting(self) -> None:
-        """With collection off there is no configs entry, so the file is never read
-        (no .meta.jsonl is written either)."""
         config = helion.Config(block_sizes=[32])
         kernel = Mock()
         with (
@@ -362,7 +390,7 @@ class TestAutotuneLogSink(TestCase):
             sink.start_run()
             config_id = sink.register_config(config)
             assert config_id is not None
-            sink.capture_generated_code(config_id, kernel, config)
+            sink.capture_generated_code(config_id, kernel, config, (_PERF_STATS,))
             sink.end_run()
         kernel.get_cached_path.assert_not_called()
 
@@ -385,105 +413,46 @@ class TestAutotuneLogSink(TestCase):
             self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
-_PERF_STATS_KEYS = {"min", "median", "mean", "p90", "std", "n_samples"}
-_PERF_STATS = PerfStats(
-    min=1.0,
-    median=1.1,
-    mean=1.2,
-    p90=1.3,
-    std=0.1,
-    n_samples=50,
-)
-
-
 class TestPerfStats(TestCase):
-    """perf_stats rides in the meta configs map; last *successful* benchmark wins."""
-
-    def test_source_hash_positional_compatibility(self) -> None:
-        config = helion.Config(block_sizes=[32], num_warps=4)
-        entry = AutotuneLogEntry(0, "ok", 1.1, 0.5, "config-id", config, "source-abc")
-
-        self.assertEqual(entry.source_hash, "source-abc")
-        self.assertIsNone(entry.perf_stats)
-
-    def _record(
-        self,
-        entries: Callable[[str, helion.Config], list[AutotuneLogEntry]],
-    ) -> tuple[str, dict[str, object]]:
+    def _capture(
+        self, measurements: tuple[tuple[PerfStats, ...], ...]
+    ) -> dict[str, object]:
         config = helion.Config(block_sizes=[32], num_warps=4)
         with tempfile.TemporaryDirectory() as tmp:
+            source_path = Path(tmp) / "compiled_kernel.py"
+            source_path.write_text("source", encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(source_path)
             with AutotuneLogSink(
                 f"{tmp}/run", _metadata(), collect_dataset=True
             ) as sink:
                 sink.start_run()
                 config_id = sink.register_config(config)
                 assert config_id is not None
-                for entry in entries(config_id, config):
-                    sink.record(entry)
+                for perf_stats in measurements:
+                    sink.capture_generated_code(config_id, kernel, config, perf_stats)
                 sink.end_run()
             record = json.loads(
                 sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
             )
-        return config_id, record["configs"][config_id]
+        return record["configs"][config_id]
 
-    def test_perf_stats_recorded_per_config(self) -> None:
-        _cid, entry = self._record(
-            lambda cid, cfg: [
-                AutotuneLogEntry(
-                    generation=0,
-                    status="ok",
-                    perf_ms=1.1,
-                    compile_time=0.5,
-                    config_id=cid,
-                    config=cfg,
-                    perf_stats=_PERF_STATS,
-                )
-            ]
-        )
-        self.assertEqual(set(entry["perf_stats"]), _PERF_STATS_KEYS)
-        self.assertEqual(entry["perf_stats"], _PERF_STATS.to_dict())
+    def test_perf_stats_recorded_for_each_shape(self) -> None:
+        entry = self._capture(((_PERF_STATS, _PERF_STATS_2),))
 
-    def test_started_only_config_has_null_perf_stats(self) -> None:
-        _cid, entry = self._record(
-            lambda cid, cfg: [
-                AutotuneLogEntry(
-                    generation=0,
-                    status="started",
-                    perf_ms=None,
-                    compile_time=None,
-                    config_id=cid,
-                    config=cfg,
-                )
-            ]
+        self.assertEqual(
+            entry["perf_stats"],
+            [_PERF_STATS.to_dict(), _PERF_STATS_2.to_dict()],
         )
-        self.assertEqual(set(entry["perf_stats"]), _PERF_STATS_KEYS)
-        self.assertEqual(entry["perf_stats"]["n_samples"], 0)
-        self.assertIsNone(entry["perf_stats"]["median"])
 
-    def test_failed_rebenchmark_keeps_good_perf_stats(self) -> None:
-        _cid, entry = self._record(
-            lambda cid, cfg: [
-                AutotuneLogEntry(
-                    generation=0,
-                    status="ok",
-                    perf_ms=1.1,
-                    compile_time=0.5,
-                    config_id=cid,
-                    config=cfg,
-                    perf_stats=_PERF_STATS,
-                ),
-                AutotuneLogEntry(
-                    generation=1,
-                    status="error",
-                    perf_ms=None,
-                    compile_time=None,
-                    config_id=cid,
-                    config=cfg,
-                    perf_stats=None,
-                ),
-            ]
-        )
-        self.assertEqual(entry["perf_stats"], _PERF_STATS.to_dict())
+    def test_last_successful_perf_stats_win(self) -> None:
+        entry = self._capture(((_PERF_STATS,), (_PERF_STATS_2,)))
+
+        self.assertEqual(entry["perf_stats"], [_PERF_STATS_2.to_dict()])
+
+    def test_empty_perf_stats_raise(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "performance statistics"):
+            self._capture(((),))
 
 
 @onlyBackends(["triton"])
@@ -551,13 +520,21 @@ class TestAutotuneDatasetE2E(TestCase):
                 self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
             record_configs = cast("dict[str, ConfigEntry]", record["configs"])
-            # Each configs entry nests the tested config and its per-config generated
-            # source; generated_code is null when the config has no cached artifact
-            # path (a config that failed to compile is still registered).
             for cfg_entry in record_configs.values():
-                self.assertIn("config", cfg_entry)
-                self.assertIsInstance(cfg_entry["generated_code"], (str, type(None)))
-                self.assertEqual(set(cfg_entry["perf_stats"]), _PERF_STATS_KEYS)
+                self.assertEqual(
+                    set(cfg_entry),
+                    {"config", "generated_code", "source_hash", "perf_stats"},
+                )
+                source = cfg_entry["generated_code"]
+                self.assertTrue(source)
+                self.assertEqual(
+                    cfg_entry["source_hash"],
+                    hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                )
+                self.assertTrue(cfg_entry["perf_stats"])
+                for stats in cfg_entry["perf_stats"]:
+                    self.assertEqual(set(stats), _PERF_STATS_KEYS)
+                    self.assertGreaterEqual(stats["n_samples"], 1)
             configs_by_id.update(record_configs)
             configs_by_run_id.setdefault(record["run_id"], {}).update(record_configs)
             run_ids.add(record["run_id"])
@@ -570,9 +547,6 @@ class TestAutotuneDatasetE2E(TestCase):
             else:
                 self.assertIsNone(record["ir_graph"])
         self.assertGreater(len(configs_by_id), 0)
-        # generated_code is null only when a config has no cached path, but a real
-        # Triton search compiles at least one config, so at least one is captured.
-        self.assertTrue(any(e["generated_code"] for e in configs_by_id.values()))
 
         rows = list(csv.reader(csv_path.read_text().splitlines()))
         header, data = rows[0], rows[1:]
@@ -602,9 +576,9 @@ class TestAutotuneDatasetE2E(TestCase):
             row_run_id, row_cfg_id = row[run_idx], row[cfg_idx]
             self.assertIn(row_run_id, configs_by_run_id)
             self.assertIn(row_cfg_id, configs_by_run_id[row_run_id])
-            stats = configs_by_run_id[row_run_id][row_cfg_id]["perf_stats"]
-            self.assertGreaterEqual(stats["n_samples"], 1)
-            self.assertIsNotNone(stats["median"])
+            stats_by_shape = configs_by_run_id[row_run_id][row_cfg_id]["perf_stats"]
+            self.assertEqual(len(stats_by_shape), 1)
+            self.assertGreaterEqual(stats_by_shape[0]["n_samples"], 1)
 
 
 class TestIrGraphDegradation(TestCase):

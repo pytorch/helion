@@ -31,7 +31,6 @@ from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
 from torch.cuda import OutOfMemoryError as CudaOOMError
 
-from .benchmarking import PerfStats
 from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
@@ -40,6 +39,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .benchmarking import PerfStats
     from .metrics import KernelMetadata
 
 else:
@@ -170,20 +170,22 @@ class AutotuningLogger:
         self._log_sink.record(entry)
 
     def register_config(self, config: Config) -> str | None:
-        """Return the content-addressed ``config_id`` (registering it on the sink
-        for the ``.meta.jsonl`` record), or ``None`` when no sink is active."""
+        """Return the content-addressed ID when a sink is active."""
 
         if self._log_sink is None:
             return None
         return self._log_sink.register_config(config)
 
     def capture_generated_code(
-        self, config_id: str, kernel: _AutotunableKernel, config: Config
+        self,
+        config_id: str,
+        kernel: _AutotunableKernel,
+        config: Config,
+        perf_stats: tuple[PerfStats, ...],
     ) -> None:
-        """Capture the config's generated source onto the sink for the
-        ``.meta.jsonl`` record; no-op when no sink is active."""
+        """Capture generated source when a sink is active."""
         if self._log_sink is not None:
-            self._log_sink.capture_generated_code(config_id, kernel, config)
+            self._log_sink.capture_generated_code(config_id, kernel, config, perf_stats)
 
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
         self._log_sink = sink
@@ -311,15 +313,13 @@ class AutotuneLogEntry(NamedTuple):
     config_id: str
     config: Config
     source_hash: str | None = None
-    perf_stats: PerfStats | None = None
 
 
 class ConfigEntry(TypedDict):
-    """One per-config entry in the dataset's ``configs`` map."""
-
     config: dict[str, object]
-    generated_code: str | None
-    perf_stats: dict[str, object]
+    generated_code: str
+    source_hash: str
+    perf_stats: list[dict[str, float | int]]
 
 
 class AutotuneLogSink:
@@ -349,8 +349,6 @@ class AutotuneLogSink:
         self._source_csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
         self._run_start_time: float | None = None
-        # Per-config dataset entries, flushed to .meta.jsonl at end_run. Unbounded
-        # by design (the R&D dataset keeps every config's full source) -- never cap.
         self._configs: dict[str, ConfigEntry] = {}
 
     def __enter__(self) -> Self:
@@ -416,38 +414,38 @@ class AutotuneLogSink:
         self._configs = {}
 
     def register_config(self, config: Config) -> str | None:
-        """Return a stable ``config_id`` for ``config``: ``sha256`` of the
-        canonical config JSON (sorted keys, compact), 16 hex chars -- the same
-        config always maps to the same id (the CSV<->record join key). Returns
-        ``None`` when the sink is not open. When collecting the dataset, the config
-        is stored under its id for the .meta.jsonl record (identical ids collapse).
-        """
+        """Return the config's stable join key when the sink is open."""
         if self._csv_writer is None:
             return None
         from .search_space_logger import canonical_config_id
 
-        config_id = canonical_config_id(config)
-        if self._collect_dataset and config_id not in self._configs:
-            self._configs[config_id] = {
-                "config": config.config,
-                "generated_code": None,
-                "perf_stats": PerfStats().to_dict(),
-            }
-        return config_id
+        return canonical_config_id(config)
 
     def capture_generated_code(
-        self, config_id: str, kernel: _AutotunableKernel, config: Config
+        self,
+        config_id: str,
+        kernel: _AutotunableKernel,
+        config: Config,
+        perf_stats: tuple[PerfStats, ...],
     ) -> None:
-        """Attach the config's already-compiled source from disk (no re-codegen)."""
-        entry = self._configs.get(config_id)
-        if entry is None or entry.get("generated_code") is not None:
+        if not self._collect_dataset:
+            return
+        if not perf_stats:
+            raise RuntimeError(f"Missing performance statistics for config {config_id}")
+        serialized_stats = [stats.to_dict() for stats in perf_stats]
+        if config_id in self._configs:
+            self._configs[config_id]["perf_stats"] = serialized_stats
             return
         path = kernel.get_cached_path(config)
         if path is None:
-            return
-        # generated_code is null only when no cached path exists. A read failure
-        # of a known artifact surfaces (probe/IO errors are not swallowed here).
-        entry["generated_code"] = Path(path).read_text(encoding="utf-8")
+            raise RuntimeError(f"Missing generated artifact for config {config_id}")
+        generated_code = Path(path).read_text(encoding="utf-8")
+        self._configs[config_id] = {
+            "config": config.config,
+            "generated_code": generated_code,
+            "source_hash": hashlib.sha256(generated_code.encode("utf-8")).hexdigest(),
+            "perf_stats": serialized_stats,
+        }
 
     def record(self, entry: AutotuneLogEntry) -> None:
         if self._csv_writer is None:
@@ -478,14 +476,6 @@ class AutotuneLogSink:
         )
         if self._csv_file is not None:
             self._csv_file.flush()
-        # Only overwrite with real stats: a later failed re-benchmark (perf_stats
-        # None) must not clobber a config's good stats with nulls.
-        if (
-            self._collect_dataset
-            and entry.perf_stats is not None
-            and entry.config_id in self._configs
-        ):
-            self._configs[entry.config_id]["perf_stats"] = entry.perf_stats.to_dict()
         if entry.source_hash is not None:
             self._record_source_hash(entry, run_id, timestamp_field)
 

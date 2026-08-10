@@ -60,36 +60,27 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
 
 @dataclasses.dataclass(frozen=True)
 class PerfStats:
-    """Per-config latency statistics for the autotune dataset.
+    min: float
+    median: float
+    mean: float
+    p90: float
+    std: float
+    n_samples: int
 
-    A successful benchmark yields all-real fields (``n_samples >= 1``). The
-    default-constructed ``PerfStats()`` is the null sentinel for a config that
-    was registered but never produced a good measurement (all ``None``,
-    ``n_samples == 0``).
-    """
-
-    min: float | None = None
-    median: float | None = None
-    mean: float | None = None
-    p90: float | None = None
-    std: float | None = None
-    n_samples: int = 0
-
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self) -> dict[str, float | int]:
         return dataclasses.asdict(self)
 
 
-# Return type of the benchmark helpers: a scalar, the multi-quantile tuple, or the
-# full PerfStats record (``return_mode="stats"``).
 BenchTimes = float | tuple[float, ...] | PerfStats
 
 
+class _BenchmarkContractError(TypeError):
+    pass
+
+
 def _compute_perf_stats(times: list[float]) -> PerfStats:
-    # Callers (do_bench / do_bench_generic) always build ``times`` from an
-    # ``n_repeat = max(1, ...)`` loop, so an empty list is a programming error,
-    # not a "no samples" state -- that state is ``PerfStats()`` at the
-    # sink boundary.
-    assert times, "_compute_perf_stats requires at least one timing sample"
+    if not times:
+        raise ValueError("performance statistics require at least one timing sample")
     n = len(times)
     arr = np.asarray(times, dtype=float)
     return PerfStats(
