@@ -2914,6 +2914,13 @@ class WalkDeviceAST(NodeVisitor):
             )
             raise exc.DeviceTensorSubscriptAssignmentNotAllowed(var_name)
         val = self.visit(node.value)
+        if (
+            isinstance(rhs_type, TensorType)
+            and rhs_type.origin.is_host()
+            and not isinstance(node.value, ast.Subscript)
+        ):
+            full_slices = [slice(None)] * rhs_type.fake_value.ndim
+            val = hl.load(val, full_slices)
         self._assign_subscript(target, val)
 
     def _assign_subscript(self, target: ast.Subscript, val: object) -> None:

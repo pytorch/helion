@@ -761,6 +761,7 @@ class TypePropagation(ast.NodeVisitor):
         # ellipsis expansion not yet supported for StackTensorType.
         if isinstance(value_type, TensorType):
             self._expand_ellipsis_in_subscript(node, value_type.fake_value.ndim)
+            self._pad_trailing_dims(node, value_type.fake_value.ndim)
         slice_type = self.visit(node.slice)
         return value_type.propagate_getitem(slice_type, self.origin())
 
@@ -806,6 +807,29 @@ class TypePropagation(ast.NodeVisitor):
             for _ in range(n_expand)
         ]
         sl.elts[idx : idx + 1] = slices
+
+    def _pad_trailing_dims(self, node: ast.Subscript, ndim: int) -> None:
+        sl = node.slice
+        if isinstance(sl, ast.Tuple):
+            consumed = sum(
+                1
+                for elt in sl.elts
+                if not (isinstance(elt, ast.Constant) and elt.value is None)
+            )
+            missing = ndim - consumed
+            if missing > 0:
+                sl.elts.extend(
+                    create(ast.Slice, lower=None, upper=None, step=None)
+                    for _ in range(missing)
+                )
+        elif not isinstance(sl, ast.Slice):
+            missing = ndim - 1
+            if missing > 0:
+                elts = [sl] + [
+                    create(ast.Slice, lower=None, upper=None, step=None)
+                    for _ in range(missing)
+                ]
+                node.slice = create(ast.Tuple, elts=elts, ctx=ast.Load())
 
     def visit_Slice(self, node: ast.Slice) -> TypeInfo:
         lower = (
