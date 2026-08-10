@@ -9,6 +9,7 @@ import torch
 
 from helion import Config
 from helion._compiler.pallas.codegen import _loop_offset_alignment
+from helion._compiler.pallas.memory_access import MEMORY_ACCESS_META
 from helion._compiler.pallas.memory_access import MemoryAccessKind
 from helion._compiler.pallas.memory_access import build_memory_access
 from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
@@ -19,8 +20,11 @@ from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 from helion._compiler.pallas.tensorcore_plan import OneHotScatterPlan
 from helion._compiler.pallas.tensorcore_plan import select_tensorcore_plan
 from helion._compiler.pallas.tracing_ops import _annotate_provable_sublane_alignment
+from helion._compiler.pallas.tracing_ops import _descendant_memory_accesses
+from helion._compiler.pallas.tracing_ops import _graph_memory_accesses
 from helion._compiler.tile_strategy import LoopDimInfo
 from helion.language import memory_ops
+from helion.language._tracing_ops import _while_loop
 from helion.language.atomic_ops import atomic_add
 
 if TYPE_CHECKING:
@@ -124,6 +128,66 @@ def test_loop_offset_uses_only_proven_window_alignment() -> None:
         _annotate_provable_sublane_alignment(unaligned_state, block_id, "offset")
         == "offset"
     )
+
+
+def test_alignment_accesses_keep_repeated_tensor_uses() -> None:
+    graph = torch.fx.Graph()
+    source = torch.empty(64, 256)
+    source_node = _placeholder(graph, "source", source)
+    first_subscript = (slice(None), slice(0, 128))
+    second_subscript = (slice(None), slice(None))
+    first = graph.call_function(memory_ops.load, (source_node, first_subscript))
+    second = graph.call_function(memory_ops.load, (source_node, second_subscript))
+    first.meta[MEMORY_ACCESS_META] = build_memory_access(
+        first,
+        source,
+        list(first_subscript),
+        [TilePattern(0), ArbitrarySlicePattern(slice(0, 128))],
+    )
+    second.meta[MEMORY_ACCESS_META] = build_memory_access(
+        second,
+        source,
+        list(second_subscript),
+        [TilePattern(0), TilePattern(1)],
+    )
+
+    accesses = _graph_memory_accesses(SimpleNamespace(graph=graph))
+
+    assert len(accesses) == 2
+    assert accesses[0].tensor is source
+    assert accesses[1].tensor is source
+    assert accesses[0].patterns != accesses[1].patterns
+
+
+def test_alignment_accesses_follow_every_while_graph() -> None:
+    parent_graph = torch.fx.Graph()
+    parent_graph.call_function(_while_loop, (1, 2, [], 3))
+
+    children: dict[int, SimpleNamespace] = {}
+    expected = []
+    for graph_id in (1, 2, 3):
+        graph = torch.fx.Graph()
+        source = torch.empty(64, 128)
+        source_node = _placeholder(graph, f"source_{graph_id}", source)
+        subscript = (slice(None), slice(None))
+        load = graph.call_function(memory_ops.load, (source_node, subscript))
+        access = build_memory_access(
+            load,
+            source,
+            list(subscript),
+            [TilePattern(0), ArbitrarySlicePattern(slice(None))],
+        )
+        load.meta[MEMORY_ACCESS_META] = access
+        children[graph_id] = SimpleNamespace(graph=graph)
+        expected.append(access)
+
+    state = cast(
+        "CodegenState",
+        SimpleNamespace(get_graph=lambda graph_id: children[graph_id]),
+    )
+    accesses = _descendant_memory_accesses(SimpleNamespace(graph=parent_graph), state)
+
+    assert accesses == expected
 
 
 def test_tensorcore_plan_owns_indirect_fallbacks() -> None:

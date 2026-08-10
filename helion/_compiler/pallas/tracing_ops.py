@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import LoopDimInfo
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
+    from .memory_access import MemoryAccess
 
 
 @_decorators.codegen(_not, "pallas")
@@ -557,6 +558,7 @@ def _emit_resident_prep_refill_once(
 
 LoopTensor = tuple[torch.Tensor, torch.fx.Node, tuple[object, ...]]
 LoopTensors = Mapping[int, LoopTensor]
+LoopAccesses = list["MemoryAccess"]
 
 
 def _classify_loop_tensors(
@@ -608,6 +610,61 @@ def _classify_loop_tensors(
                     stored_tensors[key] = (fake, tensor_node, sub_vals)
 
     return MappingProxyType(loaded_tensors), MappingProxyType(stored_tensors)
+
+
+def _graph_memory_accesses(graph_info: object) -> LoopAccesses:
+    """Every analyzed memory access directly in ``graph_info``."""
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import MemoryAccess
+
+    return [
+        access
+        for node in graph_info.graph.nodes  # type: ignore[union-attr]
+        if isinstance((access := node.meta.get(MEMORY_ACCESS_META)), MemoryAccess)
+    ]
+
+
+def _descendant_memory_accesses(
+    graph_info: object,
+    state: CodegenState,
+) -> LoopAccesses:
+    """Every memory access in control-flow graphs below ``graph_info``.
+
+    ``_classify_loop_tensors`` walks one graph and stops at nested control flow,
+    so a tile whose tensors are all sliced one graph deeper looks like it touches
+    nothing at all.  Alignment is not a per-graph question: a descendant slice
+    of an outer tile still lands wherever the outer loop's window put it.
+
+    DMA and BlockSpec plumbing must stay strictly per-loop, which is why this is
+    a separate walk rather than an option on ``_classify_loop_tensors``.
+    """
+    from ...language._tracing_ops import _while_loop
+    from ...language._tracing_ops import is_for_loop_target
+
+    accesses: LoopAccesses = []
+    seen: set[int] = set()
+    pending: list[object] = [graph_info]
+    while pending:
+        info = pending.pop()
+        for node in info.graph.nodes:  # type: ignore[union-attr]
+            if node.op != "call_function":
+                continue
+            if is_for_loop_target(node.target):
+                child_ids = node.args[:1]
+            elif node.target is _if:
+                child_ids = node.args[1:3]
+            elif node.target is _while_loop:
+                child_ids = (node.args[0], node.args[1], node.args[3])
+            else:
+                continue
+            for graph_id in child_ids:
+                if not isinstance(graph_id, int) or graph_id in seen:
+                    continue
+                seen.add(graph_id)
+                child = state.get_graph(graph_id)
+                accesses.extend(_graph_memory_accesses(child))
+                pending.append(child)
+    return accesses
 
 
 def _tensor_dim_subscripts(subscript_meta: Sequence[object]) -> list[object]:
@@ -2149,8 +2206,7 @@ def _aligned_dim(
     state: CodegenState,
     env: CompileEnvironment,
     block_ids: list[int],
-    loaded_tensors: LoopTensors,
-    stored_tensors: LoopTensors,
+    accesses: LoopAccesses,
 ) -> None:
     """Record jagged row tiles that read an aligned-enclosing window.
 
@@ -2161,9 +2217,14 @@ def _aligned_dim(
     A DIRECT row that does not carry is omitted: it reads at the exact offset.  S
     is the largest float-tensor sublane (bf16 forces 16); tiles that carry are
     also registered for the store fold/save.
+
+    ``accesses`` spans this loop and every loop nested inside it: a tile can
+    slice nothing itself and still owe its window an alignment or contain a
+    write, because the nested loop uses the offset this loop selected.
     """
     from .backend import SliceAddressing
     from .backend import _slice_addressing
+    from .memory_access import MemoryAccessKind
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import is_row_map_axis
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
@@ -2178,35 +2239,43 @@ def _aligned_dim(
 
     # Strictest addressing each row needs over the tensors it slices.
     addressing: dict[int, SliceAddressing] = {}
-    stored_bids: set[int] = set()
-    for tensors, is_store in (
-        (loaded_tensors, False),
-        (stored_tensors, True),
-    ):
-        for fake, _node, sub_meta in tensors.values():
-            dim_to_bid = _get_dim_block_ids(sub_meta, env)
-            if is_store:
-                stored_bids.update(dim_to_bid.values())
-            if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
-                continue
-            lane_block = _lane_tile(state, fake, dim_to_bid)
-            for dim, dim_bid in dim_to_bid.items():
-                access_addressing = _slice_addressing(fake, dim, lane_block)
-                if access_addressing is SliceAddressing.ALIGNED:
-                    addressing[dim_bid] = SliceAddressing.ALIGNED
-                else:
-                    addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
+    written_bids: set[int] = set()
+    for access in accesses:
+        fake = access.tensor
+        dim_to_bid = {
+            dim: bid
+            for dim, pattern in enumerate(access.patterns)
+            if isinstance((bid := getattr(pattern, "block_id", None)), int)
+        }
+        if access.kind is not MemoryAccessKind.LOAD:
+            written_bids.update(dim_to_bid.values())
+        if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+            continue
+        lane_block = _lane_tile(state, fake, dim_to_bid)
+        for dim, dim_bid in dim_to_bid.items():
+            access_addressing = _slice_addressing(fake, dim, lane_block)
+            if access_addressing is SliceAddressing.ALIGNED:
+                addressing[dim_bid] = SliceAddressing.ALIGNED
+            else:
+                addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
     sublane = max(sublanes)
     for i, bid in enumerate(block_ids):
         if not _loop_dim_is_dynamic(state, i):
             continue  # static begin or end: not a fully-dynamic jagged tile
         carry = needs_ordered_carry(state, bid)
-        direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
-        if direct and not carry:
-            continue  # reads any offset; a plain clamped slice suffices
         if not carry:
-            if bid in stored_bids:
+            addr = addressing.get(bid)
+            if addr is None or addr is SliceAddressing.DIRECT:
+                # Nothing in or below this loop slices the dim (no window to
+                # align), or it reads at any offset and a clamped slice suffices.
+                continue
+            if bid in written_bids:
+                # Some access rounded the window begin down, so every store on
+                # this dim would write the head rows [aligned_begin, begin),
+                # regardless of whether the store itself is DIRECT or ALIGNED.
+                # TODO(cota): Support a separate DIRECT store window that starts
+                # at begin, crops the value's aligned head, and clamps at end.
                 raise NotImplementedError(
                     "Pallas: a jagged row tile whose slices must be "
                     "sublane-aligned and that is written through its row dim is "
@@ -2265,7 +2334,15 @@ def _plan_inner_loop_window(
     rejects ordered carry explicitly rather than assembling a partial window.
     """
     loaded, stored = _classify_loop_tensors(graph_info, state)
-    _aligned_dim(state, env, block_ids, loaded, stored)
+    _aligned_dim(
+        state,
+        env,
+        block_ids,
+        [
+            *_graph_memory_accesses(graph_info),
+            *_descendant_memory_accesses(graph_info, state),
+        ],
+    )
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
     (
         begin_exprs,
