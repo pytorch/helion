@@ -186,26 +186,19 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
 
 @onlyBackends(["pallas"])
 class TestRemoteCopyJaxRuntime(TestCase):
-    @skipIfPallasInterpret("remote copies require physical TPU devices")
-    def test_cyclic_remote_copy(self) -> None:
+    @staticmethod
+    def _run_cyclic_copy(mesh, mesh_axis, kernel_fn) -> None:
         import jax
         import jax.numpy as jnp
 
-        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
-        if len(devices) < 2:
-            self.skipTest("requires at least two TPU devices")
-
-        devices = devices[:2]
-        world_size = len(devices)
-        mesh = jax.make_mesh((world_size,), ("peer",), devices=devices)
+        world_size = mesh.devices.size
         partition = jax.sharding.PartitionSpec
         input_specs = (
-            partition("peer", None, None),
-            partition("peer", None, None),
-            partition("peer", None),
-            partition("peer", None),
+            partition(mesh_axis, None, None),
+            partition(mesh_axis, None, None),
+            partition(mesh_axis, None),
+            partition(mesh_axis, None),
         )
-
         src = jnp.stack(
             [jnp.asarray(_rank_values(rank))[None, :] for rank in range(world_size)]
         )
@@ -216,13 +209,12 @@ class TestRemoteCopyJaxRuntime(TestCase):
             jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
             for value, spec in zip((src, dst, peers, slots), input_specs, strict=True)
         )
-
         copy = jax.jit(
             jax.shard_map(
-                _pallas_cyclic_remote_copy.jax_fn,
+                kernel_fn,
                 mesh=mesh,
                 in_specs=input_specs,
-                out_specs=partition("peer", None, None),
+                out_specs=partition(mesh_axis, None, None),
                 check_vma=False,
             )
         )
@@ -232,3 +224,62 @@ class TestRemoteCopyJaxRuntime(TestCase):
             np.testing.assert_array_equal(
                 np.asarray(result)[:, _REMOTE_SLOT], expected[:, _REMOTE_SLOT]
             )
+
+    @skipIfPallasInterpret("remote copies require physical TPU devices")
+    def test_cyclic_remote_copy(self) -> None:
+        import jax
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+        mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
+        self._run_cyclic_copy(mesh, "peer", _pallas_cyclic_remote_copy.jax_fn)
+
+    @skipIfPallasInterpret("remote copies require physical TPU devices")
+    def test_multiaxis_flat_logical_peers(self) -> None:
+        import jax
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 8:
+            self.skipTest("requires at least eight TPU devices")
+        mesh = jax.make_mesh((2, 4), ("data", "peer"), devices=devices[:8])
+        self._run_cyclic_copy(
+            mesh,
+            ("data", "peer"),
+            _pallas_cyclic_remote_copy.jax_fn,
+        )
+
+    @skipIfPallasInterpret("remote copies require physical TPU devices")
+    def test_precompiled_standalone(self) -> None:
+        import sys
+        import types
+
+        args = (
+            torch.zeros(1, 1, _WIDTH),
+            torch.zeros(1, 2, _WIDTH),
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(1, 1, dtype=torch.int32),
+        )
+        source = _pallas_cyclic_remote_copy.bind(args).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+        name = "precompiled_remote_copy_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(source, name, "exec"), module.__dict__)
+
+            import jax
+
+            devices = [
+                device for device in jax.local_devices() if device.platform == "tpu"
+            ]
+            if len(devices) < 2:
+                self.skipTest("requires at least two TPU devices")
+            mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
+            self._run_cyclic_copy(mesh, "peer", module._cyclic_remote_copy)
+        finally:
+            sys.modules.pop(name, None)

@@ -336,6 +336,33 @@ def pallas_dynamic_row_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    config=helion.Config(
+        block_sizes=[8],
+        pallas_loop_type="fori_loop",
+    ),
+    static_shapes=False,
+    backend="pallas",
+)
+def pallas_dynamic_pipeline_rows(x: torch.Tensor) -> torch.Tensor:
+    """Nested dynamic row tiles exercise launcher padding and output slicing."""
+    rows, _width = x.shape
+    out = torch.empty_like(x)
+    for outer in hl.tile(rows, block_size=8):
+        for inner in hl.tile(outer.begin, outer.end):
+            out[inner, :] = x[inner, :] * 2.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_initialized_output(x: torch.Tensor) -> torch.Tensor:
+    """A wrapper-created initialized output cannot be rebuilt from launch metadata."""
+    out = torch.zeros_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] += x[tile]
+    return out
+
+
 def _pallas_to_code(
     kernel: Any, args: tuple[object, ...], options: helion.OutputCodeOptions
 ) -> str:
@@ -558,6 +585,37 @@ class TestToCodePallas(TestCase):
                     )
             finally:
                 sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_dynamic_pipeline_padding(self) -> None:
+        """The standalone pads non-aligned inputs and slices outputs back."""
+        import jax.numpy as jnp
+        import numpy as np
+
+        width = 128
+        x0 = torch.zeros(16, width, device=DEVICE, dtype=torch.float32)
+        code = _pallas_to_code(pallas_dynamic_pipeline_rows, (x0,), _JAX)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "dynamic_pipeline_rows_jax_test"
+            mod = _import_code(code, name, tmp)
+            try:
+                for rows in (17, 23):
+                    xj = jnp.arange(rows * width, dtype=jnp.float32).reshape(
+                        rows, width
+                    )
+                    out = mod.pallas_dynamic_pipeline_rows(xj)
+                    self.assertEqual(tuple(out.shape), (rows, width))
+                    np.testing.assert_allclose(
+                        np.asarray(out), np.asarray(xj) * 2.0, rtol=1e-6, atol=1e-6
+                    )
+            finally:
+                sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_rejects_wrapper_created_inplace_output(self) -> None:
+        x = torch.zeros(128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            NotImplementedError, "wrapper-created in-place outputs"
+        ):
+            _pallas_to_code(pallas_initialized_output, (x,), _JAX)
 
     def test_jax_fn_with_helion_deps_imports_launcher(self) -> None:
         """``jax_fn`` is orthogonal to ``allow_helion_deps``: with deps allowed the
