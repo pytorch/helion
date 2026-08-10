@@ -19,6 +19,12 @@ def main() -> None:
     print(f"=== {HARNESS.title} ===")
     HARNESS.test()
     print()
+    print(f"=== {HARNESS.title}: fused input preamble ===")
+    HARNESS.test_fused_preamble()
+    print()
+    print(f"=== {HARNESS.title}: varlen ===")
+    HARNESS.test_varlen()
+    print()
     HARNESS.benchmark()
 
 

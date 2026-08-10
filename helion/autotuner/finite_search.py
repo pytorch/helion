@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .base_search import BaseSearch
+from .benchmark_provider import _MultiShapeAutotuneArgs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -38,6 +39,9 @@ class FiniteSearch(BaseSearch):
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
 
+    def _generation_invalid_config_count(self) -> int:
+        return self.config_gen.invalid_config_count
+
     def _autotune(self) -> Config:
         best_config = None
         best_time = float("inf")
@@ -45,6 +49,8 @@ class FiniteSearch(BaseSearch):
             if result.perf < best_time:
                 best_time = result.perf
                 best_config = result.config
+        if best_config is None and isinstance(self.args, _MultiShapeAutotuneArgs):
+            raise exc.NoConfigFound
         assert best_config is not None
         return best_config
 

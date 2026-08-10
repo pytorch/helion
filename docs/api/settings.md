@@ -94,11 +94,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Supported values depend on the backend:
    - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``
-   - Pallas (TPU): ``"default"`` (forces JAX default, typically bfloat16), ``"high"``, ``"highest"`` (float32 emulation).
+   - Pallas (TPU): ``"default"``, ``"high"``, ``"highest"`` and portable Triton aliases are accepted.
 
-   However, unified mappings exist so you can use any value on any backend. They map to the closest equivalent of equal or higher precision:
+   However, unified mappings exist so you can use any value on any backend:
    - On Triton: ``"default"`` maps to ``"tf32"``, ``"high"`` maps to ``"tf32x3"``, and ``"highest"`` maps to ``"ieee"``.
-   - On Pallas: ``"tf32"``, ``"tf32x3"`` and ``"ieee"`` all map to ``"highest"``.
+   - On Pallas/TPU: all values currently emit JAX default precision. JAX ``"high"``/``"highest"`` fp32 dot precision is not used because it is less compatible with PyTorch eager references on the supported TPU stack.
 
 .. autoattribute:: Settings.static_shapes
 
@@ -109,7 +109,8 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    If ``True``, enable fast math approximations. This activates both Helion-level optimizations
    (e.g. fast sigmoid) and Inductor-level fast math (flush-to-zero exp, fast online softmax,
-   etc.). May reduce numerical precision. Default is ``False``. Controlled by ``HELION_FAST_MATH=1``.
+   etc.). May reduce numerical precision and change NaN/Inf behavior. Default is ``False``.
+   Controlled by ``HELION_FAST_MATH=1``.
 
 .. autoattribute:: Settings.persistent_reserved_sms
 
@@ -160,6 +161,53 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    ``ir_graph`` is a config-independent, node-link dump of the kernel's device IR (the per-tile computation lowered to the Triton kernel body), captured once per run. Load it with ``networkx.node_link_graph(record["ir_graph"], edges="edges")`` (requires ``networkx>=3.4``). It is ``null`` when the device IR is unavailable or extraction fails. Block dimensions stay symbolic in the dump; recover concrete tile sizes by joining with each config's ``block_sizes``. Because the device IR is a function of ``run_id``'s inputs, every record sharing a ``run_id`` carries an identical ``ir_graph``.
    Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
    Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
+
+.. autoattribute:: Settings.autotune_log_search_space
+
+    Enable search space analysis logging after autotuning. When enabled, Helion logs:
+
+    - **Search space summary**: Total search space size, enabled/disabled features with reasons, shape constraints
+    - **Coverage metrics**: Configs tested vs. total space, coverage percentage
+    - **Feature exploration report**: Per-feature statistics showing how many options were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
+    - **Exploration quality**: Average and minimum feature coverage, highlighting poorly explored features (<50%)
+
+    The total search space size is the exact combinatorial product of every
+    dimension's cardinality (an arbitrary-precision integer, so for large kernels
+    it can be very large); it is reported as ``unknown`` only when some
+    dimension's cardinality cannot be determined.
+
+    Default is ``False``. Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE`` (set to ``1`` to enable).
+
+    See :doc:`autotuner` for example output and the :py:mod:`helion.autotuner.search_space_logger` module for implementation details.
+
+.. autoattribute:: Settings.autotune_log_search_space_verbose
+
+    Additionally log each individual search-space restriction *live* (at ``INFO``) the moment it is
+    applied during kernel compilation, on top of the end-of-run summary. This surfaces *why* the search
+    space shrank as it happens, for example:
+
+    - ``Autotuner feature restriction: pid_type='xyz' disabled (data-dependent loop bounds require a persistent kernel ...)``
+    - ``Autotuner feature restriction: tcgen05 search narrowed to validated configs (matmul kernel with CuTe tcgen05 backend)``
+
+    Enabling this implies ``autotune_log_search_space`` (the summary is produced as well). Default is
+    ``False``. Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE`` (set to ``1`` to enable).
+
+.. autoattribute:: Settings.autotune_log_search_space_path
+
+    Optional path to save search space analysis as JSON. When set, Helion writes one JSON file per
+    autotuned kernel/shape. The kernel name and the autotuner's stable cache hash are injected into the
+    filename stem (matching the ``.best_config`` cache key) so distinct kernels/shapes do not overwrite
+    each other:
+
+    - ``<stem>.<kernel>.<hash>.json``: a single report combining the search-space description (dimensions,
+      possible values, constraints, total size) with the exploration outcome (per-dimension observed values
+      and coverage, configs tested, valid/invalid attempts).
+
+    For example, ``autotune_log_search_space_path="/tmp/analysis.json"`` yields a file like
+    ``/tmp/analysis.my_kernel.3f9a1c2e.json``.
+    A directory (existing path or trailing separator) is also accepted, in which case the default
+    ``autotune_search_space.json`` filename is used inside it. Requires ``autotune_log_search_space`` to be enabled.
+    Default is ``None`` (only logs to console). Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH``.
 
 .. autoattribute:: Settings.autotune_compile_timeout
 
@@ -322,10 +370,10 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). This variable does not apply to the Pallas backend. |
-| ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Sets default matmul precision for Pallas dot products (JAX values: ``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). This variable does not apply to the Triton backend. |
+| ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Accepts JAX matmul precision values for Pallas dot products (``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). On TPU these values emit Pallas default precision. This variable does not apply to the Triton backend. |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
-| ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |
+| ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision and change NaN/Inf behavior. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
@@ -333,6 +381,10 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
+| ``HELION_AUTOTUNE_LOG_DETAILS`` | ``autotune_log_details`` | Enable cost-model dataset sidecar (``.meta.jsonl``) with full configs map. |
+| ``HELION_AUTOTUNE_LOG_SEARCH_SPACE`` | ``autotune_log_search_space`` | Enable search space analysis logging (default ``0``). Set to ``1`` to enable. |
+| ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE`` | ``autotune_log_search_space_verbose`` | Also log each search-space restriction live at ``INFO`` as it is applied (default ``0``). Implies ``HELION_AUTOTUNE_LOG_SEARCH_SPACE``. |
+| ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH`` | ``autotune_log_search_space_path`` | Optional path to save search space analysis JSON files. |
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |

@@ -837,9 +837,14 @@ def _xsa_shapes(
         configs = configs[:num_shapes]
     out: list[tuple[str, tuple[Any, ...]]] = []
     for b, h, t, d in configs:
-        q = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.float16)
-        k = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.float16)
-        v = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.float16)
+        # bfloat16, not float16: TPU Mosaic hits an "Invalid vector type for
+        # load" codegen error on fp16 attention shapes (the vector<8x128x2xf16>
+        # layout fp16 forces). bfloat16 sidesteps this; it's also the dtype
+        # test_examples.test_xsa uses (via HALF_DTYPE on TPU) and the sweep
+        # convention for every other kernel here.
+        q = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.bfloat16)
         out.append((f"[{b},{h},{t},{d}]", (q, k, v)))
     return out
 

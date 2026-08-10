@@ -13,28 +13,20 @@ from __future__ import annotations
 import torch
 
 import helion
-import helion.experimental
 import helion.language as hl
 
-# Optional vLLM baseline: the production composition this is benchmarked against.
-# The pretuned test env has only torch + helion (guarded import); the nightly
-# benchmark workflow installs vLLM, so main() then compares against the real
-# vLLM ops (rms_norm + RotaryEmbedding.forward_static). Both pieces must import
-# for the vLLM baseline to be used.
+# Optional vLLM baseline: the production kernel this is benchmarked against. The
+# pretuned test env has only torch + helion (guarded import); the nightly
+# benchmark workflow installs vLLM, so main() then compares against the real op.
 try:
-    from vllm import ir as _vllm_ir
-    from vllm.model_executor.layers.rotary_embedding import (
-        RotaryEmbedding as _VllmRotaryEmbedding,
-    )
+    import vllm  # noqa: F401  (registers torch.ops._C.*)
 
-    _HAS_VLLM = hasattr(_vllm_ir.ops, "rms_norm") and hasattr(
-        _VllmRotaryEmbedding, "forward_static"
-    )
+    _HAS_VLLM = hasattr(torch.ops._C, "fused_qk_norm_rope")
 except ImportError:
     _HAS_VLLM = False
 
 
-@helion.experimental.aot_kernel(
+@helion.aot_kernel(
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def fused_qk_norm_rope(
@@ -201,30 +193,21 @@ def _fused_qk_norm_rope_vllm(
     position_ids: torch.Tensor,
     forced_token_heads_per_warp: int = -1,  # dummy
 ) -> None:
-    """vLLM baseline: a Python composition of vLLM's rms_norm + RoPE ops.
-
-    Replicates the production baseline (vLLM PR 44010): per-head RMSNorm on the Q
-    and K heads (via ``vllm.ir.ops.rms_norm``) followed by rotary embedding (via
-    ``RotaryEmbedding.forward_static``), written back into ``qkv`` in place.
-    """
-    q_size = num_heads_q * head_dim
-    kv_size = num_heads_k * head_dim
-
-    q, k, _v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-
-    q_by_head = q.view(*q.shape[:-1], q.shape[-1] // head_dim, head_dim)
-    q_by_head = _vllm_ir.ops.rms_norm(q_by_head, q_weight, eps)
-    q = q_by_head.view(q.shape)
-
-    k_by_head = k.view(*k.shape[:-1], k.shape[-1] // head_dim, head_dim)
-    k_by_head = _vllm_ir.ops.rms_norm(k_by_head, k_weight, eps)
-    k = k_by_head.view(k.shape)
-
-    q, k = _VllmRotaryEmbedding.forward_static(
-        position_ids, q, k, head_dim, cos_sin_cache.shape[1], cos_sin_cache, is_neox
+    """vLLM compiled baseline (torch.ops._C.fused_qk_norm_rope)."""
+    torch.ops._C.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+        forced_token_heads_per_warp,
     )
-    qkv[:, :q_size].copy_(q)
-    qkv[:, q_size : q_size + kv_size].copy_(k)
 
 
 def _baselines() -> list[tuple[str, object]]:
@@ -297,16 +280,24 @@ def _make_inputs(
     )
 
 
+def _bench_shapes() -> list[tuple[int, int, int]]:
+    """The (num_tokens, q_heads, kv_heads) shapes main() benchmarks."""
+    num_tokens_list = [1, 8, 32, 128, 512, 2048, 8192]
+    num_heads_pair = [(16, 8), (32, 8), (64, 8)]
+    return [(t, qh, kvh) for (qh, kvh) in num_heads_pair for t in num_tokens_list]
+
+
 def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
-    args = _make_inputs(16, 16, 8)
-    qkv = args[0]
-    qkv_helion = qkv.clone()
-    qkv_torch = qkv.clone()
-    fused_qk_norm_rope(qkv_helion, *args[1:])
-    _fused_qk_norm_rope_torch(qkv_torch, *args[1:])
-    torch.testing.assert_close(qkv_helion, qkv_torch, rtol=2e-2, atol=2e-2)
+    for num_tokens, q_heads, kv_heads in _bench_shapes():
+        args = _make_inputs(num_tokens, q_heads, kv_heads)
+        qkv = args[0]
+        qkv_helion = qkv.clone()
+        qkv_torch = qkv.clone()
+        fused_qk_norm_rope(qkv_helion, *args[1:])
+        _fused_qk_norm_rope_torch(qkv_torch, *args[1:])
+        torch.testing.assert_close(qkv_helion, qkv_torch, rtol=2e-2, atol=2e-2)
 
 
 def main(verbose: bool = True) -> dict:
@@ -316,9 +307,7 @@ def main(verbose: bool = True) -> dict:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _bench import run_sweep
 
-    num_tokens_list = [1, 8, 32, 128, 512, 2048, 8192]
-    num_heads_pair = [(16, 8), (32, 8), (64, 8)]
-    shapes = [(t, qh, kvh) for (qh, kvh) in num_heads_pair for t in num_tokens_list]
+    shapes = _bench_shapes()
     baselines = _baselines()
 
     def make_calls(shape: tuple) -> tuple:
@@ -352,4 +341,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()

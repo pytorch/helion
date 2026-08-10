@@ -268,6 +268,7 @@ class TestAutotuneLogSink(TestCase):
             sidecar = json.loads(
                 sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
             )
+            source_path_exists = sink.source_path.exists()
 
         header, data = rows[0], rows[1:]
         self.assertEqual(header, _LEAN_CSV_HEADER)
@@ -278,6 +279,7 @@ class TestAutotuneLogSink(TestCase):
 
         self.assertTrue(cell("config"))
         self.assertIn("32", cell("config"))
+        self.assertFalse(source_path_exists)
 
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])

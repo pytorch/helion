@@ -66,7 +66,7 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @onlyBackends(["triton"])
     def test_reduction_fact_indexing_slot_invariant(self):
-        """The ReductionFact is built after _collect_memory_op_facts, but the collector
+        """The ReductionKernelFact is built after _collect_memory_op_facts, but the collector
         still runs after the reduction rolling, so every rolled-subgraph load/store keeps
         its ``Config.indexing`` slot and the ``memory_op_facts[i].indexing_index == i``
         invariant holds. Collecting before the rolling would desync ``Config.indexing``
@@ -83,9 +83,11 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
             sum(1 for s in specs if s.eviction_index is not None),
         )
 
-        # Exactly one ReductionFact, derived from the enriched facts.
-        self.assertEqual(len(spec.reduction_facts), 1)
-        fact = spec.reduction_facts[0]
+        # Exactly one reduction descriptor, derived from the enriched facts.
+        kf = spec.reduction_kernel_fact
+        self.assertIsNotNone(kf)
+        self.assertEqual(len(kf.reductions), 1)
+        fact = kf.reductions[0]
         # num_load scopes to the rdim's original graph(s) (one streamed input row), so the
         # rolled-subgraph copy is not double-counted.
         self.assertEqual(fact.num_load, 1)

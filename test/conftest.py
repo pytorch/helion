@@ -12,6 +12,11 @@ def pytest_configure() -> None:
     # still runs (and stays covered) without dominating the test runtime.
     os.environ.setdefault("HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS", "200")
 
+    # The device-us re-rank needs the TPU profiler plane; under interpret
+    # (CPU) it burns ~100 traced calls per candidate just to return inf.
+    if os.environ.get("HELION_PALLAS_INTERPRET") == "1":
+        os.environ.setdefault("HELION_AUTOTUNE_PALLAS_RANK_BY", "wall_time")
+
     # TODO(tcombes): remove this once Pallas RNG generation avoids int64.
     # JAX x64 is disabled on TPU, so RNG-generated int64s are truncated and
     # spam Pallas test logs with one warning per generated statement.

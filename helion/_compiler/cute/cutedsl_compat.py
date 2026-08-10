@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from functools import lru_cache
-import inspect
+import importlib.metadata
+
+from packaging.version import InvalidVersion
+from packaging.version import Version
 
 # The cute backend hard-requires the CuTe DSL 4.5.1 API generation, the
 # apache-tvm-ffi package, and CUDA >= 13. ``check_cute_backend_requirements``
@@ -9,69 +12,49 @@ import inspect
 # the rest of the backend can assume the modern APIs unconditionally rather than
 # carry per-build compatibility shims and inline workarounds.
 CUTE_MIN_CUDA_VERSION = "13"
+CUTE_MIN_VERSION = Version("4.5.1")
+CUTE_MATH_MIN_MAX_VERSION = Version("4.6.0")
+
+
+@lru_cache(maxsize=1)
+def cute_math_min_max_available() -> bool:
+    """Return whether ``cute.math.min/max`` are available in this CuTe DSL."""
+    return (
+        Version(importlib.metadata.version("nvidia-cutlass-dsl"))
+        >= CUTE_MATH_MIN_MAX_VERSION
+    )
 
 
 @lru_cache(maxsize=1)
 def _cute_backend_requirement_error() -> str | None:
     """Return why the cute backend cannot run here, or ``None`` if it can.
 
-    Cached because the answer is fixed for the lifetime of the process. The
-    CuTe DSL generation is detected by *feature*, not by ``cutlass.__version__``:
-    the published wheels under-report the API generation (the 4.5.1 API has
-    shipped in wheels that still self-report ``4.5.0``), so a version-string
-    comparison would spuriously reject a working install.
+    Cached because the answer is fixed for the lifetime of the process.
     """
     try:
-        import cutlass.cute as cute  # noqa: F401
-        from cutlass.cutlass_dsl.cutlass import if_generate
-        from cutlass.pipeline import PipelineTmaUmma
-        from cutlass.utils import TmemAllocator
-    except ImportError as e:
-        return f"the CuTe DSL is not importable (need nvidia-cutlass-dsl >= 4.5.1): {e}"
-
-    # 4.5.1 names the TmemAllocator skip-init kwarg ``initialize_mbarrier`` (it
-    # was ``dealloc_mbarrier_initialized`` in intermediate builds and absent from
-    # 4.5.0.dev0). ``@dsl_user_op`` strips kwargs from the public wrapper, so
-    # resolve ``__wrapped__`` first.
-    init = TmemAllocator.__init__
-    inner = getattr(init, "__wrapped__", init)
-    try:
-        params = inspect.signature(inner).parameters
-    except (TypeError, ValueError):
-        params = {}
-    if "initialize_mbarrier" not in params:
+        installed_version = Version(importlib.metadata.version("nvidia-cutlass-dsl"))
+    except importlib.metadata.PackageNotFoundError:
         return (
-            "the installed CuTe DSL is too old (need >= 4.5.1: "
-            "TmemAllocator.initialize_mbarrier kwarg is missing)"
+            "the CuTe DSL is not installed "
+            f"(need nvidia-cutlass-dsl >= {CUTE_MIN_VERSION})"
+        )
+    except InvalidVersion as e:
+        return (
+            "the installed CuTe DSL version is invalid "
+            f"(need >= {CUTE_MIN_VERSION}): {e}"
+        )
+    if installed_version < CUTE_MIN_VERSION:
+        return (
+            "the installed CuTe DSL is too old "
+            f"(need >= {CUTE_MIN_VERSION}, found {installed_version})"
         )
 
-    # 4.5.1 fixed the multi-result ``scf.if`` lowering used by nested
-    # ``PipelineState.advance()`` (4.5.0.dev0 raised a DSLRuntimeError from the
-    # ``OpResultList`` path) and gave ``PipelineTmaUmma.producer_tail`` peer-CTA
-    # semantics (older source gated the whole tail to the leader CTA). Both are
-    # detected from source.
     try:
-        if "ir.OpResultList" not in inspect.getsource(if_generate):
-            return (
-                "the installed CuTe DSL is too old (need >= 4.5.1: "
-                "if_generate is missing the OpResultList fix)"
-            )
-        tail_src = inspect.getsource(PipelineTmaUmma.producer_tail)
-    except (OSError, TypeError) as e:
-        return f"the installed CuTe DSL source cannot be inspected (need >= 4.5.1): {e}"
-    leader_markers = (
-        "block_idx_in_cluster",
-        "cta_rank",
-        "cluster_rank",
-        "rank_in_cluster",
-        "is_leader_cta",
-    )
-    if "producer_acquire(" not in tail_src or any(
-        marker in tail_src for marker in leader_markers
-    ):
+        import cutlass.cute as cute  # noqa: F401
+    except ImportError as e:
         return (
-            "the installed CuTe DSL is too old (need >= 4.5.1: "
-            "PipelineTmaUmma.producer_tail lacks peer-CTA semantics)"
+            "the CuTe DSL is not importable "
+            f"(need nvidia-cutlass-dsl >= {CUTE_MIN_VERSION}): {e}"
         )
 
     try:
