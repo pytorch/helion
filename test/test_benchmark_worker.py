@@ -650,70 +650,47 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertFalse(provider._subprocess_accuracy_check_enabled())
 
     def test_benchmark_job_stats_mode_returns_perf_stats(self) -> None:
-        # return_mode="stats" forwards to the bench and returns its PerfStats
-        # unchanged, through either dispatch path (event-based do_bench when
-        # use_wall_clock is False, wall-clock do_bench_generic when True). A
-        # non-PerfStats return raises TypeError at the boundary.
-        fn = _ReturnValue(torch.empty(()))
-        stats = PerfStats(
-            min=1.0,
-            median=1.1,
-            mean=1.2,
-            p90=1.3,
-            std=0.1,
-            n_samples=50,
-        )
-        for use_wall_clock, bench_attr in (
-            (False, "do_bench"),
-            (True, "do_bench_generic"),
-        ):
-            with self.subTest(use_wall_clock=use_wall_clock):
-                with (
-                    patch(
-                        "helion.autotuner.benchmark_job._load_compiled_fn",
-                        return_value=fn,
-                    ),
-                    patch(
-                        "helion.autotuner.benchmark_job.load_trusted_kernel_args",
-                        return_value=(),
-                    ),
-                    patch(
-                        f"helion.autotuner.benchmark_job.{bench_attr}",
-                        return_value=stats,
-                    ) as bench,
-                ):
-                    result = BenchmarkJob(
-                        fn_spec=cast("SerializedCompiledFunction", object()),
-                        args_path="/tmp/args.pt",
-                        use_wall_clock=use_wall_clock,
-                        return_mode="stats",
-                    )()
-                self.assertEqual(result, stats)
-                bench.assert_called_once()
-                self.assertEqual(bench.call_args.kwargs["return_mode"], "stats")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((), args_path)
+            result = BenchmarkJob(
+                fn_spec=SerializedCompiledFunction(
+                    function_name="call",
+                    source_code="def call():\n    return None\n",
+                    filename=None,
+                    module_name=None,
+                ),
+                args_path=str(args_path),
+                use_wall_clock=True,
+                return_mode="stats",
+                fixed_repetitions=3,
+            )()
 
-                # A non-PerfStats bench return violates the stats contract -> TypeError.
-                with (
-                    patch(
-                        "helion.autotuner.benchmark_job._load_compiled_fn",
-                        return_value=fn,
+        assert isinstance(result, PerfStats)
+        self.assertEqual(result.n_samples, 3)
+
+    def test_benchmark_job_stats_mode_rejects_scalar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((), args_path)
+            with (
+                patch(
+                    "helion.autotuner.benchmark_job.do_bench_generic",
+                    return_value=1.25,
+                ),
+                self.assertRaisesRegex(TypeError, "return_mode=.?stats"),
+            ):
+                BenchmarkJob(
+                    fn_spec=SerializedCompiledFunction(
+                        function_name="call",
+                        source_code="def call():\n    return None\n",
+                        filename=None,
+                        module_name=None,
                     ),
-                    patch(
-                        "helion.autotuner.benchmark_job.load_trusted_kernel_args",
-                        return_value=(),
-                    ),
-                    patch(
-                        f"helion.autotuner.benchmark_job.{bench_attr}",
-                        return_value=1.25,
-                    ),
-                    self.assertRaises(TypeError),
-                ):
-                    BenchmarkJob(
-                        fn_spec=cast("SerializedCompiledFunction", object()),
-                        args_path="/tmp/args.pt",
-                        use_wall_clock=use_wall_clock,
-                        return_mode="stats",
-                    )()
+                    args_path=str(args_path),
+                    use_wall_clock=True,
+                    return_mode="stats",
+                )()
 
     def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
