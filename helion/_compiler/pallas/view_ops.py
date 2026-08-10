@@ -9,10 +9,11 @@ captures transport the same Ref without changing its address interpretation.
 Planning is transactional: annotations are committed only after the complete
 reachable chain is valid. An unsupported value consumer normally terminates a
 chain by materializing the current view, but it is an error when another
-narrowing subscript occurs beyond that boundary. Structural and per-config
-rejections are therefore recorded where planning fails and reported only by the
-final completeness check. Codegen consumes the committed plans; it does not
-decide whether a view is eligible.
+narrowing subscript occurs beyond that boundary. Failures are recorded where
+planning stops and reported as ``BackendUnsupported`` only by the final
+completeness check. Pallas autotuning skips that config while preserving the
+specific diagnostic. Codegen consumes committed plans; it does not decide
+whether a view is eligible.
 """
 
 from __future__ import annotations
@@ -89,18 +90,13 @@ class _ResidentTransform(NamedTuple):
     selector: _ResidentSelector | None
 
 
-class _ResidentRejection(NamedTuple):
-    reason: str
-    config_dependent: bool
-
-
 class _PlanningContext(NamedTuple):
     captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]]
     parents: dict[int, torch.fx.Node]
     graph_infos: dict[torch.fx.Graph, GraphInfo]
     config: Config
     placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node]
-    rejections: dict[torch.fx.Node, _ResidentRejection]
+    failures: dict[torch.fx.Node, exc.BackendUnsupported]
 
 
 def _node_value(value: object) -> object:
@@ -313,7 +309,7 @@ def _root_variants(
     producer: torch.fx.Node,
     graph_info: GraphInfo,
     context: _PlanningContext,
-) -> tuple[_ResidentVariant, ...] | _ResidentRejection:
+) -> tuple[_ResidentVariant, ...]:
     from .backend import SliceAddressing
     from .backend import _slice_addressing
     from .tensorcore_plan import TENSORCORE_PLAN_META
@@ -324,40 +320,40 @@ def _root_variants(
     indices = producer.args[1]
     location = _where(producer)
     if not isinstance(tensor, torch.Tensor) or not isinstance(value, torch.Tensor):
-        return _ResidentRejection(
-            f"the source load at {location} has no tensor value metadata", False
+        raise exc.BackendUnsupported(
+            "pallas", f"the source load at {location} has no tensor value metadata"
         )
     if tensor.ndim != value.ndim:
-        return _ResidentRejection(
-            f"the source load at {location} changes the tensor rank", False
+        raise exc.BackendUnsupported(
+            "pallas", f"the source load at {location} changes the tensor rank"
         )
     if producer.args[2] is not None:
-        return _ResidentRejection(
-            f"the source load at {location} has an explicit mask", False
+        raise exc.BackendUnsupported(
+            "pallas", f"the source load at {location} has an explicit mask"
         )
     if not isinstance(indices, (list, tuple)):
-        return _ResidentRejection(
-            f"the source load at {location} has unsupported indices", False
+        raise exc.BackendUnsupported(
+            "pallas", f"the source load at {location} has unsupported indices"
         )
     if isinstance(producer.meta.get(TENSORCORE_PLAN_META), OneHotGatherPlan):
-        return _ResidentRejection(
-            f"the source load at {location} uses an indirect gather", False
+        raise exc.BackendUnsupported(
+            "pallas", f"the source load at {location} uses an indirect gather"
         )
 
     selected = _narrowed_dims(indices)
     if len(selected) != 1:
-        return _ResidentRejection(
+        raise exc.BackendUnsupported(
+            "pallas",
             f"the source load at {location} must tile exactly one dimension, "
             f"but it tiles {len(selected)}",
-            False,
         )
     dim = selected[0]
     outer_block_id = CompileEnvironment.current().resolve_block_id(
         _node_value(indices[dim])
     )
     if outer_block_id is None:
-        return _ResidentRejection(
-            f"the source load at {location} is not indexed by a tile", False
+        raise exc.BackendUnsupported(
+            "pallas", f"the source load at {location} is not indexed by a tile"
         )
 
     full_loop = False
@@ -378,16 +374,16 @@ def _root_variants(
     for factor in factors:
         shape = _physical_shape(value, context.config, factor)
         if shape is None:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the source load at {location} has no concrete physical shape "
                 "for this config",
-                True,
             )
         if _slice_addressing(value, dim, shape[-1]) is not SliceAddressing.DIRECT:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the source load at {location} does not have direct VMEM "
                 "addressing for this config",
-                True,
             )
         backing = _concrete_size(tensor.shape[dim], context.config, factor)
         full = full_loop and backing is not None and backing % shape[dim] == 0
@@ -421,7 +417,7 @@ def _selector(
     graph_info: GraphInfo,
     variants: tuple[_ResidentVariant, ...],
     context: _PlanningContext,
-) -> _ResidentTransform | _ResidentRejection:
+) -> _ResidentTransform:
     """Validate one contiguous Ref selector and return its output state."""
     from ..device_ir import IfGraphInfo
     from ..type_info import _detect_outer_block_bound
@@ -438,21 +434,22 @@ def _selector(
     if not isinstance(indices, (list, tuple)) or not isinstance(
         input_value, torch.Tensor
     ):
-        return _ResidentRejection(
-            f"the selector at {_where(node)} has no tensor indexing metadata", False
+        raise exc.BackendUnsupported(
+            "pallas",
+            f"the selector at {_where(node)} has no tensor indexing metadata",
         )
     if any(index is None for index in indices):
-        return _ResidentRejection(
+        raise exc.BackendUnsupported(
+            "pallas",
             f"the selector at {_where(node)} adds a dimension; resident Ref "
             "narrowing does not support None",
-            False,
         )
     selected = _narrowed_dims(indices)
     if len(selected) != 1:
-        return _ResidentRejection(
+        raise exc.BackendUnsupported(
+            "pallas",
             f"the selector at {_where(node)} must narrow exactly one dimension, "
             f"but it narrows {len(selected)}",
-            False,
         )
     logical_dim = selected[0]
     index = indices[logical_dim]
@@ -475,10 +472,10 @@ def _selector(
     )
     if source is not None and source.target is torch.ops.prims.iota.default:
         if not isinstance(graph_info, IfGraphInfo) or not source.args:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the dynamic tail selector at {_where(node)} is not inside its "
                 "matching conditional",
-                False,
             )
         width = _node_value(source.args[0])
         start = _node_value(source.kwargs.get("start"))
@@ -490,10 +487,10 @@ def _selector(
             or source.kwargs.get("step") != 1
             or not isinstance(start, torch.SymInt)
         ):
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the dynamic tail selector at {_where(node)} is not a contiguous "
                 "positive iota",
-                False,
             )
         live = start + width
         detected_outer = exact_outer_live(live)
@@ -505,10 +502,10 @@ def _selector(
             or live_expr is None
             or predicate._sympy_() != sympy.Ge(live_expr, width)
         ):
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the dynamic tail selector at {_where(node)} is not guarded by "
                 "its exact live-width predicate",
-                False,
             )
         selector = _ResidentSelector("tail", logical_dim, -1, start, width, False)
     elif source is not None:
@@ -517,61 +514,62 @@ def _selector(
         if squeeze:
             origin = _maybe_get_symbol_origin(value)
             if origin is None or not isinstance(origin.origin, TileBeginOrigin):
-                return _ResidentRejection(
+                raise exc.BackendUnsupported(
+                    "pallas",
                     f"the scalar selector at {_where(node)} is not a tile begin",
-                    False,
                 )
             local_block_id = origin.origin.block_id
         else:
             detected_local = _tile_run(source)
             if detected_local is None:
-                return _ResidentRejection(
+                raise exc.BackendUnsupported(
+                    "pallas",
                     f"the selector at {_where(node)} is not an unshifted tile run",
-                    False,
                 )
             local_block_id = detected_local
         bounds = _enclosing_loop_bounds(
             graph_info, context.parents, context.graph_infos, local_block_id
         )
         if bounds is None:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the selector at {_where(node)} is not driven by an enclosing "
                 "tile loop",
-                False,
             )
         start, end = bounds
         if not isinstance(start, (int, torch.SymInt)) or not env.known_equal(start, 0):
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the selector's tile loop at {_where(node)} must start at zero",
-                False,
             )
         if isinstance(end, int):
             if end < 1:
-                return _ResidentRejection(
-                    f"the selector's tile loop at {_where(node)} is empty", False
+                raise exc.BackendUnsupported(
+                    "pallas", f"the selector's tile loop at {_where(node)} is empty"
                 )
             static_loop_extent = end
         elif not isinstance(end, torch.SymInt):
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the selector's tile loop at {_where(node)} has an unsupported end",
-                False,
             )
         else:
             detected_outer = exact_outer_live(end)
             outer_block_id = detected_outer if detected_outer is not None else -1
             if outer_block_id < 0:
-                return _ResidentRejection(
+                raise exc.BackendUnsupported(
+                    "pallas",
                     f"the selector's live extent at {_where(node)} does not match "
                     "the source tile",
-                    False,
                 )
         selector = _ResidentSelector(
             "tile", logical_dim, local_block_id, -1, -1, not squeeze
         )
     elif isinstance(index, int):
         if index < 0:
-            return _ResidentRejection(
-                f"the static selector at {_where(node)} has a negative index", False
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the static selector at {_where(node)} has a negative index",
             )
         squeeze = True
         selector = _ResidentSelector("static", logical_dim, -1, index, 1, False)
@@ -583,17 +581,18 @@ def _selector(
             or index.start < 0
             or index.stop <= index.start
         ):
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the static selector at {_where(node)} is not a positive "
                 "contiguous slice",
-                False,
             )
         selector = _ResidentSelector(
             "static", logical_dim, -1, index.start, index.stop - index.start, False
         )
     else:
-        return _ResidentRejection(
-            f"the selector at {_where(node)} has unsupported index {index!r}", False
+        raise exc.BackendUnsupported(
+            "pallas",
+            f"the selector at {_where(node)} has unsupported index {index!r}",
         )
 
     output: list[_ResidentVariant] = []
@@ -606,10 +605,10 @@ def _selector(
             _slice_addressing(input_value, logical_dim, lane_block)
             is not SliceAddressing.DIRECT
         ):
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the selector at {_where(node)} does not have direct VMEM "
                 "addressing for this config",
-                True,
             )
         width = (
             _variant_block_size(
@@ -619,52 +618,52 @@ def _selector(
             else selector.width
         )
         if not isinstance(width, int) or width < 1:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the selector at {_where(node)} has no concrete positive width "
                 "for this config",
-                True,
             )
         if squeeze and width != 1:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the scalar selector at {_where(node)} cannot use width {width} "
                 "for this config",
-                True,
             )
         if width > variant.shape[physical_dim]:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"the run is {width} wide but the block holds only "
                 f"{variant.shape[physical_dim]} rows for this config at {_where(node)}",
-                True,
             )
         if selector.kind == "static":
             assert isinstance(selector.begin, int)
             if selector.begin + width > variant.shape[physical_dim]:
-                return _ResidentRejection(
+                raise exc.BackendUnsupported(
+                    "pallas",
                     f"the static run at {_where(node)} reaches past the resident "
                     "Ref for this config",
-                    True,
                 )
             if variant.live_guard is not None and variant.live_guard[0] == physical_dim:
-                return _ResidentRejection(
+                raise exc.BackendUnsupported(
+                    "pallas",
                     f"the static selector at {_where(node)} may address padding in "
                     "the source tile for this config",
-                    True,
                 )
         elif selector.kind == "tile":
             if variant.shape[physical_dim] % width != 0:
-                return _ResidentRejection(
+                raise exc.BackendUnsupported(
+                    "pallas",
                     f"the selector width at {_where(node)} does not divide the Ref "
                     "for this config",
-                    True,
                 )
             if (
                 static_loop_extent >= 0
                 and static_loop_extent != variant.shape[physical_dim]
             ):
-                return _ResidentRejection(
+                raise exc.BackendUnsupported(
+                    "pallas",
                     f"the inner loop at {_where(node)} does not cover exactly the "
                     "Ref for this config",
-                    True,
                 )
 
         remaining_guard = (
@@ -695,50 +694,51 @@ def _reshape_variants(
     node: torch.fx.Node,
     config: Config,
     variants: tuple[_ResidentVariant, ...],
-) -> tuple[_ResidentVariant, ...] | _ResidentRejection:
+) -> tuple[_ResidentVariant, ...]:
     value = node.meta.get("val")
     target = str(node.target)
     location = _where(node)
     if not isinstance(value, torch.Tensor):
-        return _ResidentRejection(
-            f"{target} at {location} has no tensor value metadata", False
+        raise exc.BackendUnsupported(
+            "pallas", f"{target} at {location} has no tensor value metadata"
         )
     if value.dtype is torch.bool:
-        return _ResidentRejection(
-            f"{target} at {location} cannot preserve a boolean resident Ref", False
+        raise exc.BackendUnsupported(
+            "pallas",
+            f"{target} at {location} cannot preserve a boolean resident Ref",
         )
     output: list[_ResidentVariant] = []
     for variant in variants:
         new_shape = _physical_shape(value, config, variant.worklist_factor)
         if variant.live_guard is not None:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"{target} at {location} cannot reshape a partially live resident "
                 "Ref for this config",
-                True,
             )
         if len(variant.shape) < 2:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"{target} at {location} requires a resident Ref with at least "
                 "two physical dimensions",
-                False,
             )
         if new_shape is None:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"{target} at {location} has no concrete physical shape for this "
                 "config",
-                True,
             )
         if prod(variant.shape) != prod(new_shape):
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"{target} at {location} changes the resident block's physical "
                 "element count for this config",
-                True,
             )
         if variant.shape[-2:] != new_shape[-2:]:
-            return _ResidentRejection(
+            raise exc.BackendUnsupported(
+                "pallas",
                 f"{target} at {location} changes the resident block's two minor "
                 "dimensions for this config",
-                True,
             )
         output.append(_ResidentVariant(variant.worklist_factor, new_shape, (), None))
     return tuple(output)
@@ -749,24 +749,21 @@ def _registered_transform(
     graph_info: GraphInfo,
     variants: tuple[_ResidentVariant, ...],
     context: _PlanningContext,
-) -> _ResidentTransform | _ResidentRejection:
+) -> _ResidentTransform:
     if node.target is subscript:
         indices = node.args[1]
         if not isinstance(indices, (list, tuple)):
-            return _ResidentRejection(
-                f"hl.subscript at {_where(node)} has unsupported indices", False
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"hl.subscript at {_where(node)} has unsupported indices",
             )
         if not _narrowed_dims(indices):
             output = _reshape_variants(node, context.config, variants)
-            if isinstance(output, _ResidentRejection):
-                return output
             return _ResidentTransform(output, None)
         return _selector(node, graph_info, variants, context)
 
     if node.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
         output = _reshape_variants(node, context.config, variants)
-        if isinstance(output, _ResidentRejection):
-            return output
         return _ResidentTransform(output, None)
 
     supported = ", ".join(
@@ -775,10 +772,10 @@ def _registered_transform(
             "hl.subscript",
         ]
     )
-    return _ResidentRejection(
+    raise exc.BackendUnsupported(
+        "pallas",
         f"{node.target} at {_where(node)} is not an address-preserving resident "
         f"Ref transform; expected one of {supported}",
-        False,
     )
 
 
@@ -808,10 +805,10 @@ def _effective_users(
     return results
 
 
-def _mark_rejected_descendants(
+def _record_descendant_failure(
     producer: torch.fx.Node,
     context: _PlanningContext,
-    rejection: _ResidentRejection,
+    failure: exc.BackendUnsupported,
 ) -> None:
     seen: set[torch.fx.Node] = set()
     stack = [producer]
@@ -821,11 +818,9 @@ def _mark_rejected_descendants(
             continue
         seen.add(node)
         if node.target is subscript and _narrowed_dims(node.args[1]):
-            existing = context.rejections.get(node)
-            if existing is None or (
-                existing.config_dependent and not rejection.config_dependent
-            ):
-                context.rejections[node] = rejection
+            # Keep the first failure found below this node. Later transactional
+            # rollback errors are broader and must not hide the local diagnostic.
+            context.failures.setdefault(node, failure)
         for user, _transports in _effective_users(node, context.captures):
             stack.append(user)
 
@@ -838,7 +833,7 @@ def _analyze_resident_chain(
     context: _PlanningContext,
     annotations: dict[torch.fx.Node, _ResidentPlan],
     root: bool = False,
-) -> _ResidentRejection | None:
+) -> None:
     users = _effective_users(node, context.captures)
     planned: dict[
         torch.fx.Node,
@@ -848,100 +843,95 @@ def _analyze_resident_chain(
             _ResidentSelector | None,
         ],
     ] = {}
-    unsupported: list[tuple[torch.fx.Node, _ResidentRejection]] = []
+    unsupported: list[tuple[torch.fx.Node, exc.BackendUnsupported]] = []
     for user, transports in users:
         user_info = context.graph_infos.get(user.graph)
         if user_info is None:
-            rejection = _ResidentRejection(
-                f"the resident Ref crosses an unknown graph at {_where(user)}", False
+            failure = exc.BackendUnsupported(
+                "pallas",
+                f"the resident Ref crosses an unknown graph at {_where(user)}",
             )
-            unsupported.append((user, rejection))
-            _mark_rejected_descendants(user, context, rejection)
+            unsupported.append((user, failure))
+            _record_descendant_failure(user, context, failure)
             continue
-        result = _registered_transform(
-            user,
-            user_info,
-            node_variants,
-            context,
-        )
-        if isinstance(result, _ResidentRejection):
-            unsupported.append((user, result))
-            _mark_rejected_descendants(user, context, result)
+        try:
+            result = _registered_transform(
+                user,
+                user_info,
+                node_variants,
+                context,
+            )
+        except exc.BackendUnsupported as failure:
+            unsupported.append((user, failure))
+            _record_descendant_failure(user, context, failure)
         else:
             planned[user] = (transports, result.variants, result.selector)
 
     if root and (unsupported or not planned):
         if planned and unsupported:
-            blockers = [_where(user) for user, _rejection in unsupported]
-            rejection = _ResidentRejection(
-                "the block is also consumed whole at " + ", ".join(blockers[:3]),
-                all(item.config_dependent for _user, item in unsupported),
-            )
+            blockers = [_where(user) for user, _failure in unsupported]
+            reason = "the block is also consumed whole at " + ", ".join(blockers[:3])
+            failure = exc.BackendUnsupported("pallas", reason)
             for user in planned:
-                _mark_rejected_descendants(user, context, rejection)
-            return rejection
+                _record_descendant_failure(user, context, failure)
+            raise failure
         if unsupported:
-            return next(
-                (
-                    rejection
-                    for _user, rejection in unsupported
-                    if not rejection.config_dependent
-                ),
-                unsupported[0][1],
-            )
-        return _ResidentRejection(
+            raise unsupported[0][1]
+        raise exc.BackendUnsupported(
+            "pallas",
             f"the resident load at {_where(node)} has no address-preserving users",
-            False,
         )
     if not root and (
         (selector is not None and selector.mask) or unsupported or not planned
     ):
         masked_boundary = selector is not None and selector.mask and bool(planned)
         if masked_boundary:
-            rejection = _ResidentRejection(
+            failure = exc.BackendUnsupported(
+                "pallas",
                 f"the masked selection at {_where(node)} must materialize before "
                 "another narrowing subscript",
-                False,
             )
             for user in planned:
-                _mark_rejected_descendants(user, context, rejection)
+                _record_descendant_failure(user, context, failure)
 
-        if any(variant.live_guard is not None for variant in node_variants):
-            rejection = _ResidentRejection(
+        live_guards = [
+            variant.live_guard
+            for variant in node_variants
+            if variant.live_guard is not None
+        ]
+        if live_guards:
+            failure = exc.BackendUnsupported(
+                "pallas",
                 f"the resident Ref at {_where(node)} may contain padding and "
                 "cannot be materialized for this config",
-                True,
             )
-            _mark_rejected_descendants(node, context, rejection)
-            return rejection
+            _record_descendant_failure(node, context, failure)
+            raise failure
 
         if planned and unsupported and not masked_boundary:
-            blockers = [_where(user) for user, _rejection in unsupported]
-            rejection = _ResidentRejection(
+            blockers = [_where(user) for user, _failure in unsupported]
+            reason = (
                 f"the resident view at {_where(node)} must materialize because "
-                "it is also consumed at " + ", ".join(blockers[:3]),
-                all(item.config_dependent for _user, item in unsupported),
+                "it is also consumed at " + ", ".join(blockers[:3])
             )
+            failure = exc.BackendUnsupported("pallas", reason)
             for user in planned:
-                _mark_rejected_descendants(user, context, rejection)
+                _record_descendant_failure(user, context, failure)
         annotations[node] = _ResidentPlan(True, node_variants, selector)
-        return None
+        return
 
     annotations[node] = _ResidentPlan(False, node_variants, selector)
     for user, (transports, output, user_spec) in planned.items():
         transport_plan = _ResidentPlan(False, node_variants, None)
         for transport in transports:
             annotations[transport] = transport_plan
-        rejection = _analyze_resident_chain(
+        _analyze_resident_chain(
             user,
             output,
             user_spec,
             context=context,
             annotations=annotations,
         )
-        if rejection is not None:
-            return rejection
-    return None
 
 
 def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
@@ -964,38 +954,33 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
                 isinstance(tensor, torch.Tensor)
                 and id(tensor.untyped_storage()) in mutated_storages
             ):
-                _mark_rejected_descendants(
+                _record_descendant_failure(
                     producer,
                     context,
-                    _ResidentRejection(
-                        "the tensor it reads is also written on device", False
+                    exc.BackendUnsupported(
+                        "pallas", "the tensor it reads is also written on device"
                     ),
                 )
                 continue
 
-            variants = _root_variants(producer, info, context)
-            if isinstance(variants, _ResidentRejection):
-                _mark_rejected_descendants(producer, context, variants)
-                continue
-
             annotations: dict[torch.fx.Node, _ResidentPlan] = {}
-            rejection = _analyze_resident_chain(
-                producer,
-                variants,
-                None,
-                context=context,
-                annotations=annotations,
-                root=True,
-            )
-            if rejection is None:
+            try:
+                variants = _root_variants(producer, info, context)
+                _analyze_resident_chain(
+                    producer,
+                    variants,
+                    None,
+                    context=context,
+                    annotations=annotations,
+                    root=True,
+                )
+            except exc.BackendUnsupported as failure:
+                # Planning is transactional. Carry a child failure to every
+                # narrowing node that loses its tentative annotation.
+                _record_descendant_failure(producer, context, failure)
+            else:
                 for node, resident_plan in annotations.items():
                     node.meta[_RESIDENT_PLAN_KEY] = resident_plan
-            else:
-                # The plan is transactional. A failure in any child rolls back
-                # every tentative annotation, so carry its cause to all narrowing
-                # nodes that lose their plan rather than letting the final scan
-                # reconstruct a generic structural error.
-                _mark_rejected_descendants(producer, context, rejection)
 
     # Narrowing is accepted during tracing before its load provenance and config
     # are known. The load-rooted walk may also stop at a legitimate value boundary,
@@ -1004,20 +989,14 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
         for node in info.graph.find_nodes(op="call_function", target=subscript):
             if _resident_plan(node) is not None or not _narrowed_dims(node.args[1]):
                 continue
-            rejection = context.rejections.get(
-                node,
-                _ResidentRejection(
+            failure = context.failures.get(node)
+            if failure is None:
+                failure = exc.BackendUnsupported(
+                    "pallas",
+                    f"narrowing subscript {node.name} requires a resident Ref, but "
                     "its input is not derived from an eligible direct Pallas load",
-                    False,
-                ),
-            )
-            message = (
-                f"Pallas narrowing subscript {node.name} requires a resident Ref, "
-                f"but {rejection.reason.rstrip('.')}."
-            )
-            if rejection.config_dependent:
-                raise exc.InvalidConfig(message)
-            raise exc.InvalidIndexingType(message)
+                )
+            raise failure
 
 
 def _codegen_resident_subscript(state: CodegenState) -> ast.AST:
