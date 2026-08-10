@@ -402,6 +402,13 @@ _PERF_STATS = PerfStats(
 class TestPerfStats(TestCase):
     """perf_stats rides in the meta configs map; last *successful* benchmark wins."""
 
+    def test_source_hash_positional_compatibility(self) -> None:
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        entry = AutotuneLogEntry(0, "ok", 1.1, 0.5, "config-id", config, "source-abc")
+
+        self.assertEqual(entry.source_hash, "source-abc")
+        self.assertIsNone(entry.perf_stats)
+
     def _record(
         self,
         entries: Callable[[str, helion.Config], list[AutotuneLogEntry]],
