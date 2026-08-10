@@ -310,8 +310,8 @@ class AutotuneLogEntry(NamedTuple):
     compile_time: float | None
     config_id: str
     config: Config
-    perf_stats: PerfStats | None = None
     source_hash: str | None = None
+    perf_stats: PerfStats | None = None
 
 
 class ConfigEntry(TypedDict):

@@ -286,9 +286,6 @@ class TestAutotuneLogSink(TestCase):
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
-        # The CSV row joins to its config via config_id; each entry nests the
-        # tested config alongside its generated_code (None here -- this device-free
-        # sink test does not capture source).
         entry = sidecar["configs"][cell("config_id")]
         self.assertIsNone(entry["generated_code"])
         cfg = helion.Config.from_json(json.dumps(entry["config"]))
@@ -401,6 +398,13 @@ _PERF_STATS = PerfStats(
 
 class TestPerfStats(TestCase):
     """perf_stats rides in the meta configs map; last *successful* benchmark wins."""
+
+    def test_source_hash_positional_compatibility(self) -> None:
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        entry = AutotuneLogEntry(0, "ok", 1.1, 0.5, "config-id", config, "source-abc")
+
+        self.assertEqual(entry.source_hash, "source-abc")
+        self.assertIsNone(entry.perf_stats)
 
     def _record(
         self,
@@ -605,7 +609,6 @@ class TestAutotuneDatasetE2E(TestCase):
 
 class TestIrGraphDegradation(TestCase):
     def test_ir_graph_none_without_device_ir(self) -> None:
-        # cpu device for a host-independent hardware_info probe; see _metadata().
         meta = KernelMetadata(
             kernel_name="k", kernel_source="src", _device=torch.device("cpu")
         )
