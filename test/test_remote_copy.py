@@ -179,7 +179,7 @@ def _ring_all_gather(
     """Seed the local shard, then forward each newly received shard clockwise."""
     num_steps = hl.specialize(slots.size(1))
     for _program in hl.grid(1):
-        gathered[slots[0, :1], 0, :, :] = local_values[:, :, :]
+        gathered[slots[0, 0], 0, :, :] = local_values[0, :, :]
         hl.remote_barrier(peers[0, :])
         for step in hl.tile(num_steps, block_size=1):
             slot = slots[0, step.begin]
