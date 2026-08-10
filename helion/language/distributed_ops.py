@@ -33,10 +33,17 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AsyncCopyDescriptor",
+    "make_async_remote_copy",
+    "remote_barrier",
     "start_async_remote_copy",
+    "start_async_remote_copy_descriptor",
+    "start_async_remote_copy_descriptor_if",
     "wait_async_remote_copy",
+    "wait_async_remote_copy_if",
     "wait_recv_async_remote_copy",
+    "wait_recv_async_remote_copy_if",
     "wait_send_async_remote_copy",
+    "wait_send_async_remote_copy_if",
 ]
 
 
@@ -56,14 +63,81 @@ class AsyncCopyDescriptor:
 
     _proxy: object | None = None
 
-    def wait(self) -> None:
-        return wait_async_remote_copy(self)
+    def start(self, predicate: bool | torch.Tensor | None = None) -> None:
+        if predicate is None:
+            return start_async_remote_copy_descriptor(self)
+        return start_async_remote_copy_descriptor_if(self, predicate)
 
-    def wait_send(self) -> None:
-        return wait_send_async_remote_copy(self)
+    def wait(self, predicate: bool | torch.Tensor | None = None) -> None:
+        if predicate is None:
+            return wait_async_remote_copy(self)
+        return wait_async_remote_copy_if(self, predicate)
 
-    def wait_recv(self) -> None:
-        return wait_recv_async_remote_copy(self)
+    def wait_send(self, predicate: bool | torch.Tensor | None = None) -> None:
+        if predicate is None:
+            return wait_send_async_remote_copy(self)
+        return wait_send_async_remote_copy_if(self, predicate)
+
+    def wait_recv(self, predicate: bool | torch.Tensor | None = None) -> None:
+        if predicate is None:
+            return wait_recv_async_remote_copy(self)
+        return wait_recv_async_remote_copy_if(self, predicate)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def remote_barrier(
+    device_ids: int | torch.Tensor | list[int | torch.Tensor],
+) -> None:
+    """Synchronize ranks connected by the listed logical peer IDs.
+
+    ``device_ids`` may be one logical peer, a one-dimensional tensor of peers,
+    or a Python list. Every rank must name each peer with which it communicates.
+    Pallas statically unrolls one-dimensional peer tensors and uses a two-phase
+    neighbor barrier so a fast rank cannot enter the next invocation on a
+    reused collective ID while a peer is still finishing the prior one.
+    Triton/NVSHMEM currently strengthens this to a world barrier.
+
+    Pallas kernels with incompatible communication groups must use distinct
+    ``Config(pallas_collective_id=...)`` values. The default is zero; repeated
+    invocations of one kernel may reuse its ID because this barrier is
+    two-phase.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(remote_barrier)
+def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
+    from .._compiler.type_info import NoType
+
+    return NoType(origin=origin)
+
+
+@_decorators.register_fake(remote_barrier)
+def _(device_ids: int | torch.Tensor | list[int | torch.Tensor]) -> None:
+    return None
+
+
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def make_async_remote_copy(
+    src: torch.Tensor,
+    src_index: list[object],
+    device_id: int | torch.Tensor,
+    dst: torch.Tensor | None = None,
+    dst_index: list[object] | None = None,
+    signal: torch.Tensor | None = None,
+    signal_index: list[object] | None = None,
+) -> AsyncCopyDescriptor:
+    """Create a descriptor for a contiguous push to ``device_id``.
+
+    Call ``start()`` on the returned descriptor to issue the transfer.  Keeping
+    construction separate from issue lets software pipelines drain a descriptor
+    slot from an earlier loop iteration before reusing it for the next transfer.
+
+    See ``start_async_remote_copy`` for the region, signal, and launch-model
+    contract.
+    """
+    raise exc.NotInsideKernel
 
 
 @has_side_effect
@@ -77,7 +151,7 @@ def start_async_remote_copy(
     signal: torch.Tensor | None = None,
     signal_index: list[object] | None = None,
 ) -> AsyncCopyDescriptor:
-    """Start a contiguous push from this device to ``device_id``.
+    """Create and immediately start a contiguous push to ``device_id``.
 
     ``device_id`` is a flat logical rank in the active communication mesh.  It
     may be a compile-time integer or a runtime scalar.  By default the copy is
@@ -101,8 +175,7 @@ def start_async_remote_copy(
     raise exc.NotInsideKernel
 
 
-@_decorators.prepare_args(start_async_remote_copy)
-def _(
+def _prepare_remote_copy_args(
     src: torch.Tensor,
     src_index: list[object],
     device_id: int | torch.Tensor,
@@ -148,11 +221,18 @@ def _(
     return src, src_index, device_id, dst, dst_index, signal, signal_index
 
 
-@_decorators.type_propagation(start_async_remote_copy)
-def _(*args: TypeInfo, origin: Origin, **kwargs: TypeInfo) -> TypeInfo:
+_decorators.prepare_args(make_async_remote_copy)(_prepare_remote_copy_args)
+_decorators.prepare_args(start_async_remote_copy)(_prepare_remote_copy_args)
+
+
+def _remote_copy_type(*args: TypeInfo, origin: Origin, **kwargs: TypeInfo) -> TypeInfo:
     from .._compiler.type_info import AsyncCopyDescriptorType
 
     return AsyncCopyDescriptorType(origin=origin, element_types={})
+
+
+_decorators.type_propagation(make_async_remote_copy)(_remote_copy_type)
+_decorators.type_propagation(start_async_remote_copy)(_remote_copy_type)
 
 
 def _suffix_numel(shape: torch.Size, indexed_dims: int) -> int | None:
@@ -245,8 +325,7 @@ def _validate_signal_contract(
         )
 
 
-@_decorators.register_fake(start_async_remote_copy)
-def _(
+def _remote_copy_fake(
     src: torch.Tensor,
     src_index: list[object],
     device_id: int | torch.Tensor,
@@ -256,6 +335,60 @@ def _(
     signal_index: list[object],
 ) -> AsyncCopyDescriptor:
     return AsyncCopyDescriptor()
+
+
+_decorators.register_fake(make_async_remote_copy)(_remote_copy_fake)
+_decorators.register_fake(start_async_remote_copy)(_remote_copy_fake)
+
+
+def _make_descriptor_proxy(
+    tracer: object,
+    target: object,
+    src: torch.Tensor,
+    src_index: list[object],
+    device_id: int | torch.Tensor,
+    dst: torch.Tensor,
+    dst_index: list[object],
+    signal: torch.Tensor | None,
+    signal_index: list[object],
+) -> AsyncCopyDescriptor:
+    proxy_out = tracer.create_proxy(  # type: ignore[attr-defined]
+        "call_function",
+        target,
+        *args_to_proxies(
+            tracer,  # pyrefly: ignore[bad-argument-type]
+            (src, src_index, device_id, dst, dst_index, signal, signal_index),
+            {},
+        ),
+    )
+    descriptor = AsyncCopyDescriptor()
+    descriptor._proxy = proxy_out
+    proxy_out.node.meta["val"] = descriptor
+    return descriptor
+
+
+@_decorators.register_to_device_ir(make_async_remote_copy)
+def _(
+    tracer: object,
+    src: torch.Tensor,
+    src_index: list[object],
+    device_id: int | torch.Tensor,
+    dst: torch.Tensor,
+    dst_index: list[object],
+    signal: torch.Tensor | None,
+    signal_index: list[object],
+) -> AsyncCopyDescriptor:
+    return _make_descriptor_proxy(
+        tracer,
+        make_async_remote_copy,
+        src,
+        src_index,
+        device_id,
+        dst,
+        dst_index,
+        signal,
+        signal_index,
+    )
 
 
 @_decorators.register_to_device_ir(start_async_remote_copy)
@@ -269,25 +402,24 @@ def _(
     signal: torch.Tensor | None,
     signal_index: list[object],
 ) -> AsyncCopyDescriptor:
-    proxy_out = tracer.create_proxy(  # type: ignore[attr-defined]
-        "call_function",
+    return _make_descriptor_proxy(
+        tracer,
         start_async_remote_copy,
-        *args_to_proxies(
-            tracer,  # pyrefly: ignore[bad-argument-type]
-            (src, src_index, device_id, dst, dst_index, signal, signal_index),
-            {},
-        ),
+        src,
+        src_index,
+        device_id,
+        dst,
+        dst_index,
+        signal,
+        signal_index,
     )
-    descriptor = AsyncCopyDescriptor()
-    descriptor._proxy = proxy_out
-    proxy_out.node.meta["val"] = descriptor
-    return descriptor
 
 
-def _register_wait_op(
+def _register_descriptor_op(
     tracer: object,
     descriptor: AsyncCopyDescriptor,
     op: object,
+    predicate: bool | torch.Tensor | None = None,
 ) -> None:
     if not isinstance(descriptor, AsyncCopyDescriptor):
         raise exc.TypeInferenceError(
@@ -298,8 +430,14 @@ def _register_wait_op(
         raise exc.TypeInferenceError(
             "remote-copy descriptor is not associated with a start operation"
         )
+    args = (descriptor._proxy,) if predicate is None else (descriptor._proxy, predicate)
+    proxy_args, proxy_kwargs = args_to_proxies(
+        tracer,  # pyrefly: ignore[bad-argument-type]
+        args,
+        {},
+    )
     tracer.create_proxy(  # type: ignore[attr-defined]
-        "call_function", op, (descriptor._proxy,), {}
+        "call_function", op, proxy_args, proxy_kwargs
     )
 
 
@@ -313,6 +451,59 @@ def _wait_type(descriptor: TypeInfo, origin: Origin) -> TypeInfo:
             "hl.start_async_remote_copy"
         )
     return NoType(origin=origin)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def start_async_remote_copy_descriptor(descriptor: AsyncCopyDescriptor) -> None:
+    """Issue a transfer previously created by ``make_async_remote_copy``."""
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(start_async_remote_copy_descriptor)
+def _(descriptor: TypeInfo, *, origin: Origin) -> TypeInfo:
+    return _wait_type(descriptor, origin)
+
+
+@_decorators.register_fake(start_async_remote_copy_descriptor)
+def _(descriptor: AsyncCopyDescriptor) -> None:
+    return None
+
+
+@_decorators.register_to_device_ir(start_async_remote_copy_descriptor)
+def _(tracer: object, descriptor: AsyncCopyDescriptor) -> None:
+    _register_descriptor_op(tracer, descriptor, start_async_remote_copy_descriptor)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def start_async_remote_copy_descriptor_if(
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    """Conditionally issue a prepared transfer."""
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(start_async_remote_copy_descriptor_if)
+def _(descriptor: TypeInfo, predicate: TypeInfo, *, origin: Origin) -> TypeInfo:
+    return _wait_type(descriptor, origin)
+
+
+@_decorators.register_fake(start_async_remote_copy_descriptor_if)
+def _(descriptor: AsyncCopyDescriptor, predicate: bool | torch.Tensor) -> None:
+    return None
+
+
+@_decorators.register_to_device_ir(start_async_remote_copy_descriptor_if)
+def _(
+    tracer: object,
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    _register_descriptor_op(
+        tracer, descriptor, start_async_remote_copy_descriptor_if, predicate
+    )
 
 
 @has_side_effect
@@ -334,7 +525,36 @@ def _(descriptor: AsyncCopyDescriptor) -> None:
 
 @_decorators.register_to_device_ir(wait_async_remote_copy)
 def _(tracer: object, descriptor: AsyncCopyDescriptor) -> None:
-    _register_wait_op(tracer, descriptor, wait_async_remote_copy)
+    _register_descriptor_op(tracer, descriptor, wait_async_remote_copy)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def wait_async_remote_copy_if(
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    """Conditionally wait for outgoing-send and incoming-copy completion."""
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(wait_async_remote_copy_if)
+def _(descriptor: TypeInfo, predicate: TypeInfo, *, origin: Origin) -> TypeInfo:
+    return _wait_type(descriptor, origin)
+
+
+@_decorators.register_fake(wait_async_remote_copy_if)
+def _(descriptor: AsyncCopyDescriptor, predicate: bool | torch.Tensor) -> None:
+    return None
+
+
+@_decorators.register_to_device_ir(wait_async_remote_copy_if)
+def _(
+    tracer: object,
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    _register_descriptor_op(tracer, descriptor, wait_async_remote_copy_if, predicate)
 
 
 @has_side_effect
@@ -356,7 +576,38 @@ def _(descriptor: AsyncCopyDescriptor) -> None:
 
 @_decorators.register_to_device_ir(wait_send_async_remote_copy)
 def _(tracer: object, descriptor: AsyncCopyDescriptor) -> None:
-    _register_wait_op(tracer, descriptor, wait_send_async_remote_copy)
+    _register_descriptor_op(tracer, descriptor, wait_send_async_remote_copy)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def wait_send_async_remote_copy_if(
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    """Conditionally wait until the outgoing source can be reused."""
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(wait_send_async_remote_copy_if)
+def _(descriptor: TypeInfo, predicate: TypeInfo, *, origin: Origin) -> TypeInfo:
+    return _wait_type(descriptor, origin)
+
+
+@_decorators.register_fake(wait_send_async_remote_copy_if)
+def _(descriptor: AsyncCopyDescriptor, predicate: bool | torch.Tensor) -> None:
+    return None
+
+
+@_decorators.register_to_device_ir(wait_send_async_remote_copy_if)
+def _(
+    tracer: object,
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    _register_descriptor_op(
+        tracer, descriptor, wait_send_async_remote_copy_if, predicate
+    )
 
 
 @has_side_effect
@@ -378,4 +629,35 @@ def _(descriptor: AsyncCopyDescriptor) -> None:
 
 @_decorators.register_to_device_ir(wait_recv_async_remote_copy)
 def _(tracer: object, descriptor: AsyncCopyDescriptor) -> None:
-    _register_wait_op(tracer, descriptor, wait_recv_async_remote_copy)
+    _register_descriptor_op(tracer, descriptor, wait_recv_async_remote_copy)
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def wait_recv_async_remote_copy_if(
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    """Conditionally wait for the matching incoming copy."""
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(wait_recv_async_remote_copy_if)
+def _(descriptor: TypeInfo, predicate: TypeInfo, *, origin: Origin) -> TypeInfo:
+    return _wait_type(descriptor, origin)
+
+
+@_decorators.register_fake(wait_recv_async_remote_copy_if)
+def _(descriptor: AsyncCopyDescriptor, predicate: bool | torch.Tensor) -> None:
+    return None
+
+
+@_decorators.register_to_device_ir(wait_recv_async_remote_copy_if)
+def _(
+    tracer: object,
+    descriptor: AsyncCopyDescriptor,
+    predicate: bool | torch.Tensor,
+) -> None:
+    _register_descriptor_op(
+        tracer, descriptor, wait_recv_async_remote_copy_if, predicate
+    )

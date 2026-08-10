@@ -83,13 +83,17 @@ class DimensionTiling:
     block_ids: list[int] = field(default_factory=list)
 
 
+REMOTE_SRC_INDEXING_PATTERNS = "pallas_remote_src_indexing_patterns"
+REMOTE_DST_INDEXING_PATTERNS = "pallas_remote_dst_indexing_patterns"
+
+
 def plan_tiling(
     graphs: list[GraphInfo],
     config: Config,
     tile_strategy: TileStrategyDispatch,
 ) -> None:
-    local_access_ids = _collect_local_access_ids(graphs)
     for graph_info in graphs:
+        local_access_ids = _collect_local_access_ids([graph_info])
         _analyze_indexing_expressions(graph_info, config, local_access_ids)
 
 
@@ -122,7 +126,10 @@ def _analyze_indexing_expressions(
     for node in graph_info.graph.nodes:
         if node.op != "call_function":
             continue
-        if node.target is distributed_ops.start_async_remote_copy:
+        if node.target in (
+            distributed_ops.make_async_remote_copy,
+            distributed_ops.start_async_remote_copy,
+        ):
             _analyze_remote_copy(node, config, local_access_ids)
         elif node.target in indexing_targets:
             _analyze_indexing(node, config)
@@ -133,12 +140,26 @@ def _analyze_remote_copy(
 ) -> None:
     if len(node.args) != 7:
         raise exc.InternalError(
-            RuntimeError(
-                "start_async_remote_copy was not normalized to its seven-argument form"
-            )
+            RuntimeError("remote copy was not normalized to its seven-argument form")
         )
-    _analyze_remote_operand(node, node.args[0], node.args[1], config, local_access_ids)
-    _analyze_remote_operand(node, node.args[3], node.args[4], config, local_access_ids)
+    _analyze_remote_operand(
+        node,
+        node.args[0],
+        node.args[1],
+        config,
+        local_access_ids,
+        REMOTE_SRC_INDEXING_PATTERNS,
+        is_destination=False,
+    )
+    _analyze_remote_operand(
+        node,
+        node.args[3],
+        node.args[4],
+        config,
+        local_access_ids,
+        REMOTE_DST_INDEXING_PATTERNS,
+        is_destination=True,
+    )
 
 
 def _analyze_remote_operand(
@@ -147,6 +168,9 @@ def _analyze_remote_operand(
     subscript: object,
     config: Config,
     local_access_ids: set[int],
+    metadata_key: str,
+    *,
+    is_destination: bool,
 ) -> None:
     if not isinstance(tensor_arg, torch.fx.Node):
         raise exc.InternalError(RuntimeError("remote-copy operand is not an FX node"))
@@ -165,7 +189,7 @@ def _analyze_remote_operand(
         device_fn.pallas_tensor_dim_tilings[tensor_id] = [
             DimensionTiling() for _ in range(tensor.ndim)
         ]
-    _analyze_subscript_patterns(
+    node.meta[metadata_key] = _analyze_subscript_patterns(
         tensor,
         list(subscript),
         device_fn.pallas_tensor_dim_tilings[tensor_id],
@@ -173,7 +197,17 @@ def _analyze_remote_operand(
         config,
     )
 
-    if device_fn.pallas_memory_space.get(tensor_id) != PallasMemorySpace.HBM:
+    if is_destination and tensor_id not in local_access_ids:
+        # A destination that is not locally accessed by this graph must retain
+        # a persistent HBM allocation. This includes route-in-one-loop,
+        # consume-in-a-later-loop pipelines. Once any graph needs persistence,
+        # later local accesses must not downgrade the tensor to VMEM.
+        device_fn.pallas_memory_space[tensor_id] = PallasMemorySpace.HBM
+    elif device_fn.pallas_memory_space.get(tensor_id) != PallasMemorySpace.HBM:
+        # When the same graph both communicates through and computes from a
+        # tensor, its BlockSpec is the symmetric resident region addressed by
+        # the remote copy. Keeping that region in VMEM avoids an unnecessary
+        # HBM round trip and permits immediate consumption after the DMA wait.
         device_fn.pallas_memory_space[tensor_id] = (
             PallasMemorySpace.VMEM
             if tensor_id in local_access_ids

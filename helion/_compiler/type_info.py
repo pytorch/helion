@@ -87,6 +87,10 @@ class TypeInfo:
             return SymIntType(origin, value)
         if isinstance(value, torch.SymFloat):
             return SymFloatType(origin, value)
+        from ..language.distributed_ops import AsyncCopyDescriptor
+
+        if isinstance(value, AsyncCopyDescriptor):
+            return AsyncCopyDescriptorType(origin=origin, element_types={})
         if type(value) in (int, float, bool, type(None), range):
             return LiteralType(origin, value)
         if type(value) in (str, torch.dtype, torch.device):
@@ -1579,7 +1583,7 @@ class StackTensorType(ClassType):
 
 
 class AsyncCopyDescriptorType(ClassType):
-    """Type of the handle returned by ``hl.start_async_remote_copy``."""
+    """Type of a Helion asynchronous remote-copy handle."""
 
     # pyrefly: ignore [bad-override]
     def proxy(self) -> object:
@@ -1588,7 +1592,7 @@ class AsyncCopyDescriptorType(ClassType):
         return AsyncCopyDescriptor()
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        if attr in ("wait", "wait_send", "wait_recv"):
+        if attr in ("start", "wait", "wait_send", "wait_recv"):
             return _AsyncCopyDescriptorMethodType(origin, self, attr)
         return super().propagate_attribute(attr, origin)
 
@@ -1610,21 +1614,38 @@ class _AsyncCopyDescriptorMethodType(TypeInfo):
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo:
-        if args or kwargs:
+        if len(args) > 1 or kwargs:
             raise exc.TypeInferenceError(
-                f"AsyncCopyDescriptor.{self.method_name}() takes no arguments"
+                f"AsyncCopyDescriptor.{self.method_name}() takes at most one predicate"
             )
+        from ..language.distributed_ops import start_async_remote_copy_descriptor
+        from ..language.distributed_ops import start_async_remote_copy_descriptor_if
         from ..language.distributed_ops import wait_async_remote_copy
+        from ..language.distributed_ops import wait_async_remote_copy_if
         from ..language.distributed_ops import wait_recv_async_remote_copy
+        from ..language.distributed_ops import wait_recv_async_remote_copy_if
         from ..language.distributed_ops import wait_send_async_remote_copy
+        from ..language.distributed_ops import wait_send_async_remote_copy_if
 
-        wait_ops = {
+        descriptor_ops = {
+            "start": start_async_remote_copy_descriptor,
             "wait": wait_async_remote_copy,
             "wait_send": wait_send_async_remote_copy,
             "wait_recv": wait_recv_async_remote_copy,
         }
-        result = CallableType(origin, wait_ops[self.method_name]).propagate_call(
-            (self.descriptor_type,), {}, origin
+        conditional_ops = {
+            "start": start_async_remote_copy_descriptor_if,
+            "wait": wait_async_remote_copy_if,
+            "wait_send": wait_send_async_remote_copy_if,
+            "wait_recv": wait_recv_async_remote_copy_if,
+        }
+        op = (
+            conditional_ops[self.method_name]
+            if args
+            else descriptor_ops[self.method_name]
+        )
+        result = CallableType(origin, op).propagate_call(
+            (self.descriptor_type, *args), {}, origin
         )
         assert result is not None
         return result

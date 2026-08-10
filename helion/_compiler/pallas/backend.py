@@ -292,6 +292,7 @@ class PallasBackend(Backend):
             "flatten_loops",
             "pallas_worklist_grouping",
             "pallas_loop_type",
+            "pallas_collective_id",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
             "pallas_topk_recall_target",
@@ -1248,6 +1249,15 @@ class PallasBackend(Backend):
             scratch_shapes_str = HostFunction.current().literal_expr(scratch_shapes)
             launcher_args.append(f"_scratch_shapes={scratch_shapes_str}")
 
+        if device_fn.requires_collective_id:
+            collective_id = config.get("pallas_collective_id", 0)
+            if not isinstance(collective_id, int):
+                raise TypeError(
+                    "pallas_collective_id must be an integer, got "
+                    f"{type(collective_id)!r}"
+                )
+            launcher_args.append(f"_collective_id={collective_id!r}")
+
         # Identify which launcher arg positions correspond to pipeline-body
         # tensors (need HBM refs); all others get proper BlockSpecs.
         from ..device_function import TensorArg
@@ -1632,6 +1642,7 @@ class JaxLaunchMeta:
     out_shape_exprs: list[list[str]]
     out_dtypes: list[str]
     interpret: bool
+    collective_id: int | None
     n_args: int
 
 
@@ -1926,6 +1937,7 @@ def capture_jax_launch_metadata(
         for p in output_indices
     ]
     interpret = bool(kw.get("_pallas_interpret") or False)
+    collective_id = cast("int | None", kw.get("_collective_id"))
 
     # Derive the grid, output shapes, and shape-derived scalar launch args from the
     # RUNTIME input shapes so a single standalone is correct at every dynamic shape.
@@ -2026,6 +2038,7 @@ def capture_jax_launch_metadata(
         out_shape_exprs=out_shape_exprs,
         out_dtypes=out_dtypes,
         interpret=interpret,
+        collective_id=collective_id,
         n_args=len(launch_args),
     )
 
@@ -2218,6 +2231,7 @@ def build_jax_fn_ast(
         ast.parse(f"_INPLACE_INDICES = {meta.inplace_indices!r}").body[0],
         ast.parse(f"_USER_POSITIONS = {meta.user_positions!r}").body[0],
         ast.parse(f"_INTERPRET = {meta.interpret!r}").body[0],
+        ast.parse(f"_COLLECTIVE_ID = {meta.collective_id!r}").body[0],
         ast.parse(f"_N_ARGS = {meta.n_args}").body[0],
     ]
     entrypoint = ast.parse(_jax_entrypoint_source(meta, device_kernel)).body[0]
@@ -2283,6 +2297,7 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        scratch_shapes=_SCRATCH_SHAPES,",
         "        hbm_arg_indices=_HBM_ARG_INDICES,",
         "        smem_arg_indices=_SMEM_ARG_INDICES,",
+        "        collective_id=_COLLECTIVE_ID,",
         "        interpret=_INTERPRET,",
         "        compact=None,",
         "        orig_shapes=orig_shapes,",

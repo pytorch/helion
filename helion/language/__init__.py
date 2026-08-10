@@ -20,7 +20,12 @@ from .creation_ops import zeros as zeros
 from .debug_ops import breakpoint as breakpoint  # noqa: A004
 from .device_print import device_print as device_print
 from .distributed_ops import AsyncCopyDescriptor as AsyncCopyDescriptor
+from .distributed_ops import make_async_remote_copy as make_async_remote_copy
+from .distributed_ops import remote_barrier as remote_barrier
 from .distributed_ops import start_async_remote_copy as start_async_remote_copy
+from .distributed_ops import (
+    start_async_remote_copy_descriptor as start_async_remote_copy_descriptor,
+)
 from .distributed_ops import wait_async_remote_copy as wait_async_remote_copy
 from .distributed_ops import wait_recv_async_remote_copy as wait_recv_async_remote_copy
 from .distributed_ops import wait_send_async_remote_copy as wait_send_async_remote_copy
