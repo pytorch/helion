@@ -5808,6 +5808,25 @@ class TestPallasJaxFn(TestCase):
         ref = float(jnp.sum(ref_out))
         self.assertAlmostEqual(result, ref, places=2)
 
+    def test_jax_fn_rebinds_inplace_output(self) -> None:
+        """A mutated input must surface as a new JAX value after launch."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def increment_inplace(x: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + 1.0
+            return x
+
+        f = jax.jit(increment_inplace.jax_fn)
+        x = jnp.zeros((128, 128), dtype=jnp.float32)
+        result = jax.block_until_ready(f(x))
+        self.assertTrue(bool(jnp.all(result == 1.0)))
+
 
 class TestPallasPrinter(TestCase):
     def test_pallas_texpr_mod(self) -> None:
