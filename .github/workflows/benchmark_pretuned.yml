@@ -76,7 +76,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python-version }}
 
@@ -93,7 +93,7 @@ jobs:
 
           # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
           PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.13.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
@@ -105,7 +105,7 @@ jobs:
       - name: Install vLLM (optional baseline)
         # vLLM supplies the production baselines the pretuned kernels compare
         # against (torch.ops._C.* quant ops, cutlass_scaled_mm). vLLM's nightly
-        # wheel pins torch==2.11.0, matching the torch installed above. This is
+        # wheel pins torch==2.13.0, matching the torch installed above. This is
         # non-fatal: if it fails, pretuned_kernels/run.py falls back to the
         # torch-native baselines.
         if: startsWith(inputs.image, 'nvidia')
@@ -121,6 +121,22 @@ jobs:
             --index-strategy unsafe-best-match \
             --extra-index-url https://wheels.vllm.ai/nightly
           python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
+
+      - name: Install CuTe DSL
+        # vLLM may upgrade nvidia-cutlass-dsl, but the vLLM baselines used here
+        # call precompiled operators and do not use the Python DSL at runtime.
+        # Reinstall Helion's tested pin so its CuTe kernels compile against the
+        # expected API.
+        if: inputs.alias == 'b200'
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh cu13
+          python - <<'PY'
+          from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
+
+          check_cute_backend_requirements()
+          print("Helion CuTe backend requirements OK")
+          PY
 
       - name: CUDA Compute Check
         if: startsWith(inputs.image, 'nvidia')

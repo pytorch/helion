@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import functools
 import hashlib
 import itertools
@@ -10,6 +11,7 @@ import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Iterator
 from typing import NamedTuple
 from typing import cast
 
@@ -19,26 +21,29 @@ import torch.distributed as dist
 
 from .._compat import _regs_per_block
 from .._compat import device_num_sm
-from .._compat import get_num_xcd
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
-from .._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
-from .._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
+from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
-from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+from .._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
-from .._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from .._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
+from .._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
+from .._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from .._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
+from .._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+from .._compiler.cute.cute_flash import FlashAttentionConfig
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_offset0
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_params
@@ -48,6 +53,9 @@ from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
 from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
+from .._compiler.cute.cute_flash import _flash_pipeline_family_flags
+from .._compiler.cute.cute_flash import flash_effective_config_values
+from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -56,6 +64,7 @@ from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraint
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..exc import InvalidConfig
+from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
@@ -84,6 +93,58 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+
+def _live_log_restriction(feature: str, reason: str, verbose: bool) -> None:
+    """Log a search-space restriction live (at INFO), best-effort.
+
+    ``verbose`` is the owning :class:`ConfigSpec`'s
+    ``log_restrictions_verbose`` flag (sourced from
+    ``Settings.autotune_log_search_space_verbose``); when False this is a no-op
+    so restrictions applied outside verbose autotuning stay quiet.
+
+    Purely diagnostic: any failure here must never disrupt compilation or the
+    autotuner loop.
+    """
+    try:
+        if verbose and log.isEnabledFor(logging.INFO):
+            log.info(
+                "Autotuner feature restriction: %s (%s)",
+                feature,
+                reason,
+            )
+    except Exception:
+        log.debug("Failed to log search-space restriction", exc_info=True)
+
+
+def _record_restriction(
+    store: list[tuple[str, str]],
+    feature: str,
+    reason: str | None,
+    verbose: bool,
+) -> None:
+    """Record a search-space restriction and, when verbose, log it live.
+
+    ``verbose`` is the owning :class:`ConfigSpec`'s
+    ``log_restrictions_verbose`` flag.
+
+    Purely diagnostic: any failure here must never disrupt compilation or the
+    autotuner loop, so the whole body is best-effort.
+    """
+    if reason is None:
+        return
+    try:
+        pair = (feature, reason)
+        # De-duplicate: a shared ConfigSpec can see the same restriction applied
+        # once per matmul op (enforce_dot_requirements runs per dot node), which
+        # would otherwise emit duplicate summary lines. Preserve first-occurrence
+        # order (the field's documented contract).
+        if pair not in store:
+            store.append(pair)
+    except Exception:
+        log.debug("Failed to record search-space restriction", exc_info=True)
+    _live_log_restriction(feature, reason, verbose)
+
+
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
 
 
@@ -110,83 +171,119 @@ class MatmulFact(NamedTuple):
     rhs_dtype: torch.dtype
 
 
-class ReductionFact(NamedTuple):
-    """Workload facts for one inner reduction dim, recorded at compile time (like
-    ``MatmulFact``) so the seed heuristic branches on workload properties, not kernel
-    identity. Exactly one per seeded kernel; built in device_ir's
-    ``register_rollable_reductions`` (standard) or ``register_user_tiled_reductions``
-    (user-tiled).
+class ReductionCategory(enum.Enum):
+    """How a reduction axis maps onto the program grid — one category per reduction.
 
-    - ``block_id`` / ``size_hint``: the reduction axis and its extent (rnumel).
-    - ``m_block_ids``: the non-reduction (kept) tile block_ids.
-    - ``static_rnumel``: the extent if statically known, else None.
-    - ``itemsize``: bytes/element of the reduced tensor; byte caps key on
-      ``size_hint * itemsize``.
-    - ``num_load``: device loads over this rdim (the ``== 1`` stream-eviction gate).
-    - ``num_carried_2d_tiles``: 2-D [M_BLOCK, R_BLOCK] tiles carried across the inner
-      loop (the Band-B signal). Derived from ``AccumulatorFact``.
-    - ``non_reduction_loop_block_ids``: non-grid loop tiles over the extent that are NOT
-      the rdim (an apply/normalize pass); ``len(...) >= 1`` is the reduce-then-apply
-      (Band-C) signal.
-    - ``row_reread``: True iff the reduction-input row is live across the loop boundary
-      (risks spilling). Gates the persist byte cap + re-read eviction. From ``MemoryOpFact``.
-    - ``reread_eviction_index``: ``load_eviction_policies`` slot of the re-read load
-      (``None`` unless ``row_reread``), read from that load's ``MemoryOpFact.eviction_index``.
-    - ``full_width_output``: True iff a store writes the result back over the reduction
-      axis ([M, N], e.g. layer_norm), False for a per-row scalar ([M], e.g. sum) —
-      full-width is store/occupancy-bound, scalar-output reduction-tree-bound (opposite
-      num_warps).
-    - ``input_load_itemsize``: element size of the HBM input row load — the dtype-faithful
-      per-byte signal, distinct from ``itemsize`` (fp32-promoted = 4 at both dtypes). 0
-      when no single reduction-fed row load exists.
-    - ``body_live_tiles``: peak count of simultaneously-live rdim-shaped values in the
-      reduction body — the liveness signal bounding the persistent resident footprint. A
-      heavy body spills the register file when held persistent, so the standard track passes
-      it as ``footprint_factor`` to route such reductions to the looped path. A conservative
-      over-count (errs toward looping, never an unsafe spill); defaults to 1.
-    - ``per_feature_accumulator``: the faithful M-collapse discriminator — True iff a
-      loop-carried accumulator exists whose dims are ALL the materialized feature axis (the
-      grad-parameter buffer, e.g. ``grad_bias[N]`` / ``grad_weight[N]``), read from
-      accumulator provenance. The user-tiled seed keys ``is_m_collapse`` on it. False for
-      per-row or 2-D accumulators (softmax_two_pass/kl_div/welford/...).
-    - ``feature_footprint``: the PRODUCT of the materialized feature-axis extents — the
-      resident ``[inner, *features]`` per-row footprint a grad-parameter M-collapse byte-caps
-      its inner reduction tile against (``feature_footprint * itemsize``). For a 2-D norm this
-      is ``N``; for a 3-D norm the full ``C*S`` (a per-axis MAX under-counts and spills). Used
-      by both M-collapse tracks; 1 when no materialized feature axis exists.
-
-    ``grid_rows`` is NOT stored — a pure function of ``m_block_ids`` + env, computed on
-    demand by its one consumer (the narrow-row ``num_warps`` lever).
+    - ``FULL_SLICE`` — the whole axis is reduced within one program (``x[m, :]``); not on the grid.
+    - ``FULL_GRID`` — a full-extent axis on the grid, block == extent (fully resident per program).
+    - ``GRID_TILE`` — a grid axis reduced over but NOT full-extent: the grid parallelizes the
+      reduction across programs, so the whole-axis size is not a per-program extent.
+    - ``USER_TILE`` — an inner sequential ``hl.tile`` the user wrote over the reduction axis.
+    - ``DECLINED`` — no static extent (e.g. jagged / data-dependent); recorded but never sized.
     """
 
+    FULL_SLICE = "full_slice"
+    FULL_GRID = "full_grid"
+    GRID_TILE = "grid_tile"
+    USER_TILE = "user_tile"
+    DECLINED = "declined"
+
+
+# Categories the seed sizes a per-program reduction extent for. GRID_TILE (grid-parallelized
+# partial) stays a grid row and DECLINED (no static extent) falls back to the default, so neither
+# is sized as a reduction.
+SIZED_REDUCTION_CATEGORIES = frozenset(
+    {
+        ReductionCategory.FULL_SLICE,
+        ReductionCategory.FULL_GRID,
+        ReductionCategory.USER_TILE,
+    }
+)
+# Categories that occupy the full reduction extent within one program.
+FULL_EXTENT_CATEGORIES = frozenset(
+    {ReductionCategory.FULL_SLICE, ReductionCategory.FULL_GRID}
+)
+
+
+class ReductionDescriptor(NamedTuple):
+    """One reduction OCCURRENCE: a (``graph_id``, ``block_id``) reduction on the ORIGINAL
+    (pre-roll) device graphs. Stage 1 emits a list of these; the Stage-2 allocator consumes them.
+
+    A reduction axis may occur in more than one original graph (e.g. a kernel that reduces the
+    same axis in two separate passes) — each occurrence is its own descriptor, so sequential
+    passes over one axis are NOT collapsed.
+
+    Descriptors with the same ``graph_id`` are co-resident (the compiler fused them into one graph
+    -> shared resident working set). ``graph_id`` is read off the ORIGINAL graphs only (rolled
+    ``ReductionLoopGraphInfo`` subgraphs excluded), so it is invariant to the autotuner flipping a
+    ``reduction_loops`` knob.
+
+    Fields:
+    - ``category``: the :class:`ReductionCategory`.
+    - ``block_id`` / ``graph_id``: the reduction axis + its original-graph co-residency key.
+    - ``size_hint`` / ``itemsize`` / ``input_load_itemsize``: extent (element count), the
+      fp32-promoted accumulator itemsize, and the HBM-load element width feeding it.
+    - ``carried_2d_count``: the NUMBER of >=2-D ``[M_BLOCK, R_BLOCK]`` loop-carried accumulators
+      whose last dim is this rdim (e.g. kl_div=1, jsd=2); those tiles stay resident the whole loop.
+      A count (not a bool) because the carried byte cap divides the budget by it. 0 = none here.
+    - ``row_reread`` / ``reread_eviction_index`` / ``num_load``: per-reduction memory-op signals.
+    """
+
+    category: ReductionCategory
     block_id: int
+    graph_id: int
     size_hint: int
-    m_block_ids: tuple[int, ...]
-    static_rnumel: int | None
     itemsize: int
-    num_load: int
-    num_carried_2d_tiles: int = 0
-    non_reduction_loop_block_ids: tuple[int, ...] = ()
+    input_load_itemsize: int = 0
+    carried_2d_count: int = 0
     row_reread: bool = False
     reread_eviction_index: int | None = None
-    full_width_output: bool = True
-    input_load_itemsize: int = 0
-    body_live_tiles: int = 1
-    feature_footprint: int = 1
-    per_feature_accumulator: bool = False
+    num_load: int = 0
+
+
+class CoResidencyGroup(NamedTuple):
+    """A ``graph_id`` equivalence class of reductions whose working tiles are live at the same
+    time, so ONE budget must fit them all. ``descriptor_indices`` indexes into
+    ``ReductionKernelFact.reductions``.
+
+    ``live_tiles`` is the group's resident tile set — one ``dim_block_ids`` tuple per
+    register-resident tile (the block id each dim spans, ``None`` for a static/broadcast dim). It
+    is the peak live set of the group's home graph, combined with the for-loop bodies the group
+    drives and its If/Else branch siblings (see device_ir ``_group_live_tiles``). Each loop-carried
+    accumulator is captured inline at its real shape, so the Stage-2 footprint can sum ``∏(dim
+    widths)`` per actual tile. Empty when the fact is built without a live env (a bare-spec test).
+    """
+
+    graph_id: int
+    descriptor_indices: tuple[int, ...]
+    live_tiles: tuple[tuple[int | None, ...], ...] = ()
+
+
+class ReductionKernelFact(NamedTuple):
+    """The per-kernel Stage-1 product that Stage 2 consumes: the list of reduction descriptors,
+    their co-residency groups (``graph_id`` classes), the non-reduction user-tiled loops (sized as
+    a separate pass), and the parallel grid axes (rows with no reduction over them).
+
+    Built by ``build_reduction_kernel_fact``. ``reductions`` may be empty (a kernel with only
+    GRID_TILE / DECLINED reductions, or none) — the seed then declines.
+    """
+
+    reductions: tuple[ReductionDescriptor, ...]
+    coresidency_groups: tuple[CoResidencyGroup, ...]
+    non_reduction_loop_block_ids: tuple[int, ...] = ()
+    grid_axis_block_ids: tuple[int, ...] = ()
 
 
 class MatmulWithReductionEpilogueFact(NamedTuple):
     """A fused matmul + reduction-over-output-axis epilogue, recorded when a ``MatmulFact`` and
-    a register-resident epilogue ``ReductionFact`` co-occur in one kernel (e.g.
+    a register-resident epilogue reduction co-occur in one kernel (e.g.
     ``matmul_rms_norm``: ``acc = x @ y`` then a reduction over N on the carried ``[M_BLOCK,
-    N]`` accumulator, then write-back). A COMPOSED fact: it holds the two existing facts plus
-    the few derived fields the seed keys on. ``TritonMatmulReductionEpilogueHeuristic``
-    branches on it.
+    N]`` accumulator, then write-back). A COMPOSED fact: it holds the matmul fact plus the few
+    derived fields the seed keys on. ``TritonMatmulReductionEpilogueHeuristic`` branches on it.
 
-    - ``matmul`` / ``reduction``: the composed sub-facts (the matmul + the epilogue reduction).
-    - ``n_extent``: the specialized output width N (= ``reduction.size_hint``); N is
-      ``hl.specialize``'d (never tiled), so both the ``[M_BLOCK, N]`` accumulator and the
+    - ``matmul``: the composed matmul sub-fact.
+    - ``n_extent``: the specialized output width N (= the epilogue reduction's ``size_hint``); N
+      is ``hl.specialize``'d (never tiled), so both the ``[M_BLOCK, N]`` accumulator and the
       ``[K_BLOCK, N]`` operand tile scale with N — the resident-footprint signal the
       footprint-aware tile chooser keys on.
     - ``m_block_id`` / ``k_block_id``: the grid M tile and the K tile the seed sizes
@@ -194,7 +291,6 @@ class MatmulWithReductionEpilogueFact(NamedTuple):
     """
 
     matmul: MatmulFact
-    reduction: ReductionFact
     n_extent: int
     m_block_id: int | None
     k_block_id: int | None
@@ -230,7 +326,7 @@ class MemoryOpFact(NamedTuple):
     # unresolvable). Shape-resolved fallback for the gates below (the plain-slice case,
     # e.g. ``out[tile_m, :]``).
     indexed_block_ids: tuple[int | None, ...] = ()
-    # inner-dim extent for a rank>=2 op (legacy reduction-width signal; gates use subscript_block_ids).
+    # inner-dim extent for a rank>=2 op (a reduction-width signal; gates use subscript_block_ids).
     inner_extent: int | None = None
     # AXIS the op's INDEX subscripts address (block-id per non-bare-int position, from the tile/offset
     # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
@@ -240,6 +336,23 @@ class MemoryOpFact(NamedTuple):
     # ``subscript_block_ids`` (from ``.stride()``). A stride-1 position is the contiguous (coalescing)
     # axis — the last subscript for a row-major tensor, a different one for a transposed/strided view.
     subscript_strides: tuple[int, ...] = ()
+    # GATHER stride per subscript position: the multiplier on the tile index in the op's
+    # ADDRESS expression (``x[tile]`` → 1, ``x[2*tile.index]`` → 2). Independent of
+    # ``subscript_strides``, the accessed tensor's LAYOUT stride -- two ops can index the
+    # same row-major tensor while one reads it stride-2 and the other stride-1. A stride-k
+    # gather wastes ``1 - 1/k`` of every 32B sector, so this is the coalescing signal;
+    # 1 means coalesced or unknown. See ``indexing_strategy.subscript_index_scale``.
+    subscript_index_scales: tuple[int, ...] = ()
+    # Size-hinted extent at each subscript position. With ``subscript_affine_block_ids``
+    # this gives the tile ONE op materializes: the product of extents at non-tiled
+    # positions (a tiled position contributes its block size). Distinct from
+    # ``accessed_numel``, a per-TENSOR count that also grows for an oversized tensor.
+    subscript_extents: tuple[int, ...] = ()
+    # Block-ids resolved THROUGH an affine (scaled/offset) subscript.
+    # ``subscript_block_ids`` reads ``meta["tile_with_offset"]``, which the lowering sets
+    # for ``tile_index + const`` but not ``tile_index * const``, so a scaled subscript
+    # loses its axis there. Separate field so existing consumers are unaffected.
+    subscript_affine_block_ids: tuple[int | None, ...] = ()
     # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
     # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
     # resolvable fake tensor). A FULL-EXTENT op has ``accessed_numel`` == the problem numel; a
@@ -254,9 +367,9 @@ class MemoryOpFact(NamedTuple):
 class AccumulatorFact(NamedTuple):
     """One loop-carried tensor accumulator in a reduction loop, recorded at compile time.
     Reduction-AGNOSTIC (like ``MemoryOpFact``): ``dim_block_ids`` is the per-dim block-id
-    provenance (``None`` for a static dim), ``itemsize`` the element size.
-    ``ReductionFact.num_carried_2d_tiles`` counts accumulators whose last dim is the rdim
-    (a 1-D [M_BLOCK] scalar accumulator counts as 0).
+    provenance (``None`` for a static dim), ``itemsize`` the element size. Accumulators whose last
+    dim is the reduction axis feed ``ReductionDescriptor.carried_2d_count`` (a 1-D ``[M_BLOCK]``
+    scalar accumulator counts as 0).
     """
 
     dim_block_ids: tuple[int | None, ...]
@@ -289,6 +402,16 @@ class PointwiseElementwiseFact(NamedTuple):
     - ``sfu_ops``: count of transcendental (SFU) ops. SFU ops are latency-bound on a distinct unit, so
       a transcendental-heavy tile wants more warps while an all-FMA tile of the same op count does not
       — so SFU count (not total op count) drives the num_warps ramp.
+    - ``gather_stride``: the widest GATHER stride any full-extent op applies to a tiled axis in
+      its ADDRESS expression (``x[tile]`` → 1, ``x[2*tile.index]`` → 2). A stride-k gather
+      touches k 32B sectors per useful sector, so the same useful bytes cost ~k× the requests —
+      the coalescing input to the byte budget and the num_warps ramp. NOT the layout stride,
+      which cannot distinguish two ops indexing one row-major tensor at different strides.
+      1 means coalesced, or an address form the walk does not recognize.
+    - ``max_op_slab_numel``: the LARGEST single op's untiled fan-out, vs ``slab_numel``'s SUM
+      of the same quantity. Bytes ADD across ops (so the sum sizes the byte/register budgets)
+      but LANES do not (separate vector instructions over the same threads), so the max is what
+      bounds a num_warps starvation cap.
     """
 
     total_numel: int
@@ -297,6 +420,8 @@ class PointwiseElementwiseFact(NamedTuple):
     compute_itemsize: int
     contig_block_ids: tuple[int, ...] = ()
     sfu_ops: int = 0
+    gather_stride: int = 1
+    max_op_slab_numel: int = 1
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -355,6 +480,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "matrix_instr_nonkdim",
         "num_ctas",
         "occupancy",
+        "pallas_worklist_grouping",
         "pallas_loop_type",
         "pallas_pre_broadcast",
         *CUTE_TCGEN05_TUNABLE_KEYS,
@@ -388,6 +514,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_load_buffer_count",
         "pallas_pre_broadcast",
         "xcd_remap",
     }
@@ -417,6 +544,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_load_buffer_count",
         "pallas_pre_broadcast",
         "cute_vector_widths",
         *BACKEND_TUNABLE_KEYS,
@@ -430,12 +558,8 @@ VALID_KEYS: frozenset[str] = frozenset(
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
-# Full validation superset: "compact_worklist" is a tuned loop type but is only
-# *offered* to compactable kernels (owner hl.grid + jagged bounds), so it is gate
-# -appended to the search choices rather than living in the default set.  Keeping
-# AUTOTUNED_PALLAS_LOOP_TYPES first preserves `[0] == "emit_pipeline"` for the
-# setdefault below.
-VALID_PALLAS_LOOP_TYPES = (*AUTOTUNED_PALLAS_LOOP_TYPES, "compact_worklist")
+VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
+VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -498,6 +622,20 @@ def get_valid_store_cache_modifiers(backend_name: str) -> tuple[str, ...]:
     return ("",)
 
 
+class SearchDimensionInfo(NamedTuple):
+    """One tunable search dimension described from the config spec.
+
+    ``cardinality`` is the number of distinct values (``None`` if unknown /
+    unbounded); ``values`` are the explicit choices when cheaply enumerable.
+    """
+
+    name: str
+    cardinality: int | None
+    values: list[object] | None
+    is_sequence: bool
+    num_items: int
+
+
 class ConfigSpec:
     def __init__(
         self,
@@ -509,9 +647,17 @@ class ConfigSpec:
         | None = _TARGET_DEVICE_CAPABILITY_UNSET,
         device: torch.device | None = None,
         num_sm: int | None = None,
+        log_restrictions_verbose: bool = False,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        # When True, search-space restriction decisions are logged live (at
+        # INFO) the moment they are applied, in addition to being recorded for
+        # the end-of-run summary. Sourced from
+        # ``Settings.autotune_log_search_space_verbose`` by the compile path
+        # (see CompileEnvironment); left False otherwise so restrictions applied
+        # outside verbose autotuning stay quiet.
+        self.log_restrictions_verbose = log_restrictions_verbose
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
@@ -564,6 +710,12 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        # Why each disabled pid_type was removed, for search-space logging.
+        self.disallowed_pid_type_reasons: dict[str, str] = {}
+        # (feature, reason) pairs for every non-pid_type search-space restriction
+        # (currently the tcgen05 narrowing applied per matmul), for search-space
+        # logging. De-duplicated; ordered by first occurrence.
+        self.restriction_reasons: list[tuple[str, str]] = []
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
@@ -587,13 +739,17 @@ class ConfigSpec:
             EnumFragment(choices=self.valid_atomic_indexing_types()),
             length=0,
         )
+        self.pallas_load_buffer_count = ListOf(
+            IntegerFragment(1, 2, 1),
+            length=0,
+        )
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
-        # CuTe flash-attention autotune surface gating (Tasks #25 + #28).
+        # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
         # and behavior is byte-identical to the env-only path. Set True when the
         # flash detector fires (see ``lower_to_device_ir``). The shape needed to
@@ -601,16 +757,23 @@ class ConfigSpec:
         self.cute_flash_search_enabled: bool = False
         self._cute_flash_head_dim: int | None = None
         self._cute_flash_num_kv: int | None = None
+        self._cute_flash_dtype: torch.dtype = torch.float16
         self._cute_flash_is_causal: bool = False
         self._cute_flash_has_kv_tile_pruning: bool = False
         self._cute_flash_requires_ws_overlap: bool = False
         self._cute_flash_small_biased_candidate: bool = False
+        self._cute_flash_standard_dense_output: bool = False
+        self._cute_flash_standard_causal_output: bool = False
         self._cute_flash_block_size_targets: dict[int, int] = {}
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
+        # Compiler paths can opt their seeds into a single bounded timeout
+        # retry. ``None`` leaves all benchmark behavior unchanged.
+        self.compiler_seed_timeout_retry_repetitions: int | None = None
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
-        self.reduction_facts: list[ReductionFact] = []
+        # The Stage-1 categorizing product the reduction seed + allocator consume.
+        self.reduction_kernel_fact: ReductionKernelFact | None = None
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
         self.pointwise_facts: list[PointwiseElementwiseFact] = []
@@ -715,13 +878,27 @@ class ConfigSpec:
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
 
-    def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
-        """Disallow a pid_type from being used in the config."""
+    def disallow_pid_type(
+        self, pid_type: PidTypeLiteral, reason: str | None = None
+    ) -> None:
+        """Disallow a pid_type from being used in the config.
 
+        ``reason`` explains why the pid_type is unavailable for this kernel; it is
+        recorded (first reason wins) and surfaced by the search-space logger. When
+        verbose search-space logging is enabled it is also logged live.
+        """
+
+        newly_disabled = pid_type in self.allowed_pid_types
+        if newly_disabled and reason is not None:
+            self.disallowed_pid_type_reasons.setdefault(pid_type, reason)
         self.allowed_pid_types = tuple(
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
+        if newly_disabled and reason is not None and self.log_restrictions_verbose:
+            _live_log_restriction(
+                f"pid_type={pid_type!r} disabled", reason, self.log_restrictions_verbose
+            )
 
     @property
     def cute_tcgen05_search_enabled(self) -> bool:
@@ -755,22 +932,47 @@ class ConfigSpec:
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_has_non_tcgen05_operand = value
 
+    def _resolve_cute_flash_config(
+        self, config: Mapping[str, object]
+    ) -> FlashAttentionConfig:
+        assert self._cute_flash_head_dim is not None
+        assert self._cute_flash_num_kv is not None
+        flash_config = config
+        if self._cute_flash_requires_ws_overlap:
+            flash_config = {**config, FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
+        return resolve_flash_config(
+            self._cute_flash_head_dim,
+            self._cute_flash_num_kv,
+            flash_config,
+            dtype=self._cute_flash_dtype,
+            is_causal=self._cute_flash_is_causal,
+            standard_dense_output=self._cute_flash_standard_dense_output,
+            prefer_packed_reduce=(
+                self._cute_flash_has_kv_tile_pruning
+                or self._cute_flash_requires_ws_overlap
+            ),
+        )
+
     def _normalize_cute_flash(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        """Normalize the flash-attention knobs (Tasks #25 + #28).
+        """Normalize the flash-attention autotune surface.
 
         Only runs when ``cute_flash_search_enabled`` is set (the flash detector
-        fired). Mirrors ``CuteTcgen05Config.normalize_strategy``: each key in
-        ``FLASH_CONFIG_KEYS`` is validated against its fragment's choices and
-        defaulted (to the fragment default = env/shape-resolved current value)
-        when absent. When the flag is off this is a no-op so configs never grow
-        the flash keys and behavior is byte-identical to today.
+        fired). Active keys are validated against their fragments, while legacy
+        structural keys are projected into the compound pipeline-family key and
+        removed before the config is used as an autotune identity.
         """
         if not self.cute_flash_search_enabled:
             return
         assert self._cute_flash_head_dim is not None
         assert self._cute_flash_num_kv is not None
+        # ``q_tile_count`` is a family-derived invariant and is projected back
+        # to its canonical value below.  The historical MMA key accepted any
+        # truthy object, so preserve that fixed-config compatibility before the
+        # active Boolean fragment validates it.
+        if FLASH_MMA_INTERLEAVE_KEY in config:
+            config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
         from .._compiler.cute.cute_flash import flash_autotune_fragments
 
         block_size_targets = self._cute_flash_block_size_target_list()
@@ -785,27 +987,64 @@ class ConfigSpec:
         elif not self._is_cute_flash_config_envelope(config, block_size_targets):
             return
 
+        has_legacy_structural_config = any(
+            config.get(key) is not None for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
+        )
+        legacy_effective = None
+        if has_legacy_structural_config and FLASH_PIPELINE_FAMILY_KEY not in config:
+            legacy_resolution_config = {
+                key: config[key]
+                for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
+                if key in config
+            }
+            if FLASH_PERSISTENT_KEY in config:
+                legacy_resolution_config[FLASH_PERSISTENT_KEY] = config[
+                    FLASH_PERSISTENT_KEY
+                ]
+            legacy_effective = self._resolve_cute_flash_config(legacy_resolution_config)
         if self._cute_flash_requires_ws_overlap:
-            config[FLASH_TOPOLOGY_KEY] = "ws_overlap"
+            config[FLASH_PIPELINE_FAMILY_KEY] = "ws_overlap"
             topology_override = "ws_overlap"
+            pipeline_family_override = "ws_overlap"
         else:
-            valid_manual_topologies = {"fa4", "ws_overlap"}
-            topology_value = config.get(FLASH_TOPOLOGY_KEY)
-            topology_override = (
-                topology_value if topology_value in valid_manual_topologies else None
+            requested_family = _flash_pipeline_family_flags(
+                config.get(FLASH_PIPELINE_FAMILY_KEY)
             )
+            pipeline_family_override = (
+                str(config[FLASH_PIPELINE_FAMILY_KEY])
+                if requested_family is not None
+                else legacy_effective.pipeline_family
+                if legacy_effective is not None
+                else None
+            )
+            if requested_family is not None:
+                topology_override = requested_family.topology
+            else:
+                valid_manual_topologies = {"fa4", "ws_overlap"}
+                topology_value = config.get(FLASH_TOPOLOGY_KEY)
+                topology_override = (
+                    topology_value
+                    if topology_value in valid_manual_topologies
+                    else None
+                )
         fragments = flash_autotune_fragments(
             self._cute_flash_head_dim,
             self._cute_flash_num_kv,
+            dtype=self._cute_flash_dtype,
             is_causal=self._cute_flash_is_causal,
             has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
+            standard_dense_output=self._cute_flash_standard_dense_output,
             topology_override=cast("str | None", topology_override),
+            pipeline_family_override=pipeline_family_override,
         )
         e2e_offset_was_present = FLASH_E2E_OFFSET_KEY in config
         e2e_offset0_was_present = FLASH_E2E_OFFSET0_KEY in config
         e2e_offset_keys = (FLASH_E2E_OFFSET_KEY, FLASH_E2E_OFFSET0_KEY)
+        explicit_e2e_offsets = {
+            key: config[key] for key in e2e_offset_keys if key in config
+        }
         for key, fragment in fragments.items():
             choices = cast("EnumFragment", fragment).choices
             if key in config:
@@ -823,22 +1062,21 @@ class ConfigSpec:
                             f"got {config[key]!r}"
                         )
             else:
-                if key not in e2e_offset_keys:
+                if key not in (*e2e_offset_keys, FLASH_PIPELINE_FAMILY_KEY):
                     config[key] = fragment.default()
-        effective_topology = cast("str", config[FLASH_TOPOLOGY_KEY])
-        if effective_topology == "fa4" and self._cute_flash_num_kv % 2 != 0:
-            effective_topology = "ws_overlap"
-        if fix_invalid:
-            config[FLASH_TOPOLOGY_KEY] = effective_topology
-        if effective_topology != "fa4":
-            config[FLASH_ROLE_MAP_KEY] = "helion"
-            config[FLASH_EPI_TMA_KEY] = False
-            config[FLASH_MASKED_E2E_SCHEDULE_KEY] = "inherit"
-            config[FLASH_CAUSAL_KV_ORDER_KEY] = "ascending"
-            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
-        causal_kv_order = config.get(FLASH_CAUSAL_KV_ORDER_KEY)
-        if not self._cute_flash_is_causal or causal_kv_order != "descending":
-            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
+        if FLASH_PIPELINE_FAMILY_KEY not in config:
+            family_fragment = fragments[FLASH_PIPELINE_FAMILY_KEY]
+            config[FLASH_PIPELINE_FAMILY_KEY] = (
+                legacy_effective.pipeline_family
+                if legacy_effective is not None
+                else family_fragment.default()
+            )
+
+        effective = self._resolve_cute_flash_config(config)
+        effective_topology = effective.topology
+        config.update(flash_effective_config_values(effective))
+        if effective_topology == "fa4":
+            config.update(explicit_e2e_offsets)
         e2e_schedule_default = (
             "8/2"
             if (
@@ -970,25 +1208,98 @@ class ConfigSpec:
                         f"{FLASH_E2E_SCHEDULE_KEY}={config[FLASH_E2E_SCHEDULE_KEY]!r}, "
                         f"got {e2e_offset!r}"
                     )
+        self._normalize_cute_flash_register_budget(
+            config,
+            fragments,
+            effective_topology,
+            fix_invalid=fix_invalid,
+        )
+        for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
+            config.pop(key, None)
+
+    def _normalize_cute_flash_register_budget(
+        self,
+        config: dict[str, object],
+        fragments: Mapping[str, ConfigSpecFragment],
+        effective_topology: str,
+        *,
+        fix_invalid: bool,
+    ) -> None:
+        if effective_topology != "fa4":
+            return
+        softmax_regs = config.get(FLASH_SOFTMAX_REGS_KEY)
+        corr_regs = config.get(FLASH_CORR_REGS_KEY)
+        other_regs = config.get(FLASH_OTHER_REGS_KEY)
+        if (
+            type(softmax_regs) is not int
+            or type(corr_regs) is not int
+            or type(other_regs) is not int
+        ):
+            return
+        budget = 2 * softmax_regs + corr_regs + other_regs
+        if budget <= 512:
+            return
+        message = (
+            "FA4 register budget exceeds 512: "
+            f"2 * {FLASH_SOFTMAX_REGS_KEY} ({softmax_regs}) + "
+            f"{FLASH_CORR_REGS_KEY} ({corr_regs}) + "
+            f"{FLASH_OTHER_REGS_KEY} ({other_regs}) = {budget}"
+        )
+        if not fix_invalid:
+            raise InvalidConfig(message)
+
+        def _int_choices(key: str) -> tuple[int, ...]:
+            fragment = cast("EnumFragment", fragments[key])
+            return tuple(value for value in fragment.choices if type(value) is int)
+
+        current = (softmax_regs, corr_regs, other_regs)
+        best: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+        for softmax_candidate in _int_choices(FLASH_SOFTMAX_REGS_KEY):
+            for corr_candidate in _int_choices(FLASH_CORR_REGS_KEY):
+                for other_candidate in _int_choices(FLASH_OTHER_REGS_KEY):
+                    candidate = (softmax_candidate, corr_candidate, other_candidate)
+                    if 2 * softmax_candidate + corr_candidate + other_candidate > 512:
+                        continue
+                    score = (
+                        sum(a != b for a, b in zip(candidate, current, strict=True)),
+                        sum(
+                            abs(a - b) for a, b in zip(candidate, current, strict=True)
+                        ),
+                        -softmax_candidate,
+                    )
+                    if best is None or score < best[0]:
+                        best = (score, candidate)
+        if best is None:
+            raise InvalidConfig(message)
+        _score, (softmax_regs, corr_regs, other_regs) = best
+        config[FLASH_SOFTMAX_REGS_KEY] = softmax_regs
+        config[FLASH_CORR_REGS_KEY] = corr_regs
+        config[FLASH_OTHER_REGS_KEY] = other_regs
 
     def enable_cute_flash_search(
         self,
         *,
         head_dim: int,
         num_kv: int,
+        dtype: torch.dtype = torch.float16,
         block_size_targets: Mapping[int, int],
         is_causal: bool = False,
         has_kv_tile_pruning: bool = False,
         requires_ws_overlap: bool = False,
         small_biased_candidate: bool = False,
+        standard_dense_output: bool = False,
+        standard_causal_output: bool = False,
     ) -> None:
         self.cute_flash_search_enabled = True
         self._cute_flash_head_dim = head_dim
         self._cute_flash_num_kv = num_kv
+        self._cute_flash_dtype = dtype
         self._cute_flash_is_causal = is_causal
         self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
         self._cute_flash_requires_ws_overlap = requires_ws_overlap
         self._cute_flash_small_biased_candidate = small_biased_candidate
+        self._cute_flash_standard_dense_output = standard_dense_output
+        self._cute_flash_standard_causal_output = standard_causal_output
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -1130,6 +1441,39 @@ class ConfigSpec:
     def _tcgen05_full_tile_direct_entry_seed_config(self) -> helion.Config | None:
         return self._cute_tcgen05_config.full_tile_direct_entry_seed_config()
 
+    def register_cute_tcgen05_mma_analysis(
+        self,
+        *,
+        m_block_id: int,
+        n_block_id: int,
+        k_block_id: int,
+        input_dtype: torch.dtype,
+        has_leading_passthrough: bool,
+        explicit_epi_tile_compatible: bool,
+    ) -> None:
+        self._cute_tcgen05_config.register_mma_analysis(
+            m_block_id=m_block_id,
+            n_block_id=n_block_id,
+            k_block_id=k_block_id,
+            input_dtype=input_dtype,
+            has_leading_passthrough=has_leading_passthrough,
+            explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        )
+
+    def _tcgen05_matmul_block_fragments(
+        self,
+    ) -> tuple[BlockSizeFragment, BlockSizeFragment, BlockSizeFragment] | None:
+        return self._cute_tcgen05_config._matmul_block_fragments()
+
+    def _tcgen05_matmul_seed_block_sizes(
+        self, *, bm: int, bn: int, bk: int
+    ) -> list[int] | None:
+        return self._cute_tcgen05_config._matmul_seed_block_sizes(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+
     def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
         self._cute_tcgen05_config.restrict_cluster_m_search(choices)
 
@@ -1165,10 +1509,13 @@ class ConfigSpec:
                 flash_attention_seed_configs(
                     self._cute_flash_head_dim,
                     self._cute_flash_num_kv,
+                    dtype=self._cute_flash_dtype,
                     is_causal=self._cute_flash_is_causal,
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                     requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
+                    standard_dense_output=self._cute_flash_standard_dense_output,
+                    standard_causal_output=self._cute_flash_standard_causal_output,
                     block_size_targets=self._cute_flash_block_size_target_list(),
                 )
             )
@@ -1207,6 +1554,27 @@ class ConfigSpec:
             cluster_m=cluster_m,
         )
 
+    def _tcgen05_grouped_dynamic_ab4_fits_for_target(
+        self,
+        *,
+        dtype_bytes: int,
+        device: torch.device,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        c_stages: int,
+    ) -> bool:
+        return self._cute_tcgen05_config.grouped_dynamic_ab4_fits_for_target(
+            dtype_bytes=dtype_bytes,
+            device=device,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            c_stages=c_stages,
+        )
+
     def _fix_tcgen05_ab_stages_three_search_config(
         self, config: dict[str, object]
     ) -> None:
@@ -1240,6 +1608,7 @@ class ConfigSpec:
         allow_cluster_m2_fp8_small_grid: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
+        reason: str | None = None,
     ) -> None:
         self._cute_tcgen05_config.narrow_autotune_to_validated_configs(
             allow_persistent_pid_types=allow_persistent_pid_types,
@@ -1249,6 +1618,12 @@ class ConfigSpec:
             allow_cluster_m2_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
+        )
+        _record_restriction(
+            self.restriction_reasons,
+            "tcgen05 search narrowed to validated configs",
+            reason,
+            self.log_restrictions_verbose,
         )
 
     def supports_config_key(self, key: str) -> bool:
@@ -1381,6 +1756,10 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
+        if self.backend_name == "cute":
+            self._cute_tcgen05_config.prepare_normalization(
+                config, fix_invalid=_fix_invalid
+            )
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -1622,6 +2001,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "pallas_load_buffer_count",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -1671,6 +2051,42 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        if (
+            self.supports_config_key("pallas_load_buffer_count")
+            and self.has_pallas_inner_loops
+            and config.get("pallas_loop_type") == "fori_loop"
+        ):
+            values = config.setdefault(
+                "pallas_load_buffer_count", self.pallas_load_buffer_count.default()
+            )
+            expected = self.pallas_load_buffer_count.length
+            if (
+                not isinstance(values, list)
+                or len(values) != expected
+                or any(
+                    type(value) is not int or value not in (1, 2) for value in values
+                )
+            ):
+                raise InvalidConfig(
+                    "pallas_load_buffer_count must be a list containing one "
+                    "buffer count (1 or 2) per input tensor "
+                    f"(expected {expected}, got {values!r})"
+                )
+            if expected == 0:
+                config.pop("pallas_load_buffer_count")
+        else:
+            config.pop("pallas_load_buffer_count", None)
+
+        if (
+            self.supports_config_key("pallas_pre_broadcast")
+            and self.has_pallas_inner_loops
+            and config.get("pallas_loop_type") not in ("fori_loop", "emit_pipeline")
+        ):
+            # The transform widens loop-carried VMEM scratch, so it only applies
+            # to the streaming lowerings.  "unroll" carries values through the
+            # jax.lax.fori_loop tuple and allocates no scratch to widen; pin the
+            # flag off there so both settings do not autotune as distinct configs.
+            config.pop("pallas_pre_broadcast", None)
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
@@ -1957,9 +2373,32 @@ class ConfigSpec:
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
+        effective_overrides = overrides
+        family_override: str | None = None
+        if self.cute_flash_search_enabled and overrides:
+            exact_family = overrides.get(FLASH_PIPELINE_FAMILY_KEY)
+            if _flash_pipeline_family_flags(exact_family) is not None:
+                family_override = cast("str", exact_family)
+            elif FLASH_PIPELINE_FAMILY_KEY not in overrides:
+                legacy = {
+                    key: overrides[key]
+                    for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
+                    if overrides.get(key) is not None
+                }
+                if legacy:
+                    if FLASH_PERSISTENT_KEY in overrides:
+                        legacy[FLASH_PERSISTENT_KEY] = overrides[FLASH_PERSISTENT_KEY]
+                    family_override = self._resolve_cute_flash_config(
+                        legacy
+                    ).pipeline_family
+                    effective_overrides = {
+                        **overrides,
+                        FLASH_PIPELINE_FAMILY_KEY: family_override,
+                    }
         return ConfigGeneration(
             self,
-            overrides=overrides,
+            overrides=effective_overrides,
+            _flash_pipeline_family_override=family_override,
             advanced_controls_files=advanced_controls_files,
             process_group_name=process_group_name,
         )
@@ -1970,6 +2409,8 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
+                return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
         return False, None
 
@@ -1992,7 +2433,17 @@ class ConfigSpec:
     def default_config(self) -> helion.Config:
         if self.compiler_default_config is None:
             return self._base_default_config()
-        config = helion.Config.from_dict(self.compiler_default_config.config)
+        # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
+        # the full base defaults so every other key — including user register_tunable defaults — is
+        # preserved rather than dropped.
+        merged = dict(self._base_default_config().config)
+        merged.update(self.compiler_default_config.config)
+        config = helion.Config.from_dict(merged)
+        # Then normalize, so a promoted compiler default has the same canonical field set as the
+        # ``_base_default_config`` path: without this its ``repr``/equality differs from its own
+        # flatten/unflatten round-trip, which breaks callers that key on the config identity
+        # (e.g. benchmark result maps).
+        self.normalize(config, _fix_invalid=True)
         self._shrink_for_numel_constraints(config)
         return config
 
@@ -2014,8 +2465,45 @@ class ConfigSpec:
             self.tensor_numel_constraints, block_sizes, min_sizes
         )
 
+    def iter_search_dimensions(
+        self, value_limit: int = 100
+    ) -> Iterator[SearchDimensionInfo]:
+        """Yield one :class:`SearchDimensionInfo` per tunable field.
+
+        Public entry point for describing the search space. Scalar fragments
+        report their own ``cardinality()``/``search_values()``; a
+        ``BlockIdSequence`` reports the product of its per-item cardinalities.
+        Fields whose sizing depends on ConfigSpec-level state rather than the
+        fragment (e.g. ``pid_type``, ``num_stages``) are left to the caller.
+        """
+        from .block_id_sequence import BlockIdSequence
+
+        for name, field in self._flat_fields().items():
+            if isinstance(field, BlockIdSequence):
+                yield SearchDimensionInfo(
+                    name=name,
+                    cardinality=field.cardinality(self),
+                    values=None,
+                    is_sequence=True,
+                    num_items=len(field),
+                )
+            else:
+                yield SearchDimensionInfo(
+                    name=name,
+                    cardinality=field.cardinality(),
+                    values=field.search_values(value_limit),
+                    is_sequence=False,
+                    num_items=0,
+                )
+
     def _flat_fields(
         self,
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        return self._flat_fields_with_flash_family()
+
+    def _flat_fields_with_flash_family(
+        self,
+        _flash_pipeline_family_override: str | None = None,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
         """Return {key: field} for all tunable fields in flat_config() order.
 
@@ -2036,27 +2524,22 @@ class ConfigSpec:
                     flash_autotune_fragments(
                         self._cute_flash_head_dim,
                         self._cute_flash_num_kv,
+                        dtype=self._cute_flash_dtype,
                         is_causal=self._cute_flash_is_causal,
                         has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
                         requires_ws_overlap=self._cute_flash_requires_ws_overlap,
                         small_biased_candidate=(
                             self._cute_flash_small_biased_candidate
                         ),
+                        standard_dense_output=self._cute_flash_standard_dense_output,
+                        pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
-                # Universal pid emission honors ``loop_orders`` (the
-                # launch grid swaps which tile axis is outer), and the
-                # better order is shape-dependent. Expose only on the
-                # non-tcgen05 branch — the tcgen05 persistent
-                # scheduler relies on a fixed
-                # ``pid_info[0]=M, pid_info[1]=N`` mapping for
-                # ``cluster_m`` / virtual-PID logic, so sampling
-                # ``loop_orders=[[1, 0]]`` there would steer cluster
-                # logic onto the wrong axis. Measured evidence for
-                # the non-tcgen05 widening lives in ``cute_plan.md``
-                # §7.0 "Recent landed work".
+                # Universal pid emission honors ``loop_orders`` and the
+                # better order is shape-dependent. tcgen05 exposes the same
+                # field from CuteTcgen05Config.flat_fields().
                 if (
                     self.supports_config_key("loop_orders")
                     and len(self.loop_orders) > 0
@@ -2122,6 +2605,12 @@ class ConfigSpec:
             fields["indexing"] = self.indexing
         if self.supports_config_key("atomic_indexing"):
             fields["atomic_indexing"] = self.atomic_indexing
+        if (
+            self.supports_config_key("pallas_load_buffer_count")
+            and self.has_pallas_inner_loops
+            and self.pallas_load_buffer_count.length > 0
+        ):
+            fields["pallas_load_buffer_count"] = self.pallas_load_buffer_count
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
@@ -2152,8 +2641,6 @@ class ConfigSpec:
         else:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
-            # Default to the non-compact set; "compact_worklist" is gated below so
-            # it never leaks into non-jagged kernels.
             choices = AUTOTUNED_PALLAS_LOOP_TYPES
             if self.has_symbolic_or_data_dependent_bounds:
                 # Exclude "unroll" (uses Python range(), can't handle traced
@@ -2164,12 +2651,13 @@ class ConfigSpec:
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
                 if self.grid_block_ids:
-                    # Owner hl.grid + jagged bounds => compaction is applicable.
-                    # Offer it as a tuned choice; detect_compact_worklist_plan
-                    # raises exc.InvalidConfig (autotuner-skippable) if the full
-                    # pattern doesn't match, so a residual mismatch is scored inf
-                    # and skipped rather than fatal.
-                    choices = (*choices, "compact_worklist")
+                    # Owner hl.grid + jagged bounds may be compactable. The full
+                    # detector remains authoritative, so residual mismatches are
+                    # autotuner-skippable InvalidConfig candidates.
+                    choices = (*choices, "unroll")
+                    fields["pallas_worklist_grouping"] = EnumFragment(
+                        choices=VALID_PALLAS_WORKLIST_GROUPINGS
+                    )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
@@ -2232,16 +2720,29 @@ class ConfigSpec:
         return EnumFragment(tuple(files))
 
     def flat_key_layout(
-        self, *, advanced_controls_files: list[str] | None = None
+        self,
+        *,
+        advanced_controls_files: list[str] | None = None,
     ) -> list[tuple[str, int, bool]]:
         """Return (key_name, num_flat_entries, is_sequence) for each field.
 
         is_sequence is True for BlockIdSequence keys whose list values
         are spread across individual flat slots.
         """
-        result = [
-            (key, *field._flat_key_info()) for key, field in self._flat_fields().items()
-        ]
+        fields = self._flat_fields()
+        result = [(key, *field._flat_key_info()) for key, field in fields.items()]
+        if self._advanced_controls_file_fragment(advanced_controls_files) is not None:
+            result.append(("advanced_controls_file", 1, False))
+        return result
+
+    def _flat_key_layout_with_flash_family(
+        self,
+        *,
+        advanced_controls_files: list[str] | None,
+        flash_pipeline_family: str,
+    ) -> list[tuple[str, int, bool]]:
+        fields = self._flat_fields_with_flash_family(flash_pipeline_family)
+        result = [(key, *field._flat_key_info()) for key, field in fields.items()]
         if self._advanced_controls_file_fragment(advanced_controls_files) is not None:
             result.append(("advanced_controls_file", 1, False))
         return result
@@ -2253,8 +2754,34 @@ class ConfigSpec:
         advanced_controls_files: list[str] | None = None,
     ) -> helion.Config:
         """Map a flattened version of the config using the given function."""
+        return self._flat_config_from_fields(
+            fn,
+            self._flat_fields(),
+            advanced_controls_files=advanced_controls_files,
+        )
+
+    def _flat_config_with_flash_family(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None,
+        flash_pipeline_family: str,
+    ) -> helion.Config:
+        return self._flat_config_from_fields(
+            fn,
+            self._flat_fields_with_flash_family(flash_pipeline_family),
+            advanced_controls_files=advanced_controls_files,
+        )
+
+    def _flat_config_from_fields(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        fields: Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment],
+        *,
+        advanced_controls_files: list[str] | None,
+    ) -> helion.Config:
         config: dict[str, Any] = {}
-        for key, field in self._flat_fields().items():
+        for key, field in fields.items():
             config[key] = field._flat_config(self, fn)
 
         for name in (
@@ -2274,6 +2801,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "pallas_load_buffer_count",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -2519,6 +3047,17 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         if value is None:
             return None
         normalized = super()._normalize(name, value)
+        # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
+        # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
+        # block size <= 1.  The autotuner search never proposes < 8 (its fragment
+        # ``low`` is 8), but the reduction seed's byte budget can collapse the chunk
+        # to 1 on a reduction co-resident with a wide feature.  Floor a stray 1 up to
+        # that same search floor of 8; for a small extent the ``>= size_hint`` rule
+        # below then collapses it to persistent ``None``, and 1 is the only
+        # power-of-two chunk that can hit this (so legal chunks 2, 4, 8, ... are
+        # left byte-identical).
+        if isinstance(normalized, int) and normalized < 2:
+            normalized = 8
         # A looped reduction whose chunk equals or exceeds the reduction
         # extent has only one iteration — it is semantically identical to a
         # persistent reduction, but the looped codegen path occasionally

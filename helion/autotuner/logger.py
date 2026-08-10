@@ -53,6 +53,25 @@ ExcInfoParam: TypeAlias = (
     | None
 )
 
+_AUTOTUNE_CSV_FIELDS = (
+    "run_id",
+    "timestamp_s",
+    "config_id",
+    "generation",
+    "status",
+    "perf_ms",
+    "compile_time_s",
+    "config",
+)
+_AUTOTUNE_SOURCE_CSV_FIELDS = (
+    "run_id",
+    "timestamp_s",
+    "config_id",
+    "generation",
+    "status",
+    "source_hash",
+)
+
 
 class _ElapsedFormatter(logging.Formatter):
     def __init__(self, elapsed_fn: Callable[[], int]) -> None:
@@ -139,8 +158,6 @@ class AutotuningLogger:
             sink.start_run()
             try:
                 yield sink
-                # Only record the dataset if the tuning succeeds. If the tuning
-                # run fails raise the actual tuning error.
                 sink.end_run()
             finally:
                 self._detach_sink()
@@ -294,6 +311,7 @@ class AutotuneLogEntry(NamedTuple):
     config_id: str
     config: Config
     perf_stats: PerfStats | None = None
+    source_hash: str | None = None
 
 
 class ConfigEntry(TypedDict):
@@ -307,6 +325,9 @@ class ConfigEntry(TypedDict):
 class AutotuneLogSink:
     """
     Writes autotune results to CSV and connects autotune logs to a file handler.
+
+    Entries carrying generated-source identity also populate a lazy
+    ``.sources.csv`` sidecar, leaving the established main CSV schema unchanged.
     """
 
     def __init__(
@@ -317,12 +338,15 @@ class AutotuneLogSink:
     ) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")
+        self.source_path = self._base_path.with_suffix(".sources.csv")
         self.log_path = self._base_path.with_suffix(".log")
         self.meta_path = self._base_path.with_suffix(".meta.jsonl")
         self._metadata = metadata
         self._collect_dataset = collect_dataset
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: CsvWriter | None = None
+        self._source_csv_file: io.TextIOWrapper | None = None
+        self._source_csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
         self._run_start_time: float | None = None
         # Per-config dataset entries, flushed to .meta.jsonl at end_run. Unbounded
@@ -352,18 +376,7 @@ class AutotuneLogSink:
         self._csv_file = self.csv_path.open("a", encoding="utf-8", newline="")
         self._csv_writer = csv.writer(self._csv_file)
         if write_header:
-            self._csv_writer.writerow(
-                [
-                    "run_id",
-                    "timestamp_s",
-                    "config_id",
-                    "generation",
-                    "status",
-                    "perf_ms",
-                    "compile_time_s",
-                    "config",
-                ]
-            )
+            self._csv_writer.writerow(_AUTOTUNE_CSV_FIELDS)
             self._csv_file.flush()
         handler = logging.FileHandler(self.log_path, mode="a", encoding="utf-8")
         handler.setLevel(logging.DEBUG)
@@ -375,6 +388,11 @@ class AutotuneLogSink:
             self._csv_file.close()
         self._csv_file = None
         self._csv_writer = None
+        if self._source_csv_file is not None:
+            self._source_csv_file.flush()
+            self._source_csv_file.close()
+        self._source_csv_file = None
+        self._source_csv_writer = None
         if self._log_handler is not None:
             self._log_handler.flush()
             self._log_handler.close()
@@ -406,10 +424,10 @@ class AutotuneLogSink:
         """
         if self._csv_writer is None:
             return None
-        canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
-        config_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        from .search_space_logger import canonical_config_id
+
+        config_id = canonical_config_id(config)
         if self._collect_dataset and config_id not in self._configs:
-            # Don't overwrite: a re-encountered config keeps its attached source.
             self._configs[config_id] = {
                 "config": config.config,
                 "generated_code": None,
@@ -468,6 +486,34 @@ class AutotuneLogSink:
             and entry.config_id in self._configs
         ):
             self._configs[entry.config_id]["perf_stats"] = entry.perf_stats.to_dict()
+        if entry.source_hash is not None:
+            self._record_source_hash(entry, run_id, timestamp_field)
+
+    def _record_source_hash(
+        self, entry: AutotuneLogEntry, run_id: str, timestamp_field: str
+    ) -> None:
+        if self._source_csv_writer is None:
+            write_header = (
+                not self.source_path.exists() or self.source_path.stat().st_size == 0
+            )
+            self._source_csv_file = self.source_path.open(
+                "a", encoding="utf-8", newline=""
+            )
+            self._source_csv_writer = csv.writer(self._source_csv_file)
+            if write_header:
+                self._source_csv_writer.writerow(_AUTOTUNE_SOURCE_CSV_FIELDS)
+        self._source_csv_writer.writerow(
+            [
+                run_id,
+                timestamp_field,
+                entry.config_id,
+                entry.generation,
+                entry.status,
+                entry.source_hash,
+            ]
+        )
+        assert self._source_csv_file is not None
+        self._source_csv_file.flush()
 
 
 SUPPRESSED_TRITON_CODE_MSG = (

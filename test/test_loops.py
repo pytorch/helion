@@ -37,6 +37,7 @@ import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
+FIXED_BLOCK_SIZE = 16
 
 
 @helion.kernel
@@ -273,6 +274,29 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfNotTriton("range loop hints are Triton-specific")
+    def test_fixed_block_unroll_and_pipeline(self):
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bhn = x.size(0)
+            c = x.size(1)
+            for tile_bhn in hl.tile(bhn, block_size=1):
+                for tile_c in hl.tile(c, block_size=FIXED_BLOCK_SIZE):
+                    x_block = x[tile_bhn, tile_c].float()
+                    out[tile_bhn, tile_c] = x_block
+            return out
+
+        args = (torch.randn((1, 64), device=DEVICE, dtype=HALF_DTYPE),)
+        _, result = code_and_output(
+            fn,
+            args,
+            range_num_stages=[0, 2],
+            range_unroll_factors=[0, 2],
+        )
+        torch.testing.assert_close(result, args[0])
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_loop_arg_block(self):
@@ -291,7 +315,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -679,6 +702,10 @@ class TestLoops(RefEagerTestBase, TestCase):
         for e, c in zip(eager_results, compiled_result, strict=False):
             torch.testing.assert_close(e, c)
 
+    @xfailIfPallasInterpret(
+        "jax interpret-mode discharge cannot handle non-divisible blocked "
+        "slices (traced sizes)"
+    )
     def test_chebyshev_polynomials(self):
         """Test nested loops with sequential computation - Chebyshev polynomials."""
 
@@ -1293,10 +1320,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = x + fill_value[0]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallasInterpret(
-        "JAX MLIR translation rule for primitive 'program_id' is not implemented "
-        "for the CPU platform"
-    )
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
@@ -1459,6 +1482,84 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.randn(128, 1024, dtype=torch.float32, device=DEVICE)
         torch.testing.assert_close(fn(x), x)
 
+    @skipIfRefEager("inspects generated code; ref eager never lowers a kernel")
+    @skipIfNotTriton(
+        "asserts on Triton's rendered bound; Pallas lowers a dependent tile "
+        "bound through its own loop codegen and never reaches this path"
+    )
+    def test_min_max_over_derived_tile_edge_keeps_its_own_formula(self):
+        """A tile edge folded into ``min``/``max`` must keep its own formula.
+
+        ``min``/``max`` are device function replacements, so they fold their
+        operands into one sympy expression at trace time.  That drops the
+        ``tile_end``/``tile_count``/``tile_id`` op and leaves a bare symbol,
+        whose origin then has to be honored when it is rendered.  Emitting the
+        loop offset for all of them substitutes ``tile.begin``: for an end
+        bound that is a zero trip count on the first tile.
+
+        The 200x200 input is deliberately not a multiple of the 128 block, so
+        the final tile is partial and the end has to clamp.
+        """
+        cfg = helion.Config(block_sizes=[128, 128])
+
+        @helion.kernel(config=cfg)
+        def end_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), tile_q.end)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def end_max(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, max(8, tile_q.end)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def count_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), tile_q.count)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(config=cfg)
+        def id_min(x) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for tile_q in hl.tile(x.size(0)):
+                acc = hl.zeros([tile_q], dtype=torch.float32)
+                for tile_k in hl.tile(0, min(x.size(1), 2 * tile_q.id + 1)):
+                    acc += x[tile_q, tile_k].sum(-1)
+                out[tile_q] = acc.to(out.dtype)
+            return out
+
+        x = torch.randn(200, 200, device=DEVICE)
+        # Each edge renders its own formula; the offset alone would mean begin.
+        # The id case also pins the parenthesization: unbracketed, ``2 *
+        # offset_0 // BLOCK`` would floor-divide the product instead.
+        for label, kernel, fragment in (
+            ("end/min", end_min, "offset_0 + _BLOCK_SIZE_0"),
+            ("end/max", end_max, "offset_0 + _BLOCK_SIZE_0"),
+            ("count", count_min, "tl.cdiv("),
+            ("id", id_min, "2 * (offset_0 // _BLOCK_SIZE_0)"),
+        ):
+            with self.subTest(edge=label):
+                # Codegen the declared config, not the spec default: the
+                # partial final tile depends on the 128 block size.
+                code = kernel.bind((x,)).to_triton_code(cfg)
+                rendered = [ln for ln in code.splitlines() if "symnode_0 = " in ln]
+                self.assertTrue(rendered, f"no rendered bound in:\n{code}")
+                self.assertIn(fragment, rendered[0])
+
     @skipIfNotTriton(
         "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
     )
@@ -1577,6 +1678,132 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, x + 1)
         self.assertNotIn("tl.debug_barrier()", code)
+
+    @skipIfNotTriton(
+        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    )
+    def test_intra_loop_store_then_load_barrier(self):
+        """A store to a tensor followed by a load of the same tensor *within one
+        loop body* (using a different-shaped index) is a cross-thread
+        read-after-write; codegen must emit tl.debug_barrier() between them so the
+        store is visible before the reload (multi-warp, Triton)."""
+
+        @helion.kernel(autotune_effort="none")
+        def store_then_reload(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            for tile_m in hl.tile(m):
+                # store the whole row, then read back a slice of it (different
+                # index shape -> different thread<->element layout -> RAW race).
+                row = x[tile_m, :] * 2.0
+                x[tile_m, :] = row
+                half = hl.arange(n // 2)
+                lo = x[tile_m, half]
+                hi = x[tile_m, half + n // 2]
+                x[tile_m, half] = hi
+                x[tile_m, half + n // 2] = lo
+            return x
+
+        torch.manual_seed(0)
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        expected = x * 2.0
+        expected = torch.cat([expected[:, n // 2 :], expected[:, : n // 2]], dim=-1)
+        for num_warps in (4, 8):
+            code, result = code_and_output(
+                store_then_reload,
+                (x.clone(),),
+                block_sizes=[1],
+                num_warps=num_warps,
+                num_stages=2,
+            )
+            self.assertIn("tl.debug_barrier()", code)
+            torch.testing.assert_close(result, expected)
+
+    @skipIfNotTriton(
+        "tl.debug_barrier() is Triton codegen-specific; "
+        "the negative assertion is trivially true on non-Triton backends"
+    )
+    def test_intra_loop_load_before_store_no_barrier(self):
+        """A load that precedes the store (read-modify-write) is not a hazard and
+        must not get an intra-loop barrier."""
+
+        @helion.kernel(autotune_effort="none")
+        def load_then_store(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]  # load BEFORE any store to x
+                x[tile_m, :] = row + 1.0
+            return x
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            load_then_store,
+            (x.clone(),),
+            block_sizes=[1],
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(result, x + 1.0)
+        self.assertNotIn("tl.debug_barrier()", code)
+
+    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    def test_intra_loop_barrier_tracks_storage_aliases(self):
+        @helion.kernel(autotune_effort="none")
+        def store_then_load_view(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            alias = x.view(m, n)
+            for tile_m in hl.tile(m):
+                x[tile_m, :] = x[tile_m, :] * 2.0
+                half = hl.arange(n // 2)
+                lo = alias[tile_m, half]
+                hi = alias[tile_m, half + n // 2]
+                x[tile_m, half] = hi
+                x[tile_m, half + n // 2] = lo
+            return x
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        expected = x * 2.0
+        expected = torch.cat([expected[:, 64:], expected[:, :64]], dim=-1)
+        code, result = code_and_output(
+            store_then_load_view,
+            (x.clone(),),
+            block_sizes=[1],
+            num_warps=4,
+            num_stages=2,
+        )
+        self.assertIn("tl.debug_barrier()", code)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    def test_intra_loop_barrier_crosses_if_subgraph(self):
+        @helion.kernel(autotune_effort="none")
+        def store_then_load_in_branch(
+            x: torch.Tensor, flag: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.shape
+            for tile_m in hl.tile(m):
+                x[tile_m, :] = x[tile_m, :] * 2.0
+                if flag[0] > 0:
+                    half = hl.arange(n // 2)
+                    lo = x[tile_m, half]
+                    hi = x[tile_m, half + n // 2]
+                    x[tile_m, half] = hi
+                    x[tile_m, half + n // 2] = lo
+            return x
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        flag = torch.ones(1, device=DEVICE)
+        expected = x * 2.0
+        expected = torch.cat([expected[:, 64:], expected[:, :64]], dim=-1)
+        code, result = code_and_output(
+            store_then_load_in_branch,
+            (x.clone(), flag),
+            block_sizes=[1],
+            num_warps=4,
+            num_stages=2,
+        )
+        self.assertIn("tl.debug_barrier()", code)
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":

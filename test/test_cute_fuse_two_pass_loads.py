@@ -2,7 +2,7 @@
 
 When a kernel reads the same gmem tensor in two sequential inner-tile
 loops over the same range, the pass detects the redundant load and
-caches the first sweep's values in a small ``cute.make_fragment(...)``.
+caches the first sweep's values in a small ``cute.make_rmem_tensor(...)``.
 The second sweep then reads from the fragment instead of issuing a
 second LDG, eliminating the duplicate HBM/L1 traffic.
 

@@ -22,17 +22,20 @@ import zipfile
 
 RETENTION_DAYS = 365
 
-# CI alias (platform_short before any backend suffix) -> name of the
-# benchmark_dispatch input whose `default` lists the kernels that platform
-# is expected to run on the nightly cron. Stable mapping; the kernel list
-# itself is parsed from the workflow YAML so dashboard expectations track
-# whatever's currently in the workflow defaults without manual edits.
+# CI alias (platform_short before any backend suffix) -> name(s) of the
+# benchmark_dispatch input(s) whose `default` lists the kernels that platform
+# is expected to run on the nightly cron. Stable mapping; the kernel list(s)
+# are parsed from the workflow YAML so dashboard expectations track whatever's
+# currently in the workflow defaults without manual edits. Platforms can draw
+# from multiple inputs: h100 adds `kernels_linattn`, and `tpu` unions
+# run_tpu.py (`kernels_tpu`) with the tritonbench bridge (`kernels_tpu_bridge`),
+# which cover disjoint kernels but share the one `tpu` dashboard column.
 _PLATFORM_KERNELS_INPUT = {
-    "h100": "kernels",
-    "b200": "kernels",
-    "b200_cute": "kernels_cute",
-    "mi350x": "kernels",
-    "tpu": "kernels_tpu",
+    "h100": ("kernels", "kernels_linattn"),
+    "b200": ("kernels",),
+    "b200_cute": ("kernels_cute",),
+    "mi350x": ("kernels",),
+    "tpu": ("kernels_tpu", "kernels_tpu_bridge"),
 }
 
 
@@ -75,14 +78,19 @@ def get_expected_kernels_per_platform(workflow_path):
             continue
         md = input_default.match(line)
         if md:
-            input_defaults[current] = {
-                k.strip() for k in md.group(1).split(",") if k.strip()
-            }
+            names = {k.strip() for k in md.group(1).split(",") if k.strip()}
+            # The linattn suite lists variant names only; each variant emits a
+            # forward and a forward+backward ("-bwd") dashboard row, so expect both.
+            if current == "kernels_linattn":
+                names |= {f"{n}-bwd" for n in names}
+            input_defaults[current] = names
             current = None
     return {
-        plat: input_defaults[input_name]
-        for plat, input_name in _PLATFORM_KERNELS_INPUT.items()
-        if input_name in input_defaults
+        plat: set().union(
+            *(input_defaults[input_name] for input_name in input_names)
+        )
+        for plat, input_names in _PLATFORM_KERNELS_INPUT.items()
+        if all(input_name in input_defaults for input_name in input_names)
     }
 
 
@@ -186,6 +194,11 @@ def parse_run(run_dir, active_platforms=None):
         dirname = os.path.basename(bench_dir)
         parts = dirname.replace("benchmark-results-", "").split("-", 1)
         platform_short = parts[0] if parts else "unknown"
+        # The tritonbench-bridge TPU job uploads under the `tpu_bridge` alias but
+        # benchmarks the same hardware as run_tpu.py's `tpu` job (on a disjoint
+        # set of kernels); fold it into the shared `tpu` platform column.
+        if platform_short == "tpu_bridge":
+            platform_short = "tpu"
 
         if active_platforms and platform_short not in active_platforms:
             continue
@@ -206,15 +219,22 @@ def parse_run(run_dir, active_platforms=None):
         extra_info = data[0].get("benchmark", {}).get("extra_info", {})
         backend = extra_info.get("backend")
         backend_label = "CuTe" if backend == "cute" else backend
-        if backend and backend != "triton" and not platform_short.endswith(f"_{backend}"):
+        # `pallas` is the TPU-native backend (like `triton` on GPU), not an
+        # alternative worth its own column, so it doesn't get a platform suffix.
+        if (
+            backend
+            and backend not in ("triton", "pallas")
+            and not platform_short.endswith(f"_{backend}")
+        ):
             platform_short = f"{platform_short}_{backend}"
             if active_platforms and platform_short not in active_platforms:
                 continue
         platform = extra_info.get("device", platform_short)
-        if backend and backend != "triton":
+        if backend and backend not in ("triton", "pallas"):
             platform = f"{platform} ({backend_label})"
         if platform == platform_short and platform in ("b200", "h100", "mi325x", "mi350x"):
             continue
+        baseline_label = extra_info.get("baseline_label")
 
         # Group records by model name (a single file may contain multiple kernels)
         by_model = {}
@@ -235,6 +255,7 @@ def parse_run(run_dir, active_platforms=None):
                 "platform_short": platform_short,
                 "shapes": model_data["shapes"],
                 "metrics": model_data["metrics"],
+                "baseline_label": baseline_label,
             })
     return kernels
 
@@ -322,6 +343,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
                     "platform_short": k["platform_short"],
                     "shapes": k["shapes"],
                     "history": [],
+                    "baseline_label": k["baseline_label"],
                 }
             kernel_index[key]["history"].append(build_history_entry(run, k["metrics"], k["shapes"]))
 
@@ -340,6 +362,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
                     "platform_short": prev.get("platform_short", key.split("|")[1] if "|" in key else ""),
                     "shapes": [],
                     "history": [],
+                    "baseline_label": prev.get("baseline_label"),
                 }
             kernel_index[key]["history"].append(cached_runs[run["run_id"]])
 
@@ -427,6 +450,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             "kernel": entry["kernel"],
             "platform": entry["platform"],
             "platform_short": entry["platform_short"],
+            "baseline_label": entry["baseline_label"],
             "has_nightly_data": latest_data is not None,
             "status": status,
             "accuracy_failures": acc_failures,
@@ -446,6 +470,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
     # Stats and platform/kernel lists reflect only entries with nightly data
     nightly_summary = [s for s in summary if s["has_nightly_data"]]
+    default_baseline_summary = [s for s in nightly_summary if not s.get("baseline_label")]
     platforms = sorted({s["platform"] for s in nightly_summary})
     platform_shorts = sorted({s["platform_short"] for s in nightly_summary})
     unique_kernels = sorted({s["kernel"] for s in nightly_summary})
@@ -476,10 +501,10 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             "accuracy_failures": sum(len(s["accuracy_failures"]) for s in nightly_summary),
             "run_failures": sum(len(s["run_failures"]) for s in nightly_summary),
             "infra_missing": sum(1 for s in nightly_summary if s["infra_missing"]),
-            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in nightly_summary]), 4),
-            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in nightly_summary]), 4),
-            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in nightly_summary]), 4),
-            "helion_wins": sum(1 for s in nightly_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
+            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in default_baseline_summary]), 4),
+            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in default_baseline_summary]), 4),
+            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in default_baseline_summary]), 4),
+            "helion_wins": sum(1 for s in default_baseline_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
         },
         "summary": summary,
     }

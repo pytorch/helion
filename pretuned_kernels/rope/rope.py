@@ -7,7 +7,7 @@ from typing import Callable
 
 import torch
 
-import helion.experimental
+import helion
 import helion.language as hl
 
 
@@ -22,7 +22,7 @@ def _rope_shape_key(
     return q_heads * head_dim, seq_len
 
 
-@helion.experimental.aot_kernel(key=_rope_shape_key, static_shapes=True)
+@helion.aot_kernel(key=_rope_shape_key, static_shapes=True)
 def rope_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -95,7 +95,7 @@ def rope_fwd(
     return q_out, k_out
 
 
-@helion.experimental.aot_kernel(key=_rope_shape_key, static_shapes=True)
+@helion.aot_kernel(key=_rope_shape_key, static_shapes=True)
 def rope_bwd(
     grad_q_out: torch.Tensor,
     grad_k_out: torch.Tensor,

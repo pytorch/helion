@@ -15,6 +15,7 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
@@ -930,6 +931,9 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
     @largeTensorTest("8GB", device=DEVICE)
     @skipIfRefEager("RuntimeError in ref eager mode")
+    @skipIfMTIA(
+        "Triton-MTIA: register-cache layernorm (G=8) needs >14 circular buffers; see T280008478"
+    )
     def test_list_register_cache_layernorm(self):
         """Test two-pass layernorm with register-cached list elements."""
         M, D, G = 1024 * 1024, 32, 8
@@ -956,6 +960,9 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
     @largeTensorTest("8GB", device=DEVICE)
     @skipIfRefEager("RuntimeError in ref eager mode")
+    @skipIfMTIA(
+        "Triton-MTIA: no-cache layernorm (G=8, 2*G loads) exceeds the 14 circular-buffer limit; see T280008478"
+    )
     def test_list_no_cache_layernorm(self):
         """Test two-pass layernorm without register cache (re-gathers in pass 2)."""
         M, D, G = 1024 * 1024, 32, 8
@@ -990,6 +997,9 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
     )
     @skipIfCute(
         "register caching does not beat re-gather on cute: runtime dominated by two-stage shared reductions"
+    )
+    @skipIfMTIA(
+        "Triton-MTIA: both layernorm kernels exceed the 14 circular-buffer limit; see T280008478"
     )
     def test_register_cache_faster_than_no_cache(self):
         """Verify register-cached layernorm is faster than re-gathering."""

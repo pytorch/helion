@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from packaging import version
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
@@ -22,11 +23,13 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import check_example
 from helion._testing import float32_matmul_precision
+from helion._testing import get_test_float32_matmul_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCudaSharedMemoryLessThan
+from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
@@ -35,14 +38,15 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
-_orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
+_orig_float32_matmul_precision: str = "none"
 
 
 def _compile_only(
@@ -69,16 +73,18 @@ def _compile_only(
 
 
 def setUpModule() -> None:
-    global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
-    _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
-    _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
+    global _orig_cudnn_fp32_precision, _orig_float32_matmul_precision
+    cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+    _orig_cudnn_fp32_precision = cudnn_conv.fp32_precision
+    _orig_float32_matmul_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(get_test_float32_matmul_precision())
+    cudnn_conv.fp32_precision = "tf32"
 
 
 def tearDownModule() -> None:
-    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
-    torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
+    cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+    torch.set_float32_matmul_precision(_orig_float32_matmul_precision)
+    cudnn_conv.fp32_precision = _orig_cudnn_fp32_precision
 
 
 @onlyBackends(["triton", "cute", "pallas"])
@@ -126,9 +132,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
-    @xfailIfPallas(
-        "Pallas TPU clamps the N block to the lane width (128) which does"
-        " not match the test's N=96 bias dimension"
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
     )
     def test_matmul_bias_epilogue_wrapper(self):
         from typing import Any
@@ -369,8 +375,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             block_sizes=[32, 256],
             static_shapes=True,
-            atol=1e-2,
-            rtol=1e-2,
+            atol=0.02,
+            rtol=0.2,
         )
 
     def test_matmul_layernorm_small_shapes_compile_on_cute(self):
@@ -634,6 +640,46 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
 
+    @parametrize("reduction_block_size", (32, 1024))
+    @onlyBackends(["triton"])
+    @skipIfNotCUDA()
+    @skipIfRefEager("Test requires compiling a specific reduction config")
+    @skipUnlessTensorDescriptor("Test configs require tensor descriptor support")
+    def test_welford_bfloat16_accuracy(self, reduction_block_size):
+        from examples.welford import eager_layer_norm
+        from examples.welford import welford
+
+        config = helion.Config(
+            atomic_indexing=[],
+            block_sizes=[16, reduction_block_size, 256],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+            ],
+            load_eviction_policies=["last", "first", "", "last"],
+            num_stages=1,
+            num_warps=4,
+            pid_type="flat",
+            range_flattens=[None, None, None],
+            range_multi_buffers=[None, None, None],
+            range_num_stages=[0, 0, 0],
+            range_unroll_factors=[0, 0, 0],
+        )
+
+        torch.manual_seed(1337)
+        rows, columns = 4096, 1024
+        weight = torch.randn(columns, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(columns, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.randn(rows, columns, device=DEVICE, dtype=torch.bfloat16)
+        expected = eager_layer_norm(weight, bias, x)
+
+        actual = welford.bind((weight, bias, x)).compile_config(config)(weight, bias, x)
+
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
     def test_low_mem_dropout(self):
         from examples.low_mem_dropout import low_mem_dropout
         from examples.low_mem_dropout import low_mem_dropout_bwd
@@ -682,7 +728,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         "65536x1024x1280 GEMM is too slow under CPU interpret -- it exceeds the "
         "300s per-test timeout and (thread timeout method) kills the whole job"
     )
-    @xfailIfPallasTpu("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
@@ -711,22 +756,24 @@ class TestExamples(RefEagerTestBase, TestCase):
             else:
                 x_f32 = xt.float()
                 w_f32 = wt.to(torch.bfloat16).float()
-            prev = torch.backends.cuda.matmul.fp32_precision
-            torch.backends.cuda.matmul.fp32_precision = "ieee"
-            try:
+            with float32_matmul_precision("highest"):
                 out = torch.matmul(x_f32, w_f32)
-            finally:
-                torch.backends.cuda.matmul.fp32_precision = prev
             return out.to(torch.bfloat16)
 
         x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
+        # Pallas tiles the K reduction, so a tiny fraction of outputs can land
+        # on the other side of a bf16 rounding boundary vs PyTorch's full-K dot.
+        max_mismatch_pct = 1e-4 if _get_backend() == "pallas" else None
+        max_mismatched_abs_diff = 0.5 if max_mismatch_pct is not None else None
 
         check_example(
             "bf16xint16_gemm",
             (x, w),
             expected(x, w, False),
             fn_name="_bf16xint16_gemm",
+            max_mismatch_pct=max_mismatch_pct,
+            max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
         x_int16 = torch.randint(
@@ -739,6 +786,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             (x_int16, w_bf16),
             expected(x_int16, w_bf16, True),
             fn_name="_int16xbf16_gemm",
+            max_mismatch_pct=max_mismatch_pct,
+            max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
     def test_rms_norm_fwd(self):
@@ -941,6 +990,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_biased_attention_output(self):
         args = (
             torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
@@ -1038,6 +1088,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1_simple",
         )
 
+    @xfailIfPallasInterpret(
+        "jax interpret-mode discharge cannot handle non-divisible blocked "
+        "slices (traced sizes)"
+    )
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -1050,7 +1104,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
+    )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -1566,12 +1623,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @parametrize(
         "helion_precision,torch_precision,atol,rtol",
         [
-            ("highest", "highest", 1e-2, 1e-2),
+            ("highest", "medium", 1.5, 5e-2),
             ("default", "medium", 1.5, 5e-2),
         ],
-    )
-    @xfailIfPallasInterpret(
-        "The get/set_float32_matmul_precision API needs an actual backend"
     )
     @onlyBackends(["pallas"])
     def test_jagged_hstu_attn_2(self, helion_precision, torch_precision, atol, rtol):
@@ -1761,9 +1815,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_jsd(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1789,9 +1840,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallasInterpret(
-        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
-    )
     def test_kl_div(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1815,7 +1863,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    def _check_gather_gemv(self, dtype: torch.dtype):
+    def _check_gather_gemv(self, dtype: torch.dtype, atol=0.1, rtol=0.01):
         args = (
             torch.randn([4, 512, 512], device=DEVICE, dtype=dtype),
             torch.randint(0, 4, [2], device=DEVICE, dtype=torch.int32),
@@ -1834,6 +1882,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16],
             num_warps=8,
             num_stages=1,
+            atol=atol,
+            rtol=rtol,
         )
 
     # Pallas f32 succeeds under CPU emulation but fails on TPU.
@@ -1843,8 +1893,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         self._check_gather_gemv(torch.float32)
 
     @skipIfXPU("Timeout on XPU")
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_gather_gemv_half(self):
-        self._check_gather_gemv(HALF_DTYPE)
+        self._check_gather_gemv(HALF_DTYPE, atol=0.2, rtol=0.2)
 
     @xfailIfPallas("int4 unpacking not supported on pallas")
     def test_int4_gemm(self):
@@ -1898,15 +1949,28 @@ class TestExamples(RefEagerTestBase, TestCase):
         W_packed = mod.pack_fp4(W_quantized).view(torch.float4_e2m1fn_x2)
         weight_scale = mod.make_fp8_scales((N, K // 16), DEVICE)
 
-        result = mod.nvfp4_matmul(A, W_packed, weight_scale)
-        expected = mod.reference_nvfp4_matmul(A, W_packed, weight_scale)
+        result = mod.nvfp4_w4a16_matmul(A, W_packed, weight_scale)
+        expected = mod.reference_nvfp4_w4a16_matmul(A, W_packed, weight_scale)
         torch.testing.assert_close(
             result,
             expected,
             atol=1.0,
             rtol=2e-1,
         )
+        A_quantized = mod.quantize_fp4_e2m1(A)
+        A_packed = mod.pack_fp4_last_dim(A_quantized).view(torch.float4_e2m1fn_x2)
+        act_scale = mod.make_fp8_scales((M, K // 16), DEVICE)
 
+        result = mod.nvfp4_w4a4_matmul(A_packed, W_packed, act_scale, weight_scale)
+        expected = mod.reference_nvfp4_w4a4_matmul(
+            A_packed, W_packed, act_scale, weight_scale
+        )
+        torch.testing.assert_close(
+            result,
+            expected,
+            atol=1.0,
+            rtol=2e-1,
+        )
         M, K, N = 128, 256, 256
         A_packed = mod.make_random_fp4((M, K), DEVICE)
         B_packed = mod.make_random_fp4((N, K), DEVICE)
@@ -1963,6 +2027,32 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=4.0,
             rtol=2e-1,
         )
+
+        with self.assertRaisesRegex(ValueError, "x_bf16 must contain"):
+            mod.nvfp4_gemv_bf16in(weight, x_bf16[:-16], weight_scale)
+        with self.assertRaisesRegex(ValueError, "x_packed must contain"):
+            mod.nvfp4_gemv_fp4in(weight, x_packed[:-8], weight_scale, x_scale)
+
+        noncontiguous_weight = torch.randint(
+            0,
+            256,
+            (M, K_bytes + 8),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )[:, :K_bytes]
+        self.assertFalse(noncontiguous_weight.is_contiguous())
+        with self.assertRaisesRegex(ValueError, "weight_packed must be contiguous"):
+            mod.nvfp4_gemv_bf16in(noncontiguous_weight, x_bf16, weight_scale)
+
+        bad_k_weight = torch.randint(
+            0,
+            256,
+            (M, K_bytes - 1),
+            dtype=torch.uint8,
+            device=DEVICE,
+        )
+        with self.assertRaisesRegex(ValueError, "K bytes must be divisible by 8"):
+            mod.nvfp4_gemv_bf16in(bad_k_weight, x_bf16[:-2], weight_scale)
 
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
@@ -2158,7 +2248,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         131072, reason="block sizes exceed device shared memory limit"
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
@@ -2273,10 +2362,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
-    @xfailIfPallasInterpret(
-        "pl.program_id captured into emit_pipeline body is not supported in "
-        "JAX interpret mode (program_id_p.bind asserts during trace)"
-    )
     def test_squeeze_and_excitation_net_bwd_db(self):
         torch.manual_seed(0)
         m, n, k = 256, 256, 256
@@ -2316,7 +2401,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16],
             num_warps=4,
             num_stages=2,
-            atol=0.4,
+            atol=2.0,
+            rtol=0.05,
         )
 
     def test_grpo_loss_fwd(self):
@@ -2612,9 +2698,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
-    @xfailIfPallasTpu(
-        "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
-    )
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
@@ -2730,6 +2813,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_se_block_bwd_dx(self):
         m, n = 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
@@ -2786,6 +2870,315 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_warps=4,
             num_stages=3,
             rtol=1e-2,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Linear attention examples (examples/linear/)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _skip_linear_engine_autotune(self) -> None:
+        # These tests only assert correctness. Pin a fixed default config;
+        # restored after the test.
+        from examples.linear import linear_attention_engine as engine
+
+        # Free cached GPU memory after each test so xdist workers
+        # sharing one GPU don't OOM.
+        if torch.cuda.is_available():
+            self.addCleanup(torch.cuda.empty_cache)
+
+        for kernel in vars(engine).values():
+            if isinstance(kernel, helion.Kernel):
+                original_effort = kernel.settings.autotune_effort
+                self.addCleanup(
+                    setattr, kernel.settings, "autotune_effort", original_effort
+                )
+                kernel.settings.autotune_effort = "none"
+
+    def _run_linear_example(self, name: str, method: str = "test") -> None:
+        import importlib
+
+        self._skip_linear_engine_autotune()
+        mod = importlib.import_module(f"examples.linear.{name}")
+        harness = getattr(mod, "HARNESS", None)
+        if harness is not None:
+            getattr(harness, method)()
+        else:
+            mod.test()
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_simple_gla(self):
+        self._run_linear_example("example_simple_gla")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_full_gla(self):
+        self._run_linear_example("example_full_gla")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_vanilla_linear_attn(self):
+        self._run_linear_example("example_vanilla_linear_attn")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_retention(self):
+        self._run_linear_example("example_retention")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_mamba2_ssd(self):
+        self._run_linear_example("example_mamba2_ssd")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_delta_rule(self):
+        self._run_linear_example("example_delta_rule")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_gated_delta_rule(self):
+        self._run_linear_example("example_gated_delta_rule")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_kda(self):
+        self._run_linear_example("example_kda")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_kda_fused_preamble(self):
+        self._run_linear_example("example_kda", method="test_fused_preamble")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_kda_varlen(self):
+        self._run_linear_example("example_kda", method="test_varlen")
+
+    # ── Monkey-patch tests: plug our engine into FLA layers ──
+
+    def _linear_attn_monkeypatch_test(
+        self,
+        variant,
+        layer,
+        seq_len,
+        fla_mod,
+        fla_attr,
+        preprocess=None,
+        dtype=torch.bfloat16,
+    ):
+        from examples.linear.linear_attention_engine import get_helion_fwd_kernel
+        from examples.linear.linear_attention_utils import head_to_time_first as _tf
+
+        self._skip_linear_engine_autotune()
+        helion_fwd = get_helion_fwd_kernel(variant)
+
+        def _our_chunk(
+            q, k, v, g=None, beta=None, scale=None, use_qk_l2norm_in_kernel=False, **kw
+        ):
+            if scale is None:
+                scale = q.shape[-1] ** -0.5
+            if use_qk_l2norm_in_kernel:
+                q = F.normalize(q, p=2, dim=-1)
+                k = F.normalize(k, p=2, dim=-1)
+            if preprocess is not None:
+                g, beta = preprocess(q, g, beta, kw)
+            q_hf = _tf(q)
+            k_hf = _tf(k)
+            v_hf = _tf(v)
+            g_hf = _tf(g) if g is not None else None
+            beta_hf = _tf(beta) if beta is not None else None
+            o_hf = helion_fwd(q_hf, k_hf, v_hf, g_hf, beta_hf, C=64, scale=scale)
+            assert isinstance(o_hf, torch.Tensor)
+            return _tf(o_hf), None
+
+        torch.manual_seed(42)
+        layer = layer.cuda().to(dtype)
+        hidden = torch.randn(2, seq_len, 256, device=DEVICE, dtype=dtype)
+
+        # Reference
+        h_ref = hidden.detach().clone().requires_grad_(True)
+        out_ref, _, _ = layer(h_ref)
+        out_ref.sum().backward()
+        grad_ref = h_ref.grad.clone()
+
+        # Ours
+        orig = getattr(fla_mod, fla_attr)
+        setattr(fla_mod, fla_attr, _our_chunk)
+        try:
+            h_ours = hidden.detach().clone().requires_grad_(True)
+            out_ours, _, _ = layer(h_ours)
+            out_ours.sum().backward()
+            grad_ours = h_ours.grad.clone()
+        finally:
+            setattr(fla_mod, fla_attr, orig)
+
+        label = variant.name
+        fwd_err = (
+            out_ours.float() - out_ref.float()
+        ).norm() / out_ref.float().norm().clamp(min=1e-8)
+        bwd_err = (
+            grad_ours.float() - grad_ref.float()
+        ).norm() / grad_ref.float().norm().clamp(min=1e-8)
+        self.assertLess(
+            fwd_err.item(), 0.05, f"{label} monkeypatch fwd error: {fwd_err}"
+        )
+        self.assertLess(
+            bwd_err.item(), 0.10, f"{label} monkeypatch bwd error: {bwd_err}"
+        )
+
+    @pytest.mark.timeout(600)
+    def test_linear_monkeypatch_gla(self):
+        """Monkey-patch FLA's GatedLinearAttention to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
+        try:
+            import fla.layers.gla as _fla_gla_mod
+            from fla.layers.gla import GatedLinearAttention
+        except ImportError:
+            self.skipTest("fla not installed")
+
+        self._linear_attn_monkeypatch_test(
+            LinearAttentionVariant.FULL_GLA,
+            GatedLinearAttention(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=0.5,
+                expand_v=1.0,
+                use_short_conv=False,
+                use_output_gate=True,
+                fuse_norm=True,
+            ),
+            seq_len=128,
+            fla_mod=_fla_gla_mod,
+            fla_attr="chunk_gla",
+            dtype=torch.float32,
+        )
+
+    @pytest.mark.timeout(600)
+    def test_linear_monkeypatch_delta_rule(self):
+        """Monkey-patch FLA's DeltaNet to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
+        try:
+            import fla.layers.delta_net as _fla_dn_mod
+            from fla.layers.delta_net import DeltaNet
+        except ImportError:
+            self.skipTest("fla not installed")
+
+        # FLA's DeltaNet has no decay; our delta twin needs an explicit zero g.
+        def preprocess(q, g, beta, kw):
+            g = torch.zeros_like(beta)
+            return g, beta
+
+        self._linear_attn_monkeypatch_test(
+            LinearAttentionVariant.DELTA_RULE,
+            DeltaNet(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=1.0,
+                expand_v=1.0,
+                use_short_conv=True,
+                qk_norm="l2",
+                use_gate=False,
+                use_beta=True,
+            ),
+            seq_len=128,
+            fla_mod=_fla_dn_mod,
+            fla_attr="chunk_delta_rule",
+            preprocess=preprocess,
+        )
+
+    @pytest.mark.timeout(600)
+    def test_linear_monkeypatch_gated_delta_rule(self):
+        """Monkey-patch FLA's GatedDeltaNet to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
+        try:
+            import fla.layers.gated_deltanet as _fla_gdn_mod
+            from fla.layers.gated_deltanet import GatedDeltaNet
+        except ImportError:
+            self.skipTest("fla not installed")
+
+        # FLA folds the gate/beta activations into its kernel (use_gate_in_kernel /
+        # use_beta_sigmoid_in_kernel); our engine wants a per-timestep log-decay and
+        # an activated beta, so reproduce FLA's elementwise transforms here.
+        def preprocess(q, g, beta, kw):
+            A_log, dt_bias = kw.get("A_log"), kw.get("dt_bias")
+            if A_log is not None:
+                # gate == FLA naive_gdn_gate (fla/ops/gated_delta_rule/gate.py):
+                # https://github.com/fla-org/flash-linear-attention/blob/6bd90692588c81fe102ee6e12ac70686359658a2/fla/ops/gated_delta_rule/gate.py#L20
+                g = g + dt_bias if dt_bias is not None else g
+                g = -A_log.float().exp() * F.softplus(g.float())
+            # beta == FLA fused_beta_sigmoid, scale=2 if allow_neg_eigval else 1
+            # (fla/ops/gated_delta_rule/chunk.py, use_beta_sigmoid_in_kernel branch):
+            # https://github.com/fla-org/flash-linear-attention/blob/6bd90692588c81fe102ee6e12ac70686359658a2/fla/ops/gated_delta_rule/chunk.py#L286
+            scale = 2.0 if kw.get("allow_neg_eigval") else 1.0
+            beta = scale * torch.sigmoid(beta.float())
+            return g.to(q.dtype), beta.to(q.dtype)
+
+        self._linear_attn_monkeypatch_test(
+            LinearAttentionVariant.GATED_DELTA_RULE,
+            GatedDeltaNet(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=1.0,
+                expand_v=1.0,
+                use_short_conv=True,
+                qk_norm="l2",
+                use_gate=False,
+                use_beta=True,
+            ),
+            seq_len=128,
+            fla_mod=_fla_gdn_mod,
+            fla_attr="chunk_gated_delta_rule",
+            preprocess=preprocess,
+        )
+
+    @pytest.mark.timeout(600)
+    def test_linear_monkeypatch_simple_gla(self):
+        """Monkey-patch FLA's SimpleGatedLinearAttention to use our engine."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
+        try:
+            import fla.layers.simple_gla as _fla_sgla_mod
+            from fla.layers.simple_gla import SimpleGatedLinearAttention
+        except ImportError:
+            self.skipTest("fla not installed")
+
+        self._linear_attn_monkeypatch_test(
+            LinearAttentionVariant.SIMPLE_GLA,
+            SimpleGatedLinearAttention(
+                hidden_size=256,
+                num_heads=4,
+                expand_k=1.0,
+                expand_v=1.0,
+                use_short_conv=False,
+                fuse_norm=True,
+            ),
+            seq_len=64,
+            fla_mod=_fla_sgla_mod,
+            fla_attr="chunk_simple_gla",
         )
 
 

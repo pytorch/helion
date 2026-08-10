@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import importlib.metadata
 import json
 import os
 from pathlib import Path
 import random
 import tempfile
+from types import ModuleType
 from typing import TYPE_CHECKING
 from typing import cast
 import unittest
@@ -22,6 +24,7 @@ from helion._testing import skipIfRefEager
 from helion.autotuner._metadata.hardware import _DEVICE_PROPS_ATTRS
 from helion.autotuner._metadata.hardware import _GPU_BACKENDS
 from helion.autotuner._metadata.hardware import HardwareInfoRecord
+from helion.autotuner._metadata.hardware import _package_version
 from helion.autotuner._metadata.hardware import collect_hardware_info
 from helion.autotuner._metadata.ir_features import _has_networkx_node_link
 from helion.autotuner.base_search import _warn_dataset_without_log
@@ -29,6 +32,7 @@ from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuneLogSink
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import KernelMetadata
 import helion.language as hl
 
@@ -86,8 +90,6 @@ def _metadata() -> KernelMetadata:
         input_shapes="[(64,)]",
         dtypes="['torch.float32']",
         settings={"static_shapes": True, "index_dtype": None},
-        # cpu device: a device-less hardware_info probe raises on non-accelerator
-        # CI lanes (metal/pallas). The real GPU snapshot is covered by the E2E test.
         _device=torch.device("cpu"),
     )
 
@@ -170,6 +172,7 @@ class TestRunId(TestCase):
                 input_shapes="[(64,)]",
                 dtypes="['torch.float32']",
                 settings=settings,
+                _device=torch.device("cpu"),
             ).run_id
 
         base_run_id = _run_id(base_settings)
@@ -180,18 +183,12 @@ class TestRunId(TestCase):
 
 
 class TestCollectHardwareInfo(TestCase):
-    """collect_hardware_info has best-effort numeric props and a backend-aware
-    versions block; identity/required-version probes may raise."""
-
     @unittest.skipIf(
         DEVICE.type in {"mps", "mtia"},
         "collect_hardware_info probes cpu/cuda/rocm/xpu/tpu, not this device",
     )
     def test_collect_hardware_info_has_required_content(self) -> None:
-        """Real (unpatched) snapshot has the production schema and stable fields.
-        Best-effort / backend-specific fields are intentionally not asserted."""
         info = collect_hardware_info(DEVICE)
-        # device_props is GPU-only (optional key); the always-present keys are a subset.
         self.assertLessEqual(_HARDWARE_INFO_REQUIRED_KEYS, set(info))
         self.assertLessEqual(set(info), _HARDWARE_INFO_KEYS)
         self.assertIsNotNone(info["device_kind"])
@@ -199,51 +196,52 @@ class TestCollectHardwareInfo(TestCase):
         self.assertIsNotNone(info["cpu_num_threads"])
         self.assertEqual(info["versions"]["torch"], torch.__version__)
         self.assertIn("helion", info["versions"])
+        self.assertTrue(all(info["versions"].values()))
 
         if info["device_kind"] in _GPU_BACKENDS:
             self.assertIn("device_props", info)
             self.assertEqual(
                 set(info["device_props"]), set(_DEVICE_PROPS_ATTRS[info["device_kind"]])
             )
-            # First attr is the backend's compute-unit count (multi_processor_count on
-            # cuda/rocm, max_compute_units on xpu); a populated value proves the probe
-            # ran, not the all-None miss fallback.
             sm_attr = _DEVICE_PROPS_ATTRS[info["device_kind"]][0]
             self.assertIsNotNone(info["device_props"][sm_attr])
             self.assertIsNotNone(info["versions"]["triton"])
 
     def test_cpu_device_not_misreported(self) -> None:
-        """Explicit cpu device reports a cpu identity with no device_props block (not
-        a GPU) and no backend toolkit, even on a GPU host."""
         info = collect_hardware_info(torch.device("cpu"))
         self.assertEqual(set(info), _HARDWARE_INFO_REQUIRED_KEYS)
         self.assertEqual(info["device_kind"], "cpu")
         self.assertNotIn("device_props", info)
         self.assertEqual(set(info["versions"]), {"torch", "helion"})
 
+    def test_device_is_required(self) -> None:
+        with self.assertRaisesRegex(ValueError, "device"):
+            collect_hardware_info(cast("torch.device", None))
+
+    def test_missing_module_version_raises(self) -> None:
+        module_without_version = ModuleType("triton")
+        with (
+            patch(
+                "helion.autotuner._metadata.hardware.importlib.metadata.version",
+                side_effect=importlib.metadata.PackageNotFoundError,
+            ),
+            patch(
+                "helion.autotuner._metadata.hardware.importlib.import_module",
+                return_value=module_without_version,
+            ),
+            self.assertRaises(AttributeError),
+        ):
+            _package_version("triton")
+
 
 class TestKernelMetadataHardwareInfo(TestCase):
-    """hardware_info is collected lazily in to_dict() and excluded from run_id."""
+    def test_device_is_required(self) -> None:
+        with self.assertRaisesRegex(TypeError, "_device"):
+            KernelMetadata()
 
-    def test_collected_lazily_in_to_dict(self) -> None:
-        """Constructing the shell must not probe hardware; collection happens only
-        when to_dict() materializes the record (the dataset-only write path)."""
-        with patch(
-            "helion.autotuner._metadata.hardware.collect_hardware_info"
-        ) as collect:
-            collect.return_value = {"device_kind": "cuda"}
-            meta = _metadata()
-            collect.assert_not_called()
-            record = meta.to_dict()
-            collect.assert_called_once()
-        self.assertEqual(record["hardware_info"], {"device_kind": "cuda"})
-
-    def test_run_id_uses_device_name(self) -> None:
-        """run_id derives its hardware dimension from the device name."""
-        with patch("helion.autotuner.metrics.get_device_name", return_value="H100"):
-            run_id_h100 = _metadata().run_id
-            run_id_h100_again = _metadata().run_id
-        self.assertEqual(run_id_h100, run_id_h100_again)
+    def test_none_device_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "device"):
+            KernelMetadata(_device=None)
 
 
 class TestAutotuneLogSink(TestCase):
@@ -272,6 +270,7 @@ class TestAutotuneLogSink(TestCase):
             sidecar = json.loads(
                 sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
             )
+            source_path_exists = sink.source_path.exists()
 
         header, data = rows[0], rows[1:]
         self.assertEqual(header, _LEAN_CSV_HEADER)
@@ -282,6 +281,7 @@ class TestAutotuneLogSink(TestCase):
 
         self.assertTrue(cell("config"))
         self.assertIn("32", cell("config"))
+        self.assertFalse(source_path_exists)
 
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
@@ -368,6 +368,24 @@ class TestAutotuneLogSink(TestCase):
             sink.capture_generated_code(config_id, kernel, config)
             sink.end_run()
         kernel.get_cached_path.assert_not_called()
+
+    def test_failed_tune_does_not_write_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base_path = Path(tmp) / "run"
+            logger = AutotuningLogger(helion.Settings())
+            original_error = RuntimeError("tuning failed")
+
+            with (
+                self.assertRaises(RuntimeError) as raised,
+                logger.autotune_logging(
+                    str(base_path), _metadata(), collect_dataset=True
+                ),
+            ):
+                raise original_error
+
+            self.assertIs(raised.exception, original_error)
+            self.assertIsNone(logger._log_sink)
+            self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
 _PERF_STATS_KEYS = {"min", "median", "mean", "p90", "std", "n_samples"}
@@ -519,17 +537,12 @@ class TestAutotuneDatasetE2E(TestCase):
             record = json.loads(line)
             self.assertIn("kernel_source", record)
             hw = record["hardware_info"]
-            # device_props is GPU-only (optional); always-present keys are a subset.
             self.assertLessEqual(_HARDWARE_INFO_REQUIRED_KEYS, set(hw))
             self.assertLessEqual(set(hw), _HARDWARE_INFO_KEYS)
-            # torch/helion are always present; per-backend toolkit keys vary by host.
             self.assertLessEqual({"torch", "helion"}, set(hw["versions"]))
             self.assertTrue(hw["device_name"])
-            # GPU lanes report a real accelerator + sm_count + triton toolchain;
-            # tolerate a triton CPU-fallback or TPU backend.
             if hw["device_kind"] in _GPU_BACKENDS:
                 self.assertIn("device_props", hw)
-                # Backend's compute-unit count (see collect_hardware_info test above).
                 sm_attr = _DEVICE_PROPS_ATTRS[hw["device_kind"]][0]
                 self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
@@ -607,6 +620,7 @@ class TestIrGraphDegradation(TestCase):
             "input_shapes": "[s0]",
             "dtypes": "torch.float32",
             "settings": {},
+            "_device": torch.device("cpu"),
         }
         self.assertEqual(
             KernelMetadata(**fields).run_id,

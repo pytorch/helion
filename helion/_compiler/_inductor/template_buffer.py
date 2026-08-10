@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from typing import Iterable
 
     from torch._inductor.ir import MultiOutput
-    from torch._inductor.ir import _HasAliasingOrMutation
     from torch._inductor.scheduler import BaseSchedulerNode
 
     from ..inductor_lowering import CodegenState
@@ -406,7 +405,7 @@ class HelionTemplateBuffer(TemplateBuffer):
 
     def has_aliasing_or_mutation_for_prologue_fusion(
         self,
-        scheduler_node: _HasAliasingOrMutation,
+        scheduler_node: object,
     ) -> bool:
         """Return the Inductor fusion-blocking alias/mutation state.
 

@@ -5,6 +5,7 @@ import functools
 import hashlib
 import time
 from typing import TYPE_CHECKING
+from typing import cast
 
 from .._compat import get_device_name
 
@@ -37,13 +38,17 @@ class AutotuneMetrics:
     _start_time: float = dataclasses.field(default_factory=time.perf_counter)
     num_configs_tested: int = 0
     num_compile_failures: int = 0
+    num_worker_failures: int = 0
     num_accuracy_failures: int = 0
+    num_unique_sources: int = 0
+    num_source_deduplications: int = 0
     num_generations: int = 0
     autotune_time: float = 0.0
     best_perf_ms: float = 0.0
     kernel_name: str = ""
     kernel_source: str = ""
     input_shapes: str = ""
+    dtypes: str = ""
     hardware: str = ""
     random_seed: int = 0
     search_algorithm: str = ""
@@ -56,12 +61,16 @@ class AutotuneMetrics:
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
+            "dtypes": self.dtypes,
             "hardware": self.hardware,
             "random_seed": self.random_seed,
             "search_algorithm": self.search_algorithm,
             "num_configs_tested": self.num_configs_tested,
             "num_compile_failures": self.num_compile_failures,
+            "num_worker_failures": self.num_worker_failures,
             "num_accuracy_failures": self.num_accuracy_failures,
+            "num_unique_sources": self.num_unique_sources,
+            "num_source_deduplications": self.num_source_deduplications,
             "num_generations": self.num_generations,
             "autotune_time": self.autotune_time,
             "best_perf_ms": self.best_perf_ms,
@@ -111,10 +120,13 @@ class KernelMetadata:
     _device_ir: DeviceIR | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
-    # Source ref for the lazy ``hardware_info`` snapshot; repr/compare/hash off.
     _device: torch.device | None = dataclasses.field(
-        default=None, repr=False, compare=False, hash=False
+        kw_only=True, repr=False, compare=False, hash=False
     )
+
+    def __post_init__(self) -> None:
+        if self._device is None:
+            raise ValueError("device is required for kernel metadata")
 
     @functools.cached_property
     def run_id(self) -> str:
@@ -139,7 +151,7 @@ class KernelMetadata:
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
             "dtypes": self.dtypes,
-            "hardware_info": collect_hardware_info(self._device),
+            "hardware_info": collect_hardware_info(cast("torch.device", self._device)),
             "settings": self.settings,
             "ir_graph": self.ir_graph,
         }

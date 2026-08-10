@@ -18,12 +18,14 @@ import torch
 from torch._environment import is_fbcode
 import torch.nn.functional as F
 
+import helion
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import PRETUNED_KERNELS_DIR
 from helion._testing import TestCase
 from helion._testing import is_cuda
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
 
 
@@ -444,6 +446,43 @@ class TestPretunedKernelsCorrectness(TestCase):
 
     def test_fused_qk_norm_rope(self):
         self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
+
+
+@onlyBackends(["cute"])
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+class TestPretunedCuteCodegen(TestCase):
+    def test_scale_mm_64x5120x5120_omits_shared_loop(self) -> None:
+        """The tuned FP8 persistent kernel has only role-local tile loops."""
+
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        m, k, n = 64, 5120, 5120
+        x = torch.empty((m, k), device=DEVICE, dtype=torch.float8_e4m3fn)
+        y = torch.empty((n, k), device=DEVICE, dtype=torch.float8_e4m3fn).T
+        scale_a = torch.empty((m, 1), device=DEVICE).expand(m, n)
+        scale_b = torch.empty((n,), device=DEVICE)
+        args = (x, y, scale_a, scale_b)
+        config = helion.Config(
+            block_sizes=[64, 64, 128],
+            l2_groupings=[1],
+            indexing=["tensor_descriptor"] * 5,
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=12,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+
+        with patch_cute_mma_support():
+            bound = module.scale_mm_cute.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
+        self.assertNotIn("while tcgen05_work_tile_valid", code)
 
 
 @onlyBackends(["triton"])

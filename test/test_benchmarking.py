@@ -31,6 +31,17 @@ class _FakeGraphContext:
         return False
 
 
+class _FakeCuteGraphContext:
+    def __init__(self, cuda):
+        self.cuda = cuda
+
+    def __enter__(self):
+        return self.cuda.CUDAGraph()
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 class _FakeGraph:
     def __init__(self):
         self.replay_count = 0
@@ -166,6 +177,85 @@ def test_attention_force_flash_config_falls_back_without_compiler_seed():
     assert config == {"block_sizes": [1, 128, 128]}
 
 
+def test_attention_compiler_flash_seed_config_uses_promoted_default():
+    bound = SimpleNamespace(
+        config_spec=SimpleNamespace(
+            compiler_default_config=object(),
+            compiler_seed_configs=[
+                SimpleNamespace(config={"block_sizes": [1, 128, 128]})
+            ],
+            default_config=lambda: SimpleNamespace(
+                config={
+                    "block_sizes": [1, 128, 128],
+                    "cute_flash_topology": "fa4",
+                }
+            ),
+        )
+    )
+
+    config = compare_attention_backends._compiler_flash_seed_config(bound, "cute")
+
+    assert config == {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_topology": "fa4",
+    }
+
+
+def test_attention_compiler_flash_seed_config_falls_back_to_seed_list():
+    bound = SimpleNamespace(
+        config_spec=SimpleNamespace(
+            compiler_default_config=None,
+            compiler_seed_configs=[
+                SimpleNamespace(
+                    config={
+                        "block_sizes": [64, 64],
+                        "num_warps": 8,
+                    }
+                ),
+                SimpleNamespace(
+                    config={
+                        "block_sizes": [1, 128, 128],
+                        "cute_flash_kv_order": "ascending",
+                    }
+                ),
+            ],
+        )
+    )
+
+    config = compare_attention_backends._compiler_flash_seed_config(bound, "cute")
+
+    assert config == {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_kv_order": "ascending",
+    }
+
+
+def test_attention_compiler_flash_seed_config_skips_nonflash_default():
+    bound = SimpleNamespace(
+        config_spec=SimpleNamespace(
+            compiler_default_config=object(),
+            compiler_seed_configs=[
+                SimpleNamespace(
+                    config={
+                        "block_sizes": [1, 128, 128],
+                        "cute_flash_topology": "fa4",
+                    }
+                )
+            ],
+            default_config=lambda: SimpleNamespace(
+                config={"block_sizes": [64, 64], "num_warps": 8}
+            ),
+        )
+    )
+
+    config = compare_attention_backends._compiler_flash_seed_config(bound, "cute")
+
+    assert config == {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_topology": "fa4",
+    }
+
+
 def test_attention_subprocess_forwards_helion_cute_timer():
     args = _attention_subprocess_args(helion_cute_benchmark_timer="event")
 
@@ -223,6 +313,30 @@ def test_attention_helion_cute_timer_selects_bench_fn():
         is None
     )
     assert calls == ["get_do_bench"]
+
+
+@pytest.mark.parametrize(
+    "two_cta_marker",
+    (
+        "cute_tcgen05_flash.CtaGroup.TWO",
+        "is_two_cta=True",
+        "'use_2cta_instrs': True",
+    ),
+)
+def test_attention_codegen_markers_accept_generated_tcgen05_alias(
+    two_cta_marker: str,
+):
+    code = f"""
+from cutlass.cute.nvgpu import tcgen05 as cute_tcgen05_flash
+cute_tcgen05_flash.commit(ptr, mask, {two_cta_marker})
+PipelineTmaUmma.create()
+"""
+
+    assert compare_attention_backends._helion_codegen_markers(code) == {
+        "uses_tcgen05": True,
+        "uses_tcgen05_two_cta": True,
+        "uses_tma_umma_pipeline": True,
+    }
 
 
 def test_attention_markdown_and_wide_csv_include_timer():
@@ -312,8 +426,15 @@ def test_cudagraph_defaults_off(monkeypatch):
 
 
 def test_cudagraph_replay_wraps_callable(monkeypatch):
+    import helion.runtime as helion_runtime
+
     fake_cuda = _FakeCuda()
     monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
+    monkeypatch.setattr(
+        helion_runtime,
+        "cute_cuda_graph",
+        lambda: _FakeCuteGraphContext(fake_cuda),
+    )
     monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "1")
     calls = []
 

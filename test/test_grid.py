@@ -16,7 +16,6 @@ from helion._testing import skipIfMetal
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
-from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 
@@ -164,7 +163,15 @@ class TestGrid(RefEagerTestBase, TestCase):
             torch.randn([3, 4, 64, 32], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([32, 16], device=DEVICE, dtype=HALF_DTYPE),
         )
-        code, result = code_and_output(grid_2d_idx_nested, args)
+        # Pin the small (mma.sync) config this test used before the H100 matmul seed
+        # heuristic began promoting a [64, 16, 16] default. That default tiles M in a
+        # single 64-wide block, which Triton lowers to a Hopper WGMMA (wgmma.mma_async);
+        # Triton miscompiles that WGMMA inside this nested-hl.grid sequential loop on sm90
+        # (every loop iteration returns iteration 0's result). Pinning keeps this test
+        # checking nested-grid correctness, decoupled from the matmul heuristic default.
+        code, result = code_and_output(
+            grid_2d_idx_nested, args, block_sizes=[16, 16, 16]
+        )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
     @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
@@ -276,7 +283,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_multidim_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_multidim_begin_end_step_pytorch(x))
 
-    @xfailIfPallasTpu("Tile begin/end not working on Pallas TPU")
     def test_tile_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def tile_begin_end(x: torch.Tensor) -> torch.Tensor:

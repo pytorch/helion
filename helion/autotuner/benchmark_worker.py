@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import signal
 import sys
+import threading
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import TypeVar
@@ -87,6 +88,7 @@ class BenchmarkWorker:
         self.device = device
         self._process: mp.process.BaseProcess | None = None
         self._parent_connection: Connection | None = None
+        self._lock = threading.Lock()
 
     def alive(self) -> bool:
         return self._process is not None and self._process.is_alive()
@@ -102,26 +104,73 @@ class BenchmarkWorker:
         if not self.alive():
             self._start()
         connection = self._parent_connection
+        process = self._process
         assert connection is not None
-        try:
-            connection.send(job)
-        except (BrokenPipeError, OSError) as e:
-            self._kill()
-            raise BenchmarkWorkerDied("failed to send job to worker") from e
+        assert process is not None
 
-        if not connection.poll(timeout):
-            self._kill()
+        timed_out = threading.Event()
+        done = threading.Event()
+
+        def on_timeout() -> None:
+            if done.is_set():
+                return
+            timed_out.set()
+            self._kill_if_current(process, connection)
+
+        timer = threading.Timer(timeout, on_timeout)
+        timer.daemon = True
+        timer.start()
+        try:
+            try:
+                connection.send(job)
+            except (BrokenPipeError, OSError) as e:
+                if timed_out.is_set():
+                    self._kill_if_current(process, connection)
+                    raise BenchmarkTimeout(
+                        f"benchmark timeout after {timeout:.1f}s"
+                    ) from e
+                self._kill_if_current(process, connection)
+                raise BenchmarkWorkerDied("failed to send job to worker") from e
+
+            try:
+                if not connection.poll(timeout):
+                    timed_out.set()
+                    self._kill_if_current(process, connection)
+                    raise BenchmarkTimeout(f"benchmark timeout after {timeout:.1f}s")
+            except (EOFError, OSError) as e:
+                if timed_out.is_set():
+                    self._kill_if_current(process, connection)
+                    raise BenchmarkTimeout(
+                        f"benchmark timeout after {timeout:.1f}s"
+                    ) from e
+                self._kill_if_current(process, connection)
+                raise BenchmarkWorkerDied(
+                    "worker pipe closed before sending result"
+                ) from e
+
+            try:
+                result = connection.recv()
+            except (EOFError, OSError) as e:
+                if timed_out.is_set():
+                    self._kill_if_current(process, connection)
+                    raise BenchmarkTimeout(
+                        f"benchmark timeout after {timeout:.1f}s"
+                    ) from e
+                self._kill_if_current(process, connection)
+                raise BenchmarkWorkerDied(
+                    "worker pipe closed before sending result"
+                ) from e
+        finally:
+            done.set()
+            timer.cancel()
+
+        if timed_out.is_set():
+            self._kill_if_current(process, connection)
             raise BenchmarkTimeout(f"benchmark timeout after {timeout:.1f}s")
-
-        try:
-            result = connection.recv()
-        except EOFError as e:
-            self._kill()
-            raise BenchmarkWorkerDied("worker pipe closed before sending result") from e
 
         if isinstance(result, BaseException):
             if _UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(result)):
-                self._kill()
+                self._kill_if_current(process, connection)
             raise result
         return result  # type: ignore[return-value]
 
@@ -145,6 +194,15 @@ class BenchmarkWorker:
         child_connection.close()
         self._process = process
         self._parent_connection = parent_connection
+
+    def _kill_if_current(
+        self,
+        process: mp.process.BaseProcess,
+        connection: Connection,
+    ) -> None:
+        with self._lock:
+            if process is self._process and connection is self._parent_connection:
+                self._kill()
 
     def _kill(self) -> None:
         process, connection = self._process, self._parent_connection
