@@ -226,6 +226,16 @@ TCGEN05_ACC_WAIT_PLACEMENTS = (
     TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
+# Placement of per-subtile auxiliary-tensor loads relative to the accumulator
+# consumer wait. Post-wait is the conservative default; pre-wait is available
+# for full output tiles and is selected by the measured scale_mm configs.
+TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY = "tcgen05_aux_load_placement"
+TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT = "pre_acc_wait"
+TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT = "post_acc_wait"
+TCGEN05_AUX_LOAD_PLACEMENTS = (
+    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+)
 
 
 def tcgen05_two_cta_edge_k_tail_seed_overrides() -> dict[str, object]:

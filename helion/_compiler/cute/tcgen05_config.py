@@ -66,12 +66,17 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODES
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODES
+from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
@@ -191,6 +196,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_acc_stages",
     "tcgen05_c_stages",
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
+    TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
     "tcgen05_num_epi_warps",
@@ -2299,6 +2305,10 @@ class CuteTcgen05Config:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
+        if self.aux_kernel_detected or not for_search:
+            fragments[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = EnumFragment(
+                TCGEN05_AUX_LOAD_PLACEMENTS
+            )
         if not for_search:
             fragments[TCGEN05_GROUPED_MODE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_MODES
@@ -2713,6 +2723,38 @@ class CuteTcgen05Config:
             TCGEN05_ACC_WAIT_PLACEMENTS,
             fix_invalid=fix_invalid,
         )
+        self._validate_enum_config(
+            config,
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+            TCGEN05_AUX_LOAD_PLACEMENTS,
+            fix_invalid=fix_invalid,
+        )
+        aux_load_placement = config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+        if (
+            aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and not self.aux_kernel_detected
+        ):
+            raise InvalidConfig(
+                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the kernel has "
+                "no per-subtile auxiliary loads to place"
+            )
+        if (
+            aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and config.get(
+                TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
+                TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
+            )
+            == TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
+        ):
+            raise InvalidConfig(
+                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: requires "
+                f"{TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP!r}; per-subtile "
+                "auxiliary loads cannot precede an accumulator wait emitted "
+                "before the subtile loop"
+            )
         self._validate_enum_config(
             config,
             TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,

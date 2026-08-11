@@ -7062,6 +7062,7 @@ class TestCuteBackend(TestCase):
             block_sizes=[128, 128, 128],
             tcgen05_cluster_m=2,
             pid_type="persistent_blocked",
+            tcgen05_aux_load_placement="pre_acc_wait",
         )
         ref = (x.float() @ y.float()) * scale_n.float()
         torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
@@ -7080,6 +7081,7 @@ class TestCuteBackend(TestCase):
                 block_sizes=[256, 128, 128],
                 tcgen05_cluster_m=2,
                 pid_type="persistent_blocked",
+                tcgen05_aux_load_placement="pre_acc_wait",
             )
         )
         self.assertNotIn("tcgen05_aux_rmem_full_", code256)
