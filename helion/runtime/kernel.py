@@ -2184,17 +2184,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     assert self._run is not None
                     self.maybe_log_repro(log.warning, args)
 
+        current_config = self._config
         try:
             return self._run(*args)
         except OutOfResources:
+            default_config = self.env.config_spec.default_config()
+            if current_config == default_config:
+                raise
             with self._first_compile_lock:
-                default_config = self.env.config_spec.default_config()
-                if self._config == default_config:
-                    raise
-                log.warning(
-                    f"Kernel {self.kernel.name} ran out of resources with {self._config}; retrying with the default config {default_config}"
-                )
-                self.set_config(default_config)
+                if current_config == self._config:
+                    self.set_config(default_config)
+            log.warning(
+                f"Kernel {self.kernel.name} ran out of resources with {current_config}; retrying with the default config {default_config}"
+            )
             return self._run(*args)
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
