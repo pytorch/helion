@@ -1156,7 +1156,7 @@ def _serialize_value(val: object) -> object:
     """Serialize a single value to JSON-compatible format.
 
     Supports: None, bool, int, float, str, type, tuple, frozenset, set,
-    torch.dtype, torch.device, list, dict, code, bytes.
+    torch.dtype, torch.device, list, dict, code, bytes, ellipsis, complex.
     """
     if val is None:
         return None
@@ -1179,9 +1179,13 @@ def _serialize_value(val: object) -> object:
     if isinstance(val, dict):
         return {k: _serialize_value(v) for k, v in val.items()}
     if isinstance(val, types.CodeType):
-        return {"__code__": _serialize_value(_code_identity(val))}
+        return _serialize_value(_code_identity(val))
     if isinstance(val, bytes):
         return {"__bytes__": val.hex()}
+    if isinstance(val, types.EllipsisType):
+        return {"__ellipsis__": True}
+    if isinstance(val, complex):
+        return {"__complex__": [val.real, val.imag]}
     raise TypeError(f"Cannot serialize type: {type(val).__name__}")
 
 
@@ -1189,7 +1193,7 @@ def _deserialize_value(val: object) -> object:
     """Deserialize a JSON value back to Python object.
 
     Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__,
-    __type__, __code__, __bytes__.
+    __type__, __bytes__, __ellipsis__, __complex__.
 
     Note: __code__ is not turned back into a code object. This is fine because the AOT
     cache only compares specialization keys, it never calls the original function.
@@ -1208,10 +1212,13 @@ def _deserialize_value(val: object) -> object:
             return torch.device(val["__device__"])
         if "__type__" in val:
             return _import_type(val["__type__"])
-        if "__code__" in val:
-            return _deserialize_value(val["__code__"])
         if "__bytes__" in val:
             return bytes.fromhex(val["__bytes__"])
+        if "__ellipsis__" in val:
+            return ...
+        if "__complex__" in val:
+            real, imag = _deserialize_tuple(val["__complex__"])
+            return complex(real, imag)
         return {k: _deserialize_value(v) for k, v in val.items()}
     if isinstance(val, list):
         return [_deserialize_value(v) for v in val]

@@ -10,6 +10,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import inspect
+import json
 import os
 import sys
 import threading
@@ -137,6 +138,35 @@ class TestCodeSerialization:
         h1 = ShapeKey("k", (with_sin.__code__,), "hw").stable_hash()
         h2 = ShapeKey("k", (with_cos.__code__,), "hw").stable_hash()
         assert h1 != h2
+
+    def test_code_serializes_complex_and_ellipsis_consts(self) -> None:
+        def with_complex(v):
+            return v * 1j
+
+        def with_ellipsis(v):
+            return v[...]
+
+        for fn in (with_complex, with_ellipsis):
+            serialized = _serialize_value(fn.__code__)
+            json.dumps(serialized)  # must not raise
+            assert _deserialize_value(serialized) == (
+                fn.__code__.co_code,
+                fn.__code__.co_consts,
+                fn.__code__.co_names,
+            )
+
+    def test_stable_hash_survives_save_load_round_trip(self) -> None:
+        def fn(v):
+            return v * 2
+
+        key = ShapeKey("k", (fn.__code__,), "hw")
+        original_hash = key.stable_hash()
+
+        # Simulate a JSON save/load cycle
+        reloaded = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+        assert reloaded.stable_hash() == original_hash
+        reloaded_again = ShapeKey.from_dict(json.loads(json.dumps(reloaded.to_dict())))
+        assert reloaded_again.stable_hash() == original_hash
 
 
 @onlyBackends(["triton", "cute"])
