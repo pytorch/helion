@@ -141,6 +141,17 @@ class Backend(abc.ABC):
         return True
 
     @property
+    def supports_eager_prepared_call(self) -> bool:
+        """Whether eager calls may reuse a resolved ``BoundKernel`` directly.
+
+        The prepared call still enters the backend's generated host wrapper; it
+        only bypasses Helion's repeated binding and specialization lookup.  The
+        default is conservative because some backends own call-time behavior in
+        :meth:`Kernel.__call__` before the wrapper is reached.
+        """
+        return False
+
+    @property
     def max_tensor_numel(self) -> int | None:
         """Per-tile maximum tensor element count enforced during config search.
 

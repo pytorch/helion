@@ -57,6 +57,10 @@ class TritonBackend(Backend):
     def experimental(self) -> bool:
         return False
 
+    @property
+    def supports_eager_prepared_call(self) -> bool:
+        return True
+
     def transform_host_arg(
         self,
         arg: Argument,

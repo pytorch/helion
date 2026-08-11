@@ -773,6 +773,10 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    @property
+    def supports_eager_prepared_call(self) -> bool:
+        return True
+
     def validate_environment(self) -> None:
         from .cutedsl_compat import check_cute_backend_requirements
 
