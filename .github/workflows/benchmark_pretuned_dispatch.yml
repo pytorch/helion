@@ -1,11 +1,11 @@
 name: Benchmark Pretuned Dispatch
 
-# On-demand benchmark of every kernel under pretuned_kernels/ against its
-# checked-in heuristic. Mirrors Benchmark Dispatch but for the pretuned-kernel
-# suite: it fans out to GPU runners via benchmark_pretuned.yml and then triggers
-# the docs deploy, which rebuilds the dashboard's Pretuned tab from the uploaded
-# artifacts. The nightly cron lives in benchmark_pretuned_nightly.yml, which
-# dispatches this workflow with run_h100/run_b200 set.
+# On-demand benchmark of every kernel under pretuned_kernels/ with its
+# checked-in heuristic and reference baselines. Mirrors Benchmark Dispatch
+# for the pretuned-kernel suite: it fans out via benchmark_pretuned.yml and
+# triggers the docs deploy, which rebuilds the dashboard's Pretuned tab from
+# uploaded artifacts. The nightly cron lives in benchmark_pretuned_nightly.yml,
+# which dispatches this workflow with run_h100/run_b200 set.
 
 on:
   workflow_dispatch:
