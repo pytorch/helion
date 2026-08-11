@@ -21,6 +21,8 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import SearchDimensionInfo
     from ..runtime.config import Config
@@ -368,6 +370,8 @@ def analyze_search_space(
     kernel_name: str = "",
     specialization_key: str | None = None,
     hardware: str | None = None,
+    config_overrides: Mapping[str, object] | None = None,
+    advanced_controls_files: list[str] | None = None,
 ) -> SearchSpaceReport:
     """Analyze the valid search space for a kernel's config spec.
 
@@ -382,6 +386,14 @@ def analyze_search_space(
         kernel_name: Optional kernel name for logging
         specialization_key: Optional specialization key
         hardware: Optional hardware identifier
+        config_overrides: ``autotune_config_overrides`` (key -> pinned value).
+            A field pinned here is frozen during search, so its effective
+            cardinality is 1; the report clamps it accordingly instead of
+            reporting the fragment's full static range.
+        advanced_controls_files: ``autotune_search_acf``. When non-empty this is
+            an extra enum dimension the searchers explore (the listed files plus
+            the implicit default ``""``); it lives outside ``_flat_fields()`` so
+            it is added here explicitly.
 
     Returns:
         A SearchSpaceReport describing the valid search space
@@ -389,6 +401,7 @@ def analyze_search_space(
     from ..autotuner.config_spec import VALID_KEYS
     from ..autotuner.config_spec import VALID_PID_TYPES
 
+    overrides = dict(config_overrides or {})
     dimensions: list[DimensionStats] = []
     disabled_features: list[str] = []
     shape_constraints: list[str] = []
@@ -397,7 +410,19 @@ def analyze_search_space(
     for info in config_spec.iter_search_dimensions():
         dim = _dimension_from_info(info, config_spec)
         if dim is not None:
+            if info.name in overrides:
+                _apply_override(dim, overrides[info.name])
             dimensions.append(dim)
+
+    # advanced_controls_file is an autotunable enum (the configured ACF paths
+    # plus the implicit default "") that lives outside _flat_fields(), so
+    # iter_search_dimensions() never yields it. Add it here so the reported
+    # total reflects the space the searchers actually explore.
+    acf_dim = _advanced_controls_file_dimension(advanced_controls_files)
+    if acf_dim is not None:
+        if "advanced_controls_file" in overrides:
+            _apply_override(acf_dim, overrides["advanced_controls_file"])
+        dimensions.append(acf_dim)
 
     for key in sorted(VALID_KEYS):
         if key in flat_fields:
@@ -515,6 +540,37 @@ def _dimension_from_info(
         cardinality=cardinality,
         possible_values=values,
         constrained_by=constrained_by,
+    )
+
+
+def _apply_override(dim: DimensionStats, value: object) -> None:
+    """Freeze a dimension to a single pinned value from config overrides.
+
+    An overridden field is not mutated during search, so its effective
+    cardinality is 1. Clamp the reported dimension to match and note why.
+    """
+    dim.cardinality = 1
+    dim.possible_values = [value]
+    dim.constrained_by = "pinned by autotune_config_overrides"
+
+
+def _advanced_controls_file_dimension(
+    advanced_controls_files: list[str] | None,
+) -> DimensionStats | None:
+    """Describe the advanced_controls_file enum dimension, if searched.
+
+    Mirrors ``ConfigSpec._advanced_controls_file_fragment``: an empty/absent
+    list disables ACF search; otherwise the searched values are the listed
+    files plus the implicit default ``""`` (deduplicated).
+    """
+    if not advanced_controls_files:
+        return None
+    values: list[object] = list(dict.fromkeys([*advanced_controls_files, ""]))
+    return DimensionStats(
+        name="advanced_controls_file",
+        dim_type="categorical",
+        cardinality=len(values),
+        possible_values=values,
     )
 
 

@@ -545,5 +545,82 @@ class TestSaveReport(unittest.TestCase):
             self.assertEqual(saved, "")
 
 
+class TestConfigOverridesAndACF(unittest.TestCase):
+    """analyze_search_space must reflect the space actually searched: pinned
+    fields collapse to cardinality 1, and advanced_controls_file (which lives
+    outside _flat_fields) is added as its own enum dimension."""
+
+    def _spec(self) -> object:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        return ConfigSpec(backend=TritonBackend())
+
+    def _with_dims(self, spec: object, dims: list[object]) -> None:
+        spec.iter_search_dimensions = lambda value_limit=100: iter(dims)  # type: ignore[method-assign]
+
+    def test_override_clamps_dimension_to_one(self) -> None:
+        spec = self._spec()
+        self._with_dims(
+            spec,
+            [
+                SearchDimensionInfo("pid_type", 3, ["flat", "xyz", "x"], False, 0),
+                SearchDimensionInfo("num_warps", 4, None, False, 0),
+            ],
+        )
+        report = analyze_search_space(
+            spec, kernel_name="k", config_overrides={"pid_type": "flat"}
+        )
+        by_name = {d.name: d for d in report.dimensions}
+        self.assertEqual(by_name["pid_type"].cardinality, 1)
+        self.assertEqual(by_name["pid_type"].possible_values, ["flat"])
+        self.assertIn(
+            "autotune_config_overrides", by_name["pid_type"].constrained_by or ""
+        )
+        # Total reflects the clamp: 1 * 4 rather than 3 * 4.
+        self.assertEqual(report.total_search_space_size, 4)
+
+    def test_acf_added_as_dimension_with_default(self) -> None:
+        spec = self._spec()
+        self._with_dims(spec, [SearchDimensionInfo("num_warps", 4, None, False, 0)])
+        report = analyze_search_space(
+            spec, kernel_name="k", advanced_controls_files=["a.acf", "b.acf"]
+        )
+        acf = next(d for d in report.dimensions if d.name == "advanced_controls_file")
+        # Two files plus the implicit default "".
+        self.assertEqual(acf.cardinality, 3)
+        self.assertEqual(acf.possible_values, ["a.acf", "b.acf", ""])
+        self.assertEqual(report.total_search_space_size, 4 * 3)
+
+    def test_acf_absent_when_not_configured(self) -> None:
+        spec = self._spec()
+        self._with_dims(spec, [SearchDimensionInfo("num_warps", 4, None, False, 0)])
+        report = analyze_search_space(spec, kernel_name="k")
+        self.assertNotIn("advanced_controls_file", [d.name for d in report.dimensions])
+
+    def test_acf_dedupes_explicit_default(self) -> None:
+        spec = self._spec()
+        self._with_dims(spec, [SearchDimensionInfo("num_warps", 4, None, False, 0)])
+        report = analyze_search_space(
+            spec, kernel_name="k", advanced_controls_files=["a.acf", ""]
+        )
+        acf = next(d for d in report.dimensions if d.name == "advanced_controls_file")
+        self.assertEqual(acf.cardinality, 2)
+        self.assertEqual(acf.possible_values, ["a.acf", ""])
+
+    def test_acf_can_be_overridden(self) -> None:
+        spec = self._spec()
+        self._with_dims(spec, [SearchDimensionInfo("num_warps", 4, None, False, 0)])
+        report = analyze_search_space(
+            spec,
+            kernel_name="k",
+            advanced_controls_files=["a.acf", "b.acf"],
+            config_overrides={"advanced_controls_file": "a.acf"},
+        )
+        acf = next(d for d in report.dimensions if d.name == "advanced_controls_file")
+        self.assertEqual(acf.cardinality, 1)
+        self.assertEqual(acf.possible_values, ["a.acf"])
+
+
 if __name__ == "__main__":
     unittest.main()
