@@ -34,6 +34,7 @@ from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
+from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._subclasses import FakeTensor
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 import torch.distributed as dist
@@ -2183,7 +2184,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     assert self._run is not None
                     self.maybe_log_repro(log.warning, args)
 
-        return self._run(*args)
+        try:
+            return self._run(*args)
+        except OutOfResources:
+            with self._first_compile_lock:
+                default_config = self.env.config_spec.default_config()
+                if self._config == default_config:
+                    raise
+                log.warning(
+                    f"Kernel {self.kernel.name} ran out of resources with {self._config}; retrying with the default config {default_config}"
+                )
+                self.set_config(default_config)
+            return self._run(*args)
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """

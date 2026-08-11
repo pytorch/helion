@@ -12,8 +12,10 @@ import tempfile
 import textwrap
 from typing import Any
 import unittest
+from unittest.mock import Mock
 
 import torch
+from torch._inductor.runtime.triton_compat import OutOfResources
 
 import helion
 from helion._testing import DEVICE
@@ -22,6 +24,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessPallas
 import helion.language as hl
+from helion.runtime.kernel import BoundKernel
 
 _FREE = helion.OutputCodeOptions(allow_helion_deps=False)
 _JAX = helion.OutputCodeOptions(allow_helion_deps=False, jax_fn=True)
@@ -616,6 +619,55 @@ class TestToCodePallas(TestCase):
         y = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
         with self.assertRaises(NotImplementedError):
             _pallas_to_code(pallas_matmul, (x, y), _JAX)
+
+
+class TestOutOfResourcesFallback(unittest.TestCase):
+    """Unit tests for the retry-with-default-config fallback in
+    :meth:`BoundKernel.__call__`. These call the unbound method against a
+    minimal mock so they run without a device or a real compile."""
+
+    def _make_bound(self, config: object, default_config: object) -> Mock:
+        bound = Mock()
+        bound.kernel._has_specialization_extras = False
+        bound._config = config
+        bound.env.config_spec.default_config.return_value = default_config
+        return bound
+
+    def test_retries_once_with_default_config(self) -> None:
+        bound = self._make_bound(config="bad_config", default_config="default_config")
+        bound._run = Mock(side_effect=[OutOfResources(1, 2, "shared memory"), "ok"])
+
+        def fake_set_config(config: object) -> None:
+            bound._config = config
+
+        bound.set_config.side_effect = fake_set_config
+
+        result = BoundKernel.__call__(bound, "arg")
+
+        self.assertEqual(result, "ok")
+        bound.set_config.assert_called_once_with("default_config")
+        self.assertEqual(bound._run.call_count, 2)
+
+    def test_does_not_retry_when_already_on_default_config(self) -> None:
+        bound = self._make_bound(
+            config="default_config", default_config="default_config"
+        )
+        bound._run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+
+        with self.assertRaises(OutOfResources):
+            BoundKernel.__call__(bound, "arg")
+
+        bound.set_config.assert_not_called()
+        self.assertEqual(bound._run.call_count, 1)
+
+    def test_other_exceptions_are_not_caught(self) -> None:
+        bound = self._make_bound(config="bad_config", default_config="default_config")
+        bound._run = Mock(side_effect=RuntimeError("unrelated failure"))
+
+        with self.assertRaises(RuntimeError):
+            BoundKernel.__call__(bound, "arg")
+
+        bound.set_config.assert_not_called()
 
 
 if __name__ == "__main__":
