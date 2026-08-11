@@ -162,6 +162,9 @@ def _capture_edges(
     dict[torch.fx.Node, torch.fx.Node],
 ]:
     """Build parent and capture links on the current per-config graph copies."""
+    # TODO(jansel): Reuse NodeArgsGraphInfo.node_args for capture edges once kwargs()
+    # remaps those nodes into per-config graph copies (see the TODO in device_ir.py).
+    # Until then, reconstruct the links from the copied parent calls below.
     parent_args: dict[int, tuple[torch.fx.Node, int]] = {}
     for info in graphs:
         for node in info.graph.nodes:
