@@ -454,6 +454,16 @@ TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS = (
 TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY = "tcgen05_grouped_static_reserved_sms"
 TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES = (0, 2, 3, 4, 5, 8, 16)
 TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX = 1024
+# Exact per-group M/N/K values embedded by an AOT specialization.  The runtime
+# validates these values against the scheduler metadata before launch; codegen
+# can then replace the generic warp-wide group search with constant branches.
+TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY = (
+    "tcgen05_grouped_static_problem_signature"
+)
+# The specialized scheduler emits one constant branch per group in each
+# warp-specialized role. Larger signatures use the generic scheduler to bound
+# generated source and compile time.
+TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS = 8
 # Direct pointer/stride metadata for grouped dynamic TensorMap updates. This
 # keeps A/B/D payload tensors in place and only passes small per-group metadata
 # tensors to generated tcgen05 code.
@@ -463,12 +473,26 @@ TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY = (
 TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY = (
     "tcgen05_grouped_external_direct_strides"
 )
-# Source rows consumed per compact N,M worklist group. This is tied to the
-# schedule's 256x224 source tile and must not leak into general grouped-GEMM
-# tiling decisions.
+# Validated source-row tiles for compact N,M worklist schedules.  The selected
+# tile is carried explicitly by the schedule plan; it is independent of the
+# CTA K tile and must not leak into general grouped-GEMM tiling decisions.
+TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY = (
+    "tcgen05_grouped_worklist_source_m_tile"
+)
 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE = 224
+TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE = 256
+TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES = (64, 128)
+TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES = (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
 TCGEN05_GROUPED_WORKLIST_MMA_M_TILE = 256
 TCGEN05_GROUPED_WORKLIST_STORE_SHAPE = (128, 32, 32)
+# The grouped scheduler publishes CTA M/N, validity, metadata/group indices,
+# problem M/N/K, and the packed-output row start through one Int32 mailbox.
+TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT = 9
+
+
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1

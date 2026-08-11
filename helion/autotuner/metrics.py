@@ -82,6 +82,7 @@ _CODEGEN_SETTINGS: tuple[str, ...] = (
     "fast_math",
     "index_dtype",
     "pallas_interpret",
+    "pallas_topk_recall_target",
     "persistent_reserved_sms",
     "static_shapes",
     "triton_do_not_specialize",

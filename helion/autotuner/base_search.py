@@ -251,7 +251,9 @@ class BaseSearch(BaseAutotuner):
         self,
         kernel: _AutotunableKernel,
         args: Sequence[object],
-        benchmark_provider_cls: type[BenchmarkProvider] = LocalBenchmarkProvider,
+        benchmark_provider_cls: Callable[
+            ..., BenchmarkProvider
+        ] = LocalBenchmarkProvider,
     ) -> None:
         """
         Initialize the BaseSearch object.

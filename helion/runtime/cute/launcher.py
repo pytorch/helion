@@ -39,8 +39,11 @@ from ..._compiler.cute.strategies import tcgen05_smem_layout_expr
 from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
+from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
-from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
+)
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from ..triton.launcher import get_num_sm
 
@@ -679,6 +682,26 @@ def _append_cute_wrapper_plan(
             cluster_m=max(1, cluster_m),
             reserved_sms=reserved_sms,
         )
+        quota_args = tuple(
+            str(arg)
+            for arg in cast(
+                "tuple[object, ...]", plan.get("static_group_quota_args", ())
+            )
+        )
+        quotas: tuple[int, ...] = ()
+        if quota_args:
+            assert cluster_m == 1 and cluster_n == 1
+            problem_shapes = cast(
+                "tuple[tuple[int, int, int], ...]", plan["static_problem_shapes"]
+            )
+            assert len(quota_args) == len(problem_shapes)
+            quotas = _tcgen05_grouped_static_quotas(
+                problem_shapes,
+                bm=plan_int("bm"),
+                bn=plan_int("bn"),
+                bk=plan_int("bk"),
+                max_active_clusters=max_active_clusters,
+            )
         body.extend(
             (
                 (
@@ -697,6 +720,7 @@ def _append_cute_wrapper_plan(
             )
         )
         call_args.append(sched_params_arg)
+        call_args.extend(f"cutlass.Int32({quota})" for quota in quotas)
         return
     if kind != "tcgen05_ab_tma":
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
@@ -1907,12 +1931,26 @@ def _tcgen05_grouped_static_plans(cute_kernel: object) -> list[dict[str, object]
     ]
 
 
+def _tcgen05_grouped_device_split_sizes(plan: dict[str, object]) -> bool:
+    return bool(plan.get("device_split_sizes"))
+
+
+def _tcgen05_grouped_host_metadata_plans(
+    cute_kernel: object,
+) -> list[dict[str, object]]:
+    return [
+        plan
+        for plan in _tcgen05_grouped_static_plans(cute_kernel)
+        if not _tcgen05_grouped_device_split_sizes(plan)
+    ]
+
+
 def _cute_grouped_static_metadata_matches(
     grouped_static_metadata: tuple[_Tcgen05GroupedStaticMetadataCacheEntry, ...],
     cute_kernel: object,
     args: tuple[object, ...],
 ) -> bool:
-    plans = _tcgen05_grouped_static_plans(cute_kernel)
+    plans = _tcgen05_grouped_host_metadata_plans(cute_kernel)
     if len(grouped_static_metadata) != len(plans):
         return False
     for plan, entry in zip(plans, grouped_static_metadata, strict=True):
@@ -1948,6 +1986,51 @@ def _tcgen05_grouped_static_active_clusters(
         raise ValueError("reserved_sms must be non-negative")
     active_sms = max(1, num_sm - reserved_sms)
     return max(1, active_sms // cluster_m)
+
+
+def _tcgen05_grouped_static_quotas(
+    problem_shapes: tuple[tuple[int, int, int], ...],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    max_active_clusters: int,
+) -> tuple[int, ...]:
+    """Balance each group's longest CTA without assigning idle CTAs.
+
+    If fewer CTAs than groups are active, the returned ones are unused because
+    the device selects the generic scheduler instead of the specialized path.
+    """
+    tile_counts = [
+        ((problem_m + bm - 1) // bm) * ((problem_n + bn - 1) // bn)
+        for problem_m, problem_n, _problem_k in problem_shapes
+    ]
+    k_tile_counts = [
+        (problem_k + bk - 1) // bk
+        for _problem_m, _problem_n, problem_k in problem_shapes
+    ]
+    quotas = [1] * len(problem_shapes)
+    grid_size = min(sum(tile_counts), max_active_clusters)
+    for _ in range(max(0, grid_size - len(quotas))):
+        candidates = [
+            index
+            for index, (quota, tile_count) in enumerate(
+                zip(quotas, tile_counts, strict=True)
+            )
+            if quota < tile_count
+        ]
+        group = max(
+            candidates,
+            key=lambda index: (
+                (tile_counts[index] + quotas[index] - 1)
+                // quotas[index]
+                * k_tile_counts[index],
+                tile_counts[index] * k_tile_counts[index],
+                -index,
+            ),
+        )
+        quotas[group] += 1
+    return tuple(quotas)
 
 
 def _plan_int_value(plan: dict[str, object], key: str) -> int:
@@ -2064,7 +2147,13 @@ def _tcgen05_grouped_static_layout_arg(
             "cute", "tcgen05 grouped scheduler layout must be a CUDA tensor"
         )
     worklist_metadata = bool(plan.get("worklist_metadata"))
-    if worklist_metadata:
+    if _tcgen05_grouped_device_split_sizes(plan):
+        if layout.ndim != 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped device split_sizes must have shape [G]",
+            )
+    elif worklist_metadata:
         if layout.ndim != 2 or layout.size(1) != 4:
             raise exc.BackendUnsupported(
                 "cute",
@@ -2079,6 +2168,100 @@ def _tcgen05_grouped_static_layout_arg(
             "cute", "tcgen05 grouped scheduler layout must be int32 or int64"
         )
     return layout
+
+
+def _validate_tcgen05_grouped_device_split_sizes(
+    plan: dict[str, object],
+    split_sizes: torch.Tensor,
+) -> None:
+    group_count = _plan_int_value(plan, "group_count")
+    if int(split_sizes.numel()) != group_count:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped device split_sizes length must match group count",
+        )
+    if _tcgen05_plan_orientation(plan) != "nm":
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped device split_sizes requires N,M orientation",
+        )
+    bk = _plan_int_value(plan, "bk")
+    source_m_tile = _plan_int_value(plan, "source_m_tile")
+    m_size = _plan_int_value(plan, "m_size")
+    n_size = _plan_int_value(plan, "n_size")
+    k_total_size = _plan_int_value(plan, "k_total_size")
+    int32_max = torch.iinfo(torch.int32).max
+    if any(
+        extent <= 0 or extent > int32_max
+        for extent in (group_count, m_size, n_size, k_total_size)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped device split_sizes requires G, M, N, and K "
+            "dimensions to be positive signed Int32 values",
+        )
+    if (
+        bk not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        or n_size % TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2] != 0
+        or k_total_size % bk != 0
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped device split_sizes requires block_k 64 or 128, "
+            "a validated source M tile, output N divisible by 32, and K "
+            "divisible by the CTA K tile",
+        )
+    if (
+        not bool(plan.get("dynamic_ab_tensormaps"))
+        or _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) != 2
+        or not bool(plan.get("dynamic_d_tensormap"))
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped device split_sizes requires rank-2 dynamic A/B "
+            "TensorMaps and a dynamic D TensorMap",
+        )
+
+
+def _tcgen05_grouped_device_split_total_clusters(
+    plan: dict[str, object],
+) -> int:
+    """Return a value-independent bound for device split-size metadata.
+
+    The kernel clips every raw group interval to the packed ``[0, M)`` extent,
+    so any one group can expose at most ``ceil(M / source_m_tile)`` row tiles,
+    regardless of split signs, sums, or overlaps.  Multiply that bound by G
+    and by the output-column cluster count.  The wrapper caps the physical grid
+    at the active-cluster limit, so this conservative logical bound does not
+    increase resident clusters and requires no host read of split values.
+    """
+    group_count = _plan_int_value(plan, "group_count")
+    m_size = _plan_int_value(plan, "m_size")
+    n_size = _plan_int_value(plan, "n_size")
+    source_m_tile = _plan_int_value(plan, "source_m_tile")
+    if (
+        group_count <= 0
+        or m_size <= 0
+        or n_size <= 0
+        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped device split_sizes requires positive G, M, and N "
+            "and a validated source M tile",
+        )
+    n_clusters = (
+        n_size + TCGEN05_GROUPED_WORKLIST_MMA_M_TILE - 1
+    ) // TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+    packed_m_clusters = (m_size + source_m_tile - 1) // source_m_tile
+    total_clusters = n_clusters * group_count * packed_m_clusters
+    if total_clusters > torch.iinfo(torch.int32).max:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped device split_sizes cluster bound must fit signed Int32",
+        )
+    return total_clusters
 
 
 def _cute_dynamic_tensormap_contexts(
@@ -2464,7 +2647,7 @@ def _validate_tcgen05_grouped_worklist_nm(
         return
     lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
     rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+    source_m_tile = _plan_int_value(plan, "source_m_tile")
     expected_store_end = 0
     seen_groups: set[int] = set()
     for row in rows:
@@ -2622,6 +2805,8 @@ def _append_tcgen05_grouped_static_mutation_guards(
     args: tuple[object, ...],
 ) -> None:
     for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        if _tcgen05_grouped_device_split_sizes(plan):
+            continue
         for label, index in (
             ("layout", _plan_int_value(plan, "layout_idx")),
             ("n_sizes", plan.get("n_sizes_idx")),
@@ -2719,11 +2904,20 @@ def _build_tcgen05_grouped_static_metadata(
     bn = _plan_int_value(plan, "bn")
     bk = _plan_int_value(plan, "bk")
     worklist_nm = _tcgen05_plan_orientation(plan) == "nm"
-    worklist_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if worklist_nm else bm
     n_size = _plan_int_value(plan, "n_size")
     k_total_size = _plan_int_value(plan, "k_total_size")
-    scheduler_bm = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE if worklist_nm else bm
-    scheduler_bn = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if worklist_nm else bn
+    if worklist_nm:
+        worklist_m_tile = _plan_int_value(plan, "source_m_tile")
+        if worklist_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist scheduler requires a validated source M tile",
+            )
+        scheduler_bm = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+        scheduler_bn = worklist_m_tile
+    else:
+        worklist_m_tile = scheduler_bm = bm
+        scheduler_bn = bn
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
     dynamic_d_tensormap = bool(plan.get("dynamic_d_tensormap"))
     direct_pointer_metadata = bool(plan.get("direct_pointer_metadata"))
@@ -2738,10 +2932,11 @@ def _build_tcgen05_grouped_static_metadata(
         raise exc.BackendUnsupported(
             "cute", "tcgen05 N,M orientation requires grouped worklist metadata"
         )
-    if dynamic_ab_tensormaps and bk != 64:
+    if dynamic_ab_tensormaps and bk != 64 and not (worklist_nm and bk == 128):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 grouped dynamic A/B TensorMaps are validated only for BK64",
+            "tcgen05 grouped dynamic A/B TensorMaps are validated only for "
+            "BK64, or BK128 on the N,M worklist path",
         )
     direct_lhs: torch.Tensor | None = None
     direct_rhs: torch.Tensor | None = None
@@ -3003,6 +3198,19 @@ def _build_tcgen05_grouped_static_metadata(
             "n_sizes metadata; rebind and prewarm the grouped kernel with the "
             "final metadata before launch or CUDA graph capture",
         )
+    if (expected_shapes := plan.get("static_problem_shapes")) is not None:
+        actual_shapes = tuple(
+            (problem_m, problem_n, problem_k)
+            for problem_m, problem_n, problem_k, _batch in problem_sizes
+        )
+        if actual_shapes != expected_shapes:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped static problem-shape specialization does not "
+                "match the current layout/n_sizes/k_sizes metadata; expected "
+                f"{expected_shapes!r}, got {actual_shapes!r}; rebind and prewarm "
+                "with the final grouped shapes before launch or CUDA graph capture",
+            )
 
     device = layout.device
     direct_pointers_tensor: torch.Tensor | None = None
@@ -3413,27 +3621,10 @@ def _build_cute_schema_and_args(
         if owned:
             owned_tensors.append(tensor)
 
-    for plan in _tcgen05_grouped_static_plans(cute_kernel):
-        metadata_entry = _build_tcgen05_grouped_static_metadata(cute_kernel, plan, args)
-        metadata_result = metadata_entry.result
-        problem_tensor = metadata_result.problem_sizes
-        starts_tensor = metadata_result.starts
-        real_groups_tensor = metadata_result.real_groups
-        direct_pointers_tensor = metadata_result.direct_pointers
-        direct_strides_tensor = metadata_result.direct_strides
-        total_clusters = metadata_result.total_clusters
-        grouped_static_metadata.append(metadata_entry)
-        layout = _tcgen05_grouped_static_layout_arg(plan, args)
-        for name, tensor in (
-            (_plan_str_value(plan, "problem_sizes_arg"), problem_tensor),
-            (_plan_str_value(plan, "starts_arg"), starts_tensor),
-            *(
-                ((_plan_str_value(plan, "real_groups_arg"), real_groups_tensor),)
-                if real_groups_tensor is not None
-                else ()
-            ),
-        ):
-            append_wrapper_tensor(name, tensor)
+    def append_grouped_tensormap_workspace(
+        plan: dict[str, object],
+        layout: torch.Tensor,
+    ) -> None:
         workspace_name: str | None = None
         tensormap_count = 0
         if bool(plan.get("dynamic_ab_tensormaps")):
@@ -3450,6 +3641,38 @@ def _build_cute_schema_and_args(
                 tensormap_count=tensormap_count,
             )
             append_wrapper_tensor(workspace_name, workspace, owned=True)
+
+    for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        layout = _tcgen05_grouped_static_layout_arg(plan, args)
+        if _tcgen05_grouped_device_split_sizes(plan):
+            _validate_tcgen05_grouped_tensor_devices(layout, args)
+            _validate_tcgen05_grouped_device_split_sizes(plan, layout)
+            append_grouped_tensormap_workspace(plan, layout)
+            total_name = _plan_str_value(plan, "total_clusters_arg")
+            schema.append(("wrapper_host_scalar", total_name, "int"))
+            launch_args.append(_tcgen05_grouped_device_split_total_clusters(plan))
+            continue
+
+        metadata_entry = _build_tcgen05_grouped_static_metadata(cute_kernel, plan, args)
+        metadata_result = metadata_entry.result
+        problem_tensor = metadata_result.problem_sizes
+        starts_tensor = metadata_result.starts
+        real_groups_tensor = metadata_result.real_groups
+        direct_pointers_tensor = metadata_result.direct_pointers
+        direct_strides_tensor = metadata_result.direct_strides
+        total_clusters = metadata_result.total_clusters
+        grouped_static_metadata.append(metadata_entry)
+        for name, tensor in (
+            (_plan_str_value(plan, "problem_sizes_arg"), problem_tensor),
+            (_plan_str_value(plan, "starts_arg"), starts_tensor),
+            *(
+                ((_plan_str_value(plan, "real_groups_arg"), real_groups_tensor),)
+                if real_groups_tensor is not None
+                else ()
+            ),
+        ):
+            append_wrapper_tensor(name, tensor)
+        append_grouped_tensormap_workspace(plan, layout)
         if direct_pointers_tensor is not None and direct_strides_tensor is not None:
             append_wrapper_tensor(
                 _plan_str_value(plan, "direct_pointers_arg"),
@@ -3553,6 +3776,8 @@ def _cute_last_launch_arg_guard(
         )
     grouped_mutation_guards: list[_CuteLastGroupedMutationGuard] = []
     for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        if _tcgen05_grouped_device_split_sizes(plan):
+            continue
         for index in (
             _plan_int_value(plan, "layout_idx"),
             plan.get("n_sizes_idx"),

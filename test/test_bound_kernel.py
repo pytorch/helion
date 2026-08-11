@@ -336,6 +336,15 @@ def pallas_dynamic_row_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_initialized_output(x: torch.Tensor) -> torch.Tensor:
+    """A wrapper-created initialized output cannot be rebuilt from launch metadata."""
+    out = torch.zeros_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] += x[tile]
+    return out
+
+
 def _pallas_to_code(
     kernel: Any, args: tuple[object, ...], options: helion.OutputCodeOptions
 ) -> str:
@@ -558,6 +567,13 @@ class TestToCodePallas(TestCase):
                     )
             finally:
                 sys.modules.pop(name, None)
+
+    def test_pallas_jax_fn_rejects_wrapper_created_inplace_output(self) -> None:
+        x = torch.zeros(128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            NotImplementedError, "wrapper-created in-place outputs"
+        ):
+            _pallas_to_code(pallas_initialized_output, (x,), _JAX)
 
     def test_jax_fn_with_helion_deps_imports_launcher(self) -> None:
         """``jax_fn`` is orthogonal to ``allow_helion_deps``: with deps allowed the
