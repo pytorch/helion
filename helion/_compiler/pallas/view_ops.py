@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
 
 
-_RESIDENT_PLAN_KEY = "pallas_resident_ref_plan"
+RESIDENT_PLAN_META = "pallas_resident_ref_plan"
 
 # These Aten operations may preserve the address interpretation of a resident
 # Ref. Membership only permits planning; ``_reshape_variants`` still proves the
@@ -114,7 +114,7 @@ def _narrowed_dims(indices: object) -> list[int]:
 
 
 def _resident_plan(node: torch.fx.Node) -> _ResidentPlan | None:
-    value = node.meta.get(_RESIDENT_PLAN_KEY)
+    value = node.meta.get(RESIDENT_PLAN_META)
     return value if isinstance(value, _ResidentPlan) else None
 
 
@@ -980,7 +980,7 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
                 _record_descendant_failure(producer, context, failure)
             else:
                 for node, resident_plan in annotations.items():
-                    node.meta[_RESIDENT_PLAN_KEY] = resident_plan
+                    node.meta[RESIDENT_PLAN_META] = resident_plan
 
     # Narrowing is accepted during tracing before its load provenance and config
     # are known. The load-rooted walk may also stop at a legitimate value boundary,
