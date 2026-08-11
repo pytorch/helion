@@ -181,6 +181,9 @@ def default_launcher(
             _remote_copy_process_group_name,
             math.prod(grid) * _remote_copy_signal_slots_per_program,
         )
+        # Remote-copy waits assume compiler-owned completion slots start at 0.
+        # Clear any leftover values before launching a kernel that reuses them.
+        signal.zero_()
         args = (*args, signal)
 
     # For both CUDA and MTIA, use the same kernel execution
