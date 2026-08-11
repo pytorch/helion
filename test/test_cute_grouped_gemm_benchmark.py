@@ -115,6 +115,24 @@ def grouped_gemm_heuristic() -> Any:
 
 
 @pytest.fixture(scope="module")
+def pretuned_deepgemm() -> Any:
+    return _load_path(
+        PRETUNED_DIR / "grouped_gemm_deepgemm" / "grouped_gemm_deepgemm.py",
+        "helion_test_pretuned_grouped_gemm_deepgemm",
+    )
+
+
+@pytest.fixture(scope="module")
+def deepgemm_heuristic() -> Any:
+    return _load_path(
+        PRETUNED_DIR
+        / "grouped_gemm_deepgemm"
+        / "_helion_aot_grouped_gemm_deepgemm_cuda_sm100.py",
+        "helion_test_pretuned_grouped_gemm_deepgemm_heuristic",
+    )
+
+
+@pytest.fixture(scope="module")
 def pretuned_bench() -> Any:
     return _load_path(PRETUNED_DIR / "_bench.py", "helion_test_pretuned_bench")
 
@@ -338,6 +356,73 @@ def test_grouped_gemm_tuner_validates_pointer_targets(
     assert cleared == [candidate]
 
 
+def test_pretuned_deepgemm_contract(
+    deepgemm_benchmark: Any,
+    pretuned_deepgemm: Any,
+    deepgemm_heuristic: Any,
+) -> None:
+    assert [
+        config["tcgen05_ab_stages"] for config in pretuned_deepgemm._AOT_CONFIGS
+    ] == [4, 5, 6, 7]
+    assert deepgemm_heuristic.autotune_grouped_gemm_deepgemm(1, 2, 3) == (
+        deepgemm_benchmark.selected_config().config
+    )
+
+    a = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    b = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+    worklist = torch.tensor(((0, 0, 1, 2), (1, 2, 1, 2)), dtype=torch.int32)
+    output = pretuned_deepgemm._reference(a, b, worklist)
+    torch.testing.assert_close(output[0], a[0] @ b[0].T)
+    torch.testing.assert_close(output[2], a[2] @ b[1].T)
+    torch.testing.assert_close(output[[1, 3]], torch.zeros_like(output[[1, 3]]))
+
+
+@pytest.mark.parametrize("replay_writes_output", (True, False))
+def test_deepgemm_tuner_validates_captured_replay(
+    pretuned_deepgemm: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    replay_writes_output: bool,
+) -> None:
+    output = torch.zeros(2)
+    expected = torch.tensor([1.0, 2.0])
+    failures: list[object] = []
+
+    def replay() -> None:
+        if replay_writes_output:
+            output.copy_(expected)
+
+    class FakeCapture(AbstractContextManager[SimpleNamespace]):
+        def __enter__(self) -> SimpleNamespace:
+            return SimpleNamespace(replay=replay)
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    provider = pretuned_deepgemm._ColdCudagraphBenchmarkProvider.__new__(
+        pretuned_deepgemm._ColdCudagraphBenchmarkProvider
+    )
+    provider.args = ()
+    provider.settings = SimpleNamespace(autotune_accuracy_check=True)
+    provider._record_accuracy_failure = failures.append
+    provider._validate_against_baseline = lambda _config, actual, _args: torch.equal(
+        actual, expected
+    )
+
+    monkeypatch.setattr(
+        pretuned_deepgemm.helion_runtime, "cute_cuda_graph", FakeCapture
+    )
+    monkeypatch.setattr(pretuned_deepgemm.torch.cuda, "synchronize", lambda: None)
+
+    def candidate() -> torch.Tensor:
+        output.copy_(expected)
+        return output
+
+    config = object()
+    captured = provider._capture_validated_replay(config, candidate)
+    assert (captured is not None) is replay_writes_output
+    assert failures == ([] if replay_writes_output else [config])
+
+
 def test_grouped_gemm_aot_training_does_not_load_cutlass(
     pretuned_grouped_gemm: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -360,6 +445,28 @@ def test_grouped_gemm_aot_training_does_not_load_cutlass(
     for mode in ("collect", "compile", "measure"):
         monkeypatch.setenv("HELION_AOT_MODE", mode)
         assert pretuned_grouped_gemm.main(verbose=False) is result
+
+
+def test_deepgemm_aot_training_does_not_load_reference(
+    pretuned_deepgemm: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = {
+        "helion_wins": 0,
+        "total": 0,
+        "geomean": 0.0,
+        "best_speedup": 0.0,
+        "baselines": {},
+    }
+    monkeypatch.setattr(pretuned_deepgemm, "_run_aot_training", lambda _verbose: result)
+    monkeypatch.setattr(
+        pretuned_deepgemm,
+        "_deepgemm_root",
+        lambda: pytest.fail("AOT training loaded an external reference"),
+    )
+    for mode in ("collect", "compile", "measure"):
+        monkeypatch.setenv("HELION_AOT_MODE", mode)
+        assert pretuned_deepgemm.main(verbose=False) is result
 
 
 def test_pre_captured_graph_sweep_uses_shared_timer(
@@ -416,6 +523,35 @@ def test_grouped_gemm_dashboard_selects_shared_timer(
     assert recorded["use_cudagraph"] is False
     assert recorded["pre_captured_cudagraph"] is True
     assert recorded["rep"] == 204
+    assert recorded["thermal_warmup_ms"] == 10_000
+
+
+def test_deepgemm_dashboard_selects_shared_timer(
+    pretuned_deepgemm: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    monkeypatch.setattr(pretuned_deepgemm, "_deepgemm_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        pretuned_deepgemm._HARNESS,
+        "import_deepgemm",
+        lambda _root, _alignment: (object(), {}),
+    )
+
+    recorded: dict[str, object] = {}
+    expected = {"ok": True}
+
+    def fake_run_sweep(*args: object, **kwargs: object) -> dict[str, bool]:
+        recorded["args"] = args
+        recorded.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(pretuned_deepgemm._BENCH, "run_sweep", fake_run_sweep)
+    assert pretuned_deepgemm.main(verbose=False) is expected
+    assert recorded["use_cudagraph"] is False
+    assert recorded["pre_captured_cudagraph"] is True
+    assert recorded["rep"] == 102
     assert recorded["thermal_warmup_ms"] == 10_000
 
 
