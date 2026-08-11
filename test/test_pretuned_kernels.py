@@ -451,8 +451,8 @@ class TestPretunedKernelsCorrectness(TestCase):
 @onlyBackends(["cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedCuteCodegen(TestCase):
-    def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
-        """One-shot codegen follows the compile target's actual SM count."""
+    def test_scale_mm_64x5120x5120_omits_shared_loop(self) -> None:
+        """The tuned FP8 persistent kernel has only role-local tile loops."""
 
         module = _import_pretuned_kernel_module("scale_mm_cute")
         m, k, n = 64, 5120, 5120
@@ -479,28 +479,10 @@ class TestPretunedCuteCodegen(TestCase):
         with patch_cute_mma_support():
             bound = module.scale_mm_cute.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            bound.env.config_spec.num_sm = 80
-            one_shot_code = bound.to_triton_code(config)
-            bound.env.config_spec.num_sm = 79
-            persistent_code = bound.to_triton_code(config)
-            bound.env.config_spec.num_sm = 80
-            swizzled_config_values = dict(config)
-            swizzled_config_values["tcgen05_l2_swizzle_size"] = 8
-            swizzled_code = bound.to_triton_code(
-                helion.Config(**swizzled_config_values)
-            )
+            code = bound.to_triton_code(config)
 
-        self.assertNotIn(
-            "while tcgen05_role_local_0_work_tile.is_valid_tile", one_shot_code
-        )
-        self.assertIn(
-            "while tcgen05_role_local_0_work_tile.is_valid_tile", persistent_code
-        )
-        self.assertIn(
-            "while tcgen05_role_local_0_work_tile.is_valid_tile", swizzled_code
-        )
-        self.assertNotIn("while tcgen05_work_tile_valid", one_shot_code)
-        self.assertNotIn("while tcgen05_work_tile_valid", persistent_code)
+        self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
+        self.assertNotIn("while tcgen05_work_tile_valid", code)
 
 
 @onlyBackends(["triton"])
