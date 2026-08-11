@@ -32,7 +32,10 @@ import helion.language as hl
 # %%
 @helion.kernel
 def rms_norm_fwd(
-    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+    llama_semantics: hl.constexpr = False,  # type: ignore[valid-type]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Performs Root Mean Square (RMS) normalization on the input tensor.
@@ -44,6 +47,8 @@ def rms_norm_fwd(
         x: Input tensor of shape [M, N]
         weight: Scale parameter of shape [N]
         eps: Small constant for numerical stability
+        llama_semantics: Cast the normalized values back to the input dtype
+            before multiplying by weight, matching LlamaRMSNorm
 
     Returns:
         Output tensor of shape [M, N] with RMS normalization applied
@@ -65,7 +70,10 @@ def rms_norm_fwd(
 
         # Apply normalization and weight
         normalized = x_tile * inv_rms_tile[:, None]
-        out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
+        if llama_semantics:
+            out[tile_m, :] = normalized.to(out.dtype) * weight[:]
+        else:
+            out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
         inv_rms[tile_m] = inv_rms_tile
 
     return out, inv_rms.reshape(-1, 1)
@@ -77,6 +85,7 @@ def rms_norm_bwd(
     x: torch.Tensor,
     weight: torch.Tensor,
     rsqrt: torch.Tensor,
+    llama_semantics: hl.constexpr = False,  # type: ignore[valid-type]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute gradient for input tensor (dX) and weights (dW).
@@ -90,6 +99,7 @@ def rms_norm_bwd(
         x: Original input tensor [M, N]
         weight: Weight parameter [N]
         inv_rms: Inverse RMS tensor [M, 1]
+        llama_semantics: Match the bf16 multiply boundaries in LlamaRMSNorm
 
     Returns:
         grad_x: Gradient w.r.t input tensor, shape [M, N]
@@ -105,13 +115,18 @@ def rms_norm_bwd(
         grad_w_m = weight.new_zeros(weight_shape, dtype=torch.float32)
         for mb in hl.tile(mb_cta.begin, mb_cta.end):
             x_m = x[mb, :].to(torch.float32)
-            do_m = grad_out[mb, :].to(torch.float32)
             rsqrt_m = rsqrt[mb, :].to(torch.float32)
-            grad_w_m += (x_m * do_m * rsqrt_m).sum(0)
-            w_m = weight[None, :].to(torch.float32)
+            if llama_semantics:
+                normalized_m = (x_m * rsqrt_m).to(x.dtype)
+                do_m = grad_out[mb, :]
+                grad_w_m += (normalized_m * do_m).to(torch.float32).sum(0)
+                w_do_m = (weight[None, :] * do_m).to(torch.float32)
+            else:
+                do_m = grad_out[mb, :].to(torch.float32)
+                grad_w_m += (x_m * do_m * rsqrt_m).sum(0)
+                w_do_m = weight[None, :].to(torch.float32) * do_m
             grad_x[mb, :] = (
-                w_m * do_m * rsqrt_m
-                - x_m * rsqrt_m**3 * (w_m * do_m * x_m).mean(-1)[:, None]
+                w_do_m * rsqrt_m - x_m * rsqrt_m**3 * (w_do_m * x_m).mean(-1)[:, None]
             ).to(x.dtype)
         grad_weight[mb_cta.id, :] = grad_w_m
     return grad_x, grad_weight.sum(0).to(weight.dtype)
@@ -124,30 +139,40 @@ class RMSNormFunction(torch.autograd.Function):
         ctx: Any,  # noqa: ANN401
         x: torch.Tensor,
         weight: torch.Tensor,
-        eps: float = 1e-5,
+        eps: float,
+        llama_semantics: bool,
     ) -> torch.Tensor:
         """Forward pass for rms normalization."""
-        y, rms = rms_norm_fwd(x, weight, eps)
+        y, rms = rms_norm_fwd(x, weight, eps, llama_semantics)
         ctx.save_for_backward(x, weight)
         ctx.rms = rms  # type: ignore[attr-defined]
+        ctx.llama_semantics = llama_semantics  # type: ignore[attr-defined]
         return y
 
     @staticmethod
     def backward(  # type: ignore[override]
         ctx: Any,  # noqa: ANN401
         grad_out: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None]:
         """Backward pass for rms normalization split into two separate kernels for efficiency."""
         x, weight = ctx.saved_tensors  # type: ignore[attr-defined]
         rms = ctx.rms  # type: ignore[attr-defined]
-        grad_x, grad_weight = rms_norm_bwd(grad_out, x, weight, rms)
-        return grad_x, grad_weight, None
+        llama_semantics = ctx.llama_semantics  # type: ignore[attr-defined]
+        grad_x, grad_weight = rms_norm_bwd(grad_out, x, weight, rms, llama_semantics)
+        return grad_x, grad_weight, None, None
 
 
 # %%
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """RMS normalization with forward + backward support."""
-    return RMSNormFunction.apply(x, weight, eps)  # type: ignore[no-any-return]
+    return RMSNormFunction.apply(x, weight, eps, False)  # type: ignore[no-any-return]
+
+
+def rms_norm_llama(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """RMS normalization with Llama's input-dtype multiply semantics."""
+    return RMSNormFunction.apply(x, weight, eps, True)  # type: ignore[no-any-return]
 
 
 # %%
@@ -171,7 +196,7 @@ def rms_norm_tritonbench(
     Returns:
         Callable that returns normalized tensor
     """
-    return lambda: rms_norm(inp, weight, eps=1e-6)
+    return lambda: rms_norm_llama(inp, weight, eps=1e-6)
 
 
 # %%
@@ -199,6 +224,17 @@ def rms_norm_pytorch(
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + eps)
     return (weight * hidden_states).to(input_dtype)
+
+
+def rms_norm_llama_pytorch(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """Reference matching TritonBench's LlamaRMSNorm baseline."""
+    input_dtype = x.dtype
+    hidden_states = x.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    return weight * hidden_states.to(input_dtype)
 
 
 # %%

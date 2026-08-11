@@ -878,6 +878,47 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1e-2,
         )
 
+    def test_rms_norm_tritonbench_bwd(self):
+        """Test the bf16 multiply boundaries used by TritonBench's baseline."""
+        batch_size, dim = 2048, 1024
+        x = torch.randn(
+            [batch_size, dim],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        weight = torch.ones(
+            [dim], device=DEVICE, dtype=torch.bfloat16, requires_grad=True
+        )
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
+        eps = 1e-6
+
+        mod = import_path(EXAMPLES_DIR / "rms_norm.py")
+        fwd_config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        bwd_config = helion.Config(block_size=[32, 1], num_warps=4, num_stages=3)
+        fwd_kernel = helion.kernel(mod.rms_norm_fwd.fn, config=fwd_config)
+        bwd_kernel = helion.kernel(
+            mod.rms_norm_bwd.fn,
+            config=bwd_config,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+
+        x_torch = x.detach().clone().requires_grad_(True)
+        weight_torch = weight.detach().clone().requires_grad_(True)
+        y_torch = mod.rms_norm_llama_pytorch(x_torch, weight_torch, eps)
+        y_torch.backward(grad_out)
+
+        with (
+            patch.object(mod, "rms_norm_fwd", fwd_kernel),
+            patch.object(mod, "rms_norm_bwd", bwd_kernel),
+        ):
+            y = mod.rms_norm_tritonbench(None, dim, x, weight)()
+            y.backward(grad_out)
+
+        torch.testing.assert_close(y, y_torch, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(x.grad, x_torch.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(weight.grad, weight_torch.grad, rtol=1e-2, atol=1e-2)
+
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
