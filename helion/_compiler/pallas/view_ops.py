@@ -64,13 +64,23 @@ _RESIDENT_REF_ATEN_VIEW_TARGETS = frozenset(
 
 
 class _ResidentVariant(NamedTuple):
+    """Physical Ref state for one compact-worklist branch."""
+
     worklist_factor: int
     shape: tuple[int, ...]
     squeezed_dims: tuple[int, ...]
+    # (physical dimension, source block id) while that dimension may contain tail
+    # padding. Selecting it through the matching live extent discharges the guard.
     live_guard: tuple[int, int] | None
 
 
 class _ResidentSelector(NamedTuple):
+    """A selector proven to be one contiguous, directly addressable Ref slice.
+
+    Tile selectors derive their begin/width from ``local_block_id``; tail and
+    static selectors carry concrete ``begin`` and ``width`` values.
+    """
+
     kind: str
     logical_dim: int
     local_block_id: int
@@ -80,6 +90,8 @@ class _ResidentSelector(NamedTuple):
 
 
 class _ResidentPlan(NamedTuple):
+    """Planner result consumed by load/view/subscript codegen."""
+
     materialize: bool
     variants: tuple[_ResidentVariant, ...]
     selector: _ResidentSelector | None
@@ -130,6 +142,7 @@ def _where(node: torch.fx.Node) -> str:
 
 
 def _current_variant(state: CodegenState, plan: _ResidentPlan) -> _ResidentVariant:
+    """Select the physical shape emitted by the active grouped-worklist branch."""
     variants = plan.variants
     if len(variants) == 1:
         return variants[0]
@@ -273,6 +286,7 @@ def _enclosing_loop_bounds(
 
 
 def _variant_block_size(block_id: int, config: Config, factor: int) -> int | None:
+    """Resolve a block size, including a grouped compact branch's doubled tile."""
     env = CompileEnvironment.current()
     value = env.block_sizes[block_id].from_config(config)
     if not isinstance(value, int):
@@ -313,6 +327,7 @@ def _root_variants(
     graph_info: GraphInfo,
     context: _PlanningContext,
 ) -> tuple[_ResidentVariant, ...]:
+    """Prove that a direct load can remain a Ref and seed its physical states."""
     from .backend import SliceAddressing
     from .backend import _slice_addressing
     from .tensorcore_plan import TENSORCORE_PLAN_META
@@ -359,6 +374,9 @@ def _root_variants(
             "pallas", f"the source load at {location} is not indexed by a tile"
         )
 
+    # A full source loop with evenly-sized blocks has no tail padding. Otherwise
+    # the loaded Ref remains guarded until a selector proves it uses the exact live
+    # extent of this source block.
     full_loop = False
     bounds = _loop_bounds(graph_info, context.parents, outer_block_id)
     if bounds is not None:
@@ -371,6 +389,8 @@ def _root_variants(
             and env.known_equal(end, tensor.shape[dim])
         )
 
+    # Grouping=2 emits two static branches: one base block for a short work item
+    # and one double block for a full grouped item. Both must satisfy the plan.
     worklist = CompileEnvironment.current().compact_worklist_plan
     factors = (1, 2) if worklist is not None and worklist.grouping == 2 else (1,)
     variants: list[_ResidentVariant] = []
@@ -404,6 +424,7 @@ def _logical_to_physical(
 
 
 def _tile_run(index: torch.fx.Node) -> int | None:
+    """Return the block id for an unshifted vector tile index, if recognized."""
     from ..indexing_strategy import subscript_tile_info
 
     env = CompileEnvironment.current()
@@ -421,7 +442,11 @@ def _selector(
     variants: tuple[_ResidentVariant, ...],
     context: _PlanningContext,
 ) -> _ResidentTransform:
-    """Validate one contiguous Ref selector and return its output state."""
+    """Validate one contiguous Ref selector and return its output state.
+
+    Dynamic selectors are accepted only when an enclosing zero-based tile loop or
+    an exact tail predicate proves both their offset provenance and live extent.
+    """
     from ..device_ir import IfGraphInfo
     from ..type_info import _detect_outer_block_bound
     from ..variable_origin import TileBeginOrigin
@@ -473,6 +498,9 @@ def _selector(
         if isinstance(index, torch.fx.Node)
         else None
     )
+    # A dynamic tail is safe only in the branch whose predicate proves that the
+    # requested fixed-width iota is live. Merely sharing the source block symbol is
+    # insufficient because the final source block may be shorter.
     if source is not None and source.target is torch.ops.prims.iota.default:
         if not isinstance(graph_info, IfGraphInfo) or not source.args:
             raise exc.BackendUnsupported(
@@ -512,6 +540,9 @@ def _selector(
             )
         selector = _ResidentSelector("tail", logical_dim, -1, start, width, False)
     elif source is not None:
+        # Ordinary dynamic runs must partition the resident block from zero. A
+        # symbolic end must be the exact live extent of the source tile so it can
+        # also discharge that source's tail-padding guard below.
         value = source.meta.get("val")
         squeeze = isinstance(value, torch.SymInt)
         if squeeze:
@@ -598,6 +629,8 @@ def _selector(
             f"the selector at {_where(node)} has unsupported index {index!r}",
         )
 
+    # Validate every emitted physical branch. A dynamic selector must address the
+    # Ref directly, and a tiled run must partition its selected dimension exactly.
     output: list[_ResidentVariant] = []
     for variant in variants:
         physical_dim = _logical_to_physical(
@@ -669,6 +702,8 @@ def _selector(
                     "Ref for this config",
                 )
 
+        # Only selection through the matching source live extent proves that the
+        # guarded physical dimension no longer contains addressable padding.
         remaining_guard = (
             None
             if variant.live_guard == (physical_dim, outer_block_id)
@@ -698,6 +733,13 @@ def _reshape_variants(
     config: Config,
     variants: tuple[_ResidentVariant, ...],
 ) -> tuple[_ResidentVariant, ...]:
+    """Prove a view changes shape without changing the Ref's TPU lane layout.
+
+    Mosaic can reinterpret major dimensions, but the physical element count and
+    two hardware-tiled minor dimensions must remain identical. A partially-live
+    Ref is rejected because reshaping would lose which physical dimension carries
+    its tail-padding guard.
+    """
     value = node.meta.get("val")
     target = str(node.target)
     location = _where(node)
@@ -786,6 +828,12 @@ def _effective_users(
     node: torch.fx.Node,
     captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]],
 ) -> list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]]:
+    """Return semantic users while traversing identity-only graph transports.
+
+    ``_new_var`` and control-flow placeholders carry the same value into another
+    scope, so they are returned separately as transports to annotate. Parent calls
+    and shape-only reads are not value consumers of the resident Ref.
+    """
     results: list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]] = []
     seen: set[torch.fx.Node] = set()
     stack: list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]] = [(node, ())]
@@ -837,6 +885,12 @@ def _analyze_resident_chain(
     annotations: dict[torch.fx.Node, _ResidentPlan],
     root: bool = False,
 ) -> None:
+    """Plan every semantic user, materializing only at a valid value boundary.
+
+    The root load itself cannot serve both ordinary value users and resident Ref
+    users. A non-root view may end the Ref chain by materializing, provided it is
+    fully live and no later narrowing selector depends on retaining the Ref.
+    """
     users = _effective_users(node, context.captures)
     planned: dict[
         torch.fx.Node,
@@ -870,6 +924,8 @@ def _analyze_resident_chain(
         else:
             planned[user] = (transports, result.variants, result.selector)
 
+    # A root load has one codegen representation. If any branch needs its ordinary
+    # value, it cannot simultaneously remain a Ref for a narrowing branch.
     if root and (unsupported or not planned):
         if planned and unsupported:
             blockers = [_where(user) for user, _failure in unsupported]
@@ -884,11 +940,15 @@ def _analyze_resident_chain(
             "pallas",
             f"the resident load at {_where(node)} has no address-preserving users",
         )
+    # Past the root, an unsupported or terminal user is normally a legal boundary:
+    # materialize this view and let ordinary Pallas codegen continue from its value.
     if not root and (
         (selector is not None and selector.mask) or unsupported or not planned
     ):
         masked_boundary = selector is not None and selector.mask and bool(planned)
         if masked_boundary:
+            # A mask changes values rather than addresses. It is applied only when
+            # materializing, so an address-only Ref chain cannot cross this selector.
             failure = exc.BackendUnsupported(
                 "pallas",
                 f"the masked selection at {_where(node)} must materialize before "
@@ -902,6 +962,8 @@ def _analyze_resident_chain(
             for variant in node_variants
             if variant.live_guard is not None
         ]
+        # Materializing copies the full physical Ref. It is unsafe until every tail
+        # guard has been discharged, because padding would become an ordinary value.
         if live_guards:
             failure = exc.BackendUnsupported(
                 "pallas",
@@ -912,6 +974,8 @@ def _analyze_resident_chain(
             raise failure
 
         if planned and unsupported and not masked_boundary:
+            # Ordinary users force materialization here; record why any deeper
+            # narrowing users can no longer receive a resident Ref.
             blockers = [_where(user) for user, _failure in unsupported]
             reason = (
                 f"the resident view at {_where(node)} must materialize because "
@@ -925,6 +989,8 @@ def _analyze_resident_chain(
 
     annotations[node] = _ResidentPlan(False, node_variants, selector)
     for user, (transports, output, user_spec) in planned.items():
+        # Identity transports retain the input physical state; the semantic user
+        # receives the transformed state returned by _registered_transform.
         transport_plan = _ResidentPlan(False, node_variants, None)
         for transport in transports:
             annotations[transport] = transport_plan
@@ -953,6 +1019,8 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
     for info in graphs:
         for producer in info.graph.find_nodes(op="call_function", target=load):
             tensor = _node_value(producer.args[0])
+            # Keeping a Ref defers the physical read until its consumer. A device
+            # write through an alias could therefore change program semantics.
             if (
                 isinstance(tensor, torch.Tensor)
                 and id(tensor.untyped_storage()) in mutated_storages
@@ -1039,6 +1107,8 @@ def _codegen_resident_subscript(state: CodegenState) -> ast.AST:
 
     parts = [":" for _ in input_variant.shape]
     parts[physical_dim] = f"pl.ds({begin_expr}, {width_value})"
+    # ``Ref.at[...]`` composes an address transform; ``Ref[...]`` performs the
+    # load. The planner decides which representation downstream users require.
     accessor = "" if plan.materialize else ".at"
     result = expr_from_string(
         f"{{base}}{accessor}[{', '.join(parts)}]", base=state.ast_arg(0)
@@ -1047,6 +1117,8 @@ def _codegen_resident_subscript(state: CodegenState) -> ast.AST:
         return result
 
     assert variant.live_guard is None
+    # Scalar selectors are tracked as hidden physical dimensions while the value
+    # remains a Ref. Drop them only after the boundary load has materialized it.
     squeezed_dims = variant.squeezed_dims
     if squeezed_dims:
         squeeze_parts = [
@@ -1056,6 +1128,8 @@ def _codegen_resident_subscript(state: CodegenState) -> ast.AST:
             f"{{result}}[{', '.join(squeeze_parts)}]", result=result
         )
     if mask:
+        # Like squeezing, masking changes the loaded value and therefore belongs
+        # after materialization rather than in the address-only Ref transform.
         mask_var = state.codegen.mask_var(local_block_id)
         if mask_var is None:
             return result
