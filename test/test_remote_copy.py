@@ -322,12 +322,17 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
 
     def _init_process(self) -> None:
         torch.cuda.set_device(self.device)
+        group_name = (
+            f"{self.__class__.__name__}_{os.path.basename(self.file_name)}"
+            .replace(".", "_")
+        )
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend="nccl",
             world_size=self.world_size,
             rank=self.rank,
             store=store,
+            group_name=group_name,
             device_id=self.device,
         )
         torch.distributed.distributed_c10d._set_pg_timeout(
