@@ -47,10 +47,16 @@ def test_published_manifests_are_fixed(
             for case in cutlass_benchmark.CASES
         ),
         tuple(tuple(shape) for shape in deepgemm_benchmark.OFFICIAL_SHAPES),
+        (
+            deepgemm_benchmark.DEEPGEMM_SELECTED_TILE_M,
+            deepgemm_benchmark.DEEPGEMM_SELECTED_TILE_N,
+            deepgemm_benchmark.DEEPGEMM_SELECTED_TILE_K,
+            deepgemm_benchmark.M_ALIGNMENT,
+        ),
         deepgemm_benchmark.selected_config().config,
     )
     assert hashlib.sha256(repr(manifest).encode()).hexdigest() == (
-        "deffec6097179b24ed4071fda1d7908fe57a1d291f0191187655bb39d9e5d9de"
+        "608089dc016171e07938f1a67c9c42ed56e292a2d99038b8a2410393d7aa8c74"
     )
 
 

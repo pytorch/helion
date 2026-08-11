@@ -96,6 +96,8 @@ from .tcgen05_constants import TCGEN05_GROUPED_MODES
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -207,6 +209,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY,
         TCGEN05_GROUPED_MODE_CONFIG_KEY,
         TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
@@ -905,6 +908,24 @@ class CuteTcgen05Config:
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        source_m_tile_key = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+        source_m_tile = config.get(source_m_tile_key)
+        if source_m_tile_key in config and (
+            type(source_m_tile) is not int
+            or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            != TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ):
+            if fix_invalid:
+                config.pop(source_m_tile_key)
+            else:
+                raise InvalidConfig(
+                    f"{source_m_tile_key} requires "
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} and one of "
+                    f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}, got "
+                    f"{source_m_tile!r}"
+                )
         reserved_sms_key = TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
         reserved_sms = config.get(reserved_sms_key)
         if reserved_sms_key in config and (
@@ -2217,6 +2238,9 @@ class CuteTcgen05Config:
             fragments[TCGEN05_GROUPED_MODE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_MODES
             )
+            fragments[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = EnumFragment(
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            )
         direct_entry_seed_eligible = self.full_tile_direct_entry_seed_eligible()
         if direct_entry_seed_eligible or (
             not for_search and self._direct_entry_k_block_index() is not None
@@ -3010,6 +3034,24 @@ class CuteTcgen05Config:
             # path, while exact-proof compiler seeds survive flatten/unflatten.
             fields[TCGEN05_GROUPED_MODE_CONFIG_KEY] = EnumFragment(
                 (None, *grouped_seed_modes),
+                search_choices=(None,),
+            )
+        grouped_source_m_tiles = tuple(
+            dict.fromkeys(
+                source_m_tile
+                for config in self.config_spec.compiler_seed_configs
+                if (
+                    source_m_tile := config.config.get(
+                        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+                    )
+                )
+                and type(source_m_tile) is int
+                and source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            )
+        )
+        if grouped_source_m_tiles:
+            fields[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = EnumFragment(
+                (None, *grouped_source_m_tiles),
                 search_choices=(None,),
             )
         fields.update(self.strategy_autotune_fragments())
