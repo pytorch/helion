@@ -682,6 +682,26 @@ def _append_cute_wrapper_plan(
             cluster_m=max(1, cluster_m),
             reserved_sms=reserved_sms,
         )
+        quota_args = tuple(
+            str(arg)
+            for arg in cast(
+                "tuple[object, ...]", plan.get("static_group_quota_args", ())
+            )
+        )
+        quotas: tuple[int, ...] = ()
+        if quota_args:
+            assert cluster_m == 1 and cluster_n == 1
+            problem_shapes = cast(
+                "tuple[tuple[int, int, int], ...]", plan["static_problem_shapes"]
+            )
+            assert len(quota_args) == len(problem_shapes)
+            quotas = _tcgen05_grouped_static_quotas(
+                problem_shapes,
+                bm=plan_int("bm"),
+                bn=plan_int("bn"),
+                bk=plan_int("bk"),
+                max_active_clusters=max_active_clusters,
+            )
         body.extend(
             (
                 (
@@ -700,6 +720,7 @@ def _append_cute_wrapper_plan(
             )
         )
         call_args.append(sched_params_arg)
+        call_args.extend(f"cutlass.Int32({quota})" for quota in quotas)
         return
     if kind != "tcgen05_ab_tma":
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
@@ -1967,6 +1988,51 @@ def _tcgen05_grouped_static_active_clusters(
     return max(1, active_sms // cluster_m)
 
 
+def _tcgen05_grouped_static_quotas(
+    problem_shapes: tuple[tuple[int, int, int], ...],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    max_active_clusters: int,
+) -> tuple[int, ...]:
+    """Balance each group's longest CTA without assigning idle CTAs.
+
+    If fewer CTAs than groups are active, the returned ones are unused because
+    the device selects the generic scheduler instead of the specialized path.
+    """
+    tile_counts = [
+        ((problem_m + bm - 1) // bm) * ((problem_n + bn - 1) // bn)
+        for problem_m, problem_n, _problem_k in problem_shapes
+    ]
+    k_tile_counts = [
+        (problem_k + bk - 1) // bk
+        for _problem_m, _problem_n, problem_k in problem_shapes
+    ]
+    quotas = [1] * len(problem_shapes)
+    grid_size = min(sum(tile_counts), max_active_clusters)
+    for _ in range(max(0, grid_size - len(quotas))):
+        candidates = [
+            index
+            for index, (quota, tile_count) in enumerate(
+                zip(quotas, tile_counts, strict=True)
+            )
+            if quota < tile_count
+        ]
+        group = max(
+            candidates,
+            key=lambda index: (
+                (tile_counts[index] + quotas[index] - 1)
+                // quotas[index]
+                * k_tile_counts[index],
+                tile_counts[index] * k_tile_counts[index],
+                -index,
+            ),
+        )
+        quotas[group] += 1
+    return tuple(quotas)
+
+
 def _plan_int_value(plan: dict[str, object], key: str) -> int:
     value = plan[key]
     assert isinstance(value, int)
@@ -3132,6 +3198,19 @@ def _build_tcgen05_grouped_static_metadata(
             "n_sizes metadata; rebind and prewarm the grouped kernel with the "
             "final metadata before launch or CUDA graph capture",
         )
+    if (expected_shapes := plan.get("static_problem_shapes")) is not None:
+        actual_shapes = tuple(
+            (problem_m, problem_n, problem_k)
+            for problem_m, problem_n, problem_k, _batch in problem_sizes
+        )
+        if actual_shapes != expected_shapes:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped static problem-shape specialization does not "
+                "match the current layout/n_sizes/k_sizes metadata; expected "
+                f"{expected_shapes!r}, got {actual_shapes!r}; rebind and prewarm "
+                "with the final grouped shapes before launch or CUDA graph capture",
+            )
 
     device = layout.device
     direct_pointers_tensor: torch.Tensor | None = None

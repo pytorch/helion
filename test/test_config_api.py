@@ -20,9 +20,13 @@ from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY,
+)
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
@@ -1250,6 +1254,65 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 repaired.config,
             )
 
+    def test_grouped_static_problem_signature_envelope(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
+        signature = [2, 128, 64, 32, 16, 128, 1536]
+
+        def make_config(
+            value: object, mode: object = TCGEN05_GROUPED_MODE_DIRECT
+        ) -> helion.Config:
+            config = helion.Config(
+                block_sizes=[128, 64, 64],
+                pid_type="persistent_interleaved",
+            )
+            config.config[key] = value
+            if mode is not None:
+                config.config[TCGEN05_GROUPED_MODE_CONFIG_KEY] = mode
+            return config
+
+        config = make_config(signature)
+        spec.normalize(config)
+        self.assertEqual(config.config[key], signature)
+        minimized = config.minimize(spec)
+        spec.normalize(minimized)
+        self.assertEqual(minimized.config[key], signature)
+
+        dynamic = make_config(signature, TCGEN05_GROUPED_MODE_DYNAMIC)
+        spec.normalize(dynamic)
+        self.assertEqual(dynamic.config[key], signature)
+
+        static = make_config(signature, TCGEN05_GROUPED_MODE_STATIC)
+        spec.normalize(static)
+        self.assertEqual(static.config[key], signature)
+
+        invalid_values = (
+            (2, 128, 64, 32, 16, 128, 1536),
+            [True, 128, 64, 32],
+            [2, 128, 64, 32],
+            [1, 128, 0, 32],
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                invalid = make_config(value)
+                with self.assertRaisesRegex(exc.InvalidConfig, key):
+                    spec.normalize(invalid)
+                fixed = make_config(value)
+                spec.normalize(fixed, _fix_invalid=True)
+                self.assertNotIn(key, fixed.config)
+
+        for mode in (
+            None,
+            TCGEN05_GROUPED_MODE_WORKLIST_NM,
+        ):
+            with self.subTest(mode=mode):
+                invalid = make_config(signature, mode)
+                with self.assertRaisesRegex(exc.InvalidConfig, key):
+                    spec.normalize(invalid)
+                fixed = make_config(signature, mode)
+                spec.normalize(fixed, _fix_invalid=True)
+                self.assertNotIn(key, fixed.config)
+
     def test_deep_ab_stage_mode_envelopes_and_stage7_roundtrip(self) -> None:
         def selected_config() -> helion.Config:
             return helion.Config(
@@ -1276,6 +1339,38 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
             spec.normalize(grouped_ab4)
 
+        grouped_ab8 = helion.Config(
+            block_sizes=[128, 64, 64],
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_ab_stages=8,
+            tcgen05_c_stages=4,
+            **{
+                TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_DYNAMIC,
+            },
+        )
+        spec.normalize(grouped_ab8)
+        self.assertEqual(grouped_ab8.config["tcgen05_ab_stages"], 8)
+        minimized_ab8 = grouped_ab8.minimize(spec)
+        spec.normalize(minimized_ab8)
+        self.assertEqual(minimized_ab8.config["tcgen05_ab_stages"], 8)
+        self.assertEqual(minimized_ab8.config["tcgen05_c_stages"], 4)
+
+        for ab_stages, c_stages in ((8, 2), (4, 4)):
+            mismatched = helion.Config(
+                block_sizes=[128, 64, 64],
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_ab_stages=ab_stages,
+                tcgen05_c_stages=c_stages,
+            )
+            mismatched.config[TCGEN05_GROUPED_MODE_CONFIG_KEY] = (
+                TCGEN05_GROUPED_MODE_DYNAMIC
+            )
+            with (
+                self.subTest(ab_stages=ab_stages, c_stages=c_stages),
+                self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"),
+            ):
+                spec.normalize(mismatched)
+
         config = selected_config()
         spec.normalize(config)
         minimized = config.minimize(spec)
@@ -1294,6 +1389,49 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         )
         with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
             constrained_spec.normalize(selected_config())
+
+    def test_grouped_dynamic_deep_stage_smem_accounts_for_output_dtype(self) -> None:
+        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+
+        config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
+        with (
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_smem_capacity_bytes",
+                return_value=232448,
+            ),
+            patch(
+                "helion._compiler.cute.tcgen05_config.tcgen05_default_epilogue_tile_size",
+                return_value=(128, 32),
+            ),
+        ):
+            self.assertTrue(
+                config.grouped_dynamic_stages_fit_for_target(
+                    dtype_bytes=2,
+                    output_dtype_bytes=2,
+                    device=torch.device("cuda"),
+                    bm=128,
+                    bn=64,
+                    bk=64,
+                    cluster_m=1,
+                    ab_stages=8,
+                    c_stages=4,
+                )
+            )
+            self.assertFalse(
+                config.grouped_dynamic_stages_fit_for_target(
+                    dtype_bytes=2,
+                    output_dtype_bytes=4,
+                    device=torch.device("cuda"),
+                    bm=128,
+                    bn=64,
+                    bk=64,
+                    cluster_m=1,
+                    ab_stages=8,
+                    c_stages=4,
+                )
+            )
 
     def test_direct_cute_config_spec_enforces_clc_arch_gate(self) -> None:
         from helion._compiler.cute.strategies import (
