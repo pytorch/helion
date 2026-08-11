@@ -437,9 +437,8 @@ def default_launcher(
             _remote_copy_process_group_name,
             math.prod(grid) * _remote_copy_signal_slots_per_program,
         )
-        # Remote-copy waits assume compiler-owned completion slots start at 0.
-        # Clear any leftover values before launching a kernel that reuses them.
-        signal.zero_()
+        # Allocation zeroes new pads and receive waits reset consumed slots.
+        # Clearing here could erase a completion sent before this rank launches.
         args = (*args, signal)
 
     option_key = _prepared_options_key(ptx_options, kwargs)

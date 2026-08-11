@@ -320,7 +320,7 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
     def device(self) -> torch.device:
         return torch.device(f"cuda:{self.rank}")
 
-    def _init_process(self) -> None:
+    def _init_process(self) -> dist.Store:
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
@@ -334,6 +334,7 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             timedelta(seconds=60), dist.group.WORLD
         )
         symm_mem.set_backend("NVSHMEM")
+        return store
 
     def _cleanup_process(self) -> None:
         torch.cuda.synchronize()
@@ -349,7 +350,7 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
         return dst
 
     def test_one_shot_remote_copy(self) -> None:
-        self._init_process()
+        store = self._init_process()
         try:
             src = torch.from_numpy(_rank_values(self.rank)).to(self.device)
             src = src.reshape(1, 1, _WIDTH)
@@ -368,8 +369,13 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             for _invocation in range(2):
                 dst.fill_(-1)
                 dist.barrier()
+                if self.rank == 0 and _invocation == 1:
+                    # Enter the cached launch only after rank 3 has signaled us.
+                    store.wait(["rank_3_completed_one_shot_copy"])
                 result = _one_shot_remote_copy(src, dst, peers, slots)
                 torch.cuda.synchronize()
+                if self.rank == self.world_size - 1 and _invocation == 1:
+                    store.set("rank_3_completed_one_shot_copy", "1")
                 torch.testing.assert_close(result[0], expected)
         finally:
             self._cleanup_process()
