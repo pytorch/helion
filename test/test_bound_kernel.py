@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 from typing import Any
 import unittest
+from unittest.mock import MagicMock
 from unittest.mock import Mock
 
 import torch
@@ -621,13 +622,13 @@ class TestToCodePallas(TestCase):
             _pallas_to_code(pallas_matmul, (x, y), _JAX)
 
 
-class TestOutOfResourcesFallback(unittest.TestCase):
+class TestOutOfResourcesFallback(TestCase):
     """Unit tests for the retry-with-default-config fallback in
     :meth:`BoundKernel.__call__`. These call the unbound method against a
     minimal mock so they run without a device or a real compile."""
 
     def _make_bound(self, config: object, default_config: object) -> Mock:
-        bound = Mock()
+        bound = MagicMock()
         bound.kernel._has_specialization_extras = False
         bound._config = config
         bound.env.config_spec.default_config.return_value = default_config
