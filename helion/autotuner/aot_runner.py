@@ -410,11 +410,14 @@ def run_evaluate_phase(config: RunConfig) -> bool:
 
 def run_compile_phase(config: RunConfig) -> bool:
     """
-    Run the compile phase: generate standalone Triton files with no Helion deps.
+    Run the compile phase: generate standalone kernel files. Triton outputs have
+    no Helion dependency; CuTe outputs currently import its runtime launcher.
 
-    Runs the benchmark once with ``HELION_AOT_MODE=compile``.  Each kernel
-    call generates Triton code for all heuristic-selected configs and writes
-    a ``<name>_standalone.py`` file next to the kernel source.
+    Runs the benchmark once with ``HELION_AOT_MODE=compile``. Dynamic kernels
+    export all heuristic-selected configs; static kernels accumulate the
+    selected config for each observed normalized call. The output is written
+    next to a file-backed kernel source, or to the AOT data directory for
+    interactive/non-file-backed kernels.
 
     Returns True if successful.
     """
@@ -511,9 +514,7 @@ def run_full_workflow(config: RunConfig) -> bool:
     log.info("=" * 60)
     log.info("AOT autotuning workflow completed successfully!")
     log.info("=" * 60)
-    log.info(
-        "To emit standalone Triton files (no helion deps), re-run with --standalone"
-    )
+    log.info("To emit standalone kernel files, re-run with --standalone")
     return True
 
 
@@ -552,7 +553,7 @@ Examples:
   python -m helion.autotuner.aot_runner --run-id 20241217_143022_abc123 --phase measure \\
     -- python benchmark.py
 
-  # Generate standalone Triton files (no helion dependency at runtime)
+  # Generate standalone kernel files (CuTe retains its Helion launcher import)
   python -m helion.autotuner.aot_runner --standalone -- python benchmark.py
 
   # Alternative: use --benchmark with quoted command (no -- needed)
@@ -590,9 +591,12 @@ Examples:
     parser.add_argument(
         "--standalone",
         action="store_true",
-        help="After the selected phase(s), generate standalone Triton files "
-        "with zero Helion dependencies. Requires heuristics from a prior "
-        "build phase. Written next to kernel source as <name>_standalone.py.",
+        help="After the selected phase(s), generate standalone kernel files. "
+        "Triton output has zero Helion dependencies; CuTe currently retains "
+        "its Helion launcher import. Requires heuristics from a prior build "
+        "phase. Written next to kernel source as <name>_standalone.py. Static "
+        "kernels must expose tensor-derived compile-time values as scalar or "
+        "container arguments, or validate them in their runtime wrapper.",
     )
 
     parser.add_argument(
