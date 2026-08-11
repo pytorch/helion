@@ -31,6 +31,9 @@ _FLAT_PROGRAM_ID = (
     " + tl.program_id(1) * tl.num_programs(0) + tl.program_id(0)"
 )
 _NUM_PROGRAMS = "tl.num_programs(2) * tl.num_programs(1) * tl.num_programs(0)"
+# Values from NVSHMEM's nvshmemx_signal_op_t and nvshmem_cmp_t.
+_NVSHMEM_SIGNAL_ADD = 10
+_NVSHMEM_CMP_NE = 1
 
 
 @dataclass
@@ -156,7 +159,8 @@ def _prepare_remote_copy(state: CodegenState) -> ast.AST:
             "nvshmem.putmem_signal_block("
             f"{dst_ptr}, {src_ptr}, "
             f"tl.cast(({numel}) * {src.element_size()}, tl.int64), "
-            f"{signal_name}, tl.cast(1, tl.uint64), 0, {{device_id}})",
+            f"{signal_name}, tl.cast(1, tl.uint64), "
+            f"{_NVSHMEM_SIGNAL_ADD}, {{device_id}})",
             device_id=device_id,
             **src_placeholders,
             **dst_placeholders,
@@ -222,8 +226,12 @@ def _paired_signal(state: CodegenState) -> str:
 def _receive_wait_statements(state: CodegenState) -> list[ast.stmt]:
     signal = _paired_signal(state)
     return [
-        statement_from_string(f"nvshmem.signal_wait_until({signal}, 0, 1)"),
-        statement_from_string(f"tl.store({signal}, 0)"),
+        statement_from_string(
+            f"nvshmem.signal_wait_until({signal}, {_NVSHMEM_CMP_NE}, 0)"
+        ),
+        statement_from_string(
+            f"tl.atomic_add({signal}, -1, sem='relaxed', scope='sys')"
+        ),
     ]
 
 

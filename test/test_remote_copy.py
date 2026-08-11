@@ -161,6 +161,49 @@ def _reused_descriptor_pipeline_copy(
     static_shapes=True,
     config=helion.Config(block_sizes=[]),
 )
+def _ordered_reused_descriptor_pipeline_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+    gate: torch.Tensor,
+    rank: torch.Tensor,
+) -> torch.Tensor:
+    """Force two completions to reach rank 0 before it consumes either."""
+    num_steps = hl.specialize(src.size(1))
+    for _program in hl.grid(1):
+        hl.remote_barrier(peers[0, :])
+        gate_copy = hl.make_async_remote_copy(
+            gate,
+            [0],
+            peers[0, 0],
+        )
+        # Ranks 1-3 advance the ring while rank 0 waits. Rank 3 releases the
+        # gate only after its second put into rank 0's reused completion slot.
+        if rank[0] == 0:
+            gate_copy.wait()
+        for step in hl.tile(num_steps, block_size=1):
+            copy = hl.make_async_remote_copy(
+                src,
+                [0, step.begin],
+                peers[0, 0],
+                dst=dst,
+                dst_index=[0, step.begin],
+            )
+            if step.begin > 0:
+                copy.wait()
+            copy.start()
+            if step.begin == 1:
+                if rank[0] == 3:
+                    gate_copy.start()
+            if step.begin == num_steps - 1:
+                copy.wait()
+    return dst
+
+
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
 def _ring_all_gather(
     local_values: torch.Tensor,
     gathered: torch.Tensor,
@@ -386,6 +429,8 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
             src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
             dst = self._make_symmetric_buffer(src.shape)
+            gate = self._make_symmetric_buffer((1,))
+            gate.fill_(self.rank)
             peers = torch.tensor(
                 [
                     [
@@ -396,13 +441,16 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
                 dtype=torch.int32,
                 device=self.device,
             )
+            rank = torch.tensor([self.rank], dtype=torch.int32, device=self.device)
             expected = torch.from_numpy(
                 _expected_pipeline_destination(self.world_size)[self.rank]
             ).to(self.device)
             for _invocation in range(2):
                 dst.fill_(-1)
                 dist.barrier()
-                result = _reused_descriptor_pipeline_copy(src, dst, peers)
+                result = _ordered_reused_descriptor_pipeline_copy(
+                    src, dst, peers, gate, rank
+                )
                 torch.cuda.synchronize()
                 torch.testing.assert_close(result[0], expected)
         finally:
