@@ -1306,7 +1306,28 @@ def _flash_causal_hd64_seed_num_kv_supported(num_kv: int | None) -> bool:
 
 
 _FLASH_CAUSAL_HD64_LONG_AUTOTUNE_MIN_KV = 4096
-_FLASH_CAUSAL_DEG2_SEED_KV = 4096
+
+
+class _FlashCausalDegree2SeedParams(NamedTuple):
+    role_map: str
+    e2e_offset: int
+    e2e_offset0: int
+    epi_tma: bool
+
+
+def _flash_causal_degree2_seed_params(
+    num_kv: int,
+) -> _FlashCausalDegree2SeedParams | None:
+    """Transfer validated causal schedules to neighboring power-of-two lengths."""
+    if not _flash_causal_hd64_seed_num_kv_supported(num_kv) or num_kv < 512:
+        return None
+    if num_kv == 512:
+        return _FlashCausalDegree2SeedParams("fa4", 15, 3, True)
+    if num_kv == 1024:
+        return _FlashCausalDegree2SeedParams("fa4", 1, 14, False)
+    if num_kv == 2048:
+        return _FlashCausalDegree2SeedParams("fa4", 14, 12, False)
+    return _FlashCausalDegree2SeedParams("helion", 14, 12, False)
 
 
 def _flash_causal_hd64_seed_params(num_kv: int) -> tuple[int, int, int, int]:
@@ -1426,7 +1447,6 @@ _FLASH_DEG1_EXP2_OFFSET0 = 10
 # aligned KV tiles to stay within their validated numerical envelope.
 _FLASH_DENSE_HD64_2CTA_MIN_KV = 256
 _FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV = 2048
-_FLASH_DENSE_DEG2_SEED_KV = 2048
 _FLASH_MANUAL_EXP2_PACKET_PARAMS: dict[str, tuple[int, int]] = {
     _FLASH_DEG2_EXP2_PACKET: (8, 3),
     _FLASH_HYBRID_EXP2_PACKET: (8, 4),
@@ -3548,7 +3568,6 @@ def _flash_dense_degree2_seed_config(
         or requires_ws_overlap
         or small_biased_candidate
         or not _flash_dense_hd64_2cta_num_kv_supported(num_kv)
-        or num_kv != _FLASH_DENSE_DEG2_SEED_KV
     ):
         return None
     block_sizes = _flash_seed_block_sizes(block_size_targets)
@@ -3567,11 +3586,12 @@ def _flash_dense_degree2_seed_config(
         pipeline_family_override="fa4_2cta",
     )
     values = {key: fragment.default() for key, fragment in fragments.items()}
+    short_degree2_seed = num_kv <= 512
     packet_values: dict[str, object] = {
         FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
         FLASH_E2E_SCHEDULE_KEY: "16/6",
-        FLASH_E2E_OFFSET_KEY: 0,
-        FLASH_E2E_OFFSET0_KEY: 2,
+        FLASH_E2E_OFFSET_KEY: 14 if short_degree2_seed else 12,
+        FLASH_E2E_OFFSET0_KEY: 0 if short_degree2_seed else 2,
         FLASH_KV_STAGE_KEY: 2,
         FLASH_PERSISTENT_KEY: False,
         FLASH_STAT_TRANSPORT_KEY: "single_final",
@@ -3580,6 +3600,8 @@ def _flash_dense_degree2_seed_config(
         FLASH_CORR_REGS_KEY: 72,
         FLASH_OTHER_REGS_KEY: 40,
         FLASH_ROLE_MAP_KEY: "fa4",
+        FLASH_FIRST_LOAD_ORDER_KEY: 4,
+        FLASH_CORR_TILE_SIZE_KEY: 16 if short_degree2_seed else 8,
         FLASH_RESCALE_THRESHOLD_KEY: 8.0,
         FLASH_RESCALE_CHUNK_COLS_KEY: 8,
     }
@@ -3845,13 +3867,14 @@ def _flash_causal_degree2_seed_config(
     standard_causal_output: bool,
     block_size_targets: Sequence[int],
 ) -> Config | None:
-    """Return the validated 512K causal degree-2 seed."""
+    """Return a validated causal degree-2 seed."""
+    seed_params = _flash_causal_degree2_seed_params(num_kv)
     if (
         not standard_causal_output
         or not is_causal
         or dtype is not torch.float16
         or head_dim != 64
-        or num_kv != _FLASH_CAUSAL_DEG2_SEED_KV
+        or seed_params is None
         or has_kv_tile_pruning
         or requires_ws_overlap
         or small_biased_candidate
@@ -3875,13 +3898,15 @@ def _flash_causal_degree2_seed_config(
     overrides: dict[str, object] = {
         FLASH_E2E_SCHEDULE_KEY: "16/6",
         FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
-        FLASH_E2E_OFFSET_KEY: 0,
-        FLASH_E2E_OFFSET0_KEY: 14,
+        FLASH_E2E_OFFSET_KEY: seed_params.e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: seed_params.e2e_offset0,
         FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
         FLASH_WAIT_HINT_KEY: 0,
         FLASH_DISC_PIPE_KEY: 3,
+        FLASH_EPI_TMA_KEY: seed_params.epi_tma,
         FLASH_RESCALE_CHUNK_COLS_KEY: 16,
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
+        FLASH_ROLE_MAP_KEY: seed_params.role_map,
     }
     if not _flash_seed_set_all(values, fragments, overrides):
         return None
@@ -4127,6 +4152,7 @@ def flash_autotune_fragments(
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
     topology_override: str | None = None,
     pipeline_family_override: str | None = None,
 ) -> dict[str, ConfigSpecFragment]:
@@ -5016,10 +5042,28 @@ def flash_autotune_fragments(
         if defaults.exp2_packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
             exp2_packet_search_choices: tuple[str, ...] | None = (defaults.exp2_packet,)
         else:
-            exp2_packet_search_choices = (
-                _flash_choices_with_default(defaults.exp2_packet, ("8x2", "1x1"))
-                if defaults.use_2cta_instrs
-                else _flash_choices_with_default(defaults.exp2_packet, ("1x1", "4x1"))
+            ordinary_packet_choices = (
+                ("8x2", "1x1") if defaults.use_2cta_instrs else ("1x1", "4x1")
+            )
+            degree2_search_choices = (
+                (_FLASH_DEG2_EXP2_PACKET,)
+                if dtype is torch.float16
+                and (
+                    (standard_dense_output and dense_hd64_2cta_fa4)
+                    or (
+                        is_causal
+                        and standard_causal_output
+                        and _flash_causal_degree2_seed_params(num_kv) is not None
+                        and not has_kv_tile_pruning
+                        and not requires_ws_overlap
+                        and not small_biased_candidate
+                    )
+                )
+                else ()
+            )
+            exp2_packet_search_choices = _flash_choices_with_default(
+                defaults.exp2_packet,
+                (*ordinary_packet_choices, *degree2_search_choices),
             )
     else:
         exp2_packet_choices = ("1x1",)
@@ -8655,10 +8699,14 @@ if warp_idx == 15:
     # PASS2. Other paths retain their measured schedule; threshold==0.0 (fp8)
     # emits the prior block byte-identically.
     # Stage-parameterized, so one definition covers both softmax warpgroups (0/1).
-    def _disc_alpha_blocks_for(not_first: str) -> tuple[str, str]:
+    def _disc_alpha_blocks_for(
+        not_first: str, *, known_not_first: bool = False
+    ) -> tuple[str, str]:
         if cfg.rescale_threshold > 0.0:
             pin_condition = (
-                f"({not_first}) & (flash_acc_log >= -{cfg.rescale_threshold})"
+                f"flash_acc_log >= -{cfg.rescale_threshold}"
+                if known_not_first
+                else f"({not_first}) & (flash_acc_log >= -{cfg.rescale_threshold})"
             )
             if defer_causal_minus_scale:
                 return (
@@ -8966,14 +9014,16 @@ if warp_idx == 15:
                 *,
                 publish_rowsum: bool = True,
                 zero_first_tile: bool = False,
+                known_not_first: bool = False,
             ) -> str:
                 rowsum_publish = final_corr_publish_rowsum if publish_rowsum else ""
-                alpha_publish = (
-                    ""
-                    if cfg.skip_rescale_stats
-                    else f"""            if {not_first}:
+                if cfg.skip_rescale_stats:
+                    alpha_publish = ""
+                elif known_not_first:
+                    alpha_publish = _corr_publish_alpha("            ")
+                else:
+                    alpha_publish = f"""            if {not_first}:
 {corr_publish_alpha}"""
-                )
                 if zero_first_tile:
                     loop_rowmax_block = f"""            if {not_first}:
 {textwrap.indent(loop_rowmax_block, "    ")}"""
@@ -8981,7 +9031,9 @@ if warp_idx == 15:
 {textwrap.indent(loop_pass2_block, "    ")}
             else:
                 flash_p_sum = {zero_pass2_call}"""
-                alpha_block, minus_scale_block = _disc_alpha_blocks_for(not_first)
+                alpha_block, minus_scale_block = _disc_alpha_blocks_for(
+                    not_first, known_not_first=known_not_first
+                )
                 loop_header = _flash_runtime_range_header(loop_var, loop_bound)
                 return f"""        {loop_header}{actual_kv}
             _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})
@@ -9028,6 +9080,8 @@ if warp_idx == 15:
                         publish_rowsum=False,
                         zero_first_tile=stage == "0",
                     )
+                    # The proven split always executes a nonempty masked prefix
+                    # before entering its unmasked suffix.
                     unmasked_loop = _format_disc_loop(
                         "flash_kv_unmask_iter",
                         f"flash_m_tile{stage}",
@@ -9038,6 +9092,7 @@ if warp_idx == 15:
                         "flash_kv_unmask_iter >= cutlass.Int32(0)",
                         direct_dense_rowmax,
                         direct_dense_pass2,
+                        known_not_first=True,
                     )
                     return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
