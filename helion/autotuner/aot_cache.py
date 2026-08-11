@@ -1145,12 +1145,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return super().autotune(skip_cache=skip_cache)
 
 
-def _code_identity(code: types.CodeType) -> tuple[bytes, tuple[Any, ...]]:
-    """Semantic identity of a code object: bytecode+constants"""
-    return (
-        code.co_code,
-        code.co_consts,
-    )
+def _code_identity(
+    code: types.CodeType,
+) -> tuple[bytes, tuple[Any, ...], tuple[str, ...]]:
+    """Semantic identity of a code object: bytecode + constants + referenced names."""
+    return (code.co_code, code.co_consts, code.co_names)
 
 
 def _serialize_value(val: object) -> object:

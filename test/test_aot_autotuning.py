@@ -88,7 +88,11 @@ class TestCodeSerialization:
 
         serialized = _serialize_value(fn.__code__)
         deserialized = _deserialize_value(serialized)
-        assert deserialized == (fn.__code__.co_code, fn.__code__.co_consts)
+        assert deserialized == (
+            fn.__code__.co_code,
+            fn.__code__.co_consts,
+            fn.__code__.co_names,
+        )
 
     def test_stable_hash_same_for_rename(self) -> None:
         def double(v):
@@ -121,6 +125,17 @@ class TestCodeSerialization:
 
         h1 = ShapeKey("k", (with_nested_lambda_2.__code__,), "hw").stable_hash()
         h2 = ShapeKey("k", (with_nested_lambda_3.__code__,), "hw").stable_hash()
+        assert h1 != h2
+
+    def test_stable_hash_for_conames(self) -> None:
+        def with_sin(v):
+            return v.sin()
+
+        def with_cos(v):
+            return v.cos()
+
+        h1 = ShapeKey("k", (with_sin.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (with_cos.__code__,), "hw").stable_hash()
         assert h1 != h2
 
 
