@@ -16,76 +16,15 @@ Writes ``<source>_<kernel>_standalone.py`` next to each kernel source file.
 
 from __future__ import annotations
 
+import ast
 import logging
 from pathlib import Path
 import re
 
+from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
+from .._compiler.output_code_utils import dependency_free_runtime_source
+
 log: logging.Logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Helion runtime helpers inlined into standalone output
-# ---------------------------------------------------------------------------
-
-_INLINED_LAUNCHER = """
-def _default_launcher(
-    triton_kernel,
-    grid,
-    *args,
-    num_warps,
-    num_stages,
-    launch_cooperative_grid=False,
-    **kwargs,
-):
-    return triton_kernel.run(
-        *args,
-        grid=grid,
-        warmup=False,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        launch_cooperative_grid=launch_cooperative_grid,
-        **kwargs,
-    )
-"""
-
-_INLINED_GET_NUM_SM = """
-def _get_num_sm(device, reserved_sms=0):
-    if device.type == "cuda":
-        available = torch.cuda.get_device_properties(device.index).multi_processor_count
-    elif device.type == "xpu":
-        available = torch.xpu.get_device_properties(device.index).gpu_subslice_count
-    else:
-        raise NotImplementedError(f"_get_num_sm not implemented for {device.type}")
-    if reserved_sms <= 0:
-        return available
-    return max(available - reserved_sms, 1)
-"""
-
-_INLINED_GET_NUM_XCD = """
-_CUS_PER_XCD = {"gfx942": 38, "gfx950": 32, "gfx951": 32}
-
-
-def _get_num_xcd(device=None):
-    if not torch.cuda.is_available():
-        return 1
-    try:
-        props = torch.cuda.get_device_properties(
-            device if device is not None else torch.cuda.current_device()
-        )
-    except Exception:
-        return 1
-    arch = getattr(props, "gcnArchName", None)
-    if not arch:
-        return 1
-    cus_per_xcd = _CUS_PER_XCD.get(arch.split(":")[0])
-    if cus_per_xcd is None:
-        return 1
-    cu = props.multi_processor_count
-    n = round(cu / cus_per_xcd)
-    if n < 1 or abs(n * cus_per_xcd - cu) > cus_per_xcd // 4:
-        return 1
-    return n
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -110,10 +49,27 @@ def _split_imports_and_body(code: str) -> tuple[list[str], str]:
     return imports, "\n".join(lines[body_start:])
 
 
-def _replace_helion_deps(body: str) -> str:
-    """Replace inlined Helion runtime helpers with their standalone versions."""
-    body = body.replace("helion.runtime.get_num_sm(", "_get_num_sm(")
-    return body.replace("helion.runtime.get_num_xcd(", "_get_num_xcd(")
+def _is_supported_helion_import(import_line: str) -> bool:
+    """Whether an import matches the generated Triton wrapper contract."""
+    return import_line in {
+        "import helion",
+        "from helion.runtime import default_launcher as _default_launcher",
+    }
+
+
+def _runtime_references(body: str) -> set[str]:
+    """Collect direct ``helion.runtime.<name>`` references from generated code."""
+    result: set[str] = set()
+    for node in ast.walk(ast.parse(body)):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "runtime"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "helion"
+        ):
+            result.add(node.attr)
+    return result
 
 
 def _rename_config_symbols(body: str, kernel_name: str, config_idx: int) -> str:
@@ -245,24 +201,42 @@ def generate_standalone_file(
     # -- collect imports & bodies -------------------------------------------
     all_imports: set[str] = set()
     bodies: list[str] = []
-    needs_launcher = False
-    needs_get_num_sm = False
-    needs_get_num_xcd = False
+    needs_runtime = False
+    runtime_source: str | None = None
+    runtime_references: set[str] = set()
 
     for i, code in enumerate(triton_codes):
         imports, body = _split_imports_and_body(code)
         for imp in imports:
             if "helion" in imp:
+                if not _is_supported_helion_import(imp):
+                    raise ValueError(
+                        f"unsupported Helion import in standalone AOT input: {imp!r}"
+                    )
                 if "default_launcher" in imp:
-                    needs_launcher = True
+                    needs_runtime = True
                 continue
             all_imports.add(imp)
-        if "helion.runtime.get_num_sm(" in body:
-            needs_get_num_sm = True
-        if "helion.runtime.get_num_xcd(" in body:
-            needs_get_num_xcd = True
-        body = _replace_helion_deps(body)
+        references = _runtime_references(body)
+        runtime_references.update(references)
+        needs_runtime = needs_runtime or bool(references)
         bodies.append(_rename_config_symbols(body, kernel_name, i))
+
+    if needs_runtime:
+        from .._compiler.triton.backend import TritonBackend
+
+        launcher_info = TritonBackend().dependency_free_launcher_info
+        supported_runtime_names = {
+            launcher_info.launcher_symbol,
+            *launcher_info.runtime_helper_names,
+        }
+        if unknown := runtime_references - supported_runtime_names:
+            raise ValueError(
+                "unsupported Helion runtime helper in standalone AOT input: "
+                f"{', '.join(sorted(unknown))}"
+            )
+        runtime_source = dependency_free_runtime_source(launcher_info)
+        all_imports.add("import types")
 
     # -- assemble -----------------------------------------------------------
     parts: list[str] = [
@@ -276,12 +250,8 @@ def generate_standalone_file(
             parts.append(imp)
     parts.append("")
 
-    if needs_launcher:
-        parts.append(_INLINED_LAUNCHER)
-    if needs_get_num_sm:
-        parts.append(_INLINED_GET_NUM_SM)
-    if needs_get_num_xcd:
-        parts.append(_INLINED_GET_NUM_XCD)
+    if runtime_source is not None:
+        parts.append(runtime_source)
 
     sep = "=" * 65
     for i, body in enumerate(bodies):
@@ -304,6 +274,7 @@ def generate_standalone_file(
     parts.extend([f"    ][{select_expr}](*args, **kwargs)", ""])
 
     content = "\n".join(parts)
+    _check_kernel_name_not_shadowed(ast.parse(content), [], kernel_name)
 
     # -- write --------------------------------------------------------------
     if kernel_source_file is not None:
