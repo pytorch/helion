@@ -7697,6 +7697,25 @@ def _emit_mma_pipeline(
         tcgen05_scheduler_warp_count_for_plan = tcgen05_effective_scheduler_warps
         tcgen05_sched_stage_count_for_plan = tcgen05_sched_stage_count_value
         tcgen05_persistence_model_for_plan = tcgen05_persistence_model_str
+
+        # When the entire grid fits in one wave, every persistent CTA receives
+        # exactly one tile.
+        one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
+        one_shot_n_slots = n_size // bn
+        one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
+        tcgen05_one_shot_role_scheduler = (
+            tcgen05_pid_is_persistent
+            and tcgen05_static_full_tiles
+            and (analysis is None or not analysis.has_leading_passthrough)
+            and one_shot_work_ctas <= env.config_spec.num_sm
+            # A partial cluster could access out of bounds.
+            and one_shot_m_slots % tcgen05_cluster_m == 0
+            and one_shot_n_slots % tcgen05_cluster_n == 0
+            and tcgen05_use_role_local_persistent_body
+            and tcgen05_effective_scheduler_warps == 0
+            and tcgen05_grouped_plan is None
+            and tcgen05_l2_swizzle_size_value == 1
+        )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=tcgen05_mma_bm,
             bn=tcgen05_mma_bn,
@@ -7715,6 +7734,7 @@ def _emit_mma_pipeline(
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
             ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
+            one_shot_role_scheduler=tcgen05_one_shot_role_scheduler,
             scheduler_warp_count=tcgen05_scheduler_warp_count_for_plan,
             sched_stage_count=tcgen05_sched_stage_count_for_plan,
             # ``c_input_warp_count`` plumbs the warp-spec slot
