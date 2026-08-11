@@ -128,8 +128,13 @@ jobs:
             # accuracy tolerance for every correct impl. Force fp32 for those two
             # so each impl isn't compared against a downcast bf16 baseline.
             PRECISION=bf16
+            ATOL=1e-2
             case "$kernel" in
               kl_div|welford) PRECISION=fp32 ;;
+              # RMSNorm backward reduces 2048 bf16 products into dWeight.
+              # Eager, torch.compile, and Pallas may use different valid
+              # reduction trees, producing differences up to one bf16 ULP.
+              rms_norm-bwd) ATOL=1e-1 ;;
             esac
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
               python benchmarks/run.py \
@@ -143,7 +148,7 @@ jobs:
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
-                --atol 1e-2 \
+                --atol "$ATOL" \
                 --rtol 1e-2 \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
