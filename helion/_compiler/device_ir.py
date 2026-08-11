@@ -2919,7 +2919,8 @@ class WalkDeviceAST(NodeVisitor):
             and rhs_type.origin.is_host()
             and not isinstance(node.value, ast.Subscript)
         ):
-            full_slices = [slice(None)] * rhs_type.fake_value.ndim
+            full_slices: list[object] = [slice(None)] * rhs_type.fake_value.ndim
+            # pyrefly: ignore [bad-argument-type]
             val = hl.load(val, full_slices)
         self._assign_subscript(target, val)
 
