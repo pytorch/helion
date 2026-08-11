@@ -986,6 +986,31 @@ class TestPallas(TestCase):
         )
         self.assertGreaterEqual(recall, 0.99)
 
+    def test_gather_matches_torch(self) -> None:
+        @helion.kernel(
+            backend="pallas",
+            config=helion.Config(block_sizes=[8]),
+        )
+        def gather_kernel(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(index, dtype=x.dtype)
+            for rows in hl.tile(x.size(0)):
+                out[rows, :] = torch.gather(x[rows, :], 1, index[rows, :])
+            return out
+
+        x_cpu = torch.arange(8 * 128, dtype=torch.float32).reshape(8, 128)
+        rows = torch.arange(8, dtype=torch.int32)[:, None]
+        columns = torch.arange(64, dtype=torch.int32)[None, :]
+        index_cpu = (rows * 37 + columns * 53) % 128
+        index_cpu[:, 0] = 0
+        index_cpu[:, 1] = 127
+        index_cpu[:, 2] = index_cpu[:, 3]
+
+        x = x_cpu.to(DEVICE)
+        index = index_cpu.to(DEVICE)
+        result = gather_kernel(x, index)
+        expected = torch.gather(x, 1, index.to(torch.int64))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
     @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
     def test_topk_bf16_vocab_reduction(self) -> None:
         """bf16 input: the (rows, vocab) reduction buffer stays bf16 (halves the
