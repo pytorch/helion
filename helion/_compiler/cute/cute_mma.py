@@ -206,6 +206,37 @@ _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
     32,
     32,
 )
+
+
+def _tcgen05_explicit_epilogue_tile_supported(
+    *,
+    is_two_cta: bool,
+    bm: int,
+    bn: int,
+    tile_shape: tuple[int | None, int | None, int | None],
+) -> bool:
+    """Whether the current tcgen05 explicit-epilogue path supports the tile."""
+    epi_tile_m, epi_tile_n, d_store_box_n = tile_shape
+    return (
+        # Four epilogue warps own 16 or 32 supported TMEM datapaths each.
+        epi_tile_m in (64, 128)
+        # Use the dtype-independent, power-of-two TMA store widths validated by
+        # this backend; 16 is the minimum that also gives FP8 a 128-bit row.
+        and epi_tile_n in (16, 32, 64)
+        # Helion emits one epilogue subtile per TMA store box.
+        and d_store_box_n == epi_tile_n
+        # Every MMA M tile must partition into whole epilogue subtiles.
+        and bm % epi_tile_m == 0
+        # Every MMA N tile must partition into whole store boxes.
+        and bn % epi_tile_n == 0
+        # Explicit 2CTA uses the established per-CTA M128 partition.
+        and (not is_two_cta or epi_tile_m == 128)
+        # 2CTA BM128 needs a permuted per-CTA M64 layout that integer explicit
+        # tile overrides cannot express, so it stays on the implicit path.
+        and not (is_two_cta and bm == 128)
+    )
+
+
 # Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
 # degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
 # CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
@@ -7569,33 +7600,28 @@ def _emit_mma_pipeline(
             )
         )
         tcgen05_use_flat_role_coordinates = tcgen05_requested_flat_role_coordinates
-        # T2's rowvec ``acc + bias[n]`` epilogue surfaces a single rank-1
-        # (broadcast_axis=1) aux descriptor. The aux pipeline keeps the
-        # bias on the SIMT load path (no TMA), so the explicit
-        # epilogue-tile family stays validated for the T2 envelope: the
-        # store side still uses the same TMA-store + epi-tile shape as
-        # T1/T3/T4/T5. Exact-shape rank-2 aux tensors (broadcast_axis=
-        # None) and any other broadcast shape remain rejected here.
-        aux_descriptors_compatible_with_explicit_epi_tile = all(
-            d.broadcast_axis == 1 for d in aux_tensor_descriptors_value
+        explicit_epi_tile_shape = (
+            tcgen05_explicit_epi_tile_m,
+            tcgen05_explicit_epi_tile_n,
+            tcgen05_explicit_d_store_box_n,
         )
-        # The explicit-epi-tile / flat-role store path is dtype-general for any
-        # 16-bit operand: bf16 and fp16 produce the same epilogue tile
-        # (``compute_epilogue_tile_shape`` keys on the 2-byte element width) and
-        # the same TMA-store box, so admit either at ANY structurally-valid
-        # shape and ANY epilogue. The store side keys off ``epi_elem_dtype_str``,
-        # which equals the operand dtype's cutlass string here.
-        explicit_epi_tile_dtype_ok = (
-            input_dtype == torch.bfloat16 and epi_elem_dtype_str == "cutlass.BFloat16"
-        ) or (input_dtype == torch.float16 and epi_elem_dtype_str == "cutlass.Float16")
         nm_explicit_store_wave = (
             tcgen05_nm_orientation
-            and (
-                tcgen05_explicit_epi_tile_m,
-                tcgen05_explicit_epi_tile_n,
-                tcgen05_explicit_d_store_box_n,
+            and explicit_epi_tile_shape == TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+        )
+        explicit_epi_aux_supported = not c_input_aux_tensor_descriptors_value or (
+            tcgen05_warp_spec.c_input_warps == 0
+            and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        explicit_epi_tile_supported = (
+            _tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=tcgen05_is_two_cta,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                tile_shape=explicit_epi_tile_shape,
             )
-            == TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+            and explicit_epi_aux_supported
         )
         if nm_worklist:
             nm_worklist_metadata_checks = {
@@ -7629,37 +7655,12 @@ def _emit_mma_pipeline(
                         "block_k=64 or 128, "
                         "CtaGroup.TWO, and no auxiliary epilogue tensors",
                     )
-            elif not (
-                tcgen05_static_full_tiles
-                and tcgen05_is_two_cta
-                and bm == TCGEN05_TWO_CTA_BLOCK_M
-                and bn == TCGEN05_TWO_CTA_BLOCK_N
-                and explicit_epi_tile_dtype_ok
-                and aux_descriptors_compatible_with_explicit_epi_tile
-            ):
+            elif not explicit_epi_tile_supported:
                 raise exc.BackendUnsupported(
                     "cute",
-                    "explicit tcgen05 epilogue tile overrides are validated only "
-                    "for static-full 16-bit (bf16/fp16) pure matmul CtaGroup.TWO "
-                    "kernels (rank-1 rowvec aux tensors admitted for the bias "
-                    "envelope)",
-                )
-            if (
-                not nm_explicit_store_wave
-                and (
-                    tcgen05_explicit_epi_tile_m,
-                    tcgen05_explicit_epi_tile_n,
-                    tcgen05_explicit_d_store_box_n,
-                )
-                != _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE
-            ):
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "explicit tcgen05 epilogue tile is currently validated only "
-                    "for epi_tile="
-                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[:2]} "
-                    "and d_store_box_n="
-                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[2]}",
+                    "explicit tcgen05 epilogue tile must use M=64/128 and "
+                    "N=16/32/64, divide the MMA tile, and use N as the store "
+                    "box width without using staged auxiliary inputs",
                 )
         if tcgen05_use_flat_role_coordinates:
             if not (
@@ -7679,8 +7680,20 @@ def _emit_mma_pipeline(
                 # cluster_n=1 envelope and use the same flat-role launch
                 # shape, for bf16 and fp16 operands alike.
                 and bk in (64, 128)
-                and explicit_epi_tile_dtype_ok
-                and aux_descriptors_compatible_with_explicit_epi_tile
+                and (
+                    (
+                        input_dtype == torch.bfloat16
+                        and epi_elem_dtype_str == "cutlass.BFloat16"
+                    )
+                    or (
+                        input_dtype == torch.float16
+                        and epi_elem_dtype_str == "cutlass.Float16"
+                    )
+                )
+                and all(
+                    descriptor.broadcast_axis == 1
+                    for descriptor in aux_tensor_descriptors_value
+                )
                 and tcgen05_use_tma_store_epilogue
                 and tcgen05_warp_spec.scheduler_warps == 0
                 and tcgen05_warp_spec.c_input_warps == 0
