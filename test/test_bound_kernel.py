@@ -12,7 +12,6 @@ import tempfile
 import textwrap
 from typing import Any
 import unittest
-from unittest.mock import MagicMock
 from unittest.mock import Mock
 
 import torch
@@ -623,52 +622,36 @@ class TestToCodePallas(TestCase):
 
 
 class TestOutOfResourcesFallback(TestCase):
-    """Unit tests for the retry-with-default-config fallback in
-    :meth:`BoundKernel.__call__`. These call the unbound method against a
-    minimal mock so they run without a device or a real compile."""
-
-    def _make_bound(self, config: object, default_config: object) -> Mock:
-        bound = MagicMock()
-        bound.kernel._has_specialization_extras = False
-        bound._config = config
-        bound.env.config_spec.default_config.return_value = default_config
-        return bound
-
     def test_retries_once_with_default_config(self) -> None:
-        bound = self._make_bound(config="bad_config", default_config="default_config")
-        bound._run = Mock(side_effect=[OutOfResources(1, 2, "shared memory"), "ok"])
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        fallback = Mock(return_value="ok")
+        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
 
-        def fake_set_config(config: object) -> None:
-            bound._config = config
-
-        bound.set_config.side_effect = fake_set_config
-
-        result = BoundKernel.__call__(bound, "arg")
+        result = wrapped("arg")
 
         self.assertEqual(result, "ok")
-        bound.set_config.assert_called_once_with("default_config")
-        self.assertEqual(bound._run.call_count, 2)
+        run.assert_called_once_with("arg")
+        fallback.assert_called_once_with("arg")
 
-    def test_does_not_retry_when_already_on_default_config(self) -> None:
-        bound = self._make_bound(
-            config="default_config", default_config="default_config"
-        )
-        bound._run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+    def test_no_retry_when_run_succeeds(self) -> None:
+        run = Mock(return_value="ok")
+        fallback = Mock()
+        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
 
-        with self.assertRaises(OutOfResources):
-            BoundKernel.__call__(bound, "arg")
+        result = wrapped("arg")
 
-        bound.set_config.assert_not_called()
-        self.assertEqual(bound._run.call_count, 1)
+        self.assertEqual(result, "ok")
+        fallback.assert_not_called()
 
     def test_other_exceptions_are_not_caught(self) -> None:
-        bound = self._make_bound(config="bad_config", default_config="default_config")
-        bound._run = Mock(side_effect=RuntimeError("unrelated failure"))
+        run = Mock(side_effect=RuntimeError("unrelated failure"))
+        fallback = Mock()
+        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
 
         with self.assertRaises(RuntimeError):
-            BoundKernel.__call__(bound, "arg")
+            wrapped("arg")
 
-        bound.set_config.assert_not_called()
+        fallback.assert_not_called()
 
 
 if __name__ == "__main__":

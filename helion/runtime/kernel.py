@@ -1885,11 +1885,31 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config: The configuration to set.
         """
         config = self._normalize_config(config)
-        self._run = self.compile_config(config)
+        default_config = self.env.config_spec.default_config()
+        run = self.compile_config(config)
+        if config != default_config:
+            run = self._run_with_fallback(run, self.compile_config(default_config))
+        self._run = run
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
+
+    def _run_with_fallback(
+        self, run: CompiledConfig, fallback: CompiledConfig
+    ) -> CompiledConfig:
+        """Wrap ``run`` to retry once with ``fallback`` if it raises at launch."""
+
+        def run_with_fallback(*args: object) -> _R:
+            try:
+                return run(*args)
+            except OutOfResources:
+                log.warning(
+                    f"Kernel {self.kernel.name} launch failure; retrying with the fallback config"
+                )
+                return fallback(*args)
+
+        return run_with_fallback
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -2184,20 +2204,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     assert self._run is not None
                     self.maybe_log_repro(log.warning, args)
 
-        current_config = self._config
-        try:
-            return self._run(*args)
-        except OutOfResources:
-            default_config = self.env.config_spec.default_config()
-            if current_config == default_config:
-                raise
-            with self._first_compile_lock:
-                if current_config == self._config:
-                    self.set_config(default_config)
-            log.warning(
-                f"Kernel {self.kernel.name} ran out of resources with {current_config}; retrying with the default config {default_config}"
-            )
-            return self._run(*args)
+        return self._run(*args)
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """
