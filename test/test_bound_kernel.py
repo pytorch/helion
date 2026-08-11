@@ -653,6 +653,16 @@ class TestOutOfResourcesFallback(TestCase):
 
         fallback.assert_not_called()
 
+    def test_retries_on_other_launch_resource_errors(self) -> None:
+        run = Mock(side_effect=RuntimeError("too many resources requested for launch"))
+        fallback = Mock(return_value="ok")
+        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
+
+        result = wrapped("arg")
+
+        self.assertEqual(result, "ok")
+        fallback.assert_called_once_with("arg")
+
 
 if __name__ == "__main__":
     unittest.main()

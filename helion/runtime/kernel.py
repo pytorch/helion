@@ -34,7 +34,6 @@ from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
-from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._subclasses import FakeTensor
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 import torch.distributed as dist
@@ -64,6 +63,7 @@ from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
+from ..autotuner.logger import match_launch_resource_error
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -1903,12 +1903,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _run_with_fallback(
         self, run: CompiledConfig, fallback: CompiledConfig
     ) -> CompiledConfig:
-        """Wrap ``run`` to retry once with ``fallback`` if it raises at launch."""
+        """Wrap ``run`` to retry once with ``fallback`` if it raises a launch
+        resource error (shared memory, registers, grid size)."""
 
         def run_with_fallback(*args: object) -> _R:
             try:
                 return run(*args)
-            except OutOfResources:
+            except Exception as e:
+                if not match_launch_resource_error(e):
+                    raise
                 log.warning(
                     f"Kernel {self.kernel.name} launch failure; retrying with the fallback config"
                 )
