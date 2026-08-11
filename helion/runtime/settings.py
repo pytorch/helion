@@ -600,6 +600,7 @@ class _Settings:
             _env_get_bool, "HELION_PALLAS_INTERPRET", False
         )
     )
+    pallas_topk_recall_target: float = 0.99
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
@@ -720,6 +721,10 @@ class Settings(_Settings):
         "pallas_interpret": (
             "If True, run Pallas kernels in interpret mode on CPU (no TPU needed). "
             "Defaults to HELION_PALLAS_INTERPRET env var."
+        ),
+        "pallas_topk_recall_target": (
+            "Recall target for the Pallas approximate top-k lowering. Must be in "
+            "(0, 1]; use 1.0 when exact top-k results are required. Default 0.99."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "

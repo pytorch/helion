@@ -986,6 +986,55 @@ class TestPallas(TestCase):
         )
         self.assertGreaterEqual(recall, 0.99)
 
+    @skipIfPallasInterpret("topk bitonic path doesn't work in interpret mode")
+    def test_topk_recall_target_is_configurable(self) -> None:
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        # At k=8, recall 0.99 uses 768 interleaved bins. These two leading
+        # candidates collide in bin zero, so the approximate path drops one.
+        # Recall 1.0 retains one bin per vocabulary entry and returns exact top-k.
+        k = 8
+        x_cpu = torch.full((8, 896), -1000.0, dtype=torch.float32)
+        leading_indices = torch.tensor([0, 768, 1, 2, 3, 4, 5, 6])
+        x_cpu[:, leading_indices] = torch.arange(k, 0, -1, dtype=torch.float32)
+        expected_values, expected_indices = torch.topk(x_cpu, k, dim=-1)
+
+        @helion.kernel(
+            backend="pallas",
+            config=helion.Config(block_sizes=[8]),
+            static_shapes=True,
+            pallas_topk_recall_target=1.0,
+        )
+        def exact_topk_kernel(
+            x: torch.Tensor,
+            out_values: torch.Tensor,
+            out_indices: torch.Tensor,
+            top_k: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            top_k = hl.specialize(top_k)
+            for rows in hl.tile(x.size(0)):
+                values, indices = torch.topk(x[rows, :], top_k, dim=-1)
+                out_values[rows, :] = values
+                out_indices[rows, :] = indices.to(torch.int32)
+            return out_values, out_indices
+
+        x = jnp.asarray(x_cpu.numpy())
+        topk = jax.jit(exact_topk_kernel.jax_fn, static_argnums=(3,))
+        values, indices = jax.block_until_ready(
+            topk(
+                x,
+                jnp.empty((x.shape[0], k), dtype=x.dtype),
+                jnp.empty((x.shape[0], k), dtype=jnp.int32),
+                k,
+            )
+        )
+        np.testing.assert_array_equal(np.asarray(values), expected_values.numpy())
+        np.testing.assert_array_equal(
+            np.asarray(indices), expected_indices.to(torch.int32).numpy()
+        )
+
     def test_gather_matches_torch(self) -> None:
         @helion.kernel(
             backend="pallas",
