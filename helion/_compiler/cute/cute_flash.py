@@ -1205,7 +1205,10 @@ class FlashAttentionConfig:
     # autotuner can refine the threshold for fa4 and ws_overlap shapes.
     rescale_threshold: float = 0.0
     # Statistics handoff between the softmax and correction roles. ``single``
-    # uses the named-barrier handoff; ``ring2`` uses the two-slot mbarrier ring.
+    # uses one slot with a named ready barrier and an mbarrier reuse
+    # acknowledgement; ``single_final`` relies on the MMA chain for steady-state
+    # reuse and acknowledges only the terminal row sum, once per work item;
+    # ``ring2`` uses the two-slot mbarrier ring.
     stat_transport: str = "ring2"
     # Experimental FA4_SKIP_RESCALE_STATS lever. The resolver currently clamps
     # this off because dropping per-KV alpha handoffs is only correct if every
@@ -1303,7 +1306,7 @@ def _flash_causal_hd64_seed_num_kv_supported(num_kv: int | None) -> bool:
 
 
 _FLASH_CAUSAL_HD64_LONG_AUTOTUNE_MIN_KV = 4096
-_FLASH_CAUSAL_HD64_HYBRID_SEED_MIN_KV = 512
+_FLASH_CAUSAL_DEG2_SEED_KV = 4096
 
 
 def _flash_causal_hd64_seed_params(num_kv: int) -> tuple[int, int, int, int]:
@@ -1423,6 +1426,7 @@ _FLASH_DEG1_EXP2_OFFSET0 = 10
 # aligned KV tiles to stay within their validated numerical envelope.
 _FLASH_DENSE_HD64_2CTA_MIN_KV = 256
 _FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV = 2048
+_FLASH_DENSE_DEG2_SEED_KV = 2048
 _FLASH_MANUAL_EXP2_PACKET_PARAMS: dict[str, tuple[int, int]] = {
     _FLASH_DEG2_EXP2_PACKET: (8, 3),
     _FLASH_HYBRID_EXP2_PACKET: (8, 4),
@@ -2433,7 +2437,11 @@ def resolve_flash_config(
             and use_2cta_instrs
             and not softmax_disc
             and dense_degree1_eligible
-            and exp2_packet == dense_degree1_packet
+            and exp2_packet
+            in (
+                dense_degree1_packet,
+                _FLASH_DEG2_EXP2_PACKET,
+            )
         )
     )
     if exp2_packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
@@ -2499,10 +2507,20 @@ def resolve_flash_config(
     stat_transport_cfg = _cfg(FLASH_STAT_TRANSPORT_KEY)
     if stat_transport_cfg is not None:
         stat_transport = str(stat_transport_cfg)
-    if stat_transport not in ("ring2", "single"):
+    if stat_transport not in ("ring2", "single", "single_final"):
         stat_transport = stat_transport_default
     if not stat_transport_eligible:
         stat_transport = "ring2"
+    single_final_stat_eligible = (
+        stat_transport_eligible
+        and standard_dense_output
+        and (not persistent or use_2cta_instrs)
+        and not softmax_disc
+        and rescale_threshold > 0.0
+        and exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+    )
+    if stat_transport == "single_final" and not single_final_stat_eligible:
+        stat_transport = "single"
     causal_loop_split_default = (
         causal_hd64_seeded_fa4 and causal_kv_order == "descending"
     )
@@ -3508,7 +3526,7 @@ def _flash_default_seed_config(
     return Config.from_dict(seed)
 
 
-def _flash_dense_degree1_seed_config(
+def _flash_dense_degree2_seed_config(
     head_dim: int,
     num_kv: int,
     *,
@@ -3520,7 +3538,7 @@ def _flash_dense_degree1_seed_config(
     standard_dense_output: bool,
     block_size_targets: Sequence[int],
 ) -> Config | None:
-    """Return a general dense degree-1 seed from ``fa4_2cta`` defaults."""
+    """Return the validated long-dense degree-2 seed."""
     if (
         not standard_dense_output
         or is_causal
@@ -3530,6 +3548,7 @@ def _flash_dense_degree1_seed_config(
         or requires_ws_overlap
         or small_biased_candidate
         or not _flash_dense_hd64_2cta_num_kv_supported(num_kv)
+        or num_kv != _FLASH_DENSE_DEG2_SEED_KV
     ):
         return None
     block_sizes = _flash_seed_block_sizes(block_size_targets)
@@ -3548,20 +3567,22 @@ def _flash_dense_degree1_seed_config(
         pipeline_family_override="fa4_2cta",
     )
     values = {key: fragment.default() for key, fragment in fragments.items()}
-    packet_values: dict[str, object]
-    if num_kv < _FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV:
-        packet_values = {
-            FLASH_EXP2_PACKET_KEY: _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
-            FLASH_E2E_SCHEDULE_KEY: "8/2",
-        }
-    else:
-        packet_values = {
-            FLASH_EXP2_PACKET_KEY: _FLASH_DEG1_EXP2_PACKET,
-            FLASH_E2E_SCHEDULE_KEY: "16/8",
-            FLASH_E2E_OFFSET_KEY: _FLASH_DEG1_EXP2_OFFSET,
-            FLASH_E2E_OFFSET0_KEY: _FLASH_DEG1_EXP2_OFFSET0,
-            FLASH_KV_STAGE_KEY: 2,
-        }
+    packet_values: dict[str, object] = {
+        FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
+        FLASH_E2E_SCHEDULE_KEY: "16/6",
+        FLASH_E2E_OFFSET_KEY: 0,
+        FLASH_E2E_OFFSET0_KEY: 2,
+        FLASH_KV_STAGE_KEY: 2,
+        FLASH_PERSISTENT_KEY: False,
+        FLASH_STAT_TRANSPORT_KEY: "single_final",
+        FLASH_WAIT_HINT_KEY: 0,
+        FLASH_SOFTMAX_REGS_KEY: 192,
+        FLASH_CORR_REGS_KEY: 72,
+        FLASH_OTHER_REGS_KEY: 40,
+        FLASH_ROLE_MAP_KEY: "fa4",
+        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+        FLASH_RESCALE_CHUNK_COLS_KEY: 8,
+    }
     packet_values[FLASH_PIPELINE_FAMILY_KEY] = "fa4_2cta"
     if not _flash_seed_set_all(values, fragments, packet_values):
         return None
@@ -3812,7 +3833,7 @@ def _flash_causal_split_seed_config(
     return Config.from_dict(seed)
 
 
-def _flash_causal_hybrid_seed_config(
+def _flash_causal_degree2_seed_config(
     head_dim: int,
     num_kv: int,
     *,
@@ -3824,29 +3845,23 @@ def _flash_causal_hybrid_seed_config(
     standard_causal_output: bool,
     block_size_targets: Sequence[int],
 ) -> Config | None:
-    """Return the long-causal hybrid-exp2 compiler seed.
-
-    The hybrid packet uses degree 1 only in the unmasked suffix; diagonal tiles
-    retain degree 2. It remains a compiler seed because manual packet modes are
-    accepted by the fragments but excluded from random search.
-    """
+    """Return the validated 512K causal degree-2 seed."""
     if (
-        not is_causal
-        or head_dim != 64
+        not standard_causal_output
+        or not is_causal
         or dtype is not torch.float16
+        or head_dim != 64
+        or num_kv != _FLASH_CAUSAL_DEG2_SEED_KV
         or has_kv_tile_pruning
         or requires_ws_overlap
         or small_biased_candidate
-        or not standard_causal_output
-        or num_kv < _FLASH_CAUSAL_HD64_HYBRID_SEED_MIN_KV
-        or not _flash_causal_hd64_seed_num_kv_supported(num_kv)
     ):
         return None
     block_sizes = _flash_seed_block_sizes(block_size_targets)
     if block_sizes is None:
         return None
 
-    fragments = _flash_seed_fragments(
+    fragments = flash_autotune_fragments(
         head_dim,
         num_kv,
         dtype=dtype,
@@ -3854,36 +3869,23 @@ def _flash_causal_hybrid_seed_config(
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
-        topology_override="fa4",
+        pipeline_family_override="fa4",
     )
-    seed: dict[str, object] = {"block_sizes": block_sizes}
-    family_values: dict[str, object] = {
-        FLASH_PIPELINE_FAMILY_KEY: "fa4",
-        FLASH_S_STAGE_KEY: 2,
-        FLASH_KV_STAGE_KEY: 2,
-        FLASH_PERSISTENT_KEY: False,
-        FLASH_E2E_SCHEDULE_KEY: "16/8",
-        FLASH_MASKED_E2E_SCHEDULE_KEY: "16/8",
+    values = {key: fragment.default() for key, fragment in fragments.items()}
+    overrides: dict[str, object] = {
+        FLASH_E2E_SCHEDULE_KEY: "16/6",
+        FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
         FLASH_E2E_OFFSET_KEY: 0,
-        FLASH_E2E_OFFSET0_KEY: 10,
+        FLASH_E2E_OFFSET0_KEY: 14,
+        FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
+        FLASH_WAIT_HINT_KEY: 0,
         FLASH_DISC_PIPE_KEY: 3,
-        FLASH_EXP2_PACKET_KEY: _FLASH_HYBRID_EXP2_PACKET,
-        FLASH_WAIT_HINT_KEY: 10_000_000,
-        FLASH_EPI_TMA_KEY: False,
-        FLASH_EPI_STG_KEY: False,
-        FLASH_EPI_STG_GMEM_KEY: "stage",
         FLASH_RESCALE_CHUNK_COLS_KEY: 16,
-        FLASH_ROLE_MAP_KEY: "helion",
-        FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
-        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
-        FLASH_PACKED_REDUCE_KEY: True,
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
-        FLASH_CAUSAL_KV_ORDER_KEY: "descending",
-        FLASH_SOFTMAX_REGS_KEY: _flash_causal_hd64_seed_params(num_kv)[2],
     }
-    if not _flash_seed_set_all(seed, fragments, family_values):
+    if not _flash_seed_set_all(values, fragments, overrides):
         return None
-    return Config.from_dict(seed)
+    return Config.from_dict({"block_sizes": block_sizes, **values})
 
 
 def flash_attention_seed_config(
@@ -4036,7 +4038,7 @@ def flash_attention_seed_configs(
     if default_seed is not None:
         seeds.append(default_seed)
     if num_kv is not None:
-        dense_degree1_seed = _flash_dense_degree1_seed_config(
+        dense_degree2_seed = _flash_dense_degree2_seed_config(
             head_dim,
             num_kv,
             dtype=dtype,
@@ -4047,8 +4049,18 @@ def flash_attention_seed_configs(
             standard_dense_output=standard_dense_output,
             block_size_targets=block_size_targets,
         )
-        if dense_degree1_seed is not None:
-            seeds.append(dense_degree1_seed)
+        if dense_degree2_seed is not None:
+            seeds.extend(
+                (
+                    dense_degree2_seed,
+                    Config.from_dict(
+                        {
+                            **dense_degree2_seed.config,
+                            FLASH_STAT_TRANSPORT_KEY: "ring2",
+                        }
+                    ),
+                )
+            )
     causal_lpt_seed = flash_attention_seed_config(
         head_dim,
         num_kv,
@@ -4076,7 +4088,7 @@ def flash_attention_seed_configs(
     if causal_split_seed is not None:
         seeds.append(causal_split_seed)
     if num_kv is not None:
-        causal_hybrid_seed = _flash_causal_hybrid_seed_config(
+        causal_degree2_seed = _flash_causal_degree2_seed_config(
             head_dim,
             num_kv,
             dtype=dtype,
@@ -4087,8 +4099,8 @@ def flash_attention_seed_configs(
             standard_causal_output=standard_causal_output,
             block_size_targets=block_size_targets,
         )
-        if causal_hybrid_seed is not None:
-            seeds.append(causal_hybrid_seed)
+        if causal_degree2_seed is not None:
+            seeds.append(causal_degree2_seed)
     for family_seed in _flash_canonical_family_seed_configs(
         head_dim,
         num_kv,
@@ -4299,7 +4311,7 @@ def flash_autotune_fragments(
             defaults.persistent, (True, False)
         )
         persistent_search_choices: tuple[bool, ...] | None = (
-            _flash_choices_with_default(defaults.persistent, (True,))
+            _flash_choices_with_default(defaults.persistent, (True, False))
         )
         persistent_ctas_per_sm_choices = _flash_choices_with_default(
             defaults.persistent_ctas_per_sm, (1, 2, 3, 4)
@@ -5013,11 +5025,18 @@ def flash_autotune_fragments(
         exp2_packet_choices = ("1x1",)
         exp2_packet_search_choices = None
     if dense_hd64_fa4:
+        stat_transport_variants = (
+            ("ring2", "single", "single_final")
+            if standard_dense_output
+            else ("ring2", "single")
+        )
         stat_transport_choices = _flash_choices_with_default(
-            defaults.stat_transport, ("ring2", "single")
+            defaults.stat_transport, stat_transport_variants
         )
         stat_transport_search_choices: tuple[str, ...] | None = (
-            defaults.stat_transport,
+            _flash_choices_with_default(
+                defaults.stat_transport, stat_transport_variants
+            )
         )
     else:
         stat_transport_choices = ("ring2",)
@@ -5171,7 +5190,11 @@ if TYPE_CHECKING:
 # ``_flash_runtime`` (a real module compiled WITHOUT ``from __future__ import
 # annotations``); the generated module imports them. The remaining cute / utils
 # / pipeline symbols are imported under flash-local aliases.
-_FLASH_PREAMBLE_IMPORTS = """\
+_FLASH_RUNTIME_ABI = 2
+
+# This literal is part of generated source and therefore the CuTe disk-cache
+# key. Bump it whenever an imported flash runtime helper changes semantics.
+_FLASH_PREAMBLE_IMPORTS = f"""\
 import cutlass.utils as cutlass_utils_flash
 import cutlass.pipeline as cutlass_pipeline_flash
 from cutlass.cute.nvgpu import cpasync as cute_cpasync_flash
@@ -5179,6 +5202,7 @@ from cutlass.cute.nvgpu import tcgen05 as cute_tcgen05_flash
 import cutlass.utils.blackwell_helpers as sm100_utils_flash
 import helion._compiler.cute._flash_runtime as _helion_flash_rt
 import helion._compiler.cute._flash_gemm_ptx as _helion_flash_ptx
+_helion_flash_runtime_abi = {_FLASH_RUNTIME_ABI}
 """
 
 
@@ -7089,6 +7113,25 @@ def emit_flash_fa4_device_body(
     use_cga2_local_cta = cfg.use_cga2_local_cta
     use_clc_scheduler = cfg.use_clc_scheduler
     separate_kv_rings = cfg.separate_kv_rings
+    fa4_stat_handoff = cfg.stat_transport in ("single", "single_final")
+    # Match FA4's one-slot statistics pipeline: the softmax role acquires slot
+    # ownership after publishing P, while correction releases the opposite
+    # stage's slot. Unsupported schedules retain the conservative handoff below.
+    fa4_stat_pipeline = (
+        fa4_stat_handoff
+        and not is_causal
+        and cfg.exp2_impl == "split"
+        and not cfg.softmax_disc
+        and cfg.rescale_threshold > 0.0
+        and cfg.exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+    )
+    # The MMA warp's PV -> next-QK order makes each alpha slot safe to reuse
+    # without a per-iteration empty acknowledgement. Keep a single terminal
+    # handoff per work item before softmax overwrites alpha with row sum.
+    final_only_stat_pipeline = (
+        fa4_stat_pipeline and cfg.stat_transport == "single_final"
+    )
+    acknowledged_stat_pipeline = fa4_stat_pipeline and not final_only_stat_pipeline
     verified_shared_memory_bytes: int | None = None
     if separate_kv_rings:
         assert not use_cga2_local_cta
@@ -7112,6 +7155,9 @@ def emit_flash_fa4_device_body(
                     kv_iterations=num_kv if persistent else None,
                     stage_output=cfg.epi_tma or cfg.epi_stg,
                     split_p_arrive=cfg.split_p_arrive,
+                    stat_depth=1 if fa4_stat_handoff else 2,
+                    pipelined_stat_handoff=acknowledged_stat_pipeline,
+                    final_only_stat_handoff=final_only_stat_pipeline,
                 )
             )
         )
@@ -7133,6 +7179,9 @@ def emit_flash_fa4_device_body(
                     kv_iterations=num_kv if persistent else None,
                     stage_output=cfg.epi_tma or cfg.epi_stg,
                     split_p_arrive=cfg.split_p_arrive,
+                    stat_depth=1 if fa4_stat_handoff else 2,
+                    pipelined_stat_handoff=acknowledged_stat_pipeline,
+                    final_only_stat_handoff=final_only_stat_pipeline,
                 )
             )
         )
@@ -7162,17 +7211,20 @@ def emit_flash_fa4_device_body(
         cfg.exp2_packet, cfg.e2e_freq, cfg.e2e_res
     )
     if exp2_codegen.degree2:
-        assert is_causal
         assert hd == 64
         assert io_dtype == "cutlass.Float16"
         assert cfg.q_tile_count == 2
-        assert not use_2cta_instrs
         assert not use_cga2_local_cta
         assert not separate_kv_rings
-        assert cfg.softmax_disc
-        assert cfg.disc_pipe_depth >= 2
         assert cfg.p_store_repetition == 16
         assert cfg.s_load_repetition == 32
+        if is_causal:
+            assert not use_2cta_instrs
+            assert cfg.softmax_disc
+            assert cfg.disc_pipe_depth >= 2
+        else:
+            assert use_2cta_instrs
+            assert not cfg.softmax_disc
     sp_whole_row_sum = (
         _FLASH_DENSE_HD64_VERY_LONG_MIN_KV <= num_kv <= 2048
         and not is_causal
@@ -7523,7 +7575,6 @@ tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(
     _flash_tma_v, 0, cute.make_layout(1),
     cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3)){setup_gmem_slice}"""
     )
-    fa4_stat_handoff = cfg.stat_transport == "single"
     scale_layout = (
         f"cute.make_layout(({q_stage} * 128))"
         if fa4_stat_handoff
@@ -7639,7 +7690,8 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     flash_pv_acc_shape = flash_pvt.partition_shape_C(({mma_m}, {hd}))
     tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
 """
-    tmem_base_setup = f"""{tmem_fragment_setup}    flash_tmem.wait_for_alloc()
+    tmem_base_setup = f"""{tmem_fragment_setup}    _helion_flash_rt.named_barrier_wait_unaligned(
+        2, 13 * 32)
     flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
     tStS0_full = cute.make_tensor(flash_tmem_ptr, tStS.layout)
     tStS1_full = cute.make_tensor(flash_tmem_ptr + 128, tStS.layout)
@@ -7758,7 +7810,8 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     tLDcS = flash_thr_ld_coord.partition_D(tScS)
 """
         )
-        return f"""    flash_tmem.wait_for_alloc()
+        return f"""    _helion_flash_rt.named_barrier_wait_unaligned(
+        2, 13 * 32)
     flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
     flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, 128))
     tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
@@ -8529,7 +8582,7 @@ if warp_idx == 15:
         # parity matches the next work-item's correction pre-arrive (spike L1973-1977).
         flash_pfor_phase ^= 1"""
     mma_tmem_teardown = """    flash_tmem.relinquish_alloc_permit()
-    flash_tmem_user_bar.arrive_and_wait()
+    _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
     flash_tmem.free(flash_tmem_ptr)"""
     mma_role_inner = mma_inner
     if use_2cta_instrs:
@@ -8793,10 +8846,12 @@ if warp_idx == 15:
         else:
             lse_store = ""
         corr_empty_ptr = f"flash_s{stage}_corr_empty_ptr"
-        corr_prod_index = "0" if not is_causal else "flash_s_corr_prod_index"
+        corr_prod_index = "0" if fa4_stat_handoff else "flash_s_corr_prod_index"
         corr_prod_advance = (
-            "flash_s_corr_prod_phase ^= 1"
-            if not is_causal
+            ""
+            if fa4_stat_pipeline
+            else "flash_s_corr_prod_phase ^= 1"
+            if fa4_stat_handoff
             else textwrap.dedent(
                 """\
                 flash_s_corr_prod_index ^= 1
@@ -8812,31 +8867,39 @@ if warp_idx == 15:
             publish_alpha_store = (
                 f"{indent}{_scale_slot_expr(corr_prod_index, stage)} = flash_alpha\n"
             )
-            if fa4_stat_handoff:
-                return f"""{publish_alpha_store.rstrip()}
-{indent}cute.arch.barrier_arrive(
-{indent}    barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)"""
             publish_alpha_advance = corr_prod_advance.replace("\n", f"\n{indent}")
-            return f"""{indent}_helion_flash_rt.mbar_spin_wait(
+            producer_acquire = (
+                ""
+                if fa4_stat_pipeline
+                else f"""{indent}_helion_flash_rt.mbar_spin_wait(
 {indent}    {corr_empty_ptr} + {corr_prod_index}, flash_s_corr_prod_phase, {cfg.wait_hint})
-{publish_alpha_store.rstrip()}
-{indent}cute.arch.barrier_arrive(
-{indent}    barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+"""
+            )
+            return f"""{producer_acquire}{publish_alpha_store.rstrip()}
+{indent}_helion_flash_rt.named_barrier_arrive_unaligned(
+{indent}    {3 + int(stage) * 4} + warp_idx % 4, 64)
 {indent}{publish_alpha_advance}"""
 
         corr_publish_alpha = _corr_publish_alpha("                ")
+        corr_publish_dummy = f"""                _helion_flash_rt.named_barrier_arrive_unaligned(
+                    {3 + int(stage) * 4} + warp_idx % 4, 64)"""
         corr_rowsum_advance = corr_prod_advance.replace("\n", "\n        ")
-        if fa4_stat_handoff:
-            corr_publish_rowsum = f"""        {_scale_slot_expr(corr_prod_index, stage)} = flash_row_sum
-        cute.arch.barrier_arrive(
-            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
-{lse_store}"""
+        if final_only_stat_pipeline:
+            final_only_phase_advance = (
+                "        flash_s_corr_prod_phase ^= 1\n" if persistent else ""
+            )
+            rowsum_producer_acquire = f"""        _helion_flash_rt.mbar_spin_wait(
+            {corr_empty_ptr} + 0, flash_s_corr_prod_phase, {cfg.wait_hint})
+{final_only_phase_advance}"""
+        elif acknowledged_stat_pipeline:
+            rowsum_producer_acquire = ""
         else:
-            corr_publish_rowsum = f"""        _helion_flash_rt.mbar_spin_wait(
+            rowsum_producer_acquire = f"""        _helion_flash_rt.mbar_spin_wait(
             {corr_empty_ptr} + {corr_prod_index}, flash_s_corr_prod_phase, {cfg.wait_hint})
-        {_scale_slot_expr(corr_prod_index, stage)} = flash_row_sum
-        cute.arch.barrier_arrive(
-            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+"""
+        corr_publish_rowsum = f"""{rowsum_producer_acquire}        {_scale_slot_expr(corr_prod_index, stage)} = flash_row_sum
+        _helion_flash_rt.named_barrier_arrive_unaligned(
+            {3 + int(stage) * 4} + warp_idx % 4, 64)
 {lse_store}
         {corr_rowsum_advance}"""
         # The correction warp consumes per-KV alpha handoffs during the loop and
@@ -9106,6 +9169,8 @@ if warp_idx == 15:
                 )
             if exp2_codegen.degree1_unmasked:
                 sp_pass2_args.append("degree1=True")
+            elif exp2_codegen.degree2:
+                sp_pass2_args.append("degree2=True")
             sp_exp_block = (
                 f"            flash_p_sum = _helion_flash_rt.{sp_pass2_name}("
                 + ", ".join(sp_pass2_args)
@@ -9118,16 +9183,42 @@ if warp_idx == 15:
             sp_p_store_block = p_store_block
             sp_corr_publish_alpha = ""
         if not sp_corr_publish_alpha and not cfg.skip_rescale_stats:
-            sp_corr_publish_alpha = f"""            if {softmax_not_first}:
+            if acknowledged_stat_pipeline:
+                sp_corr_publish_alpha = f"""            if {softmax_not_first}:
+{corr_publish_alpha}
+            else:
+{corr_publish_dummy}"""
+            else:
+                sp_corr_publish_alpha = f"""            if {softmax_not_first}:
 {corr_publish_alpha}"""
-        fa4_publish_alpha_before_exp = fa4_stat_handoff and cfg.rescale_threshold > 0.0
+        fa4_publish_alpha_before_exp = fa4_stat_handoff and (
+            cfg.rescale_threshold > 0.0 or fa4_stat_pipeline
+        )
         sp_alpha_publish_pre = (
             sp_corr_publish_alpha if fa4_publish_alpha_before_exp else ""
         )
         sp_alpha_publish_post = (
             "" if fa4_publish_alpha_before_exp else sp_corr_publish_alpha
         )
-        return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
+        fa4_entry_stat_acquire = (
+            f"""        _helion_flash_rt.mbar_spin_wait(
+            {corr_empty_ptr} + 0, flash_s_corr_prod_phase, {cfg.wait_hint})
+        flash_s_corr_prod_phase ^= 1
+"""
+            if acknowledged_stat_pipeline
+            else ""
+        )
+        fa4_post_p_stat_acquire = (
+            f"""            _helion_flash_rt.mbar_spin_wait(
+                {corr_empty_ptr} + 0, flash_s_corr_prod_phase, {cfg.wait_hint})
+            flash_s_corr_prod_phase ^= 1
+"""
+            if acknowledged_stat_pipeline
+            else ""
+        )
+        return f"""{
+            fa4_entry_stat_acquire
+        }        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
         for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{
             softmax_actual_kv
@@ -9148,6 +9239,7 @@ if warp_idx == 15:
 {_softmax_release_p_ready(stage)}
 {_sp_alpha_post}
 {sp_alpha_publish_post}
+{fa4_post_p_stat_acquire.rstrip()}
             flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
 {sp_p_store_block}
 {final_corr_publish_rowsum}"""
@@ -9162,14 +9254,15 @@ if warp_idx == 15:
         if stage_local_softmax_setup
         else tmem_softmax_setup
     )
-    softmax_corr_prod_state = ""
+    softmax_corr_prod_state = (
+        "\n    flash_s_corr_prod_phase = cutlass.Int32(1)"
+        if acknowledged_stat_pipeline
+        else "\n    flash_s_corr_prod_phase = cutlass.Int32(0)"
+    )
     if not fa4_stat_handoff:
-        softmax_corr_prod_state = "\n    flash_s_corr_prod_phase = cutlass.Int32(0)"
-        if is_causal:
-            softmax_corr_prod_state = (
-                "\n    flash_s_corr_prod_index = cutlass.Int32(0)"
-                + softmax_corr_prod_state
-            )
+        softmax_corr_prod_state = (
+            "\n    flash_s_corr_prod_index = cutlass.Int32(0)" + softmax_corr_prod_state
+        )
     softmax0_head = f"""    cute.arch.setmaxregister_increase({cfg.softmax_regs})
 {softmax0_setup.rstrip()}
     flash_s_full_phase = cutlass.Int32(0){softmax_corr_prod_state}"""
@@ -9190,7 +9283,17 @@ if warp_idx == 15:
         )
     )
     softmax_prelude = "decode" if softmax_needs_tile_decode else "none"
-    tmem_dealloc_arrive = "    flash_tmem_user_bar.arrive()"
+    tmem_dealloc_arrive = (
+        "    _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)"
+    )
+
+    def _softmax_tail(stage: str) -> str:
+        if not acknowledged_stat_pipeline:
+            return tmem_dealloc_arrive
+        return f"""    _helion_flash_rt.mbar_spin_wait(
+        flash_s{stage}_corr_empty_ptr + 0, flash_s_corr_prod_phase, {cfg.wait_hint})
+    _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)"""
+
     softmax0_inner = _softmax_inner(
         "0",
         "flash_tiled_ld0",
@@ -9215,7 +9318,7 @@ if warp_idx == 15:
         softmax0_inner,
         persistent,
         prelude=softmax_prelude,
-        tail=tmem_dealloc_arrive,
+        tail=_softmax_tail("0"),
         total_tiles=total_tiles,
         num_m_pairs=num_m_pairs,
         use_2cta_instrs=use_2cta_instrs,
@@ -9231,7 +9334,7 @@ if warp_idx == 15:
         softmax1_inner,
         persistent,
         prelude=softmax_prelude,
-        tail=tmem_dealloc_arrive,
+        tail=_softmax_tail("1"),
         total_tiles=total_tiles,
         num_m_pairs=num_m_pairs,
         use_2cta_instrs=use_2cta_instrs,
@@ -9276,6 +9379,10 @@ if warp_idx == 15:
     )
     corr_stat_empty_init = (
         ""
+        if fa4_stat_pipeline
+        else """
+    cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)
+    cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)"""
         if fa4_stat_handoff
         else """
     cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)
@@ -9285,7 +9392,7 @@ if warp_idx == 15:
     )
     corr_cons_state = (
         "\n    flash_s_corr_cons_index = cutlass.Int32(0)"
-        if is_causal and not fa4_stat_handoff
+        if not fa4_stat_handoff
         else ""
     )
     corr_epi_empty_phase_head = (
@@ -9328,19 +9435,20 @@ if warp_idx == 15:
     )
 
     def _corr_epi(stage: str, mtile: str) -> str:
-        corr_cons_index = "0" if not is_causal else "flash_s_corr_cons_index"
+        corr_cons_index = "0" if fa4_stat_handoff else "flash_s_corr_cons_index"
         scale_expr = _scale_slot_expr(corr_cons_index, stage)
-        stat_empty_arrive = (
-            ""
-            if fa4_stat_handoff
-            else f"        cute.arch.mbarrier_arrive(flash_s{stage}_corr_empty_ptr + {corr_cons_index})\n"
-        )
+        stat_empty_arrive = ""
+        if not final_only_stat_pipeline:
+            stat_empty_arrive = (
+                f"        cute.arch.mbarrier_arrive("
+                f"flash_s{stage}_corr_empty_ptr + {corr_cons_index})\n"
+            )
         if not epi_smem:
             # Committed path: per-thread t2r (Ld32x32 Rep16) -> rescale -> cast ->
             # STG.E.128 straight to gmem (coord->linear address division per thread =
             # the epilogue IMAD/MOV overhead).
-            return f"""        cute.arch.barrier(
-            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+            return f"""        _helion_flash_rt.named_barrier_wait_unaligned(
+            {3 + int(stage) * 4} + warp_idx % 4, 64)
         flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
 {stat_empty_arrive}\
         {_corr_wait_o_ready(stage)}
@@ -9362,8 +9470,8 @@ if warp_idx == 15:
         # TMA-O or by vector STG.
         if scoped_corr_epi_smem:
             if split_corr_epi_handoff:
-                return f"""        cute.arch.barrier(
-            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+                return f"""        _helion_flash_rt.named_barrier_wait_unaligned(
+            {3 + int(stage) * 4} + warp_idx % 4, 64)
         flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
 {stat_empty_arrive}\
         {_corr_wait_o_ready(stage)}
@@ -9374,8 +9482,8 @@ if warp_idx == 15:
         cute.arch.fence_view_async_shared()
         {_corr_commit_epi_full(stage)}
 """
-            return f"""        cute.arch.barrier(
-            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+            return f"""        _helion_flash_rt.named_barrier_wait_unaligned(
+            {3 + int(stage) * 4} + warp_idx % 4, 64)
         flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
 {stat_empty_arrive}\
         _helion_flash_rt.{scoped_corr_epi_handoff_fn}(
@@ -9386,8 +9494,8 @@ if warp_idx == 15:
             flash_inv_sum{stage}, {hd}, {cfg.corr_tile_size}, {io_dtype},
             {cfg.wait_hint})
 """
-        return f"""        cute.arch.barrier(
-            barrier_id={3 + int(stage) * 4} + warp_idx % 4, number_of_threads=64)
+        return f"""        _helion_flash_rt.named_barrier_wait_unaligned(
+            {3 + int(stage) * 4} + warp_idx % 4, 64)
         flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz({scale_expr})
 {stat_empty_arrive}\
         _helion_flash_rt.fa4_correction_epilogue_handoff_to_smem(
@@ -9402,41 +9510,44 @@ if warp_idx == 15:
     corr_epi_empty_toggle = (
         "        flash_corr_epi_empty_phase ^= 1" if epi_smem else ""
     )
-    corr_cons_index = "0" if not is_causal else "flash_s_corr_cons_index"
+    corr_cons_index = "0" if fa4_stat_handoff else "flash_s_corr_cons_index"
     corr_empty0_early = (
-        ""
-        if fa4_stat_handoff
-        else (
-            "            cute.arch.mbarrier_arrive("
-            f"flash_s0_corr_empty_ptr + {corr_cons_index})"
-            if not is_causal
-            else ""
-        )
+        "            cute.arch.mbarrier_arrive("
+        f"flash_s0_corr_empty_ptr + {corr_cons_index})"
+        if not is_causal and not fa4_stat_pipeline
+        else ""
     )
     corr_empty1_early = (
-        ""
-        if fa4_stat_handoff
-        else (
-            "            cute.arch.mbarrier_arrive("
-            f"flash_s1_corr_empty_ptr + {corr_cons_index})"
-            if not is_causal
-            else ""
-        )
+        "            cute.arch.mbarrier_arrive("
+        f"flash_s1_corr_empty_ptr + {corr_cons_index})"
+        if not is_causal and not fa4_stat_pipeline
+        else ""
     )
     corr_empty0_late = (
         ""
-        if fa4_stat_handoff or not is_causal
+        if not is_causal
         else "            cute.arch.mbarrier_arrive("
         "flash_s0_corr_empty_ptr + flash_s_corr_cons_index)"
     )
     corr_empty1_late = (
         ""
-        if fa4_stat_handoff or not is_causal
+        if not is_causal
         else "            cute.arch.mbarrier_arrive("
         "flash_s1_corr_empty_ptr + flash_s_corr_cons_index)"
     )
-    corr_stage0 = f"""            cute.arch.barrier(
-                barrier_id=3 + warp_idx % 4, number_of_threads=64)
+    corr_cross_release0 = (
+        "            cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)"
+        if acknowledged_stat_pipeline
+        else ""
+    )
+    corr_cross_release1 = (
+        "            cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)"
+        if acknowledged_stat_pipeline
+        else ""
+    )
+
+    corr_stage0 = f"""            _helion_flash_rt.named_barrier_wait_unaligned(
+                3 + warp_idx % 4, 64)
             flash_a0 = {_scale_slot_expr(corr_cons_index, "0")}
 {corr_empty0_early}
             flash_need_rescale0 = cute.arch.vote_ballot_sync(flash_a0 < 1.0) != 0
@@ -9445,9 +9556,10 @@ if warp_idx == 15:
                     tOtO0, flash_a0, flash_local_tidx, {hd}, {cfg.rescale_chunk_cols})
                 cute.arch.fence_view_async_tmem_store()
             {_corr_release_p_ready("0")}
-{corr_empty0_late}"""
-    corr_stage1 = f"""            cute.arch.barrier(
-                barrier_id=7 + warp_idx % 4, number_of_threads=64)
+{corr_empty0_late}
+{corr_cross_release0}"""
+    corr_stage1 = f"""            _helion_flash_rt.named_barrier_wait_unaligned(
+                7 + warp_idx % 4, 64)
             flash_a1 = {_scale_slot_expr(corr_cons_index, "1")}
 {corr_empty1_early}
             flash_need_rescale1 = cute.arch.vote_ballot_sync(flash_a1 < 1.0) != 0
@@ -9456,10 +9568,31 @@ if warp_idx == 15:
                     tOtO1, flash_a1, flash_local_tidx, {hd}, {cfg.rescale_chunk_cols})
                 cute.arch.fence_view_async_tmem_store()
             {_corr_release_p_ready("1")}
-{corr_empty1_late}"""
+{corr_empty1_late}
+{corr_cross_release1}"""
     corr_cons_advance = (
-        "        flash_s_corr_cons_index ^= 1\n"
-        if is_causal and not fa4_stat_handoff
+        "        flash_s_corr_cons_index ^= 1\n" if not fa4_stat_handoff else ""
+    )
+    corr_stat_dummy = (
+        """        _helion_flash_rt.named_barrier_wait_unaligned(
+            3 + warp_idx % 4, 64)
+        cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)
+        _helion_flash_rt.named_barrier_wait_unaligned(
+            7 + warp_idx % 4, 64)
+"""
+        if acknowledged_stat_pipeline
+        else ""
+    )
+    corr_stat_release_held = (
+        "        cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)\n"
+        if acknowledged_stat_pipeline
+        else ""
+    )
+    corr_final_stat_release = (
+        """        cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)
+        cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)
+"""
+        if final_only_stat_pipeline
         else ""
     )
     # flash_pvt's direct-gmem partition already includes the CTA rank. Start it
@@ -9479,9 +9612,11 @@ if warp_idx == 15:
 {corr_cons_advance.rstrip()}
         flash_o_full_phase ^= 1"""
     else:
-        corr_inner = f"""        for flash_kv in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
+        corr_inner = f"""{corr_stat_dummy}        for flash_kv in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
 {corr_steady_stages}
 {textwrap.indent(corr_cons_advance.rstrip(), "    ")}
+{corr_stat_release_held.rstrip()}
+{corr_final_stat_release.rstrip()}
         # Final: divide by row_sum, cast, store (waits MMA's last-tile O_full).
 {_corr_epi("0", corr_output_m_tile0)}
         {_corr_release_p_ready("0")}

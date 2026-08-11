@@ -190,6 +190,7 @@ from helion.autotuner.config_spec import ReductionCategory
 from helion.autotuner.config_spec import ReductionDescriptor
 from helion.autotuner.config_spec import ReductionKernelFact
 from helion.autotuner.config_spec import ReductionLoopSpec
+from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
@@ -2470,6 +2471,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         cases = (
             (64, 256, torch.float16, False, False, True),
             (64, 1024, torch.float16, False, False, True),
+            (64, 2048, torch.float16, False, False, True),
             (64, 512, torch.float16, True, False, False),
             (128, 256, torch.float16, False, False, True),
             (64, 256, torch.bfloat16, False, False, False),
@@ -2535,7 +2537,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 normalized_seeds = [
                     config for _flat, config in config_gen.seed_flat_config_pairs()
                 ]
-                self.assertLessEqual(len(normalized_seeds), 5)
+                self.assertLessEqual(len(normalized_seeds), 6)
                 self.assertLessEqual(
                     legal_families,
                     {
@@ -2549,8 +2551,29 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                     family_default = family_gen.unflatten(family_gen.default_flat())
                     self.assertIn(family_default, normalized_seeds)
+                if (
+                    head_dim == 64
+                    and dtype is torch.float16
+                    and not is_causal
+                    and standard_dense_output
+                ):
+                    self.assertFalse(
+                        any(
+                            config.config[FLASH_EXP2_PACKET_KEY]
+                            in {"deg1_8x2_corr10", "deg1_16x8"}
+                            for config in normalized_seeds
+                        )
+                    )
+                    self.assertEqual(
+                        {
+                            config.config[FLASH_STAT_TRANSPORT_KEY]
+                            for config in normalized_seeds
+                            if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
+                        },
+                        {"ring2", "single_final"} if num_kv == 2048 else set(),
+                    )
 
-    def test_cute_flash_dense_degree1_seed_uses_family_defaults(self) -> None:
+    def test_cute_flash_dense_degree2_seed_uses_validated_schedule(self) -> None:
         degree1_packets = {"deg1_8x2_corr10", "deg1_16x8"}
         for num_kv in (256, 260, 512, 1024, 1536, 2044, 2048, 2052, 4096):
             with self.subTest(num_kv=num_kv):
@@ -2560,13 +2583,39 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     dtype=torch.float16,
                     standard_dense_output=True,
                 )
-                degree1_seeds = [
+                self.assertFalse(
+                    any(
+                        seed.config.get(FLASH_EXP2_PACKET_KEY) in degree1_packets
+                        for seed in seeds
+                    )
+                )
+                degree2_seeds = [
                     seed
                     for seed in seeds
-                    if seed.config.get(FLASH_EXP2_PACKET_KEY) in degree1_packets
+                    if seed.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
                 ]
-                self.assertEqual(len(degree1_seeds), 1)
-                config = degree1_seeds[0].config
+                if num_kv != 2048:
+                    self.assertFalse(degree2_seeds)
+                    continue
+                self.assertEqual(len(degree2_seeds), 2)
+                self.assertEqual(
+                    {seed.config[FLASH_STAT_TRANSPORT_KEY] for seed in degree2_seeds},
+                    {"ring2", "single_final"},
+                )
+                config = next(
+                    seed.config
+                    for seed in degree2_seeds
+                    if seed.config[FLASH_STAT_TRANSPORT_KEY] == "single_final"
+                )
+                ring2_config = next(
+                    seed.config
+                    for seed in degree2_seeds
+                    if seed.config[FLASH_STAT_TRANSPORT_KEY] == "ring2"
+                )
+                self.assertEqual(
+                    ring2_config,
+                    {**config, FLASH_STAT_TRANSPORT_KEY: "ring2"},
+                )
                 fragments = flash_autotune_fragments(
                     64,
                     num_kv,
@@ -2576,34 +2625,27 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 )
 
                 self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4_2cta")
-                changed_keys = {FLASH_EXP2_PACKET_KEY, FLASH_E2E_SCHEDULE_KEY}
-                if num_kv < 2048:
-                    self.assertEqual(config[FLASH_EXP2_PACKET_KEY], "deg1_8x2_corr10")
-                    self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
-                    self.assertEqual(
-                        config[FLASH_E2E_OFFSET_KEY],
-                        fragments[FLASH_E2E_OFFSET_KEY].default(),
-                    )
-                    self.assertEqual(
-                        config[FLASH_E2E_OFFSET0_KEY],
-                        fragments[FLASH_E2E_OFFSET0_KEY].default(),
-                    )
-                else:
-                    self.assertEqual(config[FLASH_EXP2_PACKET_KEY], "deg1_16x8")
-                    self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "16/8")
-                    self.assertEqual(config[FLASH_E2E_OFFSET_KEY], 0)
-                    self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], 10)
-                    self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
-                    changed_keys.update(
-                        {
-                            FLASH_E2E_OFFSET_KEY,
-                            FLASH_E2E_OFFSET0_KEY,
-                            FLASH_KV_STAGE_KEY,
-                        }
-                    )
+                expected = {
+                    FLASH_EXP2_PACKET_KEY: "deg2_16x6",
+                    FLASH_E2E_SCHEDULE_KEY: "16/6",
+                    FLASH_E2E_OFFSET_KEY: 0,
+                    FLASH_E2E_OFFSET0_KEY: 2,
+                    FLASH_KV_STAGE_KEY: 2,
+                    FLASH_PERSISTENT_KEY: False,
+                    FLASH_STAT_TRANSPORT_KEY: "single_final",
+                    FLASH_WAIT_HINT_KEY: 0,
+                    FLASH_SOFTMAX_REGS_KEY: 192,
+                    FLASH_CORR_REGS_KEY: 72,
+                    FLASH_OTHER_REGS_KEY: 40,
+                    FLASH_ROLE_MAP_KEY: "fa4",
+                    FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+                    FLASH_RESCALE_CHUNK_COLS_KEY: 8,
+                }
+                for key, value in expected.items():
+                    self.assertEqual(config[key], value)
 
                 for key, fragment in fragments.items():
-                    if key not in changed_keys:
+                    if key not in expected:
                         self.assertEqual(config[key], fragment.default())
                 packet_fragment = fragments[FLASH_EXP2_PACKET_KEY]
                 self.assertIsInstance(packet_fragment, EnumFragment)
@@ -2613,16 +2655,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     packet_fragment.search_choices or (),
                 )
 
-    def test_cute_flash_dense_degree1_seed_gates(self) -> None:
-        degree1_packets = {"deg1_8x2_corr10", "deg1_16x8"}
-
-        def has_degree1_seed(
+    def test_cute_flash_dense_degree2_seed_gates(self) -> None:
+        def has_degree2_seed(
             head_dim: int = 64,
-            num_kv: int = 512,
+            num_kv: int = 2048,
             **kwargs: object,
         ) -> bool:
             return any(
-                seed.config.get(FLASH_EXP2_PACKET_KEY) in degree1_packets
+                seed.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
                 for seed in flash_attention_seed_configs(
                     head_dim,
                     num_kv,
@@ -2642,6 +2682,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 "standard_dense_output": True,
                 "block_size_targets": (1, 64, 128),
             },
+            {"standard_dense_output": True, "num_kv": 2044},
+            {"standard_dense_output": True, "num_kv": 2052},
+            {"standard_dense_output": True, "num_kv": 4096},
             {"standard_dense_output": True, "num_kv": 252},
             {"standard_dense_output": True, "num_kv": 258},
             {"standard_dense_output": True, "num_kv": 2050},
@@ -2654,11 +2697,48 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             with self.subTest(case=subtest_case):
                 case = dict(case)
                 head_dim = int(case.pop("head_dim", 64))
-                num_kv = int(case.pop("num_kv", 512))
-                self.assertFalse(has_degree1_seed(head_dim, num_kv, **case))
+                num_kv = int(case.pop("num_kv", 2048))
+                self.assertFalse(has_degree2_seed(head_dim, num_kv, **case))
 
-    def test_cute_flash_long_causal_hybrid_seed(self) -> None:
-        for num_kv in (512, 4096, 8192):
+    def test_cute_flash_dense_degree2_seed_is_in_full_initial_population(
+        self,
+    ) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=2048,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            dtype=torch.float16,
+            is_causal=False,
+            standard_dense_output=True,
+        )
+        spec.compiler_seed_configs = list(
+            flash_attention_seed_configs(
+                64,
+                2048,
+                dtype=torch.float16,
+                standard_dense_output=True,
+            )
+        )
+        config_gen = ConfigGeneration(spec)
+        expected = next(
+            config
+            for _flat, config in config_gen.seed_flat_config_pairs()
+            if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
+            and config.config[FLASH_STAT_TRANSPORT_KEY] == "single_final"
+        )
+        profile = get_effort_profile("full").lfbo_pattern_search
+        assert profile is not None
+        self.assertEqual(profile.initial_population_strategy, "from_random")
+        population = config_gen.random_population(profile.initial_population)
+        self.assertEqual(population.count(expected), 1)
+
+    def test_cute_flash_does_not_automatically_seed_degree1_causal_packet(
+        self,
+    ) -> None:
+        for num_kv in (256, 512, 768, 4096, 8192):
             with self.subTest(num_kv=num_kv):
                 seeds = flash_attention_seed_configs(
                     64,
@@ -2666,29 +2746,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     is_causal=True,
                     standard_causal_output=True,
                 )
-                hybrid = [
-                    seed
-                    for seed in seeds
-                    if seed.config.get(FLASH_EXP2_PACKET_KEY) == "hybrid_deg1_16x8"
-                ]
-                self.assertEqual(len(hybrid), 1)
-                config = hybrid[0].config
-                self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-                self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "16/8")
-                self.assertEqual(config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/8")
-                self.assertTrue(config[FLASH_CAUSAL_LOOP_SPLIT_KEY])
-
-        for num_kv in (256, 768):
-            with self.subTest(num_kv=num_kv):
                 self.assertFalse(
                     any(
                         seed.config.get(FLASH_EXP2_PACKET_KEY) == "hybrid_deg1_16x8"
-                        for seed in flash_attention_seed_configs(
-                            64,
-                            num_kv,
-                            is_causal=True,
-                            standard_causal_output=True,
-                        )
+                        for seed in seeds
                     )
                 )
 
@@ -2714,7 +2775,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         normalized = [
             config for _flat, config in ConfigGeneration(spec).seed_flat_config_pairs()
         ]
-        self.assertEqual(len(normalized), 4)
+        self.assertEqual(len(normalized), 3)
         self.assertEqual(
             {
                 (
@@ -2726,10 +2787,114 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             {
                 ("fa4", "1x1"),
                 ("fa4", "4x1"),
-                ("fa4", "hybrid_deg1_16x8"),
                 ("ws_overlap", "1x1"),
             },
         )
+
+    def test_cute_flash_causal_degree2_seed_uses_validated_schedule(self) -> None:
+        for num_kv in (2048, 4096, 8192):
+            with self.subTest(num_kv=num_kv):
+                seeds = flash_attention_seed_configs(
+                    64,
+                    num_kv,
+                    is_causal=True,
+                    standard_causal_output=True,
+                )
+                degree2_seeds = [
+                    seed
+                    for seed in seeds
+                    if seed.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
+                ]
+                if num_kv != 4096:
+                    self.assertFalse(degree2_seeds)
+                    continue
+                self.assertEqual(len(degree2_seeds), 1)
+                config = degree2_seeds[0].config
+                expected = {
+                    FLASH_PIPELINE_FAMILY_KEY: "fa4",
+                    FLASH_E2E_SCHEDULE_KEY: "16/6",
+                    FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
+                    FLASH_E2E_OFFSET_KEY: 0,
+                    FLASH_E2E_OFFSET0_KEY: 14,
+                    FLASH_WAIT_HINT_KEY: 0,
+                    FLASH_DISC_PIPE_KEY: 3,
+                    FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+                    FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
+                    FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+                    FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+                    FLASH_SOFTMAX_REGS_KEY: 184,
+                    FLASH_CORR_REGS_KEY: 64,
+                    FLASH_OTHER_REGS_KEY: 48,
+                }
+                for key, value in expected.items():
+                    self.assertEqual(config[key], value)
+
+    def test_cute_flash_causal_degree2_seed_gates(self) -> None:
+        cases = (
+            {},
+            {"dtype": torch.bfloat16, "standard_causal_output": True},
+            {"head_dim": 128, "standard_causal_output": True},
+            {"has_kv_tile_pruning": True, "standard_causal_output": True},
+            {"requires_ws_overlap": True, "standard_causal_output": True},
+            {"small_biased_candidate": True, "standard_causal_output": True},
+            {
+                "block_size_targets": (1, 64, 128),
+                "standard_causal_output": True,
+            },
+        )
+        for case in cases:
+            subtest_case = {
+                key: str(value) if isinstance(value, torch.dtype) else value
+                for key, value in case.items()
+            }
+            with self.subTest(case=subtest_case):
+                case = dict(case)
+                head_dim = int(case.pop("head_dim", 64))
+                self.assertFalse(
+                    any(
+                        seed.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
+                        for seed in flash_attention_seed_configs(
+                            head_dim,
+                            4096,
+                            is_causal=True,
+                            **case,
+                        )
+                    )
+                )
+
+    def test_cute_flash_causal_degree2_seed_is_in_full_initial_population(
+        self,
+    ) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=4096,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+        spec.compiler_seed_configs = list(
+            flash_attention_seed_configs(
+                64,
+                4096,
+                is_causal=True,
+                standard_causal_output=True,
+            )
+        )
+        config_gen = ConfigGeneration(spec)
+        expected = next(
+            config
+            for _flat, config in config_gen.seed_flat_config_pairs()
+            if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
+        )
+        profile = get_effort_profile("full").lfbo_pattern_search
+        assert profile is not None
+        population = config_gen.random_population(profile.initial_population)
+        seed_count = len(config_gen.seed_flat_config_pairs())
+        self.assertIn(expected, population[:seed_count])
 
     @onlyBackends(["cute"])
     def test_cute_flash_attention_seed_heuristic(self) -> None:
@@ -2994,12 +3159,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertIn(
             causal_65536_seed, causal_65536_bound.config_spec.compiler_seed_configs
         )
-        hybrid_seeds = [
-            seed
-            for seed in causal_65536_bound.config_spec.compiler_seed_configs
-            if seed.config.get(FLASH_EXP2_PACKET_KEY) == "hybrid_deg1_16x8"
-        ]
-        self.assertEqual(len(hybrid_seeds), 1)
+        self.assertFalse(
+            any(
+                seed.config.get(FLASH_EXP2_PACKET_KEY) == "hybrid_deg1_16x8"
+                for seed in causal_65536_bound.config_spec.compiler_seed_configs
+            )
+        )
         with patch.object(
             PatternSearch,
             "_find_similar_cached_configs",
@@ -3018,7 +3183,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 quick_search.config_gen.unflatten(flat)
                 for flat in quick_search._generate_initial_population_flat()
             ]
-        self.assertEqual(len(quick_configs), 4)
+        self.assertEqual(len(quick_configs), 3)
         self.assertIsNone(causal_65536_bound.config_spec.compiler_default_config)
         causal_65536_gen = ConfigGeneration(causal_65536_bound.config_spec)
         causal_65536_default = causal_65536_gen.unflatten(
