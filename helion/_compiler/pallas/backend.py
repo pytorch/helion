@@ -20,6 +20,7 @@ from ..ast_extension import expr_from_string
 from ..backend import Backend
 from ..backend import LauncherInfo
 from ..backend import _loop_contains_matmul
+from ..backend import _validate_subscript_indices
 from ..backend import dedupe_preserve_order
 from ..backend import read_launcher_source
 
@@ -551,6 +552,19 @@ class PallasBackend(Backend):
         if not hasattr(self, "fake_tensor_loads"):
             self.fake_tensor_loads = []
         self.fake_tensor_loads.append((tensor, index))
+
+    def fake_subscript_shape(
+        self,
+        tensor: torch.Tensor,
+        index: list[object],
+    ) -> list[int | torch.SymInt]:
+        from ..indexing_strategy import SubscriptIndexing
+
+        _validate_subscript_indices(index)
+
+        # Lowerability depends on block sizes and Ref provenance, so fake
+        # propagation only validates forms whose output shape is well-defined.
+        return SubscriptIndexing.compute_shape(tensor, index)
 
     def adjust_block_size_constraints(
         self,

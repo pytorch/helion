@@ -5,6 +5,9 @@ from typing import cast
 import unittest
 from unittest import mock
 
+import torch
+
+from helion import exc
 from helion._compiler import backend_registry
 from helion._compiler.aten_lowering import AtenLowering
 from helion._compiler.backend import Backend
@@ -37,6 +40,23 @@ class TestBackendRegistry(unittest.TestCase):
     def test_get_backend_class_raises_for_unknown(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown backend: 'nonexistent'"):
             get_backend_class("nonexistent")
+
+    def test_default_fake_subscript_shape(self) -> None:
+        backend = get_backend_class("triton")()
+        tensor = torch.empty(4, 8)
+
+        self.assertEqual(
+            backend.fake_subscript_shape(tensor, [slice(None), None, slice(None)]),
+            [4, 1, 8],
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "narrowing kernel-tensor subscripts"
+        ):
+            backend.fake_subscript_shape(tensor, [0, slice(None)])
+        with self.assertRaises(exc.InvalidIndexingType):
+            backend.fake_subscript_shape(tensor, [object(), slice(None)])
+        with self.assertRaises(exc.InvalidIndexingType):
+            backend.fake_subscript_shape(tensor, [slice(0, 4, 0), slice(None)])
 
     def test_register_custom_backend(self) -> None:
         class _TestBackend(Backend):

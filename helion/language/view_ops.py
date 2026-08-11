@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -77,52 +76,7 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     env = CompileEnvironment.current()
-    if env.backend_name == "pallas":
-        from .._compiler.indexing_strategy import SubscriptIndexing
-
-        narrowed = 0
-        for val in index:
-            if val is None or (
-                isinstance(val, slice)
-                and (val.start, val.stop, val.step) == (None, None, None)
-            ):
-                continue
-            if isinstance(val, int):
-                valid = val >= 0
-            elif isinstance(val, slice):
-                valid = (
-                    val.step in (None, 1)
-                    and isinstance(val.start, int)
-                    and isinstance(val.stop, int)
-                    and val.start >= 0
-                    and val.stop > val.start
-                )
-            else:
-                valid = isinstance(val, torch.SymInt) or (
-                    isinstance(val, torch.Tensor) and val.ndim == 1
-                )
-            if not valid:
-                raise exc.InvalidIndexingType(repr(val))
-            narrowed += 1
-        if narrowed > 1:
-            raise exc.InvalidIndexingType(repr(index))
-
-        # Lowerability depends on block sizes and Ref provenance, so the fake
-        # only validates forms whose output shape is well-defined.
-        return env.new_index_result(
-            tensor, SubscriptIndexing.compute_shape(tensor, index)
-        )
-
-    input_size = collections.deque(tensor.size())
-    output_size = []
-    for val in index:
-        if val is None:
-            output_size.append(1)
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
-            output_size.append(input_size.popleft())
-        else:
-            raise exc.InvalidIndexingType(repr(val))
-    assert len(input_size) == 0
+    output_size = env.backend.fake_subscript_shape(tensor, index)
     return env.new_index_result(tensor, output_size)
 
 
