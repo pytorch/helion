@@ -1036,6 +1036,7 @@ class ConfigSpec:
             requires_ws_overlap=self._cute_flash_requires_ws_overlap,
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
+            standard_causal_output=self._cute_flash_standard_causal_output,
             topology_override=cast("str | None", topology_override),
             pipeline_family_override=pipeline_family_override,
         )
@@ -2536,6 +2537,9 @@ class ConfigSpec:
                             self._cute_flash_small_biased_candidate
                         ),
                         standard_dense_output=self._cute_flash_standard_dense_output,
+                        standard_causal_output=(
+                            self._cute_flash_standard_causal_output
+                        ),
                         pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )

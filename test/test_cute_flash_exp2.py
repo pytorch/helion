@@ -271,6 +271,32 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
         }
         assert keywords == {"pair_batch": 8, "emu_batch": 3, "degree2": True}
 
+    unmasked_loops = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "flash_kv_unmask_iter"
+    ]
+    assert len(unmasked_loops) == 2
+    for loop in unmasked_loops:
+        assert not any(
+            "flash_kv_unmask_iter" in ast.unparse(node.test)
+            for node in ast.walk(loop)
+            if isinstance(node, ast.If)
+        )
+        assert any(
+            isinstance(statement, ast.Assign)
+            and isinstance(statement.value, ast.Name)
+            and statement.value.id == "flash_alpha"
+            for statement in loop.body
+        )
+        assert any(
+            isinstance(node, ast.If)
+            and ast.unparse(node.test) == "flash_acc_log >= -8.0"
+            for node in ast.walk(loop)
+        )
+
 
 def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
     with patch.dict(os.environ, {}, clear=True):
@@ -695,23 +721,22 @@ def test_dense_nonpersistent_final_only_stat_pipeline_protocol() -> None:
 def test_dense_degree2_final_only_is_deterministic_on_peaky_inputs() -> None:
     torch.manual_seed(104)
     q, k, v = (
-        torch.randn(1, 1, 32_768, 64, dtype=torch.float16, device=DEVICE)
+        torch.randn(1, 1, 33_280, 64, dtype=torch.float16, device=DEVICE)
         for _ in range(3)
     )
     q.mul_(2.0)
     k.mul_(2.0)
-    config = {
-        "block_sizes": [1, 128, 128],
-        "cute_flash_pipeline_family": "fa4_2cta",
-        "cute_flash_exp2_packet": _DEG2_PACKET,
-        "cute_flash_e2e_schedule": "16/6",
-        "cute_flash_e2e_offset": 0,
-        "cute_flash_e2e_offset0": 2,
-        "cute_flash_kv_stage": 2,
-        "cute_flash_persistent": False,
-        "cute_flash_stat_transport": "single_final",
-        "cute_flash_wait_hint": 0,
-    }
+    config = next(
+        seed.config
+        for seed in cute_flash.flash_attention_seed_configs(
+            64,
+            260,
+            dtype=torch.float16,
+            standard_dense_output=True,
+        )
+        if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
+        and seed.config.get(cute_flash.FLASH_STAT_TRANSPORT_KEY) == "single_final"
+    )
 
     bound = _dense_attention_output.bind((q, k, v))
     active_config = helion.Config(**config)
@@ -972,19 +997,26 @@ def test_hybrid_packet_runtime_matches_sdpa_at_long_causal_threshold() -> None:
 
 
 @onlyBackends(["cute"])
-def test_hybrid_packet_runtime_matches_sdpa_beyond_previous_seed_cap() -> None:
+def test_transferred_degree2_packet_matches_sdpa_beyond_previous_seed_cap() -> None:
     torch.manual_seed(103)
     q, k, v = (
         torch.randn(1, 1, 1_048_576, 64, dtype=torch.float16, device=DEVICE)
         for _ in range(3)
     )
 
-    code, out = code_and_output(
-        _causal_attention_output,
-        (q, k, v),
-        **_hybrid_runtime_config(),
+    config = next(
+        seed.config
+        for seed in cute_flash.flash_attention_seed_configs(
+            64,
+            8192,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+        if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
     )
-    assert "degree1=True" in code
+    code, out = code_and_output(_causal_attention_output, (q, k, v), **config)
+    assert "degree1=True" not in code
     assert "degree2=True" in code
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
