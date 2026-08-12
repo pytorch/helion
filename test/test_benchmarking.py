@@ -130,6 +130,126 @@ def _attention_subprocess_args(**overrides):
     return args
 
 
+def test_attention_tilegym_tileir_registry():
+    assert "tilegym-tileir" in compare_attention_backends.ALL_IMPLS
+    assert "tilegym-tileir" not in compare_attention_backends.DEFAULT_IMPLS
+    assert "tilegym-tileir" in compare_attention_backends._DISPLAY_IMPLS
+    assert compare_attention_backends._IMPL_LABELS["tilegym-tileir"] == "TileGym+TileIR"
+    assert compare_attention_backends._IMPL_KEYS["tilegym-tileir"] == "tilegym_tileir"
+
+
+def test_attention_tilegym_tileir_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_benchmark_tilegym_tileir",
+        lambda args: {"impl": args.impl},
+    )
+
+    assert compare_attention_backends._run_impl(
+        SimpleNamespace(impl="tilegym-tileir")
+    ) == {"impl": "tilegym-tileir"}
+
+
+def test_attention_tilegym_kwargs_set_dense_and_matrix_bias():
+    dense_args = SimpleNamespace(causal=0)
+    dense_kwargs = compare_attention_backends._tilegym_attention_kwargs(
+        dense_args, None
+    )
+    bias = torch.ones(1)
+    biased_kwargs = compare_attention_backends._tilegym_attention_kwargs(
+        dense_args, bias
+    )
+
+    assert dense_kwargs["is_causal"] is False
+    assert dense_kwargs["layout"] == "bnsd"
+    assert dense_kwargs["bias_type"] is None
+    assert biased_kwargs["bias_type"] == "matrix"
+    assert biased_kwargs["bias"] is bias
+
+
+def test_attention_tilegym_unavailable_skips(monkeypatch):
+    def unavailable():
+        raise RuntimeError("TileIR unavailable")
+
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_import_tilegym_fmha",
+        unavailable,
+    )
+
+    result = compare_attention_backends._benchmark_tilegym_tileir(
+        _attention_subprocess_args(causal=0, biased=0)
+    )
+
+    assert result["impl"] == "tilegym-tileir"
+    assert result["accuracy"] == "SKIP"
+    assert result["skipped_reason"] == "TileIR unavailable"
+
+
+def test_attention_tilegym_result_records_best_config(monkeypatch):
+    class FakeConfig:
+        def all_kwargs(self):
+            return {
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
+
+    tensor = torch.ones(1)
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_import_tilegym_fmha",
+        lambda: (
+            lambda *args, **kwargs: tensor,
+            lambda: FakeConfig(),
+        ),
+    )
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_make_inputs",
+        lambda args, dtype: (tensor, tensor, tensor),
+    )
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_make_bias",
+        lambda args, dtype: None,
+    )
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_sdpa_reference",
+        lambda *args, **kwargs: tensor,
+    )
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_check_close",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_bench_steady",
+        lambda *args, **kwargs: {
+            "best_ms": 1.0,
+            "median_ms": 1.0,
+            "mean_ms": 1.0,
+            "std_ms": 0.0,
+            "runs_ms": [1.0],
+        },
+    )
+
+    result = compare_attention_backends._benchmark_tilegym_tileir(
+        _attention_subprocess_args(causal=0, biased=0)
+    )
+
+    assert result["accuracy"] == "PASS"
+    assert result["config"] == {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
+
+
 def test_attention_force_flash_config_uses_compiler_default_seed():
     args = SimpleNamespace(
         helion_config=[],

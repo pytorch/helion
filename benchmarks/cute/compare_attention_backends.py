@@ -18,6 +18,11 @@ Impls:
                   supports causal too.
     helion-triton examples.attention attention kernels with the DEFAULT
                   (triton) backend.
+    helion-tileir examples.attention attention kernels with
+                  HELION_BACKEND=tileir. Requires ENABLE_TILE=1 and a compatible
+                  NV Triton TileIR installation.
+    tilegym-tileir NVIDIA TileGym's handwritten Triton FMHA variant compiled
+                   with the active NV Triton TileIR backend.
     helion-cute   examples.attention attention kernels with
                   HELION_BACKEND=cute. By default this uses output-only
                   variants for dense, causal, and biased attention so Helion
@@ -84,9 +89,15 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
-ALL_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
-HELION_IMPLS = ("helion-cute", "helion-triton")
+DEFAULT_IMPLS = (
+    "helion-triton",
+    "helion-cute",
+    "flexattention",
+    "sdpa",
+    "fa4",
+)
+ALL_IMPLS = (*DEFAULT_IMPLS, "helion-tileir", "tilegym-tileir")
+HELION_IMPLS = ("helion-cute", "helion-tileir", "helion-triton")
 
 
 class _ConfigLike(Protocol):
@@ -153,9 +164,19 @@ _SHAPE_SUITES = {
     "dense_causal8": _DENSE_CAUSAL8_SHAPES,
 }
 
-_DISPLAY_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
+_DISPLAY_IMPLS = (
+    "helion-triton",
+    "helion-tileir",
+    "tilegym-tileir",
+    "helion-cute",
+    "flexattention",
+    "sdpa",
+    "fa4",
+)
 _IMPL_LABELS = {
     "helion-triton": "Helion+Triton",
+    "helion-tileir": "Helion+TileIR",
+    "tilegym-tileir": "TileGym+TileIR",
     "helion-cute": "Helion+CuTe",
     "flexattention": "FlexAttention",
     "sdpa": "torch SDPA",
@@ -163,6 +184,8 @@ _IMPL_LABELS = {
 }
 _IMPL_KEYS = {
     "helion-triton": "helion_triton",
+    "helion-tileir": "helion_tileir",
+    "tilegym-tileir": "tilegym_tileir",
     "helion-cute": "helion_cute",
     "flexattention": "flexattention",
     "sdpa": "torch_sdpa",
@@ -381,6 +404,47 @@ def _resolve_fa4_root() -> Path:
     if tritonbench_fa4_root is not None:
         return tritonbench_fa4_root
     return _ensure_fa4_checkout(_FA4_STANDALONE_ROOT)
+
+
+def _import_tilegym_fmha() -> tuple[
+    Callable[..., torch.Tensor],
+    Callable[[], object | None],
+]:
+    # TileGym's recommended TileIR path enables these before its Triton kernels
+    # compile. ``setdefault`` preserves explicit per-run overrides.
+    os.environ.setdefault("TILEIR_ENABLE_APPROX", "1")
+    os.environ.setdefault("TILEIR_ENABLE_FTZ", "1")
+
+    from benchmarks.cute import tilegym_attention
+
+    if tilegym_attention._get_available_triton_backend() != "nvt":
+        raise RuntimeError(
+            "TileGym attention did not detect the NV Triton TileIR backend; "
+            "set ENABLE_TILE=1 and put NV Triton first on PYTHONPATH"
+        )
+
+    def get_best_config() -> object | None:
+        return getattr(tilegym_attention._prefill_fmha, "best_config", None)
+
+    return (
+        cast(
+            "Callable[..., torch.Tensor]",
+            tilegym_attention.fmha_variant_triton,
+        ),
+        get_best_config,
+    )
+
+
+def _tilegym_attention_kwargs(
+    args: argparse.Namespace, bias: torch.Tensor | None
+) -> dict[str, object]:
+    return {
+        "scaling": None,
+        "is_causal": bool(args.causal),
+        "bias_type": "matrix" if bias is not None else None,
+        "bias": bias,
+        "layout": "bnsd",
+    }
 
 
 def _uses_bias(args: argparse.Namespace) -> bool:
@@ -925,6 +989,60 @@ def _benchmark_fa4(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _benchmark_tilegym_tileir(args: argparse.Namespace) -> dict[str, Any]:
+    """TileGym's handwritten Triton FMHA running through NV Triton TileIR."""
+    try:
+        fmha, get_best_config = _import_tilegym_fmha()
+    except (ImportError, RuntimeError) as exc:
+        return {
+            "impl": "tilegym-tileir",
+            "shape": _shape_dict(args),
+            "accuracy": "SKIP",
+            "skipped_reason": str(exc),
+        }
+
+    dtype = _dtype_from_name(args.dtype)
+    q, k, v = _make_inputs(args, dtype)
+    bias = _make_bias(args, dtype)
+    kwargs = _tilegym_attention_kwargs(args, bias)
+
+    def run() -> torch.Tensor:
+        return fmha(q, k, v, **kwargs)
+
+    accuracy = "PASS"
+    if not args.skip_correctness:
+        expected = _sdpa_reference(q, k, v, causal=bool(args.causal), bias=bias)
+        accuracy = "PASS" if _check_close(run(), expected, dtype) else "FAIL"
+
+    stats = _bench_steady(
+        run,
+        num_runs=args.num_runs,
+        warmup_ms=args.warmup_ms,
+        rep_ms=args.rep_ms,
+    )
+    best_config = get_best_config()
+    config = (
+        dict(cast("Any", best_config).all_kwargs()) if best_config is not None else None
+    )
+    return _result(
+        "tilegym-tileir",
+        args,
+        stats,
+        accuracy=accuracy,
+        benchmark_timer="event",
+        config=config,
+        notes=[
+            "Kernel source: benchmarks/cute/tilegym_attention.py",
+            (
+                "TILEIR_ENABLE_APPROX="
+                f"{os.environ.get('TILEIR_ENABLE_APPROX', '<unset>')}; "
+                "TILEIR_ENABLE_FTZ="
+                f"{os.environ.get('TILEIR_ENABLE_FTZ', '<unset>')}"
+            ),
+        ],
+    )
+
+
 def _helion_benchmark_timer(args: argparse.Namespace, backend: str) -> str:
     if backend == "cute":
         return str(getattr(args, "helion_cute_benchmark_timer", "wall"))
@@ -961,9 +1079,9 @@ def _scrubbed_argv() -> Iterator[None]:
 def _benchmark_helion(args: argparse.Namespace) -> dict[str, Any]:
     """Helion attention via examples/attention.py.
 
-    Backend is determined by ``args.helion_backend`` (cute or triton). The cute
-    path may currently be numerically wrong; we never let that crash the
-    harness -- we record accuracy=FAIL and still report timing.
+    Backend is determined by ``args.helion_backend`` (cute, tileir, or triton).
+    The cute path may currently be numerically wrong; we never let that crash
+    the harness -- we record accuracy=FAIL and still report timing.
 
     When ``--helion-force-flash-config`` is set, skip autotune and directly use
     the compiler-promoted flash seed, including any shape-specific heuristic
@@ -1072,6 +1190,11 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
     if args.impl == "helion-triton":
         args.helion_backend = "triton"
         return _benchmark_helion(args)
+    if args.impl == "helion-tileir":
+        args.helion_backend = "tileir"
+        return _benchmark_helion(args)
+    if args.impl == "tilegym-tileir":
+        return _benchmark_tilegym_tileir(args)
     if args.impl == "sdpa":
         return _benchmark_sdpa(args)
     if args.impl == "flexattention":
@@ -1521,7 +1644,7 @@ def _write_matplotlib_bar_graph(path: Path, payloads: list[dict[str, Any]]) -> N
                 values_by_impl[impl].append(np.nan)
 
     x = np.arange(len(labels))
-    width = 0.15
+    width = min(0.15, 0.8 / len(_DISPLAY_IMPLS))
     fig_width = max(13.5, 1.45 * len(labels) + 4.0)
     fig, ax = plt.subplots(figsize=(fig_width, 6.5))
     for index, impl in enumerate(_DISPLAY_IMPLS):
