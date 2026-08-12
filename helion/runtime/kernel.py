@@ -1889,7 +1889,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if self.settings.retry_with_fallback and config != (
             default_config := self.env.config_spec.default_config()
         ):
-            run = self._run_with_fallback(run, self.compile_config(default_config))
+            run = self._run_with_fallback(run, default_config)
         self._run = run
         self._config = config
         counters["best_config_decorator"][
@@ -1897,10 +1897,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ] = 1
 
     def _run_with_fallback(
-        self, run: CompiledConfig, fallback: CompiledConfig
+        self, run: CompiledConfig, fallback_config: Config
     ) -> CompiledConfig:
-        """Wrap ``run`` to retry once with ``fallback`` if it raises a launch
-        resource error (shared memory, registers, grid size)."""
+        """Wrap ``run`` to retry once with the ``fallback_config`` if it raises a
+        launch resource error (shared memory, registers, grid size)."""
 
         def run_with_fallback(*args: object) -> _R:
             try:
@@ -1911,6 +1911,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 log.warning(
                     f"Kernel {self.kernel.name} failed to launch; retrying with the fallback config"
                 )
+                fallback = self.compile_config(fallback_config)
                 return fallback(*args)
 
         return run_with_fallback
