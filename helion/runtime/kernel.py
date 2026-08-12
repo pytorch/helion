@@ -113,10 +113,6 @@ CompiledConfig = Callable[..., _R]
 # Off by default so the eager dispatch path is unchanged.
 _TPU_COMPILE_CAPTURE = os.environ.get("HELION_TPU_COMPILE_CAPTURE", "0") == "1"
 
-# Opt-in: retry with the fallback config if a config fails at launch.
-# Off by default so set_config has no overhead.
-_RETRY_WITH_FALLBACK = os.environ.get("HELION_RETRY_WITH_FALLBACK", "0") == "1"
-
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
@@ -1890,7 +1886,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         config = self._normalize_config(config)
         run = self.compile_config(config)
-        if _RETRY_WITH_FALLBACK:
+        if self.settings.retry_with_fallback:
             default_config = self.env.config_spec.default_config()
             if config != default_config:
                 run = self._run_with_fallback(run, self.compile_config(default_config))
@@ -1913,7 +1909,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 if not match_launch_resource_error(e):
                     raise
                 log.warning(
-                    f"Kernel {self.kernel.name} launch failure; retrying with the fallback config"
+                    f"Kernel {self.kernel.name} failed to launch; retrying with the fallback config"
                 )
                 return fallback(*args)
 

@@ -621,6 +621,11 @@ class _Settings:
             _env_get_str_or_none, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH", None
         )
     )
+    retry_with_fallback: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_RETRY_WITH_FALLBACK", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -858,6 +863,11 @@ class Settings(_Settings):
         "autotune_log_search_space_path": (
             "Optional path to save search space analysis JSON. "
             "Set HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/path/to/analysis.json to save."
+        ),
+        "retry_with_fallback": (
+            "If True, retry a failed kernel launch once with the default config "
+            "if the configured config fails with a launch resource error. "
+            "Off by default; set HELION_RETRY_WITH_FALLBACK=1 to enable."
         ),
     }
 
