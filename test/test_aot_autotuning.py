@@ -143,7 +143,7 @@ class TestCodeSerialization:
         def with_complex(v):
             return v * 1j
 
-        def with_ellipsis(v):
+        def with_ellipsis(v):  # noqa: FURB118
             return v[...]
 
         for fn in (with_complex, with_ellipsis):
