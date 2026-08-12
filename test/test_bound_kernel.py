@@ -625,38 +625,42 @@ class TestOutOfResourcesFallback(TestCase):
     def test_retries_once_with_default_config(self) -> None:
         run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
         fallback = Mock(return_value="ok")
-        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
+        bound = Mock(compile_config=Mock(return_value=fallback))
+        fallback_config = Mock()
+        wrapped = BoundKernel._run_with_fallback(bound, run, fallback_config)
 
         result = wrapped("arg")
 
         self.assertEqual(result, "ok")
         run.assert_called_once_with("arg")
+        bound.compile_config.assert_called_once_with(fallback_config)
         fallback.assert_called_once_with("arg")
 
     def test_no_retry_when_run_succeeds(self) -> None:
         run = Mock(return_value="ok")
-        fallback = Mock()
-        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
+        bound = Mock(compile_config=Mock())
+        wrapped = BoundKernel._run_with_fallback(bound, run, Mock())
 
         result = wrapped("arg")
 
         self.assertEqual(result, "ok")
-        fallback.assert_not_called()
+        bound.compile_config.assert_not_called()
 
     def test_other_exceptions_are_not_caught(self) -> None:
         run = Mock(side_effect=RuntimeError("unrelated failure"))
-        fallback = Mock()
-        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
+        bound = Mock(compile_config=Mock())
+        wrapped = BoundKernel._run_with_fallback(bound, run, Mock())
 
         with self.assertRaises(RuntimeError):
             wrapped("arg")
 
-        fallback.assert_not_called()
+        bound.compile_config.assert_not_called()
 
     def test_retries_on_other_launch_resource_errors(self) -> None:
         run = Mock(side_effect=RuntimeError("too many resources requested for launch"))
         fallback = Mock(return_value="ok")
-        wrapped = BoundKernel._run_with_fallback(Mock(), run, fallback)
+        bound = Mock(compile_config=Mock(return_value=fallback))
+        wrapped = BoundKernel._run_with_fallback(bound, run, Mock())
 
         result = wrapped("arg")
 
