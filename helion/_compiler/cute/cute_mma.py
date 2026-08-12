@@ -2433,6 +2433,26 @@ class _MmaOperandAnalysis:
     rhs: _MmaOperandInfo
 
     @property
+    def supports_role_local_n_edge_tma(self) -> bool:
+        """Whether rank-2 layouts support the partial-N role-local TMA path."""
+        return (
+            not self.has_leading_passthrough
+            and self.lhs.matrix_major == "row"
+            # The partial-N role-local TMA path is runtime-validated for a
+            # K-major B. MN-major B remains correct through the scalar edge
+            # fill but produces wrong results with role-local edge TMA.
+            and self.rhs.matrix_major == "col"
+        )
+
+    @property
+    def scalar_loads_use_identity_axis_mapping(self) -> bool:
+        """Whether scalar fallback indices address both source tensors directly."""
+        return (
+            self.lhs.source_to_logical_order is None
+            and self.rhs.source_to_logical_order is None
+        )
+
+    @property
     def leading_passthrough_block_id(self) -> int | None:
         return (
             self.lhs.leading_passthrough_block_id
@@ -2953,6 +2973,7 @@ class _CuteMmaNode(_CuteMmaTarget):
     """A CuTe MMA target with its structurally analyzed operands."""
 
     operands: _MmaOperandAnalysis
+    output_store_analysis: _MmaOutputStoreAnalysis | None
     explicit_epi_tile_compatible: bool
     output_column_major: bool
     requires_pair_epilogue: bool = False
@@ -2962,6 +2983,23 @@ class _CuteMmaNode(_CuteMmaTarget):
     def requires_scalar_fallback(self) -> bool:
         """Whether the incoming accumulator cannot seed a collective fragment."""
         return self.requires_accumulator_seed and self.operands.has_leading_passthrough
+
+    @property
+    def supports_small_n_role_local_tma(self) -> bool:
+        """Whether compiler analysis proved the small-N TMA/store requirements."""
+        return (
+            self.operands.supports_role_local_n_edge_tma
+            and self.output_store_analysis is not None
+        )
+
+    @property
+    def supports_small_n_scalar_fallback(self) -> bool:
+        """Whether non-tcgen05 and nonpersistent small-N candidates stay correct."""
+        return (
+            not self.operands.has_leading_passthrough
+            and self.output_store_analysis is not None
+            and self.operands.scalar_loads_use_identity_axis_mapping
+        )
 
 
 def _decode_cute_mma_target(
@@ -3125,7 +3163,10 @@ def analyze_cute_mma_node(
         operands.lhs.source_to_logical_order is not None
         and operands.rhs.source_to_logical_order is not None
     )
-    if needs_output_store_analysis:
+    # DeviceIR provides the complete graph set needed to compute and cache the
+    # store analysis for small-N search. Later codegen callers lack DeviceIR;
+    # operand forms that require this proof retrieve the cached result instead.
+    if needs_output_store_analysis or device_ir is not None:
         cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
         if isinstance(cached, _MmaOutputStoreAnalysis):
             output_store_analysis = cached
@@ -3169,7 +3210,7 @@ def analyze_cute_mma_node(
                     graphs=device_ir.graphs,
                 )
             node.meta[_MMA_OUTPUT_STORE_ANALYSIS_META_KEY] = output_store_analysis
-        if output_store_analysis is None:
+        if needs_output_store_analysis and output_store_analysis is None:
             return None
     acc_dtype: torch.dtype | None = None
     if target.acc is not None:
@@ -3194,6 +3235,7 @@ def analyze_cute_mma_node(
         acc=target.acc,
         out_dtype=target.out_dtype,
         operands=operands,
+        output_store_analysis=output_store_analysis,
         explicit_epi_tile_compatible=(
             operands.lhs.matrix_major == "row"
             and operands.rhs.matrix_major in ("row", "col")
@@ -11156,10 +11198,12 @@ def _mma_impl_matches_problem_shape(
     if mma_impl == "universal":
         return True
     is_fp8 = input_dtype == torch.float8_e4m3fn
+    min_n = 16 if is_fp8 else 8
+    n_multiple = 16 if is_fp8 else 8
     if (
         input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-        or bn < 8
-        or bn % 8 != 0
+        or bn < min_n
+        or bn % n_multiple != 0
     ):
         return False
     if bn > 256 and (

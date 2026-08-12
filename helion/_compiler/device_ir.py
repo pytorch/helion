@@ -3792,7 +3792,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 root_grid_block_ids = {
                     tuple(block_ids) for block_ids in device_ir.grid_block_ids
                 }
-                search_candidates = []
+                mma_candidates = []
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         candidate = analyze_cute_mma_node(node, device_ir=device_ir)
@@ -3810,25 +3810,42 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             and isinstance(rhs, torch.Tensor)
                         ):
                             continue
-                        search_plan = plan_cute_tcgen05_search(
-                            lhs,
-                            rhs,
-                            has_leading_passthrough=(
-                                candidate.operands.has_leading_passthrough
-                            ),
+                        mma_candidates.append((candidate, lhs, rhs, node))
+                supports_small_n_role_local_tma = bool(mma_candidates) and all(
+                    candidate.supports_small_n_role_local_tma
+                    for candidate, _lhs, _rhs, _node in mma_candidates
+                )
+                supports_small_n_scalar_fallback = bool(mma_candidates) and all(
+                    candidate.supports_small_n_scalar_fallback
+                    for candidate, _lhs, _rhs, _node in mma_candidates
+                )
+                search_candidates = []
+                for candidate, lhs, rhs, node in mma_candidates:
+                    search_plan = plan_cute_tcgen05_search(
+                        lhs,
+                        rhs,
+                        has_leading_passthrough=(
+                            candidate.operands.has_leading_passthrough
+                        ),
+                        supports_small_n_role_local_tma=(
+                            supports_small_n_role_local_tma
+                        ),
+                        supports_small_n_scalar_fallback=(
+                            supports_small_n_scalar_fallback
+                        ),
+                    )
+                    if search_plan is None or not (
+                        tcgen05_pair_epilogue_can_shape_search(
+                            device_ir.graphs,
+                            node,
+                            candidate,
+                            min_search_m=search_plan.min_search_m,
+                            max_search_m=search_plan.max_search_m,
+                            max_search_n=search_plan.max_search_n,
                         )
-                        if search_plan is None or not (
-                            tcgen05_pair_epilogue_can_shape_search(
-                                device_ir.graphs,
-                                node,
-                                candidate,
-                                min_search_m=search_plan.min_search_m,
-                                max_search_m=search_plan.max_search_m,
-                                max_search_n=search_plan.max_search_n,
-                            )
-                        ):
-                            continue
-                        search_candidates.append((candidate, lhs, search_plan))
+                    ):
+                        continue
+                    search_candidates.append((candidate, lhs, search_plan))
                 if tcgen05_pair_epilogue_present(
                     device_ir.graphs
                 ) and not tcgen05_pair_epilogue_has_unique_anchor(
