@@ -8,13 +8,15 @@ The kernel is ported from https://github.com/pytorch/helion/pull/2788/
 pretuned for the skinny-M (decode / small-batch) and small decoder-layer FP8
 W8A8 serving shapes that back the nightly B200 CuTe benchmark dashboard.
 
-Two kernels ship:
+Specialized kernels include:
 
 * :func:`scale_mm_cute` tiles over both M and N.
 * :func:`scale_mm_cute_skinny_m` keeps the full (small) M resident and tiles
-  only over N, which the CuTe backend runs faster for tiny M.
+  only over N for single-token decode.
+* :func:`scale_mm_cute_swap_ab` swaps M/N so M=2/8/16/32 can use efficient
+  Blackwell tensor-core tiles.
 
-:func:`_scale_mm_cute` dispatches to the skinny-M kernel when ``M <= 1``.
+:func:`_scale_mm_cute` dispatches each pretuned shape to its specialized kernel.
 """
 
 from __future__ import annotations
@@ -26,8 +28,19 @@ import torch
 import helion
 import helion.language as hl
 
-# M at or below this uses the skinny-M kernel (mirrors examples/fp8_gemm.py).
+# Only single-token decode uses the scalar skinny-M kernel. Wider small-M
+# shapes use the swapped tensor-core kernel below.
 _SKINNY_M_MAX = 1
+_SWAP_AB_SHAPES = {
+    (m, k, n)
+    for m in (2, 8, 16, 32)
+    for k, n in (
+        (4096, 4096),
+        (4096, 256),
+        (2048, 4096),
+        (4096, 6144),
+    )
+}
 
 
 @helion.aot_kernel(backend="cute", static_shapes=True)
@@ -78,15 +91,47 @@ def scale_mm_cute_skinny_m(
     return out
 
 
+@helion.aot_kernel(backend="cute", static_shapes=True)
+def scale_mm_cute_swap_ab(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> torch.Tensor:
+    """Small-M FP8 GEMM with M/N swapped for efficient tensor-core tiles."""
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    out_t = out.T
+    scale_a_t = scale_a.unsqueeze(0)
+    scale_b_t = scale_b.unsqueeze(-1).expand(n, m)
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                y[tile_k, tile_n].T,
+                x[tile_m, tile_k].T,
+                acc=acc,
+            )
+        out_t[tile_n, tile_m] = (
+            acc * scale_a_t[tile_n, tile_m] * scale_b_t[tile_n, tile_m]
+        ).to(torch.bfloat16)
+    return out
+
+
 def _scale_mm_cute(
     x: torch.Tensor,
     y: torch.Tensor,
     scale_a: torch.Tensor,
     scale_b: torch.Tensor,
 ) -> torch.Tensor:
-    """Dispatch to the skinny-M kernel for small M, else the [M, N]-tiled one."""
+    """Dispatch each pretuned shape to its specialized CuTe kernel."""
     if x.size(0) <= _SKINNY_M_MAX:
         return scale_mm_cute_skinny_m(x, y, scale_a, scale_b)
+    shape = (x.size(0), x.size(1), y.size(1))
+    if shape in _SWAP_AB_SHAPES:
+        return scale_mm_cute_swap_ab(x, y, scale_a[:, 0], scale_b)
     return scale_mm_cute(x, y, scale_a, scale_b)
 
 
