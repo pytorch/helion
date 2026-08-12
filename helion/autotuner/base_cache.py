@@ -21,10 +21,12 @@ from torch._inductor.codecache import torch_key
 from .. import exc
 from .._utils import counters
 from .base_search import BaseAutotuner
+from .benchmark_provider import _format_selected_multi_shape_configs
 from .benchmark_provider import _format_selected_multi_shape_measurement
 from .benchmark_provider import _has_valid_multi_shape_measurement
 from .benchmark_provider import _materialize_multi_shape_config
 from .benchmark_provider import _MultiShapeAutotuneArgs
+from .benchmark_provider import _select_multi_shape_configs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -345,7 +347,18 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
                 config,
             ):
                 raise exc.NoConfigFound
-            summary = _format_selected_multi_shape_measurement(self.args, config)
+            if self.args.num_config_limit > 1:
+                selection = _select_multi_shape_configs(self.args)
+                if not selection.configs:
+                    raise exc.NoConfigFound
+                self.args.selected_configs = selection.configs
+                self.args.selected_config_indices = selection.case_config_indices
+                config = selection.configs[0]
+                summary = _format_selected_multi_shape_configs(self.args, selection)
+            else:
+                self.args.selected_configs = (config,)
+                self.args.selected_config_indices = (0,) * len(self.args.cases)
+                summary = _format_selected_multi_shape_measurement(self.args, config)
             if summary is not None:
                 self._log_selected_multi_shape(summary)
 
