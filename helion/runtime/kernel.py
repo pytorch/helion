@@ -1886,10 +1886,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         config = self._normalize_config(config)
         run = self.compile_config(config)
-        if self.settings.retry_with_fallback:
-            default_config = self.env.config_spec.default_config()
-            if config != default_config:
-                run = self._run_with_fallback(run, self.compile_config(default_config))
+        if self.settings.retry_with_fallback and config != (
+            default_config := self.env.config_spec.default_config()
+        ):
+            run = self._run_with_fallback(run, self.compile_config(default_config))
         self._run = run
         self._config = config
         counters["best_config_decorator"][
