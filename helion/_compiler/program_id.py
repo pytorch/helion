@@ -5580,6 +5580,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "cutlass.Float8E4M3FN",
             "cutlass.Int32",
             "cutlass.Int64",
+            "cutlass.Uint8",
+            # Scalar fallback loads left behind after all work-producing
+            # statements move into role-local tcgen05 loops are side-effect
+            # free. They may be discarded when none of their results feed
+            # post-loop cleanup; stores and pipeline operations remain unsafe.
+            "cute.arch.load",
         }
     )
 
@@ -5593,6 +5599,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 return None
             return f"{base}.{func.attr}"
         return None
+
+    @staticmethod
+    def _tcgen05_is_iterator_load(expr: ast.Call) -> bool:
+        return (
+            isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == "load"
+            and not expr.args
+            and not expr.keywords
+            and any(
+                isinstance(node, ast.Attribute) and node.attr == "iterator"
+                for node in ast.walk(expr.func.value)
+            )
+        )
 
     @classmethod
     def _tcgen05_expr_safe_to_omit(cls, expr: ast.AST) -> bool:
@@ -5638,6 +5657,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 for part in (expr.lower, expr.upper, expr.step)
             )
         if isinstance(expr, ast.Call):
+            # Generated scalar fallback loads can appear either as the
+            # canonical ``cute.arch.load(...)`` helper or as a zero-argument
+            # ``iterator.load()`` method call. Both are side-effect free; the
+            # surrounding residual-body and post-loop dependency checks still
+            # retain the shared loop whenever the loaded value is observed.
+            if cls._tcgen05_is_iterator_load(expr):
+                assert isinstance(expr.func, ast.Attribute)
+                return cls._tcgen05_expr_safe_to_omit(expr.func.value)
             call_path = cls._tcgen05_call_path(expr.func)
             if call_path in {"max", "min"} and expr.keywords:
                 return False

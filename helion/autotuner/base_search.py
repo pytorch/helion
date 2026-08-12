@@ -1121,6 +1121,49 @@ class PopulationBasedSearch(BaseSearch):
             return None
         return PopulationMember(_unset_fn, [], canonical_flat, config)
 
+    def _pad_initial_population_with_unique_random(
+        self,
+        population: Sequence[FlatConfig],
+        target: int,
+    ) -> list[FlatConfig]:
+        """Pad an initial population with normalized, unique random configs."""
+        result: list[FlatConfig] = []
+        seen: set[Config] = set()
+        invalid = 0
+        duplicate = 0
+
+        def append_if_valid(flat: FlatConfig) -> None:
+            nonlocal invalid, duplicate
+            try:
+                canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+            except exc.InvalidConfig:
+                invalid += 1
+                return
+            if config in seen:
+                duplicate += 1
+                return
+            seen.add(config)
+            result.append(canonical_flat)
+
+        for flat in population:
+            append_if_valid(flat)
+
+        attempts = 0
+        max_attempts = max(64, max(0, target - len(result)) * 64)
+        while len(result) < target and attempts < max_attempts:
+            attempts += 1
+            append_if_valid(self.config_gen.random_flat())
+
+        if len(result) < target:
+            self.log(
+                "Generated only "
+                f"{len(result)}/{target} unique valid initial population configs "
+                f"after {attempts} random attempts "
+                f"({invalid} invalid, {duplicate} duplicate)."
+            )
+        self.log(f"Initial population after unique random padding: {len(result)} total")
+        return result
+
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
         Generate initial population using default config, explicit seed configs,
@@ -1229,7 +1272,7 @@ class PopulationBasedSearch(BaseSearch):
         if duplicates > 0:
             self.log.debug(f"Discarded {duplicates} duplicate config(s)")
 
-        self.log(f"Initial population: {len(result)} total")
+        self.log(f"Seed/default/cache population: {len(result)} total")
 
         return result
 
