@@ -1,7 +1,7 @@
 """Tests for the CuTe tile-loop vec hoist codegen.
 
 The hoist emits a single ``cute.arch.load(..., ir.VectorType.get([V], ...))``
-above the constexpr V-loop in ``CuteNDTileStrategy``; the V-loop body then
+above the constexpr V-loop in ``PerThreadNDTileStrategy``; the V-loop body then
 reads per-lane scalars via bitcast extracts from the hoist var. This
 replaces V scalar fp16 loads with one V*2-byte vec load per thread per
 outer iter.
@@ -11,7 +11,7 @@ The hoist is gated to V<=4 for fp16/bf16 (the CuTe DSL's
 ``_a`` / ``_b`` suffixed hoist vars covering vec lanes 0-3 and 4-7.
 
 Lives in ``helion/_compiler/tile_strategy.py``
-(``CuteNDTileStrategy._cute_*_by_block`` hooks) and
+(``PerThreadNDTileStrategy._cute_*_by_block`` hooks) and
 ``helion/language/memory_ops.py`` (``_cute_register_tile_unroll_vec_hoist``
 and ``_cute_vector_load_ctx`` ``"tile_unroll"`` / ``"tile_unroll_split2"``
 modes).
@@ -53,7 +53,7 @@ def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
 
     Mirrors the structure ``examples/softmax.py::softmax_two_pass`` uses
     (an outer M-grid tile, an inner N-tile loop) so the inner load goes
-    through ``CuteNDTileStrategy``'s tile-loop vec hoist when
+    through ``PerThreadNDTileStrategy``'s tile-loop vec hoist when
     ``cute_vector_widths`` is set.
     """
     m, n = x.size()

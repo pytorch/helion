@@ -127,7 +127,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
 
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
-    """V seed for ``CuteNDTileStrategy`` lane-loop vec on a given dtype.
+    """V seed for ``PerThreadNDTileStrategy`` lane-loop vec on a given dtype.
 
     Returns 4 for fp32 (LDG.128 = 16 bytes), 4 for fp16/bf16 (LDG.64,
     8 bytes per thread per outer iter).  Note: V=8 for fp16/bf16 IS now

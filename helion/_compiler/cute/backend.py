@@ -2028,8 +2028,8 @@ class CuteBackend(Backend):
         from ..device_ir import ForLoopGraphInfo
         from ..device_ir import ReductionLoopGraphInfo
         from ..host_function import HostFunction
-        from ..tile_strategy import CuteFlattenedTileStrategy
-        from ..tile_strategy import CuteNDTileStrategy
+        from ..tile_strategy import PerThreadFlattenedTileStrategy
+        from ..tile_strategy import PerThreadNDTileStrategy
 
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
@@ -2288,9 +2288,13 @@ class CuteBackend(Backend):
             from .thread_budget import check_thread_limit
 
             # Detect MMA-compatible K-loops: device loops containing
-            # addmm/mm with float16/bfloat16 operands.
+            # addmm/mm with float16/bfloat16 operands.  Metal borrows this
+            # planner but has its own matmul lowering (MPP), and everything
+            # ``mma_mode`` selects -- tcgen05, warpgroups, cute_state -- is
+            # CuTe's, so only run the detectors for CuTe.
             mma_mode = False
-            if is_device_loop:
+            detect_mma = self.name == "cute"
+            if is_device_loop and detect_mma:
                 if _detect_attention_mma_loop(
                     fn,
                     block_ids,
@@ -2310,7 +2314,8 @@ class CuteBackend(Backend):
                         config=config,
                     )
             elif (
-                len(device_ir.grid_block_ids) == 1
+                detect_mma
+                and len(device_ir.grid_block_ids) == 1
                 and block_ids == device_ir.grid_block_ids[0]
             ):
                 specialized_mma_plan = _kernel_specialized_mma_plan(fn, config=config)
@@ -2357,7 +2362,7 @@ class CuteBackend(Backend):
                     )
 
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
-            return CuteNDTileStrategy(
+            return PerThreadNDTileStrategy(
                 fn,
                 block_ids,
                 block_size=nd_block_size,
@@ -2391,7 +2396,7 @@ class CuteBackend(Backend):
             from .thread_budget import check_thread_limit
 
             check_thread_limit(flat_num_threads, context=str(block_size))
-        return CuteFlattenedTileStrategy(
+        return PerThreadFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,
