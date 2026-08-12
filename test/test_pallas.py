@@ -1761,11 +1761,14 @@ class TestPallas(TestCase):
         torch.testing.assert_close(out[0], x.sum(dim=0), rtol=1e-4, atol=1e-4)
 
     def test_resident_subview_config_dependent_eligibility(self) -> None:
-        """A run must divide the block, which depends on the block size."""
+        """A fixed-width inner run must exactly cover its resident outer block."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def divisible(x: torch.Tensor, out: torch.Tensor) -> None:
             tokens, _heads, _width = x.size()
+            # This range is intentionally wider than the semantically valid choice:
+            # production code with a fixed four-row body should register (4, 4).
+            # Keeping 2..tokens here exercises candidate-local planner rejection.
             block_t = hl.register_block_size(2, tokens)
             for _request in hl.grid(1):
                 acc = hl.zeros([2, 128], dtype=torch.float32)

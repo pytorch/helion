@@ -154,7 +154,11 @@ def _current_variant(state: CodegenState, plan: _ResidentPlan) -> _ResidentVaria
     current = state.device_function.resolved_block_size(block_id)
     assert isinstance(current, int)
     factor = current // env.compact_worklist_block
-    return next(variant for variant in variants if variant.worklist_factor == factor)
+    variant = next(
+        (variant for variant in variants if variant.worklist_factor == factor), None
+    )
+    assert variant is not None, f"no resident Ref variant for worklist factor {factor}"
+    return variant
 
 
 def maybe_materialize_resident_ref(node: torch.fx.Node, result: ast.AST) -> ast.AST:
@@ -274,15 +278,17 @@ def _enclosing_loop_bounds(
     graph_infos: dict[torch.fx.Graph, GraphInfo],
     block_id: int,
 ) -> tuple[object, object] | None:
+    seen: set[torch.fx.Graph] = set()
     while True:
         if (bounds := _loop_bounds(info, parents, block_id)) is not None:
             return bounds
+        assert info.graph not in seen, "cycle while resolving an enclosing tile loop"
+        seen.add(info.graph)
         parent = parents.get(info.graph_id)
         outer = graph_infos.get(parent.graph) if parent is not None else None
         if outer is None:
             return None
         info = outer
-    return None
 
 
 def _variant_block_size(block_id: int, config: Config, factor: int) -> int | None:
@@ -436,6 +442,119 @@ def _tile_run(index: torch.fx.Node) -> int | None:
     return None
 
 
+def _apply_selector_to_variants(
+    location: str,
+    input_value: torch.Tensor,
+    variants: tuple[_ResidentVariant, ...],
+    selector: _ResidentSelector,
+    *,
+    squeeze: bool,
+    outer_block_id: int,
+    static_loop_extent: int,
+    config: Config,
+) -> _ResidentTransform:
+    """Validate and apply a logical selector to every physical Ref variant."""
+    from .backend import SliceAddressing
+    from .backend import _slice_addressing
+
+    logical_dim = selector.logical_dim
+    output: list[_ResidentVariant] = []
+    for variant in variants:
+        physical_dim = _logical_to_physical(
+            logical_dim, variant.squeezed_dims, len(variant.shape)
+        )
+        lane_block = variant.shape[-1]
+        if (
+            _slice_addressing(input_value, logical_dim, lane_block)
+            is not SliceAddressing.DIRECT
+        ):
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the selector at {location} does not have direct VMEM "
+                "addressing for this config",
+            )
+        width = (
+            _variant_block_size(
+                selector.local_block_id, config, variant.worklist_factor
+            )
+            if selector.kind == "tile"
+            else selector.width
+        )
+        if not isinstance(width, int) or width < 1:
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the selector at {location} has no concrete positive width "
+                "for this config",
+            )
+        if squeeze and width != 1:
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the scalar selector at {location} cannot use width {width} "
+                "for this config",
+            )
+        if width > variant.shape[physical_dim]:
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the run is {width} wide but the block holds only "
+                f"{variant.shape[physical_dim]} rows for this config at {location}",
+            )
+        if selector.kind == "static":
+            assert isinstance(selector.begin, int)
+            if selector.begin + width > variant.shape[physical_dim]:
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    f"the static run at {location} reaches past the resident "
+                    "Ref for this config",
+                )
+            if variant.live_guard is not None and variant.live_guard[0] == physical_dim:
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    f"the static selector at {location} may address padding in "
+                    "the source tile for this config",
+                )
+        elif selector.kind == "tile":
+            if variant.shape[physical_dim] % width != 0:
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    f"the selector width at {location} does not divide the Ref "
+                    "for this config",
+                )
+            if (
+                static_loop_extent >= 0
+                and static_loop_extent != variant.shape[physical_dim]
+            ):
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    f"the inner loop at {location} does not cover exactly the Ref "
+                    "for this config",
+                )
+
+        # Only selection through the matching source live extent proves that the
+        # guarded physical dimension no longer contains addressable padding.
+        remaining_guard = (
+            None
+            if variant.live_guard == (physical_dim, outer_block_id)
+            else variant.live_guard
+        )
+        new_shape = list(variant.shape)
+        new_shape[physical_dim] = width
+        new_squeezed_dims = (
+            tuple(sorted((*variant.squeezed_dims, physical_dim)))
+            if squeeze
+            else variant.squeezed_dims
+        )
+        output.append(
+            _ResidentVariant(
+                variant.worklist_factor,
+                tuple(new_shape),
+                new_squeezed_dims,
+                remaining_guard,
+            )
+        )
+
+    return _ResidentTransform(tuple(output), selector)
+
+
 def _selector(
     node: torch.fx.Node,
     graph_info: GraphInfo,
@@ -450,10 +569,9 @@ def _selector(
     from ..device_ir import IfGraphInfo
     from ..type_info import _detect_outer_block_bound
     from ..variable_origin import TileBeginOrigin
-    from .backend import SliceAddressing
-    from .backend import _slice_addressing
     from .plan_tiling import _maybe_get_symbol_origin
 
+    location = _where(node)
     indices = node.args[1]
     input_node = node.args[0]
     input_value = (
@@ -464,19 +582,19 @@ def _selector(
     ):
         raise exc.BackendUnsupported(
             "pallas",
-            f"the selector at {_where(node)} has no tensor indexing metadata",
+            f"the selector at {location} has no tensor indexing metadata",
         )
     if any(index is None for index in indices):
         raise exc.BackendUnsupported(
             "pallas",
-            f"the selector at {_where(node)} adds a dimension; resident Ref "
+            f"the selector at {location} adds a dimension; resident Ref "
             "narrowing does not support None",
         )
     selected = _narrowed_dims(indices)
     if len(selected) != 1:
         raise exc.BackendUnsupported(
             "pallas",
-            f"the selector at {_where(node)} must narrow exactly one dimension, "
+            f"the selector at {location} must narrow exactly one dimension, "
             f"but it narrows {len(selected)}",
         )
     logical_dim = selected[0]
@@ -505,7 +623,7 @@ def _selector(
         if not isinstance(graph_info, IfGraphInfo) or not source.args:
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the dynamic tail selector at {_where(node)} is not inside its "
+                f"the dynamic tail selector at {location} is not inside its "
                 "matching conditional",
             )
         width = _node_value(source.args[0])
@@ -520,7 +638,7 @@ def _selector(
         ):
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the dynamic tail selector at {_where(node)} is not a contiguous "
+                f"the dynamic tail selector at {location} is not a contiguous "
                 "positive iota",
             )
         live = start + width
@@ -535,7 +653,7 @@ def _selector(
         ):
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the dynamic tail selector at {_where(node)} is not guarded by "
+                f"the dynamic tail selector at {location} is not guarded by "
                 "its exact live-width predicate",
             )
         selector = _ResidentSelector("tail", logical_dim, -1, start, width, False)
@@ -550,7 +668,7 @@ def _selector(
             if origin is None or not isinstance(origin.origin, TileBeginOrigin):
                 raise exc.BackendUnsupported(
                     "pallas",
-                    f"the scalar selector at {_where(node)} is not a tile begin",
+                    f"the scalar selector at {location} is not a tile begin",
                 )
             local_block_id = origin.origin.block_id
         else:
@@ -558,7 +676,7 @@ def _selector(
             if detected_local is None:
                 raise exc.BackendUnsupported(
                     "pallas",
-                    f"the selector at {_where(node)} is not an unshifted tile run",
+                    f"the selector at {location} is not an unshifted tile run",
                 )
             local_block_id = detected_local
         bounds = _enclosing_loop_bounds(
@@ -567,25 +685,24 @@ def _selector(
         if bounds is None:
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the selector at {_where(node)} is not driven by an enclosing "
-                "tile loop",
+                f"the selector at {location} is not driven by an enclosing tile loop",
             )
         start, end = bounds
         if not isinstance(start, (int, torch.SymInt)) or not env.known_equal(start, 0):
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the selector's tile loop at {_where(node)} must start at zero",
+                f"the selector's tile loop at {location} must start at zero",
             )
         if isinstance(end, int):
             if end < 1:
                 raise exc.BackendUnsupported(
-                    "pallas", f"the selector's tile loop at {_where(node)} is empty"
+                    "pallas", f"the selector's tile loop at {location} is empty"
                 )
             static_loop_extent = end
         elif not isinstance(end, torch.SymInt):
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the selector's tile loop at {_where(node)} has an unsupported end",
+                f"the selector's tile loop at {location} has an unsupported end",
             )
         else:
             detected_outer = exact_outer_live(end)
@@ -593,7 +710,7 @@ def _selector(
             if outer_block_id < 0:
                 raise exc.BackendUnsupported(
                     "pallas",
-                    f"the selector's live extent at {_where(node)} does not match "
+                    f"the selector's live extent at {location} does not match "
                     "the source tile",
                 )
         selector = _ResidentSelector(
@@ -603,7 +720,7 @@ def _selector(
         if index < 0:
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the static selector at {_where(node)} has a negative index",
+                f"the static selector at {location} has a negative index",
             )
         squeeze = True
         selector = _ResidentSelector("static", logical_dim, -1, index, 1, False)
@@ -617,8 +734,7 @@ def _selector(
         ):
             raise exc.BackendUnsupported(
                 "pallas",
-                f"the static selector at {_where(node)} is not a positive "
-                "contiguous slice",
+                f"the static selector at {location} is not a positive contiguous slice",
             )
         selector = _ResidentSelector(
             "static", logical_dim, -1, index.start, index.stop - index.start, False
@@ -626,106 +742,19 @@ def _selector(
     else:
         raise exc.BackendUnsupported(
             "pallas",
-            f"the selector at {_where(node)} has unsupported index {index!r}",
+            f"the selector at {location} has unsupported index {index!r}",
         )
 
-    # Validate every emitted physical branch. A dynamic selector must address the
-    # Ref directly, and a tiled run must partition its selected dimension exactly.
-    output: list[_ResidentVariant] = []
-    for variant in variants:
-        physical_dim = _logical_to_physical(
-            logical_dim, variant.squeezed_dims, len(variant.shape)
-        )
-        lane_block = variant.shape[-1]
-        if (
-            _slice_addressing(input_value, logical_dim, lane_block)
-            is not SliceAddressing.DIRECT
-        ):
-            raise exc.BackendUnsupported(
-                "pallas",
-                f"the selector at {_where(node)} does not have direct VMEM "
-                "addressing for this config",
-            )
-        width = (
-            _variant_block_size(
-                selector.local_block_id, context.config, variant.worklist_factor
-            )
-            if selector.kind == "tile"
-            else selector.width
-        )
-        if not isinstance(width, int) or width < 1:
-            raise exc.BackendUnsupported(
-                "pallas",
-                f"the selector at {_where(node)} has no concrete positive width "
-                "for this config",
-            )
-        if squeeze and width != 1:
-            raise exc.BackendUnsupported(
-                "pallas",
-                f"the scalar selector at {_where(node)} cannot use width {width} "
-                "for this config",
-            )
-        if width > variant.shape[physical_dim]:
-            raise exc.BackendUnsupported(
-                "pallas",
-                f"the run is {width} wide but the block holds only "
-                f"{variant.shape[physical_dim]} rows for this config at {_where(node)}",
-            )
-        if selector.kind == "static":
-            assert isinstance(selector.begin, int)
-            if selector.begin + width > variant.shape[physical_dim]:
-                raise exc.BackendUnsupported(
-                    "pallas",
-                    f"the static run at {_where(node)} reaches past the resident "
-                    "Ref for this config",
-                )
-            if variant.live_guard is not None and variant.live_guard[0] == physical_dim:
-                raise exc.BackendUnsupported(
-                    "pallas",
-                    f"the static selector at {_where(node)} may address padding in "
-                    "the source tile for this config",
-                )
-        elif selector.kind == "tile":
-            if variant.shape[physical_dim] % width != 0:
-                raise exc.BackendUnsupported(
-                    "pallas",
-                    f"the selector width at {_where(node)} does not divide the Ref "
-                    "for this config",
-                )
-            if (
-                static_loop_extent >= 0
-                and static_loop_extent != variant.shape[physical_dim]
-            ):
-                raise exc.BackendUnsupported(
-                    "pallas",
-                    f"the inner loop at {_where(node)} does not cover exactly the "
-                    "Ref for this config",
-                )
-
-        # Only selection through the matching source live extent proves that the
-        # guarded physical dimension no longer contains addressable padding.
-        remaining_guard = (
-            None
-            if variant.live_guard == (physical_dim, outer_block_id)
-            else variant.live_guard
-        )
-        new_shape = list(variant.shape)
-        new_shape[physical_dim] = width
-        new_squeezed_dims = (
-            tuple(sorted((*variant.squeezed_dims, physical_dim)))
-            if squeeze
-            else variant.squeezed_dims
-        )
-        output.append(
-            _ResidentVariant(
-                variant.worklist_factor,
-                tuple(new_shape),
-                new_squeezed_dims,
-                remaining_guard,
-            )
-        )
-
-    return _ResidentTransform(tuple(output), selector)
+    return _apply_selector_to_variants(
+        location,
+        input_value,
+        variants,
+        selector,
+        squeeze=squeeze,
+        outer_block_id=outer_block_id,
+        static_loop_extent=static_loop_extent,
+        config=context.config,
+    )
 
 
 def _reshape_variants(
