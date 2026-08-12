@@ -4,7 +4,9 @@
 
 """Standalone TileGym Triton attention baseline for Helion benchmarks."""
 
-from __future__ import annotations
+# Vendored from NVIDIA TileGym/Ocean commit
+# 051606aa56a2997bcb206383292469b7059bb76e.
+# Keep this file close to its upstream kernel for reviewability.
 
 import inspect
 import math
@@ -54,9 +56,10 @@ _TRITON_SUPPORTS_V2_OPT_LEVEL = _supports_v2_opt_level()
 def _permute_by_layout(b, n, s, d, layout: tl.constexpr):
     if layout == "bnsd":
         return [b, n, s, d]
-    if layout == "nsbd":
+    elif layout == "nsbd":
         return [n, s, b, d]
-    raise ValueError(f"Unsupported layout: {layout}")
+    else:
+        raise ValueError(f"Unsupported layout: {layout}")
 
 
 @triton.jit
@@ -140,7 +143,7 @@ def _attn_fwd_inner(
             if KV_LEN_MASK:
                 lo, hi = (
                     stage_1_end,
-                    min(q_seq_end_cur_block, kv_end),
+                    kv_end if q_seq_end_cur_block > kv_end else q_seq_end_cur_block,
                 )
             else:
                 lo, hi = stage_1_end, q_seq_end_cur_block
@@ -318,13 +321,15 @@ def _create_layout_aware_pre_hook():
 def _get_default_kernel_configs():
     if _get_available_triton_backend() == "oait":
         return {"BLOCK_M": 64, "BLOCK_N": 64}
-    if torch.cuda.get_device_capability() in [(12, 0), (12, 1)]:
-        return {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "occupancy": 2,
-        }
-    return {"BLOCK_M": 256, "BLOCK_N": 128}
+    else:
+        if torch.cuda.get_device_capability() in [(12, 0), (12, 1)]:
+            return {
+                "BLOCK_M": 64,
+                "BLOCK_N": 64,
+                "occupancy": 2,
+            }
+        else:
+            return {"BLOCK_M": 256, "BLOCK_N": 128}
 
 
 def _get_configs(kernel_type="prefill"):
@@ -383,8 +388,10 @@ def _early_config_prune(configs, named_args, **kwargs):
                 return block_m != 64 or block_n != 64
 
             return [cfg for cfg in configs if save_config(cfg)]
+        else:
+            return configs
+    else:
         return configs
-    return configs
 
 
 # Device kernels
@@ -882,6 +889,3 @@ def get_fmha_variant_sdpa_paged_interface(backend=None, kernel_configs=None):
         return o.transpose(1, 2).contiguous(), None
 
     return fmha_interface_wrapper
-
-
-# fmt: on

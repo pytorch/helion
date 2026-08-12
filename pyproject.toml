@@ -126,7 +126,17 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 # Keep the attributed TileGym Triton kernel close to its upstream source. Normal
 # Python annotations and style rewrites are inappropriate for several @triton.jit
 # functions and would make future source comparisons needlessly difficult.
-"benchmarks/cute/tilegym_attention.py" = ["ANN", "B008", "C408", "E731", "E741", "RET504"]
+"benchmarks/cute/tilegym_attention.py" = [
+  "I002",
+  "ANN",
+  "B008",
+  "C408",
+  "E731",
+  "E741",
+  "FURB136",
+  "RET504",
+  "RET505",
+]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
