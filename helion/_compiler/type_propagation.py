@@ -5,6 +5,7 @@ import builtins
 import contextlib
 import dataclasses
 import functools
+import itertools
 import types
 from typing import TYPE_CHECKING
 from typing import NoReturn
@@ -687,7 +688,35 @@ class TypePropagation(ast.NodeVisitor):
                 comparators[i],
             )
             result = self._bool_op(ast.And(), result, new_result)
+        active_nodes = ExtendedAST.current()
+        if (
+            self.device_loop_count == 0
+            and len(active_nodes) == 2
+            and isinstance(active_nodes[0], ast.Assert)
+            and all(isinstance(op, ast.Eq) for op in node.ops)
+        ):
+            for left, right in itertools.pairwise(comparators):
+                self.constrain_assert_equal(left, right)
         return result
+
+    def constrain_assert_equal(self, left: TypeInfo, right: TypeInfo) -> None:
+        if isinstance(left, SymIntType) and isinstance(right, SymIntType):
+            left_symbol = left.to_sympy()
+            right_symbol = right.to_sympy()
+            env = CompileEnvironment.current()
+            if (
+                left_symbol.is_Symbol
+                and right_symbol.is_Symbol
+                and env.shape_env.replace(left_symbol)
+                != env.shape_env.replace(right_symbol)
+            ):
+                env.shape_env._constrain_unify(left.value, right.value)
+        elif isinstance(left, SequenceType) and isinstance(right, SequenceType):
+            if len(left.element_types) == len(right.element_types):
+                for left_element, right_element in zip(
+                    left.unpack(), right.unpack(), strict=True
+                ):
+                    self.constrain_assert_equal(left_element, right_element)
 
     def visit_Call(self, node: ast.Call) -> TypeInfo:
         func = self.visit(node.func)
