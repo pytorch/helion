@@ -2151,16 +2151,24 @@ def _aligned_dim(
 
     # Strictest addressing each row needs over the tensors it slices.
     addressing: dict[int, SliceAddressing] = {}
-    for fake, _node, sub_meta in (*loaded_tensors.values(), *stored_tensors.values()):
-        if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
-            continue
-        dim_to_bid = _get_dim_block_ids(sub_meta, env)
-        lane_block = _lane_tile(state, fake, dim_to_bid)
-        for dim, dim_bid in dim_to_bid.items():
-            if _slice_addressing(fake, dim, lane_block) is SliceAddressing.ALIGNED:
-                addressing[dim_bid] = SliceAddressing.ALIGNED
-            else:
-                addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
+    stored_bids: set[int] = set()
+    for tensors, is_store in (
+        (loaded_tensors, False),
+        (stored_tensors, True),
+    ):
+        for fake, _node, sub_meta in tensors.values():
+            dim_to_bid = _get_dim_block_ids(sub_meta, env)
+            if is_store:
+                stored_bids.update(dim_to_bid.values())
+            if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+                continue
+            lane_block = _lane_tile(state, fake, dim_to_bid)
+            for dim, dim_bid in dim_to_bid.items():
+                access_addressing = _slice_addressing(fake, dim, lane_block)
+                if access_addressing is SliceAddressing.ALIGNED:
+                    addressing[dim_bid] = SliceAddressing.ALIGNED
+                else:
+                    addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
     sublane = max(sublanes)
     aligned_dim: dict[int, int] = {}
@@ -2171,15 +2179,21 @@ def _aligned_dim(
         direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
         if direct and not carry:
             continue  # reads any offset; a plain clamped slice suffices
-        if not carry and not is_row_map_axis(state, bid):
-            # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
-            # dense bf16 output store can't be proven aligned for Mosaic (E2003),
-            # so reject it cleanly here instead.  f32 reductions are DIRECT and
-            # already skipped above.
-            raise NotImplementedError(
-                "Pallas: bf16 reduction over a jagged row is not supported yet "
-                "(its dense bf16 output store cannot be proven sublane-aligned)."
-            )
+        if not carry:
+            if bid in stored_bids:
+                raise NotImplementedError(
+                    "Pallas: a jagged row tile whose slices must be "
+                    "sublane-aligned and that is written through its row dim is "
+                    "only supported when ordered carry can stitch the store."
+                )
+            if not is_row_map_axis(state, bid):
+                # ALIGNED but not a map axis: a bf16 reduction over the row. Its
+                # dense bf16 output store cannot be proven aligned for Mosaic, so
+                # reject it cleanly here instead. f32 reductions are DIRECT above.
+                raise NotImplementedError(
+                    "Pallas: bf16 reduction over a jagged row is not supported yet "
+                    "(its dense bf16 output store cannot be proven sublane-aligned)."
+                )
         aligned_dim[bid] = sublane
         state.device_function.aligned_tiles[bid] = sublane
         if carry:
@@ -2382,9 +2396,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         )
                     else:
                         size_expr = slice_size_expr
-                    if bid in state.device_function.carry_tiles:
-                        sublane = state.device_function.carry_tiles[bid].sublane
-                        start_expr = f"pl.multiple_of({start_expr}, {sublane})"
+                    # Carried tiles are aligned tiles, so this covers them too.
+                    start_expr = _annotate_provable_sublane_alignment(
+                        state,
+                        bid,
+                        start_expr,
+                        steps_by_block=iter_step_expr == block_size_vars[bid_idx],
+                    )
                     lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
                 else:
                     # Static, from-zero loop: a block-aligned index is exact.
