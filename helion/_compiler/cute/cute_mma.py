@@ -206,6 +206,37 @@ _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
     32,
     32,
 )
+
+
+def _tcgen05_explicit_epilogue_tile_supported(
+    *,
+    is_two_cta: bool,
+    bm: int,
+    bn: int,
+    tile_shape: tuple[int | None, int | None, int | None],
+) -> bool:
+    """Whether the current tcgen05 explicit-epilogue path supports the tile."""
+    epi_tile_m, epi_tile_n, d_store_box_n = tile_shape
+    return (
+        # Four epilogue warps own 16 or 32 supported TMEM datapaths each.
+        epi_tile_m in (64, 128)
+        # Use the dtype-independent, power-of-two TMA store widths validated by
+        # this backend; 16 is the minimum that also gives FP8 a 128-bit row.
+        and epi_tile_n in (16, 32, 64)
+        # Helion emits one epilogue subtile per TMA store box.
+        and d_store_box_n == epi_tile_n
+        # Every MMA M tile must partition into whole epilogue subtiles.
+        and bm % epi_tile_m == 0
+        # Every MMA N tile must partition into whole store boxes.
+        and bn % epi_tile_n == 0
+        # Explicit 2CTA uses the established per-CTA M128 partition.
+        and (not is_two_cta or epi_tile_m == 128)
+        # 2CTA BM128 needs a permuted per-CTA M64 layout that integer explicit
+        # tile overrides cannot express, so it stays on the implicit path.
+        and not (is_two_cta and bm == 128)
+    )
+
+
 # Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
 # degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
 # CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
@@ -280,6 +311,50 @@ class _MmaOperandInfo:
     rhs_rank3_grouped_nt: bool = False
     rhs_segment_group: _Rank3RhsSegmentGroupInfo | None = None
     rhs_packed_group: _Rank3RhsPackedGroupInfo | None = None
+    source_to_logical_order: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_to_logical_order is None:
+            return
+        expected = self.source_fake.permute(self.source_to_logical_order)
+
+        def mismatch(field: str, actual: object, expected_value: object) -> str:
+            return (
+                f"Invalid MMA operand analysis: logical_fake {field} does not "
+                "match source_fake.permute(source_to_logical_order). The recorded "
+                "logical order is likely incorrect. Please report a bug to the "
+                "Helion maintainers with this context: "
+                f"source_to_logical_order={self.source_to_logical_order}, "
+                f"source_shape={self.source_fake.shape}, "
+                f"source_stride={self.source_fake.stride()}, "
+                f"logical_shape={self.logical_fake.shape}, "
+                f"logical_stride={self.logical_fake.stride()}, "
+                f"field={field}, actual={actual}, expected={expected_value}"
+            )
+
+        assert self.logical_fake.dtype == expected.dtype, mismatch(
+            "dtype", self.logical_fake.dtype, expected.dtype
+        )
+        assert self.logical_fake.device == expected.device, mismatch(
+            "device", self.logical_fake.device, expected.device
+        )
+        assert self.logical_fake.shape == expected.shape, mismatch(
+            "shape", self.logical_fake.shape, expected.shape
+        )
+        assert self.logical_fake.stride() == expected.stride(), mismatch(
+            "stride", self.logical_fake.stride(), expected.stride()
+        )
+        assert self.logical_fake.storage_offset() == expected.storage_offset(), (
+            mismatch(
+                "storage_offset",
+                self.logical_fake.storage_offset(),
+                expected.storage_offset(),
+            )
+        )
+
+    @property
+    def matrix_major(self) -> str | None:
+        return _tcgen05_tma_matrix_major(self.logical_fake)
 
     @property
     def matrix_rows(self) -> int | torch.SymInt:
@@ -862,6 +937,15 @@ def _tcgen05_tma_matrix_major(tensor: torch.Tensor) -> str | None:
     if tensor.stride(-2) == 1:
         return "col"
     return None
+
+
+def _compose_axis_orders(
+    source_to_logical: tuple[int, ...],
+    logical_to_target: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Map source axes directly into a target ordered from logical axes."""
+    assert len(source_to_logical) == len(logical_to_target)
+    return tuple(source_to_logical[logical_dim] for logical_dim in logical_to_target)
 
 
 def _rank3_rhs_index_block_id(index: Node, *, reduction: bool | None) -> int | None:
@@ -2381,6 +2465,7 @@ class _MmaSearchGraphView:
 @dataclass(frozen=True)
 class _MmaOutputStoreAnalysis:
     explicit_epi_tile_compatible: bool
+    output_column_major: bool
 
 
 def _mma_tiles_are_static_full(
@@ -2394,11 +2479,47 @@ def _mma_tiles_are_static_full(
     )
 
 
+def _unwrap_mma_operand_permute(
+    node: Node,
+) -> tuple[Node, tuple[int, ...] | None] | None:
+    """Unwrap the trailing-axis swap supported by collective MMA lowering.
+
+    Return ``(node, None)`` when no permutation is present, or the source node
+    and its source-to-logical axis order for a supported swap. Return ``None``
+    when the node is a malformed or unsupported permutation.
+    """
+    if node.op != "call_function" or node.target is not torch.ops.aten.permute.default:
+        return node, None
+    if len(node.args) != 2 or not isinstance(node.args[0], Node):
+        return None
+    value_fake = node.meta.get("val")
+    order = node.args[1]
+    if not isinstance(value_fake, torch.Tensor) or not isinstance(order, (list, tuple)):
+        return None
+    normalized = tuple(int(cast("int", dim)) % value_fake.ndim for dim in order)
+    # The order representation is general, but collective MMA lowering only
+    # supports swapping the two trailing matrix axes. Arbitrary permutations
+    # would also require remapping M/N/K, leading batch/group axes, tile block
+    # ids, and TMA coordinates throughout the rest of the lowering.
+    trailing_axis_swap = (
+        *range(value_fake.ndim - 2),
+        value_fake.ndim - 1,
+        value_fake.ndim - 2,
+    )
+    if normalized != trailing_axis_swap:
+        return None
+    return node.args[0], normalized
+
+
 def _analyze_mma_operand(
     node: Node,
     env: CompileEnvironment,
 ) -> _MmaOperandInfo | None:
-    info = _direct_load_tensor(node)
+    permute = _unwrap_mma_operand_permute(node)
+    if permute is None:
+        return None
+    load_value, source_to_logical_order = permute
+    info = _direct_load_tensor(load_value)
     if info is None:
         return None
     load_node, _, source_fake = info
@@ -2419,16 +2540,25 @@ def _analyze_mma_operand(
             block_size, source_fake.size(dim)
         ):
             return None
+    if source_to_logical_order is not None:
+        block_ids = tuple(block_ids[dim] for dim in source_to_logical_order)
     if source_fake.ndim not in (2, 3):
+        return None
+    if source_to_logical_order is not None and source_fake.ndim == 3:
         return None
     if value_fake.ndim not in (2, source_fake.ndim):
         return None
     return _MmaOperandInfo(
         load=load_node,
-        terminal=load_node,
+        terminal=node if source_to_logical_order is not None else load_node,
         source_fake=source_fake,
-        logical_fake=source_fake,
+        logical_fake=(
+            source_fake.permute(source_to_logical_order)
+            if source_to_logical_order is not None
+            else source_fake
+        ),
         block_ids=block_ids,
+        source_to_logical_order=source_to_logical_order,
     )
 
 
@@ -2461,7 +2591,7 @@ def _analyze_mma_operands(
     # matrices. Keep other layouts out of the shared search/planning/codegen
     # capability until their rank-3 descriptor mapping is supported.
     if leading_passthrough_block_id is not None and any(
-        operand.source_fake.stride(-1) != 1
+        operand.matrix_major != "row"
         for operand in (lhs, rhs)
         if operand.is_leading_passthrough
     ):
@@ -2672,6 +2802,7 @@ class _CuteMmaNode(_CuteMmaTarget):
 
     operands: _MmaOperandAnalysis
     explicit_epi_tile_compatible: bool
+    output_column_major: bool
 
     @property
     def requires_scalar_fallback(self) -> bool:
@@ -2807,7 +2938,11 @@ def analyze_cute_mma_node(
     if not _mma_result_can_be_deferred(node) or not _mma_loop_is_exclusive(node):
         return None
     output_store_analysis: _MmaOutputStoreAnalysis | None = None
-    if operands.has_leading_passthrough:
+    needs_output_store_analysis = operands.has_leading_passthrough or (
+        operands.lhs.source_to_logical_order is not None
+        and operands.rhs.source_to_logical_order is not None
+    )
+    if needs_output_store_analysis:
         cached = node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY)
         if isinstance(cached, _MmaOutputStoreAnalysis):
             output_store_analysis = cached
@@ -2877,13 +3012,18 @@ def analyze_cute_mma_node(
         out_dtype=target.out_dtype,
         operands=operands,
         explicit_epi_tile_compatible=(
-            _tcgen05_tma_matrix_major(operands.lhs.source_fake) == "row"
-            and _tcgen05_tma_matrix_major(operands.rhs.source_fake) in ("row", "col")
+            operands.lhs.matrix_major == "row"
+            and operands.rhs.matrix_major in ("row", "col")
             and (
                 output_store_analysis.explicit_epi_tile_compatible
                 if output_store_analysis is not None
                 else True
             )
+        ),
+        output_column_major=(
+            output_store_analysis.output_column_major
+            if output_store_analysis is not None
+            else False
         ),
         with_acc=target.with_acc,
         is_dot=target.is_dot,
@@ -3885,9 +4025,9 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
-    # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
-    # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
-    # TMA paths must keep the guarded fallback path.
+    # Static-full pipelined TMA loops can drop the per-K runtime full-tile
+    # branch and scalar fallback. Non-pipelined/asymmetric paths must keep the
+    # guarded fallback path.
     static_full_tiles: bool = False
     tma_desc_ptr_a: str | None = None
     tma_desc_ptr_b: str | None = None
@@ -3988,13 +4128,6 @@ def _build_kloop_pipeline_producer_if(
     assert args.use_tma_a and args.use_tma_b, (
         "pipelined branch requires both A and B to be TMA-loaded"
     )
-    assert not (args.static_full_tiles and args.is_two_cta), (
-        "static-full fast path is only valid for one-CTA pipelined TMA loops"
-    )
-    if load_current_tile:
-        assert not args.static_full_tiles, (
-            "current-tile producer is only used by role-local pipelined TMA loops"
-        )
     k_offset = (
         args.tma_k_tile
         if load_current_tile
@@ -4012,7 +4145,8 @@ def _build_kloop_pipeline_producer_if(
     )
     # CtaGroup.TWO uses CTA-rank-specific TMA partitions, so both CTAs issue
     # these copies; PipelineTmaUmma gates the full-barrier tx setup internally.
-    src = f"if {' and '.join(predicate_terms)}:\n"
+    predicate = " and ".join(predicate_terms) or "True"
+    src = f"if {predicate}:\n"
     producer_advance_src = (
         emit_pipeline_advance(args.tma_producer_state, indent="    ")
         if not args.skip_producer_advance
@@ -4051,9 +4185,6 @@ def _build_kloop_pipeline_consumer_if(
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
-        )
         assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
@@ -4146,9 +4277,6 @@ def _build_kloop_pipeline_release_if(
     multicast mask; separate peer arrivals over-count the empty barrier.
     """
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
-        )
         assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
@@ -4176,6 +4304,19 @@ def _build_kloop_pipeline_release_if(
             release_src + "\n" + advance_src, release_gate, indent=indent
         )
     if args.static_full_tiles:
+        if args.is_two_cta and gate_exec_warp:
+            owner_gate = _tcgen05_two_cta_owner_predicate(
+                args.exec_active,
+                is_two_cta=True,
+                gate_exec_warp=False,
+                cluster_n=args.cluster_n,
+            )
+            assert owner_gate is not None
+            full_tile_src = (
+                f"if {args.exec_active}:\n"
+                f"    if {owner_gate}:\n"
+                f"        {release_src}\n" + textwrap.indent(advance_src, "    ")
+            )
         return statement_from_string(full_tile_src)
     fallback_src = (
         "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
@@ -4672,7 +4813,10 @@ def _analyze_packed_split_mma_output_store(
         or analyzed_stores[0][1].steps
     ):
         return None
-    return _MmaOutputStoreAnalysis(explicit_epi_tile_compatible=True)
+    return _MmaOutputStoreAnalysis(
+        explicit_epi_tile_compatible=True,
+        output_column_major=_tcgen05_tma_matrix_major(tensor_fake) == "col",
+    )
 
 
 def _analyze_mma_output_stores(
@@ -4688,6 +4832,7 @@ def _analyze_mma_output_stores(
         return None
     env = CompileEnvironment.current()
     explicit_epi_tile_compatible = True
+    output_column_major: bool | None = None
     for store, chain in analyzed_stores:
         tensor_node = store.args[0] if store.args else None
         tensor_fake = (
@@ -4709,8 +4854,17 @@ def _analyze_mma_output_stores(
             tensor_fake.dtype == analysis.lhs.source_fake.dtype
             and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_steps)
         )
+        store_major = _tcgen05_tma_matrix_major(tensor_fake)
+        if store_major is None:
+            return None
+        store_column_major = store_major == "col"
+        if output_column_major is None:
+            output_column_major = store_column_major
+        elif output_column_major != store_column_major:
+            return None
     return _MmaOutputStoreAnalysis(
-        explicit_epi_tile_compatible=explicit_epi_tile_compatible
+        explicit_epi_tile_compatible=explicit_epi_tile_compatible,
+        output_column_major=bool(output_column_major),
     )
 
 
@@ -5077,6 +5231,9 @@ def _emit_mma_pipeline(
     rhs_node = candidate.rhs if candidate is not None else rhs_node
     if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
         return None
+    output_column_major = (
+        candidate.output_column_major if candidate is not None else False
+    )
 
     env = CompileEnvironment.current()
     requested_schedule = _requested_tcgen05_grouped_schedule(grouped_mode)
@@ -5407,8 +5564,8 @@ def _emit_mma_pipeline(
         torch.bfloat16,
         torch.float8_e4m3fn,
     )
-    _lhs_major = _tcgen05_tma_matrix_major(lhs_fake)
-    _rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
+    _lhs_major = lhs_operand.matrix_major
+    _rhs_major = rhs_operand.matrix_major
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
     # layout Helion emits expects the standard row-major A. Only B's major
     # mode is made layout-aware here.
@@ -6080,8 +6237,7 @@ def _emit_mma_pipeline(
     tcgen05_static_full_tma_fast_path = (
         tcgen05_static_full_tiles
         and tcgen05_use_tma_pipeline
-        and not tcgen05_is_two_cta
-        and not tcgen05_use_role_local_mma_exec
+        and not tcgen05_grouped_static_persistent_requested
     )
     tcgen05_acc_producer_mode = df.config.get(
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
@@ -7328,7 +7484,7 @@ def _emit_mma_pipeline(
     tcgen05_explicit_d_store_box_n: int | None = None
     tcgen05_d_store_layout = (
         "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
-        if nm_worklist
+        if nm_worklist or output_column_major
         else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
     )
     nm_explicit_store_wave = False
@@ -7569,33 +7725,28 @@ def _emit_mma_pipeline(
             )
         )
         tcgen05_use_flat_role_coordinates = tcgen05_requested_flat_role_coordinates
-        # T2's rowvec ``acc + bias[n]`` epilogue surfaces a single rank-1
-        # (broadcast_axis=1) aux descriptor. The aux pipeline keeps the
-        # bias on the SIMT load path (no TMA), so the explicit
-        # epilogue-tile family stays validated for the T2 envelope: the
-        # store side still uses the same TMA-store + epi-tile shape as
-        # T1/T3/T4/T5. Exact-shape rank-2 aux tensors (broadcast_axis=
-        # None) and any other broadcast shape remain rejected here.
-        aux_descriptors_compatible_with_explicit_epi_tile = all(
-            d.broadcast_axis == 1 for d in aux_tensor_descriptors_value
+        explicit_epi_tile_shape = (
+            tcgen05_explicit_epi_tile_m,
+            tcgen05_explicit_epi_tile_n,
+            tcgen05_explicit_d_store_box_n,
         )
-        # The explicit-epi-tile / flat-role store path is dtype-general for any
-        # 16-bit operand: bf16 and fp16 produce the same epilogue tile
-        # (``compute_epilogue_tile_shape`` keys on the 2-byte element width) and
-        # the same TMA-store box, so admit either at ANY structurally-valid
-        # shape and ANY epilogue. The store side keys off ``epi_elem_dtype_str``,
-        # which equals the operand dtype's cutlass string here.
-        explicit_epi_tile_dtype_ok = (
-            input_dtype == torch.bfloat16 and epi_elem_dtype_str == "cutlass.BFloat16"
-        ) or (input_dtype == torch.float16 and epi_elem_dtype_str == "cutlass.Float16")
         nm_explicit_store_wave = (
             tcgen05_nm_orientation
-            and (
-                tcgen05_explicit_epi_tile_m,
-                tcgen05_explicit_epi_tile_n,
-                tcgen05_explicit_d_store_box_n,
+            and explicit_epi_tile_shape == TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+        )
+        explicit_epi_aux_supported = not c_input_aux_tensor_descriptors_value or (
+            tcgen05_warp_spec.c_input_warps == 0
+            and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        explicit_epi_tile_supported = (
+            _tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=tcgen05_is_two_cta,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                tile_shape=explicit_epi_tile_shape,
             )
-            == TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+            and explicit_epi_aux_supported
         )
         if nm_worklist:
             nm_worklist_metadata_checks = {
@@ -7629,37 +7780,12 @@ def _emit_mma_pipeline(
                         "block_k=64 or 128, "
                         "CtaGroup.TWO, and no auxiliary epilogue tensors",
                     )
-            elif not (
-                tcgen05_static_full_tiles
-                and tcgen05_is_two_cta
-                and bm == TCGEN05_TWO_CTA_BLOCK_M
-                and bn == TCGEN05_TWO_CTA_BLOCK_N
-                and explicit_epi_tile_dtype_ok
-                and aux_descriptors_compatible_with_explicit_epi_tile
-            ):
+            elif not explicit_epi_tile_supported:
                 raise exc.BackendUnsupported(
                     "cute",
-                    "explicit tcgen05 epilogue tile overrides are validated only "
-                    "for static-full 16-bit (bf16/fp16) pure matmul CtaGroup.TWO "
-                    "kernels (rank-1 rowvec aux tensors admitted for the bias "
-                    "envelope)",
-                )
-            if (
-                not nm_explicit_store_wave
-                and (
-                    tcgen05_explicit_epi_tile_m,
-                    tcgen05_explicit_epi_tile_n,
-                    tcgen05_explicit_d_store_box_n,
-                )
-                != _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE
-            ):
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "explicit tcgen05 epilogue tile is currently validated only "
-                    "for epi_tile="
-                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[:2]} "
-                    "and d_store_box_n="
-                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[2]}",
+                    "explicit tcgen05 epilogue tile must use M=64/128 and "
+                    "N=16/32/64, divide the MMA tile, and use N as the store "
+                    "box width without using staged auxiliary inputs",
                 )
         if tcgen05_use_flat_role_coordinates:
             if not (
@@ -7679,8 +7805,20 @@ def _emit_mma_pipeline(
                 # cluster_n=1 envelope and use the same flat-role launch
                 # shape, for bf16 and fp16 operands alike.
                 and bk in (64, 128)
-                and explicit_epi_tile_dtype_ok
-                and aux_descriptors_compatible_with_explicit_epi_tile
+                and (
+                    (
+                        input_dtype == torch.bfloat16
+                        and epi_elem_dtype_str == "cutlass.BFloat16"
+                    )
+                    or (
+                        input_dtype == torch.float16
+                        and epi_elem_dtype_str == "cutlass.Float16"
+                    )
+                )
+                and all(
+                    descriptor.broadcast_axis == 1
+                    for descriptor in aux_tensor_descriptors_value
+                )
                 and tcgen05_use_tma_store_epilogue
                 and tcgen05_warp_spec.scheduler_warps == 0
                 and tcgen05_warp_spec.c_input_warps == 0
@@ -9083,9 +9221,21 @@ def _emit_mma_pipeline(
                 if tcgen05_grouped_dynamic_ab_tensormap_rank == 2:
                     ab_tma_plan["dynamic_ab_tensormap_rank"] = 2
             if lhs_operand.is_leading_passthrough:
-                ab_tma_plan["lhs_leading_passthrough"] = True
+                ab_tma_plan["lhs_tma_order"] = (1, 2, 0)
+            elif lhs_operand.source_to_logical_order is not None:
+                # A TensorMaps use logical (M, K) order. Compose that order
+                # with the program's source-to-logical permutation.
+                ab_tma_plan["lhs_tma_order"] = _compose_axis_orders(
+                    lhs_operand.source_to_logical_order, (0, 1)
+                )
             if rhs_operand.is_leading_passthrough:
-                ab_tma_plan["rhs_leading_passthrough"] = True
+                ab_tma_plan["rhs_tma_order"] = (2, 1, 0)
+            elif rhs_operand.source_to_logical_order is not None:
+                # B TensorMaps use logical (N, K) order. For B=x.T, composing
+                # that swap with x's source-to-logical swap produces identity.
+                ab_tma_plan["rhs_tma_order"] = _compose_axis_orders(
+                    rhs_operand.source_to_logical_order, (1, 0)
+                )
             # ``smem_swizzle_*`` overrides are recorded only when codegen
             # selected an explicit SMEM atom kind (either from a user
             # override or the scalar-edge fallback workaround). Keeping
@@ -10052,6 +10202,12 @@ def _emit_mma_pipeline(
                     assert mma_stage_stmt is not None
                     assert smem_a_mma_stmt is not None
                     assert smem_b_mma_stmt is not None
+                    outer_owner_gated_exec = (
+                        tcgen05_static_full_tma_fast_path
+                        and tcgen05_is_two_cta
+                        and tcgen05_cluster_m == 2
+                        and tcgen05_cluster_n == 1
+                    )
                     exec_loop_body: list[ast.stmt] = [
                         mma_stage_stmt,
                         smem_a_mma_stmt,
@@ -10079,10 +10235,6 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
-                            # Static-full pipeline builders require their
-                            # internal exec gate to keep emitting a single
-                            # statement. The outer wrapper below makes the
-                            # cloned loop's role ownership explicit.
                             gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                             use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
@@ -10103,9 +10255,6 @@ def _emit_mma_pipeline(
                                 tcgen05_frag_a=tcgen05_frag_a,
                                 tcgen05_frag_b=tcgen05_frag_b,
                                 mma_stage=mma_stage,
-                                # See the consumer wait comment above: pure
-                                # lifecycle has an outer exec-active role
-                                # wrapper plus the static-full builder gate.
                                 gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
@@ -10114,7 +10263,6 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_release_if(
                             tma_kloop_args,
-                            # See the consumer wait comment above.
                             gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                         )
@@ -10131,15 +10279,23 @@ def _emit_mma_pipeline(
                         exec_loop_body,
                         iter_expr=cloned_k_loop_iter_expr,
                     )
-                    exec_stmt: ast.stmt = exec_loop
+                    exec_role_stmt: ast.stmt = exec_loop
+                    if outer_owner_gated_exec:
+                        # Only the V-leader consumes AB stages and issues UMMA.
+                        # Keep the follower out of the cloned K loop entirely;
+                        # it still participates in the TMA-load role.
+                        exec_role_stmt = _wrap_stmt_in_if(
+                            exec_loop, _TCGEN05_CLUSTER_LEADER_PREDICATE
+                        )
+                    exec_stmt: ast.stmt = exec_role_stmt
                     if tcgen05_use_pure_matmul_role_lifecycle:
                         exec_stmt = _wrap_stmt_in_if(
-                            exec_loop, tcgen05_plan.exec_active
+                            exec_role_stmt, tcgen05_plan.exec_active
                         )
                     prefix.append(exec_stmt)
                     per_tile_stmts.append(exec_stmt)
                     if tcgen05_use_role_local_mma_exec:
-                        mma_exec_role_stmts.append(exec_loop)
+                        mma_exec_role_stmts.append(exec_role_stmt)
                 else:
                     cg.add_statement(
                         statement_from_string(
@@ -10505,6 +10661,7 @@ def _emit_mma_pipeline(
                 segment_store_row_index=segment_store_row_index,
                 segment_store_valid_m=segment_store_valid_m,
                 orientation=tcgen05_matmul_plan.orientation,
+                output_column_major=output_column_major,
             ),
         )
         if tcgen05_pure_matmul_object is not None:

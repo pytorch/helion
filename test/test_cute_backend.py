@@ -6016,8 +6016,8 @@ class TestCuteBackend(TestCase):
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
-        self.assertIn("'lhs_leading_passthrough': True", code)
-        self.assertIn("'rhs_leading_passthrough': True", code)
+        self.assertIn("'lhs_tma_order': (1, 2, 0)", code)
+        self.assertIn("'rhs_tma_order': (2, 1, 0)", code)
         self.assertIn("'d_leading_passthrough': True", code)
         self.assertIn("cpasync.tma_partition", code)
         self.assertIn("tcgen05_tma_store_atom", code)
@@ -6049,8 +6049,8 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.gemm(", code)
         self.assertIn("CtaGroup.TWO", code)
         self.assertIn("mcast_mask", code)
-        self.assertIn("'lhs_leading_passthrough': True", code)
-        self.assertIn("'rhs_leading_passthrough': True", code)
+        self.assertIn("'lhs_tma_order': (1, 2, 0)", code)
+        self.assertIn("'rhs_tma_order': (2, 1, 0)", code)
 
     def test_leading_matmul_accepts_explicit_deep_direct_entry_config(self) -> None:
         support = get_cute_mma_support()
@@ -6439,7 +6439,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
                 ),
-                "'lhs_leading_passthrough': True",
+                "'lhs_tma_order': (1, 2, 0)",
             ),
             (
                 cute_rhs_batched_dot_tcgen05,
@@ -6447,7 +6447,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
                 ),
-                "'rhs_leading_passthrough': True",
+                "'rhs_tma_order': (2, 1, 0)",
             ),
             (
                 cute_mixed_rank_batched_dot_tcgen05,
@@ -6455,7 +6455,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE).T,
                 ),
-                "'lhs_leading_passthrough': True",
+                "'lhs_tma_order': (1, 2, 0)",
             ),
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):

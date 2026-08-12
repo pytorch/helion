@@ -579,9 +579,7 @@ class CuteTcgen05Config:
             TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
                 Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
             ),
-            # (epi_tile_m, epi_tile_n, d_store_box_n) = (128, 32, 32) is the only
-            # explicit-epilogue subtile the D-descriptor codegen accepts, so it
-            # is fixed for every eligible shape.
+            # The flat-role launch path uses this fixed explicit subtile.
             TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
             TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
             TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
