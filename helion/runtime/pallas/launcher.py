@@ -1823,6 +1823,7 @@ def _pallas_jax_call(
     compact: dict[str, object] | None = None,
     orig_shapes: dict[int, tuple[int, ...]] | None = None,
     ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    return_all_outputs: bool = False,
 ) -> list[object]:
     """Drive the shared compile core (``pl.kernel``) + jit_fn on raw ``jax.Array``s
     and return the output JAX array(s).
@@ -1868,10 +1869,12 @@ def _pallas_jax_call(
     # In-place positions alias back into the caller's buffer on the torch path,
     # but JAX has no in-place mutation -- when every output is in-place, surface
     # them as fresh values (mirrors the torch fast-path descriptor list).
-    descriptors = _pallas_output_only_descriptors(
-        output_indices, result.arg_to_tensor_pos
-    )
-    if not descriptors:
+    descriptors = ()
+    if not return_all_outputs:
+        descriptors = _pallas_output_only_descriptors(
+            output_indices, result.arg_to_tensor_pos
+        )
+    if return_all_outputs or not descriptors:
         descriptors = tuple(enumerate(output_indices))
 
     output_results: list[object] = [jax_results[out_idx] for out_idx, _ in descriptors]

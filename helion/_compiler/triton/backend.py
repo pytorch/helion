@@ -57,6 +57,10 @@ class TritonBackend(Backend):
     def experimental(self) -> bool:
         return False
 
+    @property
+    def supports_eager_prepared_call(self) -> bool:
+        return True
+
     def transform_host_arg(
         self,
         arg: Argument,
@@ -201,6 +205,7 @@ class TritonBackend(Backend):
         )
         if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
             triton_jit_fn.device_caches.clear()
+            triton_jit_fn.__dict__.pop("_helion_prepared_launches", None)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object

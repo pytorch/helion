@@ -303,6 +303,8 @@ def default_pallas_jax_launcher(
     )
 
     output_indices = _output_indices if _output_indices is not None else []
+    inplace_indices = set(_inplace_indices or [])
+    wrapper_args = args
 
     # Capture original shapes BEFORE padding so output-only tensors can
     # be sliced back after the pallas_call.  ``_pallas_apply_ds_padding``
@@ -370,11 +372,26 @@ def default_pallas_jax_launcher(
         compact=compact,
         orig_shapes=orig_shapes,
         ds_pad_dims=_ds_pad_dims,
+        return_all_outputs=True,
     )
 
-    if len(output_results) == 1:
-        return _JaxExportTensor.from_jax(output_results[0], device=device)
-    return tuple(_JaxExportTensor.from_jax(r, device=device) for r in output_results)
+    for output_result, arg_index in zip(output_results, output_indices, strict=True):
+        if arg_index not in inplace_indices:
+            continue
+        adapter = wrapper_args[arg_index]
+        assert isinstance(adapter, _JaxExportTensor)
+        adapter._jax_arr = output_result
+
+    returned_results = [
+        output_result
+        for output_result, arg_index in zip(output_results, output_indices, strict=True)
+        if arg_index not in inplace_indices
+    ]
+    if not returned_results:
+        returned_results = output_results
+    if len(returned_results) == 1:
+        return _JaxExportTensor.from_jax(returned_results[0], device=device)
+    return tuple(_JaxExportTensor.from_jax(r, device=device) for r in returned_results)
 
 
 def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:

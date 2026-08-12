@@ -1164,8 +1164,8 @@ function renderPretuned() {
   const lr = D.latest_run || {};
   const ciPass = failedEntries.length === 0;
   let html = '';
-  html += '<h2 style="margin-bottom:4px">Pretuned Kernels vs PyTorch Eager</h2>';
-  html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Nightly run of every kernel under <code>pretuned_kernels/</code> against its checked-in heuristic. Speedup is geomean over each kernel\'s shape sweep; higher = faster than eager.</p>';
+  html += '<h2 style="margin-bottom:4px">Pretuned Kernels vs Best Baseline</h2>';
+  html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Nightly run of every kernel under <code>pretuned_kernels/</code> with its checked-in heuristic and reference baselines. Speedup is geomean over each kernel\'s shape sweep; higher = faster than the fastest available baseline.</p>';
   html += '<div class="filter-bar"><select id="pt-plat-filter"><option value="all">All Platforms</option>';
   shorts.forEach(p => { html += `<option value="${p}"${p === pretunedPlatform ? ' selected' : ''}>${platName(p)}</option>`; });
   html += '</select></div>';

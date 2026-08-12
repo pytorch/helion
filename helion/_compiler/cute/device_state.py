@@ -53,6 +53,8 @@ class CuteTcgen05GroupedPlan:
     problem_n: str
     problem_k: str
     global_m_start: str
+    static_problem_shapes: tuple[tuple[int, int, int], ...] | None = None
+    static_group_quota_args: tuple[str, ...] = ()
     real_groups: str | None = None
     valid_m: str | None = None
     store_m: str | None = None
@@ -60,12 +62,34 @@ class CuteTcgen05GroupedPlan:
     direct_strides: str | None = None
     d_mode: Tcgen05GroupedDMode = Tcgen05GroupedDMode.NONE
     d_tensormap: str | None = None
+    # N,M worklists carry their source-row tile explicitly so runtime metadata
+    # validation and launch bounds consume the exact schedule selected by the
+    # compiler.  For the device-split variant, ``layout`` names the device
+    # ``split_sizes[G]`` tensor while ``problem_sizes`` and ``starts`` are
+    # kernel-local SMEM tensors.  ``m_size`` lets the launcher derive a safe
+    # static cluster bound without reading split values on the host.
+    source_m_tile: int | None = None
+    m_size: int | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
         assert (self.orientation is Tcgen05Orientation.NM) == (self.valid_m is not None)
+        assert (self.orientation is Tcgen05Orientation.NM) == (
+            self.source_m_tile is not None
+        )
         assert (self.direct_pointers is None) == (self.direct_strides is None)
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
+        assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+        if self.static_problem_shapes is not None:
+            assert self.orientation is Tcgen05Orientation.MN
+            assert self.real_groups is None
+        if self.static_group_quota_args:
+            assert self.static_problem_shapes is not None
+            assert len(self.static_group_quota_args) == len(self.static_problem_shapes)
+
+    @property
+    def device_split_sizes(self) -> bool:
+        return self.m_size is not None
 
 
 class _CuteTcgen05Orientation(Protocol):
@@ -155,6 +179,13 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     segment_store_row_index: Node | None = None
     segment_store_valid_m: Node | None = None
     orientation: Tcgen05Orientation = Tcgen05Orientation.MN
+    output_column_major: bool = False
+
+    @property
+    def d_store_layout(self) -> str:
+        if self.output_column_major:
+            return "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+        return super().d_store_layout
 
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:

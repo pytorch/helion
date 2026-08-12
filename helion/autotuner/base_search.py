@@ -251,7 +251,9 @@ class BaseSearch(BaseAutotuner):
         self,
         kernel: _AutotunableKernel,
         args: Sequence[object],
-        benchmark_provider_cls: type[BenchmarkProvider] = LocalBenchmarkProvider,
+        benchmark_provider_cls: Callable[
+            ..., BenchmarkProvider
+        ] = LocalBenchmarkProvider,
     ) -> None:
         """
         Initialize the BaseSearch object.
@@ -362,6 +364,8 @@ class BaseSearch(BaseAutotuner):
                     kernel_name=kernel_name,
                     specialization_key=specialization_key,
                     hardware=hardware_spec,
+                    config_overrides=self.settings.autotune_config_overrides or None,
+                    advanced_controls_files=self.settings.autotune_search_acf or None,
                 )
                 self._search_space_tracker = SearchSpaceTracker(report)
             except Exception:
@@ -712,6 +716,12 @@ class BaseSearch(BaseAutotuner):
                             kernel_name=self._autotune_metrics.kernel_name,
                             specialization_key=specialization_key,
                             hardware=hardware_spec,
+                            config_overrides=(
+                                self.settings.autotune_config_overrides or None
+                            ),
+                            advanced_controls_files=(
+                                self.settings.autotune_search_acf or None
+                            ),
                         )
                     )
                 tracker.record_invalid(self._generation_invalid_config_count())

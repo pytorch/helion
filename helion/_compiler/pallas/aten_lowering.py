@@ -32,6 +32,7 @@ from ..aten_lowering import baddbmm_lowering
 from ..aten_lowering import bmm_lowering
 from ..aten_lowering import constant_pad_nd_lowering
 from ..aten_lowering import expand_lowering
+from ..aten_lowering import gather_lowering
 from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
@@ -164,6 +165,31 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(
         f"jnp.broadcast_to({{tensor}}, {shape_str})",
         tensor=tensor,
+    )
+
+
+@gather_lowering.register_codegen("pallas")
+def codegen_gather_pallas(ctx: LoweringContext, node: Node) -> object:
+    """Lower ``torch.gather`` on resident tensors to ``take_along_axis``."""
+    tensor, dim, index = map_arg(node.args[:3], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    assert isinstance(index, ast.AST)
+    if not isinstance(dim, int):
+        raise TypeError(f"pallas gather requires a static dim, got {dim!r}")
+    ndim = node.meta["val"].ndim
+    if dim < 0:
+        dim += ndim
+    if not 0 <= dim < ndim:
+        raise IndexError(f"gather dim {dim} is out of range for rank {ndim}")
+    sparse_grad = (
+        node.args[3] if len(node.args) > 3 else node.kwargs.get("sparse_grad", False)
+    )
+    if sparse_grad:
+        raise NotImplementedError("pallas gather does not support sparse_grad=True")
+    return expr_from_string(
+        f"jnp.take_along_axis({{tensor}}, {{index}}, axis={dim})",
+        tensor=tensor,
+        index=index,
     )
 
 
@@ -306,10 +332,22 @@ def codegen_topk_pallas(ctx: LoweringContext, node: Node) -> object:
     assert largest, "pallas topk only supports largest=True"
     _pallas_last_dim(node, dim)
 
+    raw_recall_target = CompileEnvironment.current().settings.pallas_topk_recall_target
+    if not isinstance(raw_recall_target, (int, float)):
+        raise TypeError(
+            "pallas_topk_recall_target must be numeric, got "
+            f"{type(raw_recall_target)!r}"
+        )
+    recall_target = float(raw_recall_target)
+    if not 0.0 < recall_target <= 1.0:
+        raise ValueError(
+            f"pallas_topk_recall_target must be in (0, 1], got {recall_target}"
+        )
     result = ctx.cg.device_function.new_var("topk_result")
     ctx.cg.add_statement(
         statement_from_string(
-            f"{result} = _helion_divide_filter_topk({{t}}, {k})", t=tensor
+            f"{result} = _helion_divide_filter_topk({{t}}, {k}, {recall_target!r})",
+            t=tensor,
         )
     )
     # torch.topk returns (values, indices); skip the indices expr when unused.

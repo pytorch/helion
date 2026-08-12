@@ -1554,24 +1554,28 @@ class ConfigSpec:
             cluster_m=cluster_m,
         )
 
-    def _tcgen05_grouped_dynamic_ab4_fits_for_target(
+    def _tcgen05_grouped_dynamic_stages_fit_for_target(
         self,
         *,
         dtype_bytes: int,
+        output_dtype_bytes: int,
         device: torch.device,
         bm: int,
         bn: int,
         bk: int,
         cluster_m: int,
+        ab_stages: int,
         c_stages: int,
     ) -> bool:
-        return self._cute_tcgen05_config.grouped_dynamic_ab4_fits_for_target(
+        return self._cute_tcgen05_config.grouped_dynamic_stages_fit_for_target(
             dtype_bytes=dtype_bytes,
+            output_dtype_bytes=output_dtype_bytes,
             device=device,
             bm=bm,
             bn=bn,
             bk=bk,
             cluster_m=cluster_m,
+            ab_stages=ab_stages,
             c_stages=c_stages,
         )
 

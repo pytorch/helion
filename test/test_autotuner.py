@@ -6167,6 +6167,35 @@ class TestConfigFilter(TestCase):
         )
         return add, args
 
+    def test_finite_search_accepts_benchmark_provider_factory(self) -> None:
+        class CustomBenchmarkProvider(LocalBenchmarkProvider):
+            def __init__(
+                self, *args: object, context: object, **kwargs: object
+            ) -> None:
+                self.context = context
+                super().__init__(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        configs = [
+            helion.Config(block_sizes=[16], num_warps=4),
+            helion.Config(block_sizes=[32], num_warps=4),
+        ]
+        add, args = self._make_kernel_and_args()
+        context = object()
+        provider_factory = functools.partial(
+            CustomBenchmarkProvider,
+            context=context,
+        )
+        search = FiniteSearch(
+            add.bind(args),
+            args,
+            configs=configs,
+            benchmark_provider_cls=provider_factory,
+        )
+        search._prepare()
+
+        self.assertIsInstance(search.benchmark_provider, CustomBenchmarkProvider)
+        self.assertIs(search.benchmark_provider.context, context)
+
     def test_autotune_config_filter_skips_filtered_configs(self) -> None:
         """Filtered configs produce status='filtered' and perf=inf."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)

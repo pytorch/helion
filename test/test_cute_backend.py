@@ -6016,8 +6016,8 @@ class TestCuteBackend(TestCase):
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
-        self.assertIn("'lhs_leading_passthrough': True", code)
-        self.assertIn("'rhs_leading_passthrough': True", code)
+        self.assertIn("'lhs_tma_order': (1, 2, 0)", code)
+        self.assertIn("'rhs_tma_order': (2, 1, 0)", code)
         self.assertIn("'d_leading_passthrough': True", code)
         self.assertIn("cpasync.tma_partition", code)
         self.assertIn("tcgen05_tma_store_atom", code)
@@ -6049,8 +6049,8 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.gemm(", code)
         self.assertIn("CtaGroup.TWO", code)
         self.assertIn("mcast_mask", code)
-        self.assertIn("'lhs_leading_passthrough': True", code)
-        self.assertIn("'rhs_leading_passthrough': True", code)
+        self.assertIn("'lhs_tma_order': (1, 2, 0)", code)
+        self.assertIn("'rhs_tma_order': (2, 1, 0)", code)
 
     def test_leading_matmul_accepts_explicit_deep_direct_entry_config(self) -> None:
         support = get_cute_mma_support()
@@ -6439,7 +6439,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
                 ),
-                "'lhs_leading_passthrough': True",
+                "'lhs_tma_order': (1, 2, 0)",
             ),
             (
                 cute_rhs_batched_dot_tcgen05,
@@ -6447,7 +6447,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
                 ),
-                "'rhs_leading_passthrough': True",
+                "'rhs_tma_order': (2, 1, 0)",
             ),
             (
                 cute_mixed_rank_batched_dot_tcgen05,
@@ -6455,7 +6455,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE).T,
                 ),
-                "'lhs_leading_passthrough': True",
+                "'lhs_tma_order': (1, 2, 0)",
             ),
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
@@ -7062,6 +7062,7 @@ class TestCuteBackend(TestCase):
             block_sizes=[128, 128, 128],
             tcgen05_cluster_m=2,
             pid_type="persistent_blocked",
+            tcgen05_aux_load_placement="pre_acc_wait",
         )
         ref = (x.float() @ y.float()) * scale_n.float()
         torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
@@ -7080,6 +7081,7 @@ class TestCuteBackend(TestCase):
                 block_sizes=[256, 128, 128],
                 tcgen05_cluster_m=2,
                 pid_type="persistent_blocked",
+                tcgen05_aux_load_placement="pre_acc_wait",
             )
         )
         self.assertNotIn("tcgen05_aux_rmem_full_", code256)
@@ -8162,6 +8164,58 @@ class TestCuteBackend(TestCase):
         self.assertEqual(second, ("launched", (context_b, "stream-B")))
         self.assertEqual(third, ("launched", (context_b, "stream-C")))
 
+    def test_grouped_static_metadata_match_filters_device_plans(self) -> None:
+        launcher = importlib.import_module("helion.runtime.cute.launcher")
+        host_plan = {"kind": "tcgen05_grouped_static_persistent"}
+        device_plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "device_split_sizes": True,
+        }
+        unrelated_plan = {"kind": "unrelated"}
+        cute_kernel = type("DummyCuteKernel", (), {})()
+
+        class Entry:
+            has_m_tail = False
+            has_n_tail = False
+
+            def __init__(self, matches: bool = True) -> None:
+                self._matches = matches
+
+            def matches(self, *_args: object) -> bool:
+                return self._matches
+
+        def metadata_matches(entries: tuple[Entry, ...]) -> bool:
+            return launcher._cute_grouped_static_metadata_matches(
+                entries,
+                cute_kernel,
+                (),
+            )
+
+        with (
+            patch.object(
+                launcher,
+                "_tcgen05_grouped_static_layout_arg",
+                return_value=object(),
+            ),
+            patch.object(
+                launcher,
+                "_tcgen05_grouped_static_size_arg",
+                return_value=None,
+            ),
+        ):
+            for plans in ([], [unrelated_plan], [device_plan]):
+                cute_kernel._helion_cute_wrapper_plans = plans
+                self.assertTrue(metadata_matches(()))
+
+            for plans in (
+                [host_plan, device_plan],
+                [device_plan, unrelated_plan, host_plan],
+            ):
+                cute_kernel._helion_cute_wrapper_plans = plans
+                self.assertTrue(metadata_matches((Entry(),)))
+                self.assertFalse(metadata_matches(()))
+                self.assertFalse(metadata_matches((Entry(matches=False),)))
+
     def test_grouped_capture_retains_generated_tensors_beyond_launch_lru(
         self,
     ) -> None:
@@ -8369,6 +8423,101 @@ class TestCuteBackend(TestCase):
                     layout,
                 ),
             )
+
+    def test_grouped_device_split_cluster_bound_uses_source_profile(self) -> None:
+        launcher = importlib.import_module("helion.runtime.cute.launcher")
+        common_plan = {
+            "group_count": 8,
+            "m_size": 2048,
+            "n_size": 512,
+        }
+
+        self.assertEqual(
+            launcher._tcgen05_grouped_device_split_total_clusters(
+                {**common_plan, "source_m_tile": 224}
+            ),
+            160,
+        )
+        self.assertEqual(
+            launcher._tcgen05_grouped_device_split_total_clusters(
+                {**common_plan, "source_m_tile": 256}
+            ),
+            128,
+        )
+
+    def test_grouped_device_split_dimensions_must_fit_int32(self) -> None:
+        launcher = importlib.import_module("helion.runtime.cute.launcher")
+        plan = {
+            "group_count": 1,
+            "orientation": "nm",
+            "bk": 128,
+            "source_m_tile": 256,
+            "m_size": torch.iinfo(torch.int32).max + 1,
+            "n_size": 512,
+            "k_total_size": 128,
+            "dynamic_ab_tensormaps": True,
+            "dynamic_ab_tensormap_rank": 2,
+            "dynamic_d_tensormap": True,
+        }
+
+        with self.assertRaisesRegex(BackendUnsupported, "positive signed Int32"):
+            launcher._validate_tcgen05_grouped_device_split_sizes(
+                plan,
+                torch.empty(1, dtype=torch.int32),
+            )
+
+    def test_grouped_static_problem_shapes_runtime_guard(self) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("grouped static problem-shape guard needs CUDA")
+        runtime_mod = importlib.import_module("helion.runtime")
+        base_plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "layout_idx": 0,
+            "n_sizes_idx": 1,
+            "group_count": 2,
+            "bm": 128,
+            "bn": 64,
+            "bk": 128,
+            "n_size": 256,
+            "k_total_size": 128,
+            "problem_sizes_arg": "problem_sizes",
+            "starts_arg": "starts",
+            "total_clusters_arg": "total_clusters",
+        }
+        layout = torch.cat(
+            (
+                torch.zeros(128, dtype=torch.int32, device=DEVICE),
+                torch.ones(128, dtype=torch.int32, device=DEVICE),
+            )
+        )
+        n_sizes = torch.tensor((64, 256), dtype=torch.int32, device=DEVICE)
+        args = (layout, n_sizes)
+        actual_shapes = ((128, 64, 128), (128, 256, 128))
+
+        matching_plan = {**base_plan, "static_problem_shapes": actual_shapes}
+        matching_kernel = type("MatchingDummyCuteKernel", (), {})()
+        matching_kernel._helion_cute_wrapper_plans = [matching_plan]
+        runtime_mod._build_tcgen05_grouped_static_metadata(
+            matching_kernel, matching_plan, args
+        )
+
+        mismatches = (
+            ((64, 64, 128), (128, 256, 128)),
+            ((128, 64, 128), (128, 192, 128)),
+            ((128, 64, 64), (128, 256, 128)),
+        )
+        for expected_shapes in mismatches:
+            with self.subTest(expected_shapes=expected_shapes):
+                plan = {**base_plan, "static_problem_shapes": expected_shapes}
+                cute_kernel = type("MismatchedDummyCuteKernel", (), {})()
+                cute_kernel._helion_cute_wrapper_plans = [plan]
+                with self.assertRaisesRegex(
+                    BackendUnsupported,
+                    "static problem-shape specialization",
+                ):
+                    runtime_mod._build_tcgen05_grouped_static_metadata(
+                        cute_kernel, plan, args
+                    )
 
     def test_grouped_inference_metadata_tracks_value_mutation(self) -> None:
         if DEVICE.type != "cuda":

@@ -53,6 +53,7 @@ from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
+from helion._compiler.cute.cute_mma import _compose_axis_orders
 from helion._compiler.cute.cute_mma import _decode_cute_mma_target
 from helion._compiler.cute.cute_mma import _emit_sched_pipeline_setup
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
@@ -62,15 +63,19 @@ from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
 from helion._compiler.cute.cute_mma import _mma_loop_is_exclusive
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
+from helion._compiler.cute.cute_mma import _MmaOperandInfo
 from helion._compiler.cute.cute_mma import _MmaRoleCoordinatePlan
 from helion._compiler.cute.cute_mma import _new_tcgen05_layout_plan
 from helion._compiler.cute.cute_mma import _new_tcgen05_sched_pipeline_plan
+from helion._compiler.cute.cute_mma import _operand_infos_exclusive_for_mma
 from helion._compiler.cute.cute_mma import _PerKiterTmaArgs
 from helion._compiler.cute.cute_mma import _tcgen05_ab_stage_count
 from helion._compiler.cute.cute_mma import _tcgen05_epi_warp_count
+from helion._compiler.cute.cute_mma import _tcgen05_explicit_epilogue_tile_supported
 from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
+from helion._compiler.cute.cute_mma import _unwrap_mma_operand_permute
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
@@ -141,6 +146,15 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
@@ -597,6 +611,134 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
 
 @onlyBackends(["cute"])
 class TestCuteLowerings(unittest.TestCase):
+    def test_tcgen05_explicit_epilogue_tile_structural_rules(self) -> None:
+        valid = [(False, 64, 64, (64, n, n)) for n in (16, 32, 64)] + [
+            (True, 256, 256, (128, 32, 32)),
+            (False, 128, 128, (128, 32, 32)),
+            (False, 128, 128, (128, 64, 64)),
+        ]
+        invalid = [
+            (True, 256, 256, (128, 32, 16)),
+            (False, 64, 64, (32, 32, 32)),
+            (False, 64, 64, (64, 8, 8)),
+            (False, 64, 96, (64, 12, 12)),
+            (True, 128, 128, (64, 32, 32)),
+            (True, 256, 256, (64, 64, 64)),
+        ]
+        for expected, cases in ((True, valid), (False, invalid)):
+            for is_two_cta, bm, bn, tile_shape in cases:
+                with self.subTest(tile_shape=tile_shape, bm=bm, bn=bn):
+                    self.assertEqual(
+                        _tcgen05_explicit_epilogue_tile_supported(
+                            is_two_cta=is_two_cta,
+                            bm=bm,
+                            bn=bn,
+                            tile_shape=tile_shape,
+                        ),
+                        expected,
+                    )
+
+    def test_mma_operand_matrix_major_tracks_source_order(self) -> None:
+        graph = Graph()
+        load = graph.placeholder("load")
+        row_major = torch.empty_strided((4, 8), (8, 1))
+
+        direct = _MmaOperandInfo(
+            load=load,
+            terminal=load,
+            source_fake=row_major,
+            logical_fake=row_major,
+            block_ids=(0, 1),
+        )
+        transposed = dataclasses.replace(
+            direct,
+            logical_fake=row_major.permute(1, 0),
+            block_ids=(1, 0),
+            source_to_logical_order=(1, 0),
+        )
+
+        self.assertEqual(direct.matrix_major, "row")
+        self.assertEqual(transposed.matrix_major, "col")
+        self.assertEqual((transposed.matrix_rows, transposed.matrix_cols), (8, 4))
+
+        padded_row_major = torch.empty_strided((4, 8), (16, 1))
+        self.assertEqual(
+            dataclasses.replace(
+                direct,
+                source_fake=padded_row_major,
+                logical_fake=padded_row_major.permute(1, 0),
+                block_ids=(1, 0),
+                source_to_logical_order=(1, 0),
+            ).matrix_major,
+            "col",
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "logical_fake shape does not match.*logical order is likely "
+            "incorrect.*report a bug to the Helion maintainers",
+        ):
+            dataclasses.replace(
+                direct,
+                source_to_logical_order=(1, 0),
+            )
+
+    def test_unwrap_mma_operand_permute(self) -> None:
+        graph = Graph()
+        load = graph.placeholder("load")
+        transpose = graph.call_function(torch.ops.aten.permute.default, (load, (1, 0)))
+        transpose.meta["val"] = torch.empty(4, 8).mT
+        unsupported = graph.call_function(
+            torch.ops.aten.permute.default, (load, (0, 1))
+        )
+        unsupported.meta["val"] = torch.empty(4, 8)
+
+        self.assertEqual(_unwrap_mma_operand_permute(load), (load, None))
+        self.assertEqual(_unwrap_mma_operand_permute(transpose), (load, (1, 0)))
+        self.assertIsNone(_unwrap_mma_operand_permute(unsupported))
+
+    def test_mma_source_and_tma_orders_are_composed(self) -> None:
+        source_transpose = (1, 0)
+
+        self.assertEqual(
+            _compose_axis_orders(source_transpose, (0, 1)),
+            (1, 0),
+        )
+        self.assertEqual(
+            _compose_axis_orders(source_transpose, (1, 0)),
+            (0, 1),
+        )
+
+    def test_mma_operand_exclusivity_tracks_source_order(self) -> None:
+        graph = Graph()
+        lhs_load = graph.placeholder("lhs_load")
+        rhs_load = graph.placeholder("rhs_load")
+        lhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (lhs_load, (1, 0))
+        )
+        rhs_transpose = graph.call_function(
+            torch.ops.aten.permute.default, (rhs_load, (1, 0))
+        )
+        mma = graph.call_function(
+            torch.ops.aten.mm.default, (lhs_transpose, rhs_transpose)
+        )
+        source = torch.empty(4, 8)
+        lhs = _MmaOperandInfo(
+            load=lhs_load,
+            terminal=lhs_transpose,
+            source_fake=source,
+            logical_fake=source.mT,
+            source_to_logical_order=(1, 0),
+        )
+        rhs = dataclasses.replace(lhs, load=rhs_load, terminal=rhs_transpose)
+
+        self.assertTrue(_operand_infos_exclusive_for_mma(lhs, rhs, mma))
+        self.assertFalse(
+            _operand_infos_exclusive_for_mma(
+                dataclasses.replace(lhs, terminal=lhs_load), rhs, mma
+            )
+        )
+
     def _argreduce_ctx(self, inp: torch.fx.Node) -> object:
         return SimpleNamespace(
             env={inp: ast.Name(id="x", ctx=ast.Load())},
@@ -2739,16 +2881,17 @@ class TestCuteLowerings(unittest.TestCase):
 
         torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_explicit_epilogue_tile_rejects_unsupported_shape(self) -> None:
+    def test_tcgen05_explicit_epilogue_tile_accepts_single_cta_shape(self) -> None:
+        torch.manual_seed(0)
         args = (
-            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16),
         )
         cfg = _make_tcgen05_role_local_monolithic_seed_config(
-            block_sizes=[256, 256, 128],
+            block_sizes=[128, 128, 128],
             l2_groupings=[1],
             pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
+            tcgen05_cluster_m=1,
             tcgen05_cluster_n=1,
             tcgen05_ab_stages=2,
             tcgen05_acc_stages=2,
@@ -2759,18 +2902,22 @@ class TestCuteLowerings(unittest.TestCase):
                     Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
                 ),
                 TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
-                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 64,
-                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 64,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
             },
         )
         with patch_cute_mma_support():
             bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            with self.assertRaisesRegex(
-                exc.BackendUnsupported,
-                r"epi_tile=\(128, 32\).*d_store_box_n=32",
-            ):
-                bound.to_triton_code(cfg)
+            code = bound.to_triton_code(cfg)
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        self.assertIn(
+            "tcgen05_store_epi_tile = (cute.make_layout(128), cute.make_layout(32))",
+            code,
+        )
+        torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_explicit_epilogue_tile_runtime_correctness(self) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -4738,13 +4885,14 @@ class TestCuteLowerings(unittest.TestCase):
         """Persistent tcgen05 lifts producer, exec, and epi work into
         role-local persistent loops. The TMA producer K-loop is now a
         top-level extracted role block, not an inline wrapper inside the
-        shared K-loop, and its predicate drops the inline
-        ``tcgen05_tma_warp`` gate because the enclosing role-local loop
-        already restricts execution to that warp. The MMA-exec role owns
-        AB consumer wait/release, UMMA issue, and acc producer state. The
-        epi role owns acc consumer wait/release and the TMA-store epilogue
-        with a role-local tile counter for the SMEM ring. The generated kernel
-        is also executed and checked against PyTorch."""
+        shared K-loop. Its predicate drops the inline ``tcgen05_tma_warp``
+        gate because the enclosing role-local loop already restricts execution
+        to that warp, and drops the current-tile full check because this
+        configuration is statically divisible. The MMA-exec role owns AB
+        consumer wait/release, UMMA issue, and acc producer state. The epi role
+        owns acc consumer wait/release and the TMA-store epilogue with a
+        role-local tile counter for the SMEM ring. The generated kernel is also
+        executed and checked against PyTorch."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -4817,13 +4965,10 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("pid_0 = virtual_pid % num_blocks_0", role_src)
                 self.assertIn("tile_offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
                 self.assertIn("for tile_offset_2 in range", role_src)
-                self.assertIn(
-                    "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
-                    role_src,
-                )
+                self.assertIn("if tcgen05_tma_next_full_tile:", role_src)
+                self.assertNotIn("tcgen05_tma_full_tile =", role_src)
                 self.assertNotIn(
-                    "tcgen05_tma_full_tile and tcgen05_tma_warp and "
-                    "tcgen05_tma_next_full_tile",
+                    "tcgen05_tma_warp and tcgen05_tma_next_full_tile",
                     role_src,
                 )
                 found_role_local_producer_loop = True
@@ -6339,6 +6484,176 @@ class TestCuteLowerings(unittest.TestCase):
             "loads whose index expression is not exactly the carrier tile-id symbol",
             message,
         )
+
+    def test_tcgen05_aux_load_placement_config(self) -> None:
+        """The placement knob moves only aux loads across the acc wait."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                acc = acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def unscaled_fp8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([64, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 64], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([64, 1], device=DEVICE).expand(64, 64),
+            torch.empty([64], device=DEVICE),
+        )
+        base = {
+            "block_sizes": [64, 64, 128],
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "indexing": ["tensor_descriptor"] * 5,
+        }
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            placement_fragment = bound.env.config_spec._flat_fields()[
+                TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+            ]
+            self.assertEqual(
+                placement_fragment.choices,  # type: ignore[attr-defined]
+                (
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+                    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+                ),
+            )
+            for fix_invalid in (False, True):
+                invalid_placement = helion.Config(
+                    **base,
+                    **{
+                        TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
+                        ),
+                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                        ),
+                    },
+                )
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    "per-subtile auxiliary loads cannot precede",
+                ):
+                    bound.env.config_spec.normalize(
+                        invalid_placement, _fix_invalid=fix_invalid
+                    )
+            no_aux_bound = unscaled_fp8.bind(args[:2])
+            no_aux_bound.env.config_spec.cute_tcgen05_search_enabled = True
+            no_aux_base = {
+                **base,
+                "indexing": ["tensor_descriptor"]
+                * no_aux_bound.env.config_spec.indexing.length,
+            }
+            for fix_invalid in (False, True):
+                no_aux_config = helion.Config(
+                    **no_aux_base,
+                    **{
+                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                        )
+                    },
+                )
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    "no per-subtile auxiliary loads",
+                ):
+                    no_aux_bound.env.config_spec.normalize(
+                        no_aux_config, _fix_invalid=fix_invalid
+                    )
+            codes = {
+                placement: bound.to_triton_code(
+                    helion.Config(
+                        **base,
+                        **{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: placement},
+                    )
+                )
+                for placement in (
+                    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+                )
+            }
+
+        for placement, code in codes.items():
+            loop_pos = code.find("for _tcgen05_subtile in cutlass.range")
+            aux_load_pos = code.find("tcgen05_aux_loaded_0", loop_pos)
+            acc_wait_pos = code.find("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+            t2r_pos = code.find("cute.copy(tcgen05_tiled_copy_t2r,", loop_pos)
+            self.assertGreater(aux_load_pos, loop_pos)
+            self.assertGreater(acc_wait_pos, loop_pos)
+            self.assertGreater(t2r_pos, acc_wait_pos)
+            if placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT:
+                self.assertLess(aux_load_pos, acc_wait_pos)
+            else:
+                self.assertGreater(aux_load_pos, t2r_pos)
+
+        m128_args = (
+            torch.empty([512, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([512, 1], device=DEVICE).expand(512, 128),
+            torch.empty([128], device=DEVICE),
+        )
+        m128_base = {
+            **base,
+            "block_sizes": [128, 128, 128],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+        }
+        with patch_cute_mma_support():
+            m128_bound = scaled_fp8.bind(m128_args)
+            m128_bound.env.config_spec.cute_tcgen05_search_enabled = True
+            m128_codes = {
+                placement: m128_bound.to_triton_code(
+                    helion.Config(
+                        **m128_base,
+                        **{TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: placement},
+                    )
+                )
+                for placement in (
+                    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+                )
+            }
+
+        pre_code = m128_codes[TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT]
+        post_code = m128_codes[TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT]
+        self.assertIn("tcgen05_aux_rmem_full_1", pre_code)
+        self.assertNotIn("tcgen05_aux_rmem_full_1", post_code)
+        post_loop_pos = post_code.find("for _tcgen05_subtile in cutlass.range")
+        post_wait_pos = post_code.find(
+            "tcgen05_acc_pipeline.consumer_wait", post_loop_pos
+        )
+        post_aux_load_pos = post_code.find("tcgen05_aux_loaded_0", post_loop_pos)
+        self.assertGreater(post_aux_load_pos, post_wait_pos)
 
     def test_tcgen05_fused_residual_epilogue_runtime_correctness(self) -> None:
         """``out[tile] = (acc + residual[tile_m, tile_n]).to(x.dtype)``
@@ -9539,6 +9854,22 @@ class TestCuteLowerings(unittest.TestCase):
                     )
                     found_role_local_tma = True
                 elif test_src == exec_role_predicate:
+                    outer_owner_k_loops = [
+                        loop
+                        for owner in ast.walk(node)
+                        if isinstance(owner, ast.If)
+                        and ast.unparse(owner.test) == _TCGEN05_CLUSTER_LEADER_PREDICATE
+                        for loop in ast.walk(owner)
+                        if isinstance(loop, ast.For)
+                        and "tcgen05_ab_pipeline.consumer_wait" in ast.unparse(loop)
+                        and "cute.gemm(" in ast.unparse(loop)
+                    ]
+                    self.assertEqual(
+                        len(outer_owner_k_loops),
+                        1,
+                        "Expected the complete MMA K loop to be nested under the "
+                        "CtaGroup.TWO leader gate. Generated role code:\n" + role_src,
+                    )
                     first_ab_peek_pos = role_src.index(
                         "tcgen05_ab_pipeline.consumer_try_wait"
                     )
@@ -11049,6 +11380,84 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cutlass.Float16, 1)", emitted)
         self.assertEqual(
             call_args, ["tma_atom_a", "tma_tensor_a", "tma_atom_b", "tma_tensor_b"]
+        )
+
+    def test_tcgen05_ab_tma_wrapper_plan_uses_explicit_orders(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_ab_tma",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "lhs_tma_order": (1, 0),
+                "rhs_tma_order": (0, 1),
+                "bm": 64,
+                "bn": 16,
+                "bk": 256,
+                "ab_stage_count": 2,
+                "input_dtype": "cutlass.Float8E4M3FN",
+                "acc_dtype": "cutlass.Float32",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+        )
+        emitted = "\n".join(body)
+        self.assertIn(
+            "tma_atom_a_lhs_tma = cute.make_tensor(arg0.iterator, "
+            "layout=cute.make_layout((arg0_shape1, arg0_shape0), "
+            "stride=(arg0_stride1, arg0_stride0)))",
+            emitted,
+        )
+        self.assertIn(
+            "tma_atom_b_rhs_tma = cute.make_tensor(arg1.iterator, "
+            "layout=cute.make_layout((arg1_shape0, arg1_shape1), "
+            "stride=(arg1_stride0, arg1_stride1)))",
+            emitted,
+        )
+
+    def test_tcgen05_ab_tma_wrapper_plan_uses_rank3_orders(self) -> None:
+        body: list[str] = []
+        call_args: list[str] = []
+        _append_cute_wrapper_plan(
+            body,
+            call_args,
+            {
+                "kind": "tcgen05_ab_tma",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "lhs_tma_order": (1, 2, 0),
+                "rhs_tma_order": (2, 1, 0),
+                "bm": 64,
+                "bn": 16,
+                "bk": 32,
+                "ab_stage_count": 2,
+                "input_dtype": "cutlass.Float16",
+                "acc_dtype": "cutlass.Float32",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+        )
+        emitted = "\n".join(body)
+        self.assertIn(
+            "layout=cute.make_layout((arg0_shape1, arg0_shape2, arg0_shape0), "
+            "stride=(arg0_stride1, arg0_stride2, arg0_stride0))",
+            emitted,
+        )
+        self.assertIn(
+            "layout=cute.make_layout((arg1_shape2, arg1_shape1, arg1_shape0), "
+            "stride=(arg1_stride2, arg1_stride1, arg1_stride0))",
+            emitted,
         )
 
     def test_tcgen05_wide_codegen_uses_dense_physical_participant_ids(self) -> None:
@@ -15702,6 +16111,14 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
             code = bound.to_triton_code(cfg)
+            cfg.config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            )
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "partial-output TMA-store epilogue",
+            ):
+                bound.to_triton_code(cfg)
         self.assertIn("'kind': 'tcgen05_aux_tma'", code)
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn("cute.copy(tcgen05_aux_tma_atom_0", code)
@@ -19731,6 +20148,19 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertIsInstance(producer, ast.If)
         self.assertEqual(ast.unparse(producer.test), "tma_warp and next_full_tile")
 
+        current_tile_producer = _build_kloop_pipeline_producer_if(
+            args,
+            gate_tma_warp=False,
+            load_current_tile=True,
+        )
+        self.assertEqual(ast.unparse(current_tile_producer.test), "True")
+        current_tile_src = ast.unparse(
+            ast.Module(body=current_tile_producer.body, type_ignores=[])
+        )
+        self.assertIn("gA[None, tma_k_tile]", current_tile_src)
+        self.assertIn("gB[None, tma_k_tile]", current_tile_src)
+        self.assertNotIn("tma_k_tile +", current_tile_src)
+
         consumer = _build_kloop_pipeline_consumer_if(
             args,
             include_scalar_fallback=False,
@@ -19751,19 +20181,30 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             _build_kloop_pipeline_release_if(args)
 
         two_cta_args = self._make_args(is_two_cta=True, static_full_tiles=True)
-        for builder in (
-            _build_kloop_pipeline_producer_if,
-            _build_kloop_pipeline_consumer_if,
-            _build_kloop_pipeline_release_if,
-        ):
-            with (
-                self.subTest(builder=builder.__name__),
-                self.assertRaisesRegex(AssertionError, "one-CTA"),
-            ):
-                if builder is _build_kloop_pipeline_producer_if:
-                    builder(two_cta_args)
-                else:
-                    builder(two_cta_args, include_scalar_fallback=False)
+        two_cta_producer = _build_kloop_pipeline_producer_if(two_cta_args)
+        self.assertEqual(
+            ast.unparse(two_cta_producer.test), "tma_warp and next_full_tile"
+        )
+
+        two_cta_consumer = _build_kloop_pipeline_consumer_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(
+            ast.unparse(two_cta_consumer.test),
+            f"exec_active and {_TCGEN05_CLUSTER_LEADER_PREDICATE}",
+        )
+
+        two_cta_release = _build_kloop_pipeline_release_if(
+            two_cta_args, include_scalar_fallback=False
+        )
+        self.assertEqual(ast.unparse(two_cta_release.test), "exec_active")
+        self.assertEqual(self._stmt_kinds(two_cta_release.body), ["If", "advance"])
+        release_gate = two_cta_release.body[0]
+        self.assertIsInstance(release_gate, ast.If)
+        self.assertEqual(
+            ast.unparse(release_gate.test), _TCGEN05_CLUSTER_LEADER_PREDICATE
+        )
+        self.assertEqual(self._stmt_kinds(release_gate.body), ["consumer_release"])
 
     def test_non_pipeline_builders_reject_static_full_fast_path(self) -> None:
         args = self._make_args(static_full_tiles=True)
