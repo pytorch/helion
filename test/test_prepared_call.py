@@ -52,6 +52,29 @@ def _tensor_size(values: Sequence[object]) -> int:
 
 @onlyBackends(["triton", "cute"])
 class TestPreparedCall(RefEagerTestDisabled, TestCase):
+    def _assert_aot_repeat_uses_direct_dispatch_cache(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[object, ...],
+        expected: torch.Tensor,
+    ) -> None:
+        self.assertIsNone(kernel._prepared_call)  # type: ignore[attr-defined]
+        with (
+            patch.object(
+                kernel,
+                "_key_fn",
+                wraps=kernel._key_fn,  # type: ignore[attr-defined]
+            ) as key_fn,
+            patch.object(
+                kernel,
+                "_prepare_dispatch_entry",
+                side_effect=AssertionError("AOT cache hit tried to prepare"),
+            ) as prepare,
+        ):
+            torch.testing.assert_close(kernel(*args), expected)
+        key_fn.assert_called_once_with(*args)
+        prepare.assert_not_called()
+
     def test_fresh_tensor_bypasses_dispatch_key(self) -> None:
         add_one = _make_add_one()
         x = torch.randn(64, device=DEVICE)
@@ -215,13 +238,74 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(add_one(x), x + 1)
         self.assertIsNone(add_one._prepared_call)  # type: ignore[attr-defined]
 
+    def test_default_aot_key_repeat_uses_direct_dispatch_cache(self) -> None:
+        @helion.aot_kernel(
+            config=helion.Config(block_sizes=[64]),
+        )
+        def aot_add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_add_one(x), x + 1)
+        self._assert_aot_repeat_uses_direct_dispatch_cache(aot_add_one, (x,), x + 1)
+
+    def test_omitted_default_aot_repeat_uses_direct_dispatch_cache(self) -> None:
+        def key(x: torch.Tensor, _value: float = 1.0) -> int:
+            return x.size(0)
+
+        @helion.aot_kernel(
+            config=helion.Config(block_sizes=[64]),
+            key=key,
+        )
+        def aot_add_value(x: torch.Tensor, value: float = 1.0) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_add_value(x), x + 1)
+        self._assert_aot_repeat_uses_direct_dispatch_cache(aot_add_value, (x,), x + 1)
+
+    def test_user_key_aot_repeat_uses_direct_dispatch_cache(self) -> None:
+        calls = 0
+
+        def key(x: torch.Tensor) -> int:
+            nonlocal calls
+            calls += 1
+            return x.size(0)
+
+        @helion.aot_kernel(
+            config=helion.Config(block_sizes=[64]),
+            key=key,
+        )
+        def user_key_aot_add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(user_key_aot_add_one(x), x + 1)
+
+        calls = 0
+        self._assert_aot_repeat_uses_direct_dispatch_cache(
+            user_key_aot_add_one, (x,), x + 1
+        )
+        self.assertEqual(calls, 1)
+
     def test_compiler_capture_does_not_inspect_prepared_guard(self) -> None:
         add_one = _make_add_one()
         x = torch.randn(64, device=DEVICE)
         add_one(x)
 
         with (
-            patch.object(torch.compiler, "is_compiling", return_value=True),
+            patch.object(
+                torch.compiler, "is_compiling", return_value=True
+            ) as is_compiling,
             patch.object(
                 kernel_module._PreparedCall,
                 "matches",
@@ -229,6 +313,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             ),
         ):
             out = add_one(x)
+        is_compiling.assert_called_once_with()
         torch.testing.assert_close(out, x + 1)
 
     def test_unsupported_signature_does_not_rebind_after_run(self) -> None:
@@ -323,6 +408,35 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 add_one._prepare_dispatch_entry((x,), bound, known_fast_key=fast_key)
             )
         self.assertEqual(calls, 1)
+
+    def test_custom_key_distributed_bound_rechecks_dispatch(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+            key=lambda _x: 0,
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        add_one(x)
+        fast_key, bound = next(iter(add_one._dispatch_cache.items()))  # type: ignore[attr-defined]
+        # Model a bound produced by automatic symmetric-memory detection rather
+        # than an explicit distributed setting or ProcessGroupName argument.
+        bound._env._is_distributed = True
+
+        with patch.object(
+            add_one,
+            "_prepare_dispatch_entry",
+            return_value=(fast_key, None),
+        ) as prepare:
+            out = add_one(x)
+
+        prepare.assert_called_once_with((x,), bound, known_fast_key=fast_key)
+        torch.testing.assert_close(out, x + 1)
 
     def test_alternating_cached_specializations_prepare_latest(self) -> None:
         add_one = _make_add_one()

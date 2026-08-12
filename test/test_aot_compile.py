@@ -80,7 +80,7 @@ def _aot_add_one(x: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton"])
 @skipIfNotCUDA()
-class TestAOTPreparedLauncher(RefEagerTestDisabled, TestCase):
+class TestAOTStandaloneRuntime(RefEagerTestDisabled, TestCase):
     def test_multiple_configs_share_and_execute_canonical_runtime(self) -> None:
         heuristic = "def key_add(*args):\n    return 0\n"
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +106,7 @@ class TestAOTPreparedLauncher(RefEagerTestDisabled, TestCase):
                     module.add(torch.device(DEVICE)), module._default_launcher
                 )
 
-    def test_generated_aot_uses_prepared_launcher(self) -> None:
+    def test_generated_aot_reuses_canonical_runtime(self) -> None:
         x = torch.randn(64, device=DEVICE)
         bound = _aot_add_one.bind((x,))
         code = bound.to_triton_code()
@@ -133,13 +133,10 @@ class TestAOTPreparedLauncher(RefEagerTestDisabled, TestCase):
                 jit_fn = module._helion__aot_add_one_c0
 
                 other = torch.randn_like(x)
-                with patch.object(
-                    jit_fn,
-                    "run",
-                    side_effect=AssertionError("AOT repeated JITFunction.run"),
-                ):
+                with patch.object(jit_fn, "run", wraps=jit_fn.run) as jit_run:
                     second = module._aot_add_one(other)
                 torch.testing.assert_close(second, other + 1)
+                jit_run.assert_called_once()
             finally:
                 sys.modules.pop(name, None)
 
