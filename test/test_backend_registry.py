@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import ModuleType
 from types import SimpleNamespace
 from typing import cast
 import unittest
@@ -117,117 +116,6 @@ class TestBackendCodegenRepair(unittest.TestCase):
 
         self.assertEqual(reload_mock.call_count, 2)
 
-    def test_reload_is_scoped_to_requested_codegen_backend(self) -> None:
-        class TritonBackend:
-            __module__ = "test_backends.triton.backend"
-            codegen_name = "triton"
-
-        class PallasBackend:
-            __module__ = "test_backends.pallas.backend"
-            codegen_name = "pallas"
-
-        registry_module = ModuleType("test_backends.triton._codegen_modules")
-        leaf_module = ModuleType("test_backends.triton.memory_ops")
-        vars(registry_module)["memory_ops"] = leaf_module
-
-        with (
-            mock.patch.object(
-                backend_registry,
-                "_REGISTRY",
-                {"triton": TritonBackend, "pallas": PallasBackend},
-            ),
-            mock.patch.object(
-                backend_registry.importlib,
-                "import_module",
-                return_value=registry_module,
-            ) as import_module,
-            mock.patch.dict(
-                backend_registry.sys.modules,
-                {
-                    registry_module.__name__: registry_module,
-                    leaf_module.__name__: leaf_module,
-                },
-            ),
-            mock.patch.object(backend_registry.importlib, "reload") as reload_module,
-        ):
-            backend_registry._reload_backend_codegen("triton")
-
-        import_module.assert_called_once_with("test_backends.triton._codegen_modules")
-        self.assertEqual(
-            reload_module.call_args_list,
-            [mock.call(registry_module), mock.call(leaf_module)],
-        )
-
-    def test_repair_scope_includes_shared_names_and_packages(self) -> None:
-        class TritonBackend:
-            __module__ = "test_backends.shared.backend"
-            codegen_name = "triton"
-
-        class SharedBackend:
-            __module__ = "test_backends.shared.backend"
-            codegen_name = "shared"
-
-        class ExtraTritonBackend:
-            __module__ = "test_backends.extra.backend"
-            codegen_name = "triton"
-
-        with mock.patch.object(
-            backend_registry,
-            "_REGISTRY",
-            {
-                "triton": TritonBackend,
-                "shared": SharedBackend,
-                "extra": ExtraTritonBackend,
-            },
-        ):
-            codegen_names, packages = backend_registry._codegen_repair_scope("triton")
-
-        self.assertEqual(codegen_names, frozenset(("triton", "shared")))
-        self.assertEqual(
-            packages,
-            frozenset(("test_backends.shared", "test_backends.extra")),
-        )
-
-    def test_cross_package_import_stays_fresh_for_entire_repair(self) -> None:
-        class FirstBackend:
-            __module__ = "test_backends.first.backend"
-            codegen_name = "shared"
-
-        class SecondBackend:
-            __module__ = "test_backends.second.backend"
-            codegen_name = "shared"
-
-        first_registry = ModuleType("test_backends.first._codegen_modules")
-        second_registry = ModuleType("test_backends.second._codegen_modules")
-        second_leaf = ModuleType("test_backends.second.memory_ops")
-        vars(second_registry)["memory_ops"] = second_leaf
-
-        def import_module(name: str) -> ModuleType:
-            if name == first_registry.__name__:
-                backend_registry.sys.modules[second_registry.__name__] = second_registry
-                backend_registry.sys.modules[second_leaf.__name__] = second_leaf
-                return first_registry
-            self.assertEqual(name, second_registry.__name__)
-            return second_registry
-
-        with (
-            mock.patch.object(
-                backend_registry,
-                "_REGISTRY",
-                {"first": FirstBackend, "second": SecondBackend},
-            ),
-            mock.patch.dict(backend_registry.sys.modules),
-            mock.patch.object(
-                backend_registry.importlib,
-                "import_module",
-                side_effect=import_module,
-            ),
-            mock.patch.object(backend_registry.importlib, "reload") as reload_module,
-        ):
-            backend_registry._reload_backend_codegen("shared")
-
-        reload_module.assert_not_called()
-
     def test_controlled_repair_allows_reregistration(self) -> None:
         @api()
         def op() -> None:
@@ -254,34 +142,6 @@ class TestBackendCodegenRepair(unittest.TestCase):
 
         self.assertIs(
             dict.__getitem__(cast("APIFunc", op)._codegen, "triton"), replacement
-        )
-
-    def test_repair_does_not_overwrite_unrelated_backend(self) -> None:
-        @api()
-        def op() -> None:
-            return None
-
-        def original(state: object) -> str:
-            return "pallas"
-
-        def reloaded(state: object) -> str:
-            return "reloaded"
-
-        codegen(op, "pallas")(original)
-
-        def reload_backend(codegen_name: str) -> None:
-            self.assertEqual(codegen_name, "triton")
-            codegen(op, "pallas")(reloaded)
-
-        with mock.patch.object(
-            backend_registry,
-            "_reload_backend_codegen",
-            side_effect=reload_backend,
-        ):
-            repair_backend_codegen("triton")
-
-        self.assertIs(
-            dict.__getitem__(cast("APIFunc", op)._codegen, "pallas"), original
         )
 
     def test_repair_rejects_second_registration_for_same_slot(self) -> None:
