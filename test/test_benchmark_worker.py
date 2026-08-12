@@ -12,6 +12,7 @@ from pathlib import Path
 import pickle
 import random
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -50,6 +51,8 @@ from helion.autotuner.precompile_future import _load_compiled_fn
 from helion.autotuner.precompile_future import _run_kernel_in_subprocess_spawn
 from helion.autotuner.precompile_future import _serialize_compiled_fn
 from helion.autotuner.precompile_future import _unload_compiled_fn
+from helion.autotuner.process_utils import signal_process_tree
+from helion.autotuner.process_utils import start_isolated_process_group
 from helion.autotuner.random_search import RandomSearch
 from helion.runtime import _create_cute_wrapper
 from helion.runtime.config import Config
@@ -97,6 +100,16 @@ class _Crash:
 
 
 @dataclasses.dataclass
+class _SpawnChildAndSleep:
+    pid_path: str
+
+    def __call__(self) -> None:
+        child = subprocess.Popen(["sleep", "60"])
+        Path(self.pid_path).write_text(str(child.pid))
+        time.sleep(60)
+
+
+@dataclasses.dataclass
 class _ReturnValue:
     value: object
 
@@ -105,6 +118,30 @@ class _ReturnValue:
 
 
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
+    def test_precompile_worker_starts_isolated_process_group(self) -> None:
+        with patch("helion.autotuner.process_utils.os.setsid") as setsid:
+            start_isolated_process_group()
+
+        setsid.assert_called_once_with()
+
+    def test_precompile_timeout_signals_process_group(self) -> None:
+        process = Mock(pid=123)
+        with patch("helion.autotuner.process_utils.os.killpg") as killpg:
+            signal_process_tree(process, signal.SIGKILL)
+
+        killpg.assert_called_once_with(123, signal.SIGKILL)
+        process.kill.assert_not_called()
+
+    def test_precompile_timeout_falls_back_when_group_is_not_ready(self) -> None:
+        process = Mock(pid=123)
+        with patch(
+            "helion.autotuner.process_utils.os.killpg",
+            side_effect=ProcessLookupError,
+        ):
+            signal_process_tree(process, signal.SIGTERM)
+
+        process.terminate.assert_called_once_with()
+
     @skipUnlessCuteAvailable("_create_cute_wrapper requires the CuTe DSL")
     def test_cute_wrapper_failure_does_not_leak_linecache(self) -> None:
         launcher_filenames_before = {
@@ -747,6 +784,28 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
             worker.shutdown()
+
+    def test_timeout_kills_worker_process_group(self) -> None:
+        worker = BenchmarkWorker()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_path = Path(tmpdir) / "child.pid"
+            try:
+                worker.run(_ReturnValue(None), timeout=30.0)
+                with self.assertRaises(BenchmarkTimeout):
+                    worker.run(_SpawnChildAndSleep(str(pid_path)), timeout=1.0)
+                child_pid = int(pid_path.read_text())
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
+                    except FileNotFoundError:
+                        state = "gone"
+                    if state in {"gone", "Z"}:
+                        break
+                    time.sleep(0.1)
+                self.assertIn(state, {"gone", "Z"})
+            finally:
+                worker.shutdown()
 
     def test_watchdog_kills_worker_when_poll_timeout_is_ignored(self) -> None:
         original_poll = Connection.poll
