@@ -860,27 +860,26 @@ class TestCuteLowerings(unittest.TestCase):
     def _role_local_while_source_for_predicate(
         self, code: str, tree: ast.AST, role_predicate: str
     ) -> tuple[str, int, int]:
+        role_blocks: list[ast.If] = []
         matches: list[ast.While] = []
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.If) and ast.unparse(node.test) == role_predicate
             ):
                 continue
+            role_blocks.append(node)
             for role_child in ast.walk(node):
                 if isinstance(
                     role_child, ast.While
                 ) and "tcgen05_role_local" in ast.unparse(role_child.test):
                     matches.append(role_child)
-        self.assertEqual(
-            len(matches),
-            1,
-            "Expected exactly one role-local while for "
-            f"{role_predicate!r}. Generated code:\n{code}",
-        )
-        role_src = ast.get_source_segment(code, matches[0])
+        self.assertEqual(len(role_blocks), 1, code)
+        self.assertLessEqual(len(matches), 1, code)
+        role_node: ast.If | ast.While = matches[0] if matches else role_blocks[0]
+        role_src = ast.get_source_segment(code, role_node)
         self.assertIsNotNone(
             role_src,
-            "Expected parsed role-local while to preserve source extent. "
+            "Expected parsed role-local body to preserve source extent. "
             "Generated code:\n" + code,
         )
         assert role_src is not None
@@ -2202,53 +2201,57 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_persistent_post_loop.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            # ``persistent_blocked`` is normally disallowed for tcgen05
-            # via ``enforce_dot_requirements`` because autotune can still
-            # choose configs that fall back to guarded partial persistent
-            # paths. The codegen itself accepts the explicit config, which
-            # is what this structural test exercises.
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 16],
-                pid_type="persistent_blocked",
-            )
-            code = bound.to_triton_code(cfg)
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_persistent_post_loop.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                # ``persistent_blocked`` is normally disallowed for tcgen05
+                # via ``enforce_dot_requirements`` because autotune can still
+                # choose configs that fall back to guarded partial persistent
+                # paths. The codegen itself accepts the explicit config, which
+                # is what this structural test exercises.
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 16],
+                    pid_type="persistent_blocked",
+                )
+                code = bound.to_triton_code(cfg)
 
-        # Role-local codegen emits one work-tile loop per warp role. Verify
-        # one-shot cleanup follows the last of those loops, rather than being
-        # replayed in any role's per-tile body.
-        tree = ast.parse(code)
-        work_tile_loops = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.While)
-            and (
-                "tcgen05_role_local_" in ast.unparse(node.test)
-                or ast.unparse(node.test) == "tcgen05_work_tile_valid"
-            )
-        ]
-        self.assertTrue(
-            work_tile_loops, "expected at least one persistent work-tile loop"
-        )
-        last_work_tile_line = max(
-            node.end_lineno or node.lineno for node in work_tile_loops
-        )
-        for tag in (
-            "tcgen05_acc_pipeline.producer_tail",
-            "tcgen05_tmem_allocator.free",
-        ):
-            cleanup_calls = [
-                node
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and tag in ast.unparse(node.func)
-            ]
-            self.assertTrue(cleanup_calls, f"expected cleanup call {tag}")
-            self.assertTrue(
-                all(node.lineno > last_work_tile_line for node in cleanup_calls),
-                f"{tag} must follow all work-tile loops",
-            )
+                # Role-local codegen emits one work-tile loop per warp role
+                # unless one-shot is admitted. Cleanup must follow the last
+                # loop in the persistent case and remain present in both.
+                tree = ast.parse(code)
+                work_tile_loops = [
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.While)
+                    and (
+                        "tcgen05_role_local_" in ast.unparse(node.test)
+                        or ast.unparse(node.test) == "tcgen05_work_tile_valid"
+                    )
+                ]
+                self.assertEqual(bool(work_tile_loops), num_sm == 0, code)
+                for tag in (
+                    "tcgen05_acc_pipeline.producer_tail",
+                    "tcgen05_tmem_allocator.free",
+                ):
+                    cleanup_calls = [
+                        node
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Call) and tag in ast.unparse(node.func)
+                    ]
+                    self.assertTrue(cleanup_calls, f"expected cleanup call {tag}")
+                    if work_tile_loops:
+                        last_work_tile_line = max(
+                            node.end_lineno or node.lineno for node in work_tile_loops
+                        )
+                        self.assertTrue(
+                            all(
+                                node.lineno > last_work_tile_line
+                                for node in cleanup_calls
+                            ),
+                            f"{tag} must follow all work-tile loops",
+                        )
 
     def test_tcgen05_persistent_post_loop_runtime_correctness(self) -> None:
         """The role-local persistent kernel runs after omitting its shared loop."""
@@ -2320,29 +2323,32 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(256, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 256, device=DEVICE, dtype=torch.float16),
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_persistent_compile.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 16],
-                pid_type="persistent_blocked",
-            )
-            # The act of generating the Python source already runs the
-            # CuTe DSL preprocessor; the IR verifier runs at first
-            # execution (cute.compile). The code-string checks below pin
-            # the persistent host wrapper shape; runtime coverage for both
-            # z-seeded and tile-advance scheduler paths lives in
-            # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
-            code = bound.to_triton_code(cfg)
-            self.assertIn("while tcgen05_role_local_0_work_tile.is_valid_tile", code)
-            self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
-            from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_persistent_compile.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 16],
+                    pid_type="persistent_blocked",
+                )
+                # The act of generating the Python source already runs the
+                # CuTe DSL preprocessor; the IR verifier runs at first
+                # execution (cute.compile). The code-string checks below pin
+                # the persistent host wrapper shape; runtime coverage for both
+                # z-seeded and tile-advance scheduler paths lives in
+                # ``test_tcgen05_persistent_multi_tile_runtime_correctness``.
+                code = bound.to_triton_code(cfg)
+                role_loop = "while tcgen05_role_local_0_work_tile.is_valid_tile"
+                self.assertEqual(role_loop in code, num_sm == 0, code)
+                self.assertIn("tcgen05_acc_pipeline.producer_tail", code)
+                from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
-            self.assertNotIn(
-                Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
-                code,
-            )
-            self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
+                self.assertNotIn(
+                    Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR,
+                    code,
+                )
+                self.assertRegex(code, r"\(\s*1\s*,\s*1\s*,\s*min\s*\(")
 
     def test_tcgen05_role_local_monolithic_codegen_markers(self) -> None:
         """The retained role-local monolithic seed emits the required
@@ -4918,16 +4924,26 @@ class TestCuteLowerings(unittest.TestCase):
             torch.randn(128, 32, device=DEVICE, dtype=torch.float16),
             torch.randn(32, 128, device=DEVICE, dtype=torch.float16),
         )
-        with patch_cute_mma_support():
-            bound = cute_matmul_persistent_role.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 16],
-                pid_type="persistent_blocked",
-            )
-            bound.set_config(cfg)
-            code = bound.to_triton_code(cfg)
-            out = bound(*args)
+        results: dict[int, tuple[str, torch.Tensor]] = {}
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_persistent_role.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 16],
+                    pid_type="persistent_blocked",
+                )
+                bound.set_config(cfg)
+                generated_code = bound.to_triton_code(cfg)
+                self.assertEqual(
+                    "while tcgen05_role_local" in generated_code,
+                    num_sm == 0,
+                    generated_code,
+                )
+                results[num_sm] = (generated_code, bound(*args))
+
+        code, out = results[0]
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
         self.assertIn(
             "tcgen05_tma_store_role_tile = tcgen05_tma_store_role_tile + cutlass.Int32(1)",
@@ -5065,6 +5081,9 @@ class TestCuteLowerings(unittest.TestCase):
             "loop. Generated code:\n" + code,
         )
         torch.testing.assert_close(out, args[0] @ args[1], atol=2e-1, rtol=1e-2)
+        torch.testing.assert_close(
+            results[148][1], args[0] @ args[1], atol=2e-1, rtol=1e-2
+        )
 
     def test_tcgen05_flat_static_full_uses_tma_store_epilogue(self) -> None:
         """Static-full flat tcgen05 lowers the first G2 TMA-store epilogue.
@@ -5931,10 +5950,9 @@ class TestCuteLowerings(unittest.TestCase):
             )
             bound.set_config(cfg)
             code = bound.to_triton_code(cfg)
+            self.assertNotIn("while tcgen05_role_local", code)
             self.assertIn(
-                "if True:\n"
-                "                            if _tcgen05_subtile == 0:\n"
-                "                                tcgen05_acc_pipeline.consumer_wait",
+                "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)",
                 code,
             )
             out = bound(*args)
@@ -9713,10 +9731,7 @@ class TestCuteLowerings(unittest.TestCase):
                 code,
             )
             self.assertIn("StaticPersistentTileScheduler.create", code)
-            self.assertIn(
-                "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                code,
-            )
+            self.assertNotIn("while tcgen05_role_local", code)
             self.assertIn(
                 "tcgen05_ab_pipeline_consumer_group = "
                 "cutlass.pipeline.CooperativeGroup("
@@ -10044,7 +10059,7 @@ class TestCuteLowerings(unittest.TestCase):
                         "cutlass.utils.StaticPersistentTileScheduler.create(",
                         code,
                     )
-                    self.assertIn(
+                    self.assertNotIn(
                         "while tcgen05_role_local_0_work_tile.is_valid_tile",
                         code,
                     )
@@ -10260,41 +10275,41 @@ class TestCuteLowerings(unittest.TestCase):
         )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
-        with patch_cute_mma_support():
-            bound = cute_matmul_cluster_m2_two_cta_grid.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[256, 256, 16],
-                l2_groupings=[4],
-                num_sm_multiplier=2,
-                pid_type="persistent_blocked",
-                tcgen05_cluster_m=2,
-            )
-            bound.set_config(cfg)
-            code = bound.to_triton_code(cfg)
-            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn(
-                "tcgen05_role_local_0_tile_sched = "
-                "cutlass.utils.StaticPersistentTileScheduler.create(",
-                code,
-            )
-            self.assertIn("StaticPersistentTileScheduler.create", code)
-            self.assertIn(
-                "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                code,
-            )
-            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
-            self.assertNotIn(total_var, code)
-            launcher_lines = [
-                line
-                for line in code.splitlines()
-                if "_launcher(" in line and "_helion_cute" in line
-            ]
-            self.assertEqual(len(launcher_lines), 1, code)
-            self.assertRegex(launcher_lines[0], r"_launcher\([^,]+,\s*\(2,\s*1,")
-            self.assertIn("_NUM_SM", launcher_lines[0])
-            self.assertRegex(launcher_lines[0], r"//\s*2")
-            self.assertIn("min(", launcher_lines[0])
+        for num_sm in (0, 148):
+            with self.subTest(num_sm=num_sm), patch_cute_mma_support():
+                bound = cute_matmul_cluster_m2_two_cta_grid.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = num_sm
+                cfg = _make_tcgen05_persistent_config(
+                    block_sizes=[256, 256, 16],
+                    l2_groupings=[4],
+                    num_sm_multiplier=2,
+                    pid_type="persistent_blocked",
+                    tcgen05_cluster_m=2,
+                )
+                bound.set_config(cfg)
+                code = bound.to_triton_code(cfg)
+                self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                self.assertIn(
+                    "tcgen05_role_local_0_tile_sched = "
+                    "cutlass.utils.StaticPersistentTileScheduler.create(",
+                    code,
+                )
+                self.assertIn("StaticPersistentTileScheduler.create", code)
+                role_loop = "while tcgen05_role_local_0_work_tile.is_valid_tile"
+                self.assertEqual(role_loop in code, num_sm == 0, code)
+                total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                self.assertNotIn(total_var, code)
+                launcher_lines = [
+                    line
+                    for line in code.splitlines()
+                    if "_launcher(" in line and "_helion_cute" in line
+                ]
+                self.assertEqual(len(launcher_lines), 1, code)
+                self.assertRegex(launcher_lines[0], r"_launcher\([^,]+,\s*\(2,\s*1,")
+                self.assertIn("_NUM_SM", launcher_lines[0])
+                self.assertRegex(launcher_lines[0], r"//\s*2")
+                self.assertIn("min(", launcher_lines[0])
 
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_z_limit_uses_recycling(
         self,
@@ -10469,10 +10484,15 @@ class TestCuteLowerings(unittest.TestCase):
                         "cutlass.utils.StaticPersistentTileScheduler.create(",
                         code,
                     )
-                    self.assertIn(
-                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                        code,
-                    )
+                    # K only changes the inner reduction loop. This 256x256
+                    # output has one logical tile, mapped to one two-CTA
+                    # cluster, so every CTA receives exactly one work tile
+                    # and no role-local scheduler backedge is needed.
+                    if bound.env.config_spec.num_sm >= 2:
+                        self.assertNotIn(
+                            "while tcgen05_role_local_",
+                            code,
+                        )
                     self.assertIn("StaticPersistentTileScheduler.create", code)
                     total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
                     self.assertNotIn(total_var, code)
@@ -10653,45 +10673,122 @@ class TestCuteLowerings(unittest.TestCase):
                 ).to(x.dtype)
             return out
 
-        torch.manual_seed(0)
-        args = (
-            torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(128, 384, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(384, device=DEVICE, dtype=torch.bfloat16),
-            torch.randn(256, 384, device=DEVICE, dtype=torch.bfloat16),
-        )
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
-        with patch_cute_mma_support():
-            bound = cute_matmul_cluster_m2_two_cta_n_edge.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[256, 256, 128],
-                pid_type="persistent_interleaved",
-                tcgen05_cluster_m=2,
-                tcgen05_ab_stages=3,
-                tcgen05_acc_stages=1,
-                tcgen05_c_stages=4,
-                num_warps=4,
-            )
-            bound.set_config(cfg)
-            code = bound.to_triton_code(cfg)
-            self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
-            self.assertIn("PipelineTmaUmma.create", code)
-            self.assertNotIn("PipelineTmaStore.create", code)
-            self.assertIn(
-                "while tcgen05_role_local_0_work_tile.is_valid_tile",
-                code,
-            )
-            self.assertIn("tile_offset_1 < cutlass.Int32(384)", code)
-            total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
-            self.assertNotIn(total_var, code)
-            out = bound(*args)
-        expected = torch.nn.functional.gelu(
-            1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
-            approximate="tanh",
-        ).to(args[0].dtype)
-        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+        for n, expect_tma_store in ((128, False), (384, True)):
+            with self.subTest(n=n):
+                torch.manual_seed(0)
+                args = (
+                    torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(128, n, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(n, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(256, n, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_cluster_m2_two_cta_n_edge.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 128],
+                        pid_type="persistent_interleaved",
+                        tcgen05_cluster_m=2,
+                        tcgen05_ab_stages=2,
+                        tcgen05_acc_stages=1,
+                        tcgen05_c_stages=4,
+                        num_warps=4,
+                    )
+                    bound.set_config(cfg)
+                    code = bound.to_triton_code(cfg)
+                    self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+                    self.assertIn("PipelineTmaUmma.create", code)
+                    if expect_tma_store:
+                        self.assertIn("PipelineTmaStore.create", code)
+                    else:
+                        self.assertNotIn("PipelineTmaStore.create", code)
+                    self.assertIn(
+                        "while tcgen05_role_local_0_work_tile.is_valid_tile",
+                        code,
+                    )
+                    self.assertIn(f"tile_offset_1 < cutlass.Int32({n})", code)
+                    total_var = Tcgen05PersistentProgramIDs._MULTI_TILE_GUARD_TOTAL_VAR
+                    self.assertNotIn(total_var, code)
+                    out = bound(*args)
+                expected = torch.nn.functional.gelu(
+                    1.25 * (args[0] @ args[1]).float() + 0.5 * args[3] + args[2],
+                    approximate="tanh",
+                ).to(args[0].dtype)
+                torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_persistent_one_cta_n_edge_rhs_layouts(self) -> None:
+        """One-CTA role-local TMA handles general N edges for both RHS views."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def direct_rhs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute")
+        def transposed_rhs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n, _ = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(
+                        acc,
+                        x[tile_m, tile_k],
+                        y[tile_n, tile_k].T,
+                    )
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 256, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=4,
+            num_warps=4,
+        )
+        for n in (128, 384):
+            for name, kernel in (
+                ("direct", direct_rhs),
+                ("transposed", transposed_rhs),
+            ):
+                with self.subTest(n=n, rhs=name):
+                    torch.manual_seed(0)
+                    x = torch.randn(256, 128, device=DEVICE, dtype=torch.bfloat16)
+                    logical_y = torch.randn(128, n, device=DEVICE, dtype=torch.bfloat16)
+                    y = logical_y if name == "direct" else logical_y.T.contiguous()
+                    with patch_cute_mma_support():
+                        bound = kernel.bind((x, y))
+                        bound.env.config_spec.cute_tcgen05_search_enabled = True
+                        bound.set_config(config)
+                        code = bound.to_triton_code(config)
+                        self.assertIn("PipelineTmaUmma.create", code)
+                        self.assertIn("while tcgen05_role_local", code)
+                        self.assertNotIn("while tcgen05_work_tile_valid", code)
+                        self.assertNotIn("PipelineTmaStore.create", code)
+                        actual = bound(x, y)
+                    torch.testing.assert_close(
+                        actual,
+                        x @ logical_y,
+                        atol=2e-1,
+                        rtol=1e-2,
+                    )
 
     def test_tcgen05_persistent_cluster_m2_two_cta_double_edge_runtime_correctness(
         self,
@@ -18827,14 +18924,70 @@ class TestPersistentLoopSplitter(unittest.TestCase):
                 partition, [self._stmt("final_state += 1")]
             )
 
-        observable_partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+        scalar_load_partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
             role_blocks_inline=[],
             role_blocks_extracted=[],
             shared_body_extracted=[self._stmt("value = tensor.iterator.load()")],
         )
-        self.assertTrue(
-            splitter._tcgen05_shared_loop_has_meaningful_work(observable_partition, [])
+        self.assertFalse(
+            splitter._tcgen05_shared_loop_has_meaningful_work(scalar_load_partition, [])
         )
+        self.assertTrue(
+            splitter._tcgen05_shared_loop_has_meaningful_work(
+                scalar_load_partition, [self._stmt("cleanup(value)")]
+            )
+        )
+        stateful_load_partition = Tcgen05PersistentProgramIDs._PartitionedRoleBody(
+            role_blocks_inline=[],
+            role_blocks_extracted=[],
+            shared_body_extracted=[self._stmt("value = state.load()")],
+        )
+        self.assertTrue(
+            splitter._tcgen05_shared_loop_has_meaningful_work(
+                stateful_load_partition, []
+            )
+        )
+
+    def test_role_local_one_shot_scheduler_omits_tile_loop(self) -> None:
+        from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        plan = CuteTcgen05MatmulPlan(
+            bm=64,
+            bn=64,
+            bk=128,
+            k_tile_count=16,
+            cluster_m=1,
+            is_two_cta=False,
+            uses_role_local_persistent_body=True,
+            uses_cluster_m2_one_cta_role_local_bridge=False,
+            cta_thread_count=192,
+            physical_m_threads=32,
+            acc_stage_count=2,
+            ab_stage_count=2,
+            c_stage_count=2,
+            epi_warp_count=4,
+            one_shot_role_scheduler=True,
+        )
+        splitter._tcgen05_plan = lambda: plan  # type: ignore[method-assign]
+        role_block = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+            role_predicate="__test_tma_load_warp__",
+            stmts=[self._stmt("tma_pipeline.producer_acquire(state)")],
+        )
+
+        emitted = splitter._build_role_local_while(
+            stub_df,
+            self._make_minimal_layout(),
+            role_block,
+            scheduler_var_prefix="one_shot_test",
+        )
+        emitted_src = ast.unparse(emitted)
+
+        self.assertFalse(any(isinstance(node, ast.While) for node in ast.walk(emitted)))
+        self.assertIn("producer_acquire(state)", emitted_src)
+        self.assertNotIn("advance_to_next_work", emitted_src)
+        self.assertNotIn("get_current_work", emitted_src)
 
     def _make_role_local_stubs(self, *, num_pid_dims: int = 2) -> tuple[object, object]:
         """Build a richer device-function stub plus per-pid stubs that

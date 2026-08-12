@@ -82,6 +82,43 @@ def _causal_attention_output(
     return out.view(q_in.size())
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _dense_attention_output(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+) -> torch.Tensor:
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * math.log2(math.e)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        out[tile_b, tile_m, :] = (acc / l_i[:, :, None]).to(out.dtype)
+    return out.view(q_in.size())
+
+
 def _manual_config(
     packet: str = _DEG2_PACKET, **overrides: object
 ) -> dict[str, object]:
@@ -132,13 +169,21 @@ def test_degree2_polynomial_relative_error_bound() -> None:
     assert relative_error.max().item() < 0.00173
 
 
-def test_degree1_polynomial_relative_error_bound() -> None:
-    x = torch.linspace(0.0, 1.0, 100_001, dtype=torch.float32)
-    c0, c1 = _flash_runtime._POLY_EX2_DEG1
-    approximate = torch.tensor(c1) * x + torch.tensor(c0)
-    relative_error = (approximate / torch.exp2(x) - 1.0).abs()
+def test_legacy_degree1_packet_uses_degree2_evaluator() -> None:
+    pair_result = object()
+    with patch.object(
+        _flash_runtime, "ex2_emulation_deg2_2", return_value=pair_result
+    ) as pair_evaluator:
+        assert _flash_runtime.ex2_emulation_deg1_2("x", "y") is pair_result
+    pair_evaluator.assert_called_once_with("x", "y")
 
-    assert relative_error.max().item() < 0.02983
+    batch_result = object()
+    pairs = [("x0", "y0"), ("x1", "y1")]
+    with patch.object(
+        _flash_runtime, "ex2_emulation_deg2_batch", return_value=batch_result
+    ) as batch_evaluator:
+        assert _flash_runtime.ex2_emulation_deg1_batch(pairs) is batch_result
+    batch_evaluator.assert_called_once_with(pairs)
 
 
 def test_degree2_packet_codegen_route_is_exact_and_manual_only() -> None:
@@ -226,6 +271,32 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
         }
         assert keywords == {"pair_batch": 8, "emu_batch": 3, "degree2": True}
 
+    unmasked_loops = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "flash_kv_unmask_iter"
+    ]
+    assert len(unmasked_loops) == 2
+    for loop in unmasked_loops:
+        assert not any(
+            "flash_kv_unmask_iter" in ast.unparse(node.test)
+            for node in ast.walk(loop)
+            if isinstance(node, ast.If)
+        )
+        assert any(
+            isinstance(statement, ast.Assign)
+            and isinstance(statement.value, ast.Name)
+            and statement.value.id == "flash_alpha"
+            for statement in loop.body
+        )
+        assert any(
+            isinstance(node, ast.If)
+            and ast.unparse(node.test) == "flash_acc_log >= -8.0"
+            for node in ast.walk(loop)
+        )
+
 
 def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
     with patch.dict(os.environ, {}, clear=True):
@@ -276,15 +347,25 @@ def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
 
 
 @pytest.mark.parametrize(
-    ("packet", "num_kv", "sequence_extent", "total_tiles", "freq", "res", "emu"),
     (
-        (_DEG1_SHORT_PACKET, 256, 32_768, 4_096, 8, 2, 2),
-        (_DEG1_SHORT_PACKET, 512, 65_536, 8_192, 8, 2, 2),
-        (_DEG1_SHORT_PACKET, 1024, 131_072, 16_384, 8, 2, 2),
-        (_DEG1_PACKET, 2048, 262_144, 32_768, 16, 8, 4),
+        "packet",
+        "num_kv",
+        "sequence_extent",
+        "total_tiles",
+        "freq",
+        "res",
+        "emu",
+        "polynomial_keyword",
+    ),
+    (
+        (_DEG1_SHORT_PACKET, 256, 32_768, 4_096, 8, 2, 2, "degree1"),
+        (_DEG1_SHORT_PACKET, 512, 65_536, 8_192, 8, 2, 2, "degree1"),
+        (_DEG1_SHORT_PACKET, 1024, 131_072, 16_384, 8, 2, 2, "degree1"),
+        (_DEG1_PACKET, 2048, 262_144, 32_768, 16, 8, 4, "degree1"),
+        (_DEG2_PACKET, 2048, 262_144, 32_768, 16, 6, 3, "degree2"),
     ),
 )
-def test_degree1_packet_uses_whole_row_dense_pass2(
+def test_polynomial_packet_uses_whole_row_dense_pass2(
     packet: str,
     num_kv: int,
     sequence_extent: int,
@@ -292,6 +373,7 @@ def test_degree1_packet_uses_whole_row_dense_pass2(
     freq: int,
     res: int,
     emu: int,
+    polynomial_keyword: str,
 ) -> None:
     with patch.dict(os.environ, {}, clear=True):
         config = cute_flash.resolve_flash_config(
@@ -342,7 +424,7 @@ def test_degree1_packet_uses_whole_row_dense_pass2(
             "early_split_publish": True,
             "pair_batch": 8,
             "emu_batch": emu,
-            "degree1": True,
+            polynomial_keyword: True,
         }
 
 
@@ -398,6 +480,471 @@ def test_short_degree1_packet_reverses_steady_correction_order(
     assert alpha_stages == list(expected_alpha_stages)
 
 
+def _emit_dense_single_stat_source(
+    *,
+    pipeline_family: str = "fa4_2cta",
+    packet: str = "8x2",
+    softmax_disc: bool = False,
+    rescale_threshold: float = 8.0,
+    persistent: bool = True,
+    final_only_stat_pipeline: bool = False,
+) -> str:
+    with patch.dict(os.environ, {}, clear=True):
+        config = cute_flash.resolve_flash_config(
+            64,
+            256,
+            _manual_config(
+                packet,
+                **{
+                    cute_flash.FLASH_PIPELINE_FAMILY_KEY: pipeline_family,
+                    cute_flash.FLASH_STAT_TRANSPORT_KEY: (
+                        "single_final" if final_only_stat_pipeline else "single"
+                    ),
+                    cute_flash.FLASH_PERSISTENT_KEY: persistent,
+                    cute_flash.FLASH_SOFTMAX_DISC_KEY: softmax_disc,
+                    cute_flash.FLASH_RESCALE_THRESHOLD_KEY: rescale_threshold,
+                },
+            ),
+            dtype=torch.float16,
+            is_causal=False,
+            standard_dense_output=True,
+        )
+        body = cute_flash.emit_flash_fa4_device_body(
+            cast("DeviceFunction", None),
+            head_dim=64,
+            num_kv=256,
+            sequence_extent=32_768,
+            num_bh=64,
+            total_tiles=4_096 if config.use_2cta_instrs else 8_192,
+            cfg=config,
+            has_lse=False,
+            io_dtype="cutlass.Float16",
+            score_plan=dense_score_plan(64),
+        )
+    return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+
+def test_dense_single_stat_emits_fa4_late_acquire_protocol() -> None:
+    source = _emit_dense_single_stat_source()
+
+    assert source.count("flash_s_corr_prod_phase = cutlass.Int32(1)") == 2
+    assert "flash_s_corr_prod_phase = cutlass.Int32(0)" not in source
+
+    stage0_start = source.index("flash_s_corr_prod_phase = cutlass.Int32(1)")
+    stage1_start = source.index(
+        "flash_s_corr_prod_phase = cutlass.Int32(1)", stage0_start + 1
+    )
+    softmax0 = source[stage0_start:stage1_start]
+    empty_wait = (
+        "_helion_flash_rt.mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
+        "flash_s_corr_prod_phase, 10000000)"
+    )
+    empty_wait_lines = [line for line in softmax0.splitlines() if empty_wait in line]
+    # Entry and post-P acquires live inside each persistent work item. The final
+    # acquire drains the final row-sum handoff after the persistent loop.
+    assert [len(line) - len(line.lstrip()) for line in empty_wait_lines] == [8, 12, 4]
+    assert softmax0.count("flash_s_corr_prod_phase ^= 1") == 2
+    assert (
+        "else:\n"
+        "                _helion_flash_rt.named_barrier_arrive_unaligned("
+        "3 + warp_idx % 4, 64)"
+    ) in softmax0
+    entry_wait = softmax0.index(empty_wait)
+    alpha_store = softmax0.index(
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_alpha"
+    )
+    p_publication = softmax0.index("flash_pfor_ptr + 0", alpha_store)
+    post_p_wait = softmax0.index(empty_wait, p_publication)
+    row_sum_update = softmax0.index(
+        "flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum", post_p_wait
+    )
+    rowsum_store = softmax0.index(
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_row_sum", row_sum_update
+    )
+    tail_wait = softmax0.index(empty_wait, rowsum_store)
+    assert (
+        entry_wait
+        < alpha_store
+        < p_publication
+        < post_p_wait
+        < row_sum_update
+        < rowsum_store
+        < tail_wait
+    )
+
+    correction = source[source.index("(warp_idx >= 8) & (warp_idx < 12):") :]
+    work_loop = correction.index("for flash_tile_iter")
+    ready0 = "_helion_flash_rt.named_barrier_wait_unaligned(3 + warp_idx % 4, 64)"
+    ready1 = "_helion_flash_rt.named_barrier_wait_unaligned(7 + warp_idx % 4, 64)"
+    empty0 = "cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)"
+    empty1 = "cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)"
+
+    dummy_ready0 = correction.index(ready0, work_loop)
+    dummy_release0 = correction.index(empty0, dummy_ready0)
+    dummy_ready1 = correction.index(ready1, dummy_release0)
+    steady_loop = correction.index("for flash_kv", dummy_ready1)
+    alpha0 = correction.index("flash_a0 =", steady_loop)
+    pfor0 = correction.index(
+        "_helion_flash_rt.mbarrier_arrive(flash_pfor_ptr + 0", alpha0
+    )
+    cross_release1 = correction.index(empty1, pfor0)
+    alpha1 = correction.index("flash_a1 =", cross_release1)
+    pfor1 = correction.index(
+        "_helion_flash_rt.mbarrier_arrive(flash_pfor_ptr + 1", alpha1
+    )
+    cross_release0 = correction.index(empty0, pfor1)
+    held_release1 = correction.index(empty1, cross_release0)
+    final_ready0 = correction.index(ready0, held_release1)
+    final_rowsum0 = correction.index("flash_inv_sum0 =", final_ready0)
+    final_release0 = correction.index(empty0, final_rowsum0)
+    final_ready1 = correction.index(ready1, final_release0)
+    final_rowsum1 = correction.index("flash_inv_sum1 =", final_ready1)
+    final_release1 = correction.index(empty1, final_rowsum1)
+    assert (
+        dummy_ready0
+        < dummy_release0
+        < dummy_ready1
+        < steady_loop
+        < alpha0
+        < pfor0
+        < cross_release1
+        < alpha1
+        < pfor1
+        < cross_release0
+        < held_release1
+        < final_ready0
+        < final_rowsum0
+        < final_release0
+        < final_ready1
+        < final_rowsum1
+        < final_release1
+    )
+
+
+def test_dense_nonpersistent_final_only_stat_pipeline_protocol() -> None:
+    source = _emit_dense_single_stat_source(
+        persistent=False,
+        final_only_stat_pipeline=True,
+    )
+
+    assert source.count("flash_s_corr_prod_phase = cutlass.Int32(0)") == 2
+    assert "flash_s_corr_prod_phase = cutlass.Int32(1)" not in source
+    assert "flash_s_corr_prod_phase ^= 1" not in source
+
+    stage0_start = source.index("flash_s_corr_prod_phase = cutlass.Int32(0)")
+    stage1_start = source.index(
+        "flash_s_corr_prod_phase = cutlass.Int32(0)", stage0_start + 1
+    )
+    softmax0 = source[stage0_start:stage1_start]
+    empty_wait = (
+        "_helion_flash_rt.mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
+        "flash_s_corr_prod_phase, 10000000)"
+    )
+    ready_arrive = (
+        "_helion_flash_rt.named_barrier_arrive_unaligned(3 + warp_idx % 4, 64)"
+    )
+    assert softmax0.count(empty_wait) == 1
+    assert softmax0.count(ready_arrive) == 2
+    assert "else:\n            " + ready_arrive not in softmax0
+
+    alpha_store = softmax0.index(
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_alpha"
+    )
+    p_publication = softmax0.index("flash_pfor_ptr + 0", alpha_store)
+    row_sum_update = softmax0.index(
+        "flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum",
+        p_publication,
+    )
+    terminal_wait = softmax0.index(empty_wait, row_sum_update)
+    rowsum_store = softmax0.index(
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_row_sum",
+        terminal_wait,
+    )
+    rowsum_ready = softmax0.index(ready_arrive, rowsum_store)
+    dealloc = softmax0.index(
+        "_helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)",
+        rowsum_ready,
+    )
+    assert (
+        alpha_store
+        < p_publication
+        < row_sum_update
+        < terminal_wait
+        < rowsum_store
+        < rowsum_ready
+        < dealloc
+    )
+
+    correction = source[source.index("(warp_idx >= 8) & (warp_idx < 12):") :]
+    steady_loop = correction.index("for flash_kv")
+    empty0 = "cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)"
+    empty1 = "cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)"
+    assert correction.count(empty0) == 1
+    assert correction.count(empty1) == 1
+
+    alpha0 = correction.index("flash_a0 =", steady_loop)
+    pfor0 = correction.index(
+        "_helion_flash_rt.mbarrier_arrive(flash_pfor_ptr + 0", alpha0
+    )
+    alpha1 = correction.index("flash_a1 =", pfor0)
+    pfor1 = correction.index(
+        "_helion_flash_rt.mbarrier_arrive(flash_pfor_ptr + 1", alpha1
+    )
+    terminal_release0 = correction.index(empty0, pfor1)
+    terminal_release1 = correction.index(empty1, terminal_release0)
+    final_ready0 = correction.index(
+        "_helion_flash_rt.named_barrier_wait_unaligned(3 + warp_idx % 4, 64)",
+        terminal_release1,
+    )
+    final_rowsum0 = correction.index("flash_inv_sum0 =", final_ready0)
+    assert (
+        steady_loop
+        < alpha0
+        < pfor0
+        < alpha1
+        < pfor1
+        < terminal_release0
+        < terminal_release1
+        < final_ready0
+        < final_rowsum0
+    )
+    assert empty0 not in correction[steady_loop:terminal_release0]
+    assert empty1 not in correction[steady_loop:terminal_release0]
+    assert "cute.arch.barrier(" not in correction
+    assert (
+        correction.count("_helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)")
+        == 1
+    )
+
+
+@onlyBackends(["cute"])
+def test_dense_degree2_final_only_is_deterministic_on_peaky_inputs() -> None:
+    torch.manual_seed(104)
+    q, k, v = (
+        torch.randn(1, 1, 33_280, 64, dtype=torch.float16, device=DEVICE)
+        for _ in range(3)
+    )
+    q.mul_(2.0)
+    k.mul_(2.0)
+    config = next(
+        seed.config
+        for seed in cute_flash.flash_attention_seed_configs(
+            64,
+            260,
+            dtype=torch.float16,
+            standard_dense_output=True,
+        )
+        if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
+        and seed.config.get(cute_flash.FLASH_STAT_TRANSPORT_KEY) == "single_final"
+    )
+
+    bound = _dense_attention_output.bind((q, k, v))
+    active_config = helion.Config(**config)
+    bound.set_config(active_config)
+    code = bound.to_triton_code(active_config)
+    out = bound(q, k, v)
+    repeated = bound(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    diff = (out.float() - expected.float()).abs()
+    strict_failures = diff > (0.002 + 0.01 * expected.float().abs())
+    normalized_rmse = torch.sqrt((diff * diff).mean(dtype=torch.float64)) / torch.sqrt(
+        (expected.float() * expected.float()).mean(dtype=torch.float64)
+    )
+
+    assert "degree2=True" in code
+    assert torch.equal(out, repeated)
+    assert torch.isfinite(out).all()
+    assert diff.max().item() < 0.01
+    assert normalized_rmse.item() < 0.002
+    assert strict_failures.count_nonzero().item() / out.numel() < 1e-5
+
+
+@onlyBackends(["cute"])
+def test_dense_bfloat16_final_only_stat_handoff_is_accurate() -> None:
+    torch.manual_seed(106)
+    q, k, v = (
+        torch.randn(1, 1, 1024, 64, dtype=torch.bfloat16, device=DEVICE)
+        for _ in range(3)
+    )
+    config = {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_pipeline_family": "fa4",
+        "cute_flash_persistent": False,
+        "cute_flash_softmax_disc": False,
+        "cute_flash_stat_transport": "single_final",
+        "cute_flash_rescale_threshold": 8.0,
+    }
+    resolved = cute_flash.resolve_flash_config(
+        64,
+        8,
+        config,
+        dtype=torch.bfloat16,
+        standard_dense_output=True,
+    )
+
+    bound = _dense_attention_output.bind((q, k, v))
+    active_config = helion.Config(**config)
+    bound.set_config(active_config)
+    code = bound.to_triton_code(active_config)
+    out = bound(q, k, v)
+    repeated = bound(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    assert resolved.stat_transport == "single_final"
+    assert "flash_s_corr_prod_phase" in code
+    assert torch.equal(out, repeated)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected, atol=0.01, rtol=0.02)
+
+
+@onlyBackends(["cute"])
+def test_persistent_legacy_degree1_final_only_is_accurate_across_work() -> None:
+    torch.manual_seed(105)
+    q = torch.randn(1, 1, 262_144, 64, dtype=torch.float16, device=DEVICE)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    q.mul_(2.0)
+    k.mul_(2.0)
+    config = {
+        "block_sizes": [1, 128, 128],
+        "cute_flash_pipeline_family": "fa4_2cta",
+        "cute_flash_exp2_packet": _DEG1_PACKET,
+        "cute_flash_e2e_schedule": "16/8",
+        "cute_flash_e2e_offset": 0,
+        "cute_flash_e2e_offset0": 2,
+        "cute_flash_kv_stage": 2,
+        "cute_flash_persistent": True,
+        "cute_flash_stat_transport": "single_final",
+        "cute_flash_wait_hint": 0,
+        "cute_flash_rescale_threshold": 8.0,
+        "cute_flash_rescale_chunk_cols": 8,
+    }
+
+    bound = _dense_attention_output.bind((q, k, v))
+    active_config = helion.Config(**config)
+    bound.set_config(active_config)
+    code = bound.to_triton_code(active_config)
+    out = bound(q, k, v)
+    repeated = bound(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    diff = (out.float() - expected.float()).abs()
+    strict_failures = diff > (0.002 + 0.01 * expected.float().abs())
+    normalized_rmse = torch.sqrt((diff * diff).mean(dtype=torch.float64)) / torch.sqrt(
+        (expected.float() * expected.float()).mean(dtype=torch.float64)
+    )
+
+    assert f"_helion_flash_runtime_abi = {cute_flash._FLASH_RUNTIME_ABI}" in code
+    assert "degree1=True" in code
+    assert "while flash_tile_id <" in code
+    assert torch.equal(out, repeated)
+    assert torch.isfinite(out).all()
+    assert diff.max().item() < 0.01
+    assert normalized_rmse.item() < 0.002
+    assert strict_failures.count_nonzero().item() / out.numel() < 1e-5
+
+
+def test_persistent_final_only_stat_transport_carries_terminal_phase() -> None:
+    source = _emit_dense_single_stat_source(final_only_stat_pipeline=True)
+    assert source != _emit_dense_single_stat_source()
+
+    stage0_start = source.index("flash_s_corr_prod_phase = cutlass.Int32(0)")
+    stage1_start = source.index(
+        "flash_s_corr_prod_phase = cutlass.Int32(0)", stage0_start + 1
+    )
+    softmax0 = source[stage0_start:stage1_start]
+    terminal_wait = (
+        "_helion_flash_rt.mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
+        "flash_s_corr_prod_phase, 10000000)"
+    )
+    assert softmax0.count(terminal_wait) == 1
+    assert softmax0.count("flash_s_corr_prod_phase ^= 1") == 1
+    wait_index = softmax0.index(terminal_wait)
+    phase_index = softmax0.index("flash_s_corr_prod_phase ^= 1", wait_index)
+    rowsum_index = softmax0.index(
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_row_sum",
+        phase_index,
+    )
+    assert wait_index < phase_index < rowsum_index
+
+    correction = source[source.index("(warp_idx >= 8) & (warp_idx < 12):") :]
+    for stage in (0, 1):
+        empty = f"cute.arch.mbarrier_arrive(flash_s{stage}_corr_empty_ptr + 0)"
+        assert correction.count(empty) == 1
+
+
+@pytest.mark.parametrize(
+    ("packet", "softmax_disc", "rescale_threshold"),
+    ((_DEG1_SHORT_PACKET, False, 8.0), ("8x2", True, 8.0), ("8x2", False, 0.0)),
+)
+def test_dense_single_stat_unsupported_schedules_use_conservative_protocol(
+    packet: str, softmax_disc: bool, rescale_threshold: float
+) -> None:
+    source = _emit_dense_single_stat_source(
+        pipeline_family="fa4" if softmax_disc else "fa4_2cta",
+        packet=packet,
+        softmax_disc=softmax_disc,
+        rescale_threshold=rescale_threshold,
+    )
+
+    assert source.count("flash_s_corr_prod_phase = cutlass.Int32(0)") == 2
+    assert "flash_s_corr_prod_phase = cutlass.Int32(1)" not in source
+    correction = source[source.index("(warp_idx >= 8) & (warp_idx < 12):") :]
+    first_empty = correction.index(
+        "cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)"
+    )
+    first_ready = correction.index(
+        "_helion_flash_rt.named_barrier_wait_unaligned(3 + warp_idx % 4, 64)"
+    )
+    assert first_empty < first_ready
+
+
+def test_dense_ring2_emits_two_slot_stat_protocol() -> None:
+    def emit(stat_transport: str) -> str:
+        with patch.dict(os.environ, {}, clear=True):
+            config = cute_flash.resolve_flash_config(
+                64,
+                4,
+                _manual_config(
+                    "8x2",
+                    **{
+                        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
+                        cute_flash.FLASH_STAT_TRANSPORT_KEY: stat_transport,
+                        cute_flash.FLASH_PERSISTENT_KEY: True,
+                    },
+                ),
+                dtype=torch.float16,
+                is_causal=False,
+                standard_dense_output=True,
+            )
+        body = cute_flash.emit_flash_fa4_device_body(
+            cast("DeviceFunction", None),
+            head_dim=64,
+            num_kv=4,
+            sequence_extent=512,
+            num_bh=64,
+            total_tiles=128,
+            cfg=config,
+            has_lse=False,
+            io_dtype="cutlass.Float16",
+            score_plan=dense_score_plan(64),
+        )
+        return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+    ring2 = emit("ring2")
+    single = emit("single")
+
+    assert "flash_s_corr_prod_index = cutlass.Int32(0)" in ring2
+    assert "flash_s_corr_cons_index = cutlass.Int32(0)" in ring2
+    assert "flash_s_corr_prod_index ^= 1" in ring2
+    assert "flash_s_corr_cons_index ^= 1" in ring2
+    assert "if flash_s_corr_prod_index == 0:" in ring2
+    assert "flash_scale_t[flash_s_corr_prod_index, 0, flash_local_tidx]" in ring2
+    assert "flash_scale_t[flash_s_corr_cons_index, 0, flash_local_tidx]" in ring2
+    assert "flash_s_corr_prod_index" not in single
+    assert "flash_s_corr_cons_index" not in single
+    assert ring2 != single
+
+
 @onlyBackends(["cute"])
 def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
     torch.manual_seed(101)
@@ -450,19 +997,26 @@ def test_hybrid_packet_runtime_matches_sdpa_at_long_causal_threshold() -> None:
 
 
 @onlyBackends(["cute"])
-def test_hybrid_packet_runtime_matches_sdpa_beyond_previous_seed_cap() -> None:
+def test_transferred_degree2_packet_matches_sdpa_beyond_previous_seed_cap() -> None:
     torch.manual_seed(103)
     q, k, v = (
         torch.randn(1, 1, 1_048_576, 64, dtype=torch.float16, device=DEVICE)
         for _ in range(3)
     )
 
-    code, out = code_and_output(
-        _causal_attention_output,
-        (q, k, v),
-        **_hybrid_runtime_config(),
+    config = next(
+        seed.config
+        for seed in cute_flash.flash_attention_seed_configs(
+            64,
+            8192,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+        if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
     )
-    assert "degree1=True" in code
+    code, out = code_and_output(_causal_attention_output, (q, k, v), **config)
+    assert "degree1=True" not in code
     assert "degree2=True" in code
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
@@ -693,7 +1247,10 @@ def test_current_packets_keep_existing_normalization(packet: str) -> None:
 
 @pytest.mark.parametrize(
     ("packet", "schedule"),
-    ((_DEG2_PACKET, "16/6"), (_HYBRID_PACKET, "16/8")),
+    (
+        (_DEG2_PACKET, "16/6"),
+        (_HYBRID_PACKET, "16/8"),
+    ),
 )
 def test_manual_packet_config_spec_is_fixed_not_searched(
     packet: str, schedule: str

@@ -2475,8 +2475,14 @@ class TestCuteBackend(TestCase):
                 if "flash_grid_m_pairs_delta" in code:
                     self.assertIn("flash_grid_m_pairs_delta", code)
                     self.assertIn("flash_tmem_dealloc_ptr", code)
-                    self.assertIn("flash_tmem_user_bar.arrive_and_wait()", code)
-                    self.assertIn("flash_tmem_user_bar.arrive()", code)
+                    self.assertIn(
+                        "_helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)",
+                        code,
+                    )
+                    self.assertIn(
+                        "_helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)",
+                        code,
+                    )
                     self.assertNotIn("mbarrier_wait(flash_tmem_dealloc_ptr, 0)", code)
                     self.assertNotIn("mbarrier_arrive(flash_tmem_dealloc_ptr)", code)
                     self.assertNotIn("cute.arch.barrier()", code)
@@ -2614,12 +2620,99 @@ class TestCuteBackend(TestCase):
             cute_flash_stat_transport="single",
         )
         self.assertIn("while flash_tile_id < 192", code)
-        self.assertNotIn("flash_s_corr_prod_phase", code)
+        self.assertIn("flash_s_corr_prod_phase = cutlass.Int32(0)", code)
+        self.assertNotIn("flash_s_corr_prod_index", code)
+        for stage, barrier_id in ((0, 3), (1, 7)):
+            empty_arrive = (
+                f"cute.arch.mbarrier_arrive(flash_s{stage}_corr_empty_ptr + 0)"
+            )
+            self.assertIn(empty_arrive, code)
+            producer_wait_text = (
+                f"_helion_flash_rt.mbar_spin_wait("
+                f"flash_s{stage}_corr_empty_ptr + 0, flash_s_corr_prod_phase,"
+            )
+            producer_wait = code.index(producer_wait_text)
+            alpha_store = code.index(
+                f"flash_scale_t[{stage} * 128 + flash_local_tidx] = flash_alpha",
+                producer_wait,
+            )
+            producer_publish = code.index(
+                "_helion_flash_rt.named_barrier_arrive_unaligned(", alpha_store
+            )
+            producer_advance = code.index(
+                "flash_s_corr_prod_phase ^= 1", producer_publish
+            )
+            rowsum_wait = code.index(producer_wait_text, producer_advance)
+            rowsum_store = code.index(
+                f"flash_scale_t[{stage} * 128 + flash_local_tidx] = flash_row_sum",
+                rowsum_wait,
+            )
+            rowsum_publish = code.index(
+                "_helion_flash_rt.named_barrier_arrive_unaligned(", rowsum_store
+            )
+            rowsum_advance = code.index("flash_s_corr_prod_phase ^= 1", rowsum_publish)
+            consumer_wait = code.index(
+                f"_helion_flash_rt.named_barrier_wait_unaligned("
+                f"{barrier_id} + warp_idx % 4, 64)",
+                rowsum_advance,
+            )
+            alpha_load = code.index(
+                f"flash_a{stage} = flash_scale_t[{stage} * 128 + flash_local_tidx]",
+                consumer_wait,
+            )
+            consumer_release = code.index(empty_arrive, alpha_load)
+            final_wait = code.index(
+                f"_helion_flash_rt.named_barrier_wait_unaligned("
+                f"{barrier_id} + warp_idx % 4, 64)",
+                consumer_release,
+            )
+            rowsum_load = code.index(
+                f"flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz("
+                f"flash_scale_t[{stage} * 128 + flash_local_tidx])",
+                final_wait,
+            )
+            final_release = code.index(empty_arrive, rowsum_load)
+            self.assertLess(producer_wait, alpha_store)
+            self.assertLess(alpha_store, producer_publish)
+            self.assertLess(producer_publish, producer_advance)
+            self.assertLess(producer_advance, rowsum_wait)
+            self.assertLess(rowsum_wait, rowsum_store)
+            self.assertLess(rowsum_store, rowsum_publish)
+            self.assertLess(rowsum_publish, rowsum_advance)
+            self.assertLess(rowsum_advance, consumer_wait)
+            self.assertLess(consumer_wait, alpha_load)
+            self.assertLess(alpha_load, consumer_release)
+            self.assertLess(consumer_release, final_wait)
+            self.assertLess(final_wait, rowsum_load)
+            self.assertLess(rowsum_load, final_release)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=bias
         )
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
         self.assertTrue(torch.isfinite(lse).all())
+
+    def test_flash_attention_late_acquire_stat_handoff_persistent(self) -> None:
+        q, k, v = (
+            torch.randn(1, 64, 768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_persistent=True,
+            cute_flash_stat_transport="single",
+            cute_flash_exp2_packet="8x2",
+            cute_flash_softmax_disc=False,
+            cute_flash_rescale_threshold=8.0,
+        )
+
+        self.assertIn("while flash_tile_id < 192", code)
+        self.assertEqual(code.count("flash_s_corr_prod_phase = cutlass.Int32(1)"), 2)
+        self.assertNotIn("flash_s_corr_prod_phase = cutlass.Int32(0)", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
     def test_flash_attention_fa4_deep_one_cta_causal_split_matches_sdpa(
         self,
@@ -2706,6 +2799,30 @@ class TestCuteBackend(TestCase):
         self.assertIn("is_two_cta=True", code)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_ring2_stat_handoff_persistent_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(1, 64, 768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(
+            cute_dense_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            # 192 work items exceed B200's 148-CTA persistent grid, forcing
+            # phase and ring-index state to carry into a second work item.
+            cute_flash_pipeline_family="fa4",
+            cute_flash_stat_transport="ring2",
+            cute_flash_persistent=True,
+            cute_flash_persistent_ctas_per_sm=1,
+        )
+
+        self.assertIn("flash_s_corr_prod_index = cutlass.Int32(0)", code)
+        self.assertIn("flash_s_corr_cons_index = cutlass.Int32(0)", code)
+        self.assertIn("flash_s_corr_prod_index ^= 1", code)
+        self.assertIn("flash_s_corr_cons_index ^= 1", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
     def test_flash_attention_fa4_causal_two_cta_modifier_matches_sdpa(self) -> None:
         q, k, v = (
@@ -2919,6 +3036,7 @@ class TestCuteBackend(TestCase):
                     cute_flash_persistent=True,
                     cute_flash_use_2cta=True,
                     cute_flash_epi_tma=True,
+                    cute_flash_stat_transport="single",
                 )
 
                 self.assertIn("cta_group=2", code)
@@ -2928,6 +3046,11 @@ class TestCuteBackend(TestCase):
                 self.assertIn("mbarrier_init(flash_pfor2_ptr + flash_st, 256)", code)
                 self.assertIn("fa4_correction_epilogue_to_smem_scoped_2cta", code)
                 self.assertIn("'use_2cta_instrs': True", code)
+                self.assertIn(
+                    "mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
+                    "flash_s_corr_prod_phase",
+                    code,
+                )
                 self.assertIn("gemm_ptx_precomputed_qk_static", code)
                 self.assertIn(
                     "early_split_publish=True, pair_batch=8, emu_batch=2", code
@@ -3162,7 +3285,8 @@ class TestCuteBackend(TestCase):
                         "flash_local_tidx] = flash_alpha"
                     )
                     alpha_publish = masked_stage0.index(
-                        "cute.arch.barrier_arrive(", alpha_store
+                        "_helion_flash_rt.named_barrier_arrive_unaligned(",
+                        alpha_store,
                     )
                     self.assertEqual(masked_stage0.count("flash_minus_max_scale ="), 1)
                     minus_scale = masked_stage0.index("flash_minus_max_scale =")
@@ -3283,7 +3407,7 @@ class TestCuteBackend(TestCase):
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
 
-    def test_flash_attention_dense_degree1_seed_requires_standard_output(self) -> None:
+    def test_flash_attention_dense_degree2_seed_requires_standard_output(self) -> None:
         target = torch.empty(1, 1, 262_144, 64, dtype=torch.float16, device=DEVICE)
         cases = (
             (cute_dense_attention, True),
@@ -3297,14 +3421,22 @@ class TestCuteBackend(TestCase):
                     bound.config_spec._cute_flash_standard_dense_output,
                     expected_standard,
                 )
-                has_degree1_seed = any(
-                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
-                    in {"deg1_8x2_corr10", "deg1_16x8"}
+                self.assertFalse(
+                    any(
+                        seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
+                        in {"deg1_8x2_corr10", "deg1_16x8"}
+                        for seed in bound.config_spec.compiler_seed_configs
+                    )
+                )
+                has_degree2_seed = any(
+                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
                     for seed in bound.config_spec.compiler_seed_configs
                 )
-                self.assertEqual(has_degree1_seed, expected_standard)
+                self.assertEqual(has_degree2_seed, expected_standard)
 
-    def test_flash_attention_hybrid_seed_excludes_auxiliary_outputs(self) -> None:
+    def test_flash_attention_auxiliary_outputs_have_no_causal_degree1_seed(
+        self,
+    ) -> None:
         target = torch.empty(1, 1, 65_536, 64, dtype=torch.float16, device=DEVICE)
         slopes = torch.empty(1, dtype=torch.float32, device=DEVICE)
         cases = (
@@ -4726,19 +4858,16 @@ class TestCuteBackend(TestCase):
             dense_midrange = resolve_flash_config(64, 1536, force_two_cta)
             dense_long = resolve_flash_config(64, 2052, force_two_cta)
             dense_long_unaligned = resolve_flash_config(64, 2050, force_two_cta)
-            dense_long_seed = next(
-                seed
-                for seed in _cute_flash.flash_attention_seed_configs(
-                    64,
-                    2052,
-                    standard_dense_output=True,
-                )
-                if seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY) == "deg1_16x8"
-            )
             dense_long_degree1 = resolve_flash_config(
                 64,
                 2052,
-                dense_long_seed.config,
+                force_two_cta
+                | {
+                    _cute_flash.FLASH_EXP2_PACKET_KEY: "deg1_16x8",
+                    _cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/8",
+                    _cute_flash.FLASH_E2E_OFFSET_KEY: 0,
+                    _cute_flash.FLASH_E2E_OFFSET0_KEY: 10,
+                },
                 standard_dense_output=True,
             )
             dense_bf16 = resolve_flash_config(

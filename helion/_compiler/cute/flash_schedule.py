@@ -17,6 +17,8 @@ class FlashNodeKind(enum.Enum):
     QK_MMA = "qk_mma"
     SOFTMAX = "softmax"
     STAT_PUBLISH = "stat_publish"
+    FINAL_STAT_PUBLISH = "final_stat_publish"
+    FINAL_STAT_CONSUME = "final_stat_consume"
     CORRECTION = "correction"
     PV_MMA = "pv_mma"
     OUTPUT_STAGE = "output_stage"
@@ -61,6 +63,9 @@ class FlashScheduleSpec:
     output_order: FlashOutputOrder = FlashOutputOrder.INTERLEAVED
     cooperative_mma: bool = False
     split_p_arrive: bool = True
+    stat_depth: int = 2
+    pipelined_stat_handoff: bool = False
+    final_only_stat_handoff: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,6 +107,7 @@ class FlashMemoryRegion:
     writer: str
     consumers: tuple[str, ...]
     reuse_distance: int | None = None
+    reuse_barrier: str | None = None
     alias_group: str | None = None
     cta_rank: int | None = None
     physical: bool = True
@@ -201,6 +207,18 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
         raise FlashScheduleError("output order is invalid")
     if spec.dtype_bytes <= 0:
         raise FlashScheduleError("dtype size must be positive")
+    if spec.stat_depth not in (1, 2):
+        raise FlashScheduleError("stat transport depth must be one or two")
+    if spec.pipelined_stat_handoff and (spec.stat_depth != 1 or spec.causal):
+        raise FlashScheduleError(
+            "pipelined stat handoff requires depth one and a noncausal schedule"
+        )
+    if spec.final_only_stat_handoff and (spec.stat_depth != 1 or spec.causal):
+        raise FlashScheduleError(
+            "final-only stat handoff requires depth one and a noncausal schedule"
+        )
+    if spec.pipelined_stat_handoff and spec.final_only_stat_handoff:
+        raise FlashScheduleError("stat handoff modes are mutually exclusive")
 
     nodes: list[FlashNode] = []
     edges: list[FlashEdge] = []
@@ -226,6 +244,7 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     overhead_offset = output_offset + (
         spec.query_slots_per_cta * tile_bytes if spec.stage_output else 0
     )
+    stat_bytes_per_query = spec.stat_depth * 128 * 4
 
     load_nodes: set[str] = set()
     for rank in range(spec.cta_count):
@@ -352,6 +371,8 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
             qk = _node_name("qk", rank, slot)
             softmax = _node_name("softmax", rank, slot)
             stat = _node_name("stat", rank, slot)
+            final_stat_publish = _node_name("final_stat_publish", rank, slot)
+            final_stat_consume = _node_name("final_stat_consume", rank, slot)
             correction = _node_name("correction", rank, slot)
             pv = _node_name("pv", rank, slot)
             output_stage = _node_name("output_stage", rank, slot)
@@ -368,16 +389,35 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     FlashNode(output_store, FlashNodeKind.OUTPUT_STORE, rank, slot),
                 ]
             )
+            if spec.final_only_stat_handoff:
+                nodes.extend(
+                    [
+                        FlashNode(
+                            final_stat_publish,
+                            FlashNodeKind.FINAL_STAT_PUBLISH,
+                            rank,
+                            slot,
+                        ),
+                        FlashNode(
+                            final_stat_consume,
+                            FlashNodeKind.FINAL_STAT_CONSUME,
+                            rank,
+                            slot,
+                        ),
+                    ]
+                )
 
             q_ready = f"q_ready_r{rank}_q{slot}"
             s_full = f"s_full_r{rank}_q{slot}"
             stat_ready = f"stat_ready_r{rank}_q{slot}"
+            stat_empty = f"stat_empty_r{rank}_q{slot}"
             o_full = f"o_full_r{rank}_q{slot}"
             barriers.extend(
                 [
                     FlashBarrier(q_ready, 1, FlashSyncScope.CTA),
                     FlashBarrier(s_full, 1, FlashSyncScope.CTA),
                     FlashBarrier(stat_ready, 1, FlashSyncScope.CTA),
+                    FlashBarrier(stat_empty, 1, FlashSyncScope.CTA),
                     FlashBarrier(o_full, 1, FlashSyncScope.CTA),
                 ]
             )
@@ -448,6 +488,40 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                     ),
                 ]
             )
+            if not spec.final_only_stat_handoff:
+                edges.append(
+                    FlashEdge(
+                        correction,
+                        stat,
+                        iteration_delta=spec.stat_depth,
+                        barrier=stat_empty,
+                        arrival_count=1,
+                    )
+                )
+            else:
+                edges.extend(
+                    [
+                        FlashEdge(
+                            correction,
+                            final_stat_publish,
+                            barrier=stat_empty,
+                            arrival_count=1,
+                        ),
+                        FlashEdge(
+                            final_stat_publish,
+                            final_stat_consume,
+                            resource=f"FINAL_STAT_r{rank}_q{slot}",
+                        ),
+                    ]
+                )
+                if spec.persistent:
+                    edges.append(
+                        FlashEdge(
+                            final_stat_consume,
+                            stat,
+                            iteration_delta=1,
+                        )
+                    )
             if slot + 1 == spec.query_slots_per_cta:
                 if spec.cooperative_mma and rank != 0:
                     reuse_ranks: tuple[int, ...] | range = ()
@@ -564,15 +638,42 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                 FlashMemoryRegion(
                     f"STAT_r{rank}_q{slot}",
                     FlashMemorySpace.SMEM,
-                    overhead_offset + slot * 64,
-                    64,
+                    overhead_offset + slot * stat_bytes_per_query,
+                    stat_bytes_per_query,
                     16,
                     FlashVisibility.CTA_PRIVATE,
                     stat,
                     (correction,),
+                    reuse_distance=(
+                        1 if spec.final_only_stat_handoff else spec.stat_depth
+                    ),
+                    reuse_barrier=(
+                        None if spec.final_only_stat_handoff else stat_empty
+                    ),
+                    alias_group=(
+                        f"stat_terminal_r{rank}_q{slot}"
+                        if spec.final_only_stat_handoff
+                        else None
+                    ),
                     cta_rank=rank,
                 )
             )
+            if spec.final_only_stat_handoff:
+                regions.append(
+                    FlashMemoryRegion(
+                        f"FINAL_STAT_r{rank}_q{slot}",
+                        FlashMemorySpace.SMEM,
+                        overhead_offset + slot * stat_bytes_per_query,
+                        stat_bytes_per_query,
+                        16,
+                        FlashVisibility.CTA_PRIVATE,
+                        final_stat_publish,
+                        (final_stat_consume,),
+                        reuse_distance=1 if spec.persistent else None,
+                        alias_group=f"stat_terminal_r{rank}_q{slot}",
+                        cta_rank=rank,
+                    )
+                )
             if spec.stage_output:
                 regions.append(
                     FlashMemoryRegion(
@@ -651,8 +752,14 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
             )
         cycles = []
         for barrier in barriers:
+            stat_barrier = barrier.name.startswith(("stat_ready", "stat_empty"))
             uses_per_work = (
-                spec.kv_iterations
+                1
+                if spec.final_only_stat_handoff
+                and barrier.name.startswith("stat_empty")
+                else spec.kv_iterations + 1
+                if stat_barrier and spec.pipelined_stat_handoff
+                else spec.kv_iterations
                 if barrier.name.startswith(
                     (
                         "k_ready",
@@ -661,15 +768,25 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                         "v_reuse",
                         "s_full",
                         "stat_ready",
+                        "stat_empty",
                         "pfor",
                     )
                 )
                 else 1
             )
+            initial_phase = (
+                1
+                if spec.pipelined_stat_handoff and barrier.name.startswith("stat_empty")
+                else 0
+            )
             cycles.append(
                 FlashPhaseCycle(
                     barrier.name,
-                    (0, uses_per_work & 1, 0),
+                    (
+                        initial_phase,
+                        initial_phase ^ (uses_per_work & 1),
+                        initial_phase,
+                    ),
                     uses_per_work,
                 )
             )
@@ -789,6 +906,29 @@ def verify_flash_schedule(
                 f"barrier {barrier.name} expected {barrier.expected_arrivals} "
                 f"arrivals, got {arrivals[barrier.name]}"
             )
+    if schedule.spec.final_only_stat_handoff:
+        edge_keys = {
+            (edge.source, edge.target, edge.iteration_delta, edge.barrier)
+            for edge in schedule.edges
+        }
+        for rank in range(schedule.spec.cta_count):
+            for slot in range(schedule.spec.query_slots_per_cta):
+                correction = _node_name("correction", rank, slot)
+                stat = _node_name("stat", rank, slot)
+                publish = _node_name("final_stat_publish", rank, slot)
+                consume = _node_name("final_stat_consume", rank, slot)
+                if (
+                    (correction, publish, 0, f"stat_empty_r{rank}_q{slot}")
+                    not in edge_keys
+                    or (publish, consume, 0, None) not in edge_keys
+                    or (
+                        schedule.spec.persistent
+                        and (consume, stat, 1, None) not in edge_keys
+                    )
+                ):
+                    raise FlashScheduleError(
+                        "final-only stat handoff is missing terminal ordering"
+                    )
     if schedule.spec.multicast_kv:
         for rank in range(schedule.spec.cta_count):
             for operand, consumer_kind in (("k", "qk"), ("v", "pv")):
@@ -907,6 +1047,20 @@ def verify_flash_schedule(
                     raise FlashScheduleError(
                         f"memory region {region.name} is reused before all consumers"
                     )
+            if region.reuse_barrier is not None:
+                for consumer in region.consumers:
+                    if not any(
+                        edge.source == consumer
+                        and edge.target == region.writer
+                        and edge.iteration_delta == region.reuse_distance
+                        and edge.barrier == region.reuse_barrier
+                        for edge in schedule.edges
+                    ):
+                        raise FlashScheduleError(
+                            f"memory region {region.name} is reused before all consumers"
+                        )
+        elif region.reuse_barrier is not None:
+            raise FlashScheduleError("reuse barrier requires a reuse distance")
 
     for rank in range(schedule.spec.cta_count):
         k_region = region_by_name.get(f"K_r{rank}")
