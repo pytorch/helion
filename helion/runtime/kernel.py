@@ -662,18 +662,15 @@ class Kernel(Generic[_R]):
         if is_distributed is None:
             is_distributed = self._compute_is_distributed(args)
         key.append(is_distributed)
-        if signature is None and (
-            self._has_specialization_extras or self._key_fn is not None
-        ):
+        if signature is None and self._has_specialization_extras:
             signature = self._base_specialization_key(
                 args, is_distributed=is_distributed
             )
         if self._key_fn is not None:
-            assert signature is not None
-            key.append(signature[-1])
+            key.append(self._key_fn(*args) if signature is None else signature[-1])
         if signature is not None:
             extra_fns = self._specialize_extra.get(signature)
-            if extra_fns is not None:
+            if extra_fns:
                 extra_guards = tuple(
                     (extractor, extractor(args)) for extractor in extra_fns
                 )
@@ -1264,8 +1261,9 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
+        is_compiling = torch.compiler.is_compiling()
         if (
-            not torch.compiler.is_compiling()
+            not is_compiling
             and (prepared := self._prepared_call) is not None
             and prepared.matches(self, args)
             and prepared.bound._run is not None
@@ -1282,7 +1280,18 @@ class Kernel(Generic[_R]):
                 bound = self._dispatch_cache.get(fast_key)
                 if bound is not None and bound._run is not None:
                     run = bound._run
-                    if torch.compiler.is_compiling():
+                    if is_compiling:
+                        return run(*args)
+                    # Keyed calls cannot produce a prepared call.  The exact
+                    # dispatch key is sufficient when no late or distributed
+                    # guards require the locked revalidation below.
+                    if (
+                        self._key_fn is not None
+                        and not self._has_specialization_extras
+                        and not self.settings.distributed
+                        and not self._declares_process_group
+                        and not bound._env._is_distributed
+                    ):
                         return run(*args)
                     # A compilation can discover a late specialization while a
                     # different thread is reading this cache. Publish a prepared
@@ -1316,7 +1325,7 @@ class Kernel(Generic[_R]):
             return self.bind(args)(*args)
         bound = self.bind(args)
         result = bound(*args)
-        if torch.compiler.is_compiling():
+        if is_compiling:
             if self._has_specialization_extras:
                 bound = self.bind(args)
             if bound._run is not None:
