@@ -30,6 +30,14 @@ if TYPE_CHECKING:
 _TRITON_PREPARED_GLOBAL = 1
 
 
+class _FakeDispatchRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def __call__(self, *args: object) -> None:
+        self.calls.append(args)
+
+
 class _FakeCompiled:
     def __init__(self) -> None:
         self.runner_calls: list[tuple[object, ...]] = []
@@ -122,6 +130,107 @@ def _launch(
 
 @onlyBackends(["triton"])
 class TestPreparedTritonLauncherUnit(TestCase):
+    def test_dispatch_runners_project_arguments(self) -> None:
+        fake_triton = _fake_triton()
+        active = fake_triton.runtime.driver.active
+        compiled = SimpleNamespace(
+            _dispatch_arg_indices=(0, 2),
+            _dispatcher=object(),
+            _num_kernel_args=2,
+        )
+        fallback_compiled = SimpleNamespace(_dispatcher=None)
+        dispatch_runner = _FakeDispatchRunner()
+        dispatcher_fallback_calls: list[tuple[object, ...]] = []
+        fallback_calls: list[tuple[object, ...]] = []
+
+        def dispatcher_fallback_runner(*args: object) -> None:
+            dispatcher_fallback_calls.append(args)
+
+        def fallback_runner(*args: object) -> None:
+            fallback_calls.append(args)
+
+        with patch.object(launcher, "triton", fake_triton):
+            wrapped_dispatch = launcher._wrap_prepared_launch_runner(
+                active,
+                compiled,
+                dispatch_runner,
+                (1, 1, 1),
+                3,
+            )
+            wrapped_dispatcher_fallback = launcher._wrap_prepared_launch_runner(
+                active,
+                compiled,
+                dispatcher_fallback_runner,
+                (1, 1, 1),
+                3,
+            )
+            wrapped_fallback = launcher._wrap_prepared_launch_runner(
+                active,
+                fallback_compiled,
+                fallback_runner,
+                (1, 1, 1),
+                3,
+            )
+            wrapped_dispatch("runtime_a", "constexpr", "runtime_b")
+            wrapped_dispatcher_fallback("runtime_a", "constexpr", "runtime_b")
+            wrapped_fallback("runtime_a", "constexpr", "runtime_b")
+
+        self.assertEqual(dispatch_runner.calls, [("runtime_a", "runtime_b")])
+        self.assertEqual(dispatcher_fallback_calls, [("runtime_a", "runtime_b")])
+        self.assertEqual(fallback_calls, [("runtime_a", "constexpr", "runtime_b")])
+
+    def test_dispatch_runner_observes_hooks_added_after_prepare(self) -> None:
+        fake_triton = _fake_triton()
+        active = fake_triton.runtime.driver.active
+        active.get_current_stream = lambda _device: 17
+        dispatch_runner = _FakeDispatchRunner()
+        function = object()
+        packed_metadata = object()
+        launch_metadata = object()
+        result = object()
+        compiled = SimpleNamespace(
+            _dispatch_arg_indices=(0, 2),
+            _dispatcher=object(),
+            _num_kernel_args=2,
+            function=function,
+            packed_metadata=packed_metadata,
+            launch_metadata=Mock(return_value=launch_metadata),
+            run=Mock(return_value=result),
+        )
+
+        with patch.object(launcher, "triton", fake_triton):
+            wrapped = launcher._wrap_prepared_launch_runner(
+                active,
+                compiled,
+                dispatch_runner,
+                (2, 3),
+                3,
+            )
+            enter_hook = object()
+            exit_hook = object()
+            fake_triton.knobs.runtime.launch_enter_hook = enter_hook
+            fake_triton.knobs.runtime.launch_exit_hook = exit_hook
+            self.assertIs(wrapped("runtime_a", "constexpr", "runtime_b"), result)
+
+        self.assertFalse(dispatch_runner.calls)
+        compiled.launch_metadata.assert_called_once_with(  # type: ignore[union-attr]
+            (2, 3), 17, "runtime_a", "constexpr", "runtime_b"
+        )
+        compiled.run.assert_called_once_with(  # type: ignore[union-attr]
+            2,
+            3,
+            1,
+            17,
+            function,
+            packed_metadata,
+            launch_metadata,
+            enter_hook,
+            exit_hook,
+            "runtime_a",
+            "constexpr",
+            "runtime_b",
+        )
+
     def test_kernel_cache_membership_invalidates_prepared_launch(self) -> None:
         jit_fn = _FakeJITFunction()
         fake_triton = _fake_triton()
@@ -387,6 +496,27 @@ class TestPreparedTritonLauncherCuda(RefEagerTestDisabled, TestCase):
             )
         self.assertEqual(jit_run.call_count, 1)
         torch.testing.assert_close(out[:32], x[:32] * 2.5)
+
+    def test_specialized_scalar_uses_native_runner_abi(self) -> None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def fill(out, stride, value, block: tl.constexpr):
+            offsets = tl.arange(0, block)
+            tl.store(out + offsets * stride, value)
+
+        out = torch.empty(64, device=DEVICE)
+        launcher.default_launcher(fill, (1,), out, 1, 17, 64, num_warps=4, num_stages=1)
+        with patch.object(
+            fill,
+            "run",
+            side_effect=AssertionError("prepared launch called JITFunction.run"),
+        ):
+            launcher.default_launcher(
+                fill, (1,), out, 1, 19, 64, num_warps=4, num_stages=1
+            )
+        torch.testing.assert_close(out, torch.full_like(out, 19))
 
     def test_warmup_never_prepares_or_launches(self) -> None:
         import triton

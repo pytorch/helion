@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextvars
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -369,6 +370,64 @@ def _prepared_launch_cache(
     return cache
 
 
+def _wrap_prepared_launch_runner(
+    active: object,
+    compiled: object,
+    runner: Callable[..., object],
+    grid: tuple[int, ...],
+    num_args: int,
+) -> Callable[..., object]:
+    """Adapt Triton's dispatcher runner to the full JIT argument ABI."""
+    triton_module = triton
+    if triton_module is None or getattr(compiled, "_dispatcher", None) is None:
+        return runner
+
+    arg_indices = getattr(compiled, "_dispatch_arg_indices", None)
+    num_kernel_args = getattr(compiled, "_num_kernel_args", None)
+    if (
+        type(arg_indices) is not tuple
+        or type(num_kernel_args) is not int
+        or len(arg_indices) != num_kernel_args
+        or not all(
+            type(index) is int and 0 <= index < num_args for index in arg_indices
+        )
+    ):
+        raise TypeError("invalid Triton dispatcher argument indices")
+    dispatch_arg_indices = cast("tuple[int, ...]", arg_indices)
+
+    def run(*args: object) -> object:
+        runtime = triton_module.knobs.runtime
+        enter_hook = runtime.launch_enter_hook
+        exit_hook = runtime.launch_exit_hook
+        if not enter_hook and not exit_hook:
+            return runner(*(args[index] for index in dispatch_arg_indices))
+
+        # Dispatcher-backed runners bypass launch hooks.  Reproduce
+        # CompiledKernel's Python launch path while retaining the resolved
+        # binary and current stream whenever hooks become live after prepare.
+        device = active.get_current_device()  # pyrefly: ignore [missing-attribute]
+        stream = active.get_current_stream(  # pyrefly: ignore [missing-attribute]
+            device
+        )
+        launch_metadata = compiled.launch_metadata(  # pyrefly: ignore [missing-attribute]
+            grid, stream, *args
+        )
+        return compiled.run(  # pyrefly: ignore [missing-attribute, not-callable]
+            grid[0],
+            grid[1] if len(grid) > 1 else 1,
+            grid[2] if len(grid) > 2 else 1,
+            stream,
+            compiled.function,  # pyrefly: ignore [missing-attribute]
+            compiled.packed_metadata,  # pyrefly: ignore [missing-attribute]
+            launch_metadata,
+            enter_hook,
+            exit_hook,
+            *args,
+        )
+
+    return run
+
+
 def _is_future_kernel(compiled: object) -> bool:
     compiled_type = type(compiled)
     return (
@@ -527,12 +586,19 @@ def default_launcher(
                 grid[1] if len(grid) > 1 else 1,
                 grid[2] if len(grid) > 2 else 1,
             )
+            runner = _wrap_prepared_launch_runner(
+                active,
+                compiled,
+                compiled[normalized_grid],  # pyrefly: ignore [unsupported-operation]
+                grid,
+                len(args),
+            )
             cache.insert(
                 0,
                 (
                     guard,
                     (
-                        compiled[normalized_grid],  # pyrefly: ignore [unsupported-operation]
+                        runner,
                         compiled,
                     ),
                 ),
