@@ -10,6 +10,7 @@ import torch
 
 from helion import Config
 from helion._compiler.device_function import DeviceFunction
+from helion._compiler.pallas.codegen import _loop_offset_alignment
 from helion._compiler.pallas.memory_access import MemoryAccessKind
 from helion._compiler.pallas.memory_access import build_memory_access
 from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
@@ -105,6 +106,7 @@ def test_loop_offset_uses_only_proven_window_alignment() -> None:
         return cast("CodegenState", SimpleNamespace(device_function=device_function))
 
     aligned_state = make_state({block_id: 16}, block_size=32)
+    assert _loop_offset_alignment(block_id, aligned_state) == 16
     assert (
         _annotate_provable_sublane_alignment(aligned_state, block_id, "offset")
         == "pl.multiple_of(offset, 16)"
@@ -113,6 +115,7 @@ def test_loop_offset_uses_only_proven_window_alignment() -> None:
     # A block size that is not a multiple of the window alignment proves
     # nothing: offsets 16, 40, 64, ... are not all multiples of 16.
     unstepped_state = make_state({block_id: 16}, block_size=24)
+    assert _loop_offset_alignment(block_id, unstepped_state) is None
     assert (
         _annotate_provable_sublane_alignment(unstepped_state, block_id, "offset")
         == "offset"
