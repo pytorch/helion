@@ -13,7 +13,6 @@ from typing import Any
 from typing import cast
 
 import cutlass
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import nvvm
 from cutlass.base_dsl.typing import Numeric
@@ -23,6 +22,8 @@ from cutlass.cute.typing import Float32
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blackwell_helpers as sm100_utils_flash
+
+from ._mlir_compat import ir
 
 
 @functools.cache
@@ -80,14 +81,16 @@ def flash_fa4_shared_storage(
     epi_tma: bool = False,
     use_clc_scheduler: bool = False,
     clc_stages: int = 1,
+    separate_kv: bool = False,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
     16-warp / 512-thread layout: 2 softmax warpgroups (128 threads each), a
     correction warpgroup, and single MMA/load/epilogue/empty warps. The raw
     mbarriers (s_full / pfor / pfor2 / o_full / s*_corr) are FA4-style raw
-    handshakes. K and V share one FA4-style KV pipeline and one shared-memory
-    ring; the emitter aliases the V tensor over ``sK`` with the V swizzle.
+    handshakes. Legacy FA4 aliases K and V onto one shared-memory ring. The
+    deep one-CTA family instead gives K and V independent rings and pipeline
+    barriers so both operands can remain resident concurrently.
     s0_corr / s1_corr use the first ``s_corr_stage`` slots as full barriers and
     the second half as empty barriers. ``sScale`` is the FA4-style softmax to
     correction handoff: steady slots carry alpha, and the final slot carries
@@ -98,6 +101,41 @@ def flash_fa4_shared_storage(
     softmax_threads = 128
     clc_response_size = clc_stages * 4 if use_clc_scheduler else 0
     clc_mbar_size = clc_stages * 2 if use_clc_scheduler else 0
+    separate_o_size = 128 * head_dim * 2 if epi_tma else 0
+
+    if separate_kv:
+
+        @cute.struct
+        class SharedStorage:
+            q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
+            k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+            v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+            s_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            pfor_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            pfor2_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            o_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            corr_epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+            s0_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
+            s1_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
+            tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_holding_buf: cutlass.Int32
+            sScale: cute.struct.MemRange[
+                cutlass.Float32, s_corr_stage * q_stage * softmax_threads
+            ]
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
+            clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            ]
+            sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
+
+        return SharedStorage
 
     if epi_tma:
 
@@ -124,7 +162,9 @@ def flash_fa4_shared_storage(
             # PipelineClcFetchAsync expects one full and one empty mbarrier per
             # CLC stage. The response is 16 bytes, stored as 4 Int32s.
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
-            clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
+            ]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
@@ -157,7 +197,9 @@ def flash_fa4_shared_storage(
         # PipelineClcFetchAsync expects one full and one empty mbarrier per
         # CLC stage. The response is 16 bytes, stored as 4 Int32s.
         clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
-        clc_response: cute.struct.MemRange[cutlass.Int32, clc_response_size]
+        clc_response: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, clc_response_size], 16
+        ]
         sQ: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
@@ -168,7 +210,9 @@ def flash_fa4_shared_storage(
     return SharedStorage
 
 
-def mbar_spin_wait(mbar_ptr: object, phase: object) -> None:
+def mbar_spin_wait(
+    mbar_ptr: object, phase: object, wait_hint: int = 10_000_000
+) -> None:
     """FA4-style TIGHT busy-spin mbarrier wait (NO nanosleep backoff).
 
     ``cute.arch.mbarrier_wait`` lowers to a try_wait with a NANOSLEEP backoff
@@ -187,7 +231,7 @@ def mbar_spin_wait(mbar_ptr: object, phase: object) -> None:
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [$0], $1, 10000000;\n\t"
+        f"mbarrier.try_wait.parity.shared::cta.b64 P1, [$0], $1, {wait_hint};\n\t"
         "@P1 bra DONE;\n\t"
         "bra LAB_WAIT;\n\t"
         "DONE:\n\t"
@@ -223,6 +267,42 @@ def mbarrier_arrive(
             [],
             [],
         )
+
+
+@dsl_user_op
+def named_barrier_arrive_unaligned(
+    barrier_id: object,
+    number_of_threads: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Arrive at a named barrier from a divergent warp-role branch."""
+    cute.arch.barrier_arrive(
+        barrier_id=barrier_id,
+        number_of_threads=number_of_threads,
+        aligned=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def named_barrier_wait_unaligned(
+    barrier_id: object,
+    number_of_threads: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Arrive and wait at a named barrier from a divergent warp-role branch."""
+    nvvm.barrier_cta_sync(
+        cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip),
+        thread_count=cutlass.Int32(number_of_threads).ir_value(loc=loc, ip=ip),
+        aligned=False,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -263,6 +343,11 @@ _POLY_EX2_DEG3 = (
     0.695146143436431884765625,
     0.227564394474029541015625,
     0.077119089663028717041015625,
+)
+_POLY_EX2_DEG2 = (
+    1.0017247632060873,
+    0.65763628,
+    0.33718943,
 )
 _FP32_ROUND_INT = float(2**23 + 2**22)
 
@@ -359,6 +444,67 @@ def ex2_emulation_batch(pairs: list[tuple]) -> list[tuple]:
         )
         for rounded, frac_ex2 in zip(xy_rounded, xy_frac_ex2, strict=True)
     ]
+
+
+def ex2_emulation_deg2_2(x: Float32, y: Float32) -> tuple:
+    """Packed degree-2 software exp2 with a [0, 1] minimax approximation."""
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped,
+        (_FP32_ROUND_INT, _FP32_ROUND_INT),
+        rnd="rm",
+    )
+    xy_rounded_back = _sub_packed_f32x2(xy_rounded, (_FP32_ROUND_INT, _FP32_ROUND_INT))
+    xy_frac = _sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac_ex2 = _evaluate_polynomial_2(xy_frac[0], xy_frac[1], _POLY_EX2_DEG2)
+    x_out = _combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0])
+    y_out = _combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1])
+    return x_out, y_out
+
+
+def ex2_emulation_deg2_batch(pairs: list[tuple]) -> list[tuple]:
+    """Level-schedule independent packed degree-2 software exp2 pairs."""
+    xy_clamped = [
+        (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0)) for x, y in pairs
+    ]
+    xy_rounded = [
+        cute.arch.add_packed_f32x2(
+            pair,
+            (_FP32_ROUND_INT, _FP32_ROUND_INT),
+            rnd="rm",
+        )
+        for pair in xy_clamped
+    ]
+    xy_rounded_back = [
+        _sub_packed_f32x2(pair, (_FP32_ROUND_INT, _FP32_ROUND_INT))
+        for pair in xy_rounded
+    ]
+    xy_frac = list(
+        starmap(_sub_packed_f32x2, zip(xy_clamped, xy_rounded_back, strict=True))
+    )
+    xy_frac_ex2 = [(_POLY_EX2_DEG2[-1], _POLY_EX2_DEG2[-1]) for _ in pairs]
+    for coefficient in reversed(_POLY_EX2_DEG2[:-1]):
+        xy_frac_ex2 = [
+            _fma_packed_f32x2(poly, frac, (coefficient, coefficient))
+            for poly, frac in zip(xy_frac_ex2, xy_frac, strict=True)
+        ]
+    return [
+        (
+            _combine_int_frac_ex2(rounded[0], frac_ex2[0]),
+            _combine_int_frac_ex2(rounded[1], frac_ex2[1]),
+        )
+        for rounded, frac_ex2 in zip(xy_rounded, xy_frac_ex2, strict=True)
+    ]
+
+
+def ex2_emulation_deg1_2(x: Float32, y: Float32) -> tuple:
+    """Accurate compatibility route for legacy degree-1 packet schedules."""
+    return ex2_emulation_deg2_2(x, y)
+
+
+def ex2_emulation_deg1_batch(pairs: list[tuple]) -> list[tuple]:
+    """Accurate compatibility route for legacy degree-1 packet schedules."""
+    return ex2_emulation_deg2_batch(pairs)
 
 
 def exp2_split_inplace(
@@ -784,31 +930,47 @@ def fa4_exp2_convert_rowsum(
     return cutlass.Float32(s0[0]) + cutlass.Float32(s0[1])  # pyrefly: ignore[bad-argument-type]
 
 
-def _fmax_reduce_chunk(frg: cute.Tensor, init_val: Float32) -> Float32:
-    """fmax over a small fragment ``frg`` (one 32-elem t2r chunk) with 2 scalar
-    accumulators, folding the running ``init_val`` row-max in. Used by the
-    chunked-t2r row-max pass so the full 128-elem row is NEVER held."""
+def _fmax_reduce_chunk_balanced(frg: cute.Tensor, init_val: Float32) -> Float32:
+    """Reduce one 16- or 32-value t2r chunk with a balanced FMNMX3 tree.
+
+    Four independent chains cover ``init_val`` and the scores in the minimum
+    eight or sixteen ternary max instructions. The longest dependency chain is
+    three or five instructions, while retaining the one-fragment footprint.
+    """
     n = cute.size(frg)
-    lm0 = cute.arch.fmax(init_val, frg[0])
-    lm0 = cute.arch.fmax(lm0, frg[1])
-    lm1 = cute.arch.fmax(frg[2], frg[3])
-    for i in range(4, n, 4):
-        lm0 = cute.arch.fmax(lm0, cute.arch.fmax(frg[i + 0], frg[i + 1]))
-        lm1 = cute.arch.fmax(lm1, cute.arch.fmax(frg[i + 2], frg[i + 3]))
-    return cute.arch.fmax(lm0, lm1)
+    assert n in (16, 32), "balanced row-max requires a 16- or 32-value chunk"
+    lm0 = _fmax3(init_val, frg[0], frg[1])
+    lm1 = _fmax3(frg[2], frg[3], frg[4])
+    lm2 = _fmax3(frg[5], frg[6], frg[7])
+    lm3 = _fmax3(frg[8], frg[9], frg[10])
+    lm0 = _fmax3(lm0, frg[11], frg[12])
+    lm1 = _fmax3(lm1, frg[13], frg[14])
+    if n == 16:
+        lm2 = _fmax3(lm2, lm3, frg[15])
+        return _fmax3(lm0, lm1, lm2)
+    lm2 = _fmax3(lm2, frg[15], frg[16])
+    lm3 = _fmax3(lm3, frg[17], frg[18])
+    lm0 = _fmax3(lm0, frg[19], frg[20])
+    lm1 = _fmax3(lm1, frg[21], frg[22])
+    lm2 = _fmax3(lm2, frg[23], frg[24])
+    lm3 = _fmax3(lm3, frg[25], frg[26])
+    lm0 = _fmax3(lm0, frg[27], frg[28])
+    lm1 = _fmax3(lm1, frg[29], frg[30])
+    lm2 = _fmax3(lm2, lm3, frg[31])
+    return _fmax3(lm0, lm1, lm2)
 
 
-def fa4_disc_rowmax(
+def fa4_disc_rowmax_balanced(
     tiled_ld: object,
     tLDtS: cute.Tensor,
     tLDcS: cute.Tensor,
     row_max: Float32,
     ld_chunks: int,
 ) -> Float32:
-    """CHUNKED-t2r PASS 1 (row-max). For each of ``ld_chunks`` 32-elem column
-    chunks, t2r ONE chunk into a small fragment, fold into the running max via
+    """CHUNKED-t2r PASS 1 (row-max). For each 16- or 32-element column
+    chunk, t2r ONE chunk into a small fragment, fold into the running max via
     scalar fmax, then FREE the chunk -- so the full fp32 row is NEVER simultaneously
-    resident (peak live = ONE 32-elem fragment). The chunked-t2r
+    resident (peak live = ONE chunk fragment). The chunked-t2r
     ``_disc_pass1_max`` structure is the key reason the softmax body is the only one
     that closes the FA4 200/64/48/24 setmaxnreg split with ZERO spill, whereas the
     whole-row ("sp") body keeps a 128-f32 row resident and spills past the grant.
@@ -825,12 +987,12 @@ def fa4_disc_rowmax(
     for ci in range(ld_chunks):
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
-        row_max = _fmax_reduce_chunk(frg, row_max)
+        row_max = _fmax_reduce_chunk_balanced(frg, row_max)
     cute.arch.fence_view_async_tmem_load()
     return row_max
 
 
-def fa4_disc_rowmax_causal(
+def fa4_disc_rowmax_causal_balanced(
     tiled_ld: object,
     tLDtS: cute.Tensor,
     tLDcS: cute.Tensor,
@@ -839,7 +1001,7 @@ def fa4_disc_rowmax_causal(
     m_block: cutlass.Int32,
     n_block: cutlass.Int32,
 ) -> Float32:
-    """Causal variant of ``fa4_disc_rowmax`` for the FA4 topology."""
+    """Causal variant of ``fa4_disc_rowmax_balanced`` for the FA4 topology."""
     ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
     for ci in range(ld_chunks):
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
@@ -851,7 +1013,7 @@ def fa4_disc_rowmax_causal(
             n_block,
             ci,
         )
-        row_max = _fmax_reduce_chunk(frg, row_max)
+        row_max = _fmax_reduce_chunk_balanced(frg, row_max)
     cute.arch.fence_view_async_tmem_load()
     return row_max
 
@@ -875,6 +1037,8 @@ def fa4_disc_exp_convert_store(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -908,7 +1072,15 @@ def fa4_disc_exp_convert_store(
         cute.copy(tiled_ld, tLDtS[None, ci, None, None], frg)
         last_frag = ci >= p_store_chunks - 1
         _disc_chunk_exp(
-            frg, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, last_frag
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            last_frag,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
@@ -945,6 +1117,8 @@ def fa4_disc_exp_convert_store_causal(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store``."""
     p_sum = cutlass.Float32(0.0)
@@ -961,7 +1135,15 @@ def fa4_disc_exp_convert_store_causal(
         )
         last_frag = ci >= p_store_chunks - 1
         _disc_chunk_exp(
-            frg, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, last_frag
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            last_frag,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
@@ -987,6 +1169,8 @@ def _disc_chunk_exp(
     last_frag: bool,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
 ) -> None:
     """In-place packed scale-subtract then exp2(pipe-split) over ONE 32-elem chunk.
 
@@ -995,6 +1179,7 @@ def _disc_chunk_exp(
     ``e2e_offset`` shifts the residue phase for the two softmax stages.
     Verbatim from the serial ``fa4_disc_exp_convert_store`` body; factored out so the
     serial and software-pipelined pass2 share the SAME per-chunk numerics."""
+    assert not (degree1 and degree2)
     nf = cute.size(frg)
     if pair_batch == 1:
         # Preserve the established instruction order for every caller that does
@@ -1009,6 +1194,10 @@ def _disc_chunk_exp(
             if use_xu:
                 frg[i] = cute.arch.exp2(r0)
                 frg[i + 1] = cute.arch.exp2(r1)
+            elif degree1:
+                frg[i], frg[i + 1] = ex2_emulation_deg1_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
+            elif degree2:
+                frg[i], frg[i + 1] = ex2_emulation_deg2_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
             else:
                 frg[i], frg[i + 1] = ex2_emulation_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
         return
@@ -1032,18 +1221,33 @@ def _disc_chunk_exp(
                 frg[i] = cute.arch.exp2(r0)
                 frg[i + 1] = cute.arch.exp2(r1)
             elif emu_batch == 1:
-                frg[i], frg[i + 1] = ex2_emulation_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
+                if degree1:
+                    frg[i], frg[i + 1] = ex2_emulation_deg1_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
+                elif degree2:
+                    frg[i], frg[i + 1] = ex2_emulation_deg2_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
+                else:
+                    frg[i], frg[i + 1] = ex2_emulation_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
             else:
                 pending_indices.append(i)
                 pending_values.append((r0, r1))
                 if len(pending_values) == emu_batch:
-                    results = ex2_emulation_batch(pending_values)
+                    if degree1:
+                        results = ex2_emulation_deg1_batch(pending_values)
+                    elif degree2:
+                        results = ex2_emulation_deg2_batch(pending_values)
+                    else:
+                        results = ex2_emulation_batch(pending_values)
                     for pending_i, result in zip(pending_indices, results, strict=True):
                         frg[pending_i], frg[pending_i + 1] = result
                     pending_indices = []
                     pending_values = []
         if pending_values:
-            results = ex2_emulation_batch(pending_values)
+            if degree1:
+                results = ex2_emulation_deg1_batch(pending_values)
+            elif degree2:
+                results = ex2_emulation_deg2_batch(pending_values)
+            else:
+                results = ex2_emulation_batch(pending_values)
             for pending_i, result in zip(pending_indices, results, strict=True):
                 frg[pending_i], frg[pending_i + 1] = result
 
@@ -1111,6 +1315,8 @@ def fa4_disc_exp_convert_store_rep32(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -1132,7 +1338,15 @@ def fa4_disc_exp_convert_store_rep32(
         frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
         cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg)
         _disc_chunk_exp(
-            frg, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            False,
+            pair_batch,
+            emu_batch,
         )
         pchunk0 = cute.make_tensor(
             cute.recast_ptr(pchunk.iterator, dtype=io_dtype), frg.layout
@@ -1149,6 +1363,8 @@ def fa4_disc_exp_convert_store_rep32(
             e2e_res,
             e2e_offset,
             ci >= p_store_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         pchunk1 = cute.make_tensor(
             cute.recast_ptr(pchunk.iterator + half_f32, dtype=io_dtype), frg.layout
@@ -1189,6 +1405,8 @@ def fa4_disc_exp_convert_store_rep32_split(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """Rep32 P store while preserving the 3/4 staged-P release.
 
@@ -1207,7 +1425,15 @@ def fa4_disc_exp_convert_store_rep32_split(
         cute.copy(tiled_ld, tLDtS[None, ld_ci0, None, None], frg0)
         cute.copy(tiled_ld, tLDtS[None, ld_ci1, None, None], frg1)
         _disc_chunk_exp(
-            frg0, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+            frg0,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            False,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_exp(
             frg1,
@@ -1217,6 +1443,8 @@ def fa4_disc_exp_convert_store_rep32_split(
             e2e_res,
             e2e_offset,
             ld_ci1 >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_pair_convert_store(
             frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
@@ -1234,6 +1462,8 @@ def fa4_disc_exp_convert_store_rep32_split(
             e2e_res,
             e2e_offset,
             ld_ci >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ld_ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
@@ -1251,6 +1481,8 @@ def fa4_disc_exp_convert_store_rep32_split(
             e2e_res,
             e2e_offset,
             ci >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
@@ -1279,6 +1511,8 @@ def fa4_disc_exp_convert_store_rep32_pipe(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """Software-pipelined Rep32 PASS2.
 
@@ -1319,6 +1553,8 @@ def fa4_disc_exp_convert_store_rep32_pipe(
                 e2e_res,
                 e2e_offset,
                 ld_ci >= ld_chunks - 1,
+                pair_batch,
+                emu_batch,
             )
             pchunk_half = cute.make_tensor(
                 cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
@@ -1359,6 +1595,8 @@ def fa4_disc_exp_convert_store_sload16_pair_pipe(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """PASS2 for Rep16 S-loads paired into the regular Rep16 P-store.
 
@@ -1399,6 +1637,8 @@ def fa4_disc_exp_convert_store_sload16_pair_pipe(
                 e2e_res,
                 e2e_offset,
                 ld_ci >= ld_chunks - 1,
+                pair_batch,
+                emu_batch,
             )
             pchunk_half = cute.make_tensor(
                 cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
@@ -1440,6 +1680,8 @@ def fa4_disc_exp_convert_store_rep32_causal(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """Causal Rep32 PASS2 variant."""
     p_sum = cutlass.Float32(0.0)
@@ -1460,7 +1702,15 @@ def fa4_disc_exp_convert_store_rep32_causal(
             ld_ci0,
         )
         _disc_chunk_exp(
-            frg, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+            frg,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            False,
+            pair_batch,
+            emu_batch,
         )
         pchunk0 = cute.make_tensor(
             cute.recast_ptr(pchunk.iterator, dtype=io_dtype), frg.layout
@@ -1484,6 +1734,8 @@ def fa4_disc_exp_convert_store_rep32_causal(
             e2e_res,
             e2e_offset,
             ci >= p_store_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         pchunk1 = cute.make_tensor(
             cute.recast_ptr(pchunk.iterator + half_f32, dtype=io_dtype), frg.layout
@@ -1525,6 +1777,8 @@ def fa4_disc_exp_convert_store_rep32_pipe_causal(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store_rep32_pipe``."""
     p_sum = cutlass.Float32(0.0)
@@ -1566,6 +1820,8 @@ def fa4_disc_exp_convert_store_rep32_pipe_causal(
                 e2e_res,
                 e2e_offset,
                 ld_ci >= ld_chunks - 1,
+                pair_batch,
+                emu_batch,
             )
             pchunk_half = cute.make_tensor(
                 cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
@@ -1608,6 +1864,8 @@ def fa4_disc_exp_convert_store_sload16_pair_pipe_causal(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store_sload16_pair_pipe``."""
     p_sum = cutlass.Float32(0.0)
@@ -1649,6 +1907,8 @@ def fa4_disc_exp_convert_store_sload16_pair_pipe_causal(
                 e2e_res,
                 e2e_offset,
                 ld_ci >= ld_chunks - 1,
+                pair_batch,
+                emu_batch,
             )
             pchunk_half = cute.make_tensor(
                 cute.recast_ptr(pchunk.iterator + half * half_f32, dtype=io_dtype),
@@ -1692,6 +1952,8 @@ def fa4_disc_exp_convert_store_rep32_split_causal(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
 ) -> Float32:
     """Causal Rep32 staged-P variant."""
     p_sum = cutlass.Float32(0.0)
@@ -1720,7 +1982,15 @@ def fa4_disc_exp_convert_store_rep32_split_causal(
             ld_ci1,
         )
         _disc_chunk_exp(
-            frg0, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, False
+            frg0,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            False,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_exp(
             frg1,
@@ -1730,6 +2000,8 @@ def fa4_disc_exp_convert_store_rep32_split_causal(
             e2e_res,
             e2e_offset,
             ld_ci1 >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_pair_convert_store(
             frg0, frg1, tiled_st32, tST32tS, tST32cS, pair_ci, io_dtype
@@ -1754,6 +2026,8 @@ def fa4_disc_exp_convert_store_rep32_split_causal(
             e2e_res,
             e2e_offset,
             ld_ci >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ld_ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
@@ -1778,6 +2052,8 @@ def fa4_disc_exp_convert_store_rep32_split_causal(
             e2e_res,
             e2e_offset,
             ci >= ld_chunks - 1,
+            pair_batch,
+            emu_batch,
         )
         _disc_chunk_convert_store(frg, tiled_st16, tST16tS, tST16cS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
@@ -1894,10 +2170,11 @@ def fa4_correction_epilogue_handoff_to_smem(
     tOcO_corr_t2r: cute.Tensor,
     inv_sum: object,
     chunks: int,
+    wait_hint: int = 10_000_000,
 ) -> None:
     """Wait for O/epilogue handoff, stage final O in SMEM, then publish it."""
-    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
-    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase, wait_hint)
     fa4_correction_epilogue_to_smem(
         tiled_t2r,
         tiled_r2s,
@@ -2028,10 +2305,11 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
     head_dim: int,
     corr_tile_size: int,
     o_dtype: object,
+    wait_hint: int = 10_000_000,
 ) -> None:
     """Wait for O/epilogue handoff, scope copy views, then publish staged O."""
-    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
-    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase, wait_hint)
     fa4_correction_epilogue_to_smem_scoped(
         flash_pvt,
         tOtO,
@@ -2060,10 +2338,11 @@ def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
     head_dim: int,
     corr_tile_size: int,
     o_dtype: object,
+    wait_hint: int = 10_000_000,
 ) -> None:
     """Wait for handoff and stage a two-CTA output in CTA-local shared memory."""
-    mbar_spin_wait(o_full_ptr_stage, o_full_phase)
-    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase)
+    mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
+    mbar_spin_wait(corr_epi_empty_ptr_stage, corr_epi_empty_phase, wait_hint)
     fa4_correction_epilogue_to_smem_scoped_2cta(
         flash_pvt,
         tOtO,
@@ -2099,6 +2378,8 @@ def _fa4_sp_exp_convert_store_impl(
     early_split_publish: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2123,6 +2404,8 @@ def _fa4_sp_exp_convert_store_impl(
                 ci >= frag_count - 1,
                 pair_batch,
                 emu_batch,
+                degree2,
+                degree1,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_split):
@@ -2141,6 +2424,8 @@ def _fa4_sp_exp_convert_store_impl(
                 ci >= frag_count - 1,
                 pair_batch,
                 emu_batch,
+                degree2,
+                degree1,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_split, p_store_chunks):
@@ -2160,6 +2445,8 @@ def _fa4_sp_exp_convert_store_impl(
                 ci >= frag_count - 1,
                 pair_batch,
                 emu_batch,
+                degree2,
+                degree1,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_chunks):
@@ -2204,6 +2491,8 @@ def fa4_sp_exp_convert_store(
     early_split_publish: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2230,6 +2519,8 @@ def fa4_sp_exp_convert_store(
         early_split_publish,
         pair_batch,
         emu_batch,
+        degree2,
+        degree1,
     )
 
 
@@ -2254,6 +2545,8 @@ def fa4_sp_exp_convert_store_whole_rowsum(
     early_split_publish: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2280,6 +2573,8 @@ def fa4_sp_exp_convert_store_whole_rowsum(
         early_split_publish,
         pair_batch,
         emu_batch,
+        degree2,
+        degree1,
     )
 
 
@@ -2302,6 +2597,8 @@ def _fa4_sp_exp_convert_store_rep32_split_impl(
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
     whole_row_sum: bool = False,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -2318,6 +2615,8 @@ def _fa4_sp_exp_convert_store_rep32_split_impl(
             e2e_res,
             e2e_offset,
             ci >= frag_count - 1,
+            pair_batch,
+            emu_batch,
         )
     split_ld_chunks = frag_count * 3 // 4
     pair_chunks = split_ld_chunks // 2
@@ -2381,6 +2680,8 @@ def fa4_sp_exp_convert_store_rep32_split(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -2404,6 +2705,9 @@ def fa4_sp_exp_convert_store_rep32_split(
         io_dtype,
         pfor_peer_cta_rank,
         pfor_self_cta_rank,
+        False,
+        pair_batch,
+        emu_batch,
     )
 
 
@@ -2425,6 +2729,8 @@ def fa4_sp_exp_convert_store_rep32_split_whole_rowsum(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
     *,
     loc: object = None,
     ip: object = None,
@@ -2449,6 +2755,8 @@ def fa4_sp_exp_convert_store_rep32_split_whole_rowsum(
         pfor_peer_cta_rank,
         pfor_self_cta_rank,
         True,
+        pair_batch,
+        emu_batch,
     )
 
 
@@ -2511,6 +2819,10 @@ def fa4_disc_exp_convert_store_pipe(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
 ) -> Float32:
     """SOFTWARE-PIPELINED chunked-t2r PASS 2 (the L1 lever). Same numerics + staged-P
     handshake + zero-spill peak (ONE chunk + a bounded pipeline window) as the serial
@@ -2564,7 +2876,17 @@ def fa4_disc_exp_convert_store_pipe(
         cute.arch.fence_view_async_tmem_load()
         last_frag = ci >= p_store_chunks - 1
         _disc_chunk_exp(
-            cur, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, last_frag
+            cur,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            last_frag,
+            pair_batch,
+            emu_batch,
+            degree2,
+            degree1,
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)
@@ -2602,6 +2924,10 @@ def fa4_disc_exp_convert_store_pipe_causal(
     io_dtype: object = cutlass.Float16,
     pfor_peer_cta_rank: object = None,
     pfor_self_cta_rank: object = None,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+    degree1: bool = False,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store_pipe``."""
     p_sum = cutlass.Float32(0.0)
@@ -2631,7 +2957,17 @@ def fa4_disc_exp_convert_store_pipe_causal(
         )
         last_frag = ci >= p_store_chunks - 1
         _disc_chunk_exp(
-            cur, scale, minus_max_scale, e2e_freq, e2e_res, e2e_offset, last_frag
+            cur,
+            scale,
+            minus_max_scale,
+            e2e_freq,
+            e2e_res,
+            e2e_offset,
+            last_frag,
+            pair_batch,
+            emu_batch,
+            degree2,
+            degree1,
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)

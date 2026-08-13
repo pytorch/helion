@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+from typing import TYPE_CHECKING
 from typing import cast
 
 import sympy
@@ -9,6 +10,9 @@ import torch
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _to_sympy
 from . import _decorators
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def compute_symbolic_min_max(
@@ -31,11 +35,16 @@ def compute_symbolic_min_max(
     return shape_env.create_symintnode(expr, hint=hint)  # type: ignore[return-value]
 
 
-def _compute_scalar_tensor_min(
+def _compute_scalar_tensor_min_max(
     args: tuple[int | torch.SymInt | torch.Tensor, ...],
+    elementwise: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
 ) -> torch.Tensor:
+    """Reduce mixed int/SymInt/0-D tensor args with ``elementwise``.
+
+    Non-tensor args are materialized against the first tensor, so the result
+    keeps that tensor's dtype and device.
+    """
     reference = next(arg for arg in args if isinstance(arg, torch.Tensor))
-    assert isinstance(reference, torch.Tensor)
     if any(isinstance(arg, torch.Tensor) and arg.ndim != 0 for arg in args):
         raise TypeError("device min/max only supports scalar tensor arguments")
     tensor_args = [
@@ -46,7 +55,7 @@ def _compute_scalar_tensor_min(
     ]
     result = tensor_args[0]
     for arg in tensor_args[1:]:
-        result = torch.minimum(result, arg)
+        result = elementwise(result, arg)
     return result
 
 
@@ -66,21 +75,25 @@ def _builtin_min(
         The minimum value with the corresponding scalar representation.
     """
     if any(isinstance(arg, torch.Tensor) for arg in args):
-        return _compute_scalar_tensor_min(args)
+        return _compute_scalar_tensor_min_max(args, torch.minimum)
     return compute_symbolic_min_max(args, op=builtins.min)  # type: ignore[arg-type]
 
 
 @_decorators.device_func_replacement(builtins.max)
-def _builtin_max(*args: int | torch.SymInt) -> torch.SymInt | int:
-    """Device replacement for builtin max() that supports symbolic integers.
+def _builtin_max(
+    *args: int | torch.SymInt | torch.Tensor,
+) -> torch.SymInt | torch.Tensor | int:
+    """Device replacement for max() over symbolic ints or scalar tensors.
 
-    Returns the maximum value among the provided arguments, preserving
-    symbolic integer expressions when present.
+    A scalar tensor result is used when any input is a scalar tensor; otherwise
+    symbolic integer expressions are preserved.
 
     Args:
-        *args: Integer arguments, which may be concrete ints or symbolic SymInts
+        *args: Concrete ints, symbolic SymInts, or scalar tensors.
 
     Returns:
-        The maximum value, as a SymInt if any argument is symbolic, otherwise int
+        The maximum value with the corresponding scalar representation.
     """
-    return compute_symbolic_min_max(args, op=builtins.max)
+    if any(isinstance(arg, torch.Tensor) for arg in args):
+        return _compute_scalar_tensor_min_max(args, torch.maximum)
+    return compute_symbolic_min_max(args, op=builtins.max)  # type: ignore[arg-type]

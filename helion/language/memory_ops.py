@@ -26,6 +26,9 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
 from .._compiler.cute.tcgen05_constants import (
@@ -72,6 +75,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
+    from .._compiler.cute.fragment_epilogue import Tcgen05PairEpiloguePlan
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
 
@@ -1524,6 +1528,7 @@ def _codegen_cute_store_tcgen05_tile(
     value_name: str,
     epilogue_chain: Tcgen05UnaryEpilogueChain | None = None,
     grouped_tail_epilogue: Tcgen05GroupedTailEpilogueMatch | None = None,
+    pair_epilogue: Tcgen05PairEpiloguePlan | None = None,
 ) -> list[ast.AST] | ast.AST | None:
     df = state.device_function
     candidate_names = df.variable_aliases(value_name)
@@ -1578,20 +1583,30 @@ def _codegen_cute_store_tcgen05_tile(
             "tcgen05 matmul store requires the exact zero-offset output tile axes",
         )
     if tcgen05_value.pure_matmul_role_lifecycle:
-        if epilogue_chain is not None or grouped_tail_epilogue is not None:
+        if (
+            epilogue_chain is not None
+            or grouped_tail_epilogue is not None
+            or pair_epilogue is not None
+        ):
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 pure role-lifecycle supports only identity pure-matmul stores",
             )
     if tcgen05_value.orientation is Tcgen05Orientation.NM and (
-        epilogue_chain is not None or grouped_tail_epilogue is not None
+        epilogue_chain is not None
+        or grouped_tail_epilogue is not None
+        or pair_epilogue is not None
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 N,M-oriented worklist path supports only an identity BF16 store",
         )
     assert (
-        sum(value is not None for value in (epilogue_chain, grouped_tail_epilogue)) <= 1
+        sum(
+            value is not None
+            for value in (epilogue_chain, grouped_tail_epilogue, pair_epilogue)
+        )
+        <= 1
     )
     # When one matmul accumulator fans out to multiple output stores (e.g.
     # aux = pre-activation and out = gelu(pre)), the per-matmul TMA-store
@@ -1870,6 +1885,24 @@ def _codegen_cute_store_tcgen05_tile(
     aux_steps_in_chain: tuple[_AuxiliaryTensorStep, ...] = (
         epilogue_chain.auxiliary_tensor_steps if epilogue_chain is not None else ()
     )
+    tcgen05_aux_load_placement = df.config.get(
+        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+        TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
+    )
+    if tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT:
+        if not aux_steps_in_chain:
+            raise exc.InvalidConfig(
+                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the epilogue has "
+                "no per-subtile auxiliary loads to place"
+            )
+        if tcgen05_value.partial_output_tma_store:
+            raise exc.InvalidConfig(
+                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
+                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: per-subtile "
+                "auxiliary loads cannot precede the accumulator wait for a "
+                "partial-output TMA-store epilogue"
+            )
 
     aux_step_records: list[_AuxStepRecord] = []
     for aux_idx, aux_step in enumerate(aux_steps_in_chain):
@@ -1935,12 +1968,13 @@ def _codegen_cute_store_tcgen05_tile(
                     df.new_var(f"tcgen05_aux_rmem_full_{aux_idx}")
                     if (
                         aux_step.broadcast_axis in (0, 1)
+                        and tcgen05_aux_load_placement
+                        == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
                         and tcgen05_is_two_cta_m128(
                             is_two_cta=tcgen05_lifecycle.is_two_cta,
                             bm=tcgen05_value.bm,
                         )
                         and tcgen05_value.use_tma_store_epilogue
-                        and not tcgen05_value.partial_output_tma_store
                     )
                     else None
                 ),
@@ -2992,6 +3026,21 @@ def _codegen_cute_store_tcgen05_tile(
         chain.
         """
         load_expr = f"{carrier_name}.load()"
+        if pair_epilogue is not None:
+            coordinate_setup, coordinate_name = _coord_subtile_source(
+                prelude_indent, coord_layout, include_setup=True
+            )
+            from .._compiler.cute.fragment_epilogue import render_tcgen05_pair_epilogue
+
+            pair_prelude, pair_expression = render_tcgen05_pair_epilogue(
+                state,
+                pair_epilogue,
+                carrier_name=carrier_name,
+                coordinate_name=coordinate_name,
+                target_dtype=target_dtype,
+                indent=prelude_indent,
+            )
+            return "", coordinate_setup + pair_prelude, pair_expression
         if epilogue_chain is None or not epilogue_chain.steps:
             rhs = load_expr
             late_prelude = ""
@@ -3118,6 +3167,8 @@ def _codegen_cute_store_tcgen05_tile(
         }
         if leading_passthrough_output:
             d_tma_plan["d_leading_passthrough"] = True
+        if tcgen05_value.output_column_major:
+            d_tma_plan["d_column_major"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
         if d_tma_uses_tail_rank3_mnl_tensor:
             tail_d_tma_plan = {
@@ -3400,9 +3451,19 @@ def _codegen_cute_store_tcgen05_tile(
             )
         return static_setup, tile_setup
 
+    # A hybrid TMA/SIMT epilogue reaches SIMT only for edge tiles. A static
+    # output smaller than its selected tile also cannot produce a full tile,
+    # independent of whether its storage is row-major or column-major.
     simt_edge_only = (
         tcgen05_value.tma_store_full_tiles_only
         and not grouped_dynamic_d_tensormap_edge_only
+    )
+    static_m_size = tensor.shape[-2]
+    static_n_size = tensor.shape[-1]
+    simt_edge_only = simt_edge_only or (
+        isinstance(static_m_size, int)
+        and isinstance(static_n_size, int)
+        and (static_m_size < tcgen05_value.bm or static_n_size < tcgen05_value.bn)
     )
     simt_edge_aux_atoms: dict[int, str] = {}
     simt_edge_aux_atom_setup: list[str] = []
@@ -4121,13 +4182,10 @@ def _codegen_cute_store_tcgen05_tile(
     ) -> str:
         """Return the t2r/math/store-source region.
 
-        The aux prelude is rendered inside ``body`` immediately after
-        the TMEM→register copy and before ``acc.load()`` / fused math.
-        Keeping residual and bias fragments out of the acquire/T2R
-        prefix shortens their live ranges through the R2S store path;
-        the long-scoreboard overlap from the older hoist was less
-        valuable on the packed Target8 epilogue than eliminating the
-        resulting local-memory spills.
+        The default path renders the aux prelude after the TMEM→register
+        copy to keep large residual fragments out of the store prefix. The
+        compact M64 and two-CTA M128 scaled-FP8 paths prefetch their small
+        scale fragments before the accumulator wait to hide the LDG latency.
         """
         assert allow_aux_chain or not aux_steps_in_chain, (
             "split/helper epilogue layouts reject aux-tensor chains at validate "
@@ -4156,11 +4214,15 @@ def _codegen_cute_store_tcgen05_tile(
                 f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
             )
         )
+        pre_wait_aux = (
+            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        )
         return (
+            f"{early_aux_prelude if pre_wait_aux else ''}"
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"{early_aux_prelude}"
+            f"{'' if pre_wait_aux else early_aux_prelude}"
             f"{late_prelude}"
             f"        {acc_vec} = {rhs}\n"
             f"{acc_release}"
@@ -4754,6 +4816,11 @@ def _codegen_cute_store_tcgen05_tile(
                 "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
                 f"{kernel_desc}, {tcgen05_aux_epi_tidx}, {tacc}, "
                 f"{tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
+            ),
+            *(
+                [f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"]
+                if pair_epilogue is not None
+                else []
             ),
             f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
             (

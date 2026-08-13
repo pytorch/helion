@@ -26,7 +26,7 @@ re-issues the bitcast/cast/IfExp guards twice — and the second V-loop's
 register pressure waits on the first V-loop's results to commit.
 
 This pass caches the LAST common per-V-lane scalar (always ``values`` in
-practice) into a small ``cute.make_fragment(V, dtype)``.  V-loop 2's
+practice) into a small ``cute.make_rmem_tensor(V, dtype)``.  V-loop 2's
 identical prefix is then stripped — its `values` becomes a cache read.
 The bitcast and IfExp guard run ONCE per outer iter instead of twice,
 and the second V-loop's exp2 chain can issue immediately because its
@@ -278,7 +278,7 @@ def _try_merge_pair(
 
     # 1. Build the cache fragment decl above V-loop 1.
     decl = statement_from_string(
-        f"{cache_name} = cute.make_fragment({first_trip}, {cache_dtype})"
+        f"{cache_name} = cute.make_rmem_tensor({first_trip}, {cache_dtype})"
     )
 
     # 2. Rewrite V-loop 1: after the cache_stmt_idx assignment, write

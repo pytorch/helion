@@ -62,16 +62,18 @@ class AtenLowering(Lowering):
         self, backend: str
     ) -> Callable[[CodegenHandler], CodegenHandler]:
         def decorator(handler: CodegenHandler) -> CodegenHandler:
-            assert backend not in self.codegen_impls, (
-                f"codegen already registered for backend {backend!r}"
-            )
-            self.codegen_impls[backend] = handler
+            from ..language._decorators import _register_codegen_handler
+
+            _register_codegen_handler(self.codegen_impls, backend, handler)
             return handler
 
         return decorator
 
     def codegen(self, ctx: LoweringContext, node: Node) -> object:
         env = CompileEnvironment.current()
+        from .backend_registry import repair_backend_codegen
+
+        repair_backend_codegen(env.codegen_name)
         handler = self.codegen_impls.get(env.codegen_name)
         if handler is None:
             handler = self.codegen_impls.get("common")

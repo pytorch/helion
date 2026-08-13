@@ -2,17 +2,18 @@
 """Run every pretuned kernel's benchmark sweep and emit aggregate metrics as JSON.
 
 Drives the nightly pretuned-kernel dashboard pipeline. Each kernel module under
-``pretuned_kernels/<name>/<name>.py`` defines a ``main()`` that benchmarks the
-Helion kernel against PyTorch eager across its checked-in shape sweep and prints
-a machine-parseable line::
+``pretuned_kernels/<name>/<name>.py`` defines a ``main()`` that benchmarks its
+checked-in Helion heuristic against one or more reference baselines and returns
+aggregate metrics::
 
-    SUMMARY: helion_wins=.. total=.. geomean=.. best_speedup=..
+    {"helion_wins": .., "total": .., "geomean": .., "best_speedup": ..,
+     "baselines": {"name": {..}}}
 
-This script runs each ``main()``, parses that line, and writes a JSON list of
-per-kernel records that ``.github/dashboard/build_pretuned_dashboard_data.py``
-aggregates for the dashboard's Pretuned tab. A kernel that crashes (e.g. no
-heuristic for the current GPU) is recorded with an ``error`` field so the rest
-of the sweep still reports.
+This script runs each ``main()`` and writes a JSON list of per-kernel records
+that ``.github/dashboard/build_pretuned_dashboard_data.py`` aggregates for the
+dashboard's Pretuned tab. A kernel that crashes (e.g. no heuristic for the
+current GPU) is recorded with an ``error`` field so the rest of the sweep still
+reports.
 """
 
 from __future__ import annotations
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 PRETUNED_KERNELS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PRETUNED_KERNELS_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Kernel directory == module file stem == kernel name. Ordered cheap-to-expensive
 # so a partial run (e.g. timeout) still captures the quick kernels.
@@ -53,11 +57,28 @@ KERNELS = [
     "rms_norm_per_block_quant",
     "silu_and_mul_per_block_quant",
     "fused_qk_norm_rope",
+    # External grouped references compile substantial CuTe/DeepGEMM code.
+    "grouped_gemm",
+    "grouped_gemm_deepgemm",
 ]
 
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
 _HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+
+
+def parse_kernel_names(value: str) -> list[str]:
+    """Parse the comma-separated kernel input used by CLI and CI dispatches."""
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
+def grouped_reference_requirements(value: str) -> dict[str, bool]:
+    """Return which external grouped references a selected sweep requires."""
+    selected = set(parse_kernel_names(value))
+    return {
+        "cutlass": not selected or "grouped_gemm" in selected,
+        "deepgemm": not selected or "grouped_gemm_deepgemm" in selected,
+    }
 
 
 def _supported_hardware(name: str) -> set[str]:
@@ -155,7 +176,7 @@ def main() -> None:
     current_hardware = args.hardware or _HARDWARE_BY_COMPUTE.get(compute, compute)
     print(f"GPU: {device} ({compute}); hardware={current_hardware}")
 
-    kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
+    kernels = parse_kernel_names(args.kernels)
     records = []
     for name in kernels:
         print(f"\n{'=' * 60}\nBenchmarking pretuned kernel: {name}\n{'=' * 60}")

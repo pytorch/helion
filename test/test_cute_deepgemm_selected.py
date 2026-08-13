@@ -12,7 +12,13 @@ from helion._compat import requires_cuda_version
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
 )
 from helion._testing import DEVICE
 from helion._testing import matchesBackends
@@ -26,14 +32,16 @@ if matchesBackends(["cute"]):
     pytest.importorskip("cutlass.cute")
 
 
-def _aligned_m(actual_m: int) -> int:
-    tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+def _aligned_m(
+    actual_m: int,
+    tile: int = TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+) -> int:
     return ((actual_m + tile - 1) // tile) * tile
 
 
-def _selected_config() -> helion.Config:
+def _selected_config(block_k: int = 128) -> helion.Config:
     config = helion.Config(
-        block_sizes=[256, 128, 64],
+        block_sizes=[256, 128, block_k],
         l2_groupings=[1],
         loop_orders=[[0, 1, 2]],
         num_stages=7,
@@ -41,12 +49,17 @@ def _selected_config() -> helion.Config:
         pid_type="persistent_interleaved",
         tcgen05_cluster_m=2,
         tcgen05_cluster_n=1,
-        tcgen05_ab_stages=7,
+        tcgen05_ab_stages={64: 7, 128: 3}[block_k],
         tcgen05_acc_stages=2,
         tcgen05_c_stages=2,
         tcgen05_num_epi_warps=4,
     )
     config.config[TCGEN05_GROUPED_MODE_CONFIG_KEY] = TCGEN05_GROUPED_MODE_WORKLIST_NM
+    config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = (
+        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+        if block_k == 128
+        else TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+    )
     return config
 
 
@@ -55,6 +68,7 @@ def _selected_kernel(
     a_packed: torch.Tensor,
     b_grouped: torch.Tensor,
     work_tile_metadata: torch.Tensor,
+    row_alpha: hl.constexpr = 1,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     m_total_aligned, k = a_packed.shape
     _g, n, k2 = b_grouped.shape
@@ -79,7 +93,10 @@ def _selected_kernel(
         valid_m = work_tile_metadata[work_id, 2]
         store_m = work_tile_metadata[work_id, 3]
         local_m = tile_m.index
-        row_index = global_m_start + local_m
+        if row_alpha == 1:
+            row_index = global_m_start + local_m
+        else:
+            row_index = torch.add(global_m_start, local_m, alpha=2)
         valid_rows = local_m < valid_m
         store_rows = local_m < store_m
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
@@ -107,25 +124,28 @@ def _make_args(
     m_sizes: tuple[int, ...] = (17, 11),
     *,
     n: int = 128,
-    k: int = 64,
+    k: int = 128,
     dtype: torch.dtype = torch.bfloat16,
     dirty_padding: bool = False,
+    source_m_tile: int = TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     starts: list[int] = []
     cursor = 0
     for actual_m in m_sizes:
         starts.append(cursor)
-        cursor += _aligned_m(actual_m)
+        cursor += _aligned_m(actual_m, source_m_tile)
 
     a_packed = torch.zeros((cursor, k), device=DEVICE, dtype=dtype)
     for start, actual_m in zip(starts, m_sizes, strict=True):
         a_packed[start : start + actual_m].normal_()
         if dirty_padding:
-            a_packed[start + actual_m : start + _aligned_m(actual_m)].normal_()
+            a_packed[
+                start + actual_m : start + _aligned_m(actual_m, source_m_tile)
+            ].normal_()
     b_grouped = torch.randn((len(m_sizes), n, k), device=DEVICE, dtype=dtype)
     work_tile_metadata = torch.tensor(
         [
-            [group, start, actual_m, _aligned_m(actual_m)]
+            [group, start, actual_m, _aligned_m(actual_m, source_m_tile)]
             for group, (start, actual_m) in enumerate(zip(starts, m_sizes, strict=True))
         ],
         device=DEVICE,
@@ -134,15 +154,20 @@ def _make_args(
     return a_packed, b_grouped, work_tile_metadata
 
 
-def _configured_bound(args: tuple[torch.Tensor, ...]):
+def _configured_bound(args: tuple[torch.Tensor, ...], block_k: int = 128):
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
     bound.env.config_spec.cute_tcgen05_search_enabled = True
-    bound.set_config(_selected_config())
+    bound.set_config(_selected_config(block_k))
     return bound
 
 
-def _code_for(args: tuple[torch.Tensor, ...]) -> str:
+def _code_for(
+    args: tuple[torch.Tensor, ...],
+    config: helion.Config | None = None,
+) -> str:
+    if config is None:
+        config = _selected_config()
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
     bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -150,7 +175,7 @@ def _code_for(args: tuple[torch.Tensor, ...]) -> str:
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),
     ):
-        return bound.to_triton_code(_selected_config())
+        return bound.to_triton_code(config)
 
 
 def _wrapper_plans(code: str) -> list[dict[str, object]]:
@@ -206,15 +231,15 @@ def _require_runtime_cuda13_sm100() -> None:
 def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     _require_codegen_cuda()
 
-    code = _code_for(_make_args((1, 127, 224, 256), n=224, k=64))
+    code = _code_for(_make_args((1, 127, 224, 256), n=224, k=128))
 
     assert code.count("StaticPersistentGroupTileScheduler.create") == 1
     assert "TensorMapManager" in code
     assert "update_tensormap" in code
     assert "cute.nvgpu.tcgen05.CtaGroup.TWO" in code
-    assert "(256, 224)" in code
-    assert "cute.local_tile(tma_tensor_a, (256, 64)" in code
-    assert "cute.local_tile(tma_tensor_b, (224, 64)" in code
+    assert "(256, 256)" in code
+    assert "cute.local_tile(tma_tensor_a, (256, 128)" in code
+    assert "cute.local_tile(tma_tensor_b, (256, 128)" in code
     assert "StMatrix8x8x16bOp(transpose=True, num_matrices=4)" in code
     assert "cute.arch.alloc_smem(cutlass.Int32, 9" in code
 
@@ -236,11 +261,77 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     }
 
 
+def test_grouped_worklist_nm_legacy_bk64_codegen() -> None:
+    _require_codegen_cuda()
+
+    config = _selected_config(64)
+    config.config.pop(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+    code = _code_for(
+        _make_args(
+            (1, 127, 224, 256),
+            n=224,
+            k=64,
+            source_m_tile=TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+        ),
+        config,
+    )
+
+    assert "(256, 224, 64)" in code
+    assert "cute.local_tile(tma_tensor_a, (256, 64)" in code
+    assert "cute.local_tile(tma_tensor_b, (224, 64)" in code
+    plan = next(
+        plan
+        for plan in _wrapper_plans(code)
+        if plan["kind"] == "tcgen05_grouped_static_persistent"
+    )
+    assert plan["bk"] == 64
+    assert plan["source_m_tile"] == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+
+
+def test_grouped_worklist_nm_rejects_over_budget_host_metadata_profile() -> None:
+    _require_codegen_cuda()
+
+    config = _selected_config(64)
+    config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = (
+        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+    )
+    args = _make_args(
+        (224, 256),
+        n=224,
+        k=64,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    )
+    with pytest.raises(
+        helion.exc.BackendUnsupported,
+        match="grouped N,M worklist generated allocations require",
+    ):
+        _code_for(args, config)
+
+
+def test_grouped_worklist_nm_rejects_alpha_scaled_row() -> None:
+    _require_codegen_cuda()
+
+    args = (*_make_args((224, 256), n=224, k=128), 2)
+    _selected_kernel.reset()
+    bound = _selected_kernel.bind(args)
+    assert not bound.env.config_spec.cute_tcgen05_search_enabled
+    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    with (
+        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+        patch_cute_mma_support(),
+        pytest.raises(
+            helion.exc.BackendUnsupported,
+            match="rank3 grouped semantic proof failed",
+        ),
+    ):
+        bound.to_triton_code(_selected_config())
+
+
 @pytest.mark.parametrize(
     ("case", "match"),
     (
         ("fp16", "bf16_operands"),
-        ("k96", "k_multiple_64"),
+        ("k96", "k_multiple_block_k"),
         ("n196", f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}|n_multiple_32"),
         ("strided_b", f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}|contiguous_b_grouped"),
     ),
@@ -267,17 +358,36 @@ def test_grouped_worklist_nm_rejects_ineligible_inputs(case: str, match: str) ->
         _code_for(args)
 
 
-def test_grouped_worklist_nm_runtime_and_graph_replay() -> None:
+@pytest.mark.parametrize(
+    ("block_k", "source_m_tile"),
+    (
+        (64, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE),
+        (128, TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE),
+    ),
+)
+def test_grouped_worklist_nm_runtime_and_graph_replay(
+    block_k: int,
+    source_m_tile: int,
+) -> None:
     _require_runtime_cuda13_sm100()
 
-    args = _make_args((224, 449, 256), n=512, k=128, dirty_padding=True)
-    assert args[2].cpu().tolist() == [
-        [0, 0, 224, 224],
-        [1, 224, 449, 672],
-        [2, 896, 256, 448],
-    ]
+    m_sizes = (224, 449, 256)
+    args = _make_args(
+        m_sizes,
+        n=512,
+        k=2 * block_k,
+        dirty_padding=True,
+        source_m_tile=source_m_tile,
+    )
+    expected_metadata = []
+    start = 0
+    for group, actual_m in enumerate(m_sizes):
+        store_m = _aligned_m(actual_m, source_m_tile)
+        expected_metadata.append([group, start, actual_m, store_m])
+        start += store_m
+    assert args[2].cpu().tolist() == expected_metadata
     with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-        bound = _configured_bound(args)
+        bound = _configured_bound(args, block_k)
         warmup = bound(*args)
         torch.cuda.synchronize()
         _assert_output(warmup, args)

@@ -53,6 +53,7 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
+from .cute.cutedsl_compat import cute_math_min_max_available
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -485,19 +486,35 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
+
+    def codegen_from_input_asts(
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        input_asts: list[ast.AST],
+    ) -> object:
+        """Lower this pointwise node with explicitly supplied tensor values."""
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
-        with self.install_kernel_handlers(ctx, node):
+        assert len(input_asts) == len(self.input_names)
+        with install_inductor_kernel_handlers(
+            ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
+        ):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
 
-        return self._reshape_for_size1_reduction(ctx, node, result)
+        return self._reshape_for_size1_reduction(ctx, node, result, input_asts)
 
     def _reshape_for_size1_reduction(
-        self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        result: ast.AST,
+        input_asts: list[ast.AST] | None = None,
     ) -> ast.AST:
         # When Inductor converts a size-1 reduction to a Pointwise op, the
         # buffer has fewer ranges than the inputs.  This happens when the
@@ -515,7 +532,9 @@ class PointwiseLowering(InductorLowering):
             # Cute lowers one element per thread, so synthetic size-1 view dims
             # (from unsqueeze/keepdim paths rewritten to pointwise) must collapse
             # back to the underlying scalar expression.
-            inputs = self.input_asts(ctx, node)
+            inputs = (
+                input_asts if input_asts is not None else self.input_asts(ctx, node)
+            )
             if len(inputs) == 1:
                 return inputs[0]
 
@@ -1195,6 +1214,64 @@ class GenerateASTFromInductor(DefaultHandler):
             # Fall back to reciprocal(sqrt(x)) so lowering remains backend-agnostic.
             return self.reciprocal(self.sqrt(x))
 
+    def neg(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("neg", (x,), {})
+        return self._lift(expr_from_string("-({x})", x=self._to_ast(x)))
+
+    def abs(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("abs", (x,), {})
+        return self._lift(expr_from_string("abs({x})", x=self._to_ast(x)))
+
+    def maximum(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("maximum", (a, b), {})
+        dtype = self._expected_tensor_dtype()
+        if dtype is not None:
+            a = self._create_cast_expr(a, dtype)
+            b = self._create_cast_expr(b, dtype)
+        if not cute_math_min_max_available():
+            return self._lift(
+                expr_from_string(
+                    "{a} if {a} != {a} else "
+                    "({b} if {b} != {b} else ({a} if {a} >= {b} else {b}))",
+                    a=self._to_ast(a),
+                    b=self._to_ast(b),
+                )
+            )
+        return self._lift(
+            expr_from_string(
+                "cute.math.max({a}, {b}, propagate_nan=True)",
+                a=self._to_ast(a),
+                b=self._to_ast(b),
+            )
+        )
+
+    def minimum(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend_name != "cute":
+            return self._default("minimum", (a, b), {})
+        dtype = self._expected_tensor_dtype()
+        if dtype is not None:
+            a = self._create_cast_expr(a, dtype)
+            b = self._create_cast_expr(b, dtype)
+        if not cute_math_min_max_available():
+            return self._lift(
+                expr_from_string(
+                    "{a} if {a} != {a} else "
+                    "({b} if {b} != {b} else ({a} if {a} <= {b} else {b}))",
+                    a=self._to_ast(a),
+                    b=self._to_ast(b),
+                )
+            )
+        return self._lift(
+            expr_from_string(
+                "cute.math.min({a}, {b}, propagate_nan=True)",
+                a=self._to_ast(a),
+                b=self._to_ast(b),
+            )
+        )
+
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
         # Triton promotes scalar*tensor results to float32, deviating from
         # PyTorch semantics (e.g. x_bf16 * 0.1).  Emit an explicit cast back.
@@ -1419,6 +1496,25 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
+                    cute_state = self.cg.device_function.cute_state
+                    if cute_state.has_tcgen05_pair_epilogue_plan:
+                        if cute_state.is_deferred_tcgen05_pair_epilogue_node(n):
+                            n.meta["codegen"] = _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                            return _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                        if (
+                            any(
+                                self.env.get(input_node)
+                                is _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                                for input_node in n.all_input_nodes
+                            )
+                            and cute_state.tcgen05_pair_epilogue_plan_for_store(n)
+                            is None
+                        ):
+                            raise exc.BackendUnsupported(
+                                "cute",
+                                "deferred tcgen05 pair epilogue escaped its "
+                                "committed store",
+                            )
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result
@@ -1473,6 +1569,13 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
         return super().run_node(n)
+
+
+_DEFERRED_TCGEN05_PAIR_EPILOGUE = object()
+
+
+def is_deferred_tcgen05_pair_epilogue(value: object) -> bool:
+    return value is _DEFERRED_TCGEN05_PAIR_EPILOGUE
 
 
 def codegen_call_with_graph(

@@ -50,6 +50,11 @@ class RandomSearch(FiniteSearch):
                 user_seed_configs=seed_configs,
             ),
         )
+        # ``config_gen`` above is a throwaway generator used only to build the
+        # random population; FiniteSearch created ``self.config_gen`` separately.
+        # Carry over the count of configs it rejected as InvalidConfig so the
+        # search-space logger reports them as explored-invalid.
+        self.config_gen.invalid_config_count += config_gen.invalid_config_count
 
     @classmethod
     def get_kwargs_from_profile(

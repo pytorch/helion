@@ -18,12 +18,14 @@ import torch
 from torch._environment import is_fbcode
 import torch.nn.functional as F
 
+import helion
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import PRETUNED_KERNELS_DIR
 from helion._testing import TestCase
 from helion._testing import is_cuda
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
 
 
@@ -444,6 +446,135 @@ class TestPretunedKernelsCorrectness(TestCase):
 
     def test_fused_qk_norm_rope(self):
         self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
+
+
+@onlyBackends(["cute"])
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+class TestPretunedCuteCodegen(TestCase):
+    def test_scale_mm_pretuned_explicit_epilogue_configs(self) -> None:
+        path = (
+            PRETUNED_KERNELS_DIR
+            / "scale_mm_cute"
+            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+        )
+        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+
+        expected_shapes = {
+            (64, 4096, 6144),
+            (64, 5120, 10240),
+            (64, 5120, 5120),
+        }
+        explicit_configs = {
+            tuple(shape): config
+            for shape, config in zip(
+                heuristic._KEYS_scale_mm_cute,
+                heuristic._CONFIGS_scale_mm_cute,
+                strict=True,
+            )
+            if config.get("tcgen05_layout_strategy") == "explicit_epi_tile"
+        }
+        self.assertEqual(set(explicit_configs), expected_shapes)
+        for shape, config in explicit_configs.items():
+            with self.subTest(shape=shape):
+                self.assertEqual(
+                    (
+                        config["tcgen05_layout_overrides_epi_tile_m"],
+                        config["tcgen05_layout_overrides_epi_tile_n"],
+                        config["tcgen05_layout_overrides_d_store_box_n"],
+                    ),
+                    (64, 64, 64),
+                )
+
+    def test_scale_mm_explicit_epilogue_tile(self) -> None:
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        args = module._make_inputs(64, 128, 64)
+        config = helion.Config(
+            block_sizes=[64, 64, 128],
+            l2_groupings=[1],
+            indexing=["tensor_descriptor"] * 5,
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=12,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_layout_strategy="explicit_epi_tile",
+            tcgen05_layout_overrides_epi_tile_m=64,
+            tcgen05_layout_overrides_epi_tile_n=64,
+            tcgen05_layout_overrides_d_store_box_n=64,
+        )
+
+        with patch_cute_mma_support():
+            bound = module.scale_mm_cute.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+            bound.set_config(config)
+            out = bound(*args)
+
+        self.assertIn(
+            "tcgen05_store_epi_tile = (cute.make_layout(64), cute.make_layout(64))",
+            code,
+        )
+        torch.testing.assert_close(
+            out, module._scale_mm_torch(*args), atol=2e-1, rtol=1e-2
+        )
+
+    def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
+        """One-shot codegen follows the compile target's actual SM count."""
+
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        m, k, n = 64, 5120, 5120
+        x = torch.empty((m, k), device=DEVICE, dtype=torch.float8_e4m3fn)
+        y = torch.empty((n, k), device=DEVICE, dtype=torch.float8_e4m3fn).T
+        scale_a = torch.empty((m, 1), device=DEVICE).expand(m, n)
+        scale_b = torch.empty((n,), device=DEVICE)
+        args = (x, y, scale_a, scale_b)
+        config = helion.Config(
+            block_sizes=[64, 64, 128],
+            l2_groupings=[1],
+            indexing=["tensor_descriptor"] * 5,
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=12,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+
+        with patch_cute_mma_support():
+            bound = module.scale_mm_cute.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.env.config_spec.num_sm = 80
+            one_shot_code = bound.to_triton_code(config)
+            bound.env.config_spec.num_sm = 79
+            persistent_code = bound.to_triton_code(config)
+            bound.env.config_spec.num_sm = 80
+            swizzled_config_values = dict(config)
+            swizzled_config_values["tcgen05_l2_swizzle_size"] = 8
+            swizzled_code = bound.to_triton_code(
+                helion.Config(**swizzled_config_values)
+            )
+
+        self.assertNotIn(
+            "while tcgen05_role_local_0_work_tile.is_valid_tile", one_shot_code
+        )
+        self.assertIn(
+            "while tcgen05_role_local_0_work_tile.is_valid_tile", persistent_code
+        )
+        self.assertIn(
+            "while tcgen05_role_local_0_work_tile.is_valid_tile", swizzled_code
+        )
+        self.assertNotIn("while tcgen05_work_tile_valid", one_shot_code)
+        self.assertNotIn("while tcgen05_work_tile_valid", persistent_code)
 
 
 @onlyBackends(["triton"])

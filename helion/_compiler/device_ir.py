@@ -54,6 +54,7 @@ from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
+from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
@@ -1505,6 +1506,7 @@ class DeviceIR:
         spec = env.config_spec
         from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
         from ..autotuner.config_spec import PointwiseElementwiseFact
+        from ..language import memory_ops
         from ..language.atomic_ops import ATOMIC_OPS
         from ..language.inline_asm_ops import inline_asm_elementwise
         from ..language.inline_triton_ops import inline_triton
@@ -1565,6 +1567,52 @@ class DeviceIR:
                 return [s for v in val for s in _val_itemsizes(v)]
             return []
 
+        # The node set ``compute_itemsize`` may measure: DATA, excluding ADDRESSES.
+        #
+        # A load/store's index arguments are tensor-valued too, and index arithmetic is
+        # int64 once a tensor crosses the int32 indexing threshold -- so a plain bf16
+        # kernel reported width 8 purely because its tensors got large, halving ``reg_cap``
+        # on exactly the shapes that least want a smaller tile. The split is data vs
+        # address, NOT float vs integer: filtering to floats would leave a genuine
+        # int-compute kernel at the ``1`` initializer, over-estimating ``reg_cap`` instead.
+        # No cheaper proxy works -- a tile index is both a legal address and legal data, so
+        # dtype, node metadata and lowering class all fail to separate them.
+        #
+        # Walk BACKWARD from each store's value / mask, CUTTING at load nodes: a load is
+        # itself data, but its own index arithmetic is reachable backward through it. The
+        # cut also excludes a gather's loaded index, so this under-counts that case's true
+        # register pressure. One reverse-order pass suffices since FX order is topological.
+        #
+        # If nothing tensor-valued is reachable (a store of a bare scalar, or no store),
+        # fall back to the accessed buffer dtypes rather than the ``1`` initializer -- and
+        # only then, so a successful walk is never widened.
+        def _data_path_nodes() -> tuple[set[int], int]:
+            data: set[int] = set()
+            buffer_width = 1
+            for graph_info in self.graphs:
+                for node in reversed(list(graph_info.graph.nodes)):
+                    if node.op != "call_function":
+                        continue
+                    is_load = node.target is memory_ops.load
+                    if is_load or node.target is memory_ops.store:
+                        # Seed the data side: a store's value (arg 2) and either op's
+                        # extra_mask (store arg 3 / load arg 2).
+                        for pos in (2, 3) if not is_load else (2,):
+                            if len(node.args) > pos and isinstance(
+                                node.args[pos], torch.fx.Node
+                            ):
+                                data.add(id(node.args[pos]))
+                        accessed = _accessed_tensor_fake(node)
+                        if accessed is not None:
+                            buffer_width = max(buffer_width, accessed.dtype.itemsize)
+                        if is_load:
+                            continue  # CUT: args[1] is the ADDRESS, never an input
+                    if id(node) in data:
+                        data.update(id(arg) for arg in node.all_input_nodes)
+            return data, buffer_width
+
+        data_path_nodes, data_path_buffer_width = _data_path_nodes()
+
         # SFU (transcendental) op count — the num_warps signal, counted in the same graph walk. SFU
         # ops run on a distinct, low-throughput unit (~4 SFUs vs ~128 FP32 lanes/SM), so a
         # transcendental-heavy tile is latency-bound and wants more warps; an all-FMA tile of the same
@@ -1603,8 +1651,10 @@ class DeviceIR:
         sfu_ops = 0
         for graph_info in self.graphs:
             for node in graph_info.graph.nodes:
-                for size in _val_itemsizes(node.meta.get("val")):
-                    compute_itemsize = max(compute_itemsize, size)
+                # Data path only -- see ``_data_path_nodes``.
+                if id(node) in data_path_nodes:
+                    for size in _val_itemsizes(node.meta.get("val")):
+                        compute_itemsize = max(compute_itemsize, size)
                 if node.op == "call_function":
                     if node.target in _unsafe_pointwise_ops:
                         # Not tile-independent (see the set's comment above). Record no fact so the
@@ -1617,6 +1667,9 @@ class DeviceIR:
                     )[0]
                     if base in _SFU_OPS:
                         sfu_ops += 1
+        # Nothing tensor-valued reachable -> the buffer widths, never the 1 initializer.
+        if compute_itemsize == 1:
+            compute_itemsize = max(1, data_path_buffer_width)
 
         # slab_numel = sum over FULL-EXTENT load/store ops (accessed_numel >= total_numel) of the
         # untiled elements each drags per tiled element, accessed_numel // total_numel. Flat kernel:
@@ -1630,17 +1683,50 @@ class DeviceIR:
         tiled_ids = {bs.block_id for bs in spec.block_sizes}
         contig: set[int] = set()
         slab_numel = 0
+        max_op_slab_numel = 1
         storage_itemsize = 1
+        gather_stride = 1
         for memfact in spec.memory_op_facts:
             if memfact.dtype is None or memfact.accessed_numel < total_numel:
                 continue
             slab_numel += memfact.accessed_numel // total_numel
+            # The widest tile any ONE op materializes, per tiled element -- the same per-op
+            # quantity ``slab_numel`` sums, kept as a MAX because bytes add across ops but
+            # lanes do not (see ``PointwiseElementwiseFact``).
+            #
+            # Computed from the SUBSCRIPTS, not ``accessed_numel // total_numel``: that is a
+            # per-tensor ratio, so it also counts an op whose tensor is merely wider than
+            # the problem, overstating lanes. Product of extents at positions that are not
+            # a tiled axis; a tiled position contributes its block size, which the consumer
+            # supplies by scaling. Keyed on ``subscript_affine_block_ids`` so a scaled
+            # subscript counts as tiled rather than as fan-out.
+            op_slab = 1
+            for bid, extent in zip(
+                memfact.subscript_affine_block_ids,
+                memfact.subscript_extents,
+                strict=True,
+            ):
+                if bid is None or bid not in tiled_ids:
+                    op_slab *= max(1, extent)
+            max_op_slab_numel = max(max_op_slab_numel, op_slab)
             storage_itemsize = max(storage_itemsize, memfact.dtype.itemsize)
             for bid, stride in zip(
                 memfact.subscript_block_ids, memfact.subscript_strides, strict=True
             ):
                 if bid is not None and stride == 1 and bid in tiled_ids:
                     contig.add(bid)
+            # Widest address-expression scale on a tiled axis whose LAYOUT stride is 1 --
+            # gated there because that is where the sector-waste argument holds; a
+            # layout-strided fetch is already non-contiguous for other reasons. Keyed on
+            # ``subscript_affine_block_ids``, which resolves the axis through the scale.
+            for bid, scale, stride in zip(
+                memfact.subscript_affine_block_ids,
+                memfact.subscript_index_scales,
+                memfact.subscript_strides,
+                strict=True,
+            ):
+                if bid is not None and bid in tiled_ids and stride == 1:
+                    gather_stride = max(gather_stride, scale)
         spec.pointwise_facts.append(
             PointwiseElementwiseFact(
                 total_numel=total_numel,
@@ -1649,6 +1735,8 @@ class DeviceIR:
                 compute_itemsize=compute_itemsize,
                 contig_block_ids=tuple(sorted(contig)),
                 sfu_ops=sfu_ops,
+                gather_stride=gather_stride,
+                max_op_slab_numel=max_op_slab_numel,
             )
         )
 
@@ -2132,6 +2220,13 @@ class WalkDeviceAST(NodeVisitor):
 
     @staticmethod
     def should_become_arg(value: object) -> bool:
+        from ..language.distributed_ops import AsyncCopyDescriptor
+
+        # Descriptor operations in a dynamic branch close over the descriptor
+        # created by the surrounding graph. The lowering resolves that handle by
+        # compiler ID, so it is a compile-time value rather than a branch input.
+        if isinstance(value, AsyncCopyDescriptor):
+            return False
         if isinstance(value, (Tile, int, float, bool, type(None), torch.SymInt)):
             return False
         if isinstance(value, torch.Tensor):
@@ -3324,6 +3419,9 @@ def _collect_memory_op_facts(
             indexed_block_ids: tuple[int | None, ...] = ()
             subscript_block_ids: tuple[int | None, ...] = ()
             subscript_strides: tuple[int, ...] = ()
+            subscript_index_scales: tuple[int, ...] = ()
+            subscript_affine_block_ids: tuple[int | None, ...] = ()
+            subscript_extents: tuple[int, ...] = ()
             inner_extent: int | None = None
             accessed_numel = 0
             if fake is not None:
@@ -3363,6 +3461,18 @@ def _collect_memory_op_facts(
                     subscript_strides = tuple(
                         env.size_hint(fake_strides[pos]) for pos in positions
                     )
+                    # Gather stride + affine-resolved axis, same ``positions`` so all the
+                    # tuples align. See ``MemoryOpFact.subscript_index_scales``.
+                    affine = [
+                        subscript_index_scale(env, index_list[pos]) for pos in positions
+                    ]
+                    subscript_affine_block_ids = tuple(bid for bid, _ in affine)
+                    subscript_index_scales = tuple(scale for _, scale in affine)
+                    # Extent per subscript position; size_hint, not int(), so a SymInt dim
+                    # is not specialized.
+                    subscript_extents = tuple(
+                        env.size_hint(fake.shape[pos]) for pos in positions
+                    )
                 if fake.ndim >= 2:
                     # size_hint (not int()): int() would guard a SymInt inner dim to a
                     # constant, over-specializing dynamic-shape kernels. inner_extent is a
@@ -3388,6 +3498,9 @@ def _collect_memory_op_facts(
                         inner_extent=inner_extent,
                         subscript_block_ids=subscript_block_ids,
                         subscript_strides=subscript_strides,
+                        subscript_index_scales=subscript_index_scales,
+                        subscript_affine_block_ids=subscript_affine_block_ids,
+                        subscript_extents=subscript_extents,
                         accessed_numel=accessed_numel,
                     ),
                 )
@@ -3644,7 +3757,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         device_ir.register_rollable_reductions()
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
-            # Enable the flash-attention autotune surface (Tasks #25 + #28) when
+            # Enable the flash-attention autotune surface when
             # the dense flash dataflow is detected, analogous to how a matmul
             # detection sets ``cute_tcgen05_search_enabled``. Default-off
             # otherwise so the flash knobs never widen the search surface for
@@ -3662,11 +3775,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     has_kv_tile_pruning=flash_shape.has_kv_tile_pruning,
                     requires_ws_overlap=flash_shape.requires_ws_overlap,
                     small_biased_candidate=flash_shape.small_biased_candidate,
+                    standard_dense_output=flash_shape.standard_dense_output,
+                    standard_causal_output=flash_shape.standard_causal_output,
                 )
             else:
                 from ..language.matmul_ops import enable_cute_tcgen05_search
                 from ..language.matmul_ops import plan_cute_tcgen05_search
                 from .cute.cute_mma import analyze_cute_mma_node
+                from .cute.cute_mma import tcgen05_pair_epilogue_can_shape_search
+                from .cute.cute_mma import tcgen05_pair_epilogue_has_unique_anchor
+                from .cute.cute_mma import tcgen05_pair_epilogue_present
 
                 # The same structural analyzer gates tcgen05 search and codegen
                 # for every matrix rank. This prevents transformed loads from
@@ -3699,9 +3817,25 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                                 candidate.operands.has_leading_passthrough
                             ),
                         )
-                        if search_plan is None:
+                        if search_plan is None or not (
+                            tcgen05_pair_epilogue_can_shape_search(
+                                device_ir.graphs,
+                                node,
+                                candidate,
+                                min_search_m=search_plan.min_search_m,
+                                max_search_m=search_plan.max_search_m,
+                                max_search_n=search_plan.max_search_n,
+                            )
+                        ):
                             continue
                         search_candidates.append((candidate, lhs, search_plan))
+                if tcgen05_pair_epilogue_present(
+                    device_ir.graphs
+                ) and not tcgen05_pair_epilogue_has_unique_anchor(
+                    device_ir.graphs,
+                    device_ir=device_ir,
+                ):
+                    search_candidates.clear()
                 analysis_keys = {
                     (
                         candidate.operands.output_block_ids,
@@ -3732,7 +3866,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # xyz is not supported with shared program IDs. Non-tcgen05
             # persistent kernels are allowed; tcgen05 persistent has a
             # single-root scheduler/grid contract today.
-            config_spec.disallow_pid_type("xyz")
+            config_spec.disallow_pid_type(
+                "xyz",
+                reason="multiple root loops share program IDs; xyz grids are not "
+                "supported with shared program IDs",
+            )
             if config_spec.cute_tcgen05_search_enabled:
                 # The tcgen05 persistent launch grid is derived from a single
                 # root's PID space today. Keep persistent pid types out of
@@ -3749,6 +3887,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         "pid type is available. Disable forced/distributed "
                         "persistent-only mode or use a single root loop."
                     )
+                for pid_type in config_spec.allowed_pid_types:
+                    if pid_type not in non_persistent_pid_types:
+                        config_spec.disallowed_pid_type_reasons.setdefault(
+                            pid_type,
+                            "CuTe tcgen05 multi-root kernels do not support "
+                            "persistent pid types yet (single-root launch grid)",
+                        )
                 config_spec.allowed_pid_types = non_persistent_pid_types
 
         # Collect per-load/store metadata once so heuristics can map each Config.indexing slot to its

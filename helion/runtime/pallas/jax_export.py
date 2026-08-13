@@ -281,6 +281,8 @@ def default_pallas_jax_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _collective_id: int | None = None,
+    _uses_remote_copy: bool = False,
     **kwargs: object,
 ) -> object:
     """Pallas launcher used when running a Helion kernel inside ``jax.jit``.
@@ -303,6 +305,8 @@ def default_pallas_jax_launcher(
     )
 
     output_indices = _output_indices if _output_indices is not None else []
+    inplace_indices = set(_inplace_indices or [])
+    wrapper_args = args
 
     # Capture original shapes BEFORE padding so output-only tensors can
     # be sliced back after the pallas_call.  ``_pallas_apply_ds_padding``
@@ -366,15 +370,31 @@ def default_pallas_jax_launcher(
         scratch_shapes=_scratch_shapes,
         hbm_arg_indices=_hbm_arg_indices,
         smem_arg_indices=_smem_arg_indices,
+        collective_id=_collective_id,
         interpret=interpret,
         compact=compact,
         orig_shapes=orig_shapes,
         ds_pad_dims=_ds_pad_dims,
+        return_all_outputs=True,
     )
 
-    if len(output_results) == 1:
-        return _JaxExportTensor.from_jax(output_results[0], device=device)
-    return tuple(_JaxExportTensor.from_jax(r, device=device) for r in output_results)
+    for output_result, arg_index in zip(output_results, output_indices, strict=True):
+        if arg_index not in inplace_indices:
+            continue
+        adapter = wrapper_args[arg_index]
+        assert isinstance(adapter, _JaxExportTensor)
+        adapter._jax_arr = output_result
+
+    returned_results = [
+        output_result
+        for output_result, arg_index in zip(output_results, output_indices, strict=True)
+        if arg_index not in inplace_indices
+    ]
+    if not returned_results:
+        returned_results = output_results
+    if len(returned_results) == 1:
+        return _JaxExportTensor.from_jax(returned_results[0], device=device)
+    return tuple(_JaxExportTensor.from_jax(r, device=device) for r in returned_results)
 
 
 def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:

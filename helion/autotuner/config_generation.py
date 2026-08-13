@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import copy
 import functools
 import itertools
@@ -49,6 +48,7 @@ class ConfigGeneration:
         config_spec: ConfigSpec,
         *,
         overrides: Mapping[str, object] | None = None,
+        _flash_pipeline_family_override: str | None = None,
         advanced_controls_files: list[str] | None = None,
         process_group_name: str | None = None,
     ) -> None:
@@ -69,11 +69,23 @@ class ConfigGeneration:
         self.config_spec = config_spec
         self.process_group_name = process_group_name
         self._advanced_controls_files = advanced_controls_files
-        self.flat_spec: list[ConfigSpecFragment] = []
-        config_spec.flat_config(
-            _collect_spec,
-            advanced_controls_files=advanced_controls_files,
+        self._flash_pipeline_family_override = (
+            _flash_pipeline_family_override
+            if config_spec.cute_flash_search_enabled
+            else None
         )
+        self.flat_spec: list[ConfigSpecFragment] = []
+        if self._flash_pipeline_family_override is None:
+            config_spec.flat_config(
+                _collect_spec,
+                advanced_controls_files=advanced_controls_files,
+            )
+        else:
+            config_spec._flat_config_with_flash_family(
+                _collect_spec,
+                advanced_controls_files=advanced_controls_files,
+                flash_pipeline_family=self._flash_pipeline_family_override,
+            )
         assert self.flat_spec, "No config values to tune"
         self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
@@ -101,6 +113,12 @@ class ConfigGeneration:
             if config_spec.block_sizes
             else 1
         )
+        # Running count of candidate configs rejected as InvalidConfig by the
+        # internal generation retry loops (random_config / random_population).
+        # These rejections are otherwise invisible to callers because the loops
+        # silently retry; exposing the count lets the search-space logger report
+        # explored-invalid alongside explored-valid.
+        self.invalid_config_count: int = 0
 
     def _init_cute_num_thread_pairs(self) -> None:
         """Pair each CuTe num_threads flat slot with its block_size slot."""
@@ -165,9 +183,17 @@ class ConfigGeneration:
         """
         mapping: dict[str, tuple[list[int], bool]] = {}
         idx = 0
-        for key, count, is_sequence in self.config_spec.flat_key_layout(
-            advanced_controls_files=self._advanced_controls_files
-        ):
+        layout = (
+            self.config_spec.flat_key_layout(
+                advanced_controls_files=self._advanced_controls_files
+            )
+            if self._flash_pipeline_family_override is None
+            else self.config_spec._flat_key_layout_with_flash_family(
+                advanced_controls_files=self._advanced_controls_files,
+                flash_pipeline_family=self._flash_pipeline_family_override,
+            )
+        )
+        for key, count, is_sequence in layout:
             mapping[key] = (list(range(idx, idx + count)), is_sequence)
             idx += count
         assert idx == len(self.flat_spec), (
@@ -284,7 +310,13 @@ class ConfigGeneration:
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self._fragment_default_flat()
-        flat_fields = self.config_spec._flat_fields()
+        flat_fields = (
+            self.config_spec._flat_fields()
+            if self._flash_pipeline_family_override is None
+            else self.config_spec._flat_fields_with_flash_family(
+                self._flash_pipeline_family_override
+            )
+        )
         for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
                 has_default, value = self.config_spec.flatten_missing_field_default(
@@ -335,10 +367,17 @@ class ConfigGeneration:
         assert len(flat_values) == len(self.flat_spec)
         self._repair_cute_num_threads(flat_values)
         count: itertools.count[int] = itertools.count()
-        config = self.config_spec.flat_config(
-            get_next_value,
-            advanced_controls_files=self._advanced_controls_files,
-        )
+        if self._flash_pipeline_family_override is None:
+            config = self.config_spec.flat_config(
+                get_next_value,
+                advanced_controls_files=self._advanced_controls_files,
+            )
+        else:
+            config = self.config_spec._flat_config_with_flash_family(
+                get_next_value,
+                advanced_controls_files=self._advanced_controls_files,
+                flash_pipeline_family=self._flash_pipeline_family_override,
+            )
         assert next(count) == len(flat_values)
         config = self._apply_overrides(config)
         # Overrides may reintroduce pointer stores that break subtiled outputs
@@ -561,6 +600,7 @@ class ConfigGeneration:
             except InvalidConfig as e:
                 msg = str(e)
                 errors[msg] = errors.get(msg, 0) + 1
+                self.invalid_config_count += 1
                 continue
         summary = "; ".join(f"{msg} (x{n})" for msg, n in errors.items())
         raise InvalidConfig(
@@ -715,10 +755,13 @@ class ConfigGeneration:
                 result.append(self.unflatten(flat))
             except InvalidConfig:
                 attempts += 1
+                self.invalid_config_count += 1
         # Retry to fill the population to the requested size
         while len(result) < n and attempts < 64:
-            with contextlib.suppress(InvalidConfig):
+            try:
                 result.append(self.unflatten(self.random_flat()))
+            except InvalidConfig:
+                self.invalid_config_count += 1
             attempts += 1
         return result
 

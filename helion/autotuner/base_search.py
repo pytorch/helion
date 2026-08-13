@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
+    from .search_space_logger import SearchSpaceTracker
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
@@ -250,7 +251,9 @@ class BaseSearch(BaseAutotuner):
         self,
         kernel: _AutotunableKernel,
         args: Sequence[object],
-        benchmark_provider_cls: type[BenchmarkProvider] = LocalBenchmarkProvider,
+        benchmark_provider_cls: Callable[
+            ..., BenchmarkProvider
+        ] = LocalBenchmarkProvider,
     ) -> None:
         """
         Initialize the BaseSearch object.
@@ -273,6 +276,7 @@ class BaseSearch(BaseAutotuner):
         self._benchmarked_members: dict[Config, PopulationMember] = {}
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
+        self._search_space_tracker: SearchSpaceTracker | None = None
 
     @property
     def performance_unit(self) -> Literal["ms", "ratio"]:
@@ -336,10 +340,41 @@ class BaseSearch(BaseAutotuner):
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
+            dtypes=dtypes,
             hardware=hardware,
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
+        # Analyze search space if logging is enabled. Diagnostic only; a failure
+        # must not prevent autotuning from running. Verbose logging implies the
+        # summary, so either setting enables the analysis.
+        if (
+            self.settings.autotune_log_search_space
+            or self.settings.autotune_log_search_space_verbose
+        ):
+            try:
+                from .search_space_logger import SearchSpaceTracker
+                from .search_space_logger import analyze_search_space
+
+                hardware_spec, specialization_key = (
+                    self._get_current_hardware_and_specialization()
+                )
+                report = analyze_search_space(
+                    self.config_spec,
+                    kernel_name=kernel_name,
+                    specialization_key=specialization_key,
+                    hardware=hardware_spec,
+                    config_overrides=self.settings.autotune_config_overrides or None,
+                    advanced_controls_files=self.settings.autotune_search_acf or None,
+                )
+                self._search_space_tracker = SearchSpaceTracker(report)
+            except Exception:
+                self.log.warning(
+                    "Search space analysis setup failed; the end-of-run summary "
+                    "will be skipped (autotuning continues normally)",
+                    exc_info=True,
+                )
+                self._search_space_tracker = None
         host_function = getattr(self.kernel, "host_function", None)
         self._kernel_metadata: KernelMetadata = KernelMetadata(
             kernel_name=kernel_name,
@@ -363,6 +398,15 @@ class BaseSearch(BaseAutotuner):
             log=self.log,
             autotune_metrics=self._autotune_metrics,
         )
+        if self.config_spec.compiler_seed_timeout_retry_repetitions is not None:
+            seed_config_gen = self.config_spec.create_config_generation(
+                overrides=self.settings.autotune_config_overrides or None,
+                advanced_controls_files=self.settings.autotune_search_acf or None,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+            self.benchmark_provider.set_compiler_seed_configs(
+                [config for _flat, config in seed_config_gen.seed_flat_config_pairs()]
+            )
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _is_restricted_search(self) -> bool:
@@ -499,6 +543,17 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries, one per input config.
         """
         passing_configs, passing_indices = self._apply_config_filter(configs)
+        # Record configs for exploration tracking. Diagnostic only; must never
+        # interfere with benchmarking.
+        if self._search_space_tracker is not None:
+            try:
+                for config in passing_configs:
+                    self._search_space_tracker.record_config(config)
+            except Exception:
+                self.log.debug(
+                    "Exploration tracking failed; continuing autotuning",
+                    exc_info=True,
+                )
         inner_results = self.benchmark_provider.benchmark(passing_configs, desc=desc)
 
         if len(passing_indices) == len(configs):
@@ -543,6 +598,18 @@ class BaseSearch(BaseAutotuner):
             A BenchmarkResult with the compiled function and performance.
         """
         return self.benchmark_batch([config])[0]
+
+    def _generation_invalid_config_count(self) -> int:
+        """Number of candidate configs rejected as InvalidConfig during search.
+
+        These are candidates that a config fragment / normalize step ruled out
+        before they could be benchmarked (so they never reach the exploration
+        tracker's valid-config path). The base implementation reports zero;
+        subclasses that own a :class:`ConfigGeneration` expose its running
+        count so the search-space logger can report explored-invalid alongside
+        explored-valid.
+        """
+        return 0
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
@@ -624,6 +691,58 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed in "
                 "isolated benchmark workers."
             )
+        # Log search space analysis. This is purely diagnostic; any failure
+        # here (analysis, logging, or writing report files) must never block or
+        # crash autotuning, so the whole block is best-effort.
+        if (
+            self.settings.autotune_log_search_space
+            or self.settings.autotune_log_search_space_verbose
+        ):
+            try:
+                from .local_cache import stable_autotune_hash
+                from .search_space_logger import log_search_space_comparison
+
+                tracker = self._search_space_tracker
+                if tracker is None:
+                    from .search_space_logger import SearchSpaceTracker
+                    from .search_space_logger import analyze_search_space
+
+                    hardware_spec, specialization_key = (
+                        self._get_current_hardware_and_specialization()
+                    )
+                    tracker = SearchSpaceTracker(
+                        analyze_search_space(
+                            self.config_spec,
+                            kernel_name=self._autotune_metrics.kernel_name,
+                            specialization_key=specialization_key,
+                            hardware=hardware_spec,
+                            config_overrides=(
+                                self.settings.autotune_config_overrides or None
+                            ),
+                            advanced_controls_files=(
+                                self.settings.autotune_search_acf or None
+                            ),
+                        )
+                    )
+                tracker.record_invalid(self._generation_invalid_config_count())
+                report = tracker.finish(
+                    search_algorithm=type(self).__name__,
+                    elapsed_seconds=end - start,
+                )
+                log_search_space_comparison(self.log._logger, report)
+                if self.settings.autotune_log_search_space_path:
+                    saved_path = report.save(
+                        self.settings.autotune_log_search_space_path,
+                        stable_autotune_hash(self),
+                    )
+                    if saved_path:
+                        self.log(f"Search space analysis saved to: {saved_path}")
+            except Exception:
+                self.log.warning(
+                    "Search space logging failed; the end-of-run summary was not "
+                    "emitted (autotuning result is unaffected)",
+                    exc_info=True,
+                )
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")
@@ -803,7 +922,13 @@ class PopulationMember:
     flat_values: FlatConfig
     config: Config
     status: Literal[
-        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "unknown"
+        "ok",
+        "error",
+        "timeout",
+        "peer_compilation_fail",
+        "filtered",
+        "deduplicated",
+        "unknown",
     ] = "unknown"
     compile_time: float | None = None
 
@@ -864,6 +989,9 @@ class PopulationBasedSearch(BaseSearch):
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
         )
+
+    def _generation_invalid_config_count(self) -> int:
+        return self.config_gen.invalid_config_count
 
     @classmethod
     def get_kwargs_from_profile(
@@ -989,8 +1117,52 @@ class PopulationBasedSearch(BaseSearch):
         try:
             canonical_flat, config = self.config_gen.canonicalize_flat(flat_values)
         except exc.InvalidConfig:
+            self.config_gen.invalid_config_count += 1
             return None
         return PopulationMember(_unset_fn, [], canonical_flat, config)
+
+    def _pad_initial_population_with_unique_random(
+        self,
+        population: Sequence[FlatConfig],
+        target: int,
+    ) -> list[FlatConfig]:
+        """Pad an initial population with normalized, unique random configs."""
+        result: list[FlatConfig] = []
+        seen: set[Config] = set()
+        invalid = 0
+        duplicate = 0
+
+        def append_if_valid(flat: FlatConfig) -> None:
+            nonlocal invalid, duplicate
+            try:
+                canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+            except exc.InvalidConfig:
+                invalid += 1
+                return
+            if config in seen:
+                duplicate += 1
+                return
+            seen.add(config)
+            result.append(canonical_flat)
+
+        for flat in population:
+            append_if_valid(flat)
+
+        attempts = 0
+        max_attempts = max(64, max(0, target - len(result)) * 64)
+        while len(result) < target and attempts < max_attempts:
+            attempts += 1
+            append_if_valid(self.config_gen.random_flat())
+
+        if len(result) < target:
+            self.log(
+                "Generated only "
+                f"{len(result)}/{target} unique valid initial population configs "
+                f"after {attempts} random attempts "
+                f"({invalid} invalid, {duplicate} duplicate)."
+            )
+        self.log(f"Initial population after unique random padding: {len(result)} total")
+        return result
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
         """
@@ -1100,7 +1272,7 @@ class PopulationBasedSearch(BaseSearch):
         if duplicates > 0:
             self.log.debug(f"Discarded {duplicates} duplicate config(s)")
 
-        self.log(f"Initial population: {len(result)} total")
+        self.log(f"Seed/default/cache population: {len(result)} total")
 
         return result
 

@@ -155,6 +155,13 @@ def _env_get_str(var_name: str, default: str) -> str:
     return value
 
 
+def _env_get_str_or_none(var_name: str, default: str | None) -> str | None:
+    value = os.environ.get(var_name)
+    if value is None or (value := value.strip()) == "":
+        return default
+    return value
+
+
 def _get_index_dtype() -> torch.dtype | None:
     value = os.environ.get("HELION_INDEX_DTYPE")
     if value is None or (token := value.strip()) == "":
@@ -588,14 +595,31 @@ class _Settings:
         )
     )
     autotune_config_filter: Callable[[Config], Config | None] | None = None
+    pallas_collective_id: int | None = None
     pallas_interpret: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_PALLAS_INTERPRET", False
         )
     )
+    pallas_topk_recall_target: float = 0.99
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
+        )
+    )
+    autotune_log_search_space: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE", False
+        )
+    )
+    autotune_log_search_space_verbose: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE", False
+        )
+    )
+    autotune_log_search_space_path: str | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_str_or_none, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH", None
         )
     )
 
@@ -695,9 +719,18 @@ class Settings(_Settings):
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
             "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
         ),
+        "pallas_collective_id": (
+            "Optional Pallas collective namespace override. Distributed kernels "
+            "derive a stable ID automatically; set this only when otherwise "
+            "identical kernels use incompatible runtime communication groups."
+        ),
         "pallas_interpret": (
             "If True, run Pallas kernels in interpret mode on CPU (no TPU needed). "
             "Defaults to HELION_PALLAS_INTERPRET env var."
+        ),
+        "pallas_topk_recall_target": (
+            "Recall target for the Pallas approximate top-k lowering. Must be in "
+            "(0, 1]; use 1.0 when exact top-k results are required. Default 0.99."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "
@@ -815,6 +848,22 @@ class Settings(_Settings):
             "to pick configs optimal for the actual fused workload. Default False. "
             "Has no effect unless torch_compile_fusion is also True. "
             "Set HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION=1 to enable globally."
+        ),
+        "autotune_log_search_space": (
+            "If True, log search space analysis after autotuning including which features "
+            "were enabled/disabled, total search space size, and coverage metrics. "
+            "Off by default; set HELION_AUTOTUNE_LOG_SEARCH_SPACE=1 to enable."
+        ),
+        "autotune_log_search_space_verbose": (
+            "If True, additionally log each search-space restriction (disabled pid_types, "
+            "tcgen05 narrowing, etc.) live at INFO the moment it is applied during "
+            "compilation, on top of the end-of-run summary. Implies "
+            "autotune_log_search_space. Off by default; set "
+            "HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE=1 to enable."
+        ),
+        "autotune_log_search_space_path": (
+            "Optional path to save search space analysis JSON. "
+            "Set HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/path/to/analysis.json to save."
         ),
     }
 

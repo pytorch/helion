@@ -166,11 +166,6 @@ jobs:
           git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
           uv pip install -r python/requirements.txt
-          # Disable proton on XPU: proton's NVIDIA sources (CuptiApi.cpp, NvtxApi.cpp)
-          # require CUDA headers that are not present on Intel XPU runners.
-          if [ "${{ matrix.alias }}" == "xpu" ]; then
-            export TRITON_BUILD_PROTON=OFF
-          fi
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
@@ -205,7 +200,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.10.1' 'jaxlib==0.10.1' 'absl-py'
+          uv pip install 'jax==0.11.0' 'jaxlib==0.11.0' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'

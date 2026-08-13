@@ -563,6 +563,7 @@ def gemm_ptx_precomputed_pv_ts(
     mbar_phase: Int32 | None = None,
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
+    wait_hint: int = 10_000_000,
 ) -> None:
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     tCrA_layout = cute.recast_layout(32, 16, tCrA_layout)
@@ -590,7 +591,7 @@ def gemm_ptx_precomputed_pv_ts(
         mbar_wait_str = (
             ".reg .pred P1; \n\t"
             "LAB_WAIT: \n\t"
-            "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+            f"mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, {wait_hint}; \n\t"
             "@P1 bra DONE; \n\t"
             "bra     LAB_WAIT; \n\t"
             "DONE: \n\t"
@@ -668,6 +669,7 @@ def gemm_ptx_partial(
     zero_init: bool | Boolean = False,
     tA_addr: Int32 | None = None,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int | None = None,
+    wait_hint: int = 10_000_000,
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -800,7 +802,7 @@ def gemm_ptx_partial(
             mbar_wait_str = (
                 ".reg .pred P1; \n\t"
                 "LAB_WAIT: \n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                f"mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, {wait_hint}; \n\t"
                 "@P1 bra DONE; \n\t"
                 "bra     LAB_WAIT; \n\t"
                 "DONE: \n\t"

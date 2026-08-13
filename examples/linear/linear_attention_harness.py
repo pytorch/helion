@@ -21,6 +21,8 @@ from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_engine import get_helion_fwd_kernel
 from .linear_attention_engine import recurrent_step
 from .linear_attention_fla import get_fla_fwd_kernel
+from .linear_attention_flashkda import flashkda_supports
+from .linear_attention_flashkda import get_flashkda_fwd_kernel
 from .linear_attention_utils import ACC_BWD_TOL
 from .linear_attention_utils import ACC_FWD_TOL
 from .linear_attention_utils import chunked_linear_attn_reference
@@ -34,6 +36,8 @@ from helion._testing import do_bench
 # Test/benchmark config
 DTYPE = torch.bfloat16
 TEST_SHAPE = (2, 4, 128, 32, 32)
+VARLEN_TEST_SHAPE = (3, 4, 100, 32, 32)
+VARLEN_TEST_LENGTHS = [100, 37, 163]
 TEST_C = 32
 BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
 BENCH_C = 64
@@ -41,7 +45,11 @@ BENCH_C = 64
 
 @dataclass
 class Inputs:
-    """Variant inputs: q/k/v/scale always, plus the decay/correction extras."""
+    """Variant inputs: q/k/v/scale always, plus the decay/correction extras.
+
+    preamble is set only when the tensors are pre-activation: it holds the
+    *_in_kernel flags and gate parameters.
+    """
 
     q: torch.Tensor
     k: torch.Tensor
@@ -50,6 +58,7 @@ class Inputs:
     g: torch.Tensor | None = None
     beta: torch.Tensor | None = None
     gate: torch.Tensor | None = None
+    preamble: dict = field(default_factory=dict)
 
 
 def _rand_qkv(
@@ -194,11 +203,76 @@ def make_kda_inputs(
     dtype: torch.dtype = DTYPE,
     device: str | torch.device = DEVICE,
     requires_grad: bool = False,
+    fused_preamble: bool = False,
+    varlen: bool = False,
+    varlen_lengths: list[int] | None = None,
 ) -> Inputs:
-    q, k, v = _rand_q_norm_k_v(B, H, T, D, DV, dtype, device, requires_grad)
-    g = -torch.rand(B, H, T, D, device=device, dtype=dtype).abs() * 0.1
-    beta = torch.sigmoid(torch.randn(B, H, T, device=device, dtype=dtype))
-    return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g, beta=beta)
+    if varlen:
+        assert varlen_lengths is not None, "varlen needs varlen_lengths"
+        return _make_kda_varlen_inputs(varlen_lengths, H, D, DV, dtype, device)
+
+    if not fused_preamble:
+        q, k, v = _rand_q_norm_k_v(B, H, T, D, DV, dtype, device, requires_grad)
+        g = -torch.rand(B, H, T, D, device=device, dtype=dtype).abs() * 0.1
+        beta = torch.sigmoid(torch.randn(B, H, T, device=device, dtype=dtype))
+        return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g, beta=beta)
+
+    q, k, v = _rand_qkv(B, H, T, D, DV, dtype, device, requires_grad)
+    return Inputs(
+        q=q,
+        k=k,
+        v=v,
+        scale=1.0 / math.sqrt(D),
+        g=torch.randn(B, H, T, D, device=device, dtype=dtype),
+        beta=torch.randn(B, H, T, device=device, dtype=dtype),
+        preamble={
+            "use_qk_l2norm_in_kernel": True,
+            "use_gate_in_kernel": True,
+            "use_beta_sigmoid_in_kernel": True,
+            "A_log": torch.zeros(H, dtype=torch.float32, device=device),
+            "dt_bias": torch.zeros(H, D, dtype=torch.float32, device=device),
+            "lower_bound": -5.0,
+        },
+    )
+
+
+def _make_kda_varlen_inputs(
+    lens: list[int],
+    H: int,
+    D: int,
+    DV: int,
+    dtype: torch.dtype = DTYPE,
+    device: str | torch.device = DEVICE,
+) -> Inputs:
+    """Pre-activation KDA inputs as the sequences in lens, under one cu_seqlens.
+
+    Token-major [1, T_total, H, *], the layout FLA, vLLM and FlashKDA all take for a
+    variable-length batch, so both sides of the comparison read these as they are.
+    cu_seqlens rides in preamble beside the *_in_kernel flags, which helion_fwd and
+    fla_fwd already forward verbatim.
+    """
+    total = sum(lens)
+    cu_seqlens = torch.nn.functional.pad(
+        torch.tensor(lens, device=device, dtype=torch.int32).cumsum(0), (1, 0)
+    )
+    rand = lambda *shape: torch.randn(*shape, device=device, dtype=dtype)  # noqa: E731
+    return Inputs(
+        q=rand(1, total, H, D),
+        k=rand(1, total, H, D),
+        v=rand(1, total, H, DV),
+        scale=1.0 / math.sqrt(D),
+        g=rand(1, total, H, D),
+        beta=rand(1, total, H),
+        preamble={
+            "use_qk_l2norm_in_kernel": True,
+            "use_gate_in_kernel": True,
+            "use_beta_sigmoid_in_kernel": True,
+            "A_log": torch.rand(H, dtype=torch.float32, device=device),
+            "dt_bias": torch.rand(H, D, dtype=torch.float32, device=device),
+            "lower_bound": -5.0,
+            "cu_seqlens": cu_seqlens,
+        },
+    )
 
 
 def make_mamba2_ssd_inputs(
@@ -263,6 +337,10 @@ _VARIANT_SPECS: dict[
 }
 
 
+_FUSED_PREAMBLE_VARIANTS = frozenset({LinearAttentionVariant.KDA})
+_VARLEN_VARIANTS = frozenset({LinearAttentionVariant.KDA})
+
+
 @dataclass
 class LinearAttentionExampleHarness:
     """Test, benchmark, and accuracy harness for one linear-attention variant."""
@@ -270,14 +348,18 @@ class LinearAttentionExampleHarness:
     variant: LinearAttentionVariant
     title: str = field(init=False)
     make_inputs: Callable[..., Inputs] = field(init=False)
+    has_fused_preamble: bool = field(init=False)
+    has_varlen: bool = field(init=False)
     grad_tensors: tuple[str, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         self.title, self.make_inputs, self.grad_tensors = _VARIANT_SPECS[self.variant]
+        self.has_fused_preamble = self.variant in _FUSED_PREAMBLE_VARIANTS
+        self.has_varlen = self.variant in _VARLEN_VARIANTS
 
     def helion_fwd(self, i: Inputs, C: int) -> torch.Tensor:
         fwd = get_helion_fwd_kernel(self.variant)
-        out = fwd(i.q, i.k, i.v, i.g, i.beta, C=C, scale=i.scale)
+        out = fwd(i.q, i.k, i.v, i.g, i.beta, C=C, scale=i.scale, **i.preamble)
         assert isinstance(out, torch.Tensor)
         return out
 
@@ -294,16 +376,40 @@ class LinearAttentionExampleHarness:
             i.g,
             i.beta,
             scale=scale,
+            **i.preamble,
         )
         return o
 
     def fla_fb(self, i: Inputs, go_t: torch.Tensor, scale: float) -> None:
         self.fla_fwd(i, scale).backward(go_t)
 
+    def flashkda_fwd(self, i: Inputs, scale: float) -> torch.Tensor:
+        fwd = get_flashkda_fwd_kernel(self.variant)
+        assert fwd is not None
+        o, _ = fwd(
+            i.q,
+            i.k,
+            i.v,
+            i.g,
+            i.beta,
+            scale=scale,
+            **i.preamble,
+        )
+        return o
+
     def reference(self, i: Inputs) -> torch.Tensor:
         assert i.g is not None
+        # The reference walks a head-first [B, H, T, *] batch; varlen inputs are
+        # token-major, so hand it the transposed view. Its output follows suit.
+        t = _htf if _is_varlen(i) else (lambda x: x)
         return naive_recurrent_reference(
-            i.q, i.k, i.v, i.g.float(), beta=i.beta, q_scale=i.scale
+            t(i.q),
+            t(i.k),
+            t(i.v),
+            t(i.g).float(),
+            beta=t(i.beta) if i.beta is not None else None,
+            q_scale=i.scale,
+            **i.preamble,
         )
 
     def chunked_reference(self, i: Inputs, C: int) -> torch.Tensor:
@@ -316,16 +422,52 @@ class LinearAttentionExampleHarness:
     def test(self) -> None:
         run_test(self, TEST_SHAPE, TEST_C)
 
-    def benchmark(
-        self, configs: list | None = None
-    ) -> list[tuple[str, float, float, float, float]]:
-        return run_benchmark(
-            self, configs if configs is not None else BENCH_CONFIGS, BENCH_C
+    def test_fused_preamble(self) -> None:
+        assert self.has_fused_preamble, (
+            f"{self.variant.value} has no in-kernel input preamble"
+        )
+        run_test(self, TEST_SHAPE, TEST_C, fused_preamble=True)
+
+    def test_varlen(self) -> None:
+        assert self.has_varlen, f"{self.variant.value} has no varlen path"
+        run_test(
+            self,
+            VARLEN_TEST_SHAPE,
+            TEST_C,
+            varlen=True,
+            varlen_lengths=VARLEN_TEST_LENGTHS,
         )
 
-    def accuracy(self, configs: list | None = None) -> list[tuple[str, str]]:
+    def benchmark(
+        self,
+        configs: list | None = None,
+        fused_preamble: bool = False,
+        varlen: bool = False,
+        varlen_lengths: list[int] | None = None,
+    ) -> list[tuple[str, float, float, float, float, float]]:
+        return run_benchmark(
+            self,
+            configs if configs is not None else BENCH_CONFIGS,
+            BENCH_C,
+            fused_preamble=fused_preamble,
+            varlen=varlen,
+            varlen_lengths=varlen_lengths,
+        )
+
+    def accuracy(
+        self,
+        configs: list | None = None,
+        fused_preamble: bool = False,
+        varlen: bool = False,
+        varlen_lengths: list[int] | None = None,
+    ) -> list[tuple[str, str]]:
         return run_accuracy(
-            self, configs if configs is not None else BENCH_CONFIGS, BENCH_C
+            self,
+            configs if configs is not None else BENCH_CONFIGS,
+            BENCH_C,
+            fused_preamble=fused_preamble,
+            varlen=varlen,
+            varlen_lengths=varlen_lengths,
         )
 
 
@@ -346,8 +488,34 @@ def _has_fla(harness: LinearAttentionExampleHarness) -> bool:
     return get_fla_fwd_kernel(harness.variant) is not None
 
 
+def _has_flashkda(
+    harness: LinearAttentionExampleHarness, inputs: Inputs, d: int, dv: int
+) -> bool:
+    """FlashKDA runs the varlen KDA forward only, at D == DV == 128.
+
+    It reads q/k/v/g token-major and takes the input transforms itself, which is
+    the varlen path's layout and flag set. The dense path is head-first, so it is
+    excluded rather than fed transposed tensors.
+    """
+    return (
+        get_flashkda_fwd_kernel(harness.variant) is not None
+        and flashkda_supports(d, dv)
+        and _is_varlen(inputs)
+    )
+
+
+def _is_varlen(inputs: Inputs) -> bool:
+    """True when the inputs are varlen, i.e. already token-major."""
+    return "cu_seqlens" in inputs.preamble
+
+
 def _fla_inputs(inputs: Inputs) -> Inputs:
-    """Inputs in FLA's time-first layout: transpose every tensor, keep scalars."""
+    """Inputs in FLA's time-first layout: transpose every tensor, keep scalars.
+
+    Varlen inputs are token-major already, so they pass through untouched.
+    """
+    if _is_varlen(inputs):
+        return inputs
     out = dataclasses.replace(inputs)
     for f in dataclasses.fields(out):
         val = getattr(out, f.name)
@@ -388,15 +556,33 @@ def run_test(
     harness: LinearAttentionExampleHarness,
     test_shape: tuple[int, int, int, int, int],
     C: int,
+    fused_preamble: bool = False,
+    varlen: bool = False,
+    varlen_lengths: list[int] | None = None,
 ) -> None:
-    """Forward + backward correctness vs reference and FLA."""
+    """Forward + backward correctness vs reference and FLA.
+
+    fused_preamble asks for pre-activation inputs, which have no backward, so only
+    the forward is checked. varlen adds cu_seqlens on top, so its tensors are
+    token-major and the comparisons transpose our output to the head-first layout
+    the reference returns.
+    """
     torch.manual_seed(42)
     B, H, T, D, DV = test_shape
-    inputs = harness.make_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE)
+    extra: dict[str, object] = {}
+    if fused_preamble:
+        extra["fused_preamble"] = True
+    if varlen:
+        extra["varlen"] = True
+        extra["varlen_lengths"] = varlen_lengths
+    inputs = harness.make_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE, **extra)
     scale = inputs.scale
+    # A varlen forward returns token-major; the reference and FLA both give
+    # head-first, so line our output up with them.
+    as_ref = _htf if varlen else (lambda x: x)
 
     # === Forward: vs naive recurrent reference ===
-    out = harness.helion_fwd(inputs, C)
+    out = as_ref(harness.helion_fwd(inputs, C))
     ref = harness.reference(inputs)
     fwd_err = _rel_error(out, ref)
     assert fwd_err < ACC_FWD_TOL, f"Forward error: {fwd_err}"
@@ -414,6 +600,11 @@ def run_test(
             f"  fwd vs FLA:       {fla_err:.4e}"
             f" {'PASS' if fla_err < ACC_FWD_TOL else 'FAIL'}"
         )
+
+    if inputs.preamble:
+        # The in-kernel preamble has no backward, so there is nothing more to check.
+        print("All tests passed.")
+        return
 
     # === Backward: Helion grads vs chunked reference ===
     grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
@@ -451,21 +642,56 @@ def _time_config(
     harness: LinearAttentionExampleHarness,
     shape: tuple[int, int, int, int, int],
     C: int,
-) -> tuple[float, float, float, float]:
-    """Time helion/FLA forward and fwd+bwd for one shape."""
+    fused_preamble: bool = False,
+    varlen: bool = False,
+    varlen_lengths: list[int] | None = None,
+) -> tuple[float, float, float, float, float]:
+    """Time helion/FLA forward and fwd+bwd for one shape, plus FlashKDA forward.
+
+    The fwd+bwd pair is 0.0 for pre-activation inputs, which have no backward, and
+    varlen is one such case. The FlashKDA time is 0.0 wherever it does not apply.
+    """
     bi, hi, ti, di, dvi = shape
+    extra: dict[str, object] = {}
+    if fused_preamble:
+        extra["fused_preamble"] = True
+    if varlen:
+        extra["varlen"] = True
+        extra["varlen_lengths"] = varlen_lengths
     inputs = harness.make_inputs(
-        bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE, requires_grad=True
+        bi,
+        hi,
+        ti,
+        di,
+        dvi,
+        dtype=DTYPE,
+        device=DEVICE,
+        requires_grad=not (fused_preamble or varlen),
+        **extra,
     )
     scale = inputs.scale
-    grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
     fla_inputs = _fla_inputs(inputs)
-    go_t = _htf(grad_out)
-    h_grads = [getattr(inputs, n) for n in harness.grad_tensors]
-    fla_grads = [getattr(fla_inputs, n) for n in harness.grad_tensors]
 
     fwd_ms = do_bench(lambda: harness.helion_fwd(inputs, C))
     fla_fwd_ms = do_bench(lambda: harness.fla_fwd(fla_inputs, scale))
+    fk_ms = (
+        do_bench(lambda: harness.flashkda_fwd(inputs, scale))
+        if _has_flashkda(harness, inputs, di, dvi)
+        else 0.0
+    )
+    if inputs.preamble:
+        return (
+            cast("float", fwd_ms),
+            cast("float", fla_fwd_ms),
+            0.0,
+            0.0,
+            cast("float", fk_ms),
+        )
+
+    grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
+    go_t = _htf(grad_out)
+    h_grads = [getattr(inputs, n) for n in harness.grad_tensors]
+    fla_grads = [getattr(fla_inputs, n) for n in harness.grad_tensors]
     fb_ms = do_bench(
         lambda: harness.helion_fb(inputs, grad_out, C),
         grad_to_none=h_grads,  # pyrefly: ignore[bad-argument-type]
@@ -479,6 +705,7 @@ def _time_config(
         cast("float", fla_fwd_ms),
         cast("float", fb_ms),
         cast("float", fla_fb_ms),
+        cast("float", fk_ms),
     )
 
 
@@ -486,31 +713,43 @@ def run_benchmark(
     harness: LinearAttentionExampleHarness,
     configs: list,
     C: int,
-) -> list[tuple[str, float, float, float, float]]:
-    """Benchmark forward and fwd+bwd, comparing against FLA.
+    fused_preamble: bool = False,
+    varlen: bool = False,
+    varlen_lengths: list[int] | None = None,
+) -> list[tuple[str, float, float, float, float, float]]:
+    """Benchmark forward and fwd+bwd, comparing against FLA and FlashKDA.
 
-    Returns one (config, helion_fwd_ms, fla_fwd_ms, helion_fb_ms, fla_fb_ms) row
-    per config; empty when fla is unavailable.
+    Returns one (config, helion_fwd_ms, fla_fwd_ms, helion_fb_ms, fla_fb_ms,
+    flashkda_fwd_ms) row per config; empty when fla is unavailable. The fwd+bwd
+    pair is 0.0 with fused_preamble, whose inputs have no backward, and the
+    FlashKDA time is 0.0 wherever it does not apply.
     """
-    rows: list[tuple[str, float, float, float, float]] = []
+    rows: list[tuple[str, float, float, float, float, float]] = []
     if not _has_fla(harness):
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return rows
 
     print(
         f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
-        f" {'Helion f+b':>12} {'FLA f+b':>12}"
+        f" {'Helion f+b':>12} {'FLA f+b':>12} {'FlashKDA':>10}"
     )
-    print("-" * 72)
+    print("-" * 83)
 
     for shape in configs:
-        fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms = _time_config(harness, shape, C)
+        fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms, fk_ms = _time_config(
+            harness,
+            shape,
+            C,
+            fused_preamble=fused_preamble,
+            varlen=varlen,
+            varlen_lengths=varlen_lengths,
+        )
         cfg = f"({','.join(str(x) for x in shape)})"
         print(
             f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
-            f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f}"
+            f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f} {fk_ms:>10.3f}"
         )
-        rows.append((cfg, fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms))
+        rows.append((cfg, fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms, fk_ms))
 
     return rows
 
@@ -519,21 +758,34 @@ def run_accuracy(
     harness: LinearAttentionExampleHarness,
     configs: list,
     C: int,
+    fused_preamble: bool = False,
+    varlen: bool = False,
+    varlen_lengths: list[int] | None = None,
 ) -> list[tuple[str, str]]:
     """Per-config (fwd, bwd) verdicts vs the fp32 PyTorch reference.
 
     Each of fwd and bwd is one of: ``ok`` (matches within tolerance), ``FAIL``
     (ran but over tolerance), ``HEL-ERR`` (the Helion kernel errored), ``REF-ERR``
-    (the reference errored, e.g. its autograd graph OOMs). Forward compares
-    against the naive recurrent reference; backward compares autograd gradients
-    against the chunked reference.
+    (the reference errored, e.g. its autograd graph OOMs), ``n/a`` (there is no
+    backward, as with pre-activation inputs). Forward compares against the naive
+    recurrent reference; backward compares autograd gradients against the chunked
+    reference.
     """
     verdicts: list[tuple[str, str]] = []
+    extra: dict[str, object] = {}
+    if fused_preamble:
+        extra["fused_preamble"] = True
+    if varlen:
+        extra["varlen"] = True
+        extra["varlen_lengths"] = varlen_lengths
+    as_ref = _htf if varlen else (lambda x: x)
     for bi, hi, ti, di, dvi in configs:
-        inputs = harness.make_inputs(bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE)
+        inputs = harness.make_inputs(
+            bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE, **extra
+        )
 
         try:
-            out = harness.helion_fwd(inputs, C)
+            out = as_ref(harness.helion_fwd(inputs, C))
         except Exception:
             torch.cuda.empty_cache()
             fwd = "HEL-ERR"
@@ -545,6 +797,10 @@ def run_accuracy(
                 fwd = "REF-ERR"
             else:
                 fwd = "ok" if _rel_error(out, ref) < ACC_FWD_TOL else "FAIL"
+
+        if inputs.preamble:
+            verdicts.append((fwd, "n/a"))
+            continue
 
         grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
         try:

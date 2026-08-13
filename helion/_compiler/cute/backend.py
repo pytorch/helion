@@ -263,6 +263,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import analyze_cute_mma_node
+    from .cute_mma import ensure_tcgen05_pair_epilogue_plan
 
     if _detect_grouped_rank3_specialized_mma_loop(
         fn,
@@ -291,11 +292,11 @@ def _detect_specialized_mma_loop(
                 and candidate.operands.k_block_id == block_ids[0]
                 and _specialized_mma_root_mn_block_ids(candidate, config) is not None
             ):
-                candidates.append(candidate)
+                candidates.append((node, candidate))
     if not candidates:
         return False
 
-    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0], config)
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0][1], config)
     assert root_mn_block_ids is not None
     root_layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
     if root_layout is None:
@@ -305,15 +306,15 @@ def _detect_specialized_mma_loop(
     if not isinstance(bk, int):
         return False
     candidates = [
-        candidate
-        for candidate in candidates
+        (node, candidate)
+        for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
     ]
     if not candidates:
         return False
 
-    for candidate in candidates:
+    for node, candidate in candidates:
         lhs_val = candidate.operands.lhs.source_fake
         mma_impl = _choose_mma_impl(
             lhs_val.dtype,
@@ -340,6 +341,16 @@ def _detect_specialized_mma_loop(
             root_m_threads=root_m_threads,
             root_n_threads=root_n_threads,
         ):
+            if mma_impl == "tcgen05" and not ensure_tcgen05_pair_epilogue_plan(
+                fn,
+                node,
+                candidate,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=config,
+            ):
+                continue
             return True
     return False
 
@@ -773,6 +784,10 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    @property
+    def supports_eager_prepared_call(self) -> bool:
+        return True
+
     def validate_environment(self) -> None:
         from .cutedsl_compat import check_cute_backend_requirements
 
@@ -1025,6 +1040,18 @@ class CuteBackend(Backend):
             cute_kernel._helion_cute_source_hash = hashlib.sha256(
                 source.encode("utf-8")
             ).hexdigest()
+
+    def generated_source_hash(self, compiled_fn: object) -> str | None:
+        fn_globals = getattr(compiled_fn, "__globals__", None)
+        fn_name = getattr(compiled_fn, "__name__", None)
+        if not isinstance(fn_globals, dict) or not isinstance(fn_name, str):
+            return None
+        cute_kernel = fn_globals.get(f"_helion_{fn_name}")
+        source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+        return source_hash if isinstance(source_hash, str) else None
+
+    def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
+        return config_spec.cute_flash_search_enabled
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or

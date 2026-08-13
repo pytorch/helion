@@ -14,7 +14,7 @@ from cutlass.pipeline import PipelineState
 from cutlass.pipeline import PipelineUserType
 
 if TYPE_CHECKING:
-    from cutlass._mlir import ir
+    from ._mlir_compat import ir
 
 
 class HelionPipelineState(PipelineState):

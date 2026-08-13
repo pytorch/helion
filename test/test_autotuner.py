@@ -57,11 +57,14 @@ from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.config_fragment import BlockSizeFragment
 from helion.autotuner.config_fragment import BooleanFragment
+from helion.autotuner.config_fragment import ConfigSpecFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import NumThreadsFragment
+from helion.autotuner.config_fragment import NumWarpsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -225,6 +228,8 @@ class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
         self, settings: Settings, *, args: tuple[object, ...] = ()
     ) -> BaseSearch:
+        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
+        # its attributes, so new __init__ fields don't need to be added here.
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
@@ -236,10 +241,18 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.args = args
         search.log = AutotuningLogger(settings)
         search.config_spec = SimpleNamespace(
-            default_config=lambda: helion.Config(block_sizes=[1])
+            default_config=lambda: helion.Config(block_sizes=[1]),
+            cute_flash_search_enabled=False,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                should_deduplicate_generated_sources=lambda config_spec: False,
+                get_do_bench=lambda: None,
+                classify_autotune_exception=lambda error: None,
+            ),
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
+        search._search_space_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,
@@ -567,6 +580,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 compile_time=0.5,
                 config_id=config_id,
                 config=config,
+                source_hash="source-abc",
             )
             logger.record_autotune_entry(entry)
             logger("finalized entry", level=logging.CRITICAL)
@@ -603,6 +617,11 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(cell("perf_ms"), "1.234000")
         self.assertEqual(cell("compile_time_s"), "0.50")
         self.assertEqual(cell("config"), str(config))
+        source_rows = list(
+            csv.reader(base_path.with_suffix(".sources.csv").read_text().splitlines())
+        )
+        self.assertEqual(source_rows[0][-2:], ["status", "source_hash"])
+        self.assertEqual(source_rows[1][-2:], ["ok", "source-abc"])
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
@@ -966,6 +985,95 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Restricted search -> debug CSV written, but no dataset sidecar.
         self.assertTrue(base_path.with_suffix(".csv").exists())
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
+
+
+class TestConfigFragmentCardinality(TestCase):
+    """cardinality()/search_values() are pure, GPU-independent fragment
+    methods, so they run in both normal and ref-eager modes."""
+
+    def test_fragment_cardinality(self):
+        # Number of distinct search values per fragment type. Feeds the
+        # search-space size product and coverage denominators.
+        self.assertIsNone(ConfigSpecFragment().cardinality())  # unknown by default
+        self.assertEqual(PermutationFragment(1).cardinality(), 1)
+        self.assertEqual(PermutationFragment(4).cardinality(), 24)  # 4!
+        self.assertEqual(IntegerFragment(1, 8).cardinality(), 8)
+        self.assertEqual(PowerOfTwoFragment(1, 64).cardinality(), 7)  # 1..64
+        self.assertEqual(PowerOfTwoFragment(1, 1).cardinality(), 1)  # boundary
+        self.assertEqual(BlockSizeFragment(16, 256).cardinality(), 5)
+        self.assertEqual(NumWarpsFragment(1, 32).cardinality(), 6)
+        self.assertEqual(EnumFragment(("a", "b", "c")).cardinality(), 3)
+        # search_choices restrict the searched cardinality to the subset.
+        self.assertEqual(
+            EnumFragment(("a", "b", "c", "d"), search_choices=("a", "c")).cardinality(),
+            2,
+        )
+        self.assertEqual(BooleanFragment().cardinality(), 2)
+        # NumThreads: "0" (auto) plus powers of two up to high.
+        self.assertEqual(NumThreadsFragment(256).cardinality(), 10)
+        # ListOf is combinatorial (inner ** length), not linear.
+        self.assertEqual(
+            ListOf(EnumFragment(("a", "b", "c")), length=4).cardinality(), 81
+        )
+        # ListOf over an unknown-cardinality inner is itself unknown.
+        self.assertIsNone(ListOf(ConfigSpecFragment(), length=3).cardinality())
+
+    def test_fragment_search_values(self):
+        # Explicit enumerable values, and the limit guard that avoids
+        # materializing very large ranges.
+        self.assertIsNone(ConfigSpecFragment().search_values())
+        self.assertEqual(
+            IntegerFragment(1, 8).search_values(), [1, 2, 3, 4, 5, 6, 7, 8]
+        )
+        self.assertEqual(
+            PowerOfTwoFragment(1, 64).search_values(), [1, 2, 4, 8, 16, 32, 64]
+        )
+        self.assertEqual(
+            BlockSizeFragment(16, 256).search_values(), [16, 32, 64, 128, 256]
+        )
+        self.assertEqual(EnumFragment(("a", "b", "c")).search_values(), ["a", "b", "c"])
+        self.assertEqual(
+            EnumFragment(
+                ("a", "b", "c", "d"), search_choices=("a", "c")
+            ).search_values(),
+            ["a", "c"],
+        )
+        self.assertEqual(BooleanFragment().search_values(), [False, True])
+        self.assertEqual(
+            NumThreadsFragment(256).search_values(),
+            [0, 1, 2, 4, 8, 16, 32, 64, 128, 256],
+        )
+        # limit guard: None (not a materialized list) above the limit, full below.
+        self.assertIsNone(IntegerFragment(0, 200).search_values())
+        self.assertEqual(len(IntegerFragment(0, 200).search_values(limit=1000)), 201)
+        # ListOf combinations are not enumerated.
+        self.assertIsNone(
+            ListOf(EnumFragment(("a", "b", "c")), length=4).search_values()
+        )
+
+    def test_block_id_sequence_cardinality(self):
+        # Product of per-item fragment cardinalities; empty -> 1 (neutral);
+        # an unknown-cardinality item makes the whole sequence unknown.
+        from helion.autotuner.block_id_sequence import BlockIdSequence
+        from helion.autotuner.block_id_sequence import _BlockIdItem
+
+        class _Item(_BlockIdItem):
+            def __init__(self, ids, frag):
+                super().__init__(ids)
+                self._f = frag
+
+            def _fragment(self, base):
+                return self._f
+
+        seq = BlockIdSequence()
+        seq.append(_Item([0], EnumFragment(("a", "b", "c"))))
+        seq.append(_Item([1], EnumFragment(("x", "y"))))
+        self.assertEqual(seq.cardinality(None), 6)  # 3 * 2
+        self.assertEqual(BlockIdSequence().cardinality(None), 1)
+
+        unknown = BlockIdSequence()
+        unknown.append(_Item([0], ConfigSpecFragment()))
+        self.assertIsNone(unknown.cardinality(None))
 
 
 @onlyBackends(["triton"])
@@ -3791,18 +3899,19 @@ class TestCuteAutotuner(TestCase):
         torch.testing.assert_close(actual, args[0] @ args[1], atol=0.125, rtol=0.02)
 
     def test_cute_flash_search_surface(self) -> None:
-        """The flash-attention autotune surface (Tasks #25 + #28) appears only
+        """The flash-attention autotune surface appears only
         when the dense flash dataflow is detected.
 
         For an attention kernel bind ``cute_flash_search_enabled`` is True and
         every active flash autotune knob is in ``flat_key_layout()`` -- including
-        the paired exp2 schedule and the fa4-win knobs (``topology``,
-        ``disc_pipe``, ``epi_tma``), with the ``topology`` fragment offering
-        ``fa4`` for the fa4-eligible (even-num_kv) shape; for a non-attention
+        the paired exp2 schedule and the compound pipeline family, with the
+        family fragment offering ``fa4`` for the fa4-eligible (even-num_kv)
+        shape; for a non-attention
         cute kernel (a matmul) the flag is False and none of the flash knobs leak
         into the search surface.
         """
         from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
+        from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_PIPELINE_FAMILIES
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
@@ -3815,27 +3924,32 @@ class TestCuteAutotuner(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
         from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
         from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
         from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
         from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
-        from helion._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
         from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_LEGACY_CONFIG_KEYS
+        from helion._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
         from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
         from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
         from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
         from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
         from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILIES
+        from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
         from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
+        from helion._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_RECOMPUTE_TILE_COORDS_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
         from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
@@ -3846,9 +3960,14 @@ class TestCuteAutotuner(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
         from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_STAT_TRANSPORT_KEY
         from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
         from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+        from helion._compiler.cute.cute_flash import FLASH_USE_2CTA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_WAIT_HINT_KEY
         from helion._compiler.cute.cute_flash import flash_autotune_fragments
+        from helion._compiler.cute.cute_flash import flash_config_from_config
+        from helion._compiler.cute.cute_flash import flash_effective_config_values
 
         @helion.kernel(backend="cute", static_shapes=True)
         def flash_attention(q_in, k_in, v_in):
@@ -3967,17 +4086,14 @@ class TestCuteAutotuner(TestCase):
         }
         for key in FLASH_AUTOTUNE_CONFIG_KEYS:
             self.assertIn(key, attn_keys)
-        for legacy_key in (
-            FLASH_EXP2_IMPL_KEY,
-            FLASH_E2E_FREQ_KEY,
-            FLASH_E2E_RES_KEY,
-        ):
+        for legacy_key in FLASH_LEGACY_CONFIG_KEYS:
             self.assertNotIn(legacy_key, attn_keys)
         for generic_key in ("num_threads", "loop_orders", "cute_vector_widths"):
             self.assertNotIn(generic_key, attn_keys)
-        # The fa4-win knobs are explicitly part of the surface when enabled.
+        # Structural flags are represented by one compound family. The CLC
+        # children remain active because they tune a selected CLC family.
         for fa4_key in (
-            FLASH_TOPOLOGY_KEY,
+            FLASH_PIPELINE_FAMILY_KEY,
             FLASH_SOFTMAX_DISC_KEY,
             FLASH_DISC_PIPE_KEY,
             FLASH_EPI_TMA_KEY,
@@ -3986,21 +4102,31 @@ class TestCuteAutotuner(TestCase):
             FLASH_EPI_STG_GMEM_KEY,
             FLASH_CORR_TILE_SIZE_KEY,
             FLASH_OTHER_REGS_KEY,
-            FLASH_CLC_KEY,
             FLASH_CLC_HEADS_PER_BATCH_KEY,
             FLASH_CLC_PDL_KEY,
             FLASH_CLC_STAGES_KEY,
-            FLASH_LOCAL_TMA_PARTITION_KEY,
-            FLASH_TENSOR_4D_TMA_KEY,
         ):
             self.assertIn(fa4_key, attn_keys)
+        self.assertEqual(
+            set(FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS),
+            {
+                FLASH_TOPOLOGY_KEY,
+                FLASH_USE_2CTA_KEY,
+                FLASH_CGA2_LOCAL_KEY,
+                FLASH_CLC_KEY,
+                FLASH_LOCAL_TMA_PARTITION_KEY,
+                FLASH_TENSOR_4D_TMA_KEY,
+            },
+        )
+        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 15)
         # seq=256 -> num_kv=2 (even) is fa4-eligible (seq % 256 == 0), so the
         # topology fragment must offer fa4 (alongside the ws_overlap default
         # seed first) so the autotuner can pick the fa4 win for this shape.
         flash_fragments = attn_bound.config_spec._flat_fields()
-        topology_choices = flash_fragments[FLASH_TOPOLOGY_KEY].choices
-        self.assertEqual(topology_choices[0], "fa4")
-        self.assertIn("fa4", topology_choices)
+        family_choices = flash_fragments[FLASH_PIPELINE_FAMILY_KEY].choices
+        self.assertEqual(family_choices[0], "fa4")
+        self.assertIn("fa4", family_choices)
+        self.assertIn("ws_overlap", family_choices)
         self.assertEqual(
             flash_fragments[FLASH_SMALL_BIASED_KEY].search_choices, (True,)
         )
@@ -4016,19 +4142,28 @@ class TestCuteAutotuner(TestCase):
         sparse_bound = sparse_flash_attention.bind((q, k, v))
         sparse_fragments_from_bound = sparse_bound.config_spec._flat_fields()
         self.assertEqual(
-            sparse_fragments_from_bound[FLASH_TOPOLOGY_KEY].choices,
+            sparse_fragments_from_bound[FLASH_PIPELINE_FAMILY_KEY].choices,
             ("ws_overlap",),
         )
         sparse_default_config = sparse_bound.config_spec.default_config().config
-        self.assertEqual(sparse_default_config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertEqual(sparse_default_config[FLASH_PIPELINE_FAMILY_KEY], "ws_overlap")
         self.assertTrue(sparse_default_config[FLASH_PACKED_REDUCE_KEY])
         sparse_fa4_config = dict(sparse_default_config)
         sparse_fa4_config[FLASH_TOPOLOGY_KEY] = "fa4"
         sparse_bound.config_spec.normalize(sparse_fa4_config)
-        self.assertEqual(sparse_fa4_config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertEqual(sparse_fa4_config[FLASH_PIPELINE_FAMILY_KEY], "ws_overlap")
+        self.assertNotIn(FLASH_TOPOLOGY_KEY, sparse_fa4_config)
         e2e_schedule_choices = flash_fragments[FLASH_E2E_SCHEDULE_KEY].choices
         self.assertEqual(e2e_schedule_choices[0], "16/4")
-        self.assertEqual(set(e2e_schedule_choices), {"16/4", "8/2", "16/2", "xu"})
+        # The manual exp2 packets canonicalize onto "16/6"/"16/8", so those
+        # cadences are selectable as manual overrides on fa4 hd64 without
+        # entering the search surface.
+        self.assertEqual(
+            set(e2e_schedule_choices), {"16/4", "8/2", "16/2", "xu", "16/6", "16/8"}
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices, ("16/4", "8/2")
+        )
         self.assertEqual(
             flash_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices, ("inherit",)
         )
@@ -4038,6 +4173,51 @@ class TestCuteAutotuner(TestCase):
         e2e_offset0_choices = flash_fragments[FLASH_E2E_OFFSET0_KEY].choices
         self.assertEqual(e2e_offset0_choices[0], 0)
         self.assertEqual(set(e2e_offset0_choices), set(range(16)))
+        self.assertEqual(
+            set(flash_fragments[FLASH_WAIT_HINT_KEY].choices), {0, 10_000_000}
+        )
+        # The polynomial packets are manual-only overrides: selectable as fixed
+        # configs but never offered to the search.
+        self.assertEqual(
+            set(flash_fragments[FLASH_EXP2_PACKET_KEY].choices),
+            {
+                "1x1",
+                "4x1",
+                "4x2",
+                "8x1",
+                "8x2",
+                "deg2_16x6",
+                "hybrid_deg1_16x8",
+                "deg1_16x8",
+                "deg1_8x2_corr10",
+            },
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_EXP2_PACKET_KEY].search_choices, ("1x1", "4x1")
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_STAT_TRANSPORT_KEY].choices),
+            {"ring2", "single", "single_final"},
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_MMA_INTERLEAVE_KEY].choices), {False, True}
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_MMA_INTERLEAVE_KEY].search_choices, (True,)
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_STAT_TRANSPORT_KEY].search_choices,
+            ("single", "ring2", "single_final"),
+        )
+        self.assertIn(
+            "ring2",
+            flash_fragments[FLASH_STAT_TRANSPORT_KEY].pattern_neighbors("single"),
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_EXP2_PACKET_KEY].search_choices or ()),
+            {"1x1", "4x1"},
+        )
+        self.assertNotIn(FLASH_Q_TILE_COUNT_KEY, flash_fragments)
         # The fa4 levers offer narrow validated search sets.
         self.assertEqual(flash_fragments[FLASH_DISC_PIPE_KEY].choices[0], 4)
         self.assertEqual(
@@ -4138,7 +4318,7 @@ class TestCuteAutotuner(TestCase):
             env_xu_long_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
             set(env_xu_long_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
-            {"16/4", "8/2", "16/2", "xu"},
+            {"16/4", "8/2", "16/2", "xu", "16/6", "16/8"},
         )
         self.assertEqual(
             env_xu_long_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
@@ -4172,7 +4352,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             env_xu_long_fragments[FLASH_S_STAGE_KEY].search_choices,
-            (1, 2),
+            (2,),
         )
         self.assertEqual(
             env_xu_long_fragments[FLASH_SOFTMAX_REGS_KEY].choices,
@@ -4183,10 +4363,34 @@ class TestCuteAutotuner(TestCase):
         ):
             bad_topology_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
-            bad_topology_fragments[FLASH_TOPOLOGY_KEY].choices,
-            ("ws_overlap", "fa4"),
+            set(bad_topology_fragments[FLASH_PIPELINE_FAMILY_KEY].choices),
+            set(FLASH_AUTOTUNE_PIPELINE_FAMILIES),
         )
-        self.assertIsNone(bad_topology_fragments[FLASH_TOPOLOGY_KEY].search_choices)
+        self.assertEqual(
+            bad_topology_fragments[FLASH_PIPELINE_FAMILY_KEY].choices[0],
+            "ws_overlap",
+        )
+        for manual_family, causal in (
+            ("fa4_deep_1cta", False),
+            ("fa4_2cta_causal", True),
+        ):
+            with (
+                self.subTest(manual_family=manual_family),
+                unittest.mock.patch.dict(
+                    os.environ,
+                    {"HELION_CUTE_FLASH_PIPELINE_FAMILY": manual_family},
+                    clear=False,
+                ),
+            ):
+                manual_fragments = flash_autotune_fragments(
+                    64,
+                    512,
+                    is_causal=causal,
+                )
+            manual_fragment = manual_fragments[FLASH_PIPELINE_FAMILY_KEY]
+            self.assertIn(manual_family, manual_fragment.choices)
+            self.assertNotEqual(manual_fragment.default(), manual_family)
+            self.assertNotIn(manual_family, manual_fragment.search_choices or ())
         self.assertEqual(
             set(bad_topology_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
             {"16/4", "8/2", "16/2", "xu"},
@@ -4232,7 +4436,7 @@ class TestCuteAutotuner(TestCase):
             {"ascending", "descending"},
         )
         self.assertEqual(
-            causal_fragments[FLASH_TOPOLOGY_KEY].search_choices,
+            causal_fragments[FLASH_PIPELINE_FAMILY_KEY].search_choices,
             ("fa4", "ws_overlap"),
         )
         self.assertEqual(
@@ -4249,7 +4453,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices,
-            ("inherit", "xu", "16/4", "8/2"),
+            ("inherit", "xu", "16/4", "8/2", "16/6", "16/8"),
         )
         self.assertEqual(
             causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].search_choices,
@@ -4348,7 +4552,7 @@ class TestCuteAutotuner(TestCase):
             FLASH_KV_STAGE_KEY: (2,),
             FLASH_E2E_SCHEDULE_KEY: ("8/2",),
             FLASH_MASKED_E2E_SCHEDULE_KEY: ("16/4",),
-            FLASH_TOPOLOGY_KEY: ("fa4",),
+            FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap"),
             FLASH_DISC_PIPE_KEY: (4,),
             FLASH_E2E_OFFSET_KEY: (9,),
             FLASH_E2E_OFFSET0_KEY: (3,),
@@ -4370,12 +4574,12 @@ class TestCuteAutotuner(TestCase):
             )
         long_dense_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
-            long_dense_fragments[FLASH_TOPOLOGY_KEY].choices,
-            ("fa4", "ws_overlap"),
+            set(long_dense_fragments[FLASH_PIPELINE_FAMILY_KEY].choices),
+            set(FLASH_AUTOTUNE_PIPELINE_FAMILIES),
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_TOPOLOGY_KEY].search_choices,
-            ("fa4", "ws_overlap"),
+            long_dense_fragments[FLASH_PIPELINE_FAMILY_KEY].search_choices,
+            ("fa4", "ws_overlap", "fa4_clc"),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_ROLE_MAP_KEY].search_choices,
@@ -4383,7 +4587,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
-            {"16/4", "8/2", "16/2", "xu"},
+            {"16/4", "8/2", "16/2", "xu", "16/6", "16/8"},
         )
         self.assertEqual(
             long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
@@ -4484,10 +4688,6 @@ class TestCuteAutotuner(TestCase):
             (0,),
         )
         self.assertEqual(
-            very_long_dense_fragments[FLASH_CLC_KEY].search_choices,
-            (False,),
-        )
-        self.assertEqual(
             very_long_dense_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
             (0,),
         )
@@ -4539,22 +4739,14 @@ class TestCuteAutotuner(TestCase):
             very_long_dense_fragments[FLASH_EPI_STG_GMEM_KEY].search_choices,
             ("stage",),
         )
-        self.assertEqual(
-            very_long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
-            (False,),
-        )
-        self.assertEqual(
-            very_long_dense_fragments[FLASH_TENSOR_4D_TMA_KEY].search_choices,
-            (False,),
-        )
         common_very_long_dense_search_choices = {
+            FLASH_PERSISTENT_KEY: (True, False),
             FLASH_PERSISTENT_CTAS_PER_SM_KEY: (1,),
             FLASH_CORR_TILE_SIZE_KEY: (8, 16),
             FLASH_SOFTMAX_DISC_KEY: (False,),
             FLASH_DISC_PIPE_KEY: (1,),
             FLASH_P_STORE_REP_KEY: (16,),
             FLASH_S_LOAD_REP_KEY: (32,),
-            FLASH_CLC_KEY: (False,),
             FLASH_CLC_HEADS_PER_BATCH_KEY: (0,),
             FLASH_CLC_PDL_KEY: (False,),
             FLASH_CLC_STAGES_KEY: (1,),
@@ -4568,6 +4760,7 @@ class TestCuteAutotuner(TestCase):
         }
         very_long_dense_search_choices_by_num_kv = {
             256: {
+                FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap", "fa4_2cta"),
                 FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (40,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
@@ -4576,14 +4769,12 @@ class TestCuteAutotuner(TestCase):
                 FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
                 FLASH_E2E_OFFSET0_KEY: (1,),
                 FLASH_KV_ORDER_KEY: ("descending",),
-                FLASH_CGA2_LOCAL_KEY: (False,),
                 FLASH_CORR_REGS_KEY: (64,),
                 FLASH_EPI_TMA_KEY: (True,),
-                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
-                FLASH_TENSOR_4D_TMA_KEY: (False,),
                 FLASH_KV_STAGE_KEY: (2, 3),
             },
             384: {
+                FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap", "fa4_2cta"),
                 FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (32,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
@@ -4592,14 +4783,12 @@ class TestCuteAutotuner(TestCase):
                 FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
                 FLASH_E2E_OFFSET0_KEY: (3,),
                 FLASH_KV_ORDER_KEY: ("ascending",),
-                FLASH_CGA2_LOCAL_KEY: (False,),
                 FLASH_CORR_REGS_KEY: (72,),
                 FLASH_EPI_TMA_KEY: (True,),
-                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
-                FLASH_TENSOR_4D_TMA_KEY: (False,),
                 FLASH_KV_STAGE_KEY: (2, 3),
             },
             512: {
+                FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap", "fa4_2cta"),
                 FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (32,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (4,),
@@ -4608,17 +4797,20 @@ class TestCuteAutotuner(TestCase):
                 FLASH_PRECOMPUTE_QK_DESC_KEY: (True,),
                 FLASH_E2E_OFFSET0_KEY: (0,),
                 FLASH_KV_ORDER_KEY: ("descending",),
-                FLASH_CGA2_LOCAL_KEY: (False,),
                 FLASH_CORR_REGS_KEY: (80,),
                 FLASH_CORR_TILE_SIZE_KEY: (16, 8),
                 FLASH_EPI_TMA_KEY: (False,),
                 FLASH_EPI_STG_KEY: (True,),
-                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
-                FLASH_TENSOR_4D_TMA_KEY: (False,),
                 FLASH_KV_STAGE_KEY: (2, 3),
                 FLASH_ROLE_MAP_KEY: ("fa4", "helion"),
             },
             1024: {
+                FLASH_PIPELINE_FAMILY_KEY: (
+                    "fa4_clc",
+                    "fa4",
+                    "ws_overlap",
+                    "fa4_2cta",
+                ),
                 FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_OTHER_REGS_KEY: (40,),
                 FLASH_FIRST_LOAD_ORDER_KEY: (0,),
@@ -4627,19 +4819,16 @@ class TestCuteAutotuner(TestCase):
                 FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
                 FLASH_E2E_OFFSET0_KEY: (0,),
                 FLASH_KV_ORDER_KEY: ("descending",),
-                FLASH_CGA2_LOCAL_KEY: (False,),
                 FLASH_PERSISTENT_CTAS_PER_SM_KEY: (1,),
                 FLASH_CORR_REGS_KEY: (72,),
                 FLASH_EPI_TMA_KEY: (True,),
                 FLASH_EPI_STG_KEY: (False,),
-                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
-                FLASH_TENSOR_4D_TMA_KEY: (False,),
                 FLASH_KV_STAGE_KEY: (2, 3),
-                FLASH_CLC_KEY: (True,),
                 FLASH_CLC_HEADS_PER_BATCH_KEY: (32,),
                 FLASH_CLC_STAGES_KEY: (2,),
             },
             2048: {
+                FLASH_PIPELINE_FAMILY_KEY: ("fa4", "ws_overlap", "fa4_2cta"),
                 FLASH_RESCALE_THRESHOLD_KEY: (8.0, 12.0),
                 FLASH_CORR_TILE_SIZE_KEY: (8, 16),
                 FLASH_SOFTMAX_REGS_KEY: (192, 200),
@@ -4654,10 +4843,7 @@ class TestCuteAutotuner(TestCase):
                 FLASH_CORR_REGS_KEY: (80,),
                 FLASH_EPI_TMA_KEY: (False,),
                 FLASH_EPI_STG_KEY: (True,),
-                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
-                FLASH_TENSOR_4D_TMA_KEY: (False,),
                 FLASH_KV_STAGE_KEY: (3, 2),
-                FLASH_CGA2_LOCAL_KEY: (False,),
             },
         }
         for num_kv, expected in very_long_dense_search_choices_by_num_kv.items():
@@ -4735,7 +4921,8 @@ class TestCuteAutotuner(TestCase):
             long_dense_fragments[FLASH_SOFTMAX_DISC_KEY].search_choices, (True, False)
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_PERSISTENT_KEY].search_choices, (True,)
+            long_dense_fragments[FLASH_PERSISTENT_KEY].search_choices,
+            (True, False),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_P_STORE_REP_KEY].search_choices, (16, 32)
@@ -4756,9 +4943,6 @@ class TestCuteAutotuner(TestCase):
             (False, True),
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_CLC_KEY].search_choices, (False, True)
-        )
-        self.assertEqual(
             long_dense_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
             (0, 32, 16, 64),
         )
@@ -4767,14 +4951,6 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices, (2, 3)
-        )
-        self.assertEqual(
-            long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
-            (False, True),
-        )
-        self.assertEqual(
-            long_dense_fragments[FLASH_TENSOR_4D_TMA_KEY].search_choices,
-            (False, True),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_PACKED_REDUCE_KEY].search_choices, (True,)
@@ -4786,7 +4962,9 @@ class TestCuteAutotuner(TestCase):
             requires_ws_overlap=True,
         )
         self.assertEqual(sparse_fragments[FLASH_PACKED_REDUCE_KEY].choices[0], True)
-        self.assertEqual(sparse_fragments[FLASH_TOPOLOGY_KEY].choices, ("ws_overlap",))
+        self.assertEqual(
+            sparse_fragments[FLASH_PIPELINE_FAMILY_KEY].choices, ("ws_overlap",)
+        )
         with unittest.mock.patch.dict(
             os.environ, {"HELION_CUTE_FLASH_PACKED_REDUCE": "0"}
         ):
@@ -4795,7 +4973,7 @@ class TestCuteAutotuner(TestCase):
             )
         self.assertEqual(
             packed_reduce_off_fragments[FLASH_PACKED_REDUCE_KEY].search_choices,
-            (False, True),
+            (True,),
         )
         self.assertEqual(
             set(long_dense_fragments[FLASH_CORR_REGS_KEY].choices),
@@ -4809,7 +4987,7 @@ class TestCuteAutotuner(TestCase):
             {32, 40, 48, 56, 64, 80},
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_TOPOLOGY_KEY].differential_mutation(
+            long_dense_fragments[FLASH_PIPELINE_FAMILY_KEY].differential_mutation(
                 "ws_overlap", "fa4", "fa4"
             ),
             "ws_overlap",
@@ -4834,11 +5012,15 @@ class TestCuteAutotuner(TestCase):
         )
         odd_bound = flash_attention.bind((q_odd, k_odd, v_odd))
         odd_fragments = odd_bound.config_spec._flat_fields()
-        # Odd-KV shapes keep stale fa4-only values in the enum surface for
-        # best-config cache transfer, but resolve_flash_config() clamps them back
-        # to ws_overlap/no-op values before codegen.
+        # Odd-KV shapes retain the production family enum surface for cache
+        # transfer, but only search ws_overlap and clamp stale fa4 families.
         self.assertEqual(
-            odd_fragments[FLASH_TOPOLOGY_KEY].choices, ("ws_overlap", "fa4")
+            set(odd_fragments[FLASH_PIPELINE_FAMILY_KEY].choices),
+            set(FLASH_AUTOTUNE_PIPELINE_FAMILIES),
+        )
+        self.assertEqual(
+            odd_fragments[FLASH_PIPELINE_FAMILY_KEY].search_choices,
+            ("ws_overlap",),
         )
         self.assertEqual(set(odd_fragments[FLASH_DISC_PIPE_KEY].choices), {1, 2, 3, 4})
         self.assertEqual(
@@ -4878,6 +5060,132 @@ class TestCuteAutotuner(TestCase):
         )
         long_bound = flash_attention.bind((long_q, long_k, long_v))
         long_gen = ConfigGeneration(long_bound.config_spec)
+
+        legacy_compound = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_clc=True,
+            cute_flash_local_tma_partition=True,
+            cute_flash_tensor_4d_tma=True,
+            cute_flash_clc_heads_per_batch=32,
+            cute_flash_clc_pdl=True,
+            cute_flash_clc_stages=3,
+            cute_flash_q_tile_count=-1,
+            cute_flash_mma_interleave=True,
+        )
+        family_compound = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_clc_local_tma_4d",
+            cute_flash_clc_heads_per_batch=32,
+            cute_flash_clc_pdl=True,
+            cute_flash_clc_stages=3,
+        )
+        # Legacy structural configs flatten identically before normalization;
+        # the family-derived Q count does not add an independent search slot.
+        self.assertEqual(
+            long_gen.flatten(legacy_compound), long_gen.flatten(family_compound)
+        )
+        long_bound.config_spec.normalize(legacy_compound)
+        long_bound.config_spec.normalize(family_compound)
+        self.assertEqual(legacy_compound, family_compound)
+        self.assertEqual(
+            legacy_compound.config[FLASH_PIPELINE_FAMILY_KEY],
+            "fa4_clc_local_tma_4d",
+        )
+        for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
+            self.assertNotIn(legacy_key, legacy_compound)
+        self.assertEqual(legacy_compound.config[FLASH_Q_TILE_COUNT_KEY], 2)
+        self.assertTrue(legacy_compound.config[FLASH_MMA_INTERLEAVE_KEY])
+
+        clc_q, clc_k, clc_v = (
+            torch.empty(1, 1, 131072, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        clc_bound = flash_attention.bind((clc_q, clc_k, clc_v))
+        legacy_clc = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_clc=True,
+        )
+        family_clc = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_clc",
+        )
+        clc_bound.config_spec.normalize(legacy_clc)
+        clc_bound.config_spec.normalize(family_clc)
+        self.assertEqual(legacy_clc, family_clc)
+        self.assertEqual(legacy_clc.config[FLASH_CLC_HEADS_PER_BATCH_KEY], 32)
+        self.assertEqual(legacy_clc.config[FLASH_CLC_STAGES_KEY], 2)
+
+        family_authoritative = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_topology="ws_overlap",
+            cute_flash_use_2cta=True,
+            cute_flash_cga2_local=True,
+            cute_flash_clc=True,
+            cute_flash_local_tma_partition=True,
+            cute_flash_tensor_4d_tma=True,
+        )
+        long_bound.config_spec.normalize(family_authoritative, _fix_invalid=True)
+        self.assertEqual(family_authoritative.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
+        for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
+            self.assertNotIn(legacy_key, family_authoritative)
+
+        inactive_children = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_persistent=False,
+            cute_flash_persistent_ctas_per_sm=4,
+            cute_flash_recompute_tile_coords=True,
+            cute_flash_clc_heads_per_batch=64,
+            cute_flash_clc_pdl=True,
+            cute_flash_clc_stages=3,
+        )
+        long_bound.config_spec.normalize(inactive_children, _fix_invalid=True)
+        self.assertEqual(inactive_children.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
+        self.assertFalse(inactive_children.config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
+        self.assertEqual(inactive_children.config[FLASH_CLC_HEADS_PER_BATCH_KEY], 0)
+        self.assertFalse(inactive_children.config[FLASH_CLC_PDL_KEY])
+        self.assertEqual(inactive_children.config[FLASH_CLC_STAGES_KEY], 1)
+
+        two_cta_q, two_cta_k, two_cta_v = (
+            torch.empty(1, 1, 65536, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        two_cta_bound = flash_attention.bind((two_cta_q, two_cta_k, two_cta_v))
+        two_cta_alias = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta",
+            cute_flash_epi_tma=False,
+            cute_flash_epi_stg=True,
+            cute_flash_epi_stg_store="whole",
+            cute_flash_epi_stg_gmem="pair",
+            cute_flash_p_store_rep=32,
+            cute_flash_s_load_rep=16,
+            cute_flash_softmax_disc=True,
+            cute_flash_disc_pipe=4,
+            cute_flash_split_p_arrive=False,
+            cute_flash_precompute_qk_desc=False,
+        )
+        two_cta_canonical = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta",
+            cute_flash_epi_tma=True,
+            cute_flash_epi_stg=False,
+            cute_flash_epi_stg_store="slice",
+            cute_flash_epi_stg_gmem="stage",
+            cute_flash_p_store_rep=16,
+            cute_flash_s_load_rep=32,
+            cute_flash_softmax_disc=False,
+            cute_flash_disc_pipe=1,
+            cute_flash_split_p_arrive=True,
+            cute_flash_precompute_qk_desc=True,
+        )
+        two_cta_bound.config_spec.normalize(two_cta_alias, _fix_invalid=True)
+        two_cta_bound.config_spec.normalize(two_cta_canonical, _fix_invalid=True)
+        self.assertEqual(two_cta_alias, two_cta_canonical)
+
         long_manual_xu = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_e2e_schedule="xu",
@@ -4890,23 +5198,40 @@ class TestCuteAutotuner(TestCase):
             cute_flash_topology="ws_overlap",
         )
         long_bound.config_spec.normalize(long_manual_ws)
-        self.assertEqual(long_manual_ws.config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertEqual(long_manual_ws.config[FLASH_PIPELINE_FAMILY_KEY], "ws_overlap")
+        self.assertNotIn(FLASH_TOPOLOGY_KEY, long_manual_ws)
         self.assertEqual(long_manual_ws.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
         self.assertEqual(long_manual_ws.config[FLASH_E2E_OFFSET_KEY], 0)
         self.assertEqual(long_manual_ws.config[FLASH_DISC_PIPE_KEY], 1)
         self.assertFalse(long_manual_ws.config[FLASH_PACKED_REDUCE_KEY])
+        ws_offset_alias = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="ws_overlap",
+            cute_flash_e2e_offset=7,
+            cute_flash_e2e_offset0=11,
+        )
+        ws_offset_canonical = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="ws_overlap",
+        )
+        long_bound.config_spec.normalize(ws_offset_alias)
+        long_bound.config_spec.normalize(ws_offset_canonical)
+        self.assertEqual(ws_offset_alias, ws_offset_canonical)
         long_manual_bad_topology = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_topology="bad",
         )
         long_bound.config_spec.normalize(long_manual_bad_topology, _fix_invalid=True)
-        self.assertEqual(long_manual_bad_topology.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(
+            long_manual_bad_topology.config[FLASH_PIPELINE_FAMILY_KEY], "ws_overlap"
+        )
+        self.assertNotIn(FLASH_TOPOLOGY_KEY, long_manual_bad_topology)
         self.assertEqual(
             long_manual_bad_topology.config[FLASH_E2E_SCHEDULE_KEY],
             "8/2",
         )
-        self.assertEqual(long_manual_bad_topology.config[FLASH_DISC_PIPE_KEY], 3)
-        self.assertTrue(long_manual_bad_topology.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertEqual(long_manual_bad_topology.config[FLASH_DISC_PIPE_KEY], 1)
+        self.assertFalse(long_manual_bad_topology.config[FLASH_PACKED_REDUCE_KEY])
         long_manual_threshold = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_rescale_threshold=12.0,
@@ -4940,12 +5265,12 @@ class TestCuteAutotuner(TestCase):
             cute_flash_packed_reduce=False,
         )
         long_bound.config_spec.normalize(long_manual_structural)
-        self.assertEqual(long_manual_structural.config[FLASH_S_STAGE_KEY], 1)
+        self.assertEqual(long_manual_structural.config[FLASH_S_STAGE_KEY], 2)
         self.assertEqual(long_manual_structural.config[FLASH_KV_STAGE_KEY], 3)
         self.assertEqual(long_manual_structural.config[FLASH_DISC_PIPE_KEY], 2)
         self.assertTrue(long_manual_structural.config[FLASH_EPI_TMA_KEY])
         self.assertFalse(long_manual_structural.config[FLASH_PERSISTENT_KEY])
-        self.assertFalse(long_manual_structural.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertTrue(long_manual_structural.config[FLASH_PACKED_REDUCE_KEY])
         for config in (
             long_manual_xu,
             long_manual_ws,
@@ -4967,18 +5292,35 @@ class TestCuteAutotuner(TestCase):
             self.assertEqual(random_long[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
             self.assertIn(random_long[FLASH_E2E_OFFSET_KEY], set(range(16)))
             self.assertIn(random_long[FLASH_E2E_OFFSET0_KEY], set(range(16)))
-            self.assertIn(random_long[FLASH_TOPOLOGY_KEY], {"fa4", "ws_overlap"})
+            self.assertIn(
+                random_long[FLASH_PIPELINE_FAMILY_KEY],
+                {"fa4", "ws_overlap", "fa4_clc"},
+            )
             self.assertIn(random_long[FLASH_SOFTMAX_DISC_KEY], {False, True})
-            self.assertIn(random_long[FLASH_DISC_PIPE_KEY], {2, 3, 4})
+            self.assertIn(random_long[FLASH_DISC_PIPE_KEY], {1, 2, 3, 4})
             self.assertIn(random_long[FLASH_EPI_TMA_KEY], {False, True})
             self.assertIn(random_long[FLASH_EPI_STG_KEY], {False, True})
             self.assertIn(random_long[FLASH_EPI_STG_STORE_KEY], {"slice", "whole"})
             self.assertIn(random_long[FLASH_EPI_STG_GMEM_KEY], {"stage", "pair"})
+            self.assertIn(random_long[FLASH_WAIT_HINT_KEY], {0, 10_000_000})
+            self.assertIn(
+                random_long[FLASH_EXP2_PACKET_KEY],
+                {"1x1", "4x1", "4x2", "8x1", "8x2"},
+            )
+            self.assertIn(
+                random_long[FLASH_STAT_TRANSPORT_KEY],
+                {"ring2", "single", "single_final"},
+            )
+            self.assertIn(random_long[FLASH_MMA_INTERLEAVE_KEY], {False, True})
+            self.assertEqual(
+                random_long[FLASH_Q_TILE_COUNT_KEY],
+                1 if random_long[FLASH_PIPELINE_FAMILY_KEY] == "ws_overlap" else 2,
+            )
             self.assertEqual(random_long[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
             self.assertIn(random_long[FLASH_RESCALE_CHUNK_COLS_KEY], {16, 32})
             self.assertEqual(random_long[FLASH_S_STAGE_KEY], 2)
             self.assertIn(random_long[FLASH_KV_STAGE_KEY], {2, 3, 4, 6, 8})
-            self.assertTrue(random_long[FLASH_PERSISTENT_KEY])
+            self.assertIn(random_long[FLASH_PERSISTENT_KEY], {False, True})
             self.assertIn(random_long[FLASH_PERSISTENT_CTAS_PER_SM_KEY], {1, 2, 3, 4})
             self.assertIn(random_long[FLASH_P_STORE_REP_KEY], {16, 32})
             self.assertIn(random_long[FLASH_S_LOAD_REP_KEY], {16, 32})
@@ -4988,30 +5330,43 @@ class TestCuteAutotuner(TestCase):
             self.assertIn(random_long[FLASH_SKIP_RESCALE_STATS_KEY], {False, True})
             self.assertIn(random_long[FLASH_OTHER_REGS_KEY], {32, 40, 48, 56, 64, 80})
             self.assertIn(random_long[FLASH_CORR_TILE_SIZE_KEY], {8, 16, 32})
-            self.assertIn(random_long[FLASH_CLC_KEY], {False, True})
             self.assertIn(random_long[FLASH_CLC_PDL_KEY], {False, True})
             self.assertIn(random_long[FLASH_CLC_STAGES_KEY], {1, 2, 3})
-            self.assertIn(random_long[FLASH_LOCAL_TMA_PARTITION_KEY], {False, True})
-            self.assertIn(random_long[FLASH_TENSOR_4D_TMA_KEY], {False, True})
             self.assertIn(
                 random_long[FLASH_CLC_HEADS_PER_BATCH_KEY],
                 {0, 1, 2, 4, 8, 16, 32, 64},
             )
             self.assertTrue(random_long[FLASH_PACKED_REDUCE_KEY])
+            effective_values = flash_effective_config_values(
+                flash_config_from_config(
+                    random_long,
+                    64,
+                    64,
+                    standard_dense_output=True,
+                )
+            )
+            for key, value in effective_values.items():
+                self.assertEqual(random_long[key], value, key)
+            for legacy_key in FLASH_LEGACY_CONFIG_KEYS:
+                self.assertNotIn(legacy_key, random_long)
         odd_fa4_without_offset = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_topology="fa4",
             cute_flash_e2e_schedule="16/4",
         )
         odd_bound.config_spec.normalize(odd_fa4_without_offset)
+        self.assertEqual(
+            odd_fa4_without_offset.config[FLASH_PIPELINE_FAMILY_KEY], "ws_overlap"
+        )
+        self.assertNotIn(FLASH_TOPOLOGY_KEY, odd_fa4_without_offset)
         self.assertEqual(odd_fa4_without_offset.config[FLASH_E2E_OFFSET_KEY], 0)
-        invalid_narrow_offset = helion.Config(
+        inactive_narrow_offset = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_e2e_schedule="8/2",
             cute_flash_e2e_offset=13,
         )
-        with self.assertRaises(exc.InvalidConfig):
-            odd_bound.config_spec.normalize(invalid_narrow_offset)
+        odd_bound.config_spec.normalize(inactive_narrow_offset)
+        self.assertEqual(inactive_narrow_offset.config[FLASH_E2E_OFFSET_KEY], 0)
         with patch.dict(os.environ, {"HELION_CUTE_FLASH_E2E_SCHEDULE": "xu"}):
             xu_default_fragments = flash_autotune_fragments(64, 2, is_causal=False)
         self.assertEqual(
@@ -5184,6 +5539,23 @@ class TestCuteAutotuner(TestCase):
         }
         for key in FLASH_CONFIG_KEYS:
             self.assertNotIn(key, mm_keys)
+
+    def test_cute_flash_two_cta_uses_general_softmax_register_search(self) -> None:
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from helion._compiler.cute.cute_flash import flash_autotune_fragments
+
+        for num_kv in (512, 1536, 2048):
+            with self.subTest(num_kv=num_kv):
+                fragment = flash_autotune_fragments(
+                    64,
+                    num_kv,
+                    dtype=torch.float16,
+                    is_causal=False,
+                    standard_dense_output=True,
+                    pipeline_family_override="fa4_2cta",
+                )[FLASH_SOFTMAX_REGS_KEY]
+                self.assertEqual(set(fragment.search_choices or ()), {192, 200})
+                self.assertLessEqual({192, 200}, set(fragment.choices))
 
 
 @onlyBackends(["triton"])
@@ -5810,6 +6182,35 @@ class TestConfigFilter(TestCase):
         )
         return add, args
 
+    def test_finite_search_accepts_benchmark_provider_factory(self) -> None:
+        class CustomBenchmarkProvider(LocalBenchmarkProvider):
+            def __init__(
+                self, *args: object, context: object, **kwargs: object
+            ) -> None:
+                self.context = context
+                super().__init__(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        configs = [
+            helion.Config(block_sizes=[16], num_warps=4),
+            helion.Config(block_sizes=[32], num_warps=4),
+        ]
+        add, args = self._make_kernel_and_args()
+        context = object()
+        provider_factory = functools.partial(
+            CustomBenchmarkProvider,
+            context=context,
+        )
+        search = FiniteSearch(
+            add.bind(args),
+            args,
+            configs=configs,
+            benchmark_provider_cls=provider_factory,
+        )
+        search._prepare()
+
+        self.assertIsInstance(search.benchmark_provider, CustomBenchmarkProvider)
+        self.assertIs(search.benchmark_provider.context, context)
+
     def test_autotune_config_filter_skips_filtered_configs(self) -> None:
         """Filtered configs produce status='filtered' and perf=inf."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
@@ -6071,6 +6472,8 @@ class TestFiniteSearchWarmStart(TestCase):
 @onlyBackends(["triton", "cute"])
 class TestAutotuneBudget(TestCase):
     def _make_search(self, settings: Settings) -> BaseSearch:
+        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
+        # its attributes, so new __init__ fields don't need to be added here.
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
@@ -6082,10 +6485,12 @@ class TestAutotuneBudget(TestCase):
         search.args = ()
         search.log = AutotuningLogger(settings)
         search.config_spec = SimpleNamespace(
-            default_config=lambda: helion.Config(block_sizes=[1])
+            default_config=lambda: helion.Config(block_sizes=[1]),
+            compiler_seed_timeout_retry_repetitions=None,
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
+        search._search_space_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,
@@ -6351,6 +6756,41 @@ class TestAutotuneBudget(TestCase):
             search._autotune_budget_exceeded,
         )
 
+    def test_prepare_registers_normalized_compiler_seeds(self) -> None:
+        normalized = helion.Config(block_sizes=[64])
+
+        class RecordingProvider(LocalBenchmarkProvider):
+            def __init__(self, *, config_spec, **_kwargs) -> None:
+                self.config_spec = config_spec
+
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        config_gen = Mock()
+        config_gen.seed_flat_config_pairs.return_value = [([64], normalized)]
+        search.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=3,
+            create_config_generation=Mock(return_value=config_gen),
+        )
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search._benchmark_provider_cls = RecordingProvider
+        search._prepared = False
+
+        search._prepare()
+        normalized.config["block_sizes"][0] = 128
+
+        self.assertEqual(
+            search.benchmark_provider._compiler_seed_configs,
+            {helion.Config(block_sizes=[64])},
+        )
+        search.config_spec.create_config_generation.assert_called_once_with(
+            overrides=None,
+            advanced_controls_files=None,
+            process_group_name=None,
+        )
+
     def _make_stub_provider(self):
         """Construct a minimal ``LocalBenchmarkProvider`` for budget-loop
         tests without standing up a real kernel/config_spec.
@@ -6367,7 +6807,13 @@ class TestAutotuneBudget(TestCase):
         # Match the cute backend's path: CuteBackend.supports_precompile()
         # is False, which clears autotune_precompile in autotune setup.
         provider.settings.autotune_precompile = None
-        provider.config_spec = SimpleNamespace()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                should_deduplicate_generated_sources=lambda config_spec: False
+            ),
+        )
         provider.args = ()
         provider.log = AutotuningLogger(provider.settings)
         provider._autotune_metrics = SimpleNamespace(
@@ -6375,6 +6821,8 @@ class TestAutotuneBudget(TestCase):
             num_compile_failures=0,
             num_worker_failures=0,
             num_accuracy_failures=0,
+            num_unique_sources=0,
+            num_source_deduplications=0,
             num_generations=0,
             kernel_source="",
         )
@@ -6382,7 +6830,256 @@ class TestAutotuneBudget(TestCase):
         provider._benchmark_worker = None
         provider._precompile_args_path = None
         provider._precompile_tmpdir = None
+        provider._effective_source_hashes = set()
+        provider._effective_source_results = {}
+        provider._compiler_seed_configs = set()
+        provider._compiler_seed_source_hashes = set()
         return provider
+
+    def test_cute_flash_benchmark_deduplicates_effective_sources(self) -> None:
+        provider = self._make_stub_provider()
+
+        def generated_source_hash(fn):
+            return fn.source_hash
+
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=generated_source_hash,
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+
+        def compile_config(config, allow_print):
+            def fn():
+                return None
+
+            block_size = config.get("block_sizes")[0]
+            fn.source_hash = "shared" if block_size in (1, 2, 4) else "unique"
+            return fn
+
+        provider.kernel.compile_config = compile_config
+        configs = [
+            helion.Config(block_sizes=[1]),
+            helion.Config(block_sizes=[2]),
+            helion.Config(block_sizes=[3]),
+        ]
+        repeated_config = helion.Config(block_sizes=[4])
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(1.0, 2.0),
+        ) as benchmark:
+            results = provider.benchmark(configs)
+            repeated_results = provider.benchmark([repeated_config])
+
+        self.assertEqual(benchmark.call_count, 2)
+        self.assertEqual([result.perf for result in results], [1.0, 1.0, 2.0])
+        self.assertEqual(results[1].status, "deduplicated")
+        self.assertIs(results[0].fn, results[1].fn)
+        self.assertEqual(repeated_results[0].perf, 1.0)
+        self.assertEqual(repeated_results[0].status, "deduplicated")
+        self.assertIs(repeated_results[0].config, repeated_config)
+        self.assertIs(repeated_results[0].fn, results[0].fn)
+        self.assertIsNot(repeated_results[0], results[0])
+        self.assertEqual(provider._autotune_metrics.num_unique_sources, 2)
+        self.assertEqual(provider._autotune_metrics.num_source_deduplications, 2)
+
+    def test_compiler_seed_alias_marks_source_for_timeout_retry(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=3,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        representative = helion.Config(block_sizes=[1])
+        compiler_seed_alias = helion.Config(block_sizes=[2])
+        provider.set_compiler_seed_configs([compiler_seed_alias])
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            return_value=1.0,
+        ) as benchmark:
+            results = provider.benchmark([representative, compiler_seed_alias])
+
+        self.assertEqual([result.perf for result in results], [1.0, 1.0])
+        benchmark.assert_called_once_with(
+            representative,
+            results[0].fn,
+            effective_source_hash="shared",
+        )
+
+    def test_compiler_seed_source_provenance_survives_batches(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=3,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        compiler_seed = helion.Config(block_sizes=[1])
+        later_alias = helion.Config(block_sizes=[2])
+        provider.set_compiler_seed_configs([compiler_seed])
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(math.inf, 1.0),
+        ) as benchmark:
+            first = provider.benchmark([compiler_seed])
+            second = provider.benchmark([later_alias])
+
+        self.assertEqual(first[0].perf, math.inf)
+        self.assertEqual(second[0].perf, 1.0)
+        self.assertEqual(
+            benchmark.call_args_list[1],
+            unittest.mock.call(
+                later_alias,
+                second[0].fn,
+                effective_source_hash="shared",
+            ),
+        )
+
+    def test_disabled_compiler_seed_retry_does_not_register_seeds(self) -> None:
+        provider = self._make_stub_provider()
+        seed = helion.Config(block_sizes=[1])
+
+        provider.set_compiler_seed_configs([seed])
+
+        self.assertFalse(provider._is_compiler_seed_config(seed))
+        self.assertEqual(provider._compiler_seed_configs, set())
+
+    def test_backend_policy_can_disable_effective_source_dedup(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: False,
+            ),
+        )
+        configs = [
+            helion.Config(block_sizes=[1]),
+            helion.Config(block_sizes=[2]),
+        ]
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(1.0, 2.0),
+        ) as benchmark:
+            results = provider.benchmark(configs)
+
+        self.assertEqual(benchmark.call_count, 2)
+        self.assertEqual([result.perf for result in results], [1.0, 2.0])
+        self.assertEqual(provider._autotune_metrics.num_unique_sources, 0)
+        self.assertEqual(provider._autotune_metrics.num_source_deduplications, 0)
+
+    def test_failed_effective_source_is_retried(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        configs = [helion.Config(block_sizes=[1])]
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            side_effect=(math.inf, 1.0),
+        ) as benchmark:
+            first = provider.benchmark(configs)
+            second = provider.benchmark(configs)
+
+        self.assertEqual(benchmark.call_count, 2)
+        self.assertEqual(first[0].status, "error")
+        self.assertEqual(second[0].status, "ok")
+
+    def test_failed_effective_source_alias_is_logged(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: "shared",
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        representative = helion.Config(block_sizes=[1])
+        alias = helion.Config(block_sizes=[2])
+
+        with (
+            patch.object(
+                LocalBenchmarkProvider,
+                "_benchmark_function",
+                return_value=math.inf,
+            ),
+            patch.object(
+                provider.log,
+                "register_config",
+                side_effect=lambda config: (
+                    "representative" if config is representative else "alias"
+                ),
+            ),
+            patch.object(provider.log, "record_autotune_entry") as record_entry,
+        ):
+            results = provider.benchmark([representative, alias])
+
+        alias_entries = [
+            call.args[0]
+            for call in record_entry.call_args_list
+            if call.args[0].config is alias
+        ]
+        self.assertEqual([result.status for result in results], ["error", "error"])
+        self.assertEqual(len(alias_entries), 1)
+        self.assertEqual(alias_entries[0].status, "error")
+        self.assertIsNone(alias_entries[0].perf_ms)
+        self.assertEqual(alias_entries[0].source_hash, "shared")
+
+    def test_effective_source_dedup_is_disabled_for_distributed(self) -> None:
+        provider = self._make_stub_provider()
+        provider.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(
+                should_deduplicate_generated_sources=lambda config_spec: True
+            )
+        )
+        with patch(
+            "helion.autotuner.benchmark_provider.dist.is_initialized",
+            return_value=True,
+        ):
+            self.assertFalse(provider._effective_source_dedup_enabled())
+
+    def test_cute_backend_reports_attached_generated_source_hash(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        backend = CuteBackend()
+        compiled = SimpleNamespace(
+            __name__="kernel",
+            __globals__={
+                "_helion_kernel": SimpleNamespace(_helion_cute_source_hash="source-abc")
+            },
+        )
+        self.assertEqual(backend.generated_source_hash(compiled), "source-abc")
+        self.assertIsNone(backend.generated_source_hash(SimpleNamespace()))
+        self.assertTrue(
+            backend.should_deduplicate_generated_sources(
+                SimpleNamespace(cute_flash_search_enabled=True)
+            )
+        )
+        self.assertFalse(
+            backend.should_deduplicate_generated_sources(
+                SimpleNamespace(cute_flash_search_enabled=False)
+            )
+        )
 
     def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
         """``LocalBenchmarkProvider.benchmark`` must stop compiling

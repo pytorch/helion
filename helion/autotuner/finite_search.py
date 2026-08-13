@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .base_search import _AutotunableKernel
+    from .benchmark_provider import BenchmarkProvider
     from .config_generation import ConfigGeneration
 
 
@@ -27,8 +28,17 @@ class FiniteSearch(BaseSearch):
         kernel: _AutotunableKernel,
         args: Sequence[object],
         configs: Sequence[Config] | None = None,
+        *,
+        benchmark_provider_cls: Callable[..., BenchmarkProvider] | None = None,
     ) -> None:
-        super().__init__(kernel, args)
+        if benchmark_provider_cls is None:
+            super().__init__(kernel, args)
+        else:
+            super().__init__(
+                kernel,
+                args,
+                benchmark_provider_cls=benchmark_provider_cls,
+            )
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
@@ -38,6 +48,9 @@ class FiniteSearch(BaseSearch):
         self.configs: list[Config] = raw
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
+
+    def _generation_invalid_config_count(self) -> int:
+        return self.config_gen.invalid_config_count
 
     def _autotune(self) -> Config:
         best_config = None

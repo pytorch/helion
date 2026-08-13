@@ -1,18 +1,19 @@
-# ruff: noqa: ANN401
-"""Reproduce the Helion versus CUTLASS CuTeDSL grouped-GEMM comparison.
+# ruff: noqa: ANN401, E402
+"""Compare Helion with CUTLASS CuTeDSL grouped GEMM.
 
 The comparison is intentionally narrow: FP16 NT grouped GEMM, a 128x64 MMA
-tile, a 1x1 cluster, and the seven published workloads below.  Every workload
-runs in a fresh subprocess with fresh compiler caches.  Both implementations
-consume the same A/B tensors, write separate outputs, and are timed through
-CUDA graph replay.  The CUTLASS graph includes the pinned-host pointer-table
-upload performed by the published reference wrapper before each kernel launch.
+tile, a 1x1 cluster, and seven CUTLASS-example-derived heterogeneous validation
+cases (3--4 GEMMs, including M/N tails). Every case runs in a fresh subprocess
+with fresh compiler caches. Both implementations consume the same A/B tensors,
+write the same output buffers sequentially, and are timed through the shared
+cold-L2 CUDA graph-replay timer. The comparison times only device work, with
+every pointer table initialized before graph capture.
 
 Use ``grouped_gemm.py`` from NVIDIA/cutlass commit
 ``db1c288993354c88e551c40c19a8fb93a774a241``::
 
     CUDA_VISIBLE_DEVICES=0 python benchmarks/cute/compare_grouped_gemm_backends.py \
-      --cutlass-source /path/to/CUTLASS/examples/python/CuTeDSL/blackwell/grouped_gemm.py \
+      --cutlass-source /path/to/CUTLASS/examples/python/CuTeDSL/cute/blackwell/kernel/grouped_gemm/grouped_gemm.py \
       --out-dir grouped_gemm_cutlass_results --stream-subprocesses
 """
 
@@ -27,10 +28,8 @@ import linecache
 import math
 import os
 from pathlib import Path
-import statistics
 import subprocess
 import sys
-import time
 from types import ModuleType
 from typing import TYPE_CHECKING
 from typing import Any
@@ -45,57 +44,19 @@ if TYPE_CHECKING:
 hl: Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from pretuned_kernels._bench import bench_pre_captured_cudagraphs
+from pretuned_kernels._bench import thermal_warmup
+
 CUTLASS_COMMIT = "db1c288993354c88e551c40c19a8fb93a774a241"
 CUTLASS_SHA256 = "05b74a05682c024557d83284e32f973ed5be4f0d1a1a12c72fe7824c29f7e94f"
 HELION_CUTE_MMA_IMPL = "tcgen05"
 DEFAULT_OUT_DIR = Path("grouped_gemm_cutlass_results")
 CTA_M, CTA_N, CTA_K = 128, 64, 64
-
-
-@dataclass(frozen=True)
-class Case:
-    name: str
-    problems: tuple[tuple[int, int, int, int], ...]
-    reserved_sms: int
-    ab_stages: int | None
-
-    @property
-    def shape_label(self) -> str:
-        shapes = ", ".join(
-            f"g{i}: {m}x{n}x{k}" for i, (m, n, k, _l) in enumerate(self.problems)
-        )
-        return f"G{len(self.problems)} [{shapes}]"
-
-
-def _doc_case(name: str, m1: int, n3: int, *, reserved_sms: int = 0) -> Case:
-    return Case(
-        name,
-        (
-            (8192, 1280, 32, 1),
-            (m1, 384, 1536, 1),
-            (640, 1280, 16, 1),
-            (640, n3, 16, 1),
-        ),
-        reserved_sms=reserved_sms,
-        ab_stages=4,
-    )
-
-
-CASES = (
-    Case(
-        "default_small_parity",
-        ((128, 128, 128, 1), (512, 128, 128, 1), (128, 256, 128, 1)),
-        reserved_sms=0,
-        ab_stages=None,
-    ),
-    _doc_case("doc_no_mn_tail", 128, 128),
-    _doc_case("doc_no_mn_g3_192_extra_full", 128, 192),
-    _doc_case("doc_original", 16, 160, reserved_sms=3),
-    _doc_case("doc_mtail_g1_g3_192_extra_full", 16, 192, reserved_sms=3),
-    _doc_case("doc_mtail_g1_only", 16, 128),
-    _doc_case("doc_ntail_g3_160", 128, 160),
-)
-CASES_BY_NAME = {case.name: case for case in CASES}
+CUTLASS_KERNEL_BASELINE = "cutlass_cutedsl_kernel"
+STATIC_PROBLEM_SIGNATURE_CONFIG_KEY = "tcgen05_grouped_static_problem_signature"
 
 
 @dataclass
@@ -105,6 +66,55 @@ class PreparedLaunch:
 
     def __call__(self) -> object:
         return self.call()
+
+
+@dataclass(frozen=True)
+class Case:
+    name: str
+    problems: tuple[tuple[int, int, int, int], ...]
+    ab_stages: int
+    acc_stages: int
+    c_stages: int
+
+    @property
+    def shape_label(self) -> str:
+        shapes = ", ".join(
+            f"g{i}: {m}x{n}x{k}" for i, (m, n, k, _l) in enumerate(self.problems)
+        )
+        return f"G{len(self.problems)} [{shapes}]"
+
+
+def _doc_case(name: str, m1: int, n3: int) -> Case:
+    return Case(
+        name,
+        (
+            (8192, 1280, 32, 1),
+            (m1, 384, 1536, 1),
+            (640, 1280, 16, 1),
+            (640, n3, 16, 1),
+        ),
+        ab_stages=8,
+        acc_stages=2,
+        c_stages=4,
+    )
+
+
+CASES = (
+    Case(
+        "default_small_parity",
+        ((128, 128, 128, 1), (512, 128, 128, 1), (128, 256, 128, 1)),
+        ab_stages=2,
+        acc_stages=1,
+        c_stages=2,
+    ),
+    _doc_case("doc_no_mn_tail", 128, 128),
+    _doc_case("doc_no_mn_g3_192_extra_full", 128, 192),
+    _doc_case("doc_original", 16, 160),
+    _doc_case("doc_mtail_g1_g3_192_extra_full", 16, 192),
+    _doc_case("doc_mtail_g1_only", 16, 128),
+    _doc_case("doc_ntail_g3_160", 128, 160),
+)
+CASES_BY_NAME = {case.name: case for case in CASES}
 
 
 def _make_helion_kernel() -> tuple[Any, Any]:
@@ -218,20 +228,20 @@ def _prepare_helion(
         pid_type="persistent_interleaved",
         tcgen05_cluster_m=1,
         tcgen05_cluster_n=1,
-        tcgen05_acc_stages=2,
-        tcgen05_c_stages=2,
+        tcgen05_ab_stages=case.ab_stages,
+        tcgen05_acc_stages=case.acc_stages,
+        tcgen05_c_stages=case.c_stages,
         tcgen05_num_epi_warps=4,
         tcgen05_grouped_mode="direct",
         tcgen05_grouped_external_direct_pointers="direct_pointers",
         tcgen05_grouped_external_direct_strides="direct_strides",
-        **(
-            {"tcgen05_grouped_static_reserved_sms": case.reserved_sms}
-            if case.reserved_sms
-            else {}
-        ),
+        **{
+            STATIC_PROBLEM_SIGNATURE_CONFIG_KEY: [
+                len(problems),
+                *(size for m, n, k, _batch in problems for size in (m, n, k)),
+            ]
+        },
     )
-    if case.ab_stages is not None:
-        config.config["tcgen05_ab_stages"] = case.ab_stages
     bound = kernel.bind(kernel_args)
     bound.env.config_spec.cute_tcgen05_search_enabled = True
     bound.set_config(config)
@@ -244,12 +254,14 @@ def _prepare_helion(
     return PreparedLaunch(launch, owners), {
         "block_sizes": [CTA_M, CTA_N, CTA_K],
         "cluster_shape_mn": [1, 1],
-        "reserved_sms": case.reserved_sms,
         "ab_stages": case.ab_stages,
+        "acc_stages": case.acc_stages,
+        "c_stages": case.c_stages,
+        "scheduler": "shape_specialized_group_partitioned",
     }
 
 
-def _load_cutlass_source(source: Path) -> tuple[ModuleType, dict[str, str]]:
+def load_cutlass_source(source: Path) -> tuple[ModuleType, dict[str, str]]:
     """Hash and execute the retained bytes under an immutable synthetic name."""
     path = source.expanduser().resolve(strict=True)
     source_bytes = path.read_bytes()
@@ -285,7 +297,7 @@ def _load_cutlass_source(source: Path) -> tuple[ModuleType, dict[str, str]]:
     }
 
 
-def _prepare_cutlass(
+def prepare_cutlass(
     module: ModuleType,
     problems: tuple[tuple[int, int, int, int], ...],
     group_a: tuple[torch.Tensor, ...],
@@ -322,15 +334,14 @@ def _prepare_cutlass(
         assumed_align=16,
     )
     device = group_a[0].device
-    pointers_host = torch.tensor(
+    pointers_torch = torch.tensor(
         [
             (a.data_ptr(), b.data_ptr(), out.data_ptr())
             for a, b, out in zip(group_a, group_b, outputs, strict=True)
         ],
+        device=device,
         dtype=torch.int64,
-        pin_memory=True,
     )
-    pointers_torch = torch.empty_like(pointers_host, device=device)
     pointers = cutlass_torch.from_dlpack(pointers_torch, assumed_align=16)
     pointers.element_type = cutlass.Int64
     hardware = cutlass_utils.HardwareInfo()
@@ -372,7 +383,6 @@ def _prepare_cutlass(
     )
 
     def launch() -> object:
-        pointers_torch.copy_(pointers_host, non_blocking=True)
         return compiled(
             *initial,
             dims,
@@ -391,17 +401,17 @@ def _prepare_cutlass(
         tensormap,
         dims_torch,
         strides_torch,
-        pointers_host,
         pointers_torch,
         tensormap_torch,
         *group_a,
         *group_b,
         *outputs,
     )
+    torch.cuda.synchronize(device)
     return PreparedLaunch(launch, owners)
 
 
-def _make_inputs(
+def make_inputs(
     problems: Sequence[tuple[int, int, int, int]], device: torch.device
 ) -> tuple[
     tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]
@@ -422,7 +432,7 @@ def _make_inputs(
     return group_a, group_b, expected
 
 
-def _outputs(
+def make_outputs(
     group_a: Sequence[torch.Tensor], group_b: Sequence[torch.Tensor]
 ) -> tuple[torch.Tensor, ...]:
     import torch
@@ -433,8 +443,8 @@ def _outputs(
     )
 
 
-def _capture(
-    launch: PreparedLaunch, warmups: int, *, track_cute: bool = False
+def capture_launch(
+    launch: Callable[[], object], warmups: int, *, track_cute: bool = False
 ) -> torch.cuda.CUDAGraph:
     import torch
 
@@ -454,7 +464,7 @@ def _capture(
     return graph
 
 
-def _correctness(
+def check_correctness(
     outputs: Sequence[torch.Tensor], expected: Sequence[torch.Tensor]
 ) -> dict[str, object]:
     import torch
@@ -466,57 +476,24 @@ def _correctness(
     return {"ok": True, "max_abs": max_abs}
 
 
-def _thermal_warmup(duration_ms: int) -> None:
-    import torch
-
-    if duration_ms <= 0:
-        return
-    value = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-    end = time.monotonic() + duration_ms / 1000
-    while time.monotonic() < end:
-        for _ in range(50):
-            value = value @ value
-        torch.cuda.synchronize()
-
-
-def _do_bench(fn: Callable[[], object], args: argparse.Namespace) -> float:
-    from triton.testing import do_bench
-
-    value: Any = do_bench(
-        fn, warmup=args.warmup_ms, rep=args.rep_ms, return_mode="mean"
-    )
-    return float(value[0] if isinstance(value, tuple) else value)
-
-
 def _bench_pair(
     replays: Mapping[str, Callable[[], object]], args: argparse.Namespace
 ) -> dict[str, dict[str, Any]]:
-    import torch
-
-    if args.cache_warmup_calls:
-        for fn in replays.values():
-            for _ in range(args.cache_warmup_calls):
-                fn()
-        torch.cuda.synchronize()
-    _thermal_warmup(args.thermal_warmup_ms)
+    thermal_warmup(args.thermal_warmup_ms)
     names = tuple(replays)
-    samples = {name: [] for name in names}
-    for run in range(args.num_runs):
-        order = names if run % 2 == 0 else names[::-1]
-        for name in order:
-            samples[name].append(_do_bench(replays[name], args))
+    medians = bench_pre_captured_cudagraphs(
+        [replays[name] for name in names], rep=args.repetitions
+    )
     method = (
-        "one shared cache/thermal warmup phase, then paired external "
-        "triton.testing.do_bench CUDA-event runs alternating Helion/CUTLASS "
-        "and CUTLASS/Helion"
+        "shared cold-L2 CUDA-event graph-replay timer with balanced rotated "
+        "and reversed implementation order"
     )
     return {
         name: {
-            "median_ms": statistics.median(values),
-            "runs_ms": values,
+            "median_ms": median,
             "method": method,
         }
-        for name, values in samples.items()
+        for name, median in zip(names, medians, strict=True)
     }
 
 
@@ -566,37 +543,42 @@ def _run_case(args: argparse.Namespace) -> int:
     torch.cuda.set_device(0)
     torch.manual_seed(args.seed)
     device = torch.device("cuda", 0)
-    cutlass_module, provenance = _load_cutlass_source(args.cutlass_source)
-    group_a, group_b, expected = _make_inputs(case.problems, device)
-    helion_outputs = _outputs(group_a, group_b)
-    cutlass_outputs = _outputs(group_a, group_b)
+    cutlass_module, provenance = load_cutlass_source(args.cutlass_source)
+    group_a, group_b, expected = make_inputs(case.problems, device)
+    outputs = make_outputs(group_a, group_b)
 
-    helion_launch, helion_config = _prepare_helion(
-        case, group_a, group_b, helion_outputs
+    helion_launch, helion_config = _prepare_helion(case, group_a, group_b, outputs)
+    cutlass_launch = prepare_cutlass(
+        cutlass_module, case.problems, group_a, group_b, outputs
     )
-    cutlass_launch = _prepare_cutlass(
-        cutlass_module, case.problems, group_a, group_b, cutlass_outputs
-    )
-    helion_graph = _capture(helion_launch, args.compile_warmups, track_cute=True)
-    cutlass_graph = _capture(cutlass_launch, args.compile_warmups)
+    helion_graph = capture_launch(helion_launch, args.compile_warmups, track_cute=True)
+    cutlass_kernel_graph = capture_launch(cutlass_launch, args.compile_warmups)
 
-    helion_graph.replay()
-    cutlass_graph.replay()
-    torch.cuda.synchronize()
+    def replay_and_check(
+        graph: torch.cuda.CUDAGraph,
+        outputs: tuple[torch.Tensor, ...],
+    ) -> dict[str, object]:
+        for output in outputs:
+            output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        return check_correctness(outputs, expected)
+
     correctness = {
-        "helion_retained": _correctness(helion_outputs, expected),
-        "cutlass": _correctness(cutlass_outputs, expected),
+        "helion_retained": replay_and_check(helion_graph, outputs),
+        CUTLASS_KERNEL_BASELINE: replay_and_check(cutlass_kernel_graph, outputs),
     }
     replay = {
         "helion_retained": helion_graph.replay,
-        "cutlass": cutlass_graph.replay,
+        CUTLASS_KERNEL_BASELINE: cutlass_kernel_graph.replay,
     }
     timings = _bench_pair(replay, args)
-    ratio = float(timings["helion_retained"]["median_ms"]) / float(
-        timings["cutlass"]["median_ms"]
+    helion_ms = float(timings["helion_retained"]["median_ms"])
+    helion_over_cutlass_kernel = helion_ms / float(
+        timings[CUTLASS_KERNEL_BASELINE]["median_ms"]
     )
     result = {
-        "comparison": "cutlass_cutedsl_blackwell_grouped_gemm",
+        "comparison": "blackwell_grouped_gemm_backends",
         "case": case.name,
         "shape_label": case.shape_label,
         "problem_sizes": [list(problem) for problem in case.problems],
@@ -609,22 +591,28 @@ def _run_case(args: argparse.Namespace) -> int:
         "settings": {
             "seed": args.seed,
             "compile_warmups": args.compile_warmups,
-            "num_runs": args.num_runs,
-            "warmup_ms": args.warmup_ms,
-            "rep_ms": args.rep_ms,
-            "cache_warmup_calls": args.cache_warmup_calls,
+            "repetitions": args.repetitions,
             "thermal_warmup_ms": args.thermal_warmup_ms,
             "fresh_subprocess_per_case": True,
-            "cutlass_graph_includes_pointer_table_upload": True,
+            "shared_output_buffers": True,
+            "cutlass_kernel_graph_pointer_table_preloaded": True,
             "env": env,
         },
         "correctness": correctness,
         "timings": timings,
-        "ratios_to_cutlass": {"helion_retained": ratio},
+        "helion_over_cutlass_kernel": helion_over_cutlass_kernel,
     }
     output = case_dir / "result.json"
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"case": case.name, "result": str(output), "ratio": ratio}))
+    print(
+        json.dumps(
+            {
+                "case": case.name,
+                "result": str(output),
+                "helion_over_cutlass_kernel": helion_over_cutlass_kernel,
+            }
+        )
+    )
     return 0
 
 
@@ -656,15 +644,13 @@ def _build_summary(
                 "problem_sizes": result["problem_sizes"],
                 "status": "ok",
                 "timings": result["timings"],
-                "retained_over_cutlass": result["ratios_to_cutlass"].get(
-                    "helion_retained"
-                ),
+                "helion_over_cutlass_kernel": result["helion_over_cutlass_kernel"],
             }
         )
-    ratios = [
+    kernel_ratios = [
         float(value)
         for row in rows
-        if isinstance((value := row.get("retained_over_cutlass")), int | float)
+        if isinstance((value := row.get("helion_over_cutlass_kernel")), int | float)
     ]
     return {
         "artifact_dir": str(args.out_dir),
@@ -679,15 +665,15 @@ def _build_summary(
             "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         },
         "methodology": (
-            "fresh subprocess/case; common inputs; paired external do_bench CUDA "
-            "graph replays; one shared cache/thermal warmup phase; alternate "
-            "Helion/CUTLASS then CUTLASS/Helion; CUTLASS graph includes "
-            "pinned-host pointer-table upload"
+            "fresh subprocess/case; common input and output buffers; paired "
+            "cold-L2 CUDA graph replays; one shared thermal warmup phase; "
+            "balanced rotate/reverse implementation order; CUTLASS uses a "
+            "device pointer table initialized before capture"
         ),
         "rows": rows,
-        "wins": sum(ratio < 1 for ratio in ratios),
-        "total": len(ratios),
-        "geomean_helion_over_cutlass": _geomean(ratios),
+        "total": len(kernel_ratios),
+        "wins_vs_cutlass_kernel": sum(ratio < 1 for ratio in kernel_ratios),
+        "geomean_helion_over_cutlass_kernel": _geomean(kernel_ratios),
         "commands": list(commands),
         "failures": list(failures),
     }
@@ -714,13 +700,6 @@ def _non_negative(text: str) -> int:
     return value
 
 
-def _positive_even(text: str) -> int:
-    value = _positive(text)
-    if value % 2:
-        raise argparse.ArgumentTypeError("expected a positive even integer")
-    return value
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -732,10 +711,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cuda-visible-devices")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--compile-warmups", type=_positive, default=2)
-    parser.add_argument("--num-runs", type=_positive_even, default=6)
-    parser.add_argument("--warmup-ms", type=_non_negative, default=1000)
-    parser.add_argument("--rep-ms", type=_positive, default=500)
-    parser.add_argument("--cache-warmup-calls", type=_non_negative, default=5)
+    parser.add_argument("--repetitions", type=_positive, default=204)
     parser.add_argument("--thermal-warmup-ms", type=_non_negative, default=10000)
     parser.add_argument("--stream-subprocesses", action="store_true")
     parser.add_argument(
@@ -761,10 +737,7 @@ def _worker_command(args: argparse.Namespace, case: Case) -> list[str]:
         ("out-dir", args.out_dir),
         ("seed", args.seed),
         ("compile-warmups", args.compile_warmups),
-        ("num-runs", args.num_runs),
-        ("warmup-ms", args.warmup_ms),
-        ("rep-ms", args.rep_ms),
-        ("cache-warmup-calls", args.cache_warmup_calls),
+        ("repetitions", args.repetitions),
         ("thermal-warmup-ms", args.thermal_warmup_ms),
     )
     for name, value in forwarded:

@@ -76,6 +76,11 @@ if TYPE_CHECKING:
 
 MultiShapeAggregation = Literal["geomean", "max"]
 MultiShapeReference = Literal["default", "baseline"] | None
+_SUCCESSFUL_BENCHMARK_STATUSES = frozenset(("ok", "deduplicated"))
+
+
+def _benchmark_status_succeeded(status: str) -> bool:
+    return status in _SUCCESSFUL_BENCHMARK_STATUSES
 
 
 @dataclasses.dataclass
@@ -154,15 +159,18 @@ def _format_multi_shape_measurement(
         ]
         shape_text = f" tensor_shapes={tensor_shapes}" if tensor_shapes else ""
         status = statuses[index] if statuses is not None else "ok"
-        if status != "ok" or not math.isfinite(timing) or timing <= 0:
+        succeeded = _benchmark_status_succeeded(status)
+        if not succeeded or not math.isfinite(timing) or timing <= 0:
             row = f"arg_sets[{index}]{shape_text}: status={status}"
             if math.isfinite(timing):
                 row += f", latency={timing:.6f} ms"
         else:
             row = f"arg_sets[{index}]{shape_text}: latency={timing:.6f} ms"
+            if status != "ok":
+                row += f", status={status}"
         if (
             references is not None
-            and status == "ok"
+            and succeeded
             and math.isfinite(timing)
             and timing > 0
         ):
@@ -343,7 +351,9 @@ class BenchmarkResult(NamedTuple):
     config: Config
     fn: Callable[..., object]
     perf: float
-    status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
+    status: Literal[
+        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "deduplicated"
+    ]
     compile_time: float | None
 
 
@@ -404,6 +414,10 @@ class BenchmarkProvider(abc.ABC):
     def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
         """Install the search's budget-check hook on this provider."""
         self.budget_exceeded_fn = fn
+
+    def set_compiler_seed_configs(self, configs: Sequence[Config]) -> None:
+        """Register normalized compiler-owned seeds, if the provider needs them."""
+        return None
 
     @abc.abstractmethod
     def benchmark(
@@ -485,6 +499,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
+        self._effective_source_hashes: set[str] = set()
+        self._effective_source_results: dict[str, BenchmarkResult] = {}
+        self._compiler_seed_configs: set[Config] = set()
+        self._compiler_seed_source_hashes: set[str] = set()
         # budget_exceeded_fn inherits the class-level _never_exceeded default
         # until BaseSearch._prepare installs the search's real hook.
 
@@ -519,6 +537,23 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._last_benchmark_failure_status = status
         self._autotune_metrics.num_worker_failures += 1
         self._worker_failure_config_ids.append(id(config))
+
+    def set_compiler_seed_configs(self, configs: Sequence[Config]) -> None:
+        self._compiler_seed_source_hashes = set()
+        if self._compiler_seed_timeout_retry_repetitions() is None:
+            self._compiler_seed_configs = set()
+            return
+        self._compiler_seed_configs = {copy.deepcopy(config) for config in configs}
+
+    def _compiler_seed_timeout_retry_repetitions(self) -> int | None:
+        repetitions = self.config_spec.compiler_seed_timeout_retry_repetitions
+        return repetitions if type(repetitions) is int and repetitions > 0 else None
+
+    def _is_compiler_seed_config(self, config: Config) -> bool:
+        return (
+            self._compiler_seed_timeout_retry_repetitions() is not None
+            and config in self._compiler_seed_configs
+        )
 
     def _compute_baseline(
         self,
@@ -750,6 +785,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_args_path = None
         self._precompile_baseline_path = None
         self._precompile_result_counter = count()
+        self._effective_source_hashes.clear()
+        self._effective_source_results.clear()
+        self._compiler_seed_source_hashes.clear()
         # Drop the baseline tensors (GPU memory) so refcount frees them
         # the moment the provider loses its last external reference.
         self._baseline_output = None
@@ -766,6 +804,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         custom_bench = backend.get_do_bench()
         return backend.name == "cute" and custom_bench is do_bench_generic
+
+    def _effective_source_dedup_enabled(self) -> bool:
+        """Whether this provider may collapse source-identical candidates.
+
+        Rank-specialized distributed code can produce a different source
+        partition on each rank. Keeping every rank's benchmark loop identical
+        is more important than deduplicating those uncommon searches.
+        """
+        return (
+            self.config_spec.backend.should_deduplicate_generated_sources(
+                self.config_spec
+            )
+            and not dist.is_initialized()
+        )
 
     def _subprocess_benchmark_enabled(self) -> bool:
         """Subprocess benchmark path is opt-in and skipped for distributed /
@@ -906,6 +958,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         compiled: dict[int, Callable[..., object]] = {}
         futures: list[PrecompileFuture] | None = None
 
+        # Initialize results before source deduplication so source aliases and
+        # unhandled budget-tail entries can be filled positionally.
+        results: list[BenchmarkResult] = [
+            BenchmarkResult(
+                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
+            )
+            for c in all_configs
+        ]
+
         # Compilation phase
         for i, config in enumerate(all_configs):
             if self._budget_exceeded_synced():
@@ -927,6 +988,54 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"{self.kernel.format_kernel_decorator(config, self.settings)}",
                     exc_info=True,
                 )
+
+        source_hashes: dict[int, str] = {}
+        aliases_by_representative: dict[int, list[int]] = {}
+        deduplicated_indices: set[int] = set()
+        unique_compiled: dict[int, Callable[..., object]] = {}
+        representative_by_hash: dict[str, int] = {}
+        deduplicate_sources = self._effective_source_dedup_enabled()
+        backend = self.config_spec.backend if deduplicate_sources else None
+        seen_sources = self._effective_source_hashes
+        cached_source_results = self._effective_source_results
+
+        for index, fn in compiled.items():
+            source_hash = (
+                backend.generated_source_hash(fn)
+                if deduplicate_sources and backend is not None
+                else None
+            )
+            if source_hash is None:
+                unique_compiled[index] = fn
+                continue
+            source_hashes[index] = source_hash
+            if self._is_compiler_seed_config(all_configs[index]):
+                self._compiler_seed_source_hashes.add(source_hash)
+            if source_hash not in seen_sources:
+                seen_sources.add(source_hash)
+                self._autotune_metrics.num_unique_sources += 1
+            cached_result = cached_source_results.get(source_hash)
+            if cached_result is not None:
+                results[index] = BenchmarkResult(
+                    config=all_configs[index],
+                    fn=cached_result.fn,
+                    perf=cached_result.perf,
+                    status="deduplicated",
+                    compile_time=None,
+                )
+                deduplicated_indices.add(index)
+                self._autotune_metrics.num_source_deduplications += 1
+                continue
+            representative = representative_by_hash.get(source_hash)
+            if representative is not None:
+                aliases_by_representative.setdefault(representative, []).append(index)
+                deduplicated_indices.add(index)
+                self._autotune_metrics.num_source_deduplications += 1
+                continue
+            representative_by_hash[source_hash] = index
+            unique_compiled[index] = fn
+
+        compiled = unique_compiled
         fns = list(compiled.values())
         valid_indices = list(compiled.keys())
         configs = [all_configs[i] for i in valid_indices]
@@ -955,14 +1064,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         else:
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
-
-        # Initialize results with defaults
-        results: list[BenchmarkResult] = [
-            BenchmarkResult(
-                config=c, fn=_unset_fn, perf=inf, status="error", compile_time=None
-            )
-            for c in all_configs
-        ]
 
         # Benchmark loop with progress reporting
         iterator = iter_with_progress(
@@ -1001,6 +1102,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config_id=config_id,
                         config=config,
+                        source_hash=source_hashes.get(valid_indices[index]),
                     )
                 )
             if all(
@@ -1010,7 +1112,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
             ):
                 self._last_benchmark_failure_status = None
-                perf = self._benchmark_function(config, fn)
+                representative_index = valid_indices[index]
+                source_hash = source_hashes.get(representative_index)
+                compiler_seed_source = self._is_compiler_seed_config(config) or (
+                    source_hash is not None
+                    and source_hash in self._compiler_seed_source_hashes
+                )
+                if compiler_seed_source and source_hash is not None:
+                    perf = self._benchmark_function(
+                        config,
+                        fn,
+                        effective_source_hash=source_hash,
+                    )
+                else:
+                    perf = self._benchmark_function(config, fn)
                 status = (
                     "ok"
                     if math.isfinite(perf)
@@ -1036,6 +1151,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     status=status,
                     compile_time=compile_time,
                 )
+            representative_index = valid_indices[index]
+            representative_result = results[representative_index]
+            source_hash = source_hashes.get(representative_index)
+            if (
+                source_hash is not None
+                and representative_result.status == "ok"
+                and math.isfinite(representative_result.perf)
+            ):
+                cached_source_results[source_hash] = representative_result
+            for alias_index in aliases_by_representative.get(representative_index, ()):
+                results[alias_index] = BenchmarkResult(
+                    config=all_configs[alias_index],
+                    fn=representative_result.fn,
+                    perf=representative_result.perf,
+                    status=(
+                        "deduplicated"
+                        if math.isfinite(representative_result.perf)
+                        else representative_result.status
+                    ),
+                    compile_time=None,
+                )
             if config_id is not None:
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
@@ -1045,6 +1181,32 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config_id=config_id,
                         config=config,
+                        source_hash=source_hash,
+                    )
+                )
+
+        for index in deduplicated_indices:
+            result = results[index]
+            config = all_configs[index]
+            source_hash = source_hashes[index]
+            if result.status == "deduplicated":
+                self.log.debug(
+                    lambda config=config, source_hash=source_hash: (
+                        f"Reusing effective generated source {source_hash} "
+                        f"for {config!r}"
+                    )
+                )
+            config_id = self.log.register_config(config)
+            if config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status=result.status,
+                        perf_ms=result.perf if math.isfinite(result.perf) else None,
+                        compile_time=None,
+                        config_id=config_id,
+                        config=config,
+                        source_hash=source_hash,
                     )
                 )
         return results
@@ -1058,13 +1220,26 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """
         clear_jit_fast_path_caches(fn, self.log)
 
-    def _benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
+    def _benchmark_function(
+        self,
+        config: Config,
+        fn: CompiledConfig,
+        *,
+        effective_source_hash: str | None = None,
+    ) -> float:
         """Benchmark a single compiled function.  Returns time in ms or inf."""
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
 
         if self._subprocess_benchmark_enabled():
-            result = self._benchmark_function_subprocess(config, fn)
+            if effective_source_hash is not None:
+                result = self._benchmark_function_subprocess(
+                    config,
+                    fn,
+                    effective_source_hash=effective_source_hash,
+                )
+            else:
+                result = self._benchmark_function_subprocess(config, fn)
             if result is not None:
                 return result
             # None means the subprocess path could not handle this config
@@ -1245,15 +1420,47 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._clear_jit_fast_path_caches(fn)
 
     def _benchmark_function_subprocess(
-        self, config: Config, fn: CompiledConfig
+        self,
+        config: Config,
+        fn: CompiledConfig,
+        *,
+        effective_source_hash: str | None = None,
     ) -> float | None:
         """Benchmark ``fn`` in a long-lived spawn subprocess with a per-call
         timeout. Returns the measured latency in ms, ``inf`` for a failure
         we classified and handled, or ``None`` if the subprocess path cannot
-        handle this config and the caller should fall back to in-process.
+        handle this config and the caller should fall back to in-process. An
+        eligible timed-out compiler seed gets one budget-gated retry whose
+        fixed repetition count comes from ``ConfigSpec``.
         """
+        retry_repetitions = self._compiler_seed_timeout_retry_repetitions()
+        retry_compiler_seed_timeout = retry_repetitions is not None and (
+            config in self._compiler_seed_configs
+            or (
+                effective_source_hash is not None
+                and effective_source_hash in self._compiler_seed_source_hashes
+            )
+        )
         try:
-            latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+            try:
+                latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+            except BenchmarkTimeout:
+                if not retry_compiler_seed_timeout or self.budget_exceeded_fn():
+                    raise
+                assert retry_repetitions is not None
+                self.log.debug(
+                    lambda: (
+                        "Retrying timed-out compiler seed with "
+                        f"{retry_repetitions} measured "
+                        f"repetitions: {config!r}"
+                    )
+                )
+                latency = self._run_subprocess_benchmark_job(
+                    fn,
+                    warmup=1,
+                    rep=50,
+                    fixed_repetitions=retry_repetitions,
+                )
             if latency is None:
                 return None
         except BenchmarkSubprocessError as e:
@@ -1401,6 +1608,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         *,
         warmup: int,
         rep: int,
+        fixed_repetitions: int | None = None,
     ) -> float | None:
         if self._precompile_args_path is None:
             return None
@@ -1418,6 +1626,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             warmup=warmup,
             rep=rep,
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
+            fixed_repetitions=fixed_repetitions,
         )
         return float(
             self._benchmark_worker.run(
@@ -1524,6 +1733,10 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         for child in self.children:
             child.set_budget_exceeded_fn(_never_exceeded)
 
+    def set_compiler_seed_configs(self, configs: Sequence[Config]) -> None:
+        for child in self.children:
+            child.set_compiler_seed_configs(configs)
+
     def setup(self) -> None:
         case_index = 0
         try:
@@ -1566,7 +1779,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 desc="Benchmarking default reference",
             )[0]
             if (
-                result.status != "ok"
+                not _benchmark_status_succeeded(result.status)
                 or not math.isfinite(result.perf)
                 or result.perf <= 0
             ):
@@ -1662,11 +1875,13 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         materialized_keys = [repr(config) for config in materialized]
         executed_configs = [copy.deepcopy(config) for config in materialized]
 
-        child_failure_snapshots = [
+        child_metric_snapshots = [
             (
                 len(child._accuracy_failure_config_ids),
                 len(child._compile_failure_config_ids),
                 len(child._worker_failure_config_ids),
+                child._autotune_metrics.num_unique_sources,
+                child._autotune_metrics.num_source_deduplications,
             )
             for child in self.children
         ]
@@ -1683,9 +1898,13 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             accuracy_failure_ids: set[int] = set()
             compile_failure_ids: set[int] = set()
             worker_failure_ids: set[int] = set()
-            for child, (before_accuracy, before_compile, before_worker) in zip(
-                self.children, child_failure_snapshots, strict=True
-            ):
+            for child, (
+                before_accuracy,
+                before_compile,
+                before_worker,
+                before_unique_sources,
+                before_source_deduplications,
+            ) in zip(self.children, child_metric_snapshots, strict=True):
                 accuracy_failure_ids.update(
                     child._accuracy_failure_config_ids[before_accuracy:]
                 )
@@ -1695,6 +1914,13 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 worker_failure_ids.update(
                     child._worker_failure_config_ids[before_worker:]
                 )
+                self._autotune_metrics.num_unique_sources += (
+                    child._autotune_metrics.num_unique_sources - before_unique_sources
+                )
+                self._autotune_metrics.num_source_deduplications += (
+                    child._autotune_metrics.num_source_deduplications
+                    - before_source_deduplications
+                )
             self._autotune_metrics.num_accuracy_failures += len(accuracy_failure_ids)
             self._autotune_metrics.num_compile_failures += len(compile_failure_ids)
             self._autotune_metrics.num_worker_failures += len(worker_failure_ids)
@@ -1703,7 +1929,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             row = [child[child_config_index] for child in child_results]
             timings = [result.perf for result in row]
             valid = all(
-                result.status == "ok" and math.isfinite(result.perf) and result.perf > 0
+                _benchmark_status_succeeded(result.status)
+                and math.isfinite(result.perf)
+                and result.perf > 0
                 for result in row
             )
             perf = (
