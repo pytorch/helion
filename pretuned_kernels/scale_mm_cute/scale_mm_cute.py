@@ -10,7 +10,8 @@ W8A8 serving shapes that back the nightly B200 CuTe benchmark dashboard.
 
 Specialized kernels include:
 
-* :func:`scale_mm_cute` tiles over both M and N.
+* :func:`scale_mm_cute` tiles over both M and N and specializes its epilogue
+  for the four-CTA M512 schedule.
 * :func:`scale_mm_cute_skinny_m` keeps the full (small) M resident and tiles
   only over N for single-token decode.
 * :func:`scale_mm_cute_swap_ab` swaps M/N so small-M shapes can use efficient
@@ -50,6 +51,7 @@ _M64_SWAP_SHAPES = {
     (64, 25600, 5120),
 }
 _SWAP_AB_SHAPES = _SMALL_M_SWAP_SHAPES | _M64_SWAP_SHAPES
+_M512_OPT_SHAPE = (512, 2048, 4096)
 
 
 @helion.aot_kernel(backend="cute", static_shapes=True)
@@ -64,13 +66,22 @@ def scale_mm_cute(
     k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
     out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    use_grouped_scale = hl.constexpr(m == 512 and k == 2048 and n == 4096)
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-        # RowWise scale in the epilogue (per-row scale_a x per-column scale_b).
-        acc = acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
-        out[tile_m, tile_n] = acc.to(torch.bfloat16)
+        if use_grouped_scale:
+            # This shape gate exists because it is currently the only pretuned
+            # shape using the four-CTA schedule, which overlaps the independent
+            # scale product with its MMA tail. Keep the sequential form elsewhere:
+            # grouping spills at the 255-register limit, e.g. 4096^3 schedule.
+            tile_scale = scale_a[tile_m, tile_n] * scale_b[tile_n]
+            out[tile_m, tile_n] = (acc * tile_scale).to(torch.bfloat16)
+        else:
+            # RowWise scale in the epilogue (per-row scale_a x per-column scale_b).
+            acc = acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
+            out[tile_m, tile_n] = acc.to(torch.bfloat16)
     return out
 
 

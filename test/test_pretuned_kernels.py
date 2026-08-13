@@ -535,6 +535,33 @@ class TestPretunedCuteCodegen(TestCase):
         )
         self.assertEqual(set(configs), module._SWAP_AB_SHAPES)
 
+    def test_scale_mm_pretuned_m512_config(self) -> None:
+        """The static M512 branch selects the validated four-CTA schedule."""
+        path = (
+            PRETUNED_KERNELS_DIR
+            / "scale_mm_cute"
+            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+        )
+        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot_m512", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+
+        configs = dict(
+            zip(
+                heuristic._KEYS_scale_mm_cute,
+                heuristic._CONFIGS_scale_mm_cute,
+                strict=True,
+            )
+        )
+        config = configs[module._M512_OPT_SHAPE]
+        self.assertEqual(config["block_sizes"], [256, 128, 128])
+        self.assertEqual(config["tcgen05_cluster_m"], 2)
+        self.assertEqual(config["tcgen05_cluster_n"], 2)
+        self.assertEqual(config["tcgen05_c_stages"], 2)
+        self.assertEqual(config["tcgen05_aux_load_placement"], "pre_acc_wait")
+
     def test_scale_mm_explicit_epilogue_tile(self) -> None:
         module = _import_pretuned_kernel_module("scale_mm_cute")
         args = module._make_inputs(64, 128, 64)
