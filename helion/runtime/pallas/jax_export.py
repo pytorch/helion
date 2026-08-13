@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from ..kernel import Kernel
     from .launcher import _BlockSpecInfo
+    from .sparsecore_launcher import SparseCoreLauncherSpec
 
 
 _TORCH_TO_JNP_DTYPE: dict[torch.dtype, object] | None = None
@@ -370,6 +371,9 @@ def default_pallas_jax_launcher(
         compact=compact,
         orig_shapes=orig_shapes,
         ds_pad_dims=_ds_pad_dims,
+        sc_launcher_spec=cast(
+            "SparseCoreLauncherSpec | None", kwargs.get("_sc_launcher_spec")
+        ),
     )
 
     if len(output_results) == 1:
