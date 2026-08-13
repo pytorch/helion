@@ -1102,8 +1102,7 @@ def _ds_expr(
                     dim_from_end, tensor.ndim, bitwidth
                 )
                 if alignment % required == 0:
-                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
-                    offset = f"pl.multiple_of({offset}, {block_size})"
+                    offset = f"pl.multiple_of({offset}, {alignment})"
 
     return f"pl.ds({offset}, {block_size})"
 
@@ -1142,11 +1141,11 @@ def _loop_offset_alignment(
     block_id: int,
     state: CodegenState,
 ) -> int | None:
-    """Return the proven alignment of a loop's offset for *block_id*, or ``None``.
+    """Return an integer alignment for ``block_id`` offsets, or ``None``.
 
-    A loop with step ``block_size`` produces offsets ``begin + i * block_size``,
-    which are multiples of ``block_size`` iff ``begin`` is.  Returns
-    ``block_size`` (int) when provable, ``None`` otherwise.
+    For a recorded window, return its sublane alignment if the block size
+    is divisible by it. Without a recorded window, return the block size
+    if the loop begin is block-aligned or its metadata is missing.
     """
     import sympy
 
@@ -1154,7 +1153,11 @@ def _loop_offset_alignment(
     if not isinstance(bs_value, int):
         return None
 
-    # Check that the loop begins at a multiple of block_size.
+    # A recorded window overrides the block-alignment argument below: its
+    # offsets step from a rounded-down begin, so only the sublane is proven.
+    if block_id in state.device_function.aligned_tiles:
+        return state.device_function.proven_sublane_alignment(block_id)
+
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         info = loops[-1].block_id_to_info.get(block_id)
