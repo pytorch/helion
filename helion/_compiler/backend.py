@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import ast
+import collections
 import dataclasses
 import functools
 import logging
@@ -118,6 +119,37 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _validate_subscript_indices(index: list[object]) -> int:
+    """Validate supported kernel-tensor indices and count narrowing entries."""
+    narrowed = 0
+    for value in index:
+        if value is None or (
+            isinstance(value, slice)
+            and (value.start, value.stop, value.step) == (None, None, None)
+        ):
+            continue
+        if isinstance(value, int):
+            valid = value >= 0
+        elif isinstance(value, slice):
+            valid = (
+                value.step in (None, 1)
+                and isinstance(value.start, int)
+                and isinstance(value.stop, int)
+                and value.start >= 0
+                and value.stop > value.start
+            )
+        else:
+            valid = isinstance(value, torch.SymInt) or (
+                isinstance(value, torch.Tensor) and value.ndim == 1
+            )
+        if not valid:
+            raise exc.InvalidIndexingType(repr(value))
+        narrowed += 1
+    if narrowed > 1:
+        raise exc.InvalidIndexingType(repr(index))
+    return narrowed
 
 
 class Backend(abc.ABC):
@@ -396,6 +428,34 @@ class Backend(abc.ABC):
     ) -> None:
         """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
         return
+
+    def fake_subscript_shape(
+        self,
+        tensor: torch.Tensor,
+        index: list[object],
+    ) -> list[int | torch.SymInt]:
+        """Validate a kernel-tensor subscript and return its fake output shape.
+
+        All backends support shape-only ``None`` and full-slice indexing.
+        Backends that implement narrowing override this method so unsupported
+        indexing cannot reach backend codegen that assumes shape-only views.
+        """
+        if _validate_subscript_indices(index):
+            raise exc.BackendUnsupported(
+                self.name, "narrowing kernel-tensor subscripts"
+            )
+
+        input_size = collections.deque(tensor.size())
+        output_size: list[int | torch.SymInt] = []
+        for value in index:
+            if value is None:
+                output_size.append(1)
+            elif isinstance(value, slice) and repr(value) == "slice(None, None, None)":
+                output_size.append(input_size.popleft())
+            else:
+                raise exc.InvalidIndexingType(repr(value))
+        assert len(input_size) == 0
+        return output_size
 
     def adjust_block_size_constraints(
         self,

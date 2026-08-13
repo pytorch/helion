@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -65,27 +64,19 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         - :func:`~helion.language.store`: For storing tensor values
 
     Note:
-        - Only supports None and : (slice(None)) indexing
+        - Supports None and : (slice(None)) indexing on every backend
         - Used for reshaping kernel tensors by adding dimensions
         - Prefer direct indexing syntax when possible: ``tensor[None, :]``
-        - Does not support integer indexing or slicing with start/stop
+        - Pallas also supports one contiguous narrowing index when compiler
+          planning can keep the source block resident in VMEM
     """
     raise NotInsideKernel
 
 
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
-    input_size = collections.deque(tensor.size())
-    output_size = []
-    for val in index:
-        if val is None:
-            output_size.append(1)
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
-            output_size.append(input_size.popleft())
-        else:
-            raise exc.InvalidIndexingType(repr(val))
-    assert len(input_size) == 0
     env = CompileEnvironment.current()
+    output_size = env.backend.fake_subscript_shape(tensor, index)
     return env.new_index_result(tensor, output_size)
 
 
