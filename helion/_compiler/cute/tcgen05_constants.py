@@ -236,6 +236,9 @@ TCGEN05_AUX_LOAD_PLACEMENTS = (
     TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
     TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
 )
+# Explicitly select the loop-free role scheduler when compiler analysis cannot
+# infer that each resident CTA receives exactly one work tile.
+TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY = "tcgen05_one_shot_role_scheduler"
 
 
 def tcgen05_two_cta_edge_k_tail_seed_overrides() -> dict[str, object]:

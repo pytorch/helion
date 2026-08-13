@@ -548,9 +548,12 @@ class TestPretunedCuteCodegen(TestCase):
             tcgen05_num_epi_warps=4,
             tcgen05_l2_swizzle_size=1,
             tcgen05_persistence_model="static_persistent",
+            tcgen05_one_shot_role_scheduler=True,
         )
-        code = module.scale_mm_cute_swap_ab.bind(swap_args).to_triton_code(config)
-        actual = module._scale_mm_cute(x, y, scale_a, scale_b)
+        bound = module.scale_mm_cute_swap_ab.bind(swap_args)
+        code = bound.to_triton_code(config)
+        bound.set_config(config)
+        actual = bound(*swap_args)
         expected = module._scale_mm_torch(x, y, scale_a, scale_b)
 
         aux0_loaded = code.index("tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()")
@@ -570,6 +573,8 @@ class TestPretunedCuteCodegen(TestCase):
             "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_1.shape))",
             code,
         )
+        self.assertNotIn("while tcgen05_role_local_", code)
+        self.assertNotIn(".advance_to_next_work()", code)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
@@ -610,6 +615,11 @@ class TestPretunedCuteCodegen(TestCase):
             swizzled_code = bound.to_triton_code(
                 helion.Config(**swizzled_config_values)
             )
+            swizzled_config_values["tcgen05_one_shot_role_scheduler"] = True
+            with self.assertRaisesRegex(
+                helion.exc.BackendUnsupported, "identity L2 scheduler swizzling"
+            ):
+                bound.to_triton_code(helion.Config(**swizzled_config_values))
 
         self.assertNotIn(
             "while tcgen05_role_local_0_work_tile.is_valid_tile", one_shot_code

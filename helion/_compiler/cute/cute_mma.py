@@ -134,6 +134,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -8157,22 +8158,64 @@ def _emit_mma_pipeline(
         tcgen05_persistence_model_for_plan = tcgen05_persistence_model_str
 
         # When the entire grid fits in one wave, every persistent CTA receives
-        # exactly one tile.
-        one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
-        one_shot_n_slots = n_size // bn
-        one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
-        tcgen05_one_shot_role_scheduler = (
+        # exactly one tile. The automatic proof uses static-full floor counts;
+        # an explicit config may additionally select the validated FP8 N-edge
+        # path, whose partial tile requires ceiling counts.
+        auto_one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
+        auto_one_shot_n_slots = n_size // bn
+        auto_one_shot_work_ctas = auto_one_shot_m_slots * auto_one_shot_n_slots
+        auto_one_shot_role_scheduler = (
             tcgen05_pid_is_persistent
             and tcgen05_static_full_tiles
             and (analysis is None or not analysis.has_leading_passthrough)
-            and one_shot_work_ctas <= env.config_spec.num_sm
+            and auto_one_shot_work_ctas <= env.config_spec.num_sm
             # A partial cluster could access out of bounds.
-            and one_shot_m_slots % tcgen05_cluster_m == 0
-            and one_shot_n_slots % tcgen05_cluster_n == 0
+            and auto_one_shot_m_slots % tcgen05_cluster_m == 0
+            and auto_one_shot_n_slots % tcgen05_cluster_n == 0
             and tcgen05_use_role_local_persistent_body
             and tcgen05_effective_scheduler_warps == 0
             and tcgen05_grouped_plan is None
             and tcgen05_l2_swizzle_size_value == 1
+        )
+        force_one_shot_role_scheduler = bool(
+            df.config.get(TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY, False)
+        )
+        if force_one_shot_role_scheduler:
+            forced_one_shot_m_slots = ((m_size + bm - 1) // bm) * (
+                2 if tcgen05_is_two_cta else 1
+            )
+            forced_one_shot_n_slots = (n_size + bn - 1) // bn
+            forced_one_shot_work_ctas = (
+                forced_one_shot_m_slots * forced_one_shot_n_slots
+            )
+            if not (
+                tcgen05_pid_is_persistent
+                and (
+                    tcgen05_static_full_tiles
+                    or (
+                        tcgen05_role_local_n_edge_tma
+                        and input_dtype == torch.float8_e4m3fn
+                    )
+                )
+                and (analysis is None or not analysis.has_leading_passthrough)
+                and forced_one_shot_work_ctas <= env.config_spec.num_sm
+                and forced_one_shot_m_slots % tcgen05_cluster_m == 0
+                and forced_one_shot_n_slots % tcgen05_cluster_n == 0
+                and tcgen05_use_role_local_persistent_body
+                and tcgen05_effective_scheduler_warps == 0
+                and tcgen05_grouped_plan is None
+                and tcgen05_l2_swizzle_size_value == 1
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY}=True "
+                    "requires a static-full or FP8 N-edge unbatched "
+                    "role-local persistent grid with complete clusters and "
+                    "at most one work tile per resident CTA using identity "
+                    "L2 scheduler swizzling",
+                )
+        tcgen05_one_shot_role_scheduler = (
+            force_one_shot_role_scheduler or auto_one_shot_role_scheduler
         )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=tcgen05_mma_bm,

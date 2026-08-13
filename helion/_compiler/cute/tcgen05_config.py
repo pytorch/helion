@@ -113,6 +113,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
@@ -226,6 +227,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
+        TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
         TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
@@ -2831,6 +2833,11 @@ class CuteTcgen05Config:
         )
         self._validate_bool_config(
             config, TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, fix_invalid=fix_invalid
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_ONE_SHOT_ROLE_SCHEDULER_CONFIG_KEY,
+            fix_invalid=fix_invalid,
         )
         self._validate_bool_config(
             config,
