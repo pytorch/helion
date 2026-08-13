@@ -3523,11 +3523,20 @@ def _codegen_cute_store_tcgen05_tile(
         force_simt_edge_aux=simt_edge_only,
     )
     simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
-    # SIMT edge auxiliary loads are independent of the accumulator. Issue them
-    # before waiting for the MMA result so their GMEM latency overlaps the tail
-    # of the mainloop, then copy TMEM only after the consumer wait completes.
-    prefetch_simt_edge_aux = (
-        simt_edge_only and bool(aux_steps_in_chain) and not is_secondary_store
+    # SIMT auxiliary loads are independent of the accumulator. Edge-only
+    # stores always issue them early; full-tile SIMT stores do so when the
+    # placement config explicitly requests it. In either case their GMEM
+    # latency overlaps the MMA tail, and TMEM is copied only after the wait.
+    prefetch_simt_aux = (
+        (
+            simt_edge_only
+            or (
+                tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                and not tcgen05_value.use_tma_store_epilogue
+            )
+        )
+        and bool(aux_steps_in_chain)
+        and not is_secondary_store
     )
     simt_acc_wait = (
         "        if _tcgen05_subtile == 0:\n"
@@ -3752,7 +3761,7 @@ def _codegen_cute_store_tcgen05_tile(
                     f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
                 )
             ]
-            if not (is_secondary_store or prefetch_simt_edge_aux)
+            if not (is_secondary_store or prefetch_simt_aux)
             else []
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
@@ -3808,11 +3817,11 @@ def _codegen_cute_store_tcgen05_tile(
             f"    if {tcgen05_lifecycle.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-            + (f"{simt_early_aux}{simt_acc_wait}" if prefetch_simt_edge_aux else "")
+            + (f"{simt_early_aux}{simt_acc_wait}" if prefetch_simt_aux else "")
             + f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
             + (
                 f"{simt_late_prelude}"
-                if prefetch_simt_edge_aux
+                if prefetch_simt_aux
                 else f"{simt_acc_vec_prelude}"
             )
             + f"        {acc_vec} = {simt_acc_vec_rhs}\n"
