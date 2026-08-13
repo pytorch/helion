@@ -7232,6 +7232,51 @@ class TestCuteLowerings(unittest.TestCase):
         post_aux_load_pos = post_code.find("tcgen05_aux_loaded_0", post_loop_pos)
         self.assertGreater(post_aux_load_pos, post_wait_pos)
 
+    def test_tcgen05_fused_auxiliary_product_codegen(self) -> None:
+        """An explicitly grouped pair of scale loads stays one epilogue step."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_m: torch.Tensor,
+            scale_n: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                tile_scale = scale_m[tile_m, tile_n] * scale_n[tile_n]
+                out[tile_m, tile_n] = (acc * tile_scale).to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([256, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([256, 1], device=DEVICE).expand(256, 128),
+            torch.empty([128], device=DEVICE),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 128],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        loop_pos = code.index("for _tcgen05_subtile in cutlass.range")
+        product_pos = code.index(
+            "tcgen05_aux_loaded_0 * tcgen05_aux_loaded_1", loop_pos
+        )
+        acc_pos = code.index("tcgen05_acc_loaded", loop_pos)
+        self.assertGreater(product_pos, acc_pos)
+
     def test_tcgen05_fused_residual_epilogue_runtime_correctness(self) -> None:
         """``out[tile] = (acc + residual[tile_m, tile_n]).to(x.dtype)``
         after a tcgen05 matmul splices the residual load inline at the
