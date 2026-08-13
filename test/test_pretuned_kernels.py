@@ -534,8 +534,42 @@ class TestPretunedCuteCodegen(TestCase):
 
         module = _import_pretuned_kernel_module("scale_mm_cute")
         x, y, scale_a, scale_b = module._make_inputs(2, 4096, 256)
+        swap_args = (x, y, scale_a[:, 0], scale_b)
+        config = helion.Config(
+            block_sizes=[64, 16, 256],
+            l2_groupings=[1],
+            indexing=["tensor_descriptor"] * 5,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=9,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+        code = module.scale_mm_cute_swap_ab.bind(swap_args).to_triton_code(config)
         actual = module._scale_mm_cute(x, y, scale_a, scale_b)
         expected = module._scale_mm_torch(x, y, scale_a, scale_b)
+
+        aux0_loaded = code.index("tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()")
+        aux1_loaded = code.index("tcgen05_aux_loaded_1 = tcgen05_aux_rmem_1.load()")
+        acc_wait = code.index("if _tcgen05_subtile == 0:")
+        tmem_copy = code.index("cute.copy(tcgen05_tiled_copy_t2r")
+        self.assertLess(aux0_loaded, acc_wait)
+        self.assertLess(aux1_loaded, acc_wait)
+        self.assertLess(acc_wait, tmem_copy)
+        self.assertEqual(
+            code.count(
+                "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_0.shape))"
+            ),
+            1,
+        )
+        self.assertNotIn(
+            "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_1.shape))",
+            code,
+        )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
