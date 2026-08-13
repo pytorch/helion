@@ -3242,6 +3242,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     prefetched_loads: list[ScheduledDmaTransfer] = []
     immediate_loads: list[ScheduledDmaTransfer] = []
     dma_stores: list[ScheduledDmaTransfer] = []
+    scheduled_by_hbm_name: dict[str, ScheduledDmaTransfer] = {}
     # compact_worklist shares this lowering but keeps its compact/resident routes;
     # only an actual fori_loop config enables depth-two staging.
     load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
@@ -3334,14 +3335,34 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         scheduled = ScheduledDmaTransfer(transfer, resources)
         tensor_to_dma_scratch[hbm_name] = resources.scratch
         tensor_to_sem[hbm_name] = resources.semaphore
+        scheduled_by_hbm_name[hbm_name] = scheduled
 
         if transfer.direction == "store":
             dma_stores.append(scheduled)
         elif uses_load_prefetch:
             prefetched_load_tensors.add(hbm_name)
             prefetched_loads.append(scheduled)
-        else:
-            immediate_loads.append(scheduled)
+
+    # ``all_tensor_info`` represents a read-modify-write tensor only by its
+    # store record so that its load and store share one VMEM buffer.  Build
+    # immediate loads from the original load sites, as the pre-refactor path
+    # did, while reusing the resource selected for that tensor.
+    for fake, _tensor_node, sub_meta in loaded_tensors.values():
+        hbm_name = state.device_function.tensor_arg(fake).name
+        scheduled = scheduled_by_hbm_name.get(hbm_name)
+        if scheduled is None or hbm_name in prefetched_load_tensors:
+            continue
+        immediate_loads.append(
+            ScheduledDmaTransfer(
+                DmaTransfer(
+                    tensor=fake,
+                    subscript=tuple(sub_meta),
+                    direction="load",
+                    vmem_shape=scheduled.transfer.vmem_shape,
+                ),
+                scheduled.resources,
+            )
+        )
 
     # Build the body function
     body_stmts: list[ast.AST] = []

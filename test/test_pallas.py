@@ -5552,10 +5552,8 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
-    def test_dma_buffer_offset_nested_tile(self) -> None:
-        """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
-
+    @staticmethod
+    def _dma_buffer_offset_nested_tile_kernel() -> helion.Kernel:
         @helion.kernel(backend="pallas", static_shapes=True)
         def outer_in_inner(
             x: torch.Tensor, y: torch.Tensor, offsets: torch.Tensor
@@ -5576,6 +5574,26 @@ class TestPallas(TestCase):
                         )
             return out
 
+        return outer_in_inner
+
+    def test_dma_buffer_offset_nested_tile_codegen(self) -> None:
+        """A read-modify-write output must be loaded before its nested update."""
+        kernel = self._dma_buffer_offset_nested_tile_kernel()
+        args = (
+            torch.empty(128, 8, 256, device=DEVICE, dtype=torch.float32),
+            torch.empty(128, 8, 256, device=DEVICE, dtype=torch.float32),
+            torch.tensor([0, 64, 128], device=DEVICE, dtype=torch.int32),
+        )
+        code = kernel.bind(args).to_code(
+            helion.Config(block_sizes=[32, 32], pallas_loop_type="fori_loop")
+        )
+
+        self.assertIn("pltpu.make_async_copy(out.at[", code)
+
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_dma_buffer_offset_nested_tile(self) -> None:
+        """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
+        outer_in_inner = self._dma_buffer_offset_nested_tile_kernel()
         N, A, B = 128, 8, 256
         x = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
         y = torch.randn(N, A, B, device=DEVICE, dtype=torch.float32)
