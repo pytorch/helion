@@ -462,10 +462,11 @@ class TestPretunedCuteCodegen(TestCase):
         heuristic = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(heuristic)
 
-        expected_shapes = {
-            (64, 4096, 6144),
-            (64, 5120, 10240),
-            (64, 5120, 5120),
+        expected_layouts = {
+            (64, 2048, 2048): (64, 32, 32),
+            (64, 4096, 6144): (64, 64, 64),
+            (64, 5120, 10240): (64, 64, 64),
+            (64, 5120, 5120): (64, 64, 64),
         }
         explicit_configs = {
             tuple(shape): config
@@ -476,7 +477,7 @@ class TestPretunedCuteCodegen(TestCase):
             )
             if config.get("tcgen05_layout_strategy") == "explicit_epi_tile"
         }
-        self.assertEqual(set(explicit_configs), expected_shapes)
+        self.assertEqual(set(explicit_configs), set(expected_layouts))
         for shape, config in explicit_configs.items():
             with self.subTest(shape=shape):
                 self.assertEqual(
@@ -485,7 +486,7 @@ class TestPretunedCuteCodegen(TestCase):
                         config["tcgen05_layout_overrides_epi_tile_n"],
                         config["tcgen05_layout_overrides_d_store_box_n"],
                     ),
-                    (64, 64, 64),
+                    expected_layouts[shape],
                 )
 
     def test_scale_mm_pretuned_swap_ab_aux_load_placement(self) -> None:
@@ -512,6 +513,27 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertTrue(selected)
         for config in selected:
             self.assertEqual(config["tcgen05_aux_load_placement"], "pre_acc_wait")
+
+    def test_scale_mm_pretuned_swapped_configs(self) -> None:
+        path = (
+            PRETUNED_KERNELS_DIR
+            / "scale_mm_cute"
+            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+        )
+        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+
+        configs = dict(
+            zip(
+                heuristic._KEYS_scale_mm_cute_swap_ab,
+                heuristic._CONFIGS_scale_mm_cute_swap_ab,
+                strict=True,
+            )
+        )
+        self.assertEqual(set(configs), module._SWAP_AB_SHAPES)
 
     def test_scale_mm_explicit_epilogue_tile(self) -> None:
         module = _import_pretuned_kernel_module("scale_mm_cute")
@@ -574,8 +596,10 @@ class TestPretunedCuteCodegen(TestCase):
             tcgen05_l2_swizzle_size=1,
             tcgen05_persistence_model="static_persistent",
         )
-        code = module.scale_mm_cute_swap_ab.bind(swap_args).to_triton_code(config)
-        actual = module._scale_mm_cute(x, y, scale_a, scale_b)
+        bound = module.scale_mm_cute_swap_ab.bind(swap_args)
+        code = bound.to_triton_code(config)
+        bound.set_config(config)
+        actual = bound(*swap_args)
         expected = module._scale_mm_torch(x, y, scale_a, scale_b)
 
         aux0_loaded = code.index("tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()")
@@ -595,6 +619,8 @@ class TestPretunedCuteCodegen(TestCase):
             "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_1.shape))",
             code,
         )
+        self.assertNotIn("while tcgen05_role_local_", code)
+        self.assertNotIn(".advance_to_next_work()", code)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
@@ -647,6 +673,47 @@ class TestPretunedCuteCodegen(TestCase):
         )
         self.assertNotIn("while tcgen05_work_tile_valid", one_shot_code)
         self.assertNotIn("while tcgen05_work_tile_valid", persistent_code)
+
+    def test_scale_mm_n_edge_one_shot_is_automatic(self) -> None:
+        """A one-wave FP8 N-edge grid automatically uses one-shot scheduling."""
+
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs(2, 4096, 256)
+        args = (x, y, scale_a[:, 0], scale_b)
+        config_values = {
+            "block_sizes": [64, 16, 256],
+            "l2_groupings": [1],
+            "indexing": ["tensor_descriptor"] * 5,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 9,
+            "tcgen05_acc_stages": 1,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_l2_swizzle_size": 1,
+            "tcgen05_persistence_model": "static_persistent",
+        }
+
+        with patch_cute_mma_support():
+            bound = module.scale_mm_cute_swap_ab.bind(args)
+            original_search_enabled = bound.env.config_spec.cute_tcgen05_search_enabled
+            original_num_sm = bound.env.config_spec.num_sm
+            try:
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.env.config_spec.num_sm = 4
+                one_shot_code = bound.to_triton_code(helion.Config(**config_values))
+                bound.env.config_spec.num_sm = 3
+                persistent_code = bound.to_triton_code(helion.Config(**config_values))
+            finally:
+                bound.env.config_spec.cute_tcgen05_search_enabled = (
+                    original_search_enabled
+                )
+                bound.env.config_spec.num_sm = original_num_sm
+
+        role_loop = "while tcgen05_role_local_0_work_tile.is_valid_tile"
+        self.assertNotIn(role_loop, one_shot_code)
+        self.assertIn(role_loop, persistent_code)
 
     def test_scale_mm_swap_ab_aux_load_placement(self) -> None:
         """The placement config hoists full-tile SIMT scale loads."""

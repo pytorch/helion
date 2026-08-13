@@ -8157,13 +8157,19 @@ def _emit_mma_pipeline(
         tcgen05_persistence_model_for_plan = tcgen05_persistence_model_str
 
         # When the entire grid fits in one wave, every persistent CTA receives
-        # exactly one tile.
-        one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
-        one_shot_n_slots = n_size // bn
+        # exactly one tile. Use ceiling counts so the same proof covers both
+        # static-full grids and the validated FP8 role-local N-edge path.
+        one_shot_m_slots = ((m_size + bm - 1) // bm) * (2 if tcgen05_is_two_cta else 1)
+        one_shot_n_slots = (n_size + bn - 1) // bn
         one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
         tcgen05_one_shot_role_scheduler = (
             tcgen05_pid_is_persistent
-            and tcgen05_static_full_tiles
+            and (
+                tcgen05_static_full_tiles
+                or (
+                    tcgen05_role_local_n_edge_tma and input_dtype == torch.float8_e4m3fn
+                )
+            )
             and (analysis is None or not analysis.has_leading_passthrough)
             and one_shot_work_ctas <= env.config_spec.num_sm
             # A partial cluster could access out of bounds.
