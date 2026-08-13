@@ -397,6 +397,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "pallas_worklist_grouping",
         "pallas_loop_type",
         "pallas_pre_broadcast",
+        "core_type",
         *CUTE_TCGEN05_TUNABLE_KEYS,
     }
 )
@@ -474,6 +475,8 @@ VALID_KEYS: frozenset[str] = frozenset(
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
 VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+# TPU engine used by the Pallas backend.
+VALID_CORE_TYPES = ("tensorcore", "sparsecore")
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -634,6 +637,8 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        # Whether Pallas autotuning should compare TensorCore and SparseCore.
+        self.sparsecore_search_enabled: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating (Tasks #25 + #28).
         # Default False so the flash knobs never appear in the search surface
@@ -1843,6 +1848,14 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        if "core_type" in config:
+            if config["core_type"] not in VALID_CORE_TYPES:
+                raise InvalidConfig(
+                    f"Invalid value for 'core_type': {config['core_type']!r} "
+                    f"must be one of {list(VALID_CORE_TYPES)!r}"
+                )
+        elif self.sparsecore_search_enabled and self.supports_config_key("core_type"):
+            config.setdefault("core_type", VALID_CORE_TYPES[0])
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
@@ -2389,6 +2402,8 @@ class ConfigSpec:
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
+        if self.sparsecore_search_enabled and self.supports_config_key("core_type"):
+            fields["core_type"] = EnumFragment(choices=VALID_CORE_TYPES)
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)

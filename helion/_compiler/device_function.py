@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
+    from helion._compiler.pallas.sparsecore_program import SparseCoreProgram
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -303,6 +304,7 @@ class DeviceFunction:
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
         self._cute_state = CuteDeviceFunctionState()
+        self.sparsecore_program: SparseCoreProgram | None = None
 
         from .helper_function import HelperFunctionManager
 

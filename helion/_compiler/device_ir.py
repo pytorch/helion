@@ -3642,6 +3642,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # in Phase 3 (build_reduction_kernel_fact, after _collect_memory_op_facts) so it can
         # read the enriched memory_op_facts.
         device_ir.register_rollable_reductions()
+        if CompileEnvironment.current().backend.name == "pallas":
+            from .pallas.sparsecore_target import detect_sparsecore_search
+
+            detect_sparsecore_search(device_ir, config_spec)
         if CompileEnvironment.current().backend.name == "cute":
             _register_cute_lane_vector_width_specs(config_spec)
             # Enable the flash-attention autotune surface (Tasks #25 + #28) when

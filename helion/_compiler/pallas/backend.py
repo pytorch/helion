@@ -32,9 +32,12 @@ if TYPE_CHECKING:
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
     from ..device_function import Argument
+    from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
     from ..tile_dispatch import TileStrategyDispatch
+    from ..tile_strategy import SymIntLike
+    from ..tile_strategy import TileStrategy
     from .compact_worklist import CompactWorklistPlan
 
     InductorOpOverrides = OpsHandler[Any]
@@ -187,6 +190,24 @@ class PallasBackend(Backend):
     def max_reduction_threads(self) -> int | None:
         return None
 
+    def create_nd_tile_strategy(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        block_size: list[SymIntLike] | SymIntLike,
+        loop_order: list[int],
+        l2_grouping: int,
+    ) -> TileStrategy:
+        if fn.config.get("core_type", "tensorcore") == "sparsecore":
+            from .sparsecore_target import SparseCoreTileStrategy
+
+            return SparseCoreTileStrategy(
+                fn, block_ids, block_size, loop_order, l2_grouping
+            )
+        return super().create_nd_tile_strategy(
+            fn, block_ids, block_size, loop_order, l2_grouping
+        )
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
         if key not in _TORCH_TO_JAX_DTYPE:
@@ -261,6 +282,8 @@ class PallasBackend(Backend):
             "pl": "from jax.experimental import pallas as pl",
             "lax": "import jax.lax as lax",
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
+            "plsc": "from jax.experimental.pallas import tpu_sc as plsc",
+            "functools": "import functools",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             # In-kernel helpers the generated code calls. Regular output imports
             # them from helion (conditionally, only when referenced); the
@@ -294,6 +317,7 @@ class PallasBackend(Backend):
             "pallas_loop_type",
             "pallas_load_buffer_count",
             "pallas_pre_broadcast",
+            "core_type",
         }
     )
 
@@ -1285,6 +1309,21 @@ class PallasBackend(Backend):
         ):
             launcher_args.extend(self._compact_worklist_launcher_args(sorted_args))
 
+        program = device_fn.sparsecore_program
+        if program is not None and sorted_args is not None:
+            from .sparsecore_launcher import build_sparsecore_launcher_spec
+
+            def arg_position(fake: torch.Tensor) -> int | None:
+                for index, arg in enumerate(sorted_args):
+                    if isinstance(arg, TensorArg) and arg.fake_value is fake:
+                        return index
+                return None
+
+            launcher_args.append(
+                "_sc_launcher_spec="
+                f"{build_sparsecore_launcher_spec(program, arg_position)!r}"
+            )
+
         return launcher_args
 
     def _compact_worklist_launcher_args(self, sorted_args: list[Argument]) -> list[str]:
@@ -1448,7 +1487,6 @@ class PallasBackend(Backend):
         env = CompileEnvironment.current()
 
         plan_tiling(graphs, config, tile_strategy)
-        build_tensorcore_plans(graphs, config)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
         # reused across all configs of a BoundKernel (see CompileEnvironment's
@@ -1464,6 +1502,21 @@ class PallasBackend(Backend):
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
         env.compact_worklist_offset_params = []
+        from ..device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        device_fn.sparsecore_program = None
+
+        core_type = config.get("core_type", "tensorcore")
+        if core_type == "sparsecore":
+            from .sparsecore_target import build_sparsecore_program
+
+            device_fn.sparsecore_program = build_sparsecore_program(graphs, config)
+            return
+        if core_type != "tensorcore":
+            raise exc.InvalidConfig(f"unknown Pallas core type {core_type!r}")
+
+        build_tensorcore_plans(graphs, config)
 
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
