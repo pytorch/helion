@@ -7242,8 +7242,8 @@ class TestCuteBackend(TestCase):
         per-tile setup (before the accumulator ``consumer_wait``) so the
         rowvec GMEM latency hides under the MMA wait; the per-subtile loop
         slices the register tensor instead of issuing per-subtile LDGs.
-        bm=256 must keep the per-subtile GMEM load (the whole-tile hoist
-        historically caused register spills there).
+        The cluster-N=1 bm=256 family must keep the per-subtile GMEM load (the
+        whole-tile register hoist historically caused spills there).
         """
         support = get_cute_mma_support()
         if not support.tcgen05_f8:
@@ -7282,6 +7282,40 @@ class TestCuteBackend(TestCase):
             )
         )
         self.assertNotIn("tcgen05_aux_rmem_full_", code256)
+
+    def test_matmul_mma_tcgen05_fp8_four_cta_broadcast_scale_reuse(self) -> None:
+        """The bm256 cluster-N=2 scale reuse path is numerically correct."""
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        m, k, n = 512, 512, 256
+        x = (torch.randn(m, k, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        scale_m = (
+            (torch.arange(m, device=DEVICE, dtype=torch.float32) + 1.0)
+            .reshape(m, 1)
+            .expand(m, n)
+        )
+        scale_n = torch.linspace(0.5, 1.5, n, device=DEVICE)
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowwise_colwise_scale,
+            (x, y, scale_m, scale_n),
+            block_sizes=[256, 128, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_aux_load_placement="pre_acc_wait",
+        )
+        ref = (x.float() @ y.float()) * scale_m * scale_n.reshape(1, -1)
+        torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
+        self.assertFalse(out.float().isnan().any().item())
+        self.assertIn("tcgen05_aux_rowvec_smem_layout_", code)
+        self.assertIn("tcgen05_colvec_scalar_full_", code)
 
     def test_matmul_mma_tcgen05_f16_m128_cluster_m2_keeps_cta_group_one(
         self,

@@ -7275,7 +7275,85 @@ class TestCuteLowerings(unittest.TestCase):
             "tcgen05_aux_loaded_0 * tcgen05_aux_loaded_1", loop_pos
         )
         acc_pos = code.index("tcgen05_acc_loaded", loop_pos)
-        self.assertGreater(product_pos, acc_pos)
+        self.assertLess(product_pos, acc_pos)
+
+    def test_tcgen05_bm256_broadcast_scales_reuse_auxiliary_loads(self) -> None:
+        """The four-CTA full-tile epilogue reuses both broadcast scales."""
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def scaled_fp8(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_m: torch.Tensor,
+            scale_n: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                tile_scale = scale_m[tile_m, tile_n] * scale_n[tile_n]
+                out[tile_m, tile_n] = (acc * tile_scale).to(torch.bfloat16)
+            return out
+
+        args = (
+            torch.empty([512, 128], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([128, 256], device=DEVICE, dtype=torch.float8_e4m3fn),
+            torch.empty([512, 1], device=DEVICE).expand(512, 256),
+            torch.empty([256], device=DEVICE),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[256, 128, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=2,
+            tcgen05_acc_stages=1,
+            tcgen05_aux_load_placement=TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+            indexing=["tensor_descriptor"] * 5,
+        )
+        with patch_cute_mma_support():
+            bound = scaled_fp8.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+
+        self.assertIn(
+            "tcgen05_aux_rowvec_smem_layout_1 = "
+            "cute.make_layout((4, 128), stride=(128, 1))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_rowvec_tiled_copy_1 = cute.make_tiled_copy_tv",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_rowvec_thr_copy_1 = "
+            "tcgen05_aux_rowvec_tiled_copy_1.get_slice("
+            "tcgen05_epi_tidx % cutlass.Int32(32))",
+            code,
+        )
+        self.assertIn(
+            "tcgen05_aux_rowvec_smem_1[tcgen05_epi_tidx // "
+            "cutlass.Int32(32), None].iterator",
+            code,
+        )
+        scalar_assignment = next(
+            line.strip()
+            for line in code.splitlines()
+            if "tcgen05_colvec_scalar_full" in line and " = " in line
+        )
+        self.assertIn("tcgen05_tTR_gAux_grouped_0[0, 0, 0, 0]", scalar_assignment)
+        scalar_name = scalar_assignment.split(" = ", 1)[0]
+        scalar_pos = code.index(scalar_assignment)
+        loop_pos = code.index("for _tcgen05_subtile in cutlass.range", scalar_pos)
+        scalar_use_pos = code.index(f"tcgen05_aux_loaded_0 = {scalar_name}", loop_pos)
+        product_pos = code.index("tcgen05_aux_product", scalar_use_pos)
+        wait_pos = code.index("tcgen05_acc_pipeline.consumer_wait", loop_pos)
+        self.assertLess(scalar_pos, loop_pos)
+        self.assertLess(scalar_use_pos, product_pos)
+        self.assertLess(product_pos, wait_pos)
+        self.assertNotIn("tcgen05_aux_rowvec_pred_1", code)
 
     def test_tcgen05_fused_residual_epilogue_runtime_correctness(self) -> None:
         """``out[tile] = (acc + residual[tile_m, tile_n]).to(x.dtype)``
