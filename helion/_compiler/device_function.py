@@ -358,7 +358,7 @@ class DeviceFunction:
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
         # Pallas ordered carry: jagged row block_id -> CarryBoundaryTile.  Filled by
-        # the emit_pipeline codegen when the tile is a legal map axis; read by
+        # the inner-loop codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.
         self.carry_tiles: dict[int, CarryBoundaryTile] = {}
         # Pallas: jagged tile block_id -> proven runtime-window alignment.
