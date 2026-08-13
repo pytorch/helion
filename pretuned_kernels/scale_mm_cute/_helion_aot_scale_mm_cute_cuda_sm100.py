@@ -95,10 +95,27 @@ _SMALL_M_SWAP_KEYS = [
         (4096, 6144),
     )
 ]
+_SMALL_M_SWAP_KEYS.extend(
+    (m, k, n)
+    for m in (2, 8, 16, 32)
+    for k, n in (
+        (2048, 12288),
+        (5120, 5120),
+        (6144, 2048),
+    )
+)
 
 
 def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
-    if m == 32:
+    if m == 32 and (k, n) in {
+        (2048, 12288),
+        (5120, 5120),
+        (6144, 2048),
+    }:
+        block_sizes = [64, 32, 256]
+        ab_stages = 7
+        acc_stages = 1
+    elif m == 32:
         block_sizes = [64, 32, 128]
         ab_stages = 12
         acc_stages = 1
@@ -111,7 +128,7 @@ def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
         if (m, k, n) == (2, 4096, 256)
         else "persistent_blocked"
     )
-    return {
+    config = {
         "block_sizes": block_sizes,
         "l2_groupings": [1],
         "indexing": ["tensor_descriptor"] * 5,
@@ -125,13 +142,65 @@ def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
         "tcgen05_l2_swizzle_size": 1,
         "tcgen05_persistence_model": "static_persistent",
     }
+    # A one-shot role schedule is profitable when all swapped tiles fit in one
+    # wave on the 148-SM B200. The N=12288 cases need persistent reassignment.
+    if m in (2, 8) and math.ceil(n / block_sizes[0]) <= 148:
+        config["tcgen05_one_shot_role_scheduler"] = True
+    if m in (16, 32):
+        config["tcgen05_aux_load_placement"] = "pre_acc_wait"
+    return config
 
 
-_KEYS_scale_mm_cute_swap_ab = _SMALL_M_SWAP_KEYS
+_M64_SWAP_CONFIGS = {
+    (64, 4096, 24576): {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 2,
+        "tcgen05_persistence_model": "static_persistent",
+    },
+    (64, 5120, 51200): {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_blocked",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 4,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 8,
+        "tcgen05_persistence_model": "static_persistent",
+    },
+    (64, 25600, 5120): {
+        "block_sizes": [128, 64, 256],
+        "l2_groupings": [1],
+        "indexing": ["tensor_descriptor"] * 5,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 8,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        "tcgen05_l2_swizzle_size": 1,
+        "tcgen05_persistence_model": "static_persistent",
+    },
+}
+
+_KEYS_scale_mm_cute_swap_ab = [*_SMALL_M_SWAP_KEYS, *_M64_SWAP_CONFIGS]
 
 _CONFIGS_scale_mm_cute_swap_ab = [
     _small_m_swap_config(*key) for key in _SMALL_M_SWAP_KEYS
-]
+] + list(_M64_SWAP_CONFIGS.values())
 
 
 def key_scale_mm_cute_swap_ab(*args) -> int:
@@ -195,8 +264,9 @@ _CONFIGS_scale_mm_cute = [
     # bn=64/bk=128/ab=12 for large-K or very-wide-N (deepest prefetch that fits SMEM).
     # (M, K, N) = (64, 2048, 4096) -- persistent bn=32 bk=256; 0.97x vs cutlass.
     {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent', 'tcgen05_aux_load_placement': 'pre_acc_wait'},
-    # (M, K, N) = (64, 2048, 2048) -- non-persistent bn=16 bk=256 still wins here; 0.97x.
-    {'block_sizes': [64, 16, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent', 'tcgen05_aux_load_placement': 'pre_acc_wait'},
+    # (M, K, N) = (64, 2048, 2048) -- persistent bn=32 bk=256 with an
+    # explicit 64x32 epilogue; 1.061x faster than the prior flat bn=16 config.
+    {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent', 'tcgen05_aux_load_placement': 'pre_acc_wait', 'tcgen05_layout_strategy': 'explicit_epi_tile', 'tcgen05_layout_overrides_epi_tile_m': 64, 'tcgen05_layout_overrides_epi_tile_n': 32, 'tcgen05_layout_overrides_d_store_box_n': 32},
     # (M, K, N) = (64, 2048, 12288) -- persistent bn=32 bk=256; 0.92x vs cutlass (was 0.82).
     {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent', 'tcgen05_aux_load_placement': 'pre_acc_wait'},
     # (M, K, N) = (64, 6144, 2048) -- persistent bn=32 bk=256; 1.00x vs cutlass (was 0.96).
