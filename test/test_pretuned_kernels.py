@@ -525,6 +525,19 @@ class TestPretunedCuteCodegen(TestCase):
             out, module._scale_mm_torch(*args), atol=2e-1, rtol=1e-2
         )
 
+    def test_scale_mm_swap_ab_small_n(self) -> None:
+        """The swapped small-N path compiles and preserves exact FP8 results."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs(2, 4096, 256)
+        actual = module._scale_mm_cute(x, y, scale_a, scale_b)
+        expected = module._scale_mm_torch(x, y, scale_a, scale_b)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
         """One-shot codegen follows the compile target's actual SM count."""
 
