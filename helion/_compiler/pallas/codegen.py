@@ -997,8 +997,9 @@ def _ds_expr(
                     dim_from_end, tensor.ndim, bitwidth
                 )
                 if alignment % required == 0:
-                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
-                    offset = f"pl.multiple_of({offset}, {block_size})"
+                    # The loop begin and iteration step are both multiples of
+                    # `alignment`, so the promise holds for every offset.
+                    offset = f"pl.multiple_of({offset}, {alignment})"
 
     return f"pl.ds({offset}, {block_size})"
 
@@ -1039,9 +1040,11 @@ def _loop_offset_alignment(
 ) -> int | None:
     """Return the proven alignment of a loop's offset for *block_id*, or ``None``.
 
-    A loop with step ``block_size`` produces offsets ``begin + i * block_size``,
-    which are multiples of ``block_size`` iff ``begin`` is.  Returns
-    ``block_size`` (int) when provable, ``None`` otherwise.
+    A loop with step ``block_size`` produces offsets ``begin + i * block_size``.
+    An aligned jagged window proves only its recorded sublane alignment. For any
+    other loop, every offset is block-aligned iff its begin is block-aligned.
+    Return the strongest proven integer alignment, or ``None`` when a runtime
+    begin has no such proof.
     """
     import sympy
 
@@ -1049,16 +1052,22 @@ def _loop_offset_alignment(
     if not isinstance(bs_value, int):
         return None
 
-    # Check that the loop begins at a multiple of block_size.
+    window_alignment = state.device_function.aligned_tiles.get(block_id)
+    if isinstance(window_alignment, int):
+        return window_alignment if bs_value % window_alignment == 0 else None
+
+    # Without a recorded window alignment, prove block alignment from the
+    # active loop's begin.
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         info = loops[-1].block_id_to_info.get(block_id)
-        if info is not None and info.begin_expr is not None:
-            begin = info.begin_expr
-            if not isinstance(begin, (int, sympy.Integer)):
-                return None  # symbolic begin — can't prove alignment
-            if int(begin) % bs_value != 0:
-                return None
+        if info is None or info.begin_expr is None:
+            return None
+        begin = info.begin_expr
+        if not isinstance(begin, (int, sympy.Integer)):
+            return None  # symbolic begin — can't prove alignment
+        if int(begin) % bs_value != 0:
+            return None
 
     return bs_value
 
