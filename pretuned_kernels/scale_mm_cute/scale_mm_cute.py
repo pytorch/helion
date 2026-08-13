@@ -13,7 +13,7 @@ Specialized kernels include:
 * :func:`scale_mm_cute` tiles over both M and N.
 * :func:`scale_mm_cute_skinny_m` keeps the full (small) M resident and tiles
   only over N for single-token decode.
-* :func:`scale_mm_cute_swap_ab` swaps M/N so M=2/8/16/32 can use efficient
+* :func:`scale_mm_cute_swap_ab` swaps M/N so small-M shapes can use efficient
   Blackwell tensor-core tiles.
 
 :func:`_scale_mm_cute` dispatches each pretuned shape to its specialized kernel.
@@ -31,7 +31,7 @@ import helion.language as hl
 # Only single-token decode uses the scalar skinny-M kernel. Wider small-M
 # shapes use the swapped tensor-core kernel below.
 _SKINNY_M_MAX = 1
-_SWAP_AB_SHAPES = {
+_SMALL_M_SWAP_SHAPES = {
     (m, k, n)
     for m in (2, 8, 16, 32)
     for k, n in (
@@ -39,8 +39,17 @@ _SWAP_AB_SHAPES = {
         (4096, 256),
         (2048, 4096),
         (4096, 6144),
+        (2048, 12288),
+        (5120, 5120),
+        (6144, 2048),
     )
 }
+_M64_SWAP_SHAPES = {
+    (64, 4096, 24576),
+    (64, 5120, 51200),
+    (64, 25600, 5120),
+}
+_SWAP_AB_SHAPES = _SMALL_M_SWAP_SHAPES | _M64_SWAP_SHAPES
 
 
 @helion.aot_kernel(backend="cute", static_shapes=True)
@@ -203,6 +212,8 @@ def use_cudagraph() -> bool:
 
 # Skinny-M (decode / small-batch) + small decoder-layer FP8 W8A8 serving shapes
 # that back the nightly B200 CuTe dashboard (benchmarks/run.py, PR #2788).
+# The M=2/8/16/32 additions include weight shapes from vLLM's H100 scaled_mm
+# config in vllm-project/vllm#46522.
 # The M=64 rows mirror the vLLM Qwen3 FP8 serving (K, N) weight shapes at a
 # small-batch token count.
 SHAPES = [  # (M, K, N)
@@ -223,6 +234,11 @@ SHAPES = [  # (M, K, N)
     (32, 4096, 256),
     (32, 2048, 4096),
     (32, 4096, 6144),
+    *sorted(
+        (m, k, n)
+        for m, k, n in _SMALL_M_SWAP_SHAPES
+        if (k, n) in {(2048, 12288), (5120, 5120), (6144, 2048)}
+    ),
     (4096, 4096, 4096),
     (1, 4096, 256),
     (512, 2048, 4096),
