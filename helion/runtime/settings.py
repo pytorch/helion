@@ -871,8 +871,9 @@ class Settings(_Settings):
             "Set HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/path/to/analysis.json to save."
         ),
         "retry_with_fallback": (
-            "If True, retry a failed kernel launch once with the default config "
-            "if the configured config fails with a launch resource error. "
+            "If True, retry a kernel once with the default config if it fails to launch (e.g. out of resources). "
+            "Useful for complex AOT kernels (e.g. paged attention), where the generated heuristic might return invalid configurations for some inputs. "
+            "Ignored when autotune_effort=none; likely unnecessary for normal kernels or simple AOT kernels. "
             "Off by default; set HELION_RETRY_WITH_FALLBACK=1 to enable."
         ),
     }
