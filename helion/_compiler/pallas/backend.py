@@ -1233,19 +1233,61 @@ class PallasBackend(Backend):
                 launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
-        scratch_shapes = [
-            (
-                s.shape,
-                self.dtype_str(s.dtype) if s.dtype is not None else None,
-                s.scratch_type,
-            )
-            for s in device_fn._scratch_args
-        ]
+        scratch_shapes = device_fn._scratch_args
         if scratch_shapes:
             from ..host_function import HostFunction
 
-            scratch_shapes_str = HostFunction.current().literal_expr(scratch_shapes)
+            host = HostFunction.current()
+            entries: list[str] = []
+            for scratch in scratch_shapes:
+                sources = scratch.shape_sources or (None,) * len(scratch.shape)
+                shape_dims = [
+                    host.literal_expr(size)
+                    if source is None
+                    else f"{device_fn.tensor_arg(source[0]).host_str()}.size({source[1]})"
+                    for size, source in zip(scratch.shape, sources, strict=True)
+                ]
+                shape_expr = (
+                    f"({', '.join(shape_dims)}{',' if len(shape_dims) == 1 else ''})"
+                )
+                dtype = (
+                    self.dtype_str(scratch.dtype) if scratch.dtype is not None else None
+                )
+                entries.append(f"({shape_expr}, {dtype!r}, {scratch.scratch_type!r})")
+            scratch_shapes_str = f"[{', '.join(entries)}]"
             launcher_args.append(f"_scratch_shapes={scratch_shapes_str}")
+            assert sorted_args is not None
+            shape_sources: list[list[tuple[int, int] | None]] = []
+            for scratch in scratch_shapes:
+                dims: list[tuple[int, int] | None] = []
+                for source in scratch.shape_sources or (None,) * len(scratch.shape):
+                    if source is None:
+                        dims.append(None)
+                        continue
+                    source_arg = device_fn.tensor_arg(source[0])
+                    position = next(
+                        i for i, arg in enumerate(sorted_args) if arg is source_arg
+                    )
+                    dims.append((position, source[1]))
+                shape_sources.append(dims)
+            launcher_args.append(f"_scratch_shape_sources={shape_sources!r}")
+
+        if device_fn.requires_remote_copy:
+            launcher_args.append("_uses_remote_copy=True")
+
+        if device_fn.requires_collective_id:
+            collective_id = CompileEnvironment.current().settings.pallas_collective_id
+            if collective_id is None:
+                from ..host_function import HostFunction
+                from .distributed_ops import _automatic_collective_id
+
+                collective_id = _automatic_collective_id(HostFunction.current().fn)
+            if not isinstance(collective_id, int):
+                raise TypeError(
+                    "pallas_collective_id must be an integer, got "
+                    f"{type(collective_id)!r}"
+                )
+            launcher_args.append(f"_collective_id={collective_id!r}")
 
         # Identify which launcher arg positions correspond to pipeline-body
         # tensors (need HBM refs); all others get proper BlockSpecs.
@@ -1598,15 +1640,18 @@ class PallasBackend(Backend):
 
 
 # Launcher kwargs that mark a kernel using a Pallas feature the pure-JAX
-# module doesn't emit yet (scratch/VMEM buffers, HBM pass-through, SMEM,
-# dynamic-shape padding, compact-worklist, matmul dot_general).
+# module doesn't emit yet (compact-worklist, matmul dot_general).
 _JAX_UNSUPPORTED_KWARGS = (
+    "_compact_build_worklist",
+    "_matmul_dot_general",
+)
+
+_JAX_REMOTE_COPY_KWARGS = (
     "_scratch_shapes",
+    "_scratch_shape_sources",
     "_hbm_arg_indices",
     "_smem_arg_indices",
     "_ds_pad_dims",
-    "_compact_build_worklist",
-    "_matmul_dot_general",
 )
 
 # Dtypes the Pallas launcher rejects and that JAX would mishandle under x32
@@ -1629,9 +1674,14 @@ class JaxLaunchMeta:
     user_positions: list[int]
     const_slots: dict[int, str]
     block_spec_info: list[Any]
+    scratch_shape_exprs: list[tuple[list[str], str | None, str]]
+    hbm_arg_indices: list[int]
+    smem_arg_indices: list[int]
+    ds_pad_dims: list[tuple[int, int, int, int]]
     out_shape_exprs: list[list[str]]
     out_dtypes: list[str]
     interpret: bool
+    collective_id: int | None
     n_args: int
 
 
@@ -1815,10 +1865,10 @@ def capture_jax_launch_metadata(
     ``inputs[i].shape[d]`` expressions rather than baked sample constants. The AST
     builder (:func:`build_jax_fn_ast`) turns this into the emitted entrypoint.
 
-    Kernels using unsupported advanced Pallas features (scratch/pipeline/SMEM,
-    dynamic-shape padding, compact-worklist, or matmul-dot-general) or
-    int64/uint64/float64 args raise ``NotImplementedError``. Caller-owned in-place
-    aliases are captured as static launch metadata.
+    Kernels using unsupported advanced Pallas features or int64/uint64/float64
+    args raise ``NotImplementedError``. Distributed remote-copy kernels capture
+    their scratch descriptors, HBM/SMEM placements, dynamic-shape padding, and
+    in-place aliases as static launch metadata.
 
     Must be called *outside* the fake-tensor env (the capture materializes and runs
     on real tensors).
@@ -1874,7 +1924,10 @@ def capture_jax_launch_metadata(
     compiled(*args, _launcher=_capture)
 
     kw = captured["kwargs"]
-    for name in _JAX_UNSUPPORTED_KWARGS:
+    unsupported_kwargs = list(_JAX_UNSUPPORTED_KWARGS)
+    if not kw.get("_uses_remote_copy"):
+        unsupported_kwargs.extend(_JAX_REMOTE_COPY_KWARGS)
+    for name in unsupported_kwargs:
         if kw.get(name):
             raise NotImplementedError(
                 f"to_code(jax_fn=True) does not support kernels using "
@@ -1925,6 +1978,7 @@ def capture_jax_launch_metadata(
         for p in output_indices
     ]
     interpret = bool(kw.get("_pallas_interpret") or False)
+    collective_id = cast("int | None", kw.get("_collective_id"))
 
     # Derive the grid, output shapes, and shape-derived scalar launch args from the
     # RUNTIME input shapes so a single standalone is correct at every dynamic shape.
@@ -1941,6 +1995,7 @@ def capture_jax_launch_metadata(
         for p in user_positions
     ]
 
+    probe_cap: dict[str, Any] = {}
     if sym_dims:
         sym_factor = {sym: _PROBE_FACTORS[k] for k, sym in enumerate(sorted(sym_dims))}
         # (arg_index, dim) -> scale factor, from the pre-run symbolic dims (dims
@@ -1950,11 +2005,11 @@ def capture_jax_launch_metadata(
             for sym, positions in sym_dims.items()
             for pos in positions
         }
-        probe_cap: dict[str, Any] = {}
 
         def _probe(pk: object, grid: object, *pa: object, **pkw: object) -> object:
             probe_cap["grid"] = tuple(int(g) for g in cast("Any", grid))
             probe_cap["args"] = pa
+            probe_cap["kwargs"] = pkw
             return _launcher_return(pa, pkw)
 
         probe_args = _scaled_probe_args(args, dim_factor)
@@ -1967,6 +2022,39 @@ def capture_jax_launch_metadata(
         ]
     else:
         grid1, launch1, in_shapes1 = grid0, launch_args, in_shapes0
+
+    scratch0 = list(cast("list[object] | None", kw.get("_scratch_shapes")) or [])
+    probe_kw = cast("dict[str, object]", probe_cap.get("kwargs", kw))
+    scratch1 = list(cast("list[object] | None", probe_kw.get("_scratch_shapes")) or [])
+    if len(scratch0) != len(scratch1):
+        raise RuntimeError("Pallas scratch layout changed across shape probes")
+    raw_scratch_sources = cast(
+        "list[list[tuple[int, int] | None]] | None",
+        kw.get("_scratch_shape_sources"),
+    ) or [
+        [None] * len(cast("tuple[tuple[int, ...], object, object]", item)[0])
+        for item in scratch0
+    ]
+    if len(raw_scratch_sources) != len(scratch0):
+        raise RuntimeError("Pallas scratch source metadata has the wrong length")
+    launch_to_user = {position: i for i, position in enumerate(user_positions)}
+    scratch_shape_exprs: list[tuple[list[str], str | None, str]] = []
+    for first, second, sources in zip(
+        scratch0, scratch1, raw_scratch_sources, strict=True
+    ):
+        shape0, dtype0, kind0 = cast("tuple[tuple[int, ...], str | None, str]", first)
+        shape1, dtype1, kind1 = cast("tuple[tuple[int, ...], str | None, str]", second)
+        if dtype0 != dtype1 or kind0 != kind1 or len(shape0) != len(shape1):
+            raise RuntimeError("Pallas scratch layout changed across shape probes")
+        if len(sources) != len(shape0):
+            raise RuntimeError("Pallas scratch source metadata has the wrong rank")
+        dims: list[str] = []
+        for a, b, source in zip(shape0, shape1, sources, strict=True):
+            if source is not None and source[0] in launch_to_user:
+                dims.append(f"inputs[{launch_to_user[source[0]]}].shape[{source[1]}]")
+            else:
+                dims.append(_match_input_dim(a, b, in_shapes0, in_shapes1) or repr(a))
+        scratch_shape_exprs.append((dims, dtype0, kind0))
 
     grid_exprs = [
         _grid_axis_expr(g0, g1, in_shapes0, in_shapes1)
@@ -2006,9 +2094,24 @@ def capture_jax_launch_metadata(
         user_positions=user_positions,
         const_slots=const_slots,
         block_spec_info=cast("list[Any]", block_spec_info),
+        scratch_shape_exprs=scratch_shape_exprs,
+        hbm_arg_indices=list(
+            cast("list[int] | None", kw.get("_hbm_arg_indices")) or []
+        ),
+        smem_arg_indices=list(
+            cast("list[int] | None", kw.get("_smem_arg_indices")) or []
+        ),
+        ds_pad_dims=list(
+            cast(
+                "list[tuple[int, int, int, int]] | None",
+                kw.get("_ds_pad_dims"),
+            )
+            or []
+        ),
         out_shape_exprs=out_shape_exprs,
         out_dtypes=out_dtypes,
         interpret=interpret,
+        collective_id=collective_id,
         n_args=len(launch_args),
     )
 
@@ -2193,10 +2296,14 @@ def build_jax_fn_ast(
     # nodes). block_spec_info's repr is a list of tuples, so it parses cleanly.
     meta_nodes: list[ast.stmt] = [
         ast.parse(f"_BLOCK_SPEC_INFO = {meta.block_spec_info!r}").body[0],
+        ast.parse(f"_HBM_ARG_INDICES = {meta.hbm_arg_indices!r}").body[0],
+        ast.parse(f"_SMEM_ARG_INDICES = {meta.smem_arg_indices!r}").body[0],
+        ast.parse(f"_DS_PAD_DIMS = {meta.ds_pad_dims!r}").body[0],
         ast.parse(f"_OUTPUT_INDICES = {meta.output_indices!r}").body[0],
         ast.parse(f"_INPLACE_INDICES = {meta.inplace_indices!r}").body[0],
         ast.parse(f"_USER_POSITIONS = {meta.user_positions!r}").body[0],
         ast.parse(f"_INTERPRET = {meta.interpret!r}").body[0],
+        ast.parse(f"_COLLECTIVE_ID = {meta.collective_id!r}").body[0],
         ast.parse(f"_N_ARGS = {meta.n_args}").body[0],
     ]
     entrypoint = ast.parse(_jax_entrypoint_source(meta, device_kernel)).body[0]
@@ -2225,6 +2332,11 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
     const_lines = [
         f"    slots[{p}] = {expr}" for p, expr in sorted(meta.const_slots.items())
     ]
+    scratch_entries: list[str] = []
+    for dims, dtype, kind in meta.scratch_shape_exprs:
+        shape = f"({', '.join(dims)}{',' if len(dims) == 1 else ''})"
+        scratch_entries.append(f"({shape}, {dtype!r}, {kind!r})")
+    scratch_shapes = f"[{', '.join(scratch_entries)}]"
     # The explanation goes in the docstring rather than ``#`` comments: this source is
     # round-tripped through ``ast.parse`` (comments are dropped, the docstring node is
     # kept). The const-slots sentence is conditional so it appears only when present.
@@ -2244,6 +2356,15 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        slots[pos] = inp",
         *out_lines,
         *const_lines,
+        f"    _scratch_shapes = {scratch_shapes}",
+        "    orig_shapes = {pos: tuple(slots[pos].shape) for pos in _OUTPUT_INDICES}",
+        "    for arg_idx, dim, block_size, extra_pad in _DS_PAD_DIMS:",
+        "        value = slots[arg_idx]",
+        "        pad_amount = (-value.shape[dim]) % block_size + extra_pad",
+        "        if pad_amount:",
+        "            pad_widths = [(0, 0)] * value.ndim",
+        "            pad_widths[dim] = (0, pad_amount)",
+        "            slots[arg_idx] = jnp.pad(value, pad_widths)",
         "    results = _pallas_jax_call(",
         f"        {device_kernel},",
         "        _grid,",
@@ -2251,11 +2372,14 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        output_indices=_OUTPUT_INDICES,",
         "        inplace_indices=_INPLACE_INDICES,",
         "        block_spec_info=_BLOCK_SPEC_INFO,",
-        "        scratch_shapes=None,",
-        "        hbm_arg_indices=None,",
-        "        smem_arg_indices=None,",
+        "        scratch_shapes=_scratch_shapes,",
+        "        hbm_arg_indices=_HBM_ARG_INDICES,",
+        "        smem_arg_indices=_SMEM_ARG_INDICES,",
+        "        collective_id=_COLLECTIVE_ID,",
         "        interpret=_INTERPRET,",
         "        compact=None,",
+        "        orig_shapes=orig_shapes,",
+        "        ds_pad_dims=_DS_PAD_DIMS,",
         "    )",
         "    return results[0] if len(results) == 1 else tuple(results)",
     ]
