@@ -126,8 +126,10 @@ def _narrowed_dims(indices: object) -> list[int]:
 
 
 def _resident_plan(node: torch.fx.Node) -> _ResidentPlan | None:
-    value = node.meta.get(RESIDENT_PLAN_META)
-    return value if isinstance(value, _ResidentPlan) else None
+    # Codegen repair may reload this module after planning, so an existing plan
+    # can be an instance of the pre-reload NamedTuple class. The private metadata
+    # key is the stable type boundary across that reload.
+    return cast("_ResidentPlan | None", node.meta.get(RESIDENT_PLAN_META))
 
 
 def _where(node: torch.fx.Node) -> str:

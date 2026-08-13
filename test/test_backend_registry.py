@@ -202,6 +202,18 @@ class TestBackendCodegenRepair(unittest.TestCase):
         self.assertEqual(restored.__module__, "helion._compiler.triton.memory_ops")
         self.assertIsNot(restored, original)
 
+    def test_resident_plan_metadata_survives_codegen_reload(self) -> None:
+        from helion._compiler.pallas import view_ops
+
+        plan = view_ops._ResidentPlan(False, (), None)
+        node = mock.Mock(meta={view_ops.RESIDENT_PLAN_META: plan})
+
+        class ReloadedResidentPlan:
+            pass
+
+        with mock.patch.object(view_ops, "_ResidentPlan", ReloadedResidentPlan):
+            self.assertIs(view_ops._resident_plan(node), plan)
+
 
 class TestAtenCodegenRepair(unittest.TestCase):
     def test_exact_backend_passes_repair_barrier(self) -> None:
