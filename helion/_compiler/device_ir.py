@@ -2220,6 +2220,13 @@ class WalkDeviceAST(NodeVisitor):
 
     @staticmethod
     def should_become_arg(value: object) -> bool:
+        from ..language.distributed_ops import AsyncCopyDescriptor
+
+        # Descriptor operations in a dynamic branch close over the descriptor
+        # created by the surrounding graph. The lowering resolves that handle by
+        # compiler ID, so it is a compile-time value rather than a branch input.
+        if isinstance(value, AsyncCopyDescriptor):
+            return False
         if isinstance(value, (Tile, int, float, bool, type(None), torch.SymInt)):
             return False
         if isinstance(value, torch.Tensor):

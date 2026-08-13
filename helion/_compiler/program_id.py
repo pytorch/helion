@@ -2890,23 +2890,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
                 )
             )
-        per_tile_body.extend(
-            [
-                statement_from_string(f"{sched_var}.advance_to_next_work()"),
-                statement_from_string(
-                    f"{work_tile_var} = {sched_var}.get_current_work()"
-                ),
-            ]
-        )
-
-        prelude.append(
-            create(
-                ast.While,
-                test=expr_from_string(f"{work_tile_var}.is_valid_tile"),
-                body=per_tile_body,
-                orelse=[],
+        if (plan := self._tcgen05_plan()) is not None and plan.one_shot_role_scheduler:
+            prelude.extend(per_tile_body)
+        else:
+            per_tile_body.extend(
+                [
+                    statement_from_string(f"{sched_var}.advance_to_next_work()"),
+                    statement_from_string(
+                        f"{work_tile_var} = {sched_var}.get_current_work()"
+                    ),
+                ]
             )
-        )
+            prelude.append(
+                create(
+                    ast.While,
+                    test=expr_from_string(f"{work_tile_var}.is_valid_tile"),
+                    body=per_tile_body,
+                    orelse=[],
+                )
+            )
 
         return create(
             ast.If,
