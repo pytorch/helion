@@ -462,10 +462,11 @@ class TestPretunedCuteCodegen(TestCase):
         heuristic = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(heuristic)
 
-        expected_shapes = {
-            (64, 4096, 6144),
-            (64, 5120, 10240),
-            (64, 5120, 5120),
+        expected_layouts = {
+            (64, 2048, 2048): (64, 32, 32),
+            (64, 4096, 6144): (64, 64, 64),
+            (64, 5120, 10240): (64, 64, 64),
+            (64, 5120, 5120): (64, 64, 64),
         }
         explicit_configs = {
             tuple(shape): config
@@ -476,7 +477,7 @@ class TestPretunedCuteCodegen(TestCase):
             )
             if config.get("tcgen05_layout_strategy") == "explicit_epi_tile"
         }
-        self.assertEqual(set(explicit_configs), expected_shapes)
+        self.assertEqual(set(explicit_configs), set(expected_layouts))
         for shape, config in explicit_configs.items():
             with self.subTest(shape=shape):
                 self.assertEqual(
@@ -485,8 +486,38 @@ class TestPretunedCuteCodegen(TestCase):
                         config["tcgen05_layout_overrides_epi_tile_n"],
                         config["tcgen05_layout_overrides_d_store_box_n"],
                     ),
-                    (64, 64, 64),
+                    expected_layouts[shape],
                 )
+
+    def test_scale_mm_pretuned_swapped_configs(self) -> None:
+        path = (
+            PRETUNED_KERNELS_DIR
+            / "scale_mm_cute"
+            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+        )
+        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+
+        configs = dict(
+            zip(
+                heuristic._KEYS_scale_mm_cute_swap_ab,
+                heuristic._CONFIGS_scale_mm_cute_swap_ab,
+                strict=True,
+            )
+        )
+        self.assertEqual(set(configs), module._SWAP_AB_SHAPES)
+        for (m, _k, n), config in configs.items():
+            if m in (2, 8):
+                one_shot_fits = math.ceil(n / config["block_sizes"][0]) <= 148
+                self.assertEqual(
+                    config.get("tcgen05_one_shot_role_scheduler", False),
+                    one_shot_fits,
+                )
+            elif m in (16, 32):
+                self.assertEqual(config["tcgen05_aux_load_placement"], "pre_acc_wait")
 
     def test_scale_mm_explicit_epilogue_tile(self) -> None:
         module = _import_pretuned_kernel_module("scale_mm_cute")
