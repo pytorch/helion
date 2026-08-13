@@ -1467,8 +1467,10 @@ def _try_codegen_tcgen05_pair_epilogue(
     ast_subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
 ) -> ast.AST | None:
-    plan = state.device_function.cute_state.tcgen05_pair_epilogue_plan_for_store(
-        state.fx_node
+    plan = (
+        state.device_function.cute_state.tcgen05_pair_epilogue_plan_for_store(
+            state.fx_node
+        )
     )
     if plan is None:
         return None
@@ -1477,18 +1479,20 @@ def _try_codegen_tcgen05_pair_epilogue(
     from ..inductor_lowering import is_deferred_tcgen05_pair_epilogue
 
     value_node = state.fx_node.args[2] if state.fx_node is not None else None
-    if value_node is not plan.value_node or not is_deferred_tcgen05_pair_epilogue(
-        state.ast_args[2]
+    if (
+        value_node is not plan.value_node
+        or not is_deferred_tcgen05_pair_epilogue(state.ast_args[2])
     ):
         raise exc.BackendUnsupported(
-            "cute", "committed tcgen05 pair epilogue received the wrong store value"
+            "cute",
+            "committed tcgen05 thread-local epilogue received the wrong store value",
         )
     result_var = state.device_function.cute_state.matmul_fx_node_result_vars.get(
         plan.anchor
     )
     if result_var is None:
         raise exc.BackendUnsupported(
-            "cute", "tcgen05 pair epilogue store ran before its MMA anchor"
+            "cute", "tcgen05 thread-local epilogue store ran before its MMA anchor"
         )
     rewritten = _codegen_cute_store_tcgen05_tile(
         state,
@@ -1501,7 +1505,7 @@ def _try_codegen_tcgen05_pair_epilogue(
     )
     if rewritten is None:
         raise exc.BackendUnsupported(
-            "cute", "committed tcgen05 pair epilogue could not render its store"
+            "cute", "committed tcgen05 thread-local epilogue could not render its store"
         )
     for statement in rewritten if isinstance(rewritten, list) else [rewritten]:
         state.add_statement(statement)

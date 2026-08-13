@@ -27,6 +27,7 @@ from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import ReductionLoopSpec
@@ -806,6 +807,76 @@ class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
             small_biased_candidate=spec._cute_flash_small_biased_candidate,
             block_size_targets=spec._cute_flash_block_size_target_list(),
             seed_kind="causal_lpt",
+        )
+
+
+class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
+    """Seed the one-CTA tile used by tcgen05 thread-local epilogues.
+
+    The structural region analysis only decides whether this seed is useful.
+    The exhaustive, per-config ownership proof remains authoritative for
+    codegen, so planting the seed does not widen the accepted kernel surface.
+    """
+
+    name = "cute_tcgen05_thread_local_epilogue"
+    backend = "cute"
+    promote_seed_to_default = True
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ..cute.cute_mma import tcgen05_pair_epilogue_has_unique_anchor
+        from ..cute.cute_mma import tcgen05_pair_epilogue_present
+
+        spec = env.config_spec
+        return (
+            spec.cute_tcgen05_search_enabled
+            and TCGEN05_TWO_CTA_SEED_PID_TYPE in spec.allowed_pid_types
+            and tcgen05_pair_epilogue_present(device_ir.graphs)
+            and tcgen05_pair_epilogue_has_unique_anchor(
+                device_ir.graphs,
+                device_ir=device_ir,
+            )
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        fragments = spec._tcgen05_matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+
+        def select(fragment: BlockSizeFragment, choices: tuple[int, ...]) -> int | None:
+            return next(
+                (value for value in choices if fragment.low <= value <= fragment.high),
+                None,
+            )
+
+        bm = select(bm_fragment, (128,))
+        bn = select(bn_fragment, (128, 64))
+        bk = select(bk_fragment, (128, 64, 32, 16))
+        if bm is None or bn is None or bk is None:
+            return None
+        block_sizes = spec._tcgen05_matmul_seed_block_sizes(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+        if block_sizes is None:
+            return None
+        return Config(
+            block_sizes=block_sizes,
+            num_stages=2,
+            num_warps=8,
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
         )
 
 
