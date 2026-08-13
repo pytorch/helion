@@ -2232,7 +2232,6 @@ def _aligned_dim(
     from .backend import _slice_addressing
     from .memory_access import MemoryAccessKind
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
-    from helion._compiler.pallas.ordered_carry import is_row_map_axis
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
 
     sublanes = [
@@ -2286,14 +2285,6 @@ def _aligned_dim(
                     "Pallas: a jagged row tile whose slices must be "
                     "sublane-aligned and that is written through its row dim is "
                     "only supported when ordered carry can stitch the store."
-                )
-            if not is_row_map_axis(state, bid):
-                # ALIGNED but not a map axis: a bf16 reduction over the row. Its
-                # dense bf16 output store cannot be proven aligned for Mosaic, so
-                # reject it cleanly here instead. f32 reductions are DIRECT above.
-                raise NotImplementedError(
-                    "Pallas: bf16 reduction over a jagged row is not supported yet "
-                    "(its dense bf16 output store cannot be proven sublane-aligned)."
                 )
         state.device_function.aligned_tiles[bid] = sublane
         if carry:

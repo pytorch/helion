@@ -11,7 +11,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
-from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
@@ -379,14 +378,10 @@ class TestPallasJaggedCarryBmm(TestCase):
 class TestPallasJaggedCarryRejects(TestCase):
     """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
 
-    @xfailIfPallas(
-        "bf16 reduction over a jagged row falls through to the f32-only existing "
-        "path; the unaligned bf16 load can't compile yet"
-    )
     def test_jagged_reduction_over_row_bf16(self) -> None:
-        # A reduction over the jagged row (summed to a dense output) is not the
-        # carry's shape, so it falls through to the existing path.  That path is
-        # f32-only, so the bf16 case can't compile yet; the xfail tracks the gap.
+        # A reduction over the jagged row (summed to a dense output) writes
+        # nothing through that row, so its aligned window needs no carry and
+        # the over-read rows are masked away before the sum.
         @helion.kernel(backend="pallas")
         def jagged_row_sum(
             seq_offsets: torch.Tensor, jagged: torch.Tensor
