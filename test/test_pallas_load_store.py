@@ -12,7 +12,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipUnlessPallas
-from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
@@ -375,6 +374,18 @@ class TestPallasJaggedCarryBmm(TestCase):
         torch.testing.assert_close(out, jagged * 2)
 
 
+def _ref_jagged_row_sum(seq_offsets: torch.Tensor, jagged: torch.Tensor):
+    ref = torch.zeros(
+        (seq_offsets.numel() - 1, jagged.shape[1]),
+        dtype=torch.float32,
+        device=jagged.device,
+    )
+    for g in range(ref.shape[0]):
+        s, e = int(seq_offsets[g]), int(seq_offsets[g + 1])
+        ref[g] = jagged[s:e].float().sum(0)
+    return ref
+
+
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasMultipleOfPromises(TestCase):
@@ -456,17 +467,12 @@ class TestPallasJaggedIndexing(TestCase):
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
-class TestPallasJaggedCarryRejects(TestCase):
-    """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
+@xfailIfPallasInterpret(_XFAIL_INTERPRET)
+class TestPallasJaggedReductions(TestCase):
+    """Reductions over a bf16 jagged row: aligned window, no store through the row."""
 
-    @xfailIfPallas(
-        "bf16 reduction over a jagged row falls through to the f32-only existing "
-        "path; the unaligned bf16 load can't compile yet"
-    )
-    def test_jagged_reduction_over_row_bf16(self) -> None:
-        # A reduction over the jagged row (summed to a dense output) is not the
-        # carry's shape, so it falls through to the existing path.  That path is
-        # f32-only, so the bf16 case can't compile yet; the xfail tracks the gap.
+    def test_reduction_access_in_jagged_loop(self) -> None:
+        # The jagged loop is innermost and slices the tensor itself.
         @helion.kernel(backend="pallas")
         def jagged_row_sum(
             seq_offsets: torch.Tensor, jagged: torch.Tensor
@@ -492,10 +498,108 @@ class TestPallasJaggedCarryRejects(TestCase):
             block_sizes=[128, 16],
             pallas_loop_type="emit_pipeline",
         )
-        ref = torch.zeros(2, 128, device=DEVICE)
-        ref[0] = jagged[0:13].float().sum(0)
-        ref[1] = jagged[13:25].float().sum(0)
-        torch.testing.assert_close(out, ref)
+        torch.testing.assert_close(
+            out, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
+        )
+
+    def test_reduction_access_in_nested_loop(self) -> None:
+        # The jagged loop slices nothing itself; its window comes from the nested loop.
+        @helion.kernel(backend="pallas")
+        def jagged_col_accum(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        rows = jagged[st, dt].to(torch.float32)
+                        out[g, dt] = out[g, dt] + rows.sum(0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        out = torch.zeros((2, 128), dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            jagged_col_accum,
+            (seq_offsets, jagged, out),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(
+            result, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
+        )
+
+    def test_reduction_access_below_conditional(self) -> None:
+        # The access is two graphs down: an if branch, then a nested column loop.
+        @helion.kernel(backend="pallas")
+        def jagged_conditional_accum(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    if e - s > 8:
+                        for dt in hl.tile(0, D):
+                            rows = jagged[st, dt].to(torch.float32)
+                            out[g, dt] = out[g, dt] + rows.sum(0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        out = torch.zeros((2, 128), dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(
+            jagged_conditional_accum,
+            (seq_offsets, jagged, out),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(
+            result, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
+        )
+
+    def test_reduction_remasks_after_pointwise(self) -> None:
+        # Over-read rows must be re-masked after the +1.0, or they leak into the sum.
+        @helion.kernel(backend="pallas")
+        def jagged_plus_one_sum(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((B, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for dt in hl.tile(0, D):
+                    acc = hl.zeros([dt], dtype=torch.float32)
+                    for st in hl.tile(s, e):
+                        rows = jagged[st, dt].to(torch.float32) + 1.0
+                        acc = acc + rows.sum(0)
+                    out[g, dt] = acc
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        _code, result = code_and_output(
+            jagged_plus_one_sum,
+            (seq_offsets, jagged),
+            block_sizes=[128, 16],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = _ref_jagged_row_sum(seq_offsets, jagged)
+        lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.float32)[:, None]
+        torch.testing.assert_close(result, expected + lengths, rtol=1e-2, atol=1e-2)
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedCarryRejects(TestCase):
+    """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
 
     @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
     def test_block_not_multiple_of_sublane_raises(self, kernel) -> None:
