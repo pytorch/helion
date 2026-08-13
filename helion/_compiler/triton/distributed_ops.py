@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from torch.fx.experimental.symbolic_shapes import guard_int
 
 from ... import exc
 from ...language import _decorators
@@ -33,12 +34,67 @@ _FLAT_PROGRAM_ID = (
 _NUM_PROGRAMS = "tl.num_programs(2) * tl.num_programs(1) * tl.num_programs(0)"
 # Values from NVSHMEM's nvshmemx_signal_op_t and nvshmem_cmp_t.
 _NVSHMEM_SIGNAL_ADD = 10
-_NVSHMEM_CMP_NE = 1
+
+
+def _remote_barrier_peers(state: CodegenState) -> list[ast.AST]:
+    proxy_device_ids = state.proxy_arg(0)
+    ast_device_ids = state.ast_args[0]
+    if isinstance(proxy_device_ids, list):
+        assert isinstance(ast_device_ids, list)
+        peers: list[ast.AST] = []
+        for proxy_peer, ast_peer in zip(proxy_device_ids, ast_device_ids, strict=True):
+            if isinstance(proxy_peer, torch.Tensor) and proxy_peer.ndim != 0:
+                raise exc.TypeInferenceError(
+                    "remote_barrier expects scalar peers in a Python list"
+                )
+            if isinstance(ast_peer, int):
+                ast_peer = expr_from_string(repr(ast_peer))
+            assert isinstance(ast_peer, ast.AST)
+            peers.append(ast_peer)
+        return peers
+    if isinstance(proxy_device_ids, int):
+        return [expr_from_string(repr(proxy_device_ids))]
+    if not isinstance(proxy_device_ids, torch.Tensor):
+        raise exc.TypeInferenceError(
+            "remote_barrier expects a logical peer, a 1-D peer tensor, or a list"
+        )
+    if not isinstance(ast_device_ids, ast.AST):
+        raise exc.InternalError(RuntimeError("remote_barrier has no device expression"))
+    if proxy_device_ids.ndim == 0:
+        return [ast_device_ids]
+    if proxy_device_ids.ndim != 1:
+        raise exc.TypeInferenceError(
+            "remote_barrier expects a scalar or statically sized 1-D peer tensor"
+        )
+    peer_count = guard_int(proxy_device_ids.shape[0])
+    physical_size = 1 << (peer_count - 1).bit_length() if peer_count else 1
+    return [
+        expr_from_string(
+            "tl.sum(tl.where("
+            f"tl.arange(0, {physical_size}) == {index}, "
+            "{device_ids}, 0))",
+            device_ids=ast_device_ids,
+        )
+        for index in range(peer_count)
+    ]
+
+
+def _reserve_remote_barrier_signal_slots(
+    device_fn: DeviceFunction,
+) -> tuple[str, int]:
+    signal_arg = device_fn.triton_remote_barrier_signal_arg
+    if signal_arg is None:
+        signal_arg = device_fn.new_var("remote_barrier_signal")
+        device_fn.wrapper_only_params.append(signal_arg)
+        device_fn.triton_remote_barrier_signal_arg = signal_arg
+    slot = device_fn.triton_remote_barrier_signal_slots
+    device_fn.triton_remote_barrier_signal_slots += 2
+    return signal_arg, slot
 
 
 @dataclass
 class _TritonRemoteCopyInfo:
-    start_statement: ast.stmt
+    start_statements: list[ast.stmt]
     signal: str | None
     source_materialization: list[ast.stmt]
 
@@ -65,10 +121,48 @@ def _product(values: list[str]) -> str:
 def _(state: CodegenState) -> ast.AST:
     from ..compile_environment import CompileEnvironment
 
+    peers = _remote_barrier_peers(state)
+    if not peers:
+        return expr_from_string("None")
     device_fn = state.device_function
     device_fn.requires_nvshmem = True
+    signal_arg, signal_slot = _reserve_remote_barrier_signal_slots(device_fn)
+    signals = [
+        device_fn.new_var("remote_barrier_signal", dce=False),
+        device_fn.new_var("remote_barrier_signal", dce=False),
+    ]
+    for phase, signal in enumerate(signals):
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{signal} = {signal_arg} + "
+                f"({signal_slot + phase}) * ({_NUM_PROGRAMS}) + "
+                f"({_FLAT_PROGRAM_ID})"
+            )
+        )
+    statements = [
+        statement_from_string("nvshmem.quiet()"),
+        statement_from_string("tl.debug_barrier()"),
+    ]
+    for signal in signals:
+        statements.extend(
+            statement_from_string(
+                "helion_dist_utils._publish_signal("
+                f"{signal}, tl.cast(1, tl.int64), {_NVSHMEM_SIGNAL_ADD}, "
+                "{peer}, nvshmem.my_pe())",
+                peer=peer,
+            )
+            for peer in peers
+        )
+        statements.append(
+            statement_from_string(
+                "helion_dist_utils._wait_and_consume_signal("
+                f"{signal}, tl.cast({len(peers)}, tl.int64))"
+            )
+        )
+    statements.append(statement_from_string("tl.debug_barrier()"))
+    for statement in statements:
+        state.codegen.add_statement(statement)
     CompileEnvironment.current().has_barrier = True
-    state.codegen.add_statement(statement_from_string("nvshmem.barrier_all()"))
     return expr_from_string("None")
 
 
@@ -158,6 +252,27 @@ def _region_ptr(
     )
 
 
+def _reserve_remote_copy_scratch(
+    state: CodegenState,
+    like: torch.Tensor,
+    max_numel: str,
+    host_max_numel: str,
+) -> str:
+    device_fn = state.device_function
+    scratch = device_fn.new_var("remote_copy_scratch")
+    device_fn.wrapper_only_params.append(scratch)
+    device_fn.triton_remote_copy_scratch_args.append(scratch)
+    try:
+        scratch_like = device_fn.tensor_arg(like).host_str()
+    except KeyError as error:
+        raise exc.BackendUnsupported(
+            "triton",
+            "remote-copy scratch requires a host-provided symmetric tensor",
+        ) from error
+    device_fn.triton_remote_copy_scratch_specs.append((scratch_like, host_max_numel))
+    return f"{scratch} + ({_FLAT_PROGRAM_ID}) * ({max_numel})"
+
+
 def _computed_source_scratch(
     state: CodegenState,
     src: torch.Tensor,
@@ -178,18 +293,12 @@ def _computed_source_scratch(
         )
     max_numel = _product(dst_region.max_sizes)
     host_max_numel = _product(dst_region.host_max_sizes)
-    scratch = device_fn.new_var("remote_copy_scratch")
-    device_fn.wrapper_only_params.append(scratch)
-    device_fn.triton_remote_copy_scratch_args.append(scratch)
-    try:
-        scratch_like = device_fn.tensor_arg(dst).host_str()
-    except KeyError as error:
-        raise exc.BackendUnsupported(
-            "triton",
-            "remote copies from computed values require a host-provided "
-            "symmetric destination tensor",
-        ) from error
-    device_fn.triton_remote_copy_scratch_specs.append((scratch_like, host_max_numel))
+    base = _reserve_remote_copy_scratch(
+        state,
+        dst,
+        max_numel,
+        host_max_numel,
+    )
 
     offset_terms: list[str] = []
     mask_terms: list[str] = []
@@ -201,10 +310,9 @@ def _computed_source_scratch(
         index = f"tl.reshape(tl.arange(0, {physical_size}), [{', '.join(index_shape)}])"
         stride = _product(dst_region.sizes[dim + 1 :])
         offset_terms.append(f"({index}) * ({stride})")
-        mask_terms.append(f"({index}) < ({logical_size})")
+        mask_terms.append(f"(({index}) < ({logical_size}))")
     offset = " + ".join(offset_terms) or "0"
     mask = " & ".join(mask_terms)
-    base = f"{scratch} + ({_FLAT_PROGRAM_ID}) * ({max_numel})"
     store = (
         f"tl.store({base} + ({offset}), {{src_value}}, mask={mask})"
         if mask
@@ -220,6 +328,10 @@ def _computed_source_scratch(
         statement_from_string("tl.debug_barrier()"),
     ]
     return base, dst_region.numel, materialization
+
+
+def _shares_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    return lhs.untyped_storage()._cdata == rhs.untyped_storage()._cdata
 
 
 def _has_receive_wait(node: torch.fx.Node) -> bool:
@@ -280,6 +392,7 @@ def _prepare_remote_copy(state: CodegenState) -> ast.AST:
             "remote-copy destinations must be host-provided symmetric tensors",
         ) from error
     source_materialization: list[ast.stmt] = []
+    src_region: _TritonRegion | None = None
     try:
         src_region = _region_ptr(
             state,
@@ -309,6 +422,30 @@ def _prepare_remote_copy(state: CodegenState) -> ast.AST:
         if src_is_tiled or dst_region.is_tiled
         else src_numel
     )
+    if signal_info is not None and src_region is not None and _shares_storage(src, dst):
+        # Peers may write the destination while this rank is still reading the
+        # same allocation. Snapshot every rank's source before any put begins.
+        scratch_src = _reserve_remote_copy_scratch(
+            state,
+            dst,
+            _product(src_region.max_sizes),
+            _product(src_region.host_max_sizes),
+        )
+        source_materialization.extend(
+            [
+                statement_from_string(
+                    f"nvshmem.get({scratch_src}, {src_ptr}, {numel}, nvshmem.my_pe())",
+                    **src_placeholders,
+                ),
+                statement_from_string("tl.debug_barrier()"),
+                statement_from_string("nvshmem.sync_all()"),
+            ]
+        )
+        src_ptr = scratch_src
+        src_placeholders = {}
+        from ..compile_environment import CompileEnvironment
+
+        CompileEnvironment.current().has_barrier = True
     device_id = state.ast_args[2]
     if isinstance(device_id, int):
         device_id = expr_from_string(repr(device_id))
@@ -327,25 +464,30 @@ def _prepare_remote_copy(state: CodegenState) -> ast.AST:
                 f"({signal_slot}) * ({_NUM_PROGRAMS}) + ({_FLAT_PROGRAM_ID})"
             )
         )
-        start_statement = statement_from_string(
-            "nvshmem.putmem_signal_block("
-            f"{dst_region.pointer}, {src_ptr}, "
-            f"tl.cast(({numel}) * {src.element_size()}, tl.int64), "
-            f"{signal_name}, tl.cast(1, tl.uint64), "
-            f"{_NVSHMEM_SIGNAL_ADD}, {{device_id}})",
-            device_id=device_id,
-            **src_placeholders,
-            **dst_region.placeholders,
-        )
+        start_statements = [
+            statement_from_string(
+                "helion_dist_utils._nvshmem_put_signal_nbi_block("
+                f"{dst_region.pointer}, {src_ptr}, {numel}, {signal_name}, "
+                f"tl.cast(1, tl.uint64), {_NVSHMEM_SIGNAL_ADD}, {{device_id}}, "
+                "nvshmem.my_pe())",
+                device_id=device_id,
+                **src_placeholders,
+                **dst_region.placeholders,
+            )
+        ]
     else:
-        start_statement = statement_from_string(
-            f"nvshmem.put({dst_region.pointer}, {src_ptr}, {numel}, {{device_id}})",
-            device_id=device_id,
-            **src_placeholders,
-            **dst_region.placeholders,
-        )
+        start_statements = [
+            statement_from_string(
+                "helion_dist_utils._nvshmem_put_nbi_block("
+                f"{dst_region.pointer}, {src_ptr}, {numel}, {{device_id}}, "
+                "nvshmem.my_pe())",
+                device_id=device_id,
+                **src_placeholders,
+                **dst_region.placeholders,
+            )
+        ]
     device_fn.remote_copy_descriptors[descriptor_id] = _TritonRemoteCopyInfo(
-        start_statement=start_statement,
+        start_statements=start_statements,
         signal=signal_name,
         source_materialization=source_materialization,
     )
@@ -385,27 +527,23 @@ def _emit_statements(
 @_decorators.codegen(start_async_remote_copy_descriptor, "triton")
 def _(state: CodegenState) -> ast.AST:
     info = _paired_copy_info(state)
-    return _emit_statements(state, [*info.source_materialization, info.start_statement])
+    return _emit_statements(
+        state, [*info.source_materialization, *info.start_statements]
+    )
 
 
-def _paired_signal(state: CodegenState) -> str:
-    signal = _paired_copy_info(state).signal
+def _receive_wait_statements(state: CodegenState) -> list[ast.stmt]:
+    info = _paired_copy_info(state)
+    signal = info.signal
     if not isinstance(signal, str):
         raise exc.InternalError(
             RuntimeError("remote-copy receive wait could not resolve its signal")
         )
-    return signal
-
-
-def _receive_wait_statements(state: CodegenState) -> list[ast.stmt]:
-    signal = _paired_signal(state)
     return [
         statement_from_string(
-            f"nvshmem.signal_wait_until({signal}, {_NVSHMEM_CMP_NE}, 0)"
-        ),
-        statement_from_string(
-            f"tl.atomic_add({signal}, -1, sem='relaxed', scope='sys')"
-        ),
+            "helion_dist_utils._wait_and_consume_signal("
+            f"{signal}, tl.cast(1, tl.int64))"
+        )
     ]
 
 

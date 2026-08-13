@@ -194,6 +194,7 @@ def _ordered_reused_descriptor_pipeline_copy(
     src: torch.Tensor,
     dst: torch.Tensor,
     peers: torch.Tensor,
+    gate_src: torch.Tensor,
     gate: torch.Tensor,
     rank: torch.Tensor,
 ) -> torch.Tensor:
@@ -201,10 +202,13 @@ def _ordered_reused_descriptor_pipeline_copy(
     num_steps = hl.specialize(src.size(1))
     for _program in hl.grid(1):
         hl.remote_barrier(peers[0, :])
+        # This one-way control message is not a balanced in-place transfer.
         gate_copy = hl.make_async_remote_copy(
-            gate,
+            gate_src,
             [0],
             peers[0, 0],
+            dst=gate,
+            dst_index=[0],
         )
         # Ranks 1-3 advance the ring while rank 0 waits. Rank 3 releases the
         # gate only after its second put into rank 0's reused completion slot.
@@ -425,6 +429,22 @@ def _pipelined_remote_hbm_consume(
     return output
 
 
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _peer_scoped_remote_barrier(
+    peers: torch.Tensor,
+    output: torch.Tensor,
+    GROUP_NAME: hl.ProcessGroupName,
+) -> torch.Tensor:
+    for _program in hl.grid(1):
+        for step in hl.tile(2, block_size=1):
+            hl.remote_barrier(peers[0, 0])
+            output[step] = 1
+    return output
+
+
 @unittest.skipUnless(
     torch.version.cuda is not None and torch.cuda.device_count() >= 4,
     "requires four NVIDIA CUDA devices",
@@ -555,6 +575,7 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
         src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
         src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
         dst = self._make_symmetric_buffer(src.shape)
+        gate_src = torch.full((1,), self.rank, dtype=torch.float32, device=self.device)
         gate = self._make_symmetric_buffer((1,))
         gate.fill_(self.rank)
         peers = torch.tensor(
@@ -575,7 +596,7 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             dst.fill_(-1)
             dist.barrier()
             result = _ordered_reused_descriptor_pipeline_copy(
-                src, dst, peers, gate, rank
+                src, dst, peers, gate_src, gate, rank
             )
             torch.cuda.synchronize()
             torch.testing.assert_close(result[0], expected)
@@ -786,6 +807,36 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             result = _pipelined_remote_hbm_consume(src, dst, output, peers, ranks)
             torch.cuda.synchronize()
             torch.testing.assert_close(result[0], expected)
+
+    def test_remote_barrier_is_peer_scoped(self) -> None:
+        store = self._init_process()
+        group = dist.group.WORLD
+        assert group is not None
+        peers = torch.tensor(
+            [[self.rank ^ 1]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        output = torch.zeros(2, dtype=torch.int32, device=self.device)
+
+        # Warm compilation and compiler-owned symmetric barrier storage while
+        # every rank is participating.
+        result = _peer_scoped_remote_barrier(peers, output, group.group_name)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.ones_like(result))
+        dist.barrier()
+
+        output.zero_()
+        if self.rank < 2:
+            result = _peer_scoped_remote_barrier(peers, output, group.group_name)
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                store.set("first_pair_completed", "1")
+        else:
+            store.wait(["first_pair_completed"])
+            result = _peer_scoped_remote_barrier(peers, output, group.group_name)
+            torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.ones_like(result))
 
 
 @onlyBackends(["pallas"])

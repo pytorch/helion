@@ -80,10 +80,10 @@ def remote_barrier(
 
     ``device_ids`` may be one logical peer, a one-dimensional tensor of peers,
     or a Python list. Every rank must name each peer with which it communicates.
-    Pallas statically unrolls one-dimensional peer tensors and uses a two-phase
-    neighbor barrier so a fast rank cannot enter the next invocation on a
-    reused collective ID while a peer is still finishing the prior one.
-    Triton/NVSHMEM currently strengthens this to a world barrier.
+    Both backends use a two-phase neighbor barrier so a fast rank cannot enter
+    the next invocation on a reused completion slot while a peer is still
+    finishing the prior one. Pallas statically unrolls peer tensors; Triton
+    exchanges counted NVSHMEM signals with the listed peers.
 
     Pallas derives a stable best-effort collective ID from the kernel definition.
     Kernels whose runtime communication groups are incompatible despite sharing

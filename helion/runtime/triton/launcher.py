@@ -164,6 +164,8 @@ def default_launcher(
     _remote_copy_signal_dst: torch.Tensor | None = None,
     _remote_copy_signal_slots_per_program: int = 0,
     _remote_copy_process_group_name: str | None = None,
+    _remote_barrier_signal_slots_per_program: int = 0,
+    _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -184,6 +186,17 @@ def default_launcher(
         )
         # Allocation zeroes new pads and receive waits reset consumed slots.
         # Clearing here could erase a completion sent before this rank launches.
+        args = (*args, signal)
+    if _remote_barrier_signal_slots_per_program:
+        if _remote_barrier_process_group_name is None:
+            raise RuntimeError(
+                "remote-barrier completion storage requires a process group"
+            )
+        signal = _get_remote_barrier_signal(
+            triton_kernel,
+            _remote_barrier_process_group_name,
+            math.prod(grid) * _remote_barrier_signal_slots_per_program,
+        )
         args = (*args, signal)
     for slot, (scratch_like, numel_per_program) in enumerate(
         _remote_copy_scratch_specs
@@ -249,6 +262,39 @@ def _get_remote_copy_signal(
         )
     # Reserve from the end so Helion's slots do not overlap PyTorch's standard
     # low-offset signal-pad protocols.
+    return signal_pad.narrow(0, capacity - required_slots, required_slots)
+
+
+def _get_remote_barrier_signal(
+    triton_kernel: object,
+    process_group_name: str,
+    required_slots: int,
+) -> torch.Tensor:
+    """Return compiler-owned peer-barrier counters from a group workspace."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    cache = vars(triton_kernel).setdefault("_helion_remote_barrier_signal_cache", {})
+    key = (device, process_group_name)
+    entry = cache.get(key)
+    if entry is None:
+        workspace = symm_mem.empty(1, dtype=torch.uint8, device=device)
+        handle = symm_mem.rendezvous(
+            workspace,
+            group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+        )
+        cache[key] = (workspace, handle)
+    else:
+        _, handle = entry
+    signal_pad = handle.get_signal_pad(handle.rank, dtype=torch.int64)
+    capacity = signal_pad.numel()
+    if required_slots > capacity:
+        raise RuntimeError(
+            "Helion remote barriers require "
+            f"{required_slots} int64 completion slots, but the symmetric-memory "
+            f"signal pad has capacity {capacity}. Increase the signal pad size "
+            "before launching the kernel."
+        )
     return signal_pad.narrow(0, capacity - required_slots, required_slots)
 
 

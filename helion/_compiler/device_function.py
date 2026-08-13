@@ -344,6 +344,10 @@ class DeviceFunction:
         self.triton_remote_copy_signal_arg: str | None = None
         self.triton_remote_copy_signal_dst: str | None = None
         self.triton_remote_copy_signal_slots = 0
+        # Triton peer barriers use a separate compiler-owned symmetric signal
+        # pad because they do not necessarily have a remote-copy destination.
+        self.triton_remote_barrier_signal_arg: str | None = None
+        self.triton_remote_barrier_signal_slots = 0
         # NVSHMEM takes pointer sources. Computed Triton tiles are materialized
         # into compiler-owned global scratch before the transfer starts.
         self.triton_remote_copy_scratch_args: list[str] = []
@@ -907,11 +911,15 @@ class DeviceFunction:
         remote_copy_params = set(self.triton_remote_copy_scratch_args)
         if self.triton_remote_copy_signal_arg is not None:
             remote_copy_params.add(self.triton_remote_copy_signal_arg)
+        if self.triton_remote_barrier_signal_arg is not None:
+            remote_copy_params.add(self.triton_remote_barrier_signal_arg)
         wrapper_only_params = [
             name for name in self.wrapper_only_params if name not in remote_copy_params
         ]
         if self.triton_remote_copy_signal_arg is not None:
             wrapper_only_params.append(self.triton_remote_copy_signal_arg)
+        if self.triton_remote_barrier_signal_arg is not None:
+            wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
         args.extend(create_arg(name) for name in wrapper_only_params)
 

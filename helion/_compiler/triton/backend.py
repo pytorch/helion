@@ -385,6 +385,7 @@ class TritonBackend(Backend):
             "triton_helpers": "from torch._inductor.runtime import triton_helpers",
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
+            "helion_dist_utils": "from helion.runtime import dist_utils as helion_dist_utils",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
@@ -542,6 +543,18 @@ class TritonBackend(Backend):
                     f"_remote_copy_signal_dst={signal_dst}",
                     f"_remote_copy_signal_slots_per_program={device_fn.triton_remote_copy_signal_slots}",
                     f"_remote_copy_process_group_name={process_group_name!r}",
+                ]
+            )
+        if device_fn.triton_remote_barrier_signal_slots:
+            process_group_name = CompileEnvironment.current().process_group_name
+            if process_group_name is None:
+                raise exc.BackendUnsupported(
+                    "triton", "remote barriers require an active process group"
+                )
+            out.extend(
+                [
+                    f"_remote_barrier_signal_slots_per_program={device_fn.triton_remote_barrier_signal_slots}",
+                    f"_remote_barrier_process_group_name={process_group_name!r}",
                 ]
             )
         if device_fn.triton_remote_copy_scratch_specs:
