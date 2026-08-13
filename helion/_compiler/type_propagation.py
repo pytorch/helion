@@ -690,9 +690,12 @@ class TypePropagation(ast.NodeVisitor):
             result = self._bool_op(ast.And(), result, new_result)
         active_nodes = ExtendedAST.current()
         if (
+            # Only the asserted test itself, at function scope and before the
+            # first kernel launch, is guaranteed to dominate that launch.
             self.device_loop_count == 0
             and len(active_nodes) == 2
             and isinstance(active_nodes[0], ast.Assert)
+            and active_nodes[0].test is node
             and all(isinstance(op, ast.Eq) for op in node.ops)
         ):
             for left, right in itertools.pairwise(comparators):

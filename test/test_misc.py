@@ -596,7 +596,11 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel, (a, b))
         torch.testing.assert_close(result, a + b + sum(b.shape))
 
-        if not static_shapes and _get_backend() == "triton":
+        if (
+            not static_shapes
+            and _get_backend() == "triton"
+            and not self._in_ref_eager_mode
+        ):
             self.assertIn("a_size_0", code)
             self.assertNotIn("b_size_", code)
             bound = kernel.bind((a, b))
@@ -607,21 +611,28 @@ class TestMisc(RefEagerTestBase, TestCase):
     def test_size_assert_unifies_symbols(self):
         @helion.kernel(static_shapes=False)
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            assert a.size(0) == b.size(1)
+            # Equality expressions in messages and nested asserts must not unify.
+            assert a.size(0) == b.size(1), a.size(1) == b.size(0)
+            if a.size(0) > 0:
+                assert a.size(1) == b.size(0)
             out = torch.empty_like(a)
 
             for tile in hl.tile((b.size(1), a.size(1))):
-                out[tile] = a[tile] + a.size(0) + b.size(1)
+                out[tile] = a[tile] + a.size(0) + b.size(0) + b.size(1)
             return out
 
         a = torch.randn(16, 8, device=DEVICE)
-        b = torch.randn(4, 16, device=DEVICE)
+        b = torch.randn(8, 16, device=DEVICE)
         code, result = code_and_output(kernel, (a, b), block_size=[8, 8])
-        torch.testing.assert_close(result, a + a.size(0) + b.size(1))
+        torch.testing.assert_close(
+            result,
+            a + a.size(0) + b.size(0) + b.size(1),
+        )
 
         if _get_backend() == "triton":
             self.assertIn("a_size_0", code)
             self.assertNotIn("b_size_1", code)
+            self.assertIn("b_size_0", code)
 
     @skipIfRefEager("no code execution")
     def test_triton_repro_add(self):
