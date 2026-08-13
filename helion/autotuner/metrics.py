@@ -81,6 +81,7 @@ _CODEGEN_SETTINGS: tuple[str, ...] = (
     "dot_precision",
     "fast_math",
     "index_dtype",
+    "pallas_collective_id",
     "pallas_interpret",
     "pallas_topk_recall_target",
     "persistent_reserved_sms",

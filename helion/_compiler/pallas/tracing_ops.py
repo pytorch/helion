@@ -2600,7 +2600,19 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # sliced via pl.ds against a VMEM ref whose extent is the whole
     # outer-block window.  Pipelined tensors ignore these offsets and
     # use the ``:`` full-slice inside their VMEM scratches.
-    any_non_pipelined = len(pipelined_tensor_ids) < len(all_tensor_info)
+    from ...language.distributed_ops import make_async_remote_copy
+
+    uses_remote_copy = any(
+        node.op == "call_function" and node.target is make_async_remote_copy
+        for node in graph_info.graph.nodes
+    )
+
+    # Remote HBM refs have no BlockSpec to apply an inner-loop tile offset.
+    # Materialize absolute offsets even when every ordinary load/store tensor
+    # is streamed, so distributed_ops can address the correct HBM tile.
+    any_non_pipelined = (
+        len(pipelined_tensor_ids) < len(all_tensor_info) or uses_remote_copy
+    )
     if any_non_pipelined:
         _needs_explicit_indices = True
         for i, bid in enumerate(block_ids):
@@ -2842,6 +2854,33 @@ def _compute_vmem_shapes(
     return vmem_shapes
 
 
+def _runtime_vmem_shape_sources(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> tuple[tuple[torch.Tensor, int] | None, ...]:
+    """Map untiled full-slice scratch dimensions back to runtime inputs.
+
+    Tiling analysis uses concrete hint values for alignment and planning. The
+    launch-time scratch allocation must still follow untiled runtime dimensions
+    when ``static_shapes=False``.
+    """
+    from helion._utils import is_scalar_index
+
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    tensor_subscripts = _tensor_dim_subscripts(sub_meta)
+    result: list[tuple[torch.Tensor, int] | None] = []
+    for dim in range(fake.ndim):
+        bid = dim_to_bid.get(dim)
+        idx_meta = _subscript_at_dim(tensor_subscripts, dim)
+        if bid is None and not is_scalar_index(idx_meta):
+            result.append((fake, dim))
+        else:
+            result.append(None)
+    return tuple(result)
+
+
 def _classify_pipelined_tensors(
     loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
     stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
@@ -2919,6 +2958,15 @@ def _classify_pipelined_tensors(
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        if state.device_function.is_pallas_remote_copy_operand(fake) and not set(
+            dim_to_bid.values()
+        ).intersection(block_ids):
+            # A loop-invariant remote-copy operand must keep one stable address.
+            # Streaming it would select a different VMEM pipeline generation
+            # on each iteration. Ordinary tensors retain the existing pipeline
+            # classification below.
+            continue
         if not _can_stream_inner_tile(
             fake, sub_meta, direction, block_ids, vmem_shape, env, state
         ):
@@ -3246,10 +3294,18 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             resource_cache.get(resource_key) if resource_cache is not None else None
         )
         if cached_resource is None:
+            shape_sources = (
+                _runtime_vmem_shape_sources(fake, sub_meta, block_ids, env)
+                if state.device_function.is_pallas_remote_copy_operand(fake)
+                else None
+            )
             vmem_name = state.device_function.register_scratch(
                 (load_buffer_count, *vmem_shape) if uses_load_prefetch else vmem_shape,
                 fake.dtype,
                 name_hint=hbm_name.replace("_hbm", "") + "_buf",
+                shape_sources=(None, *shape_sources)
+                if uses_load_prefetch and shape_sources is not None
+                else shape_sources,
             )
             sem_name = state.device_function.register_dma_semaphore(
                 name_hint=hbm_name.replace("_hbm", "") + "_sem",
