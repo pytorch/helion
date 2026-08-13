@@ -5,7 +5,9 @@ import contextlib
 import dataclasses
 import operator
 import re
+import tempfile
 from types import SimpleNamespace
+from typing import Any
 from typing import Sequence
 from typing import cast
 import unittest
@@ -80,6 +82,11 @@ from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
+from helion._compiler.cute.fragment_epilogue import _add
+from helion._compiler.cute.fragment_epilogue import _floordiv
+from helion._compiler.cute.fragment_epilogue import _Index
+from helion._compiler.cute.fragment_epilogue import _mod
+from helion._compiler.cute.fragment_epilogue import _mul
 from helion._compiler.cute.indexing import CutePackedAffineLoad
 from helion._compiler.cute.indexing import CutePackedTerms
 from helion._compiler.cute.indexing import CuteShapeChainView
@@ -425,6 +432,208 @@ def cute_matmul_role_local_monolithic_bias_relu_bf16(
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = torch.relu(acc + bias[tile_n]).to(x.dtype)
     return out
+
+
+@helion.kernel(backend="cute")
+def cute_projection_rotary_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    table: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_h, tile_k, tile_d],
+                acc=acc,
+            )
+        bias_tile = bias[tile_h.index[:, None], tile_d.index[None, :]]
+        acc = acc + bias_tile[:, None, :]
+        table_tile = table[tile_m, tile_d]
+        table_pairs = table_tile.view(
+            tile_m.block_size, 2, tile_d.block_size // 2
+        ).permute(0, 2, 1)
+        left, right = hl.split(table_pairs)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        x0, x1 = hl.split(pairs)
+        perpendicular = hl.join(-x1, x0)
+        result = (
+            pairs * right[None, :, :, None] + perpendicular * left[None, :, :, None]
+        )
+        out[tile_h, tile_m, tile_d] = result.view(
+            tile_h.block_size, tile_m.block_size, tile_d.block_size
+        ).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_pair_butterfly_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """A generic pair-local transform unrelated to rotary embeddings."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        low, high = hl.split(pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(low + high, low - high)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_cross_pair_swap_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """A reshape transform that is deliberately not register-pair-local."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        halves = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            2,
+            tile_d.block_size // 2,
+        ).permute(0, 1, 3, 2)
+        low, high = hl.split(halves)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(high, low)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_pair_column_major_output_bf16(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """A valid pair transform stored through a column-major output view."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    base = torch.empty([d, m, h], dtype=x.dtype, device=x.device)
+    out = base.permute(2, 1, 0)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        low, high = hl.split(pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(low + high, low - high)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_mixed_pair_plain_bf16(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pair-local and ordinary MMAs in separate K loops under one root."""
+    m, k = x1.size()
+    h, _, d = weight1.size()
+    pair_out = torch.empty([h, m, d], dtype=x1.dtype, device=x1.device)
+    plain_out = torch.empty_like(pair_out)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        pair_acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k1 in hl.tile(k):
+            pair_acc = hl.dot(
+                x1[tile_m, tile_k1],
+                weight1[tile_h, tile_k1, tile_d],
+                acc=pair_acc,
+            )
+        pairs = pair_acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        low, high = hl.split(pairs)
+        pair_out[tile_h, tile_m, tile_d] = (
+            hl.join(low + high, low - high)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x1.dtype)
+        )
+
+        plain_acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k2 in hl.tile(k):
+            plain_acc = hl.dot(
+                x2[tile_m, tile_k2],
+                weight2[tile_h, tile_k2, tile_d],
+                acc=plain_acc,
+            )
+        plain_out[tile_h, tile_m, tile_d] = plain_acc.to(x1.dtype)
+    return pair_out, plain_out
+
+
+@helion.kernel(backend="cute")
+def cute_pair_plus_f32_mma(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A pair candidate plus a decoded MMA outside tcgen05 search."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    m2, k2 = a.size()
+    _, n2 = b.size()
+    pair_out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    f32_out = torch.empty([m2, n2], dtype=a.dtype, device=a.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        low, high = hl.split(pairs)
+        pair_out[tile_h, tile_m, tile_d] = (
+            hl.join(low + high, low - high)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    for tile_m2, tile_n2 in hl.tile([m2, n2]):
+        f32_acc = hl.zeros([tile_m2, tile_n2], dtype=torch.float32)
+        for tile_k2 in hl.tile(k2):
+            f32_acc = hl.dot(a[tile_m2, tile_k2], b[tile_k2, tile_n2], acc=f32_acc)
+        f32_out[tile_m2, tile_n2] = f32_acc
+    return pair_out, f32_out
 
 
 class _FakeBlockSize:
@@ -8066,6 +8275,8 @@ class TestCuteLowerings(unittest.TestCase):
         )
         bound.set_config(cfg)
         with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch.dict("os.environ", {"CUTE_DSL_CACHE_DIR": cache_dir}, clear=False),
             patch(
                 "cutlass.cute.arch.fma_packed_f32x2",
                 wraps=cute.arch.fma_packed_f32x2,
@@ -15064,6 +15275,299 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
                 "(mask_1)",
             )
+
+    def test_tcgen05_pair_index_compiler_matches_sympy(self) -> None:
+        row = _Index.variable("row", 3)
+        pair = _Index.variable("pair", 4)
+        numerator = _add(_add(_mul(row, -3), _mul(pair, 5)), -1)
+        expression = _mod(_floordiv(numerator, 2), 7)
+        evaluate = expression.compile()
+
+        rendered = expression.render({"row": "row", "pair": "pair"})
+        self.assertIn("//", rendered)
+        self.assertIn("%", rendered)
+        for row_value in range(4):
+            for pair_value in range(5):
+                variables = {"row": row_value, "pair": pair_value}
+                substitutions = {
+                    symbol: variables[str(symbol)]
+                    for symbol, _lower, _upper in expression.bounds
+                }
+                expected = int(
+                    cast("sympy.Integer", expression.semantic.subs(substitutions))
+                )
+                self.assertEqual(evaluate(variables), expected)
+
+    def test_tcgen05_pair_plan_rejection_is_memoized_per_tile_shape(self) -> None:
+        from helion._compiler.cute import cute_mma as cute_mma_module
+
+        graph = Graph()
+        anchor = graph.placeholder("mma")
+        fn = cast(
+            "Any",
+            SimpleNamespace(
+                cute_state=CuteDeviceFunctionState(),
+                codegen=SimpleNamespace(codegen_graphs=[SimpleNamespace(graph=graph)]),
+            ),
+        )
+        candidate = cast(
+            "Any",
+            SimpleNamespace(
+                requires_pair_epilogue=True,
+                operands=SimpleNamespace(output_block_ids=()),
+            ),
+        )
+        config = cast("Any", {})
+
+        with (
+            patch.object(
+                cute_mma_module, "_decode_cute_mma_target", return_value=object()
+            ),
+            patch.object(
+                cute_mma_module,
+                "_tcgen05_pair_epilogue_operands_supported",
+                return_value=True,
+            ),
+            patch.object(
+                cute_mma_module, "_mma_tiles_are_static_full", return_value=True
+            ),
+            patch.object(
+                cute_mma_module,
+                "analyze_tcgen05_pair_epilogue_plan",
+                return_value=None,
+            ) as analyze,
+        ):
+            for bn in (64, 64, 128):
+                self.assertFalse(
+                    cute_mma_module.ensure_tcgen05_pair_epilogue_plan(
+                        fn,
+                        anchor,
+                        candidate,
+                        bm=128,
+                        bn=bn,
+                        bk=32,
+                        config=config,
+                    )
+                )
+
+        self.assertEqual(analyze.call_count, 2)
+
+    def test_tcgen05_pair_fragment_projection_rotary_codegen(self) -> None:
+        dtype = torch.bfloat16
+        x = torch.empty([128, 128], device=DEVICE, dtype=dtype)
+        for head_dim in (64, 128):
+            with self.subTest(head_dim=head_dim), patch_cute_mma_support():
+                args = (
+                    x,
+                    torch.empty([1, 128, head_dim], device=DEVICE, dtype=dtype),
+                    torch.empty([128, head_dim], device=DEVICE, dtype=dtype),
+                    torch.empty([1, head_dim], device=DEVICE, dtype=dtype),
+                )
+                config = _make_tcgen05_persistent_config(
+                    block_sizes=[1, 128, head_dim, 32],
+                    loop_orders=[[0, 1, 2]],
+                    pid_type="persistent_interleaved",
+                )
+                bound = cute_projection_rotary_bf16.bind(args)
+                self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+                bound.set_config(config)
+                code = bound.to_triton_code(config)
+                self.assertEqual(code.count("for tcgen05_epi_pair"), 1)
+                self.assertEqual(
+                    len(
+                        re.findall(
+                            r"^\s*tcgen05_epi_load_\d+ = ",
+                            code,
+                            flags=re.MULTILINE,
+                        )
+                    ),
+                    4,
+                )
+                self.assertNotIn("split_smem", code)
+                self.assertNotIn("permute_smem", code)
+
+    def test_tcgen05_pair_fragment_projection_rotary_runtime(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        torch.manual_seed(0)
+        dtype = torch.bfloat16
+        heads, m, k = 2, 256, 128
+        x = torch.randn([m, k], device=DEVICE, dtype=dtype)
+        for head_dim in (64, 128):
+            with self.subTest(head_dim=head_dim), patch_cute_mma_support():
+                weight = torch.randn([heads, k, head_dim], device=DEVICE, dtype=dtype)
+                table = torch.randn([m, head_dim], device=DEVICE, dtype=dtype)
+                bias = torch.randn([heads, head_dim], device=DEVICE, dtype=dtype)
+                args = (x, weight, table, bias)
+                config = _make_tcgen05_persistent_config(
+                    block_sizes=[1, 128, head_dim, 32],
+                    loop_orders=[[0, 1, 2]],
+                    pid_type="persistent_interleaved",
+                )
+                bound = cute_projection_rotary_bf16.bind(args)
+                bound.env.config_spec.cute_tcgen05_search_enabled = True
+                bound.set_config(config)
+                actual = bound(*args)
+
+                acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
+                pairs = (acc + bias.float()[:, None, :]).view(
+                    heads, m, head_dim // 2, 2
+                )
+                left, right = (
+                    table.float().view(m, 2, head_dim // 2).permute(0, 2, 1)
+                ).unbind(-1)
+                expected = torch.stack(
+                    (
+                        pairs[..., 0] * right - pairs[..., 1] * left,
+                        pairs[..., 1] * right + pairs[..., 0] * left,
+                    ),
+                    dim=-1,
+                ).view(heads, m, head_dim)
+                torch.testing.assert_close(
+                    actual, expected.to(dtype), atol=0.1, rtol=1e-2
+                )
+
+    def test_tcgen05_pair_fragment_is_generic_and_locality_checked(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        torch.manual_seed(1)
+        dtype = torch.bfloat16
+        x = torch.randn([128, 64], device=DEVICE, dtype=dtype)
+        weight = torch.randn([1, 64, 64], device=DEVICE, dtype=dtype)
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 64, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
+        with patch_cute_mma_support():
+            bound = cute_pair_butterfly_bf16.bind((x, weight))
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(config)
+            self.assertIn("for tcgen05_epi_pair", bound.to_triton_code(config))
+            actual = bound(x, weight)
+
+            rejected = cute_cross_pair_swap_bf16.bind((x, weight))
+            self.assertFalse(rejected.config_spec.cute_tcgen05_search_enabled)
+            rejected.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "pair epilogue locality proof rejected"
+            ):
+                rejected.to_triton_code(config)
+        pairs = torch.einsum("mk,hkd->hmd", x.float(), weight.float()).view(
+            1, 128, 32, 2
+        )
+        expected = torch.stack(
+            (pairs[..., 0] + pairs[..., 1], pairs[..., 0] - pairs[..., 1]), dim=-1
+        ).view(1, 128, 64)
+        torch.testing.assert_close(actual, expected.to(dtype), atol=0.5, rtol=2e-2)
+
+    def test_tcgen05_pair_fragment_mixed_mma_is_rejected_atomically(self) -> None:
+        dtype = torch.bfloat16
+        args = (
+            torch.empty([128, 64], device=DEVICE, dtype=dtype),
+            torch.empty([128, 64], device=DEVICE, dtype=dtype),
+            torch.empty([1, 64, 64], device=DEVICE, dtype=dtype),
+            torch.empty([1, 64, 64], device=DEVICE, dtype=dtype),
+        )
+        with patch_cute_mma_support():
+            bound = cute_mixed_pair_plain_bf16.bind(args)
+            self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            for pid_type in ("flat", "persistent_interleaved"):
+                config = _make_tcgen05_persistent_config(
+                    block_sizes=[1, 128, 64, 32, 32],
+                    loop_orders=[[0, 1, 2]],
+                    pid_type=pid_type,
+                )
+                with (
+                    self.subTest(pid_type=pid_type),
+                    self.assertRaisesRegex(
+                        exc.BackendUnsupported,
+                        "pair epilogue requires a unique MMA",
+                    ),
+                ):
+                    bound.to_triton_code(config)
+
+    def test_tcgen05_pair_fragment_mixed_ineligible_mma_disables_search(self) -> None:
+        args = (
+            torch.empty([128, 64], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1, 64, 64], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 64], device=DEVICE, dtype=torch.float32),
+            torch.empty([64, 64], device=DEVICE, dtype=torch.float32),
+        )
+        with patch_cute_mma_support():
+            bound = cute_pair_plus_f32_mma.bind(args)
+        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+
+    def test_tcgen05_pair_fragment_rejects_unplanned_search_tiles(self) -> None:
+        args = (
+            torch.empty([128, 64], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1, 64, 64], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_pair_butterfly_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            for block_sizes in (
+                [1, 64, 64, 32],
+                [1, 128, 32, 32],
+                [1, 64, 32, 32],
+                [1, 128, 8, 32],
+            ):
+                config = _make_tcgen05_persistent_config(
+                    block_sizes=block_sizes,
+                    loop_orders=[[0, 1, 2]],
+                    pid_type="flat",
+                )
+                with (
+                    self.subTest(block_sizes=block_sizes),
+                    self.assertRaisesRegex(
+                        exc.BackendUnsupported,
+                        "pair epilogue locality proof rejected",
+                    ),
+                ):
+                    bound.to_triton_code(config)
+
+    def test_tcgen05_pair_fragment_column_major_output_disables_search(self) -> None:
+        args = (
+            torch.empty([128, 64], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1, 64, 64], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_pair_column_major_output_bf16.bind(args)
+        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+
+    def test_tcgen05_pair_fragment_rejects_explicit_epilogue_layout(self) -> None:
+        dtype = torch.bfloat16
+        args = (
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([1, 128, 64], device=DEVICE, dtype=dtype),
+            torch.empty([128, 64], device=DEVICE, dtype=dtype),
+            torch.empty([1, 64], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 64, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="flat",
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 64,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 64,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 64,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_projection_rotary_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "pair epilogue locality proof rejected"
+            ):
+                bound.to_triton_code(config)
 
 
 @onlyBackends(["cute"])
