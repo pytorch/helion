@@ -24,7 +24,6 @@ verified standalone sequence.
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable
 import dataclasses
 import itertools
 import math
@@ -5223,7 +5222,6 @@ def flash_config_from_config(
 
 
 if TYPE_CHECKING:
-    from ...autotuner.config_fragment import ConfigSpecFragment
     from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST

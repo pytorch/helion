@@ -263,6 +263,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import analyze_cute_mma_node
+    from .cute_mma import ensure_tcgen05_pair_epilogue_plan
 
     if _detect_grouped_rank3_specialized_mma_loop(
         fn,
@@ -291,11 +292,11 @@ def _detect_specialized_mma_loop(
                 and candidate.operands.k_block_id == block_ids[0]
                 and _specialized_mma_root_mn_block_ids(candidate, config) is not None
             ):
-                candidates.append(candidate)
+                candidates.append((node, candidate))
     if not candidates:
         return False
 
-    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0], config)
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(candidates[0][1], config)
     assert root_mn_block_ids is not None
     root_layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
     if root_layout is None:
@@ -305,15 +306,15 @@ def _detect_specialized_mma_loop(
     if not isinstance(bk, int):
         return False
     candidates = [
-        candidate
-        for candidate in candidates
+        (node, candidate)
+        for node, candidate in candidates
         if not candidate.operands.has_leading_passthrough
         or _mma_tiles_are_static_full(candidate.operands, bm=bm, bn=bn, bk=bk)
     ]
     if not candidates:
         return False
 
-    for candidate in candidates:
+    for node, candidate in candidates:
         lhs_val = candidate.operands.lhs.source_fake
         mma_impl = _choose_mma_impl(
             lhs_val.dtype,
@@ -340,6 +341,16 @@ def _detect_specialized_mma_loop(
             root_m_threads=root_m_threads,
             root_n_threads=root_n_threads,
         ):
+            if mma_impl == "tcgen05" and not ensure_tcgen05_pair_epilogue_plan(
+                fn,
+                node,
+                candidate,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                config=config,
+            ):
+                continue
             return True
     return False
 

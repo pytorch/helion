@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .fragment_epilogue import Tcgen05PairEpiloguePlan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -437,6 +438,14 @@ class CuteDeviceFunctionState:
         # registered under this result var, even when user-visible names were
         # renamed through casts or epilogue nodes.
         self.matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
+        self._pair_epilogue_plan: Tcgen05PairEpiloguePlan | None = None
+        # Rejected proofs are stable for this per-config codegen state. Keep
+        # the tile shape in the key so callers cannot accidentally reuse a
+        # verdict if this helper is ever exercised with multiple shapes.
+        self._rejected_pair_epilogue_plans: set[tuple[torch.fx.Node, int, int, int]] = (
+            set()
+        )
+        self._collective_lane_loop_suppression_vetoed = False
         self.matmul_plan: CuteTcgen05MatmulPlan | None = None
         # Variable-name containers allocated in cute_mma and consumed by
         # program_id / memory_ops role builders. They live here so CuTe pipeline
@@ -489,6 +498,53 @@ class CuteDeviceFunctionState:
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
+
+    def register_tcgen05_pair_epilogue_plan(
+        self, plan: Tcgen05PairEpiloguePlan
+    ) -> None:
+        """Atomically commit one fully validated live-FX fragment plan."""
+        if self._pair_epilogue_plan is not None:
+            raise exc.BackendUnsupported(
+                "cute", "tcgen05 pair epilogue plan must be unique"
+            )
+        self._pair_epilogue_plan = plan
+
+    def reject_tcgen05_pair_epilogue_plan(
+        self, anchor: Node, *, bm: int, bn: int, bk: int
+    ) -> None:
+        """Memoize a failed pair-locality proof for this config."""
+        self._rejected_pair_epilogue_plans.add((anchor, bm, bn, bk))
+
+    def tcgen05_pair_epilogue_plan_was_rejected(
+        self, anchor: Node, *, bm: int, bn: int, bk: int
+    ) -> bool:
+        return (anchor, bm, bn, bk) in self._rejected_pair_epilogue_plans
+
+    @property
+    def has_tcgen05_pair_epilogue_plan(self) -> bool:
+        return self._pair_epilogue_plan is not None
+
+    def tcgen05_pair_epilogue_plan_for_anchor(
+        self, anchor: Node
+    ) -> Tcgen05PairEpiloguePlan | None:
+        plan = self._pair_epilogue_plan
+        return plan if plan is not None and plan.anchor is anchor else None
+
+    def tcgen05_pair_epilogue_plan_for_store(
+        self, store: Node | None
+    ) -> Tcgen05PairEpiloguePlan | None:
+        plan = self._pair_epilogue_plan
+        return plan if plan is not None and plan.store_node is store else None
+
+    def is_deferred_tcgen05_pair_epilogue_node(self, node: Node) -> bool:
+        plan = self._pair_epilogue_plan
+        return plan is not None and node in plan.owned_nodes
+
+    def veto_collective_lane_loop_suppression(self) -> None:
+        self._collective_lane_loop_suppression_vetoed = True
+
+    def collective_lane_loop_suppression_is_vetoed(self) -> bool:
+        return self._collective_lane_loop_suppression_vetoed
 
     def register_tcgen05_store_value(
         self, name: str, value: CuteTcgen05StoreValue
