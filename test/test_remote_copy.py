@@ -154,7 +154,7 @@ def _reused_descriptor_pipeline_copy(
 
 @helion.kernel(
     static_shapes=True,
-    config=helion.Config(block_sizes=[], pallas_loop_type="fori_loop"),
+    config=helion.Config(block_sizes=[]),
 )
 def _remote_copy_with_unrelated_loop_input(
     src: torch.Tensor,
@@ -302,10 +302,7 @@ def _route_forward_then_consume(
 
 @helion.kernel(
     static_shapes=False,
-    config=helion.Config(
-        block_sizes=[_HBM_TILE],
-        pallas_loop_type="unroll",
-    ),
+    config=helion.Config(block_sizes=[_HBM_TILE]),
 )
 def _computed_tiled_hbm_copy(
     src: torch.Tensor,
@@ -314,26 +311,24 @@ def _computed_tiled_hbm_copy(
     ranks: torch.Tensor,
 ) -> torch.Tensor:
     """Send computed token tiles directly into a remote HBM output."""
-    for tile in hl.tile(src.size(1)):
-        reduced = torch.sum(src[0, tile, :, :], dim=1)
-        copy = hl.make_async_remote_copy(
-            reduced,
-            [],
-            peers[0, 0],
-            dst=dst,
-            dst_index=[0, ranks[0, 0], tile],
-        )
-        copy.start()
-        copy.wait()
+    for _program in hl.grid(1):
+        for tile in hl.tile(src.size(1)):
+            reduced = torch.sum(src[0, tile, :, :], dim=1)
+            copy = hl.make_async_remote_copy(
+                reduced,
+                [],
+                peers[0, 0],
+                dst=dst,
+                dst_index=[0, ranks[0, 0], tile],
+            )
+            copy.start()
+            copy.wait()
     return dst
 
 
 @helion.kernel(
     static_shapes=False,
-    config=helion.Config(
-        block_sizes=[_HBM_TILE],
-        pallas_loop_type="unroll",
-    ),
+    config=helion.Config(block_sizes=[_HBM_TILE]),
 )
 def _pipelined_remote_hbm_consume(
     src: torch.Tensor,
@@ -344,37 +339,40 @@ def _pipelined_remote_hbm_consume(
 ) -> torch.Tensor:
     """Exchange tile n while consuming the completed HBM slab for tile n-1."""
     tokens = src.size(1)
-    for tile in hl.tile(tokens):
-        reduced = torch.sum(src[0, tile, :, :], dim=1)
-        self_copy = hl.make_async_remote_copy(
-            reduced,
-            [],
-            peers[0, 0],
-            dst=dst,
-            dst_index=[0, ranks[0, 0], tile],
-        )
-        peer_copy = hl.make_async_remote_copy(
-            reduced,
-            [],
-            peers[0, 1],
-            dst=dst,
-            dst_index=[0, ranks[0, 0], tile],
-        )
-        if tile.begin > 0:
-            self_copy.wait()
-            peer_copy.wait()
-        self_copy.start()
-        peer_copy.start()
+    for _program in hl.grid(1):
+        for tile in hl.tile(tokens):
+            reduced = torch.sum(src[0, tile, :, :], dim=1)
+            self_copy = hl.make_async_remote_copy(
+                reduced,
+                [],
+                peers[0, 0],
+                dst=dst,
+                dst_index=[0, ranks[0, 0], tile],
+            )
+            peer_copy = hl.make_async_remote_copy(
+                reduced,
+                [],
+                peers[0, 1],
+                dst=dst,
+                dst_index=[0, ranks[0, 0], tile],
+            )
+            if tile.begin > 0:
+                self_copy.wait()
+                peer_copy.wait()
+            self_copy.start()
+            peer_copy.start()
 
-        if tile.begin > 0:
-            previous = dst[0, :, tile + (-_HBM_TILE), :]
-            output[0, tile + (-_HBM_TILE), :] = torch.sum(previous, dim=0)
+            if tile.begin > 0:
+                for row in hl.tile(_HBM_TILE, block_size=1):
+                    previous_row = tile.begin - _HBM_TILE + row.begin
+                    previous = dst[0, :, previous_row, :]
+                    output[0, previous_row, :] = torch.sum(previous, dim=0)
 
-        if tile.begin + _HBM_TILE >= tokens:
-            self_copy.wait()
-            peer_copy.wait()
-            current = dst[0, :, tile, :]
-            output[0, tile, :] = torch.sum(current, dim=0)
+            if tile.begin + _HBM_TILE >= tokens:
+                self_copy.wait()
+                peer_copy.wait()
+                current = dst[0, :, tile, :]
+                output[0, tile, :] = torch.sum(current, dim=0)
     return output
 
 
@@ -569,9 +567,11 @@ class TestRemoteCopyJaxRuntime(TestCase):
         import jax
 
         devices = [device for device in jax.local_devices() if device.platform == "tpu"]
-        if len(devices) < 8:
-            self.skipTest("requires at least eight TPU devices")
-        mesh = jax.make_mesh((2, 4), ("data", "peer"), devices=devices[:8])
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+        # Keep two mesh axes to exercise flattened logical peer IDs while
+        # fitting on the two-device TPU slice used by CI.
+        mesh = jax.make_mesh((1, 2), ("data", "peer"), devices=devices[:2])
         self._run_one_shot_copy(
             mesh,
             ("data", "peer"),
@@ -598,29 +598,25 @@ class TestRemoteCopyJaxRuntime(TestCase):
         name = "precompiled_remote_copy_test"
         module = types.ModuleType(name)
         sys.modules[name] = module
-        try:
-            exec(compile(source, name, "exec"), module.__dict__)
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(source, name, "exec"), module.__dict__)
 
-            import jax
+        import jax
 
-            devices = [
-                device for device in jax.local_devices() if device.platform == "tpu"
-            ]
-            if len(devices) < 2:
-                self.skipTest("requires at least two TPU devices")
-            mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
-            self._run_one_shot_copy(mesh, "peer", module._one_shot_remote_copy)
-        finally:
-            sys.modules.pop(name, None)
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+        mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
+        self._run_one_shot_copy(mesh, "peer", module._one_shot_remote_copy)
 
     @skipIfPallasInterpret("remote-copy pipelines require TPU VMEM lowering")
     def test_reused_descriptor_pipeline(self) -> None:
         import jax
 
         devices = [device for device in jax.local_devices() if device.platform == "tpu"]
-        if len(devices) < 4:
-            self.skipTest("requires at least four TPU devices")
-        mesh = jax.make_mesh((4,), ("peer",), devices=devices[:4])
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+        mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
         self._run_reused_descriptor_pipeline(
             mesh, _reused_descriptor_pipeline_copy.jax_fn
         )
@@ -640,9 +636,9 @@ class TestRemoteCopyJaxRuntime(TestCase):
         import jax
 
         devices = [device for device in jax.local_devices() if device.platform == "tpu"]
-        if len(devices) < 4:
-            self.skipTest("requires at least four TPU devices")
-        world_size = min(8, len(devices))
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+        world_size = 2
         mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
         self._run_ring_all_gather(mesh)
 
@@ -703,9 +699,9 @@ class TestRemoteCopyJaxRuntime(TestCase):
         import jax.numpy as jnp
 
         devices = [device for device in jax.local_devices() if device.platform == "tpu"]
-        if len(devices) < 4:
-            self.skipTest("requires at least four TPU devices")
-        world_size = 4
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+        world_size = 2
         mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
         partition = jax.sharding.PartitionSpec
         src_spec = partition("peer", None, None)
@@ -810,48 +806,46 @@ class TestRemoteCopyJaxRuntime(TestCase):
         name = "precompiled_computed_tiled_hbm_copy_test"
         module = types.ModuleType(name)
         sys.modules[name] = module
-        try:
-            exec(compile(source, name, "exec"), module.__dict__)
-            mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
-            partition = jax.sharding.PartitionSpec
-            tokens = 13
-            runtime_channels = 5
-            values = jnp.arange(
-                2 * tokens * runtime_channels * _WIDTH, dtype=jnp.float32
-            ).reshape(2, tokens, runtime_channels, _WIDTH)
-            inputs = (
-                values,
-                jnp.full((2, 2, tokens, _WIDTH), -7.0, dtype=jnp.float32),
-                (1 - jnp.arange(2, dtype=jnp.int32))[:, None],
-                jnp.arange(2, dtype=jnp.int32)[:, None],
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(source, name, "exec"), module.__dict__)
+        mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
+        partition = jax.sharding.PartitionSpec
+        tokens = 13
+        runtime_channels = 5
+        values = jnp.arange(
+            2 * tokens * runtime_channels * _WIDTH, dtype=jnp.float32
+        ).reshape(2, tokens, runtime_channels, _WIDTH)
+        inputs = (
+            values,
+            jnp.full((2, 2, tokens, _WIDTH), -7.0, dtype=jnp.float32),
+            (1 - jnp.arange(2, dtype=jnp.int32))[:, None],
+            jnp.arange(2, dtype=jnp.int32)[:, None],
+        )
+        specs = (
+            partition("peer", None, None, None),
+            partition("peer", None, None, None),
+            partition("peer", None),
+            partition("peer", None),
+        )
+        inputs = tuple(
+            jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
+            for value, spec in zip(inputs, specs, strict=True)
+        )
+        copy = jax.jit(
+            jax.shard_map(
+                module._computed_tiled_hbm_copy,
+                mesh=mesh,
+                in_specs=specs,
+                out_specs=specs[1],
+                check_vma=False,
             )
-            specs = (
-                partition("peer", None, None, None),
-                partition("peer", None, None, None),
-                partition("peer", None),
-                partition("peer", None),
-            )
-            inputs = tuple(
-                jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
-                for value, spec in zip(inputs, specs, strict=True)
-            )
-            copy = jax.jit(
-                jax.shard_map(
-                    module._computed_tiled_hbm_copy,
-                    mesh=mesh,
-                    in_specs=specs,
-                    out_specs=specs[1],
-                    check_vma=False,
-                )
-            )
-            result = np.asarray(jax.block_until_ready(copy(*inputs)))
-            host_values = np.asarray(values)
-            expected = np.full((2, 2, tokens, _WIDTH), -7.0, dtype=np.float32)
-            expected[0, 1] = host_values[1].sum(axis=1)
-            expected[1, 0] = host_values[0].sum(axis=1)
-            np.testing.assert_array_equal(result, expected)
-        finally:
-            sys.modules.pop(name, None)
+        )
+        result = np.asarray(jax.block_until_ready(copy(*inputs)))
+        host_values = np.asarray(values)
+        expected = np.full((2, 2, tokens, _WIDTH), -7.0, dtype=np.float32)
+        expected[0, 1] = host_values[1].sum(axis=1)
+        expected[1, 0] = host_values[0].sum(axis=1)
+        np.testing.assert_array_equal(result, expected)
 
     @skipIfPallasInterpret("remote HBM buffers require TPU DMA lowering")
     def test_pipeline_remote_hbm_then_consume_previous_tile(self) -> None:
@@ -923,7 +917,8 @@ def _remote_copy_torch_tpu_worker(rank: int, world_size: int, master_port: int) 
     from torch_tpu._internal import pallas  # pyrefly: ignore[missing-import]
 
     dist.init_process_group(backend="tpu_dist")
-    try:
+
+    def run_checks() -> None:
         partition = jax.sharding.PartitionSpec
         mesh = jax.make_mesh((world_size,), ("peer",))
 
@@ -1018,8 +1013,9 @@ def _remote_copy_torch_tpu_worker(rank: int, world_size: int, master_port: int) 
         expected = torch.from_numpy(_expected_all_gather(world_size)).unsqueeze(1)
         assert result.shape == (world_size, 1, _GATHER_ROWS, _WIDTH)
         torch.testing.assert_close(result.cpu(), expected)
-    finally:
-        dist.destroy_process_group()
+
+    run_checks()
+    dist.destroy_process_group()
 
 
 def _run_torch_tpu_multiprocess() -> None:
@@ -1029,7 +1025,7 @@ def _run_torch_tpu_multiprocess() -> None:
         singlehost_wrapper,
     )
 
-    world_size = 4
+    world_size = 2
     singlehost_wrapper.prepare_tpu_environment(world_size=world_size)
     master_port = portpicker.pick_unused_port()
     mp.spawn(
