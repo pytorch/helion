@@ -26,6 +26,7 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
 from helion.exc import InvalidConfig
@@ -598,6 +599,29 @@ def cute_matmul_mma_fp8_rowwise_colwise_scale(
         for tile_k in hl.tile(k):
             acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         acc = acc * scale_m[tile_m, tile_n] * scale_n[tile_n]
+        out[tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_fp8_three_broadcast_scales(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_m: torch.Tensor,
+    scale_n0: torch.Tensor,
+    scale_n1: torch.Tensor,
+) -> torch.Tensor:
+    """FP8 matmul with three separately chained broadcast auxiliaries."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        acc = acc * scale_m[tile_m, tile_n]
+        acc = acc * scale_n0[tile_n]
+        acc = acc * scale_n1[tile_n]
         out[tile_m, tile_n] = acc.to(torch.bfloat16)
     return out
 
@@ -6947,6 +6971,50 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
         self.assertFalse(out.float().isnan().any().item())
         self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_mma_tcgen05_fuses_three_broadcast_edge_loads(self) -> None:
+        m, k, n = 64, 256, 8
+        x = torch.empty((m, k), device=DEVICE, dtype=torch.float8_e4m3fn)
+        y = torch.empty((k, n), device=DEVICE, dtype=torch.float8_e4m3fn)
+        scale_m = torch.empty((m, 1), device=DEVICE).expand(m, n)
+        scale_n0 = torch.empty(n, device=DEVICE)
+        scale_n1 = torch.empty(n, device=DEVICE)
+        args = (x, y, scale_m, scale_n0, scale_n1)
+        config = helion.Config(
+            block_sizes=[64, 16, 256],
+            indexing=["tensor_descriptor"] * len(args),
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=4,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+        with patch_cute_mma_support():
+            code = cute_matmul_mma_fp8_three_broadcast_scales.bind(args).to_triton_code(
+                config
+            )
+
+        self.assertIn(
+            "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_0.shape))",
+            code,
+        )
+        for aux_idx in (1, 2):
+            self.assertNotIn(
+                f"for _edge_i in range(cute.size("
+                f"tcgen05_tTR_gAux_subtile_{aux_idx}.shape))",
+                code,
+            )
+        for aux_idx in range(3):
+            self.assertIn(
+                f"tcgen05_aux_rmem_{aux_idx}[_edge_i] = "
+                f"tcgen05_tTR_gAux_subtile_{aux_idx}[_edge_i]",
+                code,
+            )
 
     def _run_colvec_scale_row_dependent(
         self,
