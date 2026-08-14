@@ -23,6 +23,7 @@ from helion._testing import onlyBackends
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
     from typing import Hashable
 
@@ -42,6 +43,21 @@ def _make_add_one(*, distributed: bool = False) -> helion.Kernel:
         return out
 
     return add_one
+
+
+def _make_aot_scale(*, distributed: bool = False) -> helion.Kernel:
+    @helion.aot_kernel(
+        config=helion.Config(block_sizes=[64]),
+        distributed=distributed,
+    )
+    def aot_scale(x: torch.Tensor, value: int) -> torch.Tensor:
+        value = hl.specialize(value)
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size(0)):
+            out[tile] = x[tile] * value
+        return out
+
+    return aot_scale
 
 
 def _tensor_size(values: Sequence[object]) -> int:
@@ -69,11 +85,20 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 kernel,
                 "_prepare_dispatch_entry",
                 side_effect=AssertionError("AOT cache hit tried to prepare"),
-            ) as prepare,
+            ),
+            patch.object(
+                kernel,
+                "_fast_dispatch_key_and_guards",
+                side_effect=AssertionError("AOT cache hit built guard metadata"),
+            ),
+            patch.object(
+                kernel,
+                "_bind",
+                side_effect=AssertionError("AOT cache hit rebound the kernel"),
+            ),
         ):
             torch.testing.assert_close(kernel(*args), expected)
         key_fn.assert_called_once_with(*args)
-        prepare.assert_not_called()
 
     def test_fresh_tensor_bypasses_dispatch_key(self) -> None:
         add_one = _make_add_one()
@@ -85,7 +110,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         with (
             patch.object(
                 add_one,
-                "_fast_dispatch_key",
+                "_fast_dispatch_key_and_guards",
                 side_effect=AssertionError("prepared call rebuilt its dispatch key"),
             ),
             patch.object(
@@ -125,8 +150,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 ),
                 patch.object(
                     add_one,
-                    "_fast_dispatch_key",
-                    wraps=add_one._fast_dispatch_key,  # type: ignore[attr-defined]
+                    "_fast_dispatch_key_and_guards",
+                    wraps=add_one._fast_dispatch_key_and_guards,  # type: ignore[attr-defined]
                 ) as fast_key,
             ):
                 out = add_one(value)
@@ -171,7 +196,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(scale(x, 2.0), x * 2.0)
         with patch.object(
             scale,
-            "_fast_dispatch_key",
+            "_fast_dispatch_key_and_guards",
             side_effect=AssertionError("runtime scalar rebuilt its dispatch key"),
         ):
             torch.testing.assert_close(scale(x, 3.0), x * 3.0)
@@ -184,8 +209,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(kernel(x, first_value), x * first_value)
             with patch.object(
                 kernel,
-                "_fast_dispatch_key",
-                wraps=kernel._fast_dispatch_key,  # type: ignore[attr-defined]
+                "_fast_dispatch_key_and_guards",
+                wraps=kernel._fast_dispatch_key_and_guards,  # type: ignore[attr-defined]
             ) as fast_key:
                 torch.testing.assert_close(kernel(x, second_value), x * second_value)
             fast_key.assert_called()
@@ -220,12 +245,13 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         bound = next(iter(add_one._dispatch_cache.values()))  # type: ignore[attr-defined]
         different_shape = torch.randn(65, device=DEVICE)
         calls = 0
-        fast_key = add_one._fast_dispatch_key((different_shape,))  # type: ignore[attr-defined]
-        self.assertIsNotNone(fast_key)
+        fast_entry = add_one._fast_dispatch_key_and_guards(  # type: ignore[attr-defined]
+            (different_shape,)
+        )
+        self.assertIsNotNone(fast_entry)
+        assert fast_entry is not None
         self.assertIsNone(  # type: ignore[attr-defined]
-            add_one._prepare_dispatch_entry(
-                (different_shape,), bound, known_fast_key=fast_key
-            )
+            add_one._prepare_dispatch_entry((different_shape,), bound, fast_entry)
         )
         self.assertEqual(calls, 1)
 
@@ -270,6 +296,29 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(aot_add_value(x), x + 1)
         self._assert_aot_repeat_uses_direct_dispatch_cache(aot_add_value, (x,), x + 1)
 
+    def test_omitted_specialized_default_uses_prepared_call(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def add_default(x: torch.Tensor, value: int = 2) -> torch.Tensor:
+            value = hl.specialize(value)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(add_default(x), x + 2)
+        self.assertIsNotNone(add_default._prepared_call)  # type: ignore[attr-defined]
+
+        with patch.object(
+            add_default,
+            "_fast_dispatch_key_and_guards",
+            side_effect=AssertionError("prepared call rebuilt its dispatch key"),
+        ):
+            torch.testing.assert_close(add_default(x), x + 2)
+
     def test_user_key_aot_repeat_uses_direct_dispatch_cache(self) -> None:
         calls = 0
 
@@ -297,6 +346,335 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(calls, 1)
 
+    def test_aot_late_specialization_repeat_uses_dispatch_generation(self) -> None:
+        aot_scale = _make_aot_scale()
+
+        class ForbiddenLock:
+            def __enter__(self) -> None:
+                raise AssertionError("stable AOT hit acquired the bind lock")
+
+            def __exit__(self, *args: object) -> None:
+                raise AssertionError("stable AOT hit exited the bind lock")
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        self.assertTrue(aot_scale._has_specialization_extras)  # type: ignore[attr-defined]
+
+        bound = next(iter(aot_scale._dispatch_cache.values()))  # type: ignore[attr-defined]
+        self.assertEqual(
+            bound._dispatch_generation,
+            aot_scale._specialization_generation,  # type: ignore[attr-defined]
+        )
+        calls = [0, 0]
+
+        def tensor_size(values: Sequence[object]) -> int:
+            calls[0] += 1
+            return _tensor_size(values)
+
+        def scalar_value(values: Sequence[object]) -> int:
+            calls[1] += 1
+            return cast("int", values[1])
+
+        aot_scale._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
+            bound,
+            bound._base_spec_key,
+            [tensor_size, scalar_value],
+            (x, 2),
+        )
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        self.assertEqual(
+            bound._dispatch_generation,
+            aot_scale._specialization_generation,  # type: ignore[attr-defined]
+        )
+        calls[:] = [0, 0]
+        with (
+            patch.object(
+                aot_scale,
+                "_key_fn",
+                wraps=aot_scale._key_fn,  # type: ignore[attr-defined]
+            ) as key_fn,
+            patch.object(
+                aot_scale,
+                "_prepare_dispatch_entry",
+                side_effect=AssertionError("stable AOT hit re-prepared dispatch"),
+            ),
+            patch.object(
+                aot_scale,
+                "_bind",
+                side_effect=AssertionError("stable AOT hit rebound the kernel"),
+            ),
+            patch.object(aot_scale, "_bind_lock", ForbiddenLock()),
+        ):
+            torch.testing.assert_close(aot_scale(x, 2), x * 2)
+
+        key_fn.assert_called_once_with(x, 2)
+        self.assertEqual(calls, [1, 1])
+
+    def test_omitted_default_aot_specializations_follow_canonical_schema(
+        self,
+    ) -> None:
+        @helion.aot_kernel(
+            config=helion.Config(block_sizes=[64]),
+        )
+        def aot_add_default(x: torch.Tensor, value: int = 1) -> torch.Tensor:
+            value = hl.specialize(value)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_add_default(x, 1), x + 1)
+        bound = next(iter(aot_add_default._dispatch_cache.values()))  # type: ignore[attr-defined]
+
+        def default_value(values: Sequence[object]) -> int:
+            return cast("int", values[1])
+
+        # The raw omitted-default alias does not exist yet. Its first bind must
+        # still include this extension and normalize values for every extractor.
+        aot_add_default._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
+            bound,
+            bound._base_spec_key,
+            [default_value],
+            (x, 1),
+        )
+        torch.testing.assert_close(aot_add_default(x), x + 1)
+
+        with (
+            patch.object(
+                aot_add_default,
+                "normalize_args",
+                side_effect=AssertionError("stable AOT hit normalized defaults"),
+            ),
+            patch.object(
+                aot_add_default,
+                "_prepare_dispatch_entry",
+                side_effect=AssertionError("stable AOT hit re-prepared dispatch"),
+            ),
+        ):
+            torch.testing.assert_close(aot_add_default(x), x + 1)
+
+        def first_value(values: Sequence[object]) -> float:
+            return float(cast("torch.Tensor", values[0])[0].item())
+
+        def last_value(values: Sequence[object]) -> float:
+            return float(cast("torch.Tensor", values[0])[-1].item())
+
+        # Consecutive extensions occur before the evicted raw alias is rebound.
+        # The persistent proxy must pick up both additions.
+        aot_add_default._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
+            bound,
+            bound._base_spec_key,
+            [first_value],
+            (x, 1),
+        )
+        aot_add_default._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
+            bound,
+            bound._base_spec_key,
+            [last_value],
+            (x, 1),
+        )
+
+        raw_bound = aot_add_default.bind((x,))
+        x[0] = x[0] + 1
+        first_changed_bound = aot_add_default.bind((x,))
+        self.assertIsNot(first_changed_bound, raw_bound)
+        x[-1] = x[-1] + 1
+        self.assertIsNot(aot_add_default.bind((x,)), first_changed_bound)
+        torch.testing.assert_close(aot_add_default(x), x + 1)
+        with patch.object(
+            aot_add_default,
+            "_prepare_dispatch_entry",
+            side_effect=AssertionError("extended omitted-default hit re-prepared"),
+        ):
+            torch.testing.assert_close(aot_add_default(x), x + 1)
+
+    def test_compiler_bind_is_isolated_from_eager_caches(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def add_default(x: torch.Tensor, value: int = 1) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        x = torch.zeros(64, device=DEVICE)
+        bound = add_default.bind((x, 1))
+        shared_state = (
+            tuple(add_default._bound_kernels.items()),  # type: ignore[attr-defined]
+            tuple(add_default._specialization_aliases.items()),  # type: ignore[attr-defined]
+            tuple(add_default._specialize_extra.items()),  # type: ignore[attr-defined]
+        )
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            isolated = add_default.bind((x,))
+        self.assertIsNot(isolated, bound)
+        self.assertFalse(isolated._cache_managed)
+        self.assertEqual(
+            (
+                tuple(add_default._bound_kernels.items()),  # type: ignore[attr-defined]
+                tuple(add_default._specialization_aliases.items()),  # type: ignore[attr-defined]
+                tuple(add_default._specialize_extra.items()),  # type: ignore[attr-defined]
+            ),
+            shared_state,
+        )
+
+    def test_isolated_bind_with_existing_specializations_is_read_only(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def scale(x: torch.Tensor, value: int) -> torch.Tensor:
+            value = hl.specialize(value)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        expected = scale(x, 2)
+        self.assertTrue(scale._has_specialization_extras)  # type: ignore[attr-defined]
+        managed_bound = scale._prepared_call.bound  # type: ignore[attr-defined]
+        scale._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
+            managed_bound,
+            managed_bound._base_spec_key,
+            [_tensor_size],
+            (x, 2),
+        )
+        schemas = {  # type: ignore[attr-defined]
+            signature: tuple(extractors)
+            for signature, extractors in scale._specialize_extra.items()
+        }
+        scale.reset()
+
+        bound = scale._bind_isolated((x, 2))  # type: ignore[attr-defined]
+        self.assertFalse(bound._cache_managed)
+        scale._create_bound_kernel_cache_key(  # type: ignore[attr-defined]
+            bound,
+            (x, 2),
+            bound._base_spec_key,
+        )
+        torch.testing.assert_close(bound(x, 2), expected)
+
+        self.assertFalse(scale._bound_kernels)  # type: ignore[attr-defined]
+        self.assertFalse(scale._dispatch_cache)  # type: ignore[attr-defined]
+        self.assertEqual(  # type: ignore[attr-defined]
+            {
+                signature: tuple(extractors)
+                for signature, extractors in scale._specialize_extra.items()
+            },
+            schemas,
+        )
+
+    def test_inductor_lowering_bind_falls_back_when_cache_lock_is_busy(self) -> None:
+        from helion._compiler._inductor.template_buffer import _bind_kernel_for_lowering
+
+        add_one = _make_add_one()
+        x = torch.randn(64, device=DEVICE)
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_bind_lock() -> None:
+            with add_one._bind_lock:  # type: ignore[attr-defined]
+                lock_held.set()
+                self.assertTrue(release_lock.wait(5))
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            holder = pool.submit(hold_bind_lock)
+            try:
+                self.assertTrue(lock_held.wait(5))
+                isolated = _bind_kernel_for_lowering(add_one, (x,))
+            finally:
+                release_lock.set()
+            holder.result(timeout=5)
+
+        self.assertFalse(isolated._cache_managed)
+        self.assertFalse(add_one._bound_kernels)  # type: ignore[attr-defined]
+        managed = _bind_kernel_for_lowering(add_one, (x,))
+        self.assertTrue(managed._cache_managed)
+        self.assertIn(managed, add_one._bound_kernels.values())  # type: ignore[attr-defined]
+
+    def test_stale_keyed_dispatch_generation_is_rebuilt(self) -> None:
+        aot_scale = _make_aot_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        bound = next(iter(aot_scale._dispatch_cache.values()))  # type: ignore[attr-defined]
+        stale_entry = aot_scale._fast_dispatch_key_and_guards((x, 2))  # type: ignore[attr-defined]
+        assert stale_entry is not None
+        with aot_scale._bind_lock:  # type: ignore[attr-defined]
+            aot_scale._specialization_generation += 1  # type: ignore[attr-defined]
+        self.assertIsNone(  # type: ignore[attr-defined]
+            aot_scale._prepare_dispatch_entry((x, 2), bound, stale_entry)
+        )
+
+        with patch.object(
+            aot_scale,
+            "_prepare_dispatch_entry",
+            wraps=aot_scale._prepare_dispatch_entry,  # type: ignore[attr-defined]
+        ) as prepare:
+            torch.testing.assert_close(aot_scale(x, 2), x * 2)
+
+        prepare.assert_called_once()
+        self.assertEqual(  # type: ignore[attr-defined]
+            bound._dispatch_generation,
+            aot_scale._specialization_generation,
+        )
+
+        with patch.object(
+            aot_scale,
+            "_prepare_dispatch_entry",
+            side_effect=AssertionError("rebuilt generation was not reused"),
+        ):
+            torch.testing.assert_close(aot_scale(x, 2), x * 2)
+
+        aot_scale.reset()
+        self.assertNotEqual(
+            bound._dispatch_generation,
+            aot_scale._specialization_generation,  # type: ignore[attr-defined]
+        )
+
+    def test_distributed_aot_late_specialization_stays_locked(self) -> None:
+        aot_scale = _make_aot_scale(distributed=True)
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(aot_scale(x, 2), x * 2)
+        bound = next(iter(aot_scale._dispatch_cache.values()))  # type: ignore[attr-defined]
+        self.assertIsNone(bound._dispatch_generation)
+
+        with patch.object(
+            aot_scale,
+            "_prepare_dispatch_entry",
+            wraps=aot_scale._prepare_dispatch_entry,  # type: ignore[attr-defined]
+        ) as prepare:
+            torch.testing.assert_close(aot_scale(x, 2), x * 2)
+
+        prepare.assert_called_once()
+        self.assertIsNone(bound._dispatch_generation)
+
+    def test_process_group_aot_dispatch_stays_locked(self) -> None:
+        @helion.aot_kernel(
+            config=helion.Config(block_sizes=[64]),
+            key=lambda _x, _group_name: 0,
+        )
+        def add_one(x: torch.Tensor, group_name: hl.ProcessGroupName) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(add_one(x, "unused"), x + 1)
+        bound = next(iter(add_one._dispatch_cache.values()))  # type: ignore[attr-defined]
+        self.assertIsNone(bound._dispatch_generation)
+        with patch.object(
+            add_one,
+            "_prepare_dispatch_entry",
+            wraps=add_one._prepare_dispatch_entry,  # type: ignore[attr-defined]
+        ) as prepare:
+            torch.testing.assert_close(add_one(x, "unused"), x + 1)
+
+        prepare.assert_called_once()
+
     def test_compiler_capture_does_not_inspect_prepared_guard(self) -> None:
         add_one = _make_add_one()
         x = torch.randn(64, device=DEVICE)
@@ -315,6 +693,74 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             out = add_one(x)
         is_compiling.assert_called_once_with()
         torch.testing.assert_close(out, x + 1)
+
+    def test_fullgraph_capture_preserves_eager_caches(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def add_default(x: torch.Tensor, value: int = 1) -> torch.Tensor:
+            value = hl.specialize(value)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        def snapshot() -> tuple[object, ...]:
+            return (
+                tuple(add_default._bound_kernels.items()),  # type: ignore[attr-defined]
+                tuple(add_default._dispatch_cache.items()),  # type: ignore[attr-defined]
+                tuple(add_default._specialization_aliases.items()),  # type: ignore[attr-defined]
+                tuple(  # type: ignore[attr-defined]
+                    (key, tuple(extractors))
+                    for key, extractors in add_default._specialize_extra.items()
+                ),
+            )
+
+        cold_states: list[tuple[object, ...]] = []
+
+        def cold_backend(
+            graph: torch.fx.GraphModule,
+            _example_inputs: list[torch.Tensor],
+        ) -> Callable[..., object]:
+            cold_states.append(snapshot())
+            return graph.forward
+
+        def cold_call(x: torch.Tensor) -> torch.Tensor:
+            return add_default(x)
+
+        x = torch.randn(64, device=DEVICE)
+        compiled_cold = torch.compile(
+            cold_call,
+            backend=cold_backend,
+            fullgraph=True,
+        )
+        torch.testing.assert_close(compiled_cold(x), x + 1)
+        empty_state = ((), (), (), ())
+        self.assertEqual(cold_states, [empty_state])
+
+        eager_state = snapshot()
+        self.assertNotEqual(eager_state, empty_state)
+        warm_states: list[tuple[object, ...]] = []
+
+        def warm_backend(
+            graph: torch.fx.GraphModule,
+            _example_inputs: list[torch.Tensor],
+        ) -> Callable[..., object]:
+            warm_states.append(snapshot())
+            return graph.forward
+
+        def warm_call(x: torch.Tensor) -> torch.Tensor:
+            return add_default(x)
+
+        compiled_warm = torch.compile(
+            warm_call,
+            backend=warm_backend,
+            fullgraph=True,
+        )
+        torch.testing.assert_close(compiled_warm(x), x + 1)
+        self.assertEqual(warm_states, [eager_state])
+        self.assertEqual(snapshot(), eager_state)
 
     def test_unsupported_signature_does_not_rebind_after_run(self) -> None:
         @helion.kernel(
@@ -344,12 +790,44 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             patch.object(kernel_module, "kernel_uses_symm_mem", return_value=False),
             patch.object(
                 add_one,
-                "_fast_dispatch_key",
-                wraps=add_one._fast_dispatch_key,  # type: ignore[attr-defined]
+                "_fast_dispatch_key_and_guards",
+                wraps=add_one._fast_dispatch_key_and_guards,  # type: ignore[attr-defined]
             ) as fast_key,
         ):
             out = add_one(x)
         fast_key.assert_called()
+        torch.testing.assert_close(out, x + 1)
+
+    def test_direct_keyed_hit_rechecks_distributed_transition(self) -> None:
+        @helion.aot_kernel(
+            config=helion.Config(block_sizes=[64]),
+            key=lambda _x: 0,
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(add_one(x), x + 1)
+
+        with (
+            patch.object(
+                kernel_module.dist,
+                "is_initialized",
+                side_effect=(False, True, True, True),
+            ),
+            patch.object(kernel_module, "kernel_uses_symm_mem", return_value=False),
+            patch.object(
+                add_one,
+                "_prepare_dispatch_entry",
+                wraps=add_one._prepare_dispatch_entry,  # type: ignore[attr-defined]
+            ) as prepare,
+        ):
+            out = add_one(x)
+
+        prepare.assert_called_once()
         torch.testing.assert_close(out, x + 1)
 
     def test_publication_rejects_distributed_state_transition(self) -> None:
@@ -357,6 +835,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         x = torch.randn(64, device=DEVICE)
         add_one(x)
         bound = add_one._prepared_call.bound  # type: ignore[attr-defined]
+        fast_entry = add_one._fast_dispatch_key_and_guards((x,))  # type: ignore[attr-defined]
+        assert fast_entry is not None
 
         with patch.object(
             kernel_module.dist,
@@ -364,13 +844,13 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             side_effect=(False, True),
         ) as is_initialized:
             self.assertIsNone(  # type: ignore[attr-defined]
-                add_one._prepare_dispatch_entry((x,), bound)
+                add_one._prepare_dispatch_entry((x,), bound, fast_entry)
             )
         self.assertEqual(is_initialized.call_count, 2)
 
         with patch.object(kernel_module.dist, "is_initialized", return_value=True):
             self.assertIsNone(  # type: ignore[attr-defined]
-                add_one._prepare_dispatch_entry((x,), bound)
+                add_one._prepare_dispatch_entry((x,), bound, fast_entry)
             )
 
     def test_custom_key_hit_rejects_distributed_state_transition(self) -> None:
@@ -397,15 +877,15 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         add_one(x)
         bound = next(iter(add_one._dispatch_cache.values()))  # type: ignore[attr-defined]
         calls = 0
+        fast_entry = add_one._fast_dispatch_key_and_guards((x,))  # type: ignore[attr-defined]
+        assert fast_entry is not None
         with patch.object(
             kernel_module.dist,
             "is_initialized",
             side_effect=(False, True),
         ):
-            fast_key = add_one._fast_dispatch_key((x,))  # type: ignore[attr-defined]
-            assert fast_key is not None
             self.assertIsNone(  # type: ignore[attr-defined]
-                add_one._prepare_dispatch_entry((x,), bound, known_fast_key=fast_key)
+                add_one._prepare_dispatch_entry((x,), bound, fast_entry)
             )
         self.assertEqual(calls, 1)
 
@@ -422,20 +902,19 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             return out
 
         x = torch.randn(64, device=DEVICE)
-        add_one(x)
-        fast_key, bound = next(iter(add_one._dispatch_cache.items()))  # type: ignore[attr-defined]
-        # Model a bound produced by automatic symmetric-memory detection rather
-        # than an explicit distributed setting or ProcessGroupName argument.
-        bound._env._is_distributed = True
+        with patch.object(kernel_module, "kernel_uses_symm_mem", return_value=True):
+            torch.testing.assert_close(add_one(x), x + 1)
+            bound = next(iter(add_one._dispatch_cache.values()))  # type: ignore[attr-defined]
+            self.assertTrue(bound._env._is_distributed)
+            self.assertIsNone(bound._dispatch_generation)
+            with patch.object(
+                add_one,
+                "_prepare_dispatch_entry",
+                wraps=add_one._prepare_dispatch_entry,  # type: ignore[attr-defined]
+            ) as prepare:
+                out = add_one(x)
 
-        with patch.object(
-            add_one,
-            "_prepare_dispatch_entry",
-            return_value=(fast_key, None),
-        ) as prepare:
-            out = add_one(x)
-
-        prepare.assert_called_once_with((x,), bound, known_fast_key=fast_key)
+        prepare.assert_called_once()
         torch.testing.assert_close(out, x + 1)
 
     def test_alternating_cached_specializations_prepare_latest(self) -> None:
@@ -448,8 +927,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         first_64 = torch.randn_like(x64)
         with patch.object(
             add_one,
-            "_fast_dispatch_key",
-            wraps=add_one._fast_dispatch_key,  # type: ignore[attr-defined]
+            "_fast_dispatch_key_and_guards",
+            wraps=add_one._fast_dispatch_key_and_guards,  # type: ignore[attr-defined]
         ) as fast_key:
             torch.testing.assert_close(add_one(first_64), first_64 + 1)
         fast_key.assert_called()
@@ -457,36 +936,36 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         second_64 = torch.randn_like(x64)
         with patch.object(
             add_one,
-            "_fast_dispatch_key",
+            "_fast_dispatch_key_and_guards",
             side_effect=AssertionError("latest specialization was not prepared"),
         ):
             torch.testing.assert_close(add_one(second_64), second_64 + 1)
 
-    def test_preparation_failure_falls_back_after_dispatch_hit(self) -> None:
+    def test_dispatch_hit_prepares_without_repeating_extractors(self) -> None:
         add_one = _make_add_one()
         x = torch.randn(64, device=DEVICE)
         add_one(x)
         bound = add_one._prepared_call.bound  # type: ignore[attr-defined]
         calls = 0
 
-        def flaky_extractor(_args: Sequence[object]) -> int:
+        def counting_extractor(_args: Sequence[object]) -> int:
             nonlocal calls
             calls += 1
-            if calls % 2 == 0:
-                raise RuntimeError("second evaluation failed")
             return 1
 
-        add_one._specialize_extra[bound._base_spec_key] = [flaky_extractor]  # type: ignore[attr-defined]
-        add_one._has_specialization_extras = True  # type: ignore[attr-defined]
-        fast_key = add_one._fast_dispatch_key((x,))  # type: ignore[attr-defined]
-        assert fast_key is not None
-        add_one._dispatch_cache = {fast_key: bound}  # type: ignore[attr-defined]
+        add_one._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
+            bound,
+            bound._base_spec_key,
+            [counting_extractor],
+            (x,),
+        )
+        torch.testing.assert_close(add_one(x), x + 1)
         add_one._prepared_call = None  # type: ignore[attr-defined]
         calls = 0
 
         torch.testing.assert_close(add_one(x), x + 1)
-        self.assertEqual(calls, 2)
-        self.assertIsNone(add_one._prepared_call)  # type: ignore[attr-defined]
+        self.assertEqual(calls, 1)
+        self.assertIsNotNone(add_one._prepared_call)  # type: ignore[attr-defined]
 
     def test_specialization_extension_cannot_leave_stale_preparation(self) -> None:
         add_one = _make_add_one()
@@ -540,6 +1019,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         add_one(x)
         prepared = add_one._prepared_call  # type: ignore[attr-defined]
         assert prepared is not None
+        generation = add_one._specialization_generation  # type: ignore[attr-defined]
         signature = prepared.bound._base_spec_key
         original_extractors = tuple(  # type: ignore[attr-defined]
             add_one._specialize_extra[signature]
@@ -570,10 +1050,11 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         self.assertEqual(  # type: ignore[attr-defined]
             tuple(add_one._specialize_extra[signature]), original_extractors
         )
+        self.assertEqual(add_one._specialization_generation, generation)  # type: ignore[attr-defined]
         self.assertIs(add_one._prepared_call, prepared)  # type: ignore[attr-defined]
         with patch.object(
             add_one,
-            "_fast_dispatch_key",
+            "_fast_dispatch_key_and_guards",
             side_effect=AssertionError("transaction invalidated prepared call"),
         ):
             torch.testing.assert_close(add_one(x), x + 1)
@@ -591,7 +1072,11 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         bound_type = type(bound)
         original_call = bound_type.__call__
 
-        def blocking_call(current: object, *args: object, **kwargs: object) -> object:
+        def blocking_call(
+            current: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
             result = original_call(current, *args, **kwargs)
             call_finished_kernel.set()
             self.assertTrue(release_call.wait(5))
@@ -602,13 +1087,33 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             ThreadPoolExecutor(max_workers=1) as pool,
         ):
             call = pool.submit(add_one, x)
-            self.assertTrue(call_finished_kernel.wait(5))
-            add_one.reset()
-            release_call.set()
+            try:
+                self.assertTrue(call_finished_kernel.wait(5))
+                add_one.reset()
+            finally:
+                release_call.set()
             torch.testing.assert_close(call.result(timeout=5), x + 1)
 
         self.assertIsNone(add_one._prepared_call)  # type: ignore[attr-defined]
         self.assertFalse(add_one._dispatch_cache)  # type: ignore[attr-defined]
+        self.assertFalse(add_one._bound_kernels)  # type: ignore[attr-defined]
+
+    def test_reset_rejects_late_specialization_from_old_bound(self) -> None:
+        add_one = _make_add_one()
+        x = torch.randn(64, device=DEVICE)
+        add_one(x)
+        bound = add_one._prepared_call.bound  # type: ignore[attr-defined]
+
+        add_one.reset()
+        self.assertFalse(  # type: ignore[attr-defined]
+            add_one._extend_bound_kernel_specializations(
+                bound,
+                bound._base_spec_key,
+                [_tensor_size],
+                (x,),
+            )
+        )
+        self.assertFalse(add_one._bound_kernels)  # type: ignore[attr-defined]
 
     def test_backend_capability_is_explicit_and_inherited(self) -> None:
         self.assertTrue(TritonBackend().supports_eager_prepared_call)

@@ -943,6 +943,16 @@ def _flatten_return_ast(
     return result
 
 
+def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> BoundKernel:
+    """Reuse eager state unless its lock is held by a concurrent bind."""
+    if not kernel._bind_lock.acquire(blocking=False):
+        return kernel._bind_isolated(args)
+    try:
+        return kernel._bind(args)
+    finally:
+        kernel._bind_lock.release()
+
+
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
 def lower_helion_kernel(
     *,
@@ -1004,7 +1014,8 @@ def lower_helion_kernel(
         for n, p in kernel.signature.parameters.items()
         if n in all_args or p.default is not p.empty
     ]
-    bound = kernel.bind(tuple(fake_tensors))
+    # Dynamo and eager binding acquire their compile/bind locks in opposite order.
+    bound = _bind_kernel_for_lowering(kernel, tuple(fake_tensors))
 
     # Derive output structure from bound kernel using inductor-time input layouts.
     # This gives correct strides even when inductor changes input memory layouts.

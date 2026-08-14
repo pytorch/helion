@@ -9282,6 +9282,28 @@ class TestCuteBackend(TestCase):
         self.assertNotEqual(key0, key1)
         self.assertIsNot(identity.bind(args), bound)
 
+    def test_isolated_bound_does_not_publish_cute_specializations(self) -> None:
+        identity = _runtime_identity_kernel()
+        args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
+        bound = identity._bind_isolated(args)
+        kernel_mod = importlib.import_module("helion.runtime.kernel")
+
+        with (
+            patch.object(
+                kernel_mod,
+                "_cute_grouped_static_tail_extra_descriptors",
+                return_value=(("cute_grouped_static_tail", 1, 1, 128, None, None),),
+            ),
+            patch.object(
+                identity,
+                "_extend_bound_kernel_specializations",
+                side_effect=AssertionError("isolated bind published specialization"),
+            ),
+        ):
+            bound._register_cute_grouped_static_tail_specializations()
+
+        self.assertFalse(identity._cute_grouped_static_tail_extra_descriptors)
+
     def test_kernel_growing_late_specialization_evicts_all_stale_keys(self) -> None:
         identity = _runtime_identity_kernel()
         x = torch.empty(1)
