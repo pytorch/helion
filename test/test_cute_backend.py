@@ -10487,7 +10487,12 @@ class TestCuteBackendRequirements(TestCase):
         from helion._compiler.cute import cutedsl_compat
 
         self.addCleanup(cutedsl_compat.cute_math_min_max_available.cache_clear)
-        for version, expected in (("4.5.1", False), ("4.6.0", True), ("4.6.1", True)):
+        for version, expected in (
+            ("4.5.1", False),
+            ("4.6.0", True),
+            ("4.6.1", True),
+            ("4.7.0", True),
+        ):
             with self.subTest(version=version):
                 cutedsl_compat.cute_math_min_max_available.cache_clear()
                 with patch.object(
