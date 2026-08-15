@@ -2250,7 +2250,7 @@ class ConfigSpec:
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
-            and config.get("pallas_loop_type") == "fori_loop"
+            and config.get("pallas_loop_type") in ("fori_loop", "unroll")
         ):
             values = config.setdefault(
                 "pallas_load_buffer_count", self.pallas_load_buffer_count.default()
