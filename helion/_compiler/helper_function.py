@@ -20,6 +20,7 @@ from .ast_extension import statement_from_string
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import Sequence
     import types
 
     from torch.fx.node import Node
@@ -33,6 +34,8 @@ class CodegenInterface(ABC):
 
     def __init__(self, device_function: DeviceFunction) -> None:
         self.device_function = device_function
+        self._pre_node_statements: dict[int, list[ast.AST]] = {}
+        self._post_node_statements: dict[int, list[ast.AST]] = {}
 
     @abstractmethod
     def add_statement(self, stmt: ast.AST | str | None) -> None:
@@ -41,6 +44,20 @@ class CodegenInterface(ABC):
     @contextlib.contextmanager
     def statement_owner_node(self, node: Node) -> Iterator[None]:
         yield
+
+    def add_pre_node_statements(
+        self, node: Node, statements: Sequence[ast.AST]
+    ) -> None:
+        self._pre_node_statements.setdefault(id(node), []).extend(statements)
+
+    def add_post_node_statement(self, node: Node, statement: ast.AST) -> None:
+        self._post_node_statements.setdefault(id(node), []).append(statement)
+
+    def pop_pre_node_statements(self, node: Node) -> list[ast.AST]:
+        return self._pre_node_statements.pop(id(node), [])
+
+    def pop_post_node_statements(self, node: Node) -> list[ast.AST]:
+        return self._post_node_statements.pop(id(node), [])
 
     def tmpvar(self, *, dce: bool = False, prefix: str = "v") -> str:
         """Generate a temporary variable name."""
