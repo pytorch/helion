@@ -1227,11 +1227,66 @@ def _pipeline_begin_alignment(
     return None
 
 
+def _fixed_loop_extent(state: CodegenState, loop_dim_index: int) -> int | None:
+    """Return a direct ``end = begin + constant`` loop extent, if present.
+
+    Device-loop bounds that come from scalar tensor arithmetic are no longer
+    symbolic integers by codegen time. Their generated names therefore do not
+    retain enough information for SymPy simplification, but the enclosing
+    ``_for_loop`` FX node still records the original relationship. Keep this
+    matcher deliberately narrow: it proves only a direct, positive constant
+    addition (or the equivalent subtraction on the begin).
+    """
+    node = state.fx_node
+    if node is None or len(node.args) < 3:
+        return None
+    raw_begins, raw_ends = node.args[1:3]
+    begins = list(raw_begins) if isinstance(raw_begins, (list, tuple)) else [raw_begins]
+    ends = list(raw_ends) if isinstance(raw_ends, (list, tuple)) else [raw_ends]
+    if loop_dim_index >= len(begins) or loop_dim_index >= len(ends):
+        return None
+    begin = begins[loop_dim_index]
+    end = ends[loop_dim_index]
+
+    def _positive_int(value: object) -> int | None:
+        if isinstance(value, (int, sympy.Integer)) and int(value) > 0:
+            return int(value)
+        return None
+
+    if isinstance(begin, (int, sympy.Integer)) and isinstance(
+        end, (int, sympy.Integer)
+    ):
+        return _positive_int(int(end) - int(begin))
+
+    if isinstance(end, torch.fx.Node) and end.op == "call_function":
+        if (
+            end.target
+            in (operator.add, torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar)
+            and len(end.args) >= 2
+            and end.kwargs.get("alpha", 1) == 1
+        ):
+            if end.args[0] is begin:
+                return _positive_int(end.args[1])
+            if end.args[1] is begin:
+                return _positive_int(end.args[0])
+    if isinstance(begin, torch.fx.Node) and begin.op == "call_function":
+        if (
+            begin.target
+            in (operator.sub, torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar)
+            and len(begin.args) >= 2
+            and begin.kwargs.get("alpha", 1) == 1
+        ):
+            if begin.args[0] is end:
+                return _positive_int(begin.args[1])
+    return None
+
+
 def _compute_pipeline_or_dma_extra_pad(
     begin_expr: str,
     bid: int,
     env: CompileEnvironment,
     state: CodegenState,
+    loop_dim_index: int | None = None,
 ) -> int:
     """Return extra host-side padding for a pipeline/DMA dim with a non-zero begin.
 
@@ -1247,6 +1302,10 @@ def _compute_pipeline_or_dma_extra_pad(
     bs_val = state.device_function.resolved_block_size(bid)
     if not isinstance(bs_val, int):
         return 0
+    if loop_dim_index is not None:
+        extent = _fixed_loop_extent(state, loop_dim_index)
+        if extent is not None and extent % bs_val == 0:
+            return 0
     alignment = _pipeline_begin_alignment(begin_expr, state)
     if alignment is not None and alignment % bs_val == 0:
         return 0
@@ -2460,7 +2519,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 from ...language.memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state
+                    begin_expr, bid, env, state, bid_idx
                 )
                 _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 begin_is_zero = begin_expr == "0"
@@ -3714,7 +3773,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 from ...language.memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state
+                    begin_expr, bid, env, state, bid_idx
                 )
                 _record_pad_info(state, fake, dim_idx, bid, extra_pad)
             elif bid is not None and bid not in block_ids:

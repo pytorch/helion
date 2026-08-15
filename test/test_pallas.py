@@ -730,6 +730,26 @@ def pallas_refilled_dynamic_matmul(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_fixed_dynamic_window(
+    x: torch.Tensor,
+    starts: torch.Tensor,
+    EXTENT: hl.constexpr,
+) -> torch.Tensor:
+    """Sum a fixed-size window whose starting row is selected at runtime."""
+    A = hl.specialize(x.size(1))
+    B = hl.specialize(x.size(2))
+    out = torch.empty([1, A, B], dtype=torch.float32, device=x.device)
+    for owner in hl.grid(1):
+        start = starts[owner]
+        end = start + EXTENT
+        acc = hl.zeros([A, B], dtype=torch.float32)
+        for tile in hl.tile(start, end):
+            acc = acc + x[tile, :, :].to(torch.float32).sum(dim=0)
+        out[owner, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_shifted_modulo_row_index(x: torch.Tensor) -> torch.Tensor:
     """Exercise a compound modulo operand whose parentheses are significant."""
     out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
@@ -5432,6 +5452,26 @@ class TestPallas(TestCase):
             all(extra_pad == 0 for *_, extra_pad in pad_dims),
             f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
         )
+
+    def test_dynamic_begin_fixed_extent_pad(self) -> None:
+        """A block-divisible fixed window needs no worst-case boundary pad."""
+        x = torch.randn(256, 8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([3], device=DEVICE, dtype=torch.int32)
+        cases = ((128, 0), (127, 15))
+        for extent, expected_extra_pad in cases:
+            with self.subTest(extent=extent):
+                code, result = code_and_output(
+                    pallas_fixed_dynamic_window,
+                    (x, starts, extent),
+                    block_sizes=[16],
+                    pallas_loop_type="fori_loop",
+                )
+                match = re.search(r"_ds_pad_dims=(\[[^\]]*\])", code)
+                self.assertIsNotNone(match, "expected _ds_pad_dims in launcher call")
+                pad_dims = ast.literal_eval(match.group(1))
+                self.assertEqual(pad_dims, [(1, 0, 16, expected_extra_pad)])
+                expected = x[3 : 3 + extent].sum(dim=0, keepdim=True)
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
