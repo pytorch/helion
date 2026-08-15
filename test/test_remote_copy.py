@@ -52,6 +52,7 @@ else:
 _WIDTH = 128
 _REMOTE_SLOT = 1
 _PIPELINE_STEPS = 4
+_COMPUTED_SEND_SLOTS = 2
 _GATHER_ROWS = 8
 _HBM_TILE = 8
 
@@ -294,6 +295,40 @@ def _pipeline_remote_copy(
             copy.start()
             copy.wait()
     return stage, dst
+
+
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _indexed_computed_pipeline_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+    positions: torch.Tensor,
+    send_slots: hl.constexpr,
+) -> torch.Tensor:
+    """Pipeline computed sends through an explicitly indexed source ring."""
+    num_steps = hl.specialize(src.size(1))
+    for _program in hl.grid(1):
+        for step in hl.tile(num_steps, block_size=1):
+            reduced = torch.sum(src[:, step, :, :], dim=2)
+            send_slot = step.begin % send_slots
+            send_ring = reduced.expand(send_slots, -1, -1)
+            copy = hl.make_async_remote_copy(
+                send_ring,
+                [send_slot],
+                peers[0, step.begin],
+                dst=dst,
+                dst_index=[0, positions[0, step.begin], step.begin],
+            )
+            if step.begin >= send_slots:
+                copy.wait_send()
+            copy.start()
+            copy.wait_recv()
+            if step.begin + send_slots >= num_steps:
+                copy.wait_send()
+    return dst
 
 
 @helion.kernel(
@@ -1155,6 +1190,112 @@ class TestRemoteCopyJaxRuntime(TestCase):
         for _invocation in range(2):
             _stage, result = jax.block_until_ready(copy(*inputs))
             np.testing.assert_array_equal(np.asarray(result), expected)
+
+    def test_indexed_computed_source_ring_codegen(self) -> None:
+        args = (
+            torch.zeros(1, _PIPELINE_STEPS, 3, _WIDTH),
+            torch.zeros(1, 2, _PIPELINE_STEPS, 1, _WIDTH),
+            torch.zeros(1, _PIPELINE_STEPS, dtype=torch.int32),
+            torch.zeros(1, _PIPELINE_STEPS, dtype=torch.int32),
+            _COMPUTED_SEND_SLOTS,
+        )
+        source = _indexed_computed_pipeline_copy.bind(args).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+        self.assertIn("remote_send_sem.at[", source)
+        self.assertIn("remote_src.at[", source)
+        self.assertNotIn("remote_src[...] =", source)
+        self.assertIn(
+            "_scratch_shapes = [((2,), None, 'dma_semaphore'), "
+            "((), None, 'dma_semaphore'), "
+            "((2, 1, 128), 'jnp.float32', 'vmem')]",
+            source,
+        )
+
+    @skipIfPallasInterpret("indexed computed sends require TPU VMEM lowering")
+    def test_indexed_computed_source_ring(self) -> None:
+        import types
+
+        import jax
+        import jax.numpy as jnp
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+
+        args = (
+            torch.zeros(1, _PIPELINE_STEPS, 3, _WIDTH),
+            torch.zeros(1, 2, _PIPELINE_STEPS, 1, _WIDTH),
+            torch.zeros(1, _PIPELINE_STEPS, dtype=torch.int32),
+            torch.zeros(1, _PIPELINE_STEPS, dtype=torch.int32),
+            _COMPUTED_SEND_SLOTS,
+        )
+        source = _indexed_computed_pipeline_copy.bind(args).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+        name = "precompiled_indexed_computed_pipeline_copy_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(source, name, "exec"), module.__dict__)
+
+        world_size = 2
+        mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
+        partition = jax.sharding.PartitionSpec
+        src_spec = partition("peer", None, None, None)
+        dst_spec = partition("peer", None, None, None, None)
+        metadata_spec = partition("peer", None)
+
+        ranks = jnp.arange(world_size, dtype=jnp.float32)[:, None, None, None]
+        steps = jnp.arange(_PIPELINE_STEPS, dtype=jnp.float32)[None, :, None, None]
+        channels = jnp.arange(3, dtype=jnp.float32)[None, None, :, None]
+        columns = jnp.arange(_WIDTH, dtype=jnp.float32)[None, None, None, :]
+        src = ranks * 1000 + steps * 100 + channels * 10 + columns
+        dst = jnp.full(
+            (world_size, world_size, _PIPELINE_STEPS, 1, _WIDTH),
+            -7.0,
+            dtype=jnp.float32,
+        )
+        peers = jnp.broadcast_to(
+            (1 - jnp.arange(world_size, dtype=jnp.int32))[:, None],
+            (world_size, _PIPELINE_STEPS),
+        )
+        positions = jnp.broadcast_to(
+            jnp.arange(world_size, dtype=jnp.int32)[:, None],
+            (world_size, _PIPELINE_STEPS),
+        )
+        specs = (src_spec, dst_spec, metadata_spec, metadata_spec)
+        inputs = tuple(
+            jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
+            for value, spec in zip((src, dst, peers, positions), specs, strict=True)
+        )
+        copy = jax.jit(
+            jax.shard_map(
+                module._indexed_computed_pipeline_copy,
+                mesh=mesh,
+                in_specs=specs,
+                out_specs=dst_spec,
+                check_vma=False,
+            )
+        )
+
+        reduced = np.asarray(src).sum(axis=2, keepdims=True)
+        expected = np.full(
+            (world_size, world_size, _PIPELINE_STEPS, 1, _WIDTH),
+            -7.0,
+            dtype=np.float32,
+        )
+        expected[0, 1] = reduced[1]
+        expected[1, 0] = reduced[0]
+        for _invocation in range(2):
+            result = np.asarray(jax.block_until_ready(copy(*inputs)))
+            np.testing.assert_array_equal(result, expected)
 
     @skipIfPallasInterpret("nested remote copies require TPU DMA lowering")
     def test_parent_store_nested_remote_copy(self) -> None:
