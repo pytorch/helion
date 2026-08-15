@@ -8,6 +8,9 @@ to emit plain Python operators instead of Triton runtime helpers.  Moved out of
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import cast
+
+from torch.utils._sympy.printers import PRECEDENCE
 
 from ..triton.printer import HelionTritonPrinter
 
@@ -20,13 +23,17 @@ class HelionPallasPrinter(HelionTritonPrinter):
 
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} // {self._print(rhs)})"
+        level = PRECEDENCE["Atom"] - 0.5
+        lhs_expr = cast("sympy.Expr", lhs)
+        rhs_expr = cast("sympy.Expr", rhs)
+        return f"({self.parenthesize(lhs_expr, level)} // {self.parenthesize(rhs_expr, level)})"
 
     def _print_PythonMod(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} % {self._print(rhs)})"
+        level = PRECEDENCE["Atom"] - 0.5
+        lhs_expr = cast("sympy.Expr", lhs)
+        rhs_expr = cast("sympy.Expr", rhs)
+        return f"({self.parenthesize(lhs_expr, level)} % {self.parenthesize(rhs_expr, level)})"
 
 
 def pallas_texpr(expr: sympy.Expr) -> str:
