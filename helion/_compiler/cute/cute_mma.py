@@ -4032,14 +4032,17 @@ class _PerKiterTmaArgs:
     tma_desc_ptr_a: str | None = None
     tma_desc_ptr_b: str | None = None
     tma_desc_acquire_fence_src: str | None = None
+    # UMMA-drain mbarrier for the scalar edge fallback, plus the i32 0/1 parity
+    # variable tracking it. Required whenever a *live* scalar fallback is
+    # emitted (``include_scalar_fallback`` with ``is_two_cta=False``); see
+    # ``_build_kloop_pipeline_consumer_if`` for why the fallback cannot use the
+    # AB ring's own barriers. ``None`` on paths with no live scalar fallback.
+    ab_drain_mbar: str | None = None
+    ab_drain_phase: str | None = None
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
-    """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded.
-
-    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
-    multicast across cluster CTAs).
-    """
+    """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded."""
     if not args.use_tma_a:
         return ""
     mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
@@ -4175,6 +4178,29 @@ def _build_kloop_pipeline_producer_if(
     return statement_from_string(src)
 
 
+def _kloop_scalar_fallback_umma_drain_src(args: _PerKiterTmaArgs) -> str:
+    """Wait for the previous k-iteration's UMMA to release sA/sB, before the
+
+    in-flight UMMA is still reading -- a write-after-read race that silently
+    fallback must not ``consumer_release``/advance, or the ring desynchronises
+    leader-owned arrival, and is deliberately not implemented here.
+    """
+    if args.ab_drain_mbar is None:
+        return ""
+    assert args.ab_drain_phase is not None, (
+        "ab_drain_mbar requires a paired ab_drain_phase parity variable"
+    )
+    # The exec warp owns MMA issuance, so it alone commits the drain arrival;
+    # every thread must wait, since every thread participates in the fill.
+    return (
+        f"    if {args.exec_active}:\n"
+        f"        with cute.arch.elect_one():\n"
+        f"            cute.nvgpu.tcgen05.commit({args.ab_drain_mbar})\n"
+        f"    cute.arch.mbarrier_wait({args.ab_drain_mbar}, {args.ab_drain_phase})\n"
+        f"    {args.ab_drain_phase} = {args.ab_drain_phase} ^ cutlass.Int32(1)\n"
+    )
+
+
 def _build_kloop_pipeline_consumer_if(
     args: _PerKiterTmaArgs,
     *,
@@ -4191,6 +4217,20 @@ def _build_kloop_pipeline_consumer_if(
         )
         assert not sync_before_scalar_fallback, (
             "static-full fast path has no scalar fallback presync"
+        )
+    if include_scalar_fallback and not args.static_full_tiles:
+        # A live scalar fallback overwrites the sA/sB stage that the previous
+        # k-iteration's async UMMA may still be reading, so it MUST carry a
+        # UMMA-drain barrier (see ``_kloop_scalar_fallback_umma_drain_src``).
+        # Assert rather than silently degrade: without this the emitted kernel
+        # is a silent wrong-answer race, which is far worse than a build error.
+        assert not args.is_two_cta, (
+            "CtaGroup.TWO does not have a validated scalar-fallback UMMA drain; "
+            "tcgen05_mixed_tma_scalar_fallback requires cluster_m == 1"
+        )
+        assert args.ab_drain_mbar is not None, (
+            "a live scalar fallback requires ab_drain_mbar so the fill waits "
+            "for the previous UMMA to release sA/sB"
         )
     if args.skip_consumer_wait:
         consumer_src = "pass"
@@ -4227,6 +4267,7 @@ def _build_kloop_pipeline_consumer_if(
         fallback_src = (
             "\nelse:\n"
             f"{leading_sync_src}"
+            f"{_kloop_scalar_fallback_umma_drain_src(args)}"
             f"{scalar_load_a_src}\n"
             f"{scalar_load_b_src}\n"
             "    cute.arch.sync_threads()"
@@ -6021,11 +6062,23 @@ def _emit_mma_pipeline(
     tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
         tcgen05_mixed_tma_scalar_fallback
         and bk >= 128
-        and (m_size % bm != 0 or n_size % bn != 0)
+        and (
+            m_size % bm != 0
+            or n_size % bn != 0
+            or (bk > 128 and k_total_size % bk != 0)
+        )
     )
     tcgen05_sync_before_scalar_fallback = (
         tcgen05_mixed_tma_scalar_fallback and k_total_size % bk != 0
     )
+    # The scalar edge fallback overwrites the sA/sB stage that the previous
+    # k-iteration's ASYNC UMMA may still be reading. Emit a drain mbarrier so
+    # that fill waits on tcgen05.commit (real UMMA completion) instead of
+    # relying on cute.arch.sync_threads(), which only orders threads. Needed on
+    # every mixed TMA/scalar path, not just the K-tail ones: an output-edge tile
+    # takes the fallback on every k-iteration, so iteration i+1's fill races
+    # iteration i's UMMA regardless of whether K divides block_k.
+    tcgen05_use_scalar_fallback_umma_drain = tcgen05_mixed_tma_scalar_fallback
     tcgen05_preserve_tma_for_two_cta_k_tail = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
@@ -8712,6 +8765,11 @@ def _emit_mma_pipeline(
     tma_full_tile = df.new_var("tcgen05_tma_full_tile")
     tma_next_full_tile = df.new_var("tcgen05_tma_next_full_tile")
     tma_next_consumer_tile = df.new_var("tcgen05_tma_next_consumer_tile")
+    ab_drain_mbar: str | None = None
+    ab_drain_phase: str | None = None
+    if tcgen05_use_scalar_fallback_umma_drain:
+        ab_drain_mbar = df.new_var("tcgen05_ab_drain_mbar")
+        ab_drain_phase = df.new_var("tcgen05_ab_drain_phase")
 
     def _tcgen05_tma_output_tile_predicate() -> str | None:
         if tcgen05_grouped_dynamic_ab_tensormaps:
@@ -9635,6 +9693,32 @@ def _emit_mma_pipeline(
                     f"cutlass.Int64, cutlass.Int32({tcgen05_ab_stage_count_value}))"
                 )
             )
+            if ab_drain_mbar is not None:
+                assert ab_drain_phase is not None
+                # Scalar-fallback UMMA drain barrier: one Int64 cell, arrival
+                # count 1 (only the exec warp's elect_one thread arrives, via
+                # tcgen05.commit). Init is gated to one thread and made visible
+                # to the CTA with mbarrier_init_fence + sync_threads, mirroring
+                # the CLC mbarrier init in ``program_id.py``. sync_threads (not
+                # sync_warp) because every warp waits on this barrier.
+                prefix.append(
+                    statement_from_string(
+                        f"{ab_drain_mbar} = cute.arch.alloc_smem("
+                        f"cutlass.Int64, cutlass.Int32(1), alignment=8)"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(
+                        "if cute.arch.thread_idx()[0] == cutlass.Int32(0):\n"
+                        f"    cute.arch.mbarrier_init({ab_drain_mbar}, 1)"
+                    )
+                )
+                prefix.append(statement_from_string("cute.arch.mbarrier_init_fence()"))
+                prefix.append(statement_from_string("cute.arch.sync_threads()"))
+                # Parity for the drain wait; flipped after each wait.
+                prefix.append(
+                    statement_from_string(f"{ab_drain_phase} = cutlass.Int32(0)")
+                )
             prefix.append(
                 statement_from_string(
                     f"{tma_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
@@ -10121,6 +10205,8 @@ def _emit_mma_pipeline(
                     if tcgen05_grouped_dynamic_ab_tensormaps
                     else None
                 ),
+                ab_drain_mbar=ab_drain_mbar,
+                ab_drain_phase=ab_drain_phase,
             )
             if tcgen05_use_tma_pipeline:
                 grouped_k_loop_iter_expr = (

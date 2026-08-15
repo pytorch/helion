@@ -8016,6 +8016,168 @@ class TestCuteLowerings(unittest.TestCase):
         # tests.
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_scalar_edge_fallback_is_bit_exact_at_one_ab_stage(self) -> None:
+        """An output edge at ``tcgen05_ab_stages=1`` must not race the UMMA.
+
+        On an edge output tile the TMA path is skipped and codegen takes the
+        scalar-fill fallback, which stores A/B straight into sA/sB. The tcgen05
+        ``cute.gemm`` UMMA reads those buffers ASYNCHRONOUSLY, and at
+        ``ab_stages=1`` there is only one AB stage, so the next k-iteration's
+        fill targets the exact buffer the in-flight UMMA is still reading. With
+        only ``cute.arch.sync_threads()`` for ordering (which orders threads,
+        not the async UMMA) this was a silent write-after-read corruption of the
+        A operand.
+
+        Data is integers in {-1,+1} so every dot product is exactly
+        representable in bf16: a correct kernel is BIT-EXACT here, which makes
+        any mismatch a wrong answer rather than rounding. Asserting numerics
+        (not a codegen string) is deliberate -- the point is the race, and a
+        marker test would pass against a barrier that does not actually order.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_edge_ab1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # N=264 with block_n=256 is an output N-edge; K=256 gives >= 2 k-blocks
+        # so an edge tile has a live in-flight UMMA when the next fill starts.
+        m_size, n_size, k_size = 128, 264, 256
+        gen = torch.Generator(device=DEVICE).manual_seed(0)
+        x = (
+            torch.randint(
+                0, 2, (m_size, k_size), device=DEVICE, generator=gen, dtype=torch.int32
+            )
+            * 2
+            - 1
+        ).to(torch.bfloat16)
+        y = (
+            torch.randint(
+                0, 2, (k_size, n_size), device=DEVICE, generator=gen, dtype=torch.int32
+            )
+            * 2
+            - 1
+        ).to(torch.bfloat16)
+        exact = x.double() @ y.double()
+        self.assertTrue(
+            torch.equal(exact.to(torch.bfloat16).double(), exact),
+            "reference must be exactly representable in bf16 for a bit-exact check",
+        )
+
+        bound = cute_matmul_edge_ab1.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 256, 128],
+                num_warps=4,
+                tcgen05_ab_stages=1,
+                tcgen05_c_stages=4,
+                indexing=["pointer", "pointer", "pointer"],
+            )
+        )
+
+        # Repeat: the race is timing-shaped, so a single launch can pass by
+        # luck even on the broken codegen.
+        for launch in range(20):
+            out = bound(x, y)
+            torch.cuda.synchronize()
+            wrong = (out.double() != exact).nonzero()
+            self.assertEqual(
+                wrong.numel(),
+                0,
+                f"launch {launch}: {wrong.shape[0]} wrong elements at "
+                f"ab_stages=1 on a {m_size}x{n_size}x{k_size} output-edge tile "
+                f"(first bad index {wrong[0].tolist() if wrong.numel() else None}); "
+                "expected bit-exact -- indicates the scalar edge fallback "
+                "overwrote sA/sB while the previous UMMA was still reading",
+            )
+
+    def test_tcgen05_bk256_k_tail_forces_inter_a_swizzle_bit_exact(self) -> None:
+        """A K tail at ``bk=256`` must force the INTER A atom.
+
+        ``make_smem_layout_a`` picks a SWIZZLED A atom at bk=256, but the scalar
+        edge fallback writes logical ``(_row, _col)`` coordinates and cannot
+        honour a swizzle. The override that fixes this was previously gated on
+        an OUTPUT edge only, so an ALIGNED-output shape with a K tail still
+        scalar-filled through the swizzled view and silently produced wrong
+        answers (measured ~93% of elements wrong on 4096x4096x5000).
+
+        Uses {-1,+1} integer data so the reference is exactly representable in
+        bf16 and any mismatch is a wrong answer rather than rounding.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bk256_k_tail(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # Output is ALIGNED (128 % 128 == 0) so only the K tail (648 % 256 = 136)
+        # routes into the scalar fallback -- the case the old gate missed.
+        m_size, n_size, k_size = 128, 128, 648
+        gen = torch.Generator(device=DEVICE).manual_seed(0)
+        x = (
+            torch.randint(
+                0, 2, (m_size, k_size), device=DEVICE, generator=gen, dtype=torch.int32
+            )
+            * 2
+            - 1
+        ).to(torch.bfloat16)
+        y = (
+            torch.randint(
+                0, 2, (k_size, n_size), device=DEVICE, generator=gen, dtype=torch.int32
+            )
+            * 2
+            - 1
+        ).to(torch.bfloat16)
+        exact = x.double() @ y.double()
+        self.assertTrue(torch.equal(exact.to(torch.bfloat16).double(), exact))
+
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 256],
+            pid_type="flat",
+            num_warps=4,
+            tcgen05_ab_stages=1,
+            indexing=["pointer", "pointer", "pointer"],
+        )
+        bound = cute_matmul_bk256_k_tail.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        code = bound.to_triton_code(cfg)
+        self.assertIn("cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_INTER", code)
+
+        bound.set_config(cfg)
+        for launch in range(10):
+            out = bound(x, y)
+            torch.cuda.synchronize()
+            wrong = int((out.double() != exact).sum().item())
+            self.assertEqual(
+                wrong,
+                0,
+                f"launch {launch}: {wrong} wrong elements -- the bk=256 K-tail "
+                "scalar fallback wrote through a swizzled A view",
+            )
+
     def test_tcgen05_fused_gelu_exact_runtime_correctness(self) -> None:
         """Default ``F.gelu`` maps to the exact erf-based CuTe epilogue step."""
 
@@ -20051,6 +20213,8 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         use_tma_a: bool = True,
         use_tma_b: bool = True,
         static_full_tiles: bool = False,
+        ab_drain_mbar: str | None = "ab_drain_mbar",
+        ab_drain_phase: str | None = "ab_drain_phase",
     ) -> _PerKiterTmaArgs:
         if use_tma_b_mcast_mask is None:
             use_tma_b_mcast_mask = cluster_m > 1 or is_two_cta
@@ -20086,6 +20250,8 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             scalar_load_a=self._scalar_load_a(),
             scalar_load_b=self._scalar_load_b(),
             static_full_tiles=static_full_tiles,
+            ab_drain_mbar=ab_drain_mbar,
+            ab_drain_phase=ab_drain_phase,
         )
 
     @staticmethod
@@ -20271,16 +20437,33 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             self._stmt_kinds(inner.body),
             ["=consumer_try_wait", "consumer_wait"],
         )
-        # By default, partial-tile fallback scalar-loads, then waits before
-        # UMMA consumes the scalar-filled stage.
+        # By default, the partial-tile fallback first DRAINS the previous
+        # async UMMA off the sA/sB stage (gated tcgen05.commit, then a
+        # CTA-wide mbarrier_wait, then the parity flip), and only then
+        # scalar-loads and syncs. The drain must precede the fills: it is
+        # what makes the overwrite safe.
         self.assertEqual(
             self._stmt_kinds(node.orelse),
-            ["If", "If", "sync_threads"],
+            ["If", "mbarrier_wait", "Assign", "If", "If", "sync_threads"],
         )
         orelse_src = ast.unparse(ast.Module(body=node.orelse, type_ignores=[]))
         self.assertIn("smem_a", orelse_src)
         self.assertIn("smem_b", orelse_src)
         self.assertIn("cute.arch.sync_threads", orelse_src)
+        # The drain arrival is single-threaded on the exec warp (tcgen05.commit
+        # requires elect_one) while EVERY thread waits, since every thread
+        # participates in the fill.
+        self.assertIn("cute.nvgpu.tcgen05.commit(ab_drain_mbar)", orelse_src)
+        self.assertIn("with cute.arch.elect_one():", orelse_src)
+        self.assertIn(
+            "cute.arch.mbarrier_wait(ab_drain_mbar, ab_drain_phase)", orelse_src
+        )
+        self.assertIn("ab_drain_phase = ab_drain_phase ^ cutlass.Int32(1)", orelse_src)
+        self.assertLess(
+            orelse_src.index("mbarrier_wait"),
+            orelse_src.index("smem_a"),
+            "the UMMA drain must happen BEFORE the scalar fill overwrites sA",
+        )
 
     def test_pipeline_consumer_if_can_presync_scalar_fallback(self) -> None:
         args = self._make_args()
@@ -20289,10 +20472,43 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             sync_before_scalar_fallback=True,
         )
         self.assertIsInstance(node, ast.If)
+        # The presync goes first, then the UMMA drain, then the fills. The
+        # presync is a thread barrier and cannot order the async UMMA, which
+        # is why the drain is still required alongside it.
         self.assertEqual(
             self._stmt_kinds(node.orelse),
-            ["sync_threads", "If", "If", "sync_threads"],
+            [
+                "sync_threads",
+                "If",
+                "mbarrier_wait",
+                "Assign",
+                "If",
+                "If",
+                "sync_threads",
+            ],
         )
+
+    def test_pipeline_consumer_if_requires_drain_for_live_scalar_fallback(
+        self,
+    ) -> None:
+        """A live scalar fallback without a UMMA drain must fail loudly.
+
+        Emitting the fallback with no drain is a silent wrong-answer race, so
+        the builder refuses rather than degrading.
+        """
+        args = self._make_args(ab_drain_mbar=None, ab_drain_phase=None)
+        with self.assertRaisesRegex(AssertionError, "ab_drain_mbar"):
+            _build_kloop_pipeline_consumer_if(args)
+        # ...but a fallback-free call is still fine without the drain.
+        node = _build_kloop_pipeline_consumer_if(args, include_scalar_fallback=False)
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(node.orelse, [])
+
+    def test_pipeline_consumer_if_rejects_two_cta_scalar_fallback(self) -> None:
+        """CtaGroup.TWO has no validated cluster-wide UMMA drain."""
+        args = self._make_args(cluster_m=2, is_two_cta=True)
+        with self.assertRaisesRegex(AssertionError, "CtaGroup.TWO"):
+            _build_kloop_pipeline_consumer_if(args)
 
     def test_pipeline_consumer_if_can_drop_exec_gate_and_fallback(self) -> None:
         args = self._make_args()
@@ -20346,7 +20562,11 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
 
     def test_pipeline_consumer_two_cta_gates_wait_to_leader(self) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)
-        node = _build_kloop_pipeline_consumer_if(args)
+        # CtaGroup.TWO never emits a live scalar fallback: the mixed
+        # TMA/scalar path requires cluster_m == 1. The builder asserts that,
+        # because a 2-CTA fallback would need a cluster-wide UMMA drain that
+        # is deliberately not implemented.
+        node = _build_kloop_pipeline_consumer_if(args, include_scalar_fallback=False)
         self.assertIsInstance(node, ast.If)
         self.assertEqual(ast.unparse(node.test), "full_tile")
         self.assertEqual(len(node.body), 1)
