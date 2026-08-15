@@ -9,6 +9,7 @@ from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
+from .cute import CuteTcgen05AuxEdgeHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
@@ -16,6 +17,8 @@ from .cute import CuteTcgen05GroupedStaticCommonKHeuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
+from .cute_matmul_formula import CuteTcgen05FormulaFfiAltHeuristic
+from .cute_matmul_formula import CuteTcgen05FormulaMatmulHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
@@ -46,6 +49,20 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05ClusterM2Heuristic,
         CuteTcgen05GroupedStaticCommonKHeuristic,
         CuteTcgen05GroupedDynamicBk64Heuristic,
+        # The formula heuristic subsumes the 3 cluster_m=2 producers above and is
+        # registered AFTER them so its promote_seed_to_default wins (last-promote-wins).
+        # The FFI alt-seed is a second ranked (non-promoting) config, benchmarked beside
+        # the promoted Bucket-A default for 16-bit compute.
+        CuteTcgen05FormulaMatmulHeuristic,
+        CuteTcgen05FormulaFfiAltHeuristic,
+        # Registered LAST among the tcgen05 producers, and non-promoting. Position
+        # matters even for a non-promoting heuristic: seed ORDER decides which entry
+        # ``default_flat()`` builds the default config from, so registering this
+        # cluster_m=1 aux-edge seed earlier made it seed[0] and flipped the default
+        # ``pid_type`` from ``persistent_interleaved`` to ``flat`` on the cluster_m=2
+        # edge family (caught by
+        # ``test_cute_tcgen05_cluster_m2_seed_heuristic_for_edge_k_tail_family``).
+        CuteTcgen05AuxEdgeHeuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
         CuteTileVecHeuristic,
@@ -108,7 +125,14 @@ def compiler_seed_configs(
                 config = heuristic.get_seed_config(env, device_ir)
                 ranked = [config] if config is not None else []
         except Exception as e:
-            log.debug(
+            # WARNING, not debug: a heuristic RAISING is a bug. The supported way
+            # to decline a shape is ``is_eligible`` returning False, so reaching
+            # here means the producer crashed and the shape silently loses a seed
+            # — the autotuner then starts from ``default_config()``, which has
+            # measured 10-23x worse than the tuned config on shapes whose seed
+            # list came back empty. At ``log.debug`` (the logger defaults to INFO)
+            # that failure was invisible and only detectable by a hill-climb run.
+            log.warning(
                 "Autotuner heuristic %s failed while generating compiler seed config: %s",
                 heuristic.name,
                 e,

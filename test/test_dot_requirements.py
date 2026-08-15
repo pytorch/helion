@@ -316,10 +316,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertLessEqual(default_block_sizes[0], 256)
         self.assertGreaterEqual(default_block_sizes[1], 8)
         self.assertLessEqual(default_block_sizes[1], 128)
-        self.assertEqual(spec.default_config().config["l2_groupings"], [1])
-        # This small-N problem cannot form the validated 256x256 CtaGroup.TWO
-        # tile, so the autotuner keeps cluster_m narrowed to 1.
-        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
+        # The promote-to-default formula heuristic emits a wave-count-aware
+        # l2_grouping: this tiny single-wave 256x64x128 problem gets the few-wave
+        # grouping [4] (was [1] under the old fixed-grouping default).
+        self.assertEqual(spec.default_config().config["l2_groupings"], [4])
+        # The small-N shape cannot form the validated 256x256 CtaGroup.TWO tile, so
+        # the SEARCH keeps cluster_m narrowed to 1. The formula seed is orthogonal
+        # to that search restriction: it promotes the best genuinely-valid config,
+        # which here is the rectangular cluster_m=2 tile [256,64,64] (bn shrunk to
+        # N=64). So the promoted default is cluster_m=2 even though the search arm
+        # stays cluster_m=1.
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
+        self.assertEqual(spec.default_config().config["block_sizes"][:2], [256, 64])
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
         self.assertIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
@@ -361,15 +369,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertLessEqual(default_block_sizes[0], 256)
         self.assertGreaterEqual(default_block_sizes[1], 8)
         self.assertLessEqual(default_block_sizes[1], 256)
-        # The FFI direct-entry seed no longer bleeds into ``default_config()`` (it
-        # got there by repairing a partial FFI candidate ONTO the seed, which this
-        # commit stops doing), so the default is the generic one again: L2 grouping
-        # 1 and the CtaGroup.ONE tile.
+        # 16-bit 8192^3 is a full-wave compute shape; the promote-to-default
+        # formula heuristic emits the DEFAULT-layout deep-AB CtaGroup.TWO tile
+        # ([256,256,64] ab=6) with the wave-count-aware many-wave grouping [1]
+        # (this many-CTA shape exceeds the _MANY_WAVE crossover; was [2] under the
+        # old FFI-envelope default).
         self.assertEqual(spec.default_config().config["l2_groupings"], [1])
-        # K=8192 can still form validated CtaGroup.TWO products at bk >= 32 even
-        # though bk=16 is over the K-tile cap, so the SEARCH exposes both arms --
-        # only the default itself moved back to cluster_m=1.
-        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
+        # K=8192 can form validated CtaGroup.TWO products at bk >= 32 even
+        # though bk=16 is over the K-tile cap. The compute full-tile default lands
+        # on cluster_m=2, and the search exposes both arms.
+        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 2)
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
         # An over-K-tile-cap ``bk`` is now REPAIRED, not demoted. ``bk=16`` at
         # K=8192 needs 512 K-tiles against a 256 cap, so the stage used to answer
@@ -441,13 +450,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
             config = bound.config_spec.default_config()
             code = bound.to_triton_code(config)
-        # The TVM-FFI full-tile envelope no longer reaches ``default_config()``:
-        # promoting it was a side effect of repairing a partial FFI candidate ONTO
-        # the seed, which this commit stops doing. So the default falls back to the
-        # generic non-persistent bk=16 tile until a heuristic owns the default
-        # again. It still codegens on the tcgen05 path either way, which is what
-        # this test is for.
-        self.assertEqual(config.config["block_sizes"][2], 16)
+        # 16-bit 8192^3 is a full-wave compute shape; the promote-to-default
+        # formula heuristic emits a DEFAULT-layout deep-AB tile ([256,256,64] ab=6,
+        # bk=64) rather than the old bk=128 envelope -- still a validated tcgen05
+        # full tile (bk in the 32..128 range), not the old non-persistent bk=16
+        # default. It still codegens on the tcgen05 path.
+        self.assertIn(config.config["block_sizes"][2], (64, 128))
         self.assertGreaterEqual(config.config["block_sizes"][0], 128)
         self.assertLessEqual(config.config["block_sizes"][0], 256)
         self.assertGreaterEqual(config.config["block_sizes"][1], 8)
@@ -2272,6 +2280,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # rejected by ``normalize``'s validation pass).
         spec._tcgen05_num_epi_warps_validation_choices = None
         spec.restrict_tcgen05_num_epi_warps_search((2,))
+        # The promote-to-default formula heuristic pins num_epi_warps=4 explicitly
+        # in ``compiler_default_config``, which would shadow the search-view default
+        # in ``default_config()``. This assertion exercises the search-view
+        # fill-missing routing, so clear the promoted seed to expose the raw
+        # search-view fragment default (the property under test).
+        spec.compiler_default_config = None
         new_default = spec.default_config()
         self.assertEqual(new_default.config["tcgen05_num_epi_warps"], 2)
         winning_2 = helion.Config(**new_default.config)
@@ -2294,19 +2308,21 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         spec = _bind_cute_strategy_kernel().config_spec
 
-        # The TVM-FFI full-tile envelope no longer reaches ``default_config()`` --
-        # promoting it was a side effect of repairing a partial FFI candidate ONTO
-        # the seed, which this commit stops doing -- so the documented pre-FFI
-        # default is back: ROLE_LOCAL_MONOLITHIC on flat / non_persistent /
-        # DEFAULT layout. The persistence model agrees with the non-persistent
-        # pid_type, so the serialized config is still internally consistent.
+        # The 256^2 16-bit shape is a full-wave compute shape; the promote-to-
+        # default formula heuristic emits the DEFAULT-layout CtaGroup.TWO compute
+        # tile. The ROLE_LOCAL_MONOLITHIC strategy is still the pin, and the seed
+        # pins persistent_interleaved / static_persistent (vs the old non-eligible
+        # flat / non_persistent), but on the DEFAULT layout rather than the FFI
+        # explicit_epi_tile envelope. The persistence model agrees with the
+        # persistent pid_type so the serialized config is still internally
+        # consistent.
         default_cfg = spec.default_config()
         self.assertEqual(
             default_cfg.config["tcgen05_strategy"], "role_local_monolithic"
         )
-        self.assertEqual(default_cfg.config["pid_type"], "flat")
+        self.assertEqual(default_cfg.config["pid_type"], "persistent_interleaved")
         self.assertEqual(
-            default_cfg.config["tcgen05_persistence_model"], "non_persistent"
+            default_cfg.config["tcgen05_persistence_model"], "static_persistent"
         )
         self.assertEqual(default_cfg.config["tcgen05_layout_strategy"], "default")
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_ab_load_warps"], 1)
@@ -2326,10 +2342,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_c_input_warps"], 0)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_decrease"], 120)
         self.assertEqual(default_cfg.config["tcgen05_warp_spec_register_increase"], 256)
-        # The DEFAULT-layout default leaves every layout override unset so the
-        # layout helper derives the epilogue tile / D-store box / SMEM swizzle (the
-        # FFI explicit_epi_tile 128/32/32 envelope ships on the FFI seed only, and
-        # the seed no longer bleeds into the default).
+        # The DEFAULT-layout compute default leaves every layout override unset so
+        # the layout helper derives the epilogue tile / D-store box / SMEM swizzle
+        # (the FFI explicit_epi_tile 128/32/32 envelope ships only on the Bucket-B
+        # FFI alt-seed, not the promoted DEFAULT-layout default).
         for key in (
             "tcgen05_layout_overrides_epi_tile_m",
             "tcgen05_layout_overrides_epi_tile_n",
@@ -3165,11 +3181,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             tcfg.validate_strategy_invariants(dict(config), fix_invalid=False)
         tcfg.validate_strategy_invariants(config, fix_invalid=True)
         self.assertEqual(config["tcgen05_strategy"], "role_local_monolithic")
-        # The rollback derives the persistence model from the active pid_type, and
-        # the base config is the DEFAULT-layout default again (flat), so the
-        # rollback lands on ``non_persistent`` rather than the FFI seed's
-        # ``static_persistent``.
-        self.assertEqual(config["tcgen05_persistence_model"], "non_persistent")
+        self.assertEqual(config["tcgen05_persistence_model"], "static_persistent")
         self.assertEqual(config["tcgen05_layout_strategy"], "default")
         self.assertIsNone(config["tcgen05_layout_overrides_epi_tile_m"])
 
