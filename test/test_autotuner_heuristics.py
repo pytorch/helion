@@ -3285,12 +3285,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
         # Cycle 97: the for_search ab cap is BUDGET-AWARE — lifted to the 16-bit
-        # dtype hard cap of 6 wherever a deep AB ring is admissible (the SMEM-budget
+        # dtype hard cap of 8 wherever a deep AB ring is admissible (the SMEM-budget
         # constraints were recorded at bind time, i.e. bf16/fp16 on a B200-class
         # optin cap), else 2. Conditioning on the recorded constraints keeps the
         # assertion deterministic across hosts.
         expected_search_ab_high = (
-            6
+            8
             if bound.config_spec._cute_tcgen05_config.ab_stages_search_constraints
             is not None
             else 2
@@ -4863,10 +4863,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 has_source_c=True,
             )
         )
-        # Without source-C (plain matmul, 8 KB/stage): ab=3 + c=4 = 224 KB still
-        # overflows the conservative budget (the cycle-90 probe confirmed the
-        # plain 256x256 ab=3 + c=4 hits raw ptxas ``too much shared``).
-        self.assertFalse(
+        # Without source-C (plain matmul, 8 KB/stage): ab=3 + c=4 = 224 KB now FITS.
+        # ``c_stages_fits`` scores AB+C against the DEVICE CAP (232 KB) rather than
+        # the reserved budget, whose 28 KiB reservation stood in for exactly the C
+        # ring bytes and so double-counted them.
+        self.assertTrue(
             tcfg.c_stages_fits(
                 bm=256,
                 bn=256,
@@ -4877,10 +4878,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 has_source_c=False,
             )
         )
-        # True admission gate: a DIRECTLY sampled 256x256 ab=3 + c=4 candidate
-        # (no projection claims it — plain matmul, no aux) is demoted to c=2 so
-        # tuning never reaches the raw ptxas overflow. ab=3 alone fits, so the
-        # ab-stages gate keeps it — only c is demoted.
+        # True admission gate: a DIRECTLY sampled 256x256 ab=3 + c=4 candidate on a
+        # plain (no source-C) matmul now PASSES — matching the ``has_source_c=False``
+        # fit above, since the gate scores AB+C against the device cap.
         #
         # Exercise the c-stages admission gate (``_fix_c_stages_search_config``)
         # DIRECTLY rather than through the full ``fix_search_config`` chain.
@@ -4908,7 +4908,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # B200 above), so the gate is deterministic here.
         tcfg._fix_c_stages_search_config(ab3_c4.config)
         self.assertEqual(ab3_c4.config["tcgen05_ab_stages"], 3)
-        self.assertEqual(ab3_c4.config["tcgen05_c_stages"], 2)
+        self.assertEqual(ab3_c4.config["tcgen05_c_stages"], 4)
         # ab=2 + c=4 (fits) is preserved by the gate.
         ab2_c4 = helion.Config(
             block_sizes=[256, 256, 128],
@@ -5051,12 +5051,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.aux_kernel_detected)
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
-        # The for_search ab fragment is lifted to the 16-bit dtype hard cap of 6
+        # The for_search ab fragment is lifted to the 16-bit dtype hard cap of 8
         # (the budget was recorded at bind via the mocked B200 cap) for every
-        # family; the per-tile budget gate trims a drawn depth that does not fit.
+        # family; the per-tile budget walk trims a drawn depth that does not fit.
         for tcfg in (plain_tcfg, bias_tcfg, residual_tcfg):
             ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(ab_fragment.high, 6)
+            self.assertEqual(ab_fragment.high, 8)
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(
@@ -5113,29 +5113,29 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(bias_t16_ab3.config["tcgen05_cluster_m"], 2)
         self.assertEqual(bias_t16_ab3.config["block_sizes"][:3], [256, 256, 128])
 
-        # RESIDUAL source-C branch, in ISOLATION. The exact-shape aux-TMA full-tile
-        # projection forces ab=2 on a cluster_m=2 candidate BEFORE the gate runs, so
-        # to exercise the gate's source-C branch directly we call it on a cluster_m=1
-        # residual candidate (which no projection claims): AB(ab=3) + (128, 64) C
-        # ring overflows even at cluster_m=1, so it DEMOTES to 2.
+        # RESIDUAL source-C branch, in ISOLATION, on a cluster_m=1 candidate: an
+        # un-clustered 256x256x128 AB ring is 128 KiB/stage, so the depth walk lands
+        # on the deepest depth that FITS — ab=1, not the old floor of 2.
         residual_cm1_ab3 = _ab3_config(cluster_m=1)
         residual_tcfg._fix_ab_stages_search_config(residual_cm1_ab3.config)
-        self.assertEqual(residual_cm1_ab3.config["tcgen05_ab_stages"], 2)
+        self.assertEqual(residual_cm1_ab3.config["tcgen05_ab_stages"], 1)
 
-        # And the same residual source-C branch demotes a cluster_m=2 candidate too
-        # (independent of the aux-TMA projection): call the gate in isolation.
+        # At cluster_m=2 the AB ring halves to 64 KiB/stage, so ab=3 FITS and the
+        # walk (which only ever lowers) keeps the drawn depth.
         residual_cm2_ab3 = _ab3_config(cluster_m=2)
         residual_tcfg._fix_ab_stages_search_config(residual_cm2_ab3.config)
-        self.assertEqual(residual_cm2_ab3.config["tcgen05_ab_stages"], 2)
+        self.assertEqual(residual_cm2_ab3.config["tcgen05_ab_stages"], 3)
 
-        # Full chain on the cluster_m=2 residual: the aux-TMA projection forces ab=2
-        # first, and the gate is consistent (still 2).
+        # Full chain on the cluster_m=2 residual: the aux-TMA projection still forces
+        # ab=2 there, and the walk is consistent with it (it only lowers).
         residual_full = _ab3_config(cluster_m=2)
         residual_tcfg.fix_search_config(residual_full.config)
         self.assertEqual(residual_full.config["tcgen05_ab_stages"], 2)
 
         # cluster_m=1 256x256 plain ab=3 overflows bare-AB (384 KiB > budget) and is
-        # demoted even without a source-C.
+        # demoted even without a source-C. (The full chain also clamps bm to 128 for
+        # cluster_m=1 legality, so the walk judges the 128x256x128 tile and ab=2 is
+        # the deepest depth that fits there.)
         plain_cm1_ab3 = _ab3_config(cluster_m=1)
         plain_tcfg.fix_search_config(plain_cm1_ab3.config)
         self.assertEqual(plain_cm1_ab3.config["tcgen05_ab_stages"], 2)

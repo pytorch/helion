@@ -1579,11 +1579,6 @@ class ConfigSpec:
             c_stages=c_stages,
         )
 
-    def _fix_tcgen05_ab_stages_three_search_config(
-        self, config: dict[str, object]
-    ) -> None:
-        self._cute_tcgen05_config._fix_ab_stages_three_search_config(config)
-
     def _fix_tcgen05_with_scheduler_search_config(
         self, config: dict[str, object]
     ) -> None:

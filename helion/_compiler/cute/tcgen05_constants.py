@@ -439,6 +439,29 @@ TCGEN05_DIRECT_ENTRY_SEED_C_STAGES = 2
 # Bounded below by the tcgen05 MMA-K minimum (16), so no entry can be smaller than
 # a legal K tile.
 TCGEN05_CLUSTER_M2_REPAIR_BLOCK_K_ORDER: tuple[int, ...] = (256, 128, 64, 32, 16)
+# Deepest AB pipeline that can coexist with a PRODUCTIVE AUX PRODUCER WARP
+# (``tcgen05_warp_spec_c_input_warps=1``, or the store-warp merge
+# ``store_warps=1 + aux_load_mode=tma``, together with non-empty aux tensor
+# descriptors from the epilogue chain and a single-store fan-out).
+#
+# ⚠ THIS MIRRORS A CODEGEN RAISE. ``cute_mma.py``'s
+# ``ab_reject_has_aux_producer_warp ... and ab_stage_count >= 3`` guard raises
+# ``BackendUnsupported`` for exactly the configs this cap excludes: the aux SMEM
+# ring plus the AB pipeline together overshoot the 232 KB B200 cap at every
+# validated tile shape (the canonical ``bm=bn=256, bk=128, cluster_m=2`` measures
+# 263 KB used against a 232 KB cap; shrinking the aux ring to ``num_stages=1``
+# only reaches 246 KB, still 14 KB over). Both sites must move together — the
+# whole point of naming it is that a future depth widening cannot silently
+# desynchronize a search-repair ``min`` from the codegen ``>=``.
+TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES = 2
+
+# Floor for the block-K concession in ``_fix_ab_stages_search_config``. A tile that
+# overflows the SMEM budget at EVERY depth cannot be rescued by demoting the depth
+# or the C ring, so ``bk`` is halved until it fits. 32 is the smallest bk the
+# tcgen05 path accepts (``cute_mma`` raises BackendUnsupported below the
+# direct-entry legal set, and the block fragments do not draw below it), so the
+# concession stops there rather than emitting a bk no codegen path can use.
+TCGEN05_MIN_CONCEDED_BLOCK_K = 32
 
 
 TCGEN05_DIRECT_ENTRY_LEGAL_BK: frozenset[int] = frozenset({64, 128})

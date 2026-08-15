@@ -1067,19 +1067,19 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
         # Cycle 97: a deep AB ring is BUDGET-AWARE-SEARCHABLE — the for_search cap is
-        # lifted to the 16-bit dtype hard cap of 6 wherever the SMEM-budget
+        # lifted to the 16-bit dtype hard cap of 8 wherever the SMEM-budget
         # constraints were recorded (here: the mocked B200 budget), so the autotuner
         # can SAMPLE ab=3 directly. A sampled ab=3 that does not fit is then demoted
         # by ``_fix_ab_stages_search_config`` (the over-budget cases below). The
         # validation surface is independently 3 for explicit configs.
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 8)
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
-        # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the validation
-        # surface admits the deeper FFI direct-entry stage tuples — up to ab=6
-        # (the (ab=6, c=4) tuple at bk=64; see
-        # ``test_cute_tcgen05_full_tile_ffi_seed_config``). Explicit user configs
-        # at ab=3 still round-trip; the for_search cap stays budget-aware at 3.
-        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 6)
+        # The validation surface tracks the same 16-bit dtype hard cap as the search
+        # surface: an explicit ``helion.Config`` at ab=4..8 on a 16-bit cluster_m=2
+        # DEFAULT-layout tile is exactly what the search now draws and runs, so
+        # rejecting it would put the two surfaces out of agreement. Both are still
+        # gated per tile by ``max_ab_stages_that_fit``.
+        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 8)
 
         # cluster_m=2 256x256x128 ab=3: the canonical 4096^3 fast config —
         # fits the per-CTA budget (196 608 bytes vs B200's 203 776-byte
@@ -1193,7 +1193,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 )
             self.assertIsNotNone(spec._tcgen05_ab_stages_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 8)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(

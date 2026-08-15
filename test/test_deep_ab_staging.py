@@ -20,8 +20,12 @@ class TestDeepABStagingHelpers(TestCase):
         # FP8 (1 byte) -> 12 stages
         self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(1), 12)
 
-        # FP16/BF16 (2 bytes) -> 6 stages
-        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2), 6)
+        # FP16/BF16 (2 bytes) -> 8 stages. Max-OBSERVED, not max-USEFUL: every
+        # measured 16-bit winner sits at its own tile's SMEM ceiling, and the
+        # deepest of those is ab=8 (e.g. [128,256,32] cm1, [256,128,64] cm2).
+        # Raise when a deeper winner appears; the cap only exists to stop the
+        # narrow-tile pathology where a tiny bk lets the budget quotient explode.
+        self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2), 8)
 
         # FP32 (4 bytes) -> 3 stages
         self.assertEqual(CuteTcgen05Config._get_dtype_ab_stages_hard_cap(4), 3)
@@ -77,8 +81,19 @@ class TestMaxABStagesThatFit(TestCase):
         # FP8 should support deep staging (>6 stages)
         self.assertGreater(fp8_max, 6, "FP8 should enable deep staging")
 
-        # BF16 should be limited
-        self.assertLessEqual(bf16_max, 6, "BF16 should cap at 6 or less")
+        # BF16 is bounded by the SMEM BUDGET here, not by the dtype hard cap:
+        # this tile costs 32768 B/stage at 2 bytes, so the synthetic 232 KiB
+        # budget above admits 7 and the 16-bit hard cap (8) is non-binding.
+        # That is the intended shape of the gate — "the deepest depth that fits"
+        # — and it is why the cap was raised off 6, which used to clamp here and
+        # mask the budget. (On the real B200 the budget is 203776 B after the
+        # fixed reservation, so the same tile admits 6.)
+        self.assertEqual(bf16_max, smem_budget // 32768, "BF16 budget should bind")
+        self.assertLessEqual(
+            bf16_max,
+            CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2),
+            "BF16 must never exceed the dtype hard cap",
+        )
 
         # Ratio should be roughly 2x (within overhead tolerance)
         if bf16_max > 0:

@@ -17854,7 +17854,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             instead of a deep ``ptxas: uses too much shared
             data`` raise; and
           - the autotune search-time fixup
-            (``_fix_tcgen05_ab_stages_three_search_config``)
+            (``_fix_tcgen05_with_scheduler_search_config``)
             can demote affected ``ab=3`` candidates rather
             than aborting tuning at ptxas.
 
@@ -18246,7 +18246,14 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             "tcgen05_warp_spec_c_input_warps": 1,
             "tcgen05_ab_stages": 3,
         }
-        bound.env.config_spec._fix_tcgen05_with_scheduler_search_config(config_dict)
+        # The ``ab > TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES => c_input_warps = 0``
+        # guard lives in ``_fix_aux_producer_depth_feasibility_search_config``, which
+        # runs immediately after the AB depth walk so it judges the SETTLED depth.
+        # ``_fix_with_scheduler_search_config`` only makes the warp counts consistent
+        # with the strategy and does not read the depth at all.
+        bound.env.config_spec._cute_tcgen05_config._fix_aux_producer_depth_feasibility_search_config(
+            config_dict
+        )
         # Fixup demoted c_input_warps to 0; ab_stages=3 stays.
         self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
         self.assertEqual(config_dict["tcgen05_ab_stages"], 3)
@@ -18299,7 +18306,10 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertEqual(config_dict["tcgen05_warp_spec_scheduler_warps"], 0)
         self.assertEqual(config_dict["tcgen05_warp_spec_c_input_warps"], 0)
-        self.assertEqual(config_dict["tcgen05_ab_stages"], 2)
+        # The AB depth walk lands on the deepest depth that fits the RESERVED budget
+        # for the settled [128,256,128] cluster_m=1 tile with a (128, 64) source-C
+        # ring, which is ab=1 rather than the old table's floor of 2.
+        self.assertEqual(config_dict["tcgen05_ab_stages"], 1)
         self.assertEqual(config_dict["tcgen05_acc_stages"], 2)
         self.assertEqual(config_dict["tcgen05_c_stages"], 4)
         self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 1)

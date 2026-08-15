@@ -77,6 +77,7 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
+from .tcgen05_constants import TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
@@ -119,6 +120,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
+from .tcgen05_constants import TCGEN05_MIN_CONCEDED_BLOCK_K
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -176,14 +178,16 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
 
 
 class Tcgen05AbStagesSearchConstraints(NamedTuple):
-    """Search-only envelope where ``tcgen05_ab_stages=3`` is admitted.
+    """Search-only envelope where a deep AB pipeline is admitted.
 
-    The 3-stage AB pipeline is only safe to search when its larger SMEM
-    allocation fits after reserving space for CuTe runtime/barrier scratch.
+    ``per_cta_smem_budget_bytes`` is the device cap minus the CuTe
+    runtime/barrier reservation; ``per_cta_smem_capacity_bytes`` is the raw cap,
+    which ``c_stages_fits`` scores AB+C against.
     """
 
     dtype_bytes: int
     per_cta_smem_budget_bytes: int
+    per_cta_smem_capacity_bytes: int = 0
 
 
 TCGEN05_GROUPED_DYNAMIC_AB4_STAGE = 4
@@ -1092,6 +1096,7 @@ class CuteTcgen05Config:
         self.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
             dtype_bytes=dtype_bytes,
             per_cta_smem_budget_bytes=budget_bytes,
+            per_cta_smem_capacity_bytes=self.per_cta_smem_capacity_bytes(device),
         )
 
     def allow_deep_direct_entry_validation(self, *, device: torch.device) -> None:
@@ -1131,25 +1136,7 @@ class CuteTcgen05Config:
         cluster_m: int,
         ab_stages: int = 3,
     ) -> bool:
-        return self._ab_stages_fit_constraints(
-            constraints=self.ab_stages_search_constraints,
-            bm=bm,
-            bn=bn,
-            bk=bk,
-            cluster_m=cluster_m,
-            ab_stages=ab_stages,
-        )
-
-    @staticmethod
-    def _ab_stages_fit_constraints(
-        *,
-        constraints: Tcgen05AbStagesSearchConstraints | None,
-        bm: int,
-        bn: int,
-        bk: int,
-        cluster_m: int,
-        ab_stages: int,
-    ) -> bool:
+        constraints = self.ab_stages_search_constraints
         if constraints is None:
             return False
         if cluster_m not in (1, 2):
@@ -1177,19 +1164,12 @@ class CuteTcgen05Config:
         c_stages: int,
         has_source_c: bool,
     ) -> bool:
-        # Workstream A Stage 2 (cycle 90): budget-aware admission for the deeper
         # C-store ring. Reuse the ``tcgen05_ab_stages=3`` SMEM-budget envelope
         # (same dtype_bytes + per-CTA budget after the non-AB reservation) and
         # require AB + C to fit together. This is the gate that keeps a deeper
         # C ring (``tcgen05_c_stages=4``) out of the ab=3 regime, where AB+C
         # overshoots the 232 KB B200 cap and ptxas raises a raw
         # ``too much shared`` error during tuning. The C bytes use the REAL
-        # ``Tcgen05LayoutStrategy.DEFAULT`` epilogue subtile, not the (128, 32)
-        # EXPLICIT_EPI_TILE direct-entry tile, so the byte count matches the
-        # role-local codegen: a 256x256 16-bit tile is ``(128, 64)`` WITH a
-        # source-C (residual family) but ``(128, 32)`` WITHOUT one (plain
-        # matmul) -- ``compute_epilogue_tile_size`` shrinks N when no C tile
-        # competes for SMEM. ``has_source_c`` threads that distinction through.
         constraints = self.ab_stages_search_constraints
         if constraints is None:
             return False
@@ -1226,7 +1206,31 @@ class CuteTcgen05Config:
             dtype_bytes=constraints.dtype_bytes,
             c_stages=c_stages,
         )
-        return ab_bytes + c_bytes <= constraints.per_cta_smem_budget_bytes
+        capacity = constraints.per_cta_smem_capacity_bytes
+        if capacity <= 0:
+            # No recorded capacity (older constraint record / non-CUDA host): fall back to
+            # the budget, which fails closed the way every other gate here does.
+            return ab_bytes + c_bytes <= constraints.per_cta_smem_budget_bytes
+        return ab_bytes + c_bytes <= capacity
+
+    def _fix_aux_producer_depth_feasibility_search_config(
+        self, config: dict[str, object]
+    ) -> None:
+        """A productive aux producer warp cannot coexist with a deep AB pipeline."""
+        if not (self.search_enabled and self.aux_kernel_detected):
+            return
+        if (
+            config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        ):
+            return
+        ab_stages = config.get("tcgen05_ab_stages")
+        if (
+            type(ab_stages) is int
+            and ab_stages > TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES
+            and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1
+        ):
+            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
     @staticmethod
     def _grouped_dynamic_deep_config_matches(config: dict[str, object]) -> bool:
@@ -1341,26 +1345,15 @@ class CuteTcgen05Config:
         )
 
     def _fix_c_stages_search_config(self, config: dict[str, object]) -> None:
-        # Workstream A Stage 2 (cycle 90): true admission gate for the deeper C
         # ring. ``tcgen05_c_stages`` is an ``EnumFragment((2, 4))`` knob, so the
         # autotuner can SAMPLE c=4 independently of any projection — a directly
-        # sampled 256x256 cluster_m=2 ab=3 + c=4 reaches ptxas and fails with a
-        # raw ``too much shared`` error (verified cycle-90). Mirror
-        # ``_fix_ab_stages_three_search_config``: when a config carries c=4 from
-        # ANY source and ``c_stages_fits`` is False, demote it to 2.
-        #
-        # Scope: judge ONLY the canonical full-tile 256x256 DEFAULT-layout path,
-        # which is exactly where the AB+C arithmetic is calibrated (the validated
-        # CtaGroup.TWO cosize shapes) and where the role-local C ring lives. The
-        # narrow-N / bm=128 edge family (``_fix_aux_edge_search_config`` sets its
-        # own validated c=4 at a different cosize that the analytic model would
-        # mis-judge) and the EXPLICIT_EPI_TILE direct-entry seeds (separate
-        # (128, 32) tile + own admission) keep their c=4 untouched.
         if not self.search_enabled:
             return
         if config.get("tcgen05_c_stages") != TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES:
             return
-        if not self._is_default_layout_full_tile_config(config):
+        if not self._is_default_layout_config(config):
+            return
+        if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
             return
         # Fail CLOSED: the ``(2, 4)`` c-stages fragment is offered on every
         # device, but with no SMEM budget recorded (non-B200 / CPU host) we
@@ -1386,16 +1379,29 @@ class CuteTcgen05Config:
         ):
             config["tcgen05_c_stages"] = 2
 
+    @staticmethod
+    def _is_default_layout_config(config: dict[str, object]) -> bool:
+        # DEFAULT-layout role-local, ANY tile. This is where the bare-AB and AB+C
+        # per-CTA SMEM models apply, because they key on (bm, bn, bk, cluster_m)
+        # and the DEFAULT epilogue tile. EXPLICIT_EPI_TILE configs use a separate
+        # (128, 32) epilogue tile with its own admission
+        # (``_validate_direct_entry_ab_stage_envelope``) and a different store
+        # topology, so the AB+C model is not calibrated for them; an absent layout
+        # key defaults to DEFAULT.
+        return (
+            config.get(
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+                Tcgen05LayoutStrategy.DEFAULT.value,
+            )
+            == Tcgen05LayoutStrategy.DEFAULT.value
+        )
+
     def _is_default_layout_full_tile_config(self, config: dict[str, object]) -> bool:
         # The canonical 256x256 DEFAULT-layout role-local tile, where the C-ring
         # AB+C SMEM model is calibrated. EXPLICIT_EPI_TILE configs use a separate
         # tile/admission and are excluded; an absent layout key defaults to
         # DEFAULT.
-        layout = config.get(
-            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
-            Tcgen05LayoutStrategy.DEFAULT.value,
-        )
-        if layout != Tcgen05LayoutStrategy.DEFAULT.value:
+        if not self._is_default_layout_config(config):
             return False
         config_view = self._matmul_config_view(config)
         if config_view is None:
@@ -1408,26 +1414,13 @@ class CuteTcgen05Config:
 
     @staticmethod
     def _get_dtype_ab_stages_hard_cap(dtype_bytes: int) -> int:
-        """Get hardware-validated maximum ab_stages for a dtype.
-
-        The maximum practical ab_stages depends on dtype size because
-        smaller dtypes fit more pipeline stages in the same SMEM budget:
-        - FP8 (1 byte): 12 stages - validated on B200, fits 2x bf16
-        - FP16/BF16 (2 bytes): 6 stages - TVM-FFI seed validated
-        - FP32 (4 bytes): 3 stages - baseline for larger dtypes
-
-        Args:
-            dtype_bytes: Size of data type in bytes
-
-        Returns:
-            Maximum ab_stages for this dtype, or 0 if invalid
-        """
+        """Get hardware-validated maximum ab_stages for a dtype."""
         if dtype_bytes <= 0:
             return 0
         if dtype_bytes == 1:  # FP8
             return 12
         if dtype_bytes == 2:  # FP16/BF16
-            return 6
+            return 8
         # FP32 or larger
         return 3
 
@@ -1440,38 +1433,7 @@ class CuteTcgen05Config:
         cluster_m: int,
         hard_cap: int | None = None,
     ) -> int:
-        """Compute maximum ab_stages that fits in per-CTA SMEM budget.
-
-        Mirrors CUTLASS's ``_compute_stages``: fill SMEM with as many AB
-        pipeline stages as fit the hardware budget. Uses direct calculation
-        since SMEM usage scales linearly with ab_stages.
-
-        For FP8 (1-byte operands), this enables ~2x deeper staging than
-        BF16 (2-byte), which is critical for hiding K-loop TMA latency
-        in compute-bound kernels.
-
-        Args:
-            bm: Block size in M dimension
-            bn: Block size in N dimension
-            bk: Block size in K dimension
-            cluster_m: CTA cluster size (1 or 2)
-            hard_cap: Optional maximum stages override. If None, uses
-                dtype-specific default (12 for FP8, 6 for FP16, 3 for FP32)
-
-        Returns:
-            Maximum valid ab_stages in [1, hard_cap], or 0 if constraints
-            are unknown or configuration is invalid (e.g., ab_stages=1
-            doesn't fit budget).
-
-        Example:
-            >>> # FP8 256x256x64 cluster_m=2
-            >>> config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=2)
-            8  # FP8 fits 8 stages
-
-            >>> # BF16 same tile (2x larger per stage)
-            >>> config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=2)
-            4  # BF16 fits only 4 stages
-        """
+        """Compute maximum ab_stages that fits in per-CTA SMEM budget."""
         constraints = self.ab_stages_search_constraints
         if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
             return 0
@@ -1505,96 +1467,104 @@ class CuteTcgen05Config:
         # Return clamped value: at least 1, at most hard_cap or budget limit
         return max(1, min(max_from_budget, hard_cap))
 
-    def _fix_ab_stages_three_search_config(self, config: dict[str, object]) -> None:
-        if self.ab_stages_search_constraints is None:
-            return
-        if not self.search_enabled:
-            return
-        if config.get("tcgen05_ab_stages") != 3:
-            return
-        config_view = self._matmul_config_view(config)
-        if config_view is None:
-            config["tcgen05_ab_stages"] = 2
-            return
-        block_sizes, m_index, n_index, k_index = config_view
-        cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
-        if not self.ab_stages_fits(
-            bm=cast("int", block_sizes[m_index]),
-            bn=cast("int", block_sizes[n_index]),
-            bk=cast("int", block_sizes[k_index]),
-            cluster_m=cluster_m,
-        ):
-            config["tcgen05_ab_stages"] = 2
-
     def _fix_ab_stages_search_config(self, config: dict[str, object]) -> None:
-        # Budget-aware ab=3 admission for the lifted ``for_search`` cap (see
-        # ``optional_fragments`` and cute_plan.md §4.5 for the empirical narrative).
-        # Mirror ``_fix_c_stages_search_config`` (fail-CLOSED, cast-based): on the
-        # canonical 256x256 DEFAULT-layout role-local path, demote a directly-sampled
-        # ab=3 to 2 when it does not fit the per-CTA SMEM budget. The invariant — the
-        # new dimension over the bare-AB ``_fix_ab_stages_three_search_config`` gate —
-        # is REAL source-C presence, keyed on the PRECISE
-        # ``exact_shape_aux_kernel_detected`` (rank-2 exact-shape residual_add), NOT
-        # the broad ``aux_kernel_detected`` (also True for a rowvec broadcast bias
-        # that has no source-C ring): a real source-C materializes the larger
-        # (128, 64) C ring, so AB(ab=3) + C overflows the cap even at c=2 and MUST
-        # demote, while the plain / rowvec-bias family (no source-C ring) keeps the
-        # bare-AB calibration so its ab=3 winner stays searchable. The exact-shape
-        # residual cluster_m=2 full-tile candidates are already forced to ab=2 by
-        # ``_fix_aux_tma_full_tile_search_config`` (runs first); this gate's source-C
-        # branch is the fail-closed backstop for any exact-shape residual ab=3 that
-        # projection does not claim (e.g. cluster_m=1). The EXPLICIT_EPI_TILE
-        # direct-entry (TVM-FFI) seeds use a separate (128, 32) tile + own admission
-        # and are out of the DEFAULT-layout scope, so their seeded ab=3/ab=6 is
-        # untouched.
+        # Budget-aware deep-AB admission for the lifted ``for_search`` cap (see
+        # Mirror ``_fix_c_stages_search_config`` (fail-CLOSED, cast-based): on ANY
+        # DEFAULT-layout tile, demote a directly-sampled ab>=3 to the deepest depth
         if not self.search_enabled:
             return
-        if config.get("tcgen05_ab_stages") != 3:
+        ab_stages = config.get("tcgen05_ab_stages")
+        if type(ab_stages) is not int or ab_stages < 1:
             return
-        if not self._is_default_layout_full_tile_config(config):
-            return
+        #   ``if not self._is_default_layout_config(config): return``
+        # which excluded the ``explicit_epi_tile`` family because the AB+C byte model is
+        # calibrated for the DEFAULT epilogue tile. That exclusion was only safe while
         config_view = self._matmul_config_view(config)
         if config_view is None:
-            config["tcgen05_ab_stages"] = 2
+            # ``min``, not a bare ``= 2``: with no readable tile we cannot prove the
+            # drawn depth fits, so fail closed to the conservative depth — but this
+            # stage must never RAISE ``tcgen05_ab_stages``. A bare write would take
+            # a drawn ab=1 UP to 2, which falsifies the monotonicity invariant that
+            # ``_fix_with_scheduler_search_config``'s ``>= 3`` guard relies on to be
+            # safe at its earlier position (see the comment there). It cannot cross
+            config["tcgen05_ab_stages"] = min(ab_stages, 2)
             return
         block_sizes, m_index, n_index, k_index = config_view
+        bm = cast("int", block_sizes[m_index])
+        bn = cast("int", block_sizes[n_index])
+        bk = cast("int", block_sizes[k_index])
         cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
         if self.exact_shape_aux_kernel_detected:
-            # Real source-C present: require AB(ab=3) + the (128, 64) C ring to fit
-            # together. ``c_stages_fits`` fails CLOSED when no SMEM budget is
-            # recorded (non-B200 / CPU host), so the over-budget and no-budget
-            # arms are both covered by a single ``not c_stages_fits`` check.
+            # Real source-C present: require AB + the (128, 64) C ring to fit
+            # together at the sampled depth. ``c_stages_fits`` fails CLOSED when no
+            # SMEM budget is recorded (non-B200 / CPU host), so the over-budget and
+            # no-budget arms are both covered.
             c_stages = cast("int", config.get("tcgen05_c_stages", 2))
-            fits = self.c_stages_fits(
-                bm=cast("int", block_sizes[m_index]),
-                bn=cast("int", block_sizes[n_index]),
-                bk=cast("int", block_sizes[k_index]),
-                cluster_m=cluster_m,
-                ab_stages=3,
-                c_stages=c_stages,
-                has_source_c=True,
-            )
+
+            def _fits_at(ab: int, bk_: int) -> bool:
+                return self.c_stages_fits(
+                    bm=bm,
+                    bn=bn,
+                    bk=bk_,
+                    cluster_m=cluster_m,
+                    ab_stages=ab,
+                    c_stages=c_stages,
+                    has_source_c=True,
+                )
         else:
             # Plain / rowvec-bias store (no source-C ring): the bare-AB gate is the
             # calibrated admission — the small no-source-C epilogue D ring rides the
             # non-AB reservation. ``ab_stages_fits`` returns False with no
             # budget recorded, so this also fails CLOSED.
-            fits = self.ab_stages_fits(
-                bm=cast("int", block_sizes[m_index]),
-                bn=cast("int", block_sizes[n_index]),
-                bk=cast("int", block_sizes[k_index]),
-                cluster_m=cluster_m,
-            )
-        if not fits:
-            config["tcgen05_ab_stages"] = 2
+            def _fits_at(ab: int, bk_: int) -> bool:
+                return self.ab_stages_fits(
+                    bm=bm, bn=bn, bk=bk_, cluster_m=cluster_m, ab_stages=ab
+                )
+
+        def _fits(ab: int) -> bool:
+            return _fits_at(ab, bk)
+
+        # Demote to the deepest depth that fits. The floor is 1 when a real budget
+        # is recorded — ab=1 is a legal depth the fragment offers, and a tile that
+        # does not fit even at 2 (e.g. [256,256,128] cluster_m=1 = 262144 B at ab=2,
+        # fitting only at ab=1) must still be
+        # brought under the cap rather than left to fail at ptxas. ab=1 is an
+        # unpipelined AB ring and therefore slow, but the point is that it is LEGAL:
+        floor = 1 if self.ab_stages_search_constraints is not None else 2
+        while ab_stages > floor and not _fits(ab_stages):
+            ab_stages -= 1
+        config["tcgen05_ab_stages"] = ab_stages
+        if not _fits(ab_stages):
+            candidate_bk = bk
+            while candidate_bk > TCGEN05_MIN_CONCEDED_BLOCK_K:
+                candidate_bk //= 2
+                if _fits_at(ab_stages, candidate_bk):
+                    block_sizes[k_index] = candidate_bk
+                    break
+        # ⚠ HISTORY, because the ``bk`` concession above was once REMOVED and the
+        #
+        # An earlier version shrank ``block_sizes[k]`` here and was reverted, on two
 
     def _fix_with_scheduler_search_config(self, config: dict[str, object]) -> None:
+        """Strategy <-> warp-count repair. DO NOT FOLD THE TWO WARP KEYS TOGETHER.
+
+        determined by the strategy -- biconditional -- so deriving it is correct
+        * ``c_input_warps`` is an **accept set**
+        Fold them and the free axis silently disappears: any helper that derives a
+        populated, with no spare warp, which is why their accept set is ``{0}`` and
+        """
+        # ── FLAT-ROLE WARP TOPOLOGY, UNCONDITIONAL AND FIRST ──
+        #
+        # made the warp group have TWO writers in two different stages. They live here
+        if config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True:
+            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+            config[TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY] = 1
+            config["tcgen05_num_epi_warps"] = 4
         if not (self.search_enabled and self.aux_kernel_detected):
             return
         strategy = config.get(TCGEN05_STRATEGY_CONFIG_KEY)
         scheduler_warps = config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY)
         c_input_warps = config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY)
-        ab_stages = config.get("tcgen05_ab_stages")
         if strategy in (
             Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
             Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value,
@@ -1606,8 +1576,6 @@ class CuteTcgen05Config:
         elif strategy == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value:
             if scheduler_warps != 1:
                 config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
-        if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
-            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
     def _is_validated_cluster_m2_full_tile_search_candidate(
         self, config: dict[str, object]
@@ -1845,10 +1813,23 @@ class CuteTcgen05Config:
                     ab_stages=ab_stages,
                 ):
                     return
-        # fp8 (1-byte) operands fit a deeper AB pipeline than the 16-bit cap of 3,
-        # so admit ab>3 there whenever the per-CTA AB SMEM fits the budget.
+        # A deeper AB pipeline than the bf16-tuned cap of 3 is admitted whenever
+        # the per-CTA AB SMEM fits the budget, for two families:
+        #   * FP8 (1-byte) operands, any tile — lets Helion emit the same
+        #     deeply-pipelined CtaGroup.TWO kernel CUTLASS uses for fp8
         constraints = self.ab_stages_search_constraints
-        if constraints is not None and constraints.dtype_bytes == 1:  # FP8
+        is_fp8 = constraints is not None and constraints.dtype_bytes == 1
+        layout = config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        )
+        is_16bit_default = (
+            constraints is not None
+            and constraints.dtype_bytes == 2
+            and config.get("tcgen05_cluster_m") in (1, 2)
+            and layout == Tcgen05LayoutStrategy.DEFAULT.value
+        )
+        if is_fp8 or is_16bit_default:
             config_view = self._matmul_config_view(config)
             cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
             if config_view is not None:
@@ -3198,7 +3179,7 @@ class CuteTcgen05Config:
         self._fix_aux_edge_search_config(config)
         self._fix_cluster_m2_search_config(config)
         self._fix_cluster_m1_persistent_search_config(config)
-        self._fix_ab_stages_three_search_config(config)
+        self._fix_ab_stages_search_config(config)
         self._fix_target1_tvm_ffi_search_config(config)
         self._fix_aux_tma_full_tile_search_config(config)
         self._fix_with_scheduler_search_config(config)
