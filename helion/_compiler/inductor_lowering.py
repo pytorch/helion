@@ -126,6 +126,11 @@ def prepare_node_lowering(
         node.meta["lowering"] = APIFuncLowering(api)
         return
 
+    backend_lowering = CompileEnvironment.current().backend.pre_inductor_lowering(node)
+    if backend_lowering is not None:
+        node.meta["lowering"] = backend_lowering
+        return
+
     if node.target in aten_lowering_dispatch:
         if node.target in {
             torch.ops.aten.argmax.default,
