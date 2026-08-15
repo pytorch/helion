@@ -24,6 +24,7 @@ from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
 from dataclasses import replace
+import logging
 import os
 import textwrap
 from typing import TYPE_CHECKING
@@ -94,6 +95,7 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from .tcgen05_constants import TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
@@ -101,6 +103,9 @@ from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from .tcgen05_constants import TCGEN05_EXPLICIT_D_STORE_BOX_N
+from .tcgen05_constants import TCGEN05_EXPLICIT_EPI_TILE_M
+from .tcgen05_constants import TCGEN05_EXPLICIT_EPI_TILE_N
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY
@@ -135,6 +140,9 @@ from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+
+log = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from ...autotuner.config_spec import MatmulFact
@@ -200,11 +208,13 @@ _MMA_REQUIRES_ACCUMULATOR_SEED_META_KEY = "cute_mma_requires_accumulator_seed"
 # identical at the default.
 _TCGEN05_PRODUCER_REGS = 120
 # 128x32 bf16 gives the validated 64 Ki-bit D-store TMA box and x32 TMEM
-# drain for the current Target1 CtaGroup.TWO diagnostic path.
+# drain for the current Target1 CtaGroup.TWO diagnostic path. Reads the shared
+# constants so the search-surface derivation (``_derive_layout_override_bundle``)
+# and this raise cannot disagree about what the one legal point is.
 _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
-    TCGEN05_TWO_CTA_BLOCK_M // 2,
-    32,
-    32,
+    TCGEN05_EXPLICIT_EPI_TILE_M,
+    TCGEN05_EXPLICIT_EPI_TILE_N,
+    TCGEN05_EXPLICIT_D_STORE_BOX_N,
 )
 
 
@@ -4042,7 +4052,11 @@ class _PerKiterTmaArgs:
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
-    """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded."""
+    """Per-K-iter TMA copy source for A; ``""`` when A is not TMA-loaded.
+
+    A only multicasts in 2-CTA mode (asymmetric vs. B, which can also
+    multicast across cluster CTAs).
+    """
     if not args.use_tma_a:
         return ""
     mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
@@ -7953,34 +7967,6 @@ def _emit_mma_pipeline(
         # SMEM-budget rejection: ``tcgen05_ab_stages=3`` +
         # productive C-input warp
         # (``tcgen05_warp_spec_c_input_warps=1`` AND non-empty
-        # ``aux_tensor_descriptors`` AND single-store fan-out
-        # gate open) is over the 232 KB B200 SMEM cap at every
-        # validated tcgen05 tile shape (canonical
-        # ``(bm=bn=256, bk=128, cluster_m=2)`` measured 263 KB
-        # used vs 232 KB cap; reducing the aux ring to
-        # ``num_stages=1`` only drops it to 246 KB, still 14 KB
-        # over). Reject loudly at MMA-codegen time so:
-        #   - explicit user configs fail with a clear message
-        #     instead of an opaque ``ptxas: uses too much
-        #     shared data`` deep inside the cute_dsl invocation;
-        #   - the autotune search-time fixup can demote
-        #     ``tcgen05_ab_stages=3`` candidates that would
-        #     otherwise trigger this raise mid-tuning (see
-        #     ``_fix_tcgen05_with_scheduler_search_config``).
-        # The predicate mirrors the productive-body aux-pipeline
-        # allocation gate at ``_emit_mma_pipeline`` below
-        # (``has_aux_producer_warp AND aux_tensor_descriptors AND
-        # aux_single_store_value``), where the aux producer is the
-        # C-input warp (SIMT or TMA) OR — under the cycle-94 merge —
-        # the store warp (TMA only). The store-warp TMA aux ring has
-        # the SAME SMEM cost as the C-input TMA ring, so ab=3 overshoots
-        # the cap identically and must be rejected for it too. When the
-        # multi-store fan-out gate closes the productive body, the aux
-        # SMEM ring + ``c_pipeline_aux`` are NOT allocated and the
-        # kernel falls back to GMEM-aux reads with no extra SMEM cost,
-        # so the rejection must NOT fire — fan-out ``ab=3 + c_input=1``
-        # paths are legal and pinned by
-        # ``test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected``.
         c_input_aux_tensor_descriptors = (
             tcgen05_matmul_plan.c_input_aux_tensor_descriptors
         )
@@ -7993,11 +7979,15 @@ def _emit_mma_pipeline(
         ab_reject_has_aux_producer_warp = tcgen05_matmul_plan.has_c_input_warp or (
             tcgen05_matmul_plan.has_store_warp and ab_reject_aux_tma_requested
         )
+        # The depth bound is ``TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES``, shared
+        # with the search-repair ``min`` in ``_fix_aux_tma_search_config`` so a
+        # future widening cannot desynchronize the two.
         if (
             ab_reject_has_aux_producer_warp
             and c_input_aux_tensor_descriptors
             and aux_single_store_value
-            and tcgen05_matmul_plan.ab_stage_count >= 3
+            and tcgen05_matmul_plan.ab_stage_count
+            > TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES
         ):
             raise exc.BackendUnsupported(
                 "cute",
@@ -8493,41 +8483,8 @@ def _emit_mma_pipeline(
             if tcgen05_matmul_plan.is_clc_persistent:
                 prefix.extend(_emit_clc_smem_setup(tcgen05_sched_plan))
             # C-input warp aux SMEM ring + ``c_pipeline_aux``
-            # ``PipelineAsync`` (``cute_plan.md`` §7.5.3.2 cycle 2
             # of the producer-body split). Fires only when the
             # productive-body gate is open: ``c_input_warp_count > 0``
-            # AND a non-empty exact-shape ``c_input_aux_tensor_descriptors``
-            # tuple. Broadcast row-vector aux loads intentionally stay on the
-            # direct per-thread path; staging them as 2-D rings burns a full
-            # epilogue tile of SMEM for a one-dimensional input. The
-            # role-local while builder in
-            # ``program_id._build_c_input_warp_role_local_while``
-            # emits the per-descriptor producer body that issues
-            # ``producer_acquire`` → cooperative
-            # ``cute.copy(GMEM, SMEM_ring[stage])`` →
-            # ``producer_commit`` against the same plan; the
-            # consumer-side splice in
-            # ``memory_ops._aux_subtile_load_source`` reads from
-            # the SMEM ring under ``consumer_wait`` /
-            # ``consumer_release`` gating. Gate-closed configs
-            # (``c_input_warps=0`` or no aux residual) skip this
-            # allocation entirely and preserve byte identity.
-            # Multi-store fan-out safety gate: the productive body
-            # only fires when every aux descriptor for this matmul
-            # comes from a single store_value_node. With fan-out
-            # (one matmul → multiple stores with different aux
-            # operands), the producer would fire
-            # ``producer_commit`` on every ring per subtile while
-            # each store's per-store-codegen consumer covers only
-            # a subset of rings — leaving the unmatched rings
-            # uncommitted and deadlocking the producer once a CTA
-            # wraps the pipeline depth. The ``store_value_node``
-            # field on ``Tcgen05AuxTensorDescriptor`` is the
-            # discriminator; the descriptor walker dedups by it
-            # already, so single-store fan-out into multiple
-            # writes of the same value gives one ``store_value_node``
-            # in the descriptor set (and the GMEM fallback path
-            # remains byte-identical to the pre-cycle-2b shape).
             c_input_aux_tensor_descriptors = (
                 tcgen05_matmul_plan.c_input_aux_tensor_descriptors
             )
@@ -9789,15 +9746,6 @@ def _emit_mma_pipeline(
                     # Initial TMA prefetch warms stages 0..ab_stage_count-1 of
                     # the AB pipeline at the START of each tile. Both the
                     # boolean full-tile predicates and the TMA copies reference
-                    # per-tile gA/gB tensors and m_offset/n_offset, so they
-                    # must stay in the work-tile body.
-                    #
-                    # In the role-local producer path, the TMA-load warp needs
-                    # its own per-tile tensor partitions and full-tile
-                    # predicates because it no longer runs the shared work-tile
-                    # loop. Tag those prerequisites together with the prefetch
-                    # IFs so the partitioner extracts one self-contained
-                    # TMA-load role body.
                     assert tma_warp is not None
                     prefetch_args = _InitialPrefetchTmaArgs(
                         tma_pipeline=tma_pipeline,
@@ -9853,10 +9801,6 @@ def _emit_mma_pipeline(
                         # Warm every stage 1..ab_stage_count-1; each gated by
                         # an ``i+1``-k_tile fits-in-K predicate. The old
                         # two-call pattern only covered stages 0 and N-1
-                        # (sufficient for ab=2 where they're the same set);
-                        # ab>=3 leaves intermediate stages unarmed and the
-                        # consumer ``consumer_wait`` deadlocks on stage 1
-                        # phase 0. See cute_plan.md §6.9.1.
                         _emit_per_tile(
                             f"{tma_initial_next_full_tile} = "
                             + _tcgen05_tma_tile_predicate(
@@ -10327,12 +10271,6 @@ def _emit_mma_pipeline(
                         )
                     )
                     if not diagnose_skip_umma_issue:
-                        # The AB pipeline's ``consumer_wait`` is a
-                        # transaction-count ``mbarrier_try_wait`` that already
-                        # orders the TMA shared stores before the UMMA load,
-                        # so an extra ``fence_view_async_shared()`` is
-                        # redundant on this pipelined path. See cute_plan.md
-                        # §6.9.2 for the cycle's bench/NCU write-up.
                         exec_loop_body.append(
                             _build_tcgen05_mma_issue_stmt(
                                 exec_active=tcgen05_plan.exec_active,
@@ -11052,6 +10990,43 @@ def _tcgen05_candidate_exceeds_smem(
     return required > budget
 
 
+_TCGEN05_SMEM_DOWNGRADE_WARNED: set[tuple[int, int, int, int, int, int]] = set()
+
+
+def _warn_tcgen05_smem_downgrade(
+    *, bm: int, bn: int, bk: int, config: object | None
+) -> None:
+    """Warn when an over-budget tcgen05 config is silently routed to ``universal``.
+
+    WARNING, not an exception, deliberately: raising would break the fail-safe and
+    """
+    if config is None:
+        return
+    ab_stages = _tcgen05_config_int(config, "tcgen05_ab_stages", 0)
+    c_stages = _tcgen05_config_int(config, "tcgen05_c_stages", 0)
+    cluster_m = _tcgen05_cluster_m(config)
+    # De-duplicate: ``_choose_mma_impl`` is consulted several times per kernel
+    # build (setup, each codegen site), and one downgrade should read as one
+    # warning rather than seven identical lines.
+    key = (bm, bn, bk, cluster_m, ab_stages, c_stages)
+    if key in _TCGEN05_SMEM_DOWNGRADE_WARNED:
+        return
+    _TCGEN05_SMEM_DOWNGRADE_WARNED.add(key)
+    log.warning(
+        "cute tcgen05 config exceeds the per-CTA SMEM budget and was DOWNGRADED to "
+        "the non-tensor-core 'universal' path: block_sizes=[%s, %s, %s] "
+        "cluster_m=%s ab_stages=%s c_stages=%s. The kernel is numerically correct "
+        "but can be ~1500-2000x slower. Reduce tcgen05_ab_stages / tcgen05_c_stages, "
+        "or halve block_k, to stay on the tcgen05 path.",
+        bm,
+        bn,
+        bk,
+        cluster_m,
+        ab_stages,
+        c_stages,
+    )
+
+
 def _choose_mma_impl(
     input_dtype: torch.dtype,
     *,
@@ -11093,6 +11068,7 @@ def _choose_mma_impl(
                 bk=bk,
                 config=config,
             ):
+                _warn_tcgen05_smem_downgrade(bm=bm, bn=bn, bk=bk, config=config)
                 return "universal"
             return env_choice
         return "universal"
@@ -11119,6 +11095,10 @@ def _choose_mma_impl(
             config=config,
         ):
             return "tcgen05"
+        if tcgen05_ok:
+            # The shape IS a legal tcgen05 shape and the hardware supports it; the
+            # ONLY reason we are falling through is the SMEM budget.
+            _warn_tcgen05_smem_downgrade(bm=bm, bn=bn, bk=bk, config=config)
     if _mma_impl_matches_problem_shape("warp", input_dtype, bm=bm, bn=bn, bk=bk):
         if support.warp_f16bf16:
             return "warp"

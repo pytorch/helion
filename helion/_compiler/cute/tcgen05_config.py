@@ -70,6 +70,8 @@ from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
+from .tcgen05_constants import TCGEN05_AUX_EDGE_SEED_BLOCK_K
+from .tcgen05_constants import TCGEN05_AUX_EDGE_SEED_BLOCK_N
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
@@ -87,6 +89,7 @@ from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_C_STORE_MODES
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_REPAIR_BLOCK_K_ORDER
+from .tcgen05_constants import TCGEN05_CLUSTER_M2_SEED_MIN_AB_STAGES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
@@ -128,6 +131,7 @@ from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
+from .tcgen05_constants import TCGEN05_STAGED_WORK_TILE_MAILBOX_SCHED_STAGES
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -178,12 +182,7 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
 
 
 class Tcgen05AbStagesSearchConstraints(NamedTuple):
-    """Search-only envelope where a deep AB pipeline is admitted.
-
-    ``per_cta_smem_budget_bytes`` is the device cap minus the CuTe
-    runtime/barrier reservation; ``per_cta_smem_capacity_bytes`` is the raw cap,
-    which ``c_stages_fits`` scores AB+C against.
-    """
+    """Search-only envelope where ``tcgen05_ab_stages=3`` is admitted."""
 
     dtype_bytes: int
     per_cta_smem_budget_bytes: int
@@ -644,12 +643,26 @@ class CuteTcgen05Config:
             ):
                 return None
         else:
-            bk = bk_fragment.high
-            while bk >= bk_fragment.low:
-                if self.cluster_m2_bk_is_valid(bk, constraints):
+            bk = None
+            for require_ab_headroom in (True, False):
+                candidate = bk_fragment.high
+                while candidate >= bk_fragment.low:
+                    if self.cluster_m2_bk_is_valid(candidate, constraints) and (
+                        not require_ab_headroom
+                        or self.ab_stages_fits(
+                            bm=TCGEN05_TWO_CTA_BLOCK_M,
+                            bn=TCGEN05_TWO_CTA_BLOCK_N,
+                            bk=candidate,
+                            cluster_m=2,
+                            ab_stages=TCGEN05_CLUSTER_M2_SEED_MIN_AB_STAGES,
+                        )
+                    ):
+                        bk = candidate
+                        break
+                    candidate //= 2
+                if bk is not None:
                     break
-                bk //= 2
-            else:
+            if bk is None:
                 return None
 
         seed_config: dict[str, Any] = {
@@ -701,7 +714,6 @@ class CuteTcgen05Config:
         )
 
     def _aux_tma_full_tile_search_enabled(self) -> bool:
-        # Cycle 46: also admit aux-TMA on full-tile cluster_m=2 problems
         # (T14/T20/T25/T28 residual_add family). The codegen-side gate at
         # ``cute_mma.py`` ``tcgen05_static_output_tiles`` already accepts
         # full-tile shapes; only the search-space gate was excluding them.
@@ -727,10 +739,30 @@ class CuteTcgen05Config:
         )
 
     def _aux_tma_seed_config(self, c_input_seed: Config) -> Config | None:
+        """The aux-TMA producer regime as a SEED, not a projection."""
         if not self._aux_tma_search_enabled():
             return None
         seed_config: dict[str, Any] = dict(c_input_seed.config)
         seed_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        # real resource decision rather than a drawn-knob overwrite: it is the
+        # foundation for the store-warp split (the store warp drains tile N's TMA-D
+        # from the ring while the 4 epi warps run tile N+1's T2R; a 2-stage ring
+        if self._aux_tma_full_tile_search_enabled():
+            config_view = self._matmul_config_view(seed_config)
+            if config_view is not None:
+                block_sizes, m_index, n_index, k_index = config_view
+                if self.c_stages_fits(
+                    bm=cast("int", block_sizes[m_index]),
+                    bn=cast("int", block_sizes[n_index]),
+                    bk=cast("int", block_sizes[k_index]),
+                    cluster_m=2,
+                    ab_stages=cast("int", seed_config.get("tcgen05_ab_stages", 2)),
+                    c_stages=TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES,
+                    has_source_c=True,
+                ):
+                    seed_config["tcgen05_c_stages"] = (
+                        TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
+                    )
         return Config(**seed_config)
 
     def _clc_persistence_seed_config(self, base_seed: Config) -> Config | None:
@@ -739,6 +771,30 @@ class CuteTcgen05Config:
         seed_config: dict[str, Any] = dict(base_seed.config)
         seed_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
             Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+        return Config(**seed_config)
+
+    def _staged_mailbox_seed_config(self, clc_seed: Config) -> Config | None:
+        """``tcgen05_sched_stage_count = 2`` as a SEED — closing a coverage gap."""
+        if not self._clc_persistence_search_enabled():
+            return None
+        seed_config: dict[str, Any] = dict(clc_seed.config)
+        if (
+            seed_config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ):
+            return None
+        if seed_config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY) is True:
+            return None
+        block_sizes = seed_config.get("block_sizes")
+        if (
+            not isinstance(block_sizes, list)
+            or len(block_sizes) < 3
+            or block_sizes[0] != TCGEN05_TWO_CTA_BLOCK_M
+        ):
+            return None
+        seed_config[TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY] = (
+            TCGEN05_STAGED_WORK_TILE_MAILBOX_SCHED_STAGES
         )
         return Config(**seed_config)
 
@@ -844,6 +900,22 @@ class CuteTcgen05Config:
         ):
             return None
         seed_config: dict[str, Any] = dict(clc_aux_tma_seed.config)
+        narrow_ab = seed_config.get("tcgen05_ab_stages")
+        narrow_c = seed_config.get("tcgen05_c_stages")
+        if not (
+            type(narrow_ab) is int
+            and type(narrow_c) is int
+            and self.c_stages_fits(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                bk=TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+                cluster_m=2,
+                ab_stages=narrow_ab,
+                c_stages=narrow_c,
+                has_source_c=self.exact_shape_aux_kernel_detected,
+            )
+        ):
+            return None
         seed_config["block_sizes"] = [
             TCGEN05_TWO_CTA_BLOCK_M,
             TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
@@ -877,6 +949,17 @@ class CuteTcgen05Config:
                     )
                     if clc_aux_tma_narrow_n_seed is not None:
                         seeds.append(clc_aux_tma_narrow_n_seed)
+                    # The STAGED WORK-TILE MAILBOX. Derived from the WIDE-N CLC aux-TMA
+                    # seed because that one carries ``bm == 256``; the narrow-N variant
+                    # carries ``bm == 256`` too, but seeding both would put two configs
+                    # differing in one diagnostic key into the population. See
+                    # ``_staged_mailbox_seed_config`` for why the extra envelope terms are
+                    # CHECKED there rather than written.
+                    staged_mailbox_seed = self._staged_mailbox_seed_config(
+                        clc_aux_tma_seed
+                    )
+                    if staged_mailbox_seed is not None:
+                        seeds.append(staged_mailbox_seed)
         return seeds
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
@@ -956,14 +1039,8 @@ class CuteTcgen05Config:
             block_sizes[k_index] = repaired_bk
             bk = repaired_bk
         config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
-        # The tcgen05 CtaGroup.TWO MMA path does not emit the per-block-id
-        # indices/masks that a fused epilogue subtile needs, so a sampled
-        # ``epilogue_subtile`` on a cluster_m=2 candidate raises
-        # ``BackendUnsupported`` at codegen. Drop it here (rather than letting
-        # the candidate fail to compile and waste autotune budget) -- every
-        # cluster_m=2 search candidate that survives to this point is committed
-        # to the 2-CTA path.
-        config.pop("epilogue_subtile", None)
+        # unconditionally, at the top of ``fix_search_config`` -- the key is incompatible
+        # cluster_m=2 ones, so a cluster_m-scoped pop was hiding a subset of the failures.
         # ── The fp8 small-grid family is a SCOPE EXCLUSION, not a special case ──
         sampled_bm = block_sizes[m_index]
         fp8_small_grid_family = (
@@ -1576,125 +1653,85 @@ class CuteTcgen05Config:
         elif strategy == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value:
             if scheduler_warps != 1:
                 config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
-
-    def _is_validated_cluster_m2_full_tile_search_candidate(
-        self, config: dict[str, object]
-    ) -> bool:
-        # Cycle 46: full-tile cluster_m=2 candidate gate for aux-TMA admission.
-        # After ``_fix_cluster_m2_search_config`` projects a full-tile sample to
-        # the canonical 256x256x bk shape with ``persistent_interleaved`` pid,
-        # this returns True so aux-TMA stays during the search-time fixup.
-        # bk validity is already enforced by ``_fix_cluster_m2_search_config``;
-        # we re-check it here so a stale/unprojected config cannot slip through.
-        if config.get("tcgen05_cluster_m") != 2:
-            return False
-        constraints = self.cluster_m2_search_constraints
-        if constraints is None or constraints.allow_edge_k_tail_family:
-            return False
-        if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
-            return False
-        if config.get("tcgen05_cluster_n", 1) != 1:
-            return False
-        config_view = self._matmul_config_view(config)
-        if config_view is None:
-            return False
-        block_sizes, m_index, n_index, k_index = config_view
-        if block_sizes[m_index] != TCGEN05_TWO_CTA_BLOCK_M:
-            return False
-        if block_sizes[n_index] != TCGEN05_TWO_CTA_BLOCK_N:
-            return False
-        bk = block_sizes[k_index]
-        if not isinstance(bk, int) or isinstance(bk, bool):
-            return False
-        return self.cluster_m2_bk_is_valid(bk, constraints)
+            # ⚠ THE ``ab >= 3 => c_input_warps = 0`` GUARD MOVED OUT OF THIS STAGE
+            # which runs AFTER the AB depth walk. Here it read ``tcgen05_ab_stages``
+            # before ``_fix_ab_stages_search_config`` had settled it, which cost this
 
     def _fix_aux_tma_search_config(self, config: dict[str, object]) -> None:
+        """Complete the aux-TMA regime a config REQUESTED, or decline it.
+
+        | ``c_input_warps = 1`` | **required by the determinator** | ``tma`` with no producer warp raises ``BackendUnsupported`` ("requires a productive aux producer warp") — nobody issues the copy. NOT a derivation: under ``simt`` the key is a real axis (see below), so this write is scoped to the ``tma`` arm alone |
+        | ``ab_stages = min(ab, CAP)`` | **required by the determinator** | the aux SMEM ring + AB pipeline overshoot the 232 KB B200 cap past the cap depth; ``cute_mma.py`` raises. A ``min`` so it can only ever LOWER the key |
+        """
         if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) != TCGEN05_AUX_LOAD_MODE_TMA:
             return
-        if not self._aux_tma_search_enabled():
-            config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+        if self._aux_tma_request_is_satisfiable(config):
+            # Supply exactly the two values ``aux_load_mode=tma`` cannot run
+            # without. Both are unconditional inside this arm: writing the value
+            # the request requires is completing the request, not steering it.
+            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
+            ab_stages = config.get("tcgen05_ab_stages")
+            if type(ab_stages) is int:
+                config["tcgen05_ab_stages"] = min(
+                    ab_stages, TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES
+                )
             return
-        # Aux-TMA is kept when the projected cluster_m=2 candidate matches either
-        # the validated edge+K-tail shape or the cycle-46 full-tile shape, and
-        # the strategy is the ROLE_LOCAL_WITH_SCHEDULER + c-input warp combo that
-        # the aux-TMA producer warp requires.
-        if not self._is_with_scheduler_c_input_config(config):
-            config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
-            return
-        if not (
-            self._is_validated_cluster_m2_edge_search_candidate(config)
-            or self._is_validated_cluster_m2_full_tile_search_candidate(config)
-        ):
-            config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+        config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
 
-    def _fix_aux_tma_full_tile_search_config(self, config: dict[str, object]) -> None:
-        # Cycle 88 (Workstream B): on the residual full-tile cluster_m=2
-        # family (T20/T14/T25/T28 — exact-shape-gated by
-        # ``_aux_tma_full_tile_search_enabled``), project every cluster_m=2
-        # candidate onto the validated aux-TMA producer regime
-        # (role_local_with_scheduler + scheduler/c-input warp + ab=2 +
-        # aux_load_mode=tma). Clean force-config measurements show aux-TMA
-        # strictly beats the same-config SIMT control on this family (T20
-        # 962.6 vs 844.0 TF = +14%; T25 730.8 vs 324.7 TF = +125%) and also
-        # beats the autotuner's default monolithic-ab=3 SIMT pick (T20 ~915
-        # TF). Without this projection the population search either keeps the
-        # monolithic-ab=3 SIMT region (T20 reliably) or randomly lands on a
-        # catastrophic SIMT cluster_m=2 pick (T25 variance: 756 aux-TMA vs 286
-        # SIMT), so the +2.4-14 pp aux-TMA gain is not banked deterministically.
-        # This is the aux-TMA analogue of the FFI direct-entry search
-        # projection (``_fix_target1_tvm_ffi_search_config``). Tightly bounded:
-        # cluster_m=1 candidates are left untouched (search still explores
-        # them), the edge+K-tail T12 family keeps its own
-        # ``_aux_tma_edge_search_enabled`` CLC path, and the gate fires only
-        # when ``exact_shape_aux_kernel_detected`` is True (residual subset
-        # only — no non-residual target is perturbed).
-        if not self.search_enabled:
-            return
-        if not self._aux_tma_full_tile_search_enabled():
-            return
-        if config.get("tcgen05_cluster_m") != 2:
-            return
-        if not self._is_validated_cluster_m2_full_tile_search_candidate(config):
-            return
-        # ab=2 is the aux-TMA producer's validated stage depth for this family
-        # (the aux SMEM ring forces ab<=2 under the 232 KB B200 cap; the
-        # cycle-86/88 measurements ran at ab=2). ``_c_input_seed_config``
-        # already emits exactly this regime as a seed, so the shape envelope
-        # validated above is sufficient — no extra SMEM-fit check is needed.
-        config[TCGEN05_STRATEGY_CONFIG_KEY] = (
-            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
-        )
-        config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
-        config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
-        config["tcgen05_ab_stages"] = 2
-        config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
-        # Workstream A Stage 2 (cycle 90): give this family the deeper C-store
-        # ring (foundation for the Stage-4 store-warp split — the store warp
-        # drains tile N's TMA-D from the ring while the 4 epi warps run tile
-        # N+1's T2R; a 2-stage ring leaves no slack). At ab=2 the c=4 ring fits
-        # (128 KB AB + 64 KB C = 192 KB < 232 KB cap; the DEFAULT epi tile is
-        # (128, 64), so each C stage is 16 KB), confirmed correct on T20
-        # (cycle-90 force-config: c=2 942.2 TF vs c=4 936.1 TF — perf-neutral
-        # standalone, exactly the cycle-89 NCU prediction since the TMA-D store
-        # is already c_pipeline-overlapped). Gated by ``c_stages_fits`` so a
-        # future ab=3 candidate in this family cannot be lifted into overflow.
-        config_view = self._matmul_config_view(config)
-        if config_view is None:
-            return
-        block_sizes, m_index, n_index, k_index = config_view
-        if self.c_stages_fits(
-            bm=cast("int", block_sizes[m_index]),
-            bn=cast("int", block_sizes[n_index]),
-            bk=cast("int", block_sizes[k_index]),
-            cluster_m=2,
-            ab_stages=2,
-            c_stages=TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES,
-            has_source_c=True,
+    def _aux_tma_request_is_satisfiable(self, config: dict[str, object]) -> bool:
+        """Can an ``aux_load_mode=tma`` request be completed on *config*?
+
+        Every clause is a **precondition** — a fact or a knob this stage refuses to
+        write. False means the request must be declined (demoted to SIMT), because
+        no value this stage is willing to supply can rescue it.
+        """
+        # PRECONDITION-FACT: the family. All four of §3's eligibility terms
+        # (``exact_shape_aux_kernel_detected``, no leading passthrough, cm2
+        # constraints exist, edge-vs-full-tile) already live inside this one
+        # accessor; do not re-implement them here.
+        if not self._aux_tma_search_enabled():
+            return False
+        # Checked, never written: the explicit epilogue tile is incompatible with a
+        # productive aux producer warp (cute_mma.py raises on that pairing).
+        if (
+            config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
         ):
-            config["tcgen05_c_stages"] = TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
+            return False
+        # PRECONDITION-KNOB: only ROLE_LOCAL_WITH_SCHEDULER's 7-role/8-launched warp
+        # shape has the inert padding slot the aux producer occupies. The other two
+        # strategies are fully-populated 6-warp shapes, so
+        if (
+            config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        ):
+            return False
+        # PRECONDITION-KNOB: ``scheduler_warps`` is strategy-DETERMINED
+        # (``_STRATEGY_REQUIRED_SCHEDULER_WARPS``, read as an equality test in
+        # ``validate_tcgen05_strategy_invariants``), and stage 5 already derives it
+        # on the search path. Checked rather than written so this stage stays out of
+        # the warp-topology business; an explicit config that disagrees with its own
+        # strategy is declined rather than silently repaired here.
+        if config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY) != 1:
+            return False
+        # PRECONDITION-KNOB: ``c_input_warps`` and ``store_warps`` share the SINGLE
+        # padding slot, so ``c_input + store > 1`` is rejected by
+        # ``validate_tcgen05_strategy_invariants`` (``role_warp_count`` would sum to
+        # 9, rounding the launch to 12 warps / 384 threads). A drawn config cannot
+        # reach this — ``strategy_autotune_fragments`` pins ``store_warps`` to
+        # ``(0,)`` — but this stage also runs on explicit configs and cache
+        # transfers, where a store warp is expressible. With one live, the aux
+        # producer has no slot, so the request is declined rather than made illegal.
+        if config.get(TCGEN05_WARP_SPEC_STORE_WARPS_KEY, 0) != 0:
+            return False
+        #
+        # Evaluated as a PRECONDITION of the write arm rather than as a trailing
+        # demotion, which is a deliberate change of position. As a trailing clause
+        return config.get("tcgen05_cluster_n", 1) == 1
 
     @staticmethod
     def _is_with_scheduler_c_input_config(config: dict[str, object]) -> bool:
+        """The full aux-TMA producer trio, as a READ-ONLY predicate."""
         return (
             config.get(TCGEN05_STRATEGY_CONFIG_KEY)
             == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
@@ -1716,6 +1753,24 @@ class CuteTcgen05Config:
             return False
         return capability[0] >= 10 and "flat" in self.allowed_pid_types
 
+    def _clc_persistence_codegen_supported(self) -> bool:
+        """Can a CLC-persistent kernel be EMITTED on this shape at all?
+
+        (``strategies.py``'s persistence arch gate raises below it).
+        """
+        if self.cluster_m2_search_constraints is None:
+            return False
+        capability = self.config_spec.target_device_capability
+        if capability is None:
+            return False
+        # ``"flat" in allowed_pid_types`` is the FORCE-PERSISTENT DETECTOR, not a claim
+        # that CLC wants a flat pid. ``autotune_force_persistent`` (or an initialized
+        # process group) disallows ``flat``/``xyz`` in ``compile_environment.py``, and
+        # the persistence axis this gate opens is built from
+        # ``derive_persistence_model_from_pid_type``, which cannot offer
+        # ``NON_PERSISTENT`` once those are gone -- so the axis must stay hidden there.
+        return capability[0] >= 10 and "flat" in self.allowed_pid_types
+
     def _is_clc_aux_tma_request(self, config: dict[str, object]) -> bool:
         return (
             config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
@@ -1729,30 +1784,8 @@ class CuteTcgen05Config:
             config
         ) and self._is_validated_clc_persistence_search_candidate(config)
 
-    def _is_clc_aux_tma_narrow_n_request(self, config: dict[str, object]) -> bool:
-        block_sizes = config.get("block_sizes")
-        if not (
-            isinstance(block_sizes, list)
-            and len(block_sizes) >= 3
-            and block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
-            and self._is_clc_aux_tma_request(config)
-        ):
-            return False
-        projected_config = dict(config)
-        projected_block_sizes = list(block_sizes)
-        projected_config["block_sizes"] = projected_block_sizes
-        projected_config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
-        projected_block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
-        projected_block_sizes[2] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
-        if (
-            self.aux_kernel_detected
-            and self._has_any_matmul_fact_edge_tile(projected_config)
-            and projected_config.get(TCGEN05_STRATEGY_CONFIG_KEY)
-            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
-        ):
-            projected_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
-            projected_config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
-        return self._is_validated_clc_persistence_search_candidate(projected_config)
+    # the two writes it gated in ``_fix_cluster_m2_search_config``: the narrow K pin and the
+    # narrow ``acc_stages``/``l2_groupings`` arm of the L cascade. It had no other caller.
 
     def implicit_default_keys_to_preserve(self, config: dict[str, object]) -> set[str]:
         if not self._is_clc_aux_tma_config(config):
@@ -1850,59 +1883,31 @@ class CuteTcgen05Config:
             return
         raise InvalidConfig(
             "tcgen05_ab_stages > 3 is only supported by the validated "
-            "TVM-FFI direct-entry path, the grouped N,M worklist "
-            "path within the SMEM budget, or fp8 within the SMEM budget"
+            "TVM-FFI direct-entry path, a 16-bit cluster_m=2 DEFAULT-layout "
+            "tile within the SMEM budget, or fp8 within the SMEM budget"
         )
 
     def _is_validated_clc_persistence_search_candidate(
         self, config: dict[str, object]
     ) -> bool:
-        if not self._clc_persistence_search_enabled():
+        if not self._clc_persistence_codegen_supported():
             return False
-        if not self._is_validated_cluster_m2_edge_search_candidate(config):
+        # ``cluster_m == 2`` ONLY -- not the aux/edge family tag this used to read
+        # through ``_is_validated_cluster_m2_edge_search_candidate``. CLC needs the
+        # clustered shape (the query publishes to peer CTAs, and the staged-mailbox
+        # assert wants ``cluster_m > 1``); it does not need an aux tensor or an output
+        # edge. Verified bit-exact with CLC emitted on a plain full-tile 4096^3 matmul.
+        if config.get("tcgen05_cluster_m") != 2:
             return False
         if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
             return False
         if config.get("tcgen05_cluster_n", 1) != 1:
             return False
-        if not self._is_with_scheduler_c_input_config(config):
-            return False
-        block_sizes = config.get("block_sizes")
-        if not isinstance(block_sizes, list) or len(block_sizes) < 3:
-            return False
-        if block_sizes[0] != TCGEN05_TWO_CTA_BLOCK_M:
-            return False
-        if block_sizes[1] not in (
-            TCGEN05_TWO_CTA_BLOCK_N,
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
-        ):
-            return False
-        is_narrow_n = block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
-        if is_narrow_n:
-            if not self._has_any_matmul_fact_n_edge_for_block_n(
-                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
-            ):
-                return False
-            if (
-                config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
-                != TCGEN05_AUX_LOAD_MODE_TMA
-            ):
-                return False
-            if block_sizes[2] not in (
-                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
-                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
-            ):
-                return False
-        elif block_sizes[2] != TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K:
-            return False
-        if self.config_spec.supports_config_key("indexing"):
-            indexing = config.get("indexing")
-            if (
-                not isinstance(indexing, list)
-                or indexing != ["tensor_descriptor"] * self.config_spec.indexing.length
-            ):
-                return False
-        return True
+        return (
+            config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            and config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY) == 1
+        )
 
     def _fix_clc_persistence_search_config(self, config: dict[str, object]) -> None:
         if (
@@ -2008,13 +2013,12 @@ class CuteTcgen05Config:
         if key == TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY:
             return True, 0
         if key == TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY:
-            # The autotuner search surface for this key is the collapsed
-            # ``EnumFragment((True,))``; autotuner-generated configs always
-            # set it via ``default_flat()`` mutation. ``flatten`` only hits
-            # this branch on user-supplied configs that omit the key, where
-            # absence means "no FFI promotion requested" — matches the
+            # The search surface for this key draws False only
+            # (``EnumFragment((True, False), search_choices=(False,))``), so an
+            # absent key can only come from a config that did not go through the
+            # search: a user-supplied config, a partial seed, or a cache entry.
+            # Absence there means "no FFI promotion requested" — matching the
             # validation-view default and the special case at
-            # ``normalize_pre_pid_type``.
             return True, False
         if key != TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY:
             return False, None
@@ -2062,6 +2066,43 @@ class CuteTcgen05Config:
             for i in range(len(self.config_spec.matmul_facts))
         )
 
+    def _matmul_fact_has_double_edge_output(
+        self, config: dict[str, object], *, fact_index: int
+    ) -> bool:
+        """``M % bm != 0`` AND ``N % bn != 0`` on the DRAWN tile.
+
+        raise BackendUnsupported("tcgen05 SIMT edge epilogue double-edge output
+        Two things this deliberately does NOT do, both because codegen does not:
+        """
+        # Every unreadable case answers the same way -- an axis we cannot read is an axis
+        # we cannot PROVE partial, and this predicate gates a DEMOTION, so it fails toward
+        # NOT demoting. That makes the whole body one comprehension over the two axes.
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            return False
+        fact = self.config_spec.matmul_facts[fact_index]
+
+        def axis_is_partial(static_size: int | None, block_id: int | None) -> bool:
+            index = self._config_block_index(block_id)  # None if absent/unregistered
+            if static_size is None or index is None or index >= len(block_sizes):
+                return False
+            block_size = block_sizes[index]
+            if type(block_size) is not int or block_size <= 0:
+                return False  # ``type(...) is int`` also rejects bool
+            return static_size % block_size != 0
+
+        return axis_is_partial(fact.static_m, fact.m_block_id) and axis_is_partial(
+            fact.static_n, fact.n_block_id
+        )
+
+    def _has_any_matmul_fact_double_edge_output(
+        self, config: dict[str, object]
+    ) -> bool:
+        return any(
+            self._matmul_fact_has_double_edge_output(config, fact_index=i)
+            for i in range(len(self.config_spec.matmul_facts))
+        )
+
     def _has_any_matmul_fact_n_edge_for_block_n(self, block_n: int) -> bool:
         for fact in self.config_spec.matmul_facts:
             if fact.static_n is None or fact.n_block_id is None:
@@ -2076,78 +2117,82 @@ class CuteTcgen05Config:
                 return True
         return False
 
-    def _fix_aux_edge_search_config(self, config: dict[str, object]) -> None:
-        if not (self.search_enabled and self.aux_kernel_detected):
-            return
-        if not self._has_any_matmul_fact_edge_tile(config):
-            return
+    def aux_edge_seed_shape_eligible(self) -> bool:
+        """Shape-structural eligibility for the aux-edge SEED (§2.3)."""
+        if not self.aux_kernel_detected:
+            return False
+        probe: dict[str, object] = {
+            "block_sizes": self._aux_edge_seed_block_sizes(),
+        }
+        if not isinstance(probe["block_sizes"], list):
+            return False
+        return self._has_any_matmul_fact_edge_tile(probe)
 
-        if self._is_validated_cluster_m2_edge_search_candidate(config):
-            self._set_aux_edge_cluster_m2_prefix(config)
-            return
-
-        self._set_aux_edge_monolithic_prefix(config)
-        config["tcgen05_acc_stages"] = 2
-        config["tcgen05_c_stages"] = 4
-        config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
-        if isinstance(config.get("l2_groupings"), list):
-            config["l2_groupings"] = [1]
-        if isinstance(config.get("indexing"), list):
-            indexing = cast("list[object]", config["indexing"])
-            for i in range(len(indexing)):
-                indexing[i] = "pointer"
-        block_sizes = config.get("block_sizes")
-        if not isinstance(block_sizes, list):
-            return
-        for fact in self.config_spec.matmul_facts:
-            if fact.static_m is not None and fact.m_block_id is not None:
-                try:
-                    m_idx = self.config_spec.block_sizes.block_id_to_index(
-                        fact.m_block_id
-                    )
-                except KeyError:
-                    m_idx = -1
-                if 0 <= m_idx < len(block_sizes):
-                    bm = block_sizes[m_idx]
-                    if (
-                        isinstance(bm, int)
-                        and not isinstance(bm, bool)
-                        and bm > 128
-                        and fact.static_m % bm != 0
-                    ):
-                        block_sizes[m_idx] = 128
-            # K-only bk=128 tails keep the default A SMEM atom; output-edge
-            # bk=128 fallback is handled in cute_mma by forcing A INTER.
-            # Both cases have runtime coverage in test_cute_lowerings.
-
-    @staticmethod
-    def _set_aux_edge_monolithic_prefix(config: dict[str, object]) -> None:
-        config[TCGEN05_STRATEGY_CONFIG_KEY] = (
-            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+    def _aux_edge_seed_block_sizes(self) -> list[int] | None:
+        """The seed's tile."""
+        return self._matmul_seed_block_sizes(
+            bm=TCGEN05_ONE_CTA_MAX_BLOCK_M,
+            bn=TCGEN05_AUX_EDGE_SEED_BLOCK_N,
+            bk=TCGEN05_AUX_EDGE_SEED_BLOCK_K,
         )
-        config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
-        config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
-        if config.get("tcgen05_ab_stages") == 1:
-            config["tcgen05_ab_stages"] = 2
-        config.pop("epilogue_subtile", None)
+
+    def aux_edge_seed_config(self) -> Config | None:
+        """The aux-edge PERF regime, as a competing seed instead of a projection."""
+        block_sizes = self._aux_edge_seed_block_sizes()
+        if block_sizes is None:
+            return None
+        seed: dict[str, object] = {
+            "block_sizes": block_sizes,
+            TCGEN05_STRATEGY_CONFIG_KEY: (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value),
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 0,
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 0,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 4,
+            "tcgen05_ab_stages": 2,
+            TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
+            "l2_groupings": [1],
+        }
+        if self.config_spec.indexing.length > 0:
+            # Kernel-wide TMA addressing off, matching the regime this seed
+            # encodes. Unlike the stage's blanket rewrite this is a SEED value on
+            # a fresh config, so it strands nothing: the search still draws every
+            # other ``indexing`` combination.
+            seed["indexing"] = ["pointer"] * self.config_spec.indexing.length
+        try:
+            return Config(**seed)  # type: ignore[arg-type]
+        except (InvalidConfig, ValueError, TypeError, KeyError):
+            return None
 
     @staticmethod
-    def _set_aux_edge_cluster_m2_prefix(config: dict[str, object]) -> None:
-        if (
+    def _set_aux_edge_prefix(
+        config: dict[str, object], *, allow_with_scheduler: bool
+    ) -> None:
+        """The aux-edge LEGALITY prefix — one entry point, hoisted (§2.3).
+
+        MONOLITHIC with both warp counts 0, which is the only accept set for that
+        """
+        if allow_with_scheduler and (
             config.get(TCGEN05_STRATEGY_CONFIG_KEY)
             == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
         ):
             config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
             config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
-            config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = (
-                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
-            )
+            # the entry in ``tcgen05_two_cta_edge_k_tail_seed_overrides()``). The two
+            # had to go as a PAIR and the ordering is why:
         else:
-            CuteTcgen05Config._set_aux_edge_monolithic_prefix(config)
-            return
-        if config.get("tcgen05_ab_stages") == 1:
-            config["tcgen05_ab_stages"] = 2
-        config.pop("epilogue_subtile", None)
+            # ab=2 is the aux-TMA producer's validated stage depth for this family
+            # (the aux SMEM ring forces ab<=2 under the 232 KB B200 cap; the
+            # cycle-86/88 measurements ran at ab=2). ``_c_input_seed_config``
+            # already emits exactly this regime as a seed, so the shape envelope
+            # validated above is sufficient — no extra SMEM-fit check is needed.
+            config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+            )
+            config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+            config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
+        # aux-edge PERF regime now enters the population as ``aux_edge_seed_config``,
+        # which already carries ``tcgen05_ab_stages=2``, so raising a drawn ab=1 was
+        # redundant steering rather than legality: codegen has no ``ab >= 2``
 
     def _is_validated_cluster_m2_edge_search_candidate(
         self, config: dict[str, object]
@@ -2190,6 +2235,9 @@ class CuteTcgen05Config:
             and config.get("pid_type")
             in {"persistent_blocked", "persistent_interleaved"}
         ):
+            # persistent_interleaved stays in the flat enum so cluster_m=2
+            # edge-family samples can encode; cluster_m=1 samples from the
+            # same surface must use the validated flat edge fallback.
             config["pid_type"] = "flat"
 
     def restrict_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
@@ -2294,6 +2342,15 @@ class CuteTcgen05Config:
             # Validation admits the dtype's deepest AB pipeline; the depth walk trims it.
             constraints = self.ab_stages_search_constraints
             if constraints is None:
+                # Cycle 97: make ab=3 BUDGET-AWARE-SEARCHABLE. Where the device/dtype
+                # admits ab=3 at all (the SMEM-budget constraints were recorded by
+                # ``allow_ab_stages_three_search`` at bind time — B200-class optin cap,
+                # bf16/fp16), lift the ``for_search`` cap to 3 so the autotuner can
+                # SAMPLE ab=3 directly instead of reaching it only through the per-shape
+                # FFI / gelu seeds. ``_fix_ab_stages_search_config`` then demotes any
+                # sampled ab=3 that does not fit (the residual/source-C ring overflows;
+                # cluster_m=1 256x256 overflows bare-AB) before codegen, so admission is
+                # free but an overflowing kernel is never generated.
                 ab_stages_max = 3
             else:
                 ab_stages_max = self._get_dtype_ab_stages_hard_cap(
@@ -2576,6 +2633,16 @@ class CuteTcgen05Config:
             TCGEN05_AUX_STAGES_CONFIG_KEY: EnumFragment(TCGEN05_AUX_STAGE_COUNT_CHOICES)
         }
 
+    def sched_stage_count_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
+        """Per-config depth of the CLC scheduler's SMEM work-tile mailbox."""
+        if not self._clc_persistence_search_enabled():
+            return {}
+        return {
+            TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY: EnumFragment(
+                TCGEN05_SCHED_STAGE_COUNTS
+            )
+        }
+
     def consumer_regs_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         """Per-config consumer-warp ``setmaxregister_increase`` ceiling knob.
 
@@ -2600,7 +2667,10 @@ class CuteTcgen05Config:
         }
 
     def persistence_model_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
-        if not self._clc_persistence_search_enabled():
+        # Paired with stage 10's ``_is_validated_clc_persistence_search_candidate``:
+        # both read ``_clc_persistence_codegen_supported``, so the surface offers
+        # ``clc_persistent`` exactly where the repair will let it stand.
+        if not self._clc_persistence_codegen_supported():
             return {}
         default_model = derive_persistence_model_from_pid_type(
             self.allowed_pid_types[0]
@@ -2851,6 +2921,11 @@ class CuteTcgen05Config:
                     else:
                         config[key] = optional_search_fragments[key].default()
             self._clamp_l2_swizzle_size_to_shape(config)
+            # ── SETTLE THE LAYOUT GROUP BEFORE JUDGING AB DEPTH ──
+            #
+            # ``_validate_direct_entry_ab_stage_envelope`` below reads
+            if fix_invalid:
+                self._settle_layout_group(config)
             self._validate_direct_entry_ab_stage_envelope(
                 config, fix_invalid=fix_invalid
             )
@@ -3176,22 +3251,49 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
-        self._fix_aux_edge_search_config(config)
+        # epilogue_subtile is incompatible with EVERY tcgen05 matmul config: the FX split
+        # clones the store per piece, and a tcgen05-fed store off the splice whitelist hits
+        # the SIMT fallback, which needs indices_<n>/mask_<n> names the tcgen05 grid never
+        # binds (memory_ops.py:1644 raises BackendUnsupported).
+        if self.search_enabled and self.matmul_block_ids is not None:
+            # The tcgen05 CtaGroup.TWO MMA path does not emit the per-block-id
+            # indices/masks that a fused epilogue subtile needs, so a sampled
+            # ``epilogue_subtile`` on a cluster_m=2 candidate raises
+            # ``BackendUnsupported`` at codegen. Drop it here (rather than letting
+            # the candidate fail to compile and waste autotune budget) -- every
+            # cluster_m=2 search candidate that survives to this point is committed
+            # to the 2-CTA path. The edge-family prefixes below also pop it for
+            # their sub-paths; doing it once here covers the full-tile and
+            # small-grid paths too.
+            config.pop("epilogue_subtile", None)
+        # The FFI repair runs FIRST, before the cluster_m=2 block shaping. It
+        # only rewrites the FFI-only controls + layout keys, so the shaping below
+        # then sees a settled layout: a repaired candidate is DEFAULT-layout and
+        # so its sampled bn<=128 can snap to the un-seeded [256,128,*] tile,
+        # instead of being forced to 256 by the ``layout == DEFAULT`` guard in
+        # ``_fix_cluster_m2_search_config`` reading a pre-repair
+        # ``explicit_epi_tile``. (When this ran after the shaping, every repaired
+        # candidate landed on the already-seeded 256x256 tile.)
+        self._fix_target1_tvm_ffi_search_config(config)
         self._fix_cluster_m2_search_config(config)
         self._fix_cluster_m1_persistent_search_config(config)
-        self._fix_ab_stages_search_config(config)
-        self._fix_target1_tvm_ffi_search_config(config)
-        self._fix_aux_tma_full_tile_search_config(config)
+        # ── NO AUX-EDGE STAGE ──
+        #
+        # c_input_warps=0)`` on an aux kernel whose tile left a partial tile on BOTH M
         self._fix_with_scheduler_search_config(config)
         self._fix_aux_tma_search_config(config)
-        # Cycle 97: budget-aware ab-stages admission for the lifted for_search
-        # cap. Runs after the family projections (FFI / gelu / aux-TMA full-tile)
-        # have set their validated stage tuple, so a directly-SAMPLED ab=3 that no
-        # projection claimed — and that does not fit (residual/source-C ring
-        # overflow, or cluster_m=1 256x256 bare-AB overflow) — is demoted to 2 on
-        # the DEFAULT-layout full-tile path before codegen. The plain silu/gelu
-        # ab=3 winner (no source-C, cluster_m=2) is preserved.
+        # Budget-aware ab-stages admission for the lifted for_search cap, and the
+        # ONLY AB-depth budget walk on this path (it absorbed the old bare-AB
+        # ``ab == 3``-exactly stage). Runs after the family projections (FFI / gelu
+        # / aux-TMA full-tile) have set their validated stage tuple AND after the
+        # cluster_m=2 shaping, so it judges the tile that actually reaches codegen:
+        # a directly-SAMPLED ab>=3 that no projection claimed and that does not fit
         self._fix_ab_stages_search_config(config)
+        # Immediately AFTER the depth walk, on purpose: it judges the aux producer warp
+        # against the SETTLED ``tcgen05_ab_stages``. Moved out of
+        # ``_fix_with_scheduler_search_config`` (2026-08-10), whose early position made that
+        # read stale and cost the pipeline its fixed point.
+        self._fix_aux_producer_depth_feasibility_search_config(config)
         # Final c-stages admission: demote a directly-sampled (or any unclaimed)
         # deeper C ring on the canonical 256x256 DEFAULT-layout path that does
         # not fit AB+C under the B200 cap. Runs after the family fixups so their
@@ -3201,6 +3303,9 @@ class CuteTcgen05Config:
         # CLC admission depends on the projected cluster/pid/strategy tuple
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)
+        # together with the method. It cleared ``tvm_ffi_launch`` when the FINAL tile would
+        # not lower on tcgen05, mirroring ``cute/backend.py``'s raise (``--enable-tvm-ffi``
+        # is emitted only for a kernel whose specialized MMA plan is ``tcgen05``).
         self._validate_sched_stage_count_config(config, fix_invalid=True)
 
     def normalize_strategy(
@@ -3333,6 +3438,7 @@ class CuteTcgen05Config:
         fields.update(self.strategy_autotune_fragments())
         fields.update(self.aux_load_mode_autotune_fragments())
         fields.update(self.aux_stages_autotune_fragments())
+        fields.update(self.sched_stage_count_autotune_fragments())
         fields.update(self.consumer_regs_autotune_fragments())
         fields.update(self.persistence_model_autotune_fragments())
         if self.config_spec.supports_config_key("pid_type"):

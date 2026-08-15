@@ -1493,10 +1493,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self.env.restrict_pid_types_for_persistent(args)
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
-                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
-                    self.env,
-                    self.host_function.device_ir,
-                )
 
                 # Post-compile FX-graph scan to detect kernels
                 # whose tcgen05 matmul is followed by an
@@ -1537,6 +1533,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
                     host_function_matmul_has_non_tcgen05_operand(self.host_function)
+                )
+
+                # Seed generation runs AFTER the detectors above, deliberately: a
+                # seed heuristic's ``is_eligible`` may key on the aux-kernel facts
+                # (e.g. ``CuteTcgen05AuxEdgeHeuristic``), and when this ran first
+                # those flags were still at their ``False`` defaults, so such a
+                # heuristic silently never fired. The detectors need only
+                # ``self.host_function``, which is available here, so ordering them
+                # first is free.
+                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
+                    self.env,
+                    self.host_function.device_ir,
                 )
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():

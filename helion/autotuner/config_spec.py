@@ -336,22 +336,25 @@ class MemoryOpFact(NamedTuple):
     # ``subscript_block_ids`` (from ``.stride()``). A stride-1 position is the contiguous (coalescing)
     # axis — the last subscript for a row-major tensor, a different one for a transposed/strided view.
     subscript_strides: tuple[int, ...] = ()
-    # GATHER stride per subscript position: the multiplier on the tile index in the op's
-    # ADDRESS expression (``x[tile]`` → 1, ``x[2*tile.index]`` → 2). Independent of
-    # ``subscript_strides``, the accessed tensor's LAYOUT stride -- two ops can index the
-    # same row-major tensor while one reads it stride-2 and the other stride-1. A stride-k
-    # gather wastes ``1 - 1/k`` of every 32B sector, so this is the coalescing signal;
-    # 1 means coalesced or unknown. See ``indexing_strategy.subscript_index_scale``.
+    # GATHER stride per subscript position: the multiplier on the tile index in the op's ADDRESS
+    # expression (``x[tile]`` → 1, ``x[2*tile.index]`` → 2), aligned 1:1 with
+    # ``subscript_block_ids``. Independent of ``subscript_strides``, which is the accessed tensor's
+    # LAYOUT stride: two ops can index the same row-major tensor (layout stride 1) while one reads
+    # it stride-2 and the other stride-1 (sglang's interleaved vs non-interleaved silu_and_mul). A
+    # stride-k gather wastes ``1 - 1/k`` of every 32B sector, so this is the coalescing-efficiency
+    # signal; 1 means coalesced or unknown. See ``indexing_strategy.subscript_index_scale``.
     subscript_index_scales: tuple[int, ...] = ()
     # Size-hinted extent at each subscript position. With ``subscript_affine_block_ids``
     # this gives the tile ONE op materializes: the product of extents at non-tiled
     # positions (a tiled position contributes its block size). Distinct from
     # ``accessed_numel``, a per-TENSOR count that also grows for an oversized tensor.
     subscript_extents: tuple[int, ...] = ()
-    # Block-ids resolved THROUGH an affine (scaled/offset) subscript.
-    # ``subscript_block_ids`` reads ``meta["tile_with_offset"]``, which the lowering sets
-    # for ``tile_index + const`` but not ``tile_index * const``, so a scaled subscript
-    # loses its axis there. Separate field so existing consumers are unaffected.
+    # Block-ids resolved through an affine (scaled/offset) subscript, aligned 1:1 with
+    # ``subscript_block_ids`` and non-``None`` wherever the axis is recoverable at all.
+    # ``subscript_block_ids`` reads ``meta["tile_with_offset"]``, which the lowering sets for
+    # ``tile_index + const`` but NOT for ``tile_index * const``, so a SCALED subscript reads
+    # ``None`` there and its axis vanishes. Kept as a separate field so no existing consumer of
+    # ``subscript_block_ids`` changes behavior.
     subscript_affine_block_ids: tuple[int | None, ...] = ()
     # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
     # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
@@ -1546,12 +1549,14 @@ class ConfigSpec:
         bn: int,
         bk: int,
         cluster_m: int,
+        ab_stages: int = 3,
     ) -> bool:
         return self._cute_tcgen05_config.ab_stages_fits(
             bm=bm,
             bn=bn,
             bk=bk,
             cluster_m=cluster_m,
+            ab_stages=ab_stages,
         )
 
     def _tcgen05_grouped_dynamic_stages_fit_for_target(
@@ -1583,6 +1588,13 @@ class ConfigSpec:
         self, config: dict[str, object]
     ) -> None:
         self._cute_tcgen05_config._fix_with_scheduler_search_config(config)
+
+    def _fix_tcgen05_aux_producer_depth_feasibility_search_config(
+        self, config: dict[str, object]
+    ) -> None:
+        self._cute_tcgen05_config._fix_aux_producer_depth_feasibility_search_config(
+            config
+        )
 
     def _fix_tcgen05_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
