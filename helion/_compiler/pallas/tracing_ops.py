@@ -3708,6 +3708,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     dma_stores: list[ScheduledDmaTransfer] = []
     scheduled_by_hbm_name: dict[str, ScheduledDmaTransfer] = {}
     memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = {}
+    refilled_load_tensors: set[str] = set()
+    refilled_loads: list[tuple[ScheduledDmaTransfer, torch.fx.Node, torch.fx.Node]] = []
     # compact_worklist shares this lowering but keeps its compact/resident routes.
     # Ordinary fori loops and explicitly buffered static unrolls honor the
     # per-input depth; other callers keep the historical single-buffer route.
@@ -3841,6 +3843,22 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             prefetched_loads.append(scheduled)
         elif isinstance(transfer, IndirectDmaTransfer):
             immediate_loads.append(scheduled)
+        elif (
+            load_buffer_counts_active
+            and transfer.direction == "load"
+            and len(block_ids) == 1
+            and id(fake) in contiguous_ranges
+        ):
+            load_node = loaded_tensors[id(fake)][1]
+            users = list(load_node.users)
+            if (
+                len(users) == 1
+                and users[0].op == "call_function"
+                and users[0].target
+                in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default)
+            ):
+                refilled_load_tensors.add(hbm_name)
+                refilled_loads.append((scheduled, load_node, users[0]))
 
     # ``all_tensor_info`` represents a read-modify-write tensor only by its
     # store record so that its load and store share one VMEM buffer. Build
@@ -3849,7 +3867,11 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     for fake, _tensor_node, sub_meta in loaded_tensors.values():
         hbm_name = state.device_function.tensor_arg(fake).name
         scheduled = scheduled_by_hbm_name.get(hbm_name)
-        if scheduled is None or hbm_name in prefetched_load_tensors:
+        if (
+            scheduled is None
+            or hbm_name in prefetched_load_tensors
+            or hbm_name in refilled_load_tensors
+        ):
             continue
         immediate_loads.append(
             ScheduledDmaTransfer(
@@ -4236,7 +4258,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     prime_statements: list[ast.stmt] = []
     body_prefetch: ast.FunctionDef | None = None
     body_current_stage_waits: list[ast.stmt] = []
-    if prefetched_loads:
+    if prefetched_loads or refilled_loads:
         num_iterations = state.device_function.new_var("_num_iterations")
         prime_statements.append(
             statement_from_string(f"{num_iterations} = {grid_parts[-1]}")
@@ -4249,6 +4271,15 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             prime_starts.extend(
                 _dma_transfer_statements(transfer, prime_indices, "0", ("start",))
             )
+        for transfer, _load_node, _consumer in refilled_loads:
+            prime_starts.extend(
+                _dma_transfer_statements(
+                    transfer,
+                    prime_indices,
+                    None,
+                    ("start",),
+                )
+            )
         prime_statements.append(
             _guarded_statements(
                 f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
@@ -4259,22 +4290,47 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         next_iteration = f"({stage_loop_var} + 1)"
         next_indices = [*loop_vars]
         next_indices[-1] = next_iteration
-        next_stage = f"{next_iteration} % 2"
-        next_starts: list[ast.stmt] = []
-        for transfer in prefetched_loads:
-            next_starts.extend(
-                _dma_transfer_statements(transfer, next_indices, next_stage, ("start",))
+        if prefetched_loads:
+            next_stage = f"{next_iteration} % 2"
+            next_starts: list[ast.stmt] = []
+            for transfer in prefetched_loads:
+                next_starts.extend(
+                    _dma_transfer_statements(
+                        transfer, next_indices, next_stage, ("start",)
+                    )
+                )
+            body_prefetch = _guarded_statements(
+                f"{next_iteration} < {num_iterations}",
+                "_prefetch_fori_loads",
+                next_starts,
             )
-        body_prefetch = _guarded_statements(
-            f"{next_iteration} < {num_iterations}",
-            "_prefetch_fori_loads",
-            next_starts,
-        )
 
-        current_stage = f"{stage_loop_var} % 2"
-        for transfer in prefetched_loads:
-            body_current_stage_waits.extend(
-                _dma_transfer_statements(transfer, loop_vars, current_stage, ("wait",))
+            current_stage = f"{stage_loop_var} % 2"
+            for transfer in prefetched_loads:
+                body_current_stage_waits.extend(
+                    _dma_transfer_statements(
+                        transfer, loop_vars, current_stage, ("wait",)
+                    )
+                )
+
+        for transfer, load_node, consumer in refilled_loads:
+            state.codegen.add_pre_node_statements(
+                load_node,
+                _dma_transfer_statements(transfer, loop_vars, None, ("wait",)),
+            )
+            refill_starts = _dma_transfer_statements(
+                transfer,
+                next_indices,
+                None,
+                ("start",),
+            )
+            state.codegen.add_post_node_statement(
+                consumer,
+                _guarded_statements(
+                    f"{next_iteration} < {num_iterations}",
+                    "_refill_fori_load",
+                    refill_starts,
+                ),
             )
 
     # For loop-carried state, remap args to scratch reads inside the body

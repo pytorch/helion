@@ -1482,6 +1482,8 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
+                    for statement in self.cg.pop_pre_node_statements(n):
+                        self.cg.add_statement(statement)
                     cute_state = self.cg.device_function.cute_state
                     if cute_state.has_tcgen05_fragment_epilogue_plan:
                         if cute_state.is_deferred_tcgen05_fragment_epilogue_node(n):
@@ -1544,6 +1546,8 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
+                        for statement in self.cg.pop_post_node_statements(n):
+                            self.cg.add_statement(statement)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))
