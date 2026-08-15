@@ -42,6 +42,7 @@ from .dma import DmaTransfer
 from .dma import ScheduledDmaTransfer
 from .dma import allocate_dma_resources
 from .dma import async_copy_statements
+from .dma import is_tpu_dma_aligned_shape
 
 log = logging.getLogger(__name__)
 
@@ -2711,26 +2712,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     return None
 
 
-def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
-    """Check if a VMEM buffer shape satisfies TPU DMA alignment.
-
-    DMA requires last dim % 128 == 0 and second-to-last dim % 8 == 0
-    for 2D+ tensors. Note that these rules are currently optimized for
-    bf16 sublanes; they are overly conservative for f32 (no constraint)
-    and too lenient for 1D (which should be % 1024).
-
-    These rules differ from outer BlockSpec constraints where 1D is
-    dtype-dependent: 128 * (32 / bitwidth(dtype)). Unlike outer BlockSpecs,
-    emit_pipeline/fori_loop inner DMA does NOT have a ``block == tensor_dim``
-    exception.
-    """
-    if len(vmem_shape) >= 2:
-        return vmem_shape[-1] % 128 == 0 and vmem_shape[-2] % 8 == 0
-    if len(vmem_shape) == 1:
-        return vmem_shape[0] % 128 == 0
-    return True
-
-
 def _is_supported_contiguous_row_slab_dma(
     fake: torch.Tensor,
     sub_meta: list[object],
@@ -2807,7 +2788,7 @@ def _can_stream_inner_tile(
     state: CodegenState,
 ) -> bool:
     """Return whether a loop-local tensor should use the inner streaming path."""
-    if _check_dma_alignment(vmem_shape):
+    if is_tpu_dma_aligned_shape(vmem_shape, fake.dtype):
         return True
     if direction != "load":
         return False

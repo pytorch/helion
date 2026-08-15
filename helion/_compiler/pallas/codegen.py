@@ -54,13 +54,19 @@ def load_expr(
         return emit_gather(state, plan.plan, active_name)
 
     from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.pallas.plan_tiling import ContiguousRangeIndexPattern
 
     if (
         active_name == arg_name
         and device_fn.pallas_memory_space.get(id(tensor)) == PallasMemorySpace.HBM
-        and device_fn.is_pallas_remote_copy_operand(tensor)
+        and (
+            device_fn.is_pallas_remote_copy_operand(tensor)
+            or any(
+                isinstance(pattern, ContiguousRangeIndexPattern) for pattern in patterns
+            )
+        )
     ):
-        return _remote_hbm_load_expr(state, subscript, tensor, arg_name)
+        return _hbm_load_expr(state, subscript, tensor, arg_name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
@@ -81,19 +87,19 @@ def load_expr(
     return result
 
 
-def _remote_hbm_load_expr(
+def _hbm_load_expr(
     state: CodegenState,
     subscript: list[object],
     tensor: torch.Tensor,
     name: str,
 ) -> ast.AST:
-    """Stage one directly accessed remote-DMA HBM region into VMEM.
+    """Stage one directly accessed HBM region into VMEM.
 
-    Remote-copy destinations can intentionally remain in HBM so their address is
-    stable across program iterations. Mosaic cannot load an HBM Ref directly, so
-    materialize the selected region at the exact source-level load. Emitting the
-    DMA here preserves ordering with nearby remote-copy waits and avoids changing
-    the placement of unrelated tensor arguments.
+    Remote-copy destinations and dynamic contiguous windows can intentionally
+    remain in HBM. Mosaic cannot load an HBM Ref directly, so materialize the
+    selected region at the exact source-level load. Emitting the DMA here
+    preserves ordering with nearby remote-copy waits and avoids changing the
+    placement of unrelated tensor arguments.
     """
     assert state.fx_node is not None
     value = state.fx_node.meta.get("val")
@@ -660,6 +666,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from helion._compiler.pallas.plan_tiling import ContiguousRangeIndexPattern
     from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
@@ -706,6 +713,18 @@ def _generated_index_code(
             in_pipeline,
             ast_subscripts,
             pipeline_scalar_indices_local,
+        )
+
+    if isinstance(pattern, ContiguousRangeIndexPattern):
+        if in_pipeline:
+            return ":"
+        if not raw_hbm_ref:
+            raise RuntimeError(
+                "a contiguous dynamic range must address its raw HBM source"
+            )
+        index = _index_expr_from_ast(state, subscript_index, ast_subscripts)
+        return (
+            f"pl.ds(pl.multiple_of({index}[0], {pattern.alignment}), {pattern.length})"
         )
 
     if isinstance(pattern, TensorIndexPattern):

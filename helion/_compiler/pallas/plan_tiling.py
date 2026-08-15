@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import operator
 from typing import TYPE_CHECKING
 
 import sympy
@@ -69,6 +70,15 @@ class NonePattern(IndexingPattern):
 @dataclass
 class TensorIndexPattern(IndexingPattern):
     """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
+
+
+@dataclass
+class ContiguousRangeIndexPattern(IndexingPattern):
+    """Aligned ``base + arange(length)`` index addressable as one HBM window."""
+
+    base: int | torch.SymInt | torch.fx.Node
+    length: int
+    alignment: int
 
 
 @dataclass
@@ -316,9 +326,18 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
         for p in indexing_patterns
     )
+    has_contiguous_hbm_window = any(
+        isinstance(pattern, ContiguousRangeIndexPattern)
+        for pattern in indexing_patterns
+    )
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
-    if is_all_scalar:
+    if has_contiguous_hbm_window:
+        # A dynamic contiguous range cannot be represented by a static
+        # BlockSpec. Keep the source argument in HBM and stage exactly the
+        # selected range at its load site.
+        device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
+    elif is_all_scalar:
         # Only mark for SMEM if not already assigned to VMEM or HBM
         if current is None:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
@@ -384,6 +403,126 @@ def _is_supported_slice(idx: slice) -> bool:
     return True
 
 
+def _is_scalar_value(value: object) -> bool:
+    if isinstance(value, (int, torch.SymInt)):
+        return True
+    if isinstance(value, torch.fx.Node):
+        value = value.meta.get("val")
+    return isinstance(value, torch.Tensor) and value.ndim == 0
+
+
+def _constant_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.fx.Node):
+        node_value = value.meta.get("val")
+        if isinstance(node_value, int):
+            return node_value
+    return None
+
+
+def _is_proven_multiple(value: object, alignment: int) -> bool:
+    """Conservatively prove that a scalar FX expression is alignment-multiple."""
+    constant = _constant_int(value)
+    if constant is not None:
+        return constant % alignment == 0
+    if not isinstance(value, torch.fx.Node) or value.op != "call_function":
+        return False
+
+    if value.target in (
+        operator.add,
+        torch.ops.aten.add.Scalar,
+        torch.ops.aten.add.Tensor,
+    ):
+        if value.kwargs.get("alpha", 1) != 1:
+            return False
+        return all(_is_proven_multiple(arg, alignment) for arg in value.args[:2])
+    if value.target in (
+        operator.sub,
+        torch.ops.aten.sub.Scalar,
+        torch.ops.aten.sub.Tensor,
+    ):
+        if value.kwargs.get("alpha", 1) != 1:
+            return False
+        return all(_is_proven_multiple(arg, alignment) for arg in value.args[:2])
+    if value.target in (
+        operator.mul,
+        torch.ops.aten.mul.Scalar,
+        torch.ops.aten.mul.Tensor,
+    ):
+        lhs, rhs = value.args[:2]
+        lhs_constant = _constant_int(lhs)
+        rhs_constant = _constant_int(rhs)
+        return (lhs_constant is not None and lhs_constant % alignment == 0) or (
+            rhs_constant is not None and rhs_constant % alignment == 0
+        )
+    return False
+
+
+def _iota_length(node: object) -> int | None:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or node.target is not torch.ops.prims.iota.default
+    ):
+        return None
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    if start != 0 or step != 1 or len(node.args) != 1:
+        return None
+    length = node.args[0]
+    return length if isinstance(length, int) and length > 0 else None
+
+
+def _match_contiguous_range_index(
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+    load_value: object,
+) -> ContiguousRangeIndexPattern | None:
+    """Match an aligned scalar base plus an explicit unit-stride ``hl.arange``."""
+    if (
+        tensor_dim != tensor.ndim - 1
+        or node.op != "call_function"
+        or node.target
+        not in (operator.add, torch.ops.aten.add.Scalar, torch.ops.aten.add.Tensor)
+        or len(node.args) != 2
+        or node.kwargs.get("alpha", 1) != 1
+    ):
+        return None
+    if not isinstance(load_value, torch.Tensor) or not all(
+        isinstance(size, int) for size in load_value.shape
+    ):
+        return None
+    from .dma import is_tpu_dma_aligned_shape
+
+    if not is_tpu_dma_aligned_shape(tuple(load_value.shape), tensor.dtype):
+        return None
+    bitwidth = min(tensor.dtype.itemsize * 8, 32)
+    alignment = 128 if tensor.ndim > 1 else 128 * (32 // bitwidth)
+    lhs, rhs = node.args
+    for base, iota in ((lhs, rhs), (rhs, lhs)):
+        length = _iota_length(iota)
+        if length is None or length % alignment != 0:
+            continue
+        if not isinstance(base, (int, torch.SymInt, torch.fx.Node)):
+            continue
+        if not _is_scalar_value(base) or not _is_proven_multiple(base, alignment):
+            continue
+        value = node.meta.get("val")
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim == 1
+            and value.shape[0] == length
+        ):
+            return ContiguousRangeIndexPattern(
+                base=base,
+                length=length,
+                alignment=alignment,
+            )
+    return None
+
+
 def _detect_indexing_pattern(
     idx: object,
     tensor: torch.Tensor,
@@ -421,6 +560,18 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
+        from ...language import memory_ops
+
+        if node.target is memory_ops.load:
+            contiguous_range = _match_contiguous_range_index(
+                idx,
+                tensor,
+                tensor_dim,
+                node.meta.get("val"),
+            )
+            if contiguous_range is not None:
+                return contiguous_range
+
         # A tensor-valued index that didn't match any arithmetic-of-tile
         # pattern is an indirect gather (e.g. table[idx, :]).
         if isinstance(idx_val, torch.Tensor):
@@ -485,7 +636,10 @@ def _update_tiling_decision(
             # bounded slice: fixed subrange of the dim, must stay untiled
             _disallow_tiling()
 
-    elif isinstance(pattern, (ArbitraryIndexPattern, TensorIndexPattern)):
+    elif isinstance(
+        pattern,
+        (ArbitraryIndexPattern, ContiguousRangeIndexPattern, TensorIndexPattern),
+    ):
         _disallow_tiling()
 
     elif isinstance(pattern, NonePattern):
@@ -527,8 +681,8 @@ def resident_block_elements(
         ``block_size``, clamped to the full dim extent.
       - ``TileBeginWithOffsetPattern`` / ``ArbitraryIndexPattern``: scalar
         index, contributes 1.
-      - Anything else (full slice, indirect tensor index): the full dim
-        extent.
+      - ``ContiguousRangeIndexPattern``: its fixed range length.
+      - Anything else (full slice, indirect tensor index): the full dim extent.
 
     Returns ``None`` if any consumed dim is symbolic.
     """
@@ -550,6 +704,8 @@ def resident_block_elements(
                 dim_size = min(bs, dim_size)
         elif isinstance(p, (TileBeginWithOffsetPattern, ArbitraryIndexPattern)):
             dim_size = 1
+        elif isinstance(p, ContiguousRangeIndexPattern):
+            dim_size = p.length
         elements *= dim_size
         # Advance only on patterns that consume a tensor dim; NonePattern doesn't.
         tdim += 1
