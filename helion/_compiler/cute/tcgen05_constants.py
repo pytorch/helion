@@ -83,14 +83,14 @@ TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 # conservative because the search space cannot enumerate every C-stage /
 # acc-stage variant cheaply and ``ptxas: shared > 232KB`` is bad UX during
 # tuning.
-TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES = 28 * 1024
+TCGEN05_AB_STAGES_RESERVED_SMEM_BYTES = 28 * 1024
 # Hard floor on the per-CTA SMEM optin cap required to admit
 # ``tcgen05_ab_stages=3`` into autotune search. B200's optin reports
 # 232 448 bytes (= 227 * 1024). Devices below this threshold sit
 # outside the warp-specialized tcgen05 envelope this gate is designed
 # for, so admission stays off — explicit user configs still go through
 # the validation surface and get the loud cute_dsl ptxas error.
-TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN = 227 * 1024
+TCGEN05_AB_STAGES_MIN_DEVICE_SMEM_OPTIN = 227 * 1024
 
 
 def tcgen05_ab_smem_bytes_per_cta(
@@ -114,7 +114,7 @@ def tcgen05_ab_smem_bytes_per_cta(
     The autotune search-space gate uses this helper to admit
     ``tcgen05_ab_stages=3`` candidates only when the per-CTA cost fits
     the B200 SMEM optin budget after the non-AB reservation in
-    ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES``. The numbers were
+    ``TCGEN05_AB_STAGES_RESERVED_SMEM_BYTES``. The numbers were
     cross-checked against ``cute.cosize`` for the canonical tile shapes
     (256x256x128 CtaGroup.TWO ab=3 = 196 608 bytes; 128x256x128
     CtaGroup.ONE ab=3 = 294 912 bytes / overflows the 232 KB optin cap).

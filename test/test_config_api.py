@@ -18,7 +18,7 @@ from helion import exc
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesSearchConstraints
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
@@ -1381,8 +1381,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         self.assertEqual(minimized.config["tcgen05_ab_stages"], 7)
 
         constrained_spec = self._make_cute_tcgen05_spec()
-        constrained_spec._cute_tcgen05_config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
+        constrained_spec._cute_tcgen05_config.ab_stages_search_constraints = (
+            Tcgen05AbStagesSearchConstraints(
                 dtype_bytes=2,
                 per_cta_smem_budget_bytes=1,
             )

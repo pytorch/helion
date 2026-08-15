@@ -497,8 +497,8 @@ def enable_cute_tcgen05_search(
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
         allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
         allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
-        ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
-        ab_stages_three_device=lhs.device,
+        ab_stages_dtype_bytes=lhs.dtype.itemsize,
+        ab_stages_device=lhs.device,
         reason="matmul kernel with CuTe tcgen05 backend",
     )
     for axis_name, shape, max_size in (

@@ -3268,7 +3268,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # the recorded constraints keeps the assertion deterministic across hosts.
         expected_search_ab_high = (
             3
-            if bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
+            if bound.config_spec._cute_tcgen05_config.ab_stages_search_constraints
             is not None
             else 2
         )
@@ -4630,7 +4630,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
         )
         # Mock the SMEM budget to the B200 value at bind time (when
-        # ``allow_ab_stages_three_search`` records the budget into the
+        # ``allow_ab_stages_search`` records the budget into the
         # constraints) so the c=4 lift's ``c_stages_fits`` gate is deterministic
         # on any cute host (``@onlyBackends`` does not imply B200).
         b200_budget = 232448 - 28 * 1024
@@ -4865,9 +4865,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         tcfg._fix_c_stages_search_config(ab2_c4.config)
         self.assertEqual(ab2_c4.config["tcgen05_c_stages"], 4)
         # Fail CLOSED: with no recorded SMEM budget (non-B200 / CPU host, where
-        # ``ab_stages_three_search_constraints`` is None) a sampled c=4 cannot be
+        # ``ab_stages_search_constraints`` is None) a sampled c=4 cannot be
         # proven to fit, so it is demoted to 2 rather than left to overflow.
-        tcfg.ab_stages_three_search_constraints = None
+        tcfg.ab_stages_search_constraints = None
         ab2_c4_no_budget = helion.Config(
             block_sizes=[256, 256, 128],
             indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
@@ -5081,7 +5081,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         # Fail CLOSED: with no recorded SMEM budget the sampled plain ab=3 cannot be
         # proven to fit, so it is demoted to 2 rather than left to overflow.
-        plain_tcfg.ab_stages_three_search_constraints = None
+        plain_tcfg.ab_stages_search_constraints = None
         plain_ab3_no_budget = _ab3_config()
         plain_tcfg.fix_search_config(plain_ab3_no_budget.config)
         self.assertEqual(plain_ab3_no_budget.config["tcgen05_ab_stages"], 2)
@@ -5169,7 +5169,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         }
         with patch.object(
             spec._cute_tcgen05_config,
-            "ab_stages_three_fits",
+            "ab_stages_fits",
             return_value=False,
         ):
             spec._cute_tcgen05_config.fix_search_config(config_dict)

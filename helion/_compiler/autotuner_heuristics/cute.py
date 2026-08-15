@@ -655,7 +655,7 @@ class CuteTcgen05GroupedStaticCommonKHeuristic(AutotunerHeuristic):
         if (
             static_k >= 3 * bk
             and static_k % bk == 0
-            and env.config_spec._tcgen05_ab_stages_three_fits(
+            and env.config_spec._tcgen05_ab_stages_fits(
                 bm=128,
                 bn=64,
                 bk=bk,
@@ -921,7 +921,7 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             # shape, seed the canonical fast config family directly so it
             # reaches the autotuner's initial population without depending on a
             # search-stage mutation.
-            if spec._tcgen05_ab_stages_three_fits(
+            if spec._tcgen05_ab_stages_fits(
                 bm=TCGEN05_TWO_CTA_BLOCK_M,
                 bn=TCGEN05_TWO_CTA_BLOCK_N,
                 bk=bk,

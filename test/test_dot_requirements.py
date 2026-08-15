@@ -900,7 +900,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
 
-        constraints = spec._tcgen05_ab_stages_three_search_constraints
+        constraints = spec._tcgen05_ab_stages_search_constraints
         self.assertIsNotNone(constraints)
         # ``itemsize`` for BF16/FP16 is 2 bytes — matches the matmul
         # binding's ``lhs.dtype.itemsize`` argument.
@@ -991,8 +991,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         Mocking the budget helper to return 0 — the value the helper
         produces for non-CUDA hosts and any device whose optin cap sits
-        below ``TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN`` — must
-        keep ``_tcgen05_ab_stages_three_search_constraints`` ``None`` so
+        below ``TCGEN05_AB_STAGES_MIN_DEVICE_SMEM_OPTIN`` — must
+        keep ``_tcgen05_ab_stages_search_constraints`` ``None`` so
         the search surface stays at ``ab_stages_max=2`` and the
         canonical seed does not carry ``ab=3``. This guards against
         broadening the search past the hardware's known-good envelope
@@ -1001,7 +1001,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(0)
         spec = bound.config_spec
 
-        self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+        self.assertIsNone(spec._tcgen05_ab_stages_search_constraints)
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
         self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
         # Validation surface stays at 3 so explicit user configs still
@@ -1022,18 +1022,18 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
 
-        self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
+        self.assertIsNotNone(spec._tcgen05_ab_stages_search_constraints)
         with patch.object(type(spec.block_sizes), "__len__", lambda self: 9):
             with patch.object(
                 CuteTcgen05Config,
                 "per_cta_ab_smem_budget_bytes",
                 staticmethod(lambda device: b200_budget_bytes),
             ):
-                spec.allow_tcgen05_ab_stages_three_search(
+                spec.allow_tcgen05_ab_stages_search(
                     dtype_bytes=2,
                     device=torch.device("cuda:0"),
                 )
-            self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
+            self.assertIsNotNone(spec._tcgen05_ab_stages_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
             self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
 
