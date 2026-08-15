@@ -1167,7 +1167,7 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return env.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+        return env.config_spec._tcgen05_full_tile_direct_entry_seed_emittable()
 
     @classmethod
     def get_seed_config(

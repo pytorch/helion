@@ -1432,8 +1432,8 @@ class ConfigSpec:
     ) -> None:
         self._cute_tcgen05_config.num_epi_warps_validation_choices = value
 
-    def _tcgen05_full_tile_direct_entry_seed_eligible(self) -> bool:
-        return self._cute_tcgen05_config.full_tile_direct_entry_seed_eligible()
+    def _tcgen05_full_tile_direct_entry_seed_emittable(self) -> bool:
+        return self._cute_tcgen05_config.full_tile_direct_entry_seed_emittable()
 
     def _tcgen05_full_tile_direct_entry_seed_bk(self) -> int | None:
         return self._cute_tcgen05_config.full_tile_direct_entry_seed_bk()
