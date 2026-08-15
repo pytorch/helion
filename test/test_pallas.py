@@ -708,6 +708,26 @@ def pallas_two_aligned_dynamic_windows(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_shifted_modulo_row_index(x: torch.Tensor) -> torch.Tensor:
+    """Exercise a compound modulo operand whose parentheses are significant."""
+    out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
+    for _ in hl.grid(1):
+        for tile in hl.tile(4, block_size=1):
+            out[tile.begin, :] = x[(tile.begin - 1) % 4, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_shifted_floor_divide_row_index(x: torch.Tensor) -> torch.Tensor:
+    """Exercise a compound floor-division operand with significant grouping."""
+    out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
+    for _ in hl.grid(1):
+        for tile in hl.tile(4, block_size=1):
+            out[tile.begin, :] = x[(tile.begin + 1) // 2, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
     out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
@@ -945,6 +965,28 @@ class TestPallas(TestCase):
             ]
         )
         torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_shifted_modulo_preserves_expression_precedence(self) -> None:
+        x = torch.randn(5, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_shifted_modulo_row_index,
+            (x,),
+            pallas_loop_type="unroll",
+        )
+        self.assertRegex(code, r"\(-1 \+ .*\) % 4")
+        self.assertNotRegex(code, r"= -1 \+ [A-Za-z0-9_]+ % 4")
+        torch.testing.assert_close(result.cpu(), x[[3, 0, 1, 2]].cpu())
+
+    def test_shifted_floor_divide_preserves_expression_precedence(self) -> None:
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_shifted_floor_divide_row_index,
+            (x,),
+            pallas_loop_type="unroll",
+        )
+        self.assertRegex(code, r"\(1 \+ .*\) // 2")
+        self.assertNotRegex(code, r"= 1 \+ [A-Za-z0-9_]+ // 2")
+        torch.testing.assert_close(result.cpu(), x[[0, 1, 1, 2]].cpu())
 
     def test_computed_static_slice(self) -> None:
         x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
