@@ -335,6 +335,31 @@ def _indexed_computed_pipeline_copy(
     static_shapes=True,
     config=helion.Config(block_sizes=[]),
 )
+def _computed_fp8_remote_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Send one computed FP8 payload through a VMEM source scratch."""
+    for _program in hl.grid(1):
+        payload = (src[:, 0, :] + 1).to(torch.float8_e4m3fn)
+        copy = hl.make_async_remote_copy(
+            payload,
+            [],
+            peers[0, 0],
+            dst=dst,
+            dst_index=[0, positions[0, 0]],
+        )
+        copy.start()
+        copy.wait()
+    return dst
+
+
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
 def _parent_store_nested_remote_copy(
     src: torch.Tensor,
     exchange: torch.Tensor,
@@ -1295,6 +1320,94 @@ class TestRemoteCopyJaxRuntime(TestCase):
         expected[1, 0] = reduced[0]
         for _invocation in range(2):
             result = np.asarray(jax.block_until_ready(copy(*inputs)))
+            np.testing.assert_array_equal(result, expected)
+
+    def test_computed_fp8_source_codegen(self) -> None:
+        args = (
+            torch.zeros(1, 1, _WIDTH),
+            torch.zeros(1, 2, 1, _WIDTH, dtype=torch.float8_e4m3fn),
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(1, 1, dtype=torch.int32),
+        )
+        source = _computed_fp8_remote_copy.bind(args).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+        self.assertIn("'jnp.float8_e4m3fn', 'vmem'", source)
+        self.assertIn("'jnp.float8_e4m3fn': jnp.float8_e4m3fn", source)
+
+    @skipIfPallasInterpret("computed FP8 sends require TPU VMEM lowering")
+    def test_computed_fp8_source(self) -> None:
+        import types
+
+        import jax
+        import jax.numpy as jnp
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+
+        args = (
+            torch.zeros(1, 1, _WIDTH),
+            torch.zeros(1, 2, 1, _WIDTH, dtype=torch.float8_e4m3fn),
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(1, 1, dtype=torch.int32),
+        )
+        source = _computed_fp8_remote_copy.bind(args).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+        name = "precompiled_computed_fp8_remote_copy_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(source, name, "exec"), module.__dict__)
+
+        world_size = 2
+        mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
+        partition = jax.sharding.PartitionSpec
+        src_spec = partition("peer", None, None)
+        dst_spec = partition("peer", None, None, None)
+        metadata_spec = partition("peer", None)
+        ranks = jnp.arange(world_size, dtype=jnp.float32)[:, None, None]
+        columns = jnp.arange(_WIDTH, dtype=jnp.float32)[None, None, :] / 16
+        src = ranks * 16 + columns
+        dst = jnp.full(
+            (world_size, world_size, 1, _WIDTH),
+            -7.0,
+            dtype=jnp.float8_e4m3fn,
+        )
+        peers = (1 - jnp.arange(world_size, dtype=jnp.int32))[:, None]
+        positions = jnp.arange(world_size, dtype=jnp.int32)[:, None]
+        specs = (src_spec, dst_spec, metadata_spec, metadata_spec)
+        inputs = tuple(
+            jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
+            for value, spec in zip((src, dst, peers, positions), specs, strict=True)
+        )
+        copy = jax.jit(
+            jax.shard_map(
+                module._computed_fp8_remote_copy,
+                mesh=mesh,
+                in_specs=specs,
+                out_specs=dst_spec,
+                check_vma=False,
+            )
+        )
+
+        expected = np.full(
+            (world_size, world_size, 1, _WIDTH),
+            -7.0,
+            dtype=np.float32,
+        )
+        payload = np.asarray((src + 1).astype(jnp.float8_e4m3fn)).astype(np.float32)
+        expected[0, 1] = payload[1]
+        expected[1, 0] = payload[0]
+        for _invocation in range(2):
+            result = np.asarray(jax.block_until_ready(copy(*inputs))).astype(np.float32)
             np.testing.assert_array_equal(result, expected)
 
     @skipIfPallasInterpret("nested remote copies require TPU DMA lowering")
