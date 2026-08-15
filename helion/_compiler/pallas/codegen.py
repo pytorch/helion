@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
-from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.pallas.dma import DmaTransfer
+from helion._compiler.pallas.dma import allocate_dma_resources
+from helion._compiler.pallas.dma import async_copy_statements
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
 
@@ -113,23 +115,31 @@ def _remote_hbm_load_expr(
     if not scratch_shape:
         raise NotImplementedError("Pallas cannot DMA a scalar HBM load into VMEM")
 
-    scratch = state.device_function.register_scratch(
-        tuple(scratch_shape), value.dtype, name_hint=f"{name}_load"
+    transfer = DmaTransfer(
+        tensor=tensor,
+        subscript=tuple(subscript),
+        direction="load",
     )
-    semaphore = state.device_function.register_dma_semaphore(
-        name_hint=f"{name}_load_sem"
+    resources = allocate_dma_resources(
+        state.device_function,
+        transfer,
+        vmem_shape=tuple(scratch_shape),
+        buffer_count=1,
+        scratch_hint=f"{name}_load",
+        semaphore_hint=f"{name}_load_sem",
     )
-    copy = state.device_function.new_var(f"{name}_load_copy", dce=False)
     source = f"{name}.at[{', '.join(parts)}]"
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{copy} = pltpu.make_async_copy({source}, {scratch}, {semaphore})"
-        )
-    )
-    state.codegen.add_statement(statement_from_string(f"{copy}.start()"))
-    state.codegen.add_statement(statement_from_string(f"{copy}.wait()"))
+    for statement in async_copy_statements(
+        state,
+        source,
+        resources.scratch,
+        resources.semaphore,
+        ("start", "wait"),
+        f"{name}_load_copy",
+    ):
+        state.codegen.add_statement(statement)
 
-    result = expr_from_string(f"{scratch}[...]")
+    result = expr_from_string(f"{resources.scratch}[...]")
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(

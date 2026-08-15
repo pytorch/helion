@@ -38,6 +38,10 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_sympy_expr
 from ..device_function import find_block_size_symbols
 from ..host_function import HostFunction
+from .dma import DmaTransfer
+from .dma import ScheduledDmaTransfer
+from .dma import allocate_dma_resources
+from .dma import async_copy_statements
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import LoopDimInfo
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
+    from .dma import DmaDirection
 
 
 @_decorators.codegen(_not, "pallas")
@@ -3235,7 +3240,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     tensor_to_dma_scratch: dict[str, str] = {}
     tensor_to_sem: dict[str, str] = {}
     prefetched_load_tensors: set[str] = set()
-    prefetched_loads: list[tuple[torch.Tensor, list[object], str, str]] = []
+    prefetched_loads: list[ScheduledDmaTransfer] = []
+    immediate_loads: list[ScheduledDmaTransfer] = []
+    dma_stores: list[ScheduledDmaTransfer] = []
+    scheduled_by_hbm_name: dict[str, ScheduledDmaTransfer] = {}
     # compact_worklist shares this lowering but keeps its compact/resident routes;
     # only an actual fori_loop config enables depth-two staging.
     load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
@@ -3255,11 +3263,25 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
     }
 
+    dma_transfers: list[tuple[DmaTransfer, tuple[int, ...]]] = []
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
         if id(fake) not in pipelined_tensor_ids:
             continue
+        dma_transfers.append(
+            (
+                DmaTransfer(
+                    tensor=fake,
+                    subscript=tuple(sub_meta),
+                    direction=cast("DmaDirection", direction),
+                ),
+                vmem_shape,
+            )
+        )
+
+    for transfer, vmem_shape in dma_transfers:
+        fake = transfer.tensor
         storage_id = id(fake.untyped_storage())
         input_slots = input_slots_by_id.get(
             id(fake), input_slots_by_storage.get(storage_id)
@@ -3267,7 +3289,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         load_buffer_count = (
             state.config.pallas_load_buffer_count[input_slots[0]]
             if load_buffer_counts_active
-            and direction == "load"
+            and transfer.direction == "load"
             and storage_id not in stored_tensor_storages
             and input_slots is not None
             and len(input_slots) == 1
@@ -3280,7 +3302,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         resource_key = (
             graph_info.graph_id,
             hbm_name,
-            direction,
+            transfer.direction,
             vmem_shape,
             load_buffer_count,
         )
@@ -3295,31 +3317,55 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         )
         if cached_resource is None:
             shape_sources = (
-                _runtime_vmem_shape_sources(fake, sub_meta, block_ids, env)
+                _runtime_vmem_shape_sources(
+                    fake, list(transfer.subscript), block_ids, env
+                )
                 if state.device_function.is_pallas_remote_copy_operand(fake)
                 else None
             )
-            vmem_name = state.device_function.register_scratch(
-                (load_buffer_count, *vmem_shape) if uses_load_prefetch else vmem_shape,
-                fake.dtype,
-                name_hint=hbm_name.replace("_hbm", "") + "_buf",
-                shape_sources=(None, *shape_sources)
-                if uses_load_prefetch and shape_sources is not None
-                else shape_sources,
-            )
-            sem_name = state.device_function.register_dma_semaphore(
-                name_hint=hbm_name.replace("_hbm", "") + "_sem",
-                shape=(load_buffer_count,) if uses_load_prefetch else (),
+            resources = allocate_dma_resources(
+                state.device_function,
+                transfer,
+                vmem_shape=vmem_shape,
+                buffer_count=load_buffer_count,
+                scratch_hint=hbm_name.replace("_hbm", "") + "_buf",
+                semaphore_hint=hbm_name.replace("_hbm", "") + "_sem",
+                shape_sources=shape_sources,
             )
             if resource_cache is not None:
-                resource_cache[resource_key] = (vmem_name, sem_name)
+                resource_cache[resource_key] = resources
         else:
-            vmem_name, sem_name = cached_resource
-        tensor_to_dma_scratch[hbm_name] = vmem_name
-        tensor_to_sem[hbm_name] = sem_name
-        if uses_load_prefetch:
+            resources = cached_resource
+        scheduled = ScheduledDmaTransfer(transfer, resources)
+        tensor_to_dma_scratch[hbm_name] = resources.scratch
+        tensor_to_sem[hbm_name] = resources.semaphore
+        scheduled_by_hbm_name[hbm_name] = scheduled
+
+        if transfer.direction == "store":
+            dma_stores.append(scheduled)
+        elif uses_load_prefetch:
             prefetched_load_tensors.add(hbm_name)
-            prefetched_loads.append((fake, sub_meta, vmem_name, sem_name))
+            prefetched_loads.append(scheduled)
+
+    # ``all_tensor_info`` represents a read-modify-write tensor only by its
+    # store record so that its load and store share one VMEM buffer. Rebuild
+    # the immediate load from its original load site to preserve ordering
+    # before nested updates while reusing the store record's resources.
+    for fake, _tensor_node, sub_meta in loaded_tensors.values():
+        hbm_name = state.device_function.tensor_arg(fake).name
+        scheduled = scheduled_by_hbm_name.get(hbm_name)
+        if scheduled is None or hbm_name in prefetched_load_tensors:
+            continue
+        immediate_loads.append(
+            ScheduledDmaTransfer(
+                DmaTransfer(
+                    tensor=fake,
+                    subscript=tuple(sub_meta),
+                    direction="load",
+                ),
+                scheduled.resources,
+            )
+        )
 
     # Build the body function
     body_stmts: list[ast.AST] = []
@@ -3496,35 +3542,37 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         return vmem, hbm
 
     def _dma_copy_statements(
-        fake: torch.Tensor,
-        sub_meta: list[object],
-        vmem_name: str,
-        sem_name: str,
+        scheduled: ScheduledDmaTransfer,
         iteration_indices: list[str],
         stage_expr: str | None,
         methods: tuple[str, ...],
-        *,
-        store: bool = False,
     ) -> list[ast.stmt]:
+        transfer = scheduled.transfer
+        resources = scheduled.resources
+        fake = transfer.tensor
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_ref, hbm_ref = _build_dma_slices(
             fake,
-            vmem_name,
+            resources.scratch,
             hbm_name,
-            sub_meta,
-            clamp=store,
+            list(transfer.subscript),
+            clamp=transfer.direction == "store",
             iteration_indices=iteration_indices,
             stage_expr=stage_expr,
         )
-        sem_ref = f"{sem_name}.at[{stage_expr}]" if stage_expr is not None else sem_name
-        source, destination = (vmem_ref, hbm_ref) if store else (hbm_ref, vmem_ref)
-        copy_var = state.device_function.new_var("_copy_out" if store else "_copy")
-        return [
-            statement_from_string(
-                f"{copy_var} = pltpu.make_async_copy({source}, {destination}, {sem_ref})"
-            ),
-            *(statement_from_string(f"{copy_var}.{method}()") for method in methods),
-        ]
+        source, destination = (
+            (vmem_ref, hbm_ref)
+            if transfer.direction == "store"
+            else (hbm_ref, vmem_ref)
+        )
+        return async_copy_statements(
+            state,
+            source,
+            destination,
+            resources.semaphore_ref(stage_expr),
+            methods,
+            "_copy_out" if transfer.direction == "store" else "_copy",
+        )
 
     def _guarded_statements(
         condition: str, name_hint: str, statements: list[ast.stmt]
@@ -3550,9 +3598,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         prime_indices = [*loop_vars]
         prime_indices[-1] = "0"
         prime_starts: list[ast.stmt] = []
-        for record in prefetched_loads:
+        for transfer in prefetched_loads:
             prime_starts.extend(
-                _dma_copy_statements(*record, prime_indices, "0", ("start",))
+                _dma_copy_statements(transfer, prime_indices, "0", ("start",))
             )
         prime_statements.append(
             _guarded_statements(
@@ -3566,9 +3614,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         next_indices[-1] = next_iteration
         next_stage = f"{next_iteration} % 2"
         next_starts: list[ast.stmt] = []
-        for record in prefetched_loads:
+        for transfer in prefetched_loads:
             next_starts.extend(
-                _dma_copy_statements(*record, next_indices, next_stage, ("start",))
+                _dma_copy_statements(transfer, next_indices, next_stage, ("start",))
             )
         body_prefetch = _guarded_statements(
             f"{next_iteration} < {num_iterations}",
@@ -3577,9 +3625,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         )
 
         current_stage = f"{stage_loop_var} % 2"
-        for record in prefetched_loads:
+        for transfer in prefetched_loads:
             body_current_stage_waits.extend(
-                _dma_copy_statements(*record, loop_vars, current_stage, ("wait",))
+                _dma_copy_statements(transfer, loop_vars, current_stage, ("wait",))
             )
 
     # For loop-carried state, remap args to scratch reads inside the body
@@ -3607,18 +3655,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         if body_prefetch is not None:
             state.codegen.add_statement(body_prefetch)
 
-        for fake, _tensor_node, sub_meta in loaded_tensors.values():
-            hbm_name = state.device_function.tensor_arg(fake).name
-            if (
-                hbm_name not in tensor_to_dma_scratch
-                or hbm_name in prefetched_load_tensors
-            ):
-                continue
+        for transfer in immediate_loads:
             for statement in _dma_copy_statements(
-                fake,
-                sub_meta,
-                tensor_to_dma_scratch[hbm_name],
-                tensor_to_sem[hbm_name],
+                transfer,
                 loop_vars,
                 None,
                 ("start", "wait"),
@@ -3636,19 +3675,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
-        for fake, _tensor_node, sub_meta in stored_tensors.values():
-            hbm_name = state.device_function.tensor_arg(fake).name
-            if hbm_name not in tensor_to_dma_scratch:
-                continue
+        for transfer in dma_stores:
             for statement in _dma_copy_statements(
-                fake,
-                sub_meta,
-                tensor_to_dma_scratch[hbm_name],
-                tensor_to_sem[hbm_name],
+                transfer,
                 loop_vars,
                 None,
                 ("start", "wait"),
-                store=True,
             ):
                 state.codegen.add_statement(statement)
 
