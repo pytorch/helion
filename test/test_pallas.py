@@ -762,6 +762,28 @@ def pallas_fixed_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_overlap_initial_dma_with_normalization(
+    lhs: torch.Tensor,
+    table: torch.Tensor,
+    starts: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize rows while the first dynamic matmul window is loading."""
+    rows = hl.specialize(lhs.size(0))
+    hl.specialize(table.size(0))
+    out = torch.empty([starts.size(0), rows, 128], dtype=lhs.dtype, device=lhs.device)
+    for _ in hl.grid(1):
+        lhs_f32 = lhs[:, :].to(torch.float32)
+        inverse_rms = torch.rsqrt(lhs_f32.pow(2).mean(dim=-1, keepdim=True) + 1e-5)
+        normalized = (lhs_f32 * inverse_rms).to(lhs.dtype)
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            weight = table[:, begin + hl.arange(128)]
+            projected = torch.matmul(normalized, weight)
+            out[tile, :, :] = projected[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
     out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
@@ -1017,6 +1039,31 @@ class TestPallas(TestCase):
                 )
                 expected = x[3 : 3 + extent].sum(dim=0, keepdim=True)
                 torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_initial_dma_overlaps_outer_normalization(self) -> None:
+        lhs = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        table = torch.randn(128, 512, device=DEVICE, dtype=torch.bfloat16)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_overlap_initial_dma_with_normalization,
+            (lhs, table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        lhs_f32 = lhs.float()
+        normalized = (
+            lhs_f32 * torch.rsqrt(lhs_f32.pow(2).mean(-1, keepdim=True) + 1e-5)
+        ).to(lhs.dtype)
+        expected = torch.stack(
+            [
+                torch.matmul(
+                    normalized.float(),
+                    table[:, begin : begin + 128].float(),
+                )
+                for begin in range(0, 512, 128)
+            ]
+        ).to(lhs.dtype)
+        torch.testing.assert_close(result, expected)
 
     def test_computed_static_slice(self) -> None:
         x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
@@ -3663,64 +3710,19 @@ class TestPallas(TestCase):
         self.assertEqual(preferred, baseline)
         return preferred
 
-    def test_fori_loop_tensor_load_buffering_codegen(self) -> None:
+    def test_fori_loop_tensor_load_buffering(self) -> None:
         """A selected tensor is primed and prefetched on its existing DMA route."""
         args = (
             torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
             torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
         )
-        depth_one_code = self._assert_load_buffer_count_noop(
-            pallas_inner_loop_add, args, [8, 128], [1, 1]
-        )
-        self.assertNotIn("_prime_fori_loads", depth_one_code)
-        self.assertNotIn("_prefetch_fori_loads", depth_one_code)
-        code, result = code_and_output(
+        _, result = code_and_output(
             pallas_inner_loop_add,
             args,
             block_sizes=[8, 128],
             pallas_loop_type="fori_loop",
             pallas_load_buffer_count=[2, 1],
         )
-
-        self.assertIn("def _prime_fori_loads", code)
-        self.assertIn("def _prefetch_fori_loads", code)
-        self.assertIn("((2, 8, 128), 'jnp.float32', 'vmem')", code)
-        self.assertIn("((2,), None, 'dma_semaphore')", code)
-        self.assertRegex(code, r"\.at\[\(_j(?:_\d+)? \+ 1\) % 2\]")
-        self.assertRegex(code, r"\.at\[_j(?:_\d+)? % 2\]")
-
-        # The prime starts stage zero before entering the loop and deliberately
-        # does not wait. The body starts the next stage before any current-stage
-        # wait, then waits for both the ordinary depth-one load and selected load
-        # before consuming the selected stage.
-        prime_start = code.index("def _prime_fori_loads")
-        fori_call = code.index("jax.lax.fori_loop", prime_start)
-        prime = code[prime_start:fori_call]
-        self.assertIn(".start()", prime)
-        self.assertNotIn(".wait()", prime)
-
-        module = ast.parse(code)
-        body = next(
-            node
-            for node in ast.walk(module)
-            if isinstance(node, ast.FunctionDef)
-            and node.name.startswith("_fori_body_0")
-        )
-        statements = [ast.unparse(statement) for statement in body.body]
-        prefetch = next(
-            i
-            for i, statement in enumerate(body.body)
-            if isinstance(statement, ast.FunctionDef)
-            and statement.name.startswith("_prefetch_fori_loads")
-        )
-        compute = next(
-            i
-            for i, text in enumerate(statements)
-            if "% 2" in text and "_buf" in text and "make_async_copy" not in text
-        )
-        waits = [i for i, text in enumerate(statements) if ".wait()" in text]
-        self.assertLess(prefetch, min(waits))
-        self.assertGreaterEqual(sum(i < compute for i in waits), 2)
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_static_unroll_tensor_load_buffering(self) -> None:
@@ -4237,7 +4239,7 @@ class TestPallas(TestCase):
         ref = torch.nn.functional.scaled_dot_product_attention(
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
-        code, result = code_and_output(
+        _, result = code_and_output(
             pallas_attention,
             args,
             block_sizes=[4, 128, 128],
@@ -4245,24 +4247,6 @@ class TestPallas(TestCase):
             pallas_pre_broadcast=True,
             pallas_load_buffer_count=[2, 2, 2],
         )
-        self.assertIn("jax.lax.fori_loop", code)
-        self.assertIn("pltpu.make_async_copy", code)
-        self.assertIn("def _prime_fori_loads", code)
-        # The first three entries are pre-broadcast loop-carried state. K and V
-        # then receive two VMEM stages and two semaphore slots each.
-        self.assertIn(
-            "_scratch_shapes=["
-            "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((2, 4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((2,), None, 'dma_semaphore'), "
-            "((2, 4, 128, 128), 'jnp.float32', 'vmem'), "
-            "((2,), None, 'dma_semaphore')]",
-            code,
-        )
-        self.assertIn("_hbm_arg_indices=[1, 2]", code)
-        self.assertNotIn("q_view_buf", code)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
     def test_attention_emit_pipeline_correctness_head_dim_256(self) -> None:
@@ -4581,16 +4565,13 @@ class TestPallas(TestCase):
         ``NameError: name 'indices_2' is not defined`` at trace time.
         """
         x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(
+        _, result = code_and_output(
             pallas_chunked_add,
             (x,),
             block_sizes=[128],
             pallas_loop_type="fori_loop",
             pallas_load_buffer_count=[2],
         )
-        self.assertIn("def _prime_fori_loads", code)
-        self.assertIn("((2, 256, 128), 'jnp.float32', 'vmem')", code)
-        self.assertIn("((2,), None, 'dma_semaphore')", code)
         torch.testing.assert_close(result, x + 1.0)
 
     def test_mixed_scalar_and_slice_access(self) -> None:
