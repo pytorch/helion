@@ -348,15 +348,12 @@ class ConfigGeneration:
         config = self.unflatten(copy.deepcopy(flat_values))
         return self.flatten(config), config
 
-    def unflatten(self, flat_values: FlatConfig) -> Config:
-        """
-        Convert a flat configuration back into a full configuration.
+    def _decode_flat(self, flat_values: FlatConfig) -> Config:
+        """Decode *flat_values* into a normalized ``Config`` with no write-back.
 
-        Args:
-            flat_values: The flat configuration values.
-
-        Returns:
-            The full configuration object.
+        This is the raw slot-vector -> ``Config`` direction: split out of
+        :meth:`unflatten` so the post-fix write-back can re-run the decode on its
+        own candidate vector without recursing.
         """
 
         def get_next_value(spec: ConfigSpecFragment) -> object:
@@ -382,6 +379,44 @@ class ConfigGeneration:
         config = self._apply_overrides(config)
         # Overrides may reintroduce pointer stores that break subtiled outputs
         self.config_spec.fix_epilogue_subtile_store_indexing(config.config)
+        return config
+
+    def _preserved_flat_indices(self, config: Config) -> set[int]:
+        """Flat slots the post-fix write-back must NOT touch."""
+        preserved = set(self.overridden_flat_indices)
+        for key, (indices, _is_sequence) in self._key_to_flat_indices.items():
+            if key not in config.config:
+                preserved.update(indices)
+        return preserved
+
+    def _write_back_post_fix(self, flat_values: FlatConfig, config: Config) -> None:
+        """Canonicalize *flat_values* in place to the encoding of *config*."""
+        try:
+            reflat = self.flatten(config)
+        except (InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
+            return
+        if len(reflat) != len(flat_values):
+            return
+        for index in self._preserved_flat_indices(config):
+            reflat[index] = flat_values[index]
+        if reflat == list(flat_values):
+            return
+        try:
+            redecoded = self._decode_flat([*reflat])
+        except (InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
+            return
+        if redecoded != config:
+            return
+        flat_values[:] = reflat
+
+    def unflatten(self, flat_values: FlatConfig) -> Config:
+        """
+
+        *flat_values* is canonicalized in place to the encoding of the returned
+        flat_values: The flat configuration values. Mutated in place.
+        """
+        config = self._decode_flat(flat_values)
+        self._write_back_post_fix(flat_values, config)
         return config
 
     def block_numel(self, flat_config: FlatConfig) -> int:
@@ -529,18 +564,54 @@ class ConfigGeneration:
             result.append((flat, normalized))
         return result
 
-    def random_flat(self) -> FlatConfig:
-        """
-        Generate a random flat configuration.
+    def _pin_overridden_slots(self, flat_config: FlatConfig) -> None:
+        """Stamp frozen keys' values into their flat slots, in place."""
+        if not self._override_values:
+            return
+        for key, value in self._override_values.items():
+            indices, is_sequence = self._key_to_flat_indices.get(key, ([], False))
+            if not indices:
+                continue
+            per_slot: list[object]
+            if is_sequence and isinstance(value, list) and len(value) == len(indices):
+                # A sequence key spanning one slot per element (e.g. ``block_sizes``).
+                per_slot = list(value)
+            elif len(indices) == 1:
+                per_slot = [value]
+            else:
+                # Anything else (a scalar for a multi-slot key, a length mismatch) has
+                # no unambiguous positional stamp. Leave the drawn values; the override
+                # still wins in the decoded config via ``_apply_overrides``.
+                continue
+            for idx, item in zip(indices, per_slot, strict=True):
+                spec = self.flat_spec[idx]
+                stamped = copy.deepcopy(item)
+                # ⚠ VALIDATE AGAINST THE SLOT'S OWN FRAGMENT, and BROADCAST for
+                # ``ListOf``. A single flat slot can hold a LIST: ``indexing`` is
+                # ``ListOf(EnumFragment(...), length=n)`` occupying ONE slot, while its
+                # override is the scalar ``"tensor_descriptor"`` meaning "every
+                # element". Stamping the scalar there put a bare ``str`` in a slot
+                # whose ``encode()`` asserts ``isinstance(value, list)`` -- caught by
+                # ``_lab/override-widen/surrogate_sees_override_noise.py`` blowing up in
+                # ``encode_config``, i.e. by the very consumer this pin exists to fix.
+                if isinstance(spec, ListOf) and not isinstance(stamped, list):
+                    stamped = [copy.deepcopy(item) for _ in range(spec.length)]
+                try:
+                    spec.encode(stamped)
+                except Exception:
+                    # Fail SAFE: keep the drawn value rather than corrupt the vector.
+                    # A vector slot that ``encode_config`` cannot read would break the
+                    # surrogate outright, which is strictly worse than the noise.
+                    continue
+                flat_config[idx] = stamped
 
-        Returns:
-            A random flat configuration.
-        """
+    def random_flat(self) -> FlatConfig:
 
         with sync_seed(process_group_name=self.process_group_name):
             config = [spec.random() for spec in self.flat_spec]
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
             self._repair_cute_num_threads(config)
+            self._pin_overridden_slots(config)
             return config
 
     @functools.cached_property
@@ -590,6 +661,10 @@ class ConfigGeneration:
                     config.append(_value_or(prior(spec, key_pos[1]), spec.random))
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
             self._repair_cute_num_threads(config)
+            # Same pin as ``random_flat``: this is the OTHER random-draw entry point
+            # (half the random portion of the initial population), so leaving it out
+            # would reintroduce the frozen-slot noise for exactly those members.
+            self._pin_overridden_slots(config)
             return config
 
     def random_config(self) -> Config:

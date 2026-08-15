@@ -1772,7 +1772,17 @@ class PopulationBasedSearch(BaseSearch):
             simplified = False
             candidates: list[PopulationMember] = [current]
 
-            # Generate candidates by resetting each parameter to its default
+            # Generate candidates by resetting each parameter to its default.
+            #
+            # ``reset_slots`` records WHICH slot each candidate was built to reset.
+            # It is not bookkeeping for its own sake: ``unflatten`` canonicalizes the
+            # flat vector to the post-repair encoding, so a candidate's vector can
+            # differ from ``current``'s in slots the reset never touched (repair may
+            # derive or clamp other keys once slot *i* changes). The combine step
+            # below must copy only the INTENDED reset, or it would fold in
+            # repair-induced differences and stop being "combine the single-attribute
+            # resets that individually kept performance".
+            reset_slots: dict[int, int] = {}
             for i in range(len(current.flat_values)):
                 if current.flat_values[i] != default_flat[i]:
                     # Create a new config with this parameter reset to default
@@ -1781,6 +1791,7 @@ class PopulationBasedSearch(BaseSearch):
                     candidate = self.make_unbenchmarked(new_flat)
                     # Only add if valid and produces a different config
                     if candidate is not None and candidate.config != current.config:
+                        reset_slots[id(candidate)] = i
                         candidates.append(candidate)
 
             if len(candidates) <= 1:
@@ -1819,12 +1830,16 @@ class PopulationBasedSearch(BaseSearch):
             ]
 
             if len(good_candidates) > 1:
-                # Try combining all good single-attribute resets at once
+                # Try combining all good single-attribute resets at once.
+                # Copy ONLY each candidate's intended reset slot (see ``reset_slots``
+                # above) rather than every slot where it differs from ``current``:
+                # post-repair vectors can differ in derived slots the reset did not
+                # ask for, and folding those in would change what "combined" means.
                 combined_flat = [*current.flat_values]
                 for c in good_candidates:
-                    for i in range(len(combined_flat)):
-                        if c.flat_values[i] != current.flat_values[i]:
-                            combined_flat[i] = c.flat_values[i]
+                    slot = reset_slots.get(id(c))
+                    if slot is not None:
+                        combined_flat[slot] = default_flat[slot]
                 combined = self.make_unbenchmarked(combined_flat)
                 if combined is not None and combined.config != current.config:
                     self.benchmark_population(
