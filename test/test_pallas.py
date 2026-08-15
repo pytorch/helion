@@ -750,6 +750,28 @@ def pallas_fixed_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_overlap_initial_dma_with_normalization(
+    lhs: torch.Tensor,
+    table: torch.Tensor,
+    starts: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize rows while the first dynamic matmul window is loading."""
+    rows = hl.specialize(lhs.size(0))
+    hl.specialize(table.size(0))
+    out = torch.empty([starts.size(0), rows, 128], dtype=lhs.dtype, device=lhs.device)
+    for _ in hl.grid(1):
+        lhs_f32 = lhs[:, :].to(torch.float32)
+        inverse_rms = torch.rsqrt(lhs_f32.pow(2).mean(dim=-1, keepdim=True) + 1e-5)
+        normalized = (lhs_f32 * inverse_rms).to(lhs.dtype)
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            weight = table[:, begin + hl.arange(128)]
+            projected = torch.matmul(normalized, weight)
+            out[tile, :, :] = projected[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_shifted_modulo_row_index(x: torch.Tensor) -> torch.Tensor:
     """Exercise a compound modulo operand whose parentheses are significant."""
     out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
@@ -960,11 +982,15 @@ class TestPallas(TestCase):
                     )
                 )
                 self.assertIn(loop_marker, code)
-                self.assertIn("def _prime_fori_loads", code)
+                self.assertNotIn("def _prime_fori_loads", code)
                 self.assertIn("def _prefetch_fori_loads", code)
                 self.assertIn(
                     "pltpu.make_async_copy(table.at[:, pl.ds(pl.multiple_of(",
                     code,
+                )
+                self.assertLess(
+                    code.index("pltpu.make_async_copy(table.at["),
+                    code.index(loop_marker),
                 )
                 self.assertRegex(code, r"table_buf\.at\[\(_j \+ 1\) % 2\]")
                 self.assertNotIn("one_hot", code)
@@ -1015,10 +1041,11 @@ class TestPallas(TestCase):
         code = pallas_refilled_dynamic_matmul.bind(
             (lhs, table, starts)
         ).to_triton_code()
-        self.assertIn("def _prime_fori_loads", code)
+        self.assertNotIn("def _prime_fori_loads", code)
         self.assertIn("def _refill_fori_load", code)
         self.assertNotIn("table_buf.at[", code)
         table_copy_position = code.index("make_async_copy(table.at[")
+        self.assertLess(table_copy_position, code.index("jax.lax.fori_loop"))
         wait_position = code.index(".wait()", table_copy_position)
         matmul_position = code.index("lax.dot_general")
         refill_position = code.index("def _refill_fori_load")
@@ -3692,7 +3719,7 @@ class TestPallas(TestCase):
             pallas_load_buffer_count=[2, 1],
         )
 
-        self.assertIn("def _prime_fori_loads", code)
+        self.assertNotIn("def _prime_fori_loads", code)
         self.assertIn("def _prefetch_fori_loads", code)
         self.assertIn("((2, 8, 128), 'jnp.float32', 'vmem')", code)
         self.assertIn("((2,), None, 'dma_semaphore')", code)
@@ -3703,9 +3730,9 @@ class TestPallas(TestCase):
         # does not wait. The body starts the next stage before any current-stage
         # wait, then waits for both the ordinary depth-one load and selected load
         # before consuming the selected stage.
-        prime_start = code.index("def _prime_fori_loads")
-        fori_call = code.index("jax.lax.fori_loop", prime_start)
-        prime = code[prime_start:fori_call]
+        prime_start = code.index("pltpu.make_async_copy(x.at[")
+        body_definition = code.index("def _fori_body_0", prime_start)
+        prime = code[prime_start:body_definition]
         self.assertIn(".start()", prime)
         self.assertNotIn(".wait()", prime)
 
@@ -3747,9 +3774,13 @@ class TestPallas(TestCase):
             pallas_load_buffer_count=[2, 1],
         )
 
-        self.assertIn("def _prime_fori_loads", code)
+        self.assertNotIn("def _prime_fori_loads", code)
         self.assertIn("def _prefetch_fori_loads", code)
         self.assertIn("for _j in range(", code)
+        self.assertLess(
+            code.index("pltpu.make_async_copy(x.at["),
+            code.index("for _j in range("),
+        )
         self.assertNotIn("jax.lax.fori_loop", code)
         self.assertIn("((2, 8, 128), 'jnp.float32', 'vmem')", code)
         self.assertIn("((2,), None, 'dma_semaphore')", code)
@@ -4267,7 +4298,11 @@ class TestPallas(TestCase):
         )
         self.assertIn("jax.lax.fori_loop", code)
         self.assertIn("pltpu.make_async_copy", code)
-        self.assertIn("def _prime_fori_loads", code)
+        self.assertNotIn("def _prime_fori_loads", code)
+        self.assertLess(
+            code.index("pltpu.make_async_copy(k_view.at["),
+            code.index("jax.lax.fori_loop"),
+        )
         # The first three entries are pre-broadcast loop-carried state. K and V
         # then receive two VMEM stages and two semaphore slots each.
         self.assertIn(
@@ -4608,7 +4643,11 @@ class TestPallas(TestCase):
             pallas_loop_type="fori_loop",
             pallas_load_buffer_count=[2],
         )
-        self.assertIn("def _prime_fori_loads", code)
+        self.assertNotIn("def _prime_fori_loads", code)
+        self.assertLess(
+            code.index("pltpu.make_async_copy(x.at["),
+            code.index("jax.lax.fori_loop"),
+        )
         self.assertIn("((2, 256, 128), 'jnp.float32', 'vmem')", code)
         self.assertIn("((2,), None, 'dma_semaphore')", code)
         torch.testing.assert_close(result, x + 1.0)
@@ -5472,6 +5511,47 @@ class TestPallas(TestCase):
                 self.assertEqual(pad_dims, [(1, 0, 16, expected_extra_pad)])
                 expected = x[3 : 3 + extent].sum(dim=0, keepdim=True)
                 torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_initial_dma_overlaps_outer_normalization_codegen(self) -> None:
+        lhs = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        table = torch.randn(128, 512, device=DEVICE, dtype=torch.bfloat16)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        code = pallas_overlap_initial_dma_with_normalization.bind(
+            (lhs, table, starts)
+        ).to_triton_code(helion.Config(pallas_loop_type="fori_loop"))
+        first_dma = code.index("pltpu.make_async_copy(table.at[")
+        normalization = code.index("lax.rsqrt")
+        first_wait = code.index(".wait()", first_dma)
+        matmul = code.index("lax.dot_general")
+        self.assertLess(first_dma, normalization)
+        self.assertLess(normalization, first_wait)
+        self.assertLess(first_wait, matmul)
+        self.assertNotIn("def _prime_fori_loads", code)
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_initial_dma_overlaps_outer_normalization(self) -> None:
+        lhs = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        table = torch.randn(128, 512, device=DEVICE, dtype=torch.bfloat16)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_overlap_initial_dma_with_normalization,
+            (lhs, table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        lhs_f32 = lhs.float()
+        normalized = (
+            lhs_f32 * torch.rsqrt(lhs_f32.pow(2).mean(-1, keepdim=True) + 1e-5)
+        ).to(lhs.dtype)
+        expected = torch.stack(
+            [
+                torch.matmul(
+                    normalized.float(),
+                    table[:, begin : begin + 128].float(),
+                )
+                for begin in range(0, 512, 128)
+            ]
+        ).to(lhs.dtype)
+        torch.testing.assert_close(result, expected)
 
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
