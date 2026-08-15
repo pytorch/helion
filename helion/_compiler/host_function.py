@@ -290,14 +290,21 @@ class HostFunction:
             return "(" + ", ".join(self.literal_expr(x) for x in expr) + ")"
         return repr(expr)
 
+    def host_debug_str(self) -> str:
+        return print_ast(
+            self.location.to_ast(
+                ast.FunctionDef(self.name, self.args, self.body, [], None)
+            )
+        )
+
+    def semantic_debug_str(self) -> str:
+        result = [self.host_debug_str()]
+        if self._device_ir is not None:
+            result.append(self._device_ir.semantic_debug_str())
+        return "\n\n".join(result)
+
     def debug_str(self) -> str:
-        result = [
-            print_ast(
-                self.location.to_ast(
-                    ast.FunctionDef(self.name, self.args, self.body, [], None)
-                )
-            ),
-        ]
+        result = [self.host_debug_str()]
         if self._device_ir is not None:
             result.append(self._device_ir.debug_str())
         return "\n\n".join(result)

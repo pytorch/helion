@@ -12,6 +12,7 @@ from unittest.mock import patch
 import torch
 
 import helion
+from helion._compiler._dynamo.variables import infer_output_spec
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.pallas.backend import PallasBackend
 from helion._compiler.triton.backend import TileIRBackend
@@ -26,8 +27,17 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
     from typing import Hashable
+    from typing_extensions import Self
 
 kernel_module = importlib.import_module("helion.runtime.kernel")
+
+_RESET_SPECIALIZATION_USES_X = False
+
+
+def _select_reset_specialization_tensor(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    return x if _RESET_SPECIALIZATION_USES_X else y
 
 
 def _make_add_one(*, distributed: bool = False) -> helion.Kernel:
@@ -58,6 +68,21 @@ def _make_aot_scale(*, distributed: bool = False) -> helion.Kernel:
         return out
 
     return aot_scale
+
+
+def _make_scale() -> helion.Kernel:
+    @helion.kernel(
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64]),
+    )
+    def scale(x: torch.Tensor, value: int) -> torch.Tensor:
+        value = hl.specialize(value)
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size(0)):
+            out[tile] = x[tile] * value
+        return out
+
+    return scale
 
 
 def _tensor_size(values: Sequence[object]) -> int:
@@ -181,16 +206,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
                 out[tile] = x[tile] * value
             return out
 
-        @helion.kernel(
-            static_shapes=True,
-            config=helion.Config(block_sizes=[64]),
-        )
-        def scale_specialized(x: torch.Tensor, value: int) -> torch.Tensor:
-            value = hl.specialize(value)
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.size(0)):
-                out[tile] = x[tile] * value
-            return out
+        scale_specialized = _make_scale()
 
         x = torch.randn(64, device=DEVICE)
         torch.testing.assert_close(scale(x, 2.0), x * 2.0)
@@ -489,7 +505,7 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         ):
             torch.testing.assert_close(aot_add_default(x), x + 1)
 
-    def test_compiler_bind_is_isolated_from_eager_caches(self) -> None:
+    def test_compiler_binds_are_isolated_from_eager_caches(self) -> None:
         @helion.kernel(
             static_shapes=True,
             config=helion.Config(block_sizes=[64]),
@@ -511,6 +527,8 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             isolated = add_default.bind((x,))
         self.assertIsNot(isolated, bound)
         self.assertFalse(isolated._cache_managed)
+        output_spec = infer_output_spec(add_default, (x, 1))
+        self.assertEqual(output_spec["leaf_specs"][0]["shape"], [64])
         self.assertEqual(
             (
                 tuple(add_default._bound_kernels.items()),  # type: ignore[attr-defined]
@@ -520,33 +538,9 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             shared_state,
         )
 
-    def test_isolated_bind_with_existing_specializations_is_read_only(self) -> None:
-        @helion.kernel(
-            static_shapes=True,
-            config=helion.Config(block_sizes=[64]),
-        )
-        def scale(x: torch.Tensor, value: int) -> torch.Tensor:
-            value = hl.specialize(value)
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.size(0)):
-                out[tile] = x[tile] * value
-            return out
-
+    def test_isolated_bind_cache_key_is_read_only(self) -> None:
+        scale = _make_scale()
         x = torch.randn(64, device=DEVICE)
-        expected = scale(x, 2)
-        self.assertTrue(scale._has_specialization_extras)  # type: ignore[attr-defined]
-        managed_bound = scale._prepared_call.bound  # type: ignore[attr-defined]
-        scale._extend_bound_kernel_specializations(  # type: ignore[attr-defined]
-            managed_bound,
-            managed_bound._base_spec_key,
-            [_tensor_size],
-            (x, 2),
-        )
-        schemas = {  # type: ignore[attr-defined]
-            signature: tuple(extractors)
-            for signature, extractors in scale._specialize_extra.items()
-        }
-        scale.reset()
 
         bound = scale._bind_isolated((x, 2))  # type: ignore[attr-defined]
         self.assertFalse(bound._cache_managed)
@@ -555,45 +549,376 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             (x, 2),
             bound._base_spec_key,
         )
-        torch.testing.assert_close(bound(x, 2), expected)
+        torch.testing.assert_close(bound(x, 2), x * 2)
 
         self.assertFalse(scale._bound_kernels)  # type: ignore[attr-defined]
         self.assertFalse(scale._dispatch_cache)  # type: ignore[attr-defined]
-        self.assertEqual(  # type: ignore[attr-defined]
-            {
-                signature: tuple(extractors)
-                for signature, extractors in scale._specialize_extra.items()
-            },
-            schemas,
+        self.assertFalse(scale._specialize_extra)  # type: ignore[attr-defined]
+
+    def test_reset_rediscovers_conditional_specialization_schema(self) -> None:
+        global _RESET_SPECIALIZATION_USES_X
+
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def conditional_scale(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            selected = _select_reset_specialization_tensor(x, y)
+            value = hl.specialize(selected.size(0))
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        x32 = torch.randn(32, device=DEVICE)
+        x48 = torch.randn(48, device=DEVICE)
+        y64 = torch.randn(64, device=DEVICE)
+        try:
+            _RESET_SPECIALIZATION_USES_X = False
+            old = conditional_scale.bind((x32, y64))
+            signature = old._base_spec_key
+            old_extractors = conditional_scale._specialize_extra[signature]  # type: ignore[attr-defined]
+            self.assertEqual(tuple(fn((x32, y64)) for fn in old_extractors), (64,))
+
+            conditional_scale.reset()
+            _RESET_SPECIALIZATION_USES_X = True
+            first = conditional_scale.bind((x32, y64))
+            new_extractors = conditional_scale._specialize_extra[signature]  # type: ignore[attr-defined]
+            self.assertEqual(tuple(fn((x32, y64)) for fn in new_extractors), (32,))
+
+            second = conditional_scale.bind((x48, y64))
+            self.assertEqual(first._base_spec_key, second._base_spec_key)
+            self.assertIsNot(first, second)
+            self.assertEqual(len(conditional_scale._bound_kernels), 2)  # type: ignore[attr-defined]
+        finally:
+            _RESET_SPECIALIZATION_USES_X = False
+            conditional_scale.reset()
+
+    def test_stale_bound_does_not_republish_schema_after_reset(self) -> None:
+        scale = _make_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(scale(x, 2), x * 2)
+        stale_bound = scale._prepared_call.bound  # type: ignore[attr-defined]
+        signature = stale_bound._base_spec_key
+
+        scale.reset()
+        cache_key = scale._create_bound_kernel_cache_key(  # type: ignore[attr-defined]
+            stale_bound,
+            (x, 2),
+            signature,
         )
 
-    def test_inductor_lowering_bind_falls_back_when_cache_lock_is_busy(self) -> None:
+        self.assertEqual(cache_key.extra_results, (2,))
+        self.assertFalse(scale._specialize_extra)  # type: ignore[attr-defined]
+        self.assertFalse(scale._has_specialization_extras)  # type: ignore[attr-defined]
+
+    def test_reset_preserves_inflight_omitted_default_alias(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def add_default(x: torch.Tensor, value: int = 2) -> torch.Tensor:
+            value = hl.specialize(value)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        add_default.bind((x, 2))
+        add_default.bind((x,))
+        signature = add_default._base_specialization_key((x,))  # type: ignore[attr-defined]
+        alias = add_default._specialization_aliases[signature]  # type: ignore[attr-defined]
+        alias_type = type(alias)
+        original_call = alias_type.__call__
+        alias_entered = threading.Event()
+        release_alias = threading.Event()
+
+        def blocking_call(current, values):
+            alias_entered.set()
+            self.assertTrue(release_alias.wait(5))
+            return original_call(current, values)
+
+        with (
+            patch.object(alias_type, "__call__", new=blocking_call),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            key = pool.submit(
+                add_default._get_bound_kernel_cache_key,  # type: ignore[attr-defined]
+                (x,),
+                signature,
+            )
+            try:
+                self.assertTrue(alias_entered.wait(5))
+                add_default.reset()
+            finally:
+                release_alias.set()
+            self.assertIsNone(key.result(timeout=5))
+
+        self.assertFalse(add_default._specialize_extra)  # type: ignore[attr-defined]
+        self.assertFalse(add_default._specialization_aliases)  # type: ignore[attr-defined]
+
+    def test_isolated_bind_rejects_too_many_args_without_caching(self) -> None:
+        add_one = _make_add_one()
+        x = torch.empty(1, device=DEVICE)
+
+        with self.assertRaisesRegex(
+            TypeError,
+            r"Too many arguments passed to the kernel, expected: 1 got: 2\.",
+        ):
+            add_one._bind_isolated((x, x))
+
+        self.assertFalse(add_one._bound_kernels)
+
+    def test_inductor_lowering_bind_does_not_wait_for_bind_lock(self) -> None:
         from helion._compiler._inductor.template_buffer import _bind_kernel_for_lowering
 
         add_one = _make_add_one()
         x = torch.randn(64, device=DEVICE)
+        isolated_bound = add_one._bind_isolated((x,))
+        self.assertFalse(isolated_bound._cache_managed)
         lock_held = threading.Event()
         release_lock = threading.Event()
 
         def hold_bind_lock() -> None:
-            with add_one._bind_lock:  # type: ignore[attr-defined]
+            with add_one._bind_lock:
                 lock_held.set()
                 self.assertTrue(release_lock.wait(5))
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        with (
+            patch.object(
+                add_one,
+                "_bind_isolated",
+                return_value=isolated_bound,
+            ) as isolated_bind,
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
             holder = pool.submit(hold_bind_lock)
+            self.assertTrue(lock_held.wait(5))
+            binding = pool.submit(_bind_kernel_for_lowering, add_one, (x,))
             try:
-                self.assertTrue(lock_held.wait(5))
-                isolated = _bind_kernel_for_lowering(add_one, (x,))
+                self.assertIs(binding.result(timeout=2), isolated_bound)
+            finally:
+                release_lock.set()
+            holder.result(timeout=5)
+            isolated_bind.assert_called_once_with((x,))
+
+        self.assertFalse(add_one._bound_kernels)
+
+        managed_bound = _bind_kernel_for_lowering(add_one, (x,))
+        self.assertTrue(managed_bound._cache_managed)
+        self.assertIn(managed_bound, add_one._bound_kernels.values())
+
+    def test_cache_key_generation_preserves_late_specializations(self) -> None:
+        scale = _make_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(scale(x, 2), x * 2)
+        prepared = scale._prepared_call
+        assert prepared is not None
+        bound = prepared.bound
+        signature = bound._base_spec_key
+        scale._extend_bound_kernel_specializations(
+            bound,
+            signature,
+            [_tensor_size],
+            (x, 2),
+        )
+        schema = tuple(scale._specialize_extra[signature])
+        self.assertLess(len(bound._specialize_extra()), len(schema))
+
+        cache_key = scale._create_bound_kernel_cache_key(
+            bound,
+            (x, 2),
+            signature,
+        )
+
+        self.assertEqual(tuple(scale._specialize_extra[signature]), schema)
+        self.assertEqual(cache_key.extra_results, (2, 64))
+
+    def test_cache_key_generation_waits_for_specialization_extension(self) -> None:
+        scale = _make_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(scale(x, 2), x * 2)
+        prepared = scale._prepared_call
+        assert prepared is not None
+        bound = prepared.bound
+        signature = bound._base_spec_key
+        extension_entered = threading.Event()
+        release_extension = threading.Event()
+        key_lock_attempted = threading.Event()
+        lock = threading.Lock()
+
+        class TrackedLock:
+            def __enter__(self) -> Self:
+                if lock.locked():
+                    key_lock_attempted.set()
+                lock.acquire()
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc_value: object,
+                traceback: object,
+            ) -> None:
+                lock.release()
+
+        def blocking_size(values: Sequence[object]) -> int:
+            extension_entered.set()
+            self.assertTrue(release_extension.wait(5))
+            return _tensor_size(values)
+
+        with (
+            patch.object(scale, "_specialize_extra_lock", TrackedLock()),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            extension = pool.submit(
+                scale._extend_bound_kernel_specializations,
+                bound,
+                signature,
+                [blocking_size],
+                (x, 2),
+            )
+            cache_key = None
+            try:
+                self.assertTrue(extension_entered.wait(5))
+                cache_key = pool.submit(
+                    scale._create_bound_kernel_cache_key,
+                    bound,
+                    (x, 2),
+                    signature,
+                )
+                self.assertTrue(key_lock_attempted.wait(5))
+                self.assertFalse(cache_key.done())
+            finally:
+                release_extension.set()
+
+            self.assertTrue(extension.result(timeout=5))
+            assert cache_key is not None
+            result = cache_key.result(timeout=5)
+
+        self.assertEqual(result.extra_results, (2, 64))
+
+    def test_cache_key_generation_retries_after_specialization_extension(self) -> None:
+        scale = _make_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(scale(x, 2), x * 2)
+        prepared = scale._prepared_call
+        assert prepared is not None
+        bound = prepared.bound
+        signature = bound._base_spec_key
+        key_entered = threading.Event()
+        release_key = threading.Event()
+        key_thread_id: int | None = None
+
+        def blocking_value(values: Sequence[object]) -> int:
+            nonlocal key_thread_id
+            if key_thread_id is None:
+                key_thread_id = threading.get_ident()
+                key_entered.set()
+            if threading.get_ident() == key_thread_id:
+                self.assertTrue(release_key.wait(5))
+            return cast("int", values[1])
+
+        scale._specialize_extra[signature] = [blocking_value]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            cache_key = pool.submit(
+                scale._create_bound_kernel_cache_key,
+                bound,
+                (x, 2),
+                signature,
+            )
+            try:
+                self.assertTrue(key_entered.wait(5))
+                extension = pool.submit(
+                    scale._extend_bound_kernel_specializations,
+                    bound,
+                    signature,
+                    [_tensor_size],
+                    (x, 2),
+                )
+                self.assertTrue(extension.result(timeout=5))
+                self.assertFalse(cache_key.done())
+            finally:
+                release_key.set()
+
+            result = cache_key.result(timeout=5)
+
+        self.assertEqual(result.extra_results, (2, 64))
+
+    def test_specialization_key_retries_after_specialization_extension(self) -> None:
+        scale = _make_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(scale(x, 2), x * 2)
+        prepared = scale._prepared_call
+        assert prepared is not None
+        bound = prepared.bound
+        signature = bound._base_spec_key
+        key_entered = threading.Event()
+        release_key = threading.Event()
+        key_thread_id: int | None = None
+
+        def blocking_value(values: Sequence[object]) -> int:
+            nonlocal key_thread_id
+            if key_thread_id is None:
+                key_thread_id = threading.get_ident()
+                key_entered.set()
+            if threading.get_ident() == key_thread_id:
+                self.assertTrue(release_key.wait(5))
+            return cast("int", values[1])
+
+        scale._specialize_extra[signature] = [blocking_value]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            specialization_key = pool.submit(scale.specialization_key, (x, 2))
+            try:
+                self.assertTrue(key_entered.wait(5))
+                extension = pool.submit(
+                    scale._extend_bound_kernel_specializations,
+                    bound,
+                    signature,
+                    [_tensor_size],
+                    (x, 2),
+                )
+                self.assertTrue(extension.result(timeout=5))
+                self.assertFalse(specialization_key.done())
+            finally:
+                release_key.set()
+
+            result = specialization_key.result(timeout=5)
+
+        self.assertEqual(result[-2:], (2, 64))
+
+    def test_cache_key_generation_does_not_wait_for_bind_lock(self) -> None:
+        scale = _make_scale()
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(scale(x, 2), x * 2)
+        prepared = scale._prepared_call
+        assert prepared is not None
+        bound = prepared.bound
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_bind_lock() -> None:
+            with scale._bind_lock:
+                lock_held.set()
+                self.assertTrue(release_lock.wait(5))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            holder = pool.submit(hold_bind_lock)
+            self.assertTrue(lock_held.wait(5))
+            cache_key = pool.submit(
+                scale._create_bound_kernel_cache_key,
+                bound,
+                (x, 2),
+                bound._base_spec_key,
+            )
+            try:
+                result = cache_key.result(timeout=2)
             finally:
                 release_lock.set()
             holder.result(timeout=5)
 
-        self.assertFalse(isolated._cache_managed)
-        self.assertFalse(add_one._bound_kernels)  # type: ignore[attr-defined]
-        managed = _bind_kernel_for_lowering(add_one, (x,))
-        self.assertTrue(managed._cache_managed)
-        self.assertIn(managed, add_one._bound_kernels.values())  # type: ignore[attr-defined]
+        self.assertEqual(result.extra_results, (2,))
 
     def test_stale_keyed_dispatch_generation_is_rebuilt(self) -> None:
         aot_scale = _make_aot_scale()
@@ -852,6 +1177,48 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
             self.assertIsNone(  # type: ignore[attr-defined]
                 add_one._prepare_dispatch_entry((x,), bound, fast_entry)
             )
+
+    def test_omitted_default_publication_rechecks_raw_args(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def add_default(x: torch.Tensor, value: int = 1) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(add_default(x), x + 1)
+        prepared = add_default._prepared_call
+        assert prepared is not None
+        fast_entry = add_default._fast_dispatch_key_and_guards((x,))
+        assert fast_entry is not None
+        calls: list[tuple[tuple[object, ...], bool | None]] = []
+
+        def require_raw_args(
+            args: Sequence[object], *, dist_initialized: bool | None = None
+        ) -> bool:
+            calls.append((tuple(args), dist_initialized))
+            self.assertEqual(len(args), 1)
+            self.assertIs(args[0], x)
+            return False
+
+        with patch.object(
+            add_default,
+            "_compute_is_distributed",
+            side_effect=require_raw_args,
+        ):
+            entry = add_default._prepare_dispatch_entry(
+                (x,), prepared.bound, fast_entry
+            )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertIsNotNone(entry[0])
+        self.assertFalse(entry[1])
+        self.assertEqual(len(calls), 1)
 
     def test_custom_key_hit_rejects_distributed_state_transition(self) -> None:
         calls = 0

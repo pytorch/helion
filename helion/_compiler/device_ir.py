@@ -805,6 +805,14 @@ class DeviceIR:
         # Normalize indentation to 4 spaces to handle both PyTorch 2.9 and nightly formatting
         return re.sub(r" *(# File:\s+).*/([^/:]+:\d+)", r"    \1.../\2", result)
 
+    def semantic_debug_str(self) -> str:
+        """Render graph operations without layout-dependent FX metadata."""
+        return "\n\n".join(
+            f"{type(graph_info).__name__} {graph_info.name}\n"
+            f"{graph_info.graph.python_code('self').src}"
+            for graph_info in self.graphs
+        )
+
     def add_graph(
         self,
         graph: torch.fx.Graph,

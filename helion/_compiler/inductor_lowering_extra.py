@@ -99,11 +99,11 @@ FP32_FALLBACK_OPS_UNARY = [
 
 @contextlib.contextmanager
 def patch_inductor_lowerings() -> Generator[None, Any, Any]:
-    """Context manager to temporarily patch the inductor lowering table.
+    """Temporarily install lowering overrides needed by Helion compilation.
 
-    This is useful for overwriting specific Inductor lowerings without
-    affecting the global state, especially in cases where Helion
-    is missing support for a specific lowering.
+    Inductor's lowering table is process-global, so the installed wrappers
+    apply Helion behavior only with an active compile environment and delegate
+    to the prior lowerings in all other threads.
     """
     global _patch_table, _patch_users
 
