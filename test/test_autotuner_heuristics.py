@@ -3670,9 +3670,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         config_gen = spec.create_config_generation()
         seed_pairs = config_gen.seed_flat_config_pairs()
-        # 7 = the cluster_m=1 universal default plus the 7 cluster_m=2 rows, one of
-        # which dedups against the default after normalization.
-        self.assertEqual(len(seed_pairs), 7)
+        self.assertEqual(len(seed_pairs), 8)
         normalized_seeds = [normalized.config for _flat, normalized in seed_pairs]
         normalized_seed = next(
             config
@@ -5309,28 +5307,26 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound.config_spec.autotuner_heuristics,
         )
 
-        # The LEADING seed is ``default_config()``, and it is the cluster_m=1
-        # universal default again: the TVM-FFI direct-entry seed only reached the
-        # default because a partial FFI candidate was repaired ONTO the seed, which
-        # this commit stops doing. Both cluster_m=2 seeds (FFI direct-entry and
-        # DEFAULT-layout) still enter the population behind it, and remain distinct
-        # after normalization — which is what this test is actually for.
+        # fp16 4096³ is a full-wave compute shape, so the leading compiler seed is
+        # the promote-to-default formula heuristic's cluster_m=2 compute tile. The
+        # generalized TVM-FFI direct-entry seed and the DEFAULT-layout cluster_m=2
+        # seed are also emitted and remain distinct after normalization.
         config_gen = bound.config_spec.create_config_generation()
         zero_flat = config_gen.random_population_flat(0)
         self.assertEqual(len(zero_flat), 1)
         zero_config = config_gen.unflatten(zero_flat[0])
-        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 1)
+        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 2)
         one_flat = config_gen.random_population_flat(1)
         self.assertEqual(len(one_flat), 1)
         one_config = config_gen.unflatten(one_flat[0])
-        self.assertEqual(one_config.config["tcgen05_cluster_m"], 1)
+        self.assertEqual(one_config.config["tcgen05_cluster_m"], 2)
         one_config_population = config_gen.random_population(1)
         self.assertEqual(len(one_config_population), 1)
-        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
+        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 2)
         seeded_configs = config_gen.random_population(3)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             seeded_configs,
-            expected_block_ks=(128, 256),
+            expected_block_ks=(64, 128),
             expected_indexing_length=3,
         )
         expected_seed_modes = {
@@ -5365,7 +5361,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self._assert_cute_tcgen05_cluster_m2_seeded(
             acf_seed_configs,
-            expected_block_ks=(128, 256),
+            expected_block_ks=(64, 128),
             expected_indexing_length=3,
         )
 
@@ -5388,7 +5384,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertGreaterEqual(len(configs), 2)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             configs,
-            expected_block_ks=(128, 256),
+            expected_block_ks=(64, 128),
             expected_indexing_length=3,
         )
         best_available_modes = {
