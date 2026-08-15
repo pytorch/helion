@@ -1497,6 +1497,41 @@ def _fixed_loop_extent(state: CodegenState, loop_dim_index: int) -> int | None:
     return None
 
 
+def _hoist_initial_dma_before_pure_outer_compute(
+    state: CodegenState,
+    statements: list[ast.stmt],
+    loop_local_names: list[str],
+) -> bool:
+    """Move an independent initial DMA to the start of the current root body.
+
+    A buffered inner loop normally starts its first load immediately before
+    entering the loop. If the address depends only on kernel arguments and
+    constants, starting it before preceding elementwise root computation
+    exposes useful DMA/compute overlap. Stay conservative: cross only plain
+    assignments and compiler-owned scratch initialization, never user-visible
+    stores, structured control flow, or a producer of a value read by the DMA.
+    """
+    from ..ast_read_writes import ReadWrites
+
+    outer = state.codegen.statements_stack[-1]
+    dma_reads = set(ReadWrites.from_list(statements).reads)
+    # A nested loop's initial DMA can depend on an enclosing device-loop
+    # induction variable. That variable is an argument of the not-yet-emitted
+    # loop body, so it is unavailable in ``outer`` even though no assignment in
+    # ``outer`` produces it. Keep the prime inside that loop body in this case.
+    if dma_reads.intersection(loop_local_names):
+        return False
+    scratch_names = {scratch.name for scratch in state.device_function._scratch_args}
+    for statement in outer:
+        if not isinstance(statement, ast.Assign):
+            return False
+        rw = ReadWrites.from_ast(statement)
+        if set(rw.writes) & dma_reads or set(rw.inplace_writes) - scratch_names:
+            return False
+    outer[:0] = statements
+    return True
+
+
 def _compute_pipeline_or_dma_extra_pad(
     begin_expr: str,
     bid: int,
@@ -4280,11 +4315,16 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                     ("start",),
                 )
             )
-        prime_statements.append(
-            _guarded_statements(
-                f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
-            )
+        fixed_extent = _fixed_loop_extent(state, len(block_ids) - 1)
+        prime_was_hoisted = fixed_extent is not None and (
+            _hoist_initial_dma_before_pure_outer_compute(state, prime_starts, loop_vars)
         )
+        if not prime_was_hoisted:
+            prime_statements.append(
+                _guarded_statements(
+                    f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
+                )
+            )
 
         stage_loop_var = loop_vars[-1]
         next_iteration = f"({stage_loop_var} + 1)"
