@@ -719,6 +719,28 @@ def pallas_two_aligned_dynamic_windows(
     return out
 
 
+@helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(pallas_loop_type="fori_loop"),
+)
+def pallas_refilled_dynamic_matmul(
+    lhs: torch.Tensor, table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    """Multiply by one dynamic HBM weight window per loop iteration."""
+    rows = hl.specialize(lhs.size(0))
+    hl.specialize(table.size(0))
+    out = torch.empty([starts.size(0), rows, 128], dtype=lhs.dtype, device=lhs.device)
+    for _ in hl.grid(1):
+        local_lhs = lhs[:, :]
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            weight = table[:, begin + hl.arange(128)]
+            projected = torch.matmul(local_lhs, weight)
+            out[tile, :, :] = projected[None, :, :]
+    return out
+
+
 @helion.kernel(backend="pallas", static_shapes=True)
 def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
@@ -944,6 +966,22 @@ class TestPallas(TestCase):
                 for begin in range(0, 512, 128)
             ]
         )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_single_buffer_dynamic_matmul_refill(self) -> None:
+        lhs = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        table = torch.randn(128, 512, device=DEVICE, dtype=torch.bfloat16)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_refilled_dynamic_matmul, (lhs, table, starts)
+        )
+        expected = torch.stack(
+            [
+                torch.matmul(lhs.float(), table[:, begin : begin + 128].float())
+                for begin in range(0, 512, 128)
+            ]
+        ).to(torch.bfloat16)
         torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_computed_static_slice(self) -> None:
