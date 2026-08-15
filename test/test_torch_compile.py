@@ -3150,6 +3150,46 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fused_lowering_revalidates_changed_index_dtype(self):
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+            index_dtype=torch.int32,
+            torch_compile_fusion=True,
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return add_one(x)
+
+        x = torch.randn(128, device=DEVICE)
+        try:
+            add_one(x)
+            warm_bound = next(iter(add_one._bound_kernels.values()))
+            self.assertEqual(warm_bound.env.index_dtype, torch.int32)
+
+            add_one.settings.index_dtype = torch.int64
+            torch._dynamo.reset()
+            with fresh_cache():
+                actual, (code,) = run_and_get_code(
+                    torch.compile(f, fullgraph=True, backend="inductor"),
+                    x,
+                )
+
+            torch.testing.assert_close(actual, x + 1)
+            self.assertIn("tl.program_id(0).to(tl.int64)", code)
+            self.assertIs(next(iter(add_one._bound_kernels.values())), warm_bound)
+        finally:
+            add_one.settings.index_dtype = torch.int32
+            add_one.reset()
+            torch._dynamo.reset()
+
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @parametrize("static_shapes", (True, False))
     def test_fused_lowering_rejects_host_trace_change_during_compile(
         self, static_shapes
@@ -3192,7 +3232,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 )
                 with self.assertRaisesRegex(
                     InductorError,
-                    "Helion kernel trace changed",
+                    "Helion kernel trace or compile environment differed",
                 ):
                     compiled(x, y)
         finally:
@@ -3243,7 +3283,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 )
                 with self.assertRaisesRegex(
                     InductorError,
-                    "Helion kernel trace changed",
+                    "Helion kernel trace or compile environment differed",
                 ):
                     compiled(x, y)
         finally:
@@ -3341,7 +3381,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 )
                 with self.assertRaisesRegex(
                     InductorError,
-                    "Helion kernel trace changed",
+                    "Helion kernel trace or compile environment differed",
                 ):
                     compiled(x)
         finally:
@@ -3392,7 +3432,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 )
                 with self.assertRaisesRegex(
                     InductorError,
-                    "Helion kernel trace changed",
+                    "Helion kernel trace or compile environment differed",
                 ):
                     compiled(x)
         finally:

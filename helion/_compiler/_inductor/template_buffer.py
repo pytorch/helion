@@ -1071,9 +1071,9 @@ def lower_helion_kernel(
             )
         if actual_semantic_fingerprint != expected_semantic_fingerprint:
             raise RuntimeError(
-                "Helion kernel trace changed between Dynamo capture and Inductor "
-                f"lowering for kernel {kernel.fn.__name__!r}; keep ambient Python "
-                "and PyTorch state stable while torch.compile is running"
+                "Helion kernel trace or compile environment differed between "
+                "Dynamo capture and Inductor lowering for kernel "
+                f"{kernel.fn.__name__!r}; this configuration cannot be lowered safely"
             )
 
     # Derive output structure from bound kernel using inductor-time input layouts.

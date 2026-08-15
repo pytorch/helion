@@ -271,8 +271,8 @@ class _PreparedCall:
             or kernel._key_fn is not None
         ):
             return None
-        # Both call sites already obtained a non-None ``_fast_dispatch_key``,
-        # which proves every argument has an exact supported type.
+        # The caller already obtained a non-None ``_fast_dispatch_key``, which
+        # proves every argument has an exact supported type.
         try:
             return cls(
                 bound,
@@ -2168,6 +2168,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         payload = (
             input_normalization,
             normalization_compatible,
+            self.env.backend_name,
+            str(self.env.index_dtype),
             self._host_semantic_external_tensor_keys(),
             host_source,
             output_key,
@@ -2375,28 +2377,35 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         if not descriptors:
             return
-        seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
-            signature,
-            set(),
-        )
-        new_descriptors: list[Hashable] = []
-        new_extractors: list[Callable[[Sequence[object]], Hashable]] = []
-        for descriptor in descriptors:
-            if descriptor in seen:
-                continue
-            new_descriptors.append(descriptor)
-            new_extractors.append(_make_cute_grouped_static_tail_extractor(descriptor))
-        runtime_args = tuple(
-            self.env.runtime_arg_values_by_name.get(name)
-            for name in self.kernel.signature.parameters
-        )
-        if self.kernel._extend_bound_kernel_specializations(
-            self,
-            signature,
-            new_extractors,
-            runtime_args,
-        ):
-            seen.update(new_descriptors)
+        # Serialize descriptor discovery with schema extension so concurrent
+        # code generation cannot publish duplicate equivalent extractors.
+        with self.kernel._bind_lock:
+            if self._reset_generation != self.kernel._reset_generation:
+                return
+            seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
+                signature,
+                set(),
+            )
+            new_descriptors: list[Hashable] = []
+            new_extractors: list[Callable[[Sequence[object]], Hashable]] = []
+            for descriptor in descriptors:
+                if descriptor in seen:
+                    continue
+                new_descriptors.append(descriptor)
+                new_extractors.append(
+                    _make_cute_grouped_static_tail_extractor(descriptor)
+                )
+            runtime_args = tuple(
+                self.env.runtime_arg_values_by_name.get(name)
+                for name in self.kernel.signature.parameters
+            )
+            if self.kernel._extend_bound_kernel_specializations(
+                self,
+                signature,
+                new_extractors,
+                runtime_args,
+            ):
+                seen.update(new_descriptors)
 
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""

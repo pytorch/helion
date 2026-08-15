@@ -914,6 +914,8 @@ class NumericType(TypeInfo):
 
     def __str__(self) -> str:
         env = CompileEnvironment.current()
+        # Preserve the existing debug/golden rendering except while semantic
+        # fingerprinting supplies canonical symbolic-shape names.
         value = (
             env.sympy_debug(self.value._sympy_())
             if env.has_debug_shape_rename_override
