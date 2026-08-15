@@ -358,6 +358,39 @@ def _computed_fp8_remote_copy(
 
 @helion.kernel(
     static_shapes=True,
+    config=helion.Config(
+        block_sizes=[],
+        pallas_load_buffer_count=[1, 1, 1, 2],
+        pallas_loop_type="unroll",
+    ),
+)
+def _conditional_tail_receive_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Start conditionally but request receive completion only at the tail."""
+    num_steps = hl.specialize(src.size(1))
+    for _program in hl.grid(1):
+        for step in hl.tile(num_steps, block_size=1):
+            if step.begin > 0:
+                copy = hl.make_async_remote_copy(
+                    src,
+                    [0, step.begin],
+                    peers[0, step.begin],
+                    dst=dst,
+                    dst_index=[0, positions[0, step.begin], step.begin],
+                )
+                copy.start()
+                copy.wait_send()
+                if step.begin + 2 >= num_steps:
+                    copy.wait_recv()
+    return dst
+
+
+@helion.kernel(
+    static_shapes=True,
     config=helion.Config(block_sizes=[]),
 )
 def _parent_store_nested_remote_copy(
@@ -1455,6 +1488,85 @@ class TestRemoteCopyJaxRuntime(TestCase):
         expected[1, 0] = payload[0]
         for _invocation in range(2):
             result = np.asarray(jax.block_until_ready(copy(*inputs))).astype(np.float32)
+            np.testing.assert_array_equal(result, expected)
+
+    @skipIfPallasInterpret("deferred receive drains require TPU DMA lowering")
+    def test_conditional_tail_receive_drain(self) -> None:
+        import types
+
+        import jax
+        import jax.numpy as jnp
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+
+        args = (
+            torch.zeros(1, _PIPELINE_STEPS, _WIDTH),
+            torch.zeros(1, 2, _PIPELINE_STEPS, _WIDTH),
+            torch.zeros(1, _PIPELINE_STEPS, dtype=torch.int32),
+            torch.zeros(1, _PIPELINE_STEPS, dtype=torch.int32),
+        )
+        source = _conditional_tail_receive_copy.bind(args).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+        name = "precompiled_conditional_tail_receive_copy_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(source, name, "exec"), module.__dict__)
+
+        world_size = 2
+        mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
+        partition = jax.sharding.PartitionSpec
+        src_spec = partition("peer", None, None)
+        dst_spec = partition("peer", None, None, None)
+        metadata_spec = partition("peer", None)
+        ranks = jnp.arange(world_size, dtype=jnp.float32)[:, None, None]
+        steps = jnp.arange(_PIPELINE_STEPS, dtype=jnp.float32)[None, :, None]
+        columns = jnp.arange(_WIDTH, dtype=jnp.float32)[None, None, :]
+        src = ranks * 1000 + steps * 100 + columns
+        dst = jnp.full(
+            (world_size, world_size, _PIPELINE_STEPS, _WIDTH),
+            -7.0,
+            dtype=jnp.float32,
+        )
+        peers = jnp.broadcast_to(
+            (1 - jnp.arange(world_size, dtype=jnp.int32))[:, None],
+            (world_size, _PIPELINE_STEPS),
+        )
+        positions = jnp.broadcast_to(
+            jnp.arange(world_size, dtype=jnp.int32)[:, None],
+            (world_size, _PIPELINE_STEPS),
+        )
+        specs = (src_spec, dst_spec, metadata_spec, metadata_spec)
+        inputs = tuple(
+            jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
+            for value, spec in zip((src, dst, peers, positions), specs, strict=True)
+        )
+        copy = jax.jit(
+            jax.shard_map(
+                module._conditional_tail_receive_copy,
+                mesh=mesh,
+                in_specs=specs,
+                out_specs=dst_spec,
+                check_vma=False,
+            )
+        )
+
+        expected = np.full(
+            (world_size, world_size, _PIPELINE_STEPS, _WIDTH),
+            -7.0,
+            dtype=np.float32,
+        )
+        src_host = np.asarray(src)
+        expected[0, 1, 1:] = src_host[1, 1:]
+        expected[1, 0, 1:] = src_host[0, 1:]
+        for _invocation in range(2):
+            result = np.asarray(jax.block_until_ready(copy(*inputs)))
             np.testing.assert_array_equal(result, expected)
 
     @skipIfPallasInterpret("nested remote copies require TPU DMA lowering")
