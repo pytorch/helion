@@ -15,6 +15,9 @@ from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
@@ -327,8 +330,13 @@ class CuteTcgen05SearchPlan:
     max_tcgen05_n: int
     max_search_m: int
     max_search_n: int
-    max_search_k: int
+    k_family_divisor: int
     min_search_m: int
+    # Upper bound for the K BlockSizeFragment only. Distinct from
+    # ``k_family_divisor``, which additionally drives the tiling-divisibility
+    # predicates below (full-tile persistent pid types, the cluster_m=2 K cap,
+    # the edge-K-tail family). See ``max_draw_k`` in ``plan_cute_tcgen05_search``.
+    max_draw_k: int
 
 
 def plan_cute_tcgen05_search(
@@ -371,7 +379,16 @@ def plan_cute_tcgen05_search(
     max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
     max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
     max_search_n = max_tcgen05_n
-    max_search_k = min(128, pow2_floor_at_least(static_k, mma_k))
+    # The K yardstick for the tiling-divisibility predicates: "does the K axis tile
+    # evenly at the largest tile this shape uses?" It bounds NOTHING searchable —
+    # ``max_draw_k`` below is the K ``BlockSizeFragment``'s ``high``. Named
+    # ``max_search_k`` until 2026-08-01, which read as a search cap and made the
+    # gates that consume it look wrong.
+    k_family_divisor = min(128, pow2_floor_at_least(static_k, mma_k))
+    # ``bk=256`` is DRAWABLE but does not participate in the tiling-divisibility
+    # predicates below. Two separate bounds, because the two jobs pull opposite ways:
+    #
+    max_draw_k = min(256, pow2_floor_at_least(static_k, mma_k))
     min_search_m = 128 if max_tcgen05_m >= 256 else 64
     leading_work_multiplier = 1
     if has_leading_passthrough:
@@ -383,8 +400,13 @@ def plan_cute_tcgen05_search(
             min_search_m = 64
         max_search_m = min(max_search_m, static_m & -static_m)
         max_search_n = min(max_search_n, static_n & -static_n)
-        max_search_k = min(max_search_k, static_k & -static_k)
-        if max_search_m < min_search_m or max_search_n < 8 or max_search_k < mma_k:
+        k_family_divisor = min(k_family_divisor, static_k & -static_k)
+        # The batched tcgen05 path has no K-edge predication, so the draw bound
+        # takes the same largest-power-of-two-divisor clamp as the search bound
+        # here. (This clamp is why ``max_draw_k`` cannot simply be a wider literal:
+        # for a batched shape it must stay a divisor of K.)
+        max_draw_k = min(max_draw_k, static_k & -static_k)
+        if max_search_m < min_search_m or max_search_n < 8 or k_family_divisor < mma_k:
             return None
     if static_m % max_search_m != 0 and static_n % max_search_n != 0:
         max_search_m = min(max_search_m, 128)
@@ -402,8 +424,9 @@ def plan_cute_tcgen05_search(
         max_tcgen05_n=max_tcgen05_n,
         max_search_m=max_search_m,
         max_search_n=max_search_n,
-        max_search_k=max_search_k,
+        k_family_divisor=k_family_divisor,
         min_search_m=min_search_m,
+        max_draw_k=max_draw_k,
     )
 
 
@@ -434,14 +457,14 @@ def enable_cute_tcgen05_search(
     static_k = plan.static_k
     max_search_m = plan.max_search_m
     max_search_n = plan.max_search_n
-    max_search_k = plan.max_search_k
+    k_family_divisor = plan.k_family_divisor
     spec.cute_tcgen05_search_enabled = True
     allow_full_tile_persistent_pid_types = (
         static_m % max_search_m == 0
         and static_n % max_search_n == 0
-        and static_k % max_search_k == 0
+        and static_k % k_family_divisor == 0
     )
-    max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
+    max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * k_family_divisor
     allow_full_tile_cluster_m2_search = (
         allow_full_tile_persistent_pid_types
         and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
@@ -459,7 +482,7 @@ def enable_cute_tcgen05_search(
         and static_k <= max_cluster_m2_search_k
         and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
         and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
-        and static_k % max_search_k != 0
+        and static_k % k_family_divisor != 0
     )
     allow_fp8_small_grid_cluster_m2_search = (
         not has_leading_passthrough
@@ -482,7 +505,15 @@ def enable_cute_tcgen05_search(
                 cluster_n = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
             else:
                 cluster_m = TCGEN05_TWO_CTA_BLOCK_M
-                cluster_n = TCGEN05_TWO_CTA_BLOCK_N
+                # Count clusters at the narrowest tile these families can emit
+                # (block_n=128, a 256x128 output tile), not the 256x256 artifact:
+                # bn=128 yields 2x the clusters and fills where a 256x256 cm2 would
+                # underfill. Both non-fp8 families reaching here can emit bn=128
+                # (full-tile: the +8.3% S2 win; edge-K-tail: Stage 2b made its
+                # generic [256,128,128] tile searchable), so bn=128 is the honest
+                # best-fill count for both. fp8-small-grid counts at its own
+                # 128x128 tile in the branch above.
+                cluster_n = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
             work_clusters = (
                 plan.leading_work_multiplier
                 * (static_m // cluster_m)
@@ -501,10 +532,15 @@ def enable_cute_tcgen05_search(
         ab_stages_device=lhs.device,
         reason="matmul kernel with CuTe tcgen05 backend",
     )
+    # The K axis uses ``max_draw_k`` (up to 256), NOT ``k_family_divisor`` (up to 128):
+    # the fragment bound is what may be DRAWN and climbed around, while
+    # ``k_family_divisor`` additionally drives the tiling-divisibility predicates above
+    # and must stay at the tile width those predicates were written for. See the
+    # ``max_draw_k`` comment in ``plan_cute_tcgen05_search``.
     for axis_name, shape, max_size in (
         ("m", plan.m, max_search_m),
         ("n", plan.n, max_search_n),
-        ("k", plan.k, max_search_k),
+        ("k", plan.k, plan.max_draw_k),
     ):
         block_idx = env.get_block_id(shape)
         if block_idx is None:

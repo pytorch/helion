@@ -205,9 +205,6 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFI
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
 )
-from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
-)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
 from helion._compiler.cute.tcgen05_constants import (
@@ -215,6 +212,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
@@ -18266,7 +18266,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             bound = kernel.bind(args)
         spec = bound.env.config_spec
         self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertEqual([item.max_size for item in spec.block_sizes], [128, 256, 128])
+        # bk DRAW bound is 256 (pretuned entries exist at bk=256, and a bound of
+        # 128 makes a seeded bk=256 a one-way dead end for the hill-climber). The
+        # tiling-divisibility gates keep the 128-based value, so the edge-family
+        # admission below is unaffected.
+        self.assertEqual([item.max_size for item in spec.block_sizes], [128, 256, 256])
 
         config_dict: dict[str, object] = {
             "block_sizes": [256, 256, 128],
@@ -18343,9 +18347,18 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             cluster_m2_config["tcgen05_ab_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
         )
+        # ⚠ THE EDGE/K-TAIL PERF ROW IS NO LONGER IMPOSED ON A DRAWN CANDIDATE.
+        # ``_fix_cluster_m2_search_config`` used to close with
+        # ``config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())`` plus the
+        # aux-edge / CLC prefixes -- a 6-key blanket write of measured throughput
+        # values onto every cluster_m=2 candidate in this family. The stage now
+        # COMPLETES a cluster_m=2 request (legality only) instead of enumerating the
+        # tuples it recognizes, so the drawn pipeline knobs and the drawn placement
+        # keys SURVIVE. The measured row is still in the population, as a seed.
         self.assertEqual(
             cluster_m2_config["tcgen05_acc_stages"],
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+            2,
+            msg="the drawn acc_stages was re-projected onto the edge perf row",
         )
         self.assertEqual(
             cluster_m2_config["tcgen05_c_stages"],
@@ -18353,19 +18366,23 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertEqual(
             cluster_m2_config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY],
-            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+            TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
         )
         self.assertEqual(
             cluster_m2_config[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY],
-            TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+            TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
         )
+        # ``l2_swizzle_size`` is the ONE key still projected here, by
+        # ``_set_aux_edge_prefix``'s scheduler correction rather than by the deleted
+        # blanket dict, so the drawn 8 still lands on the scheduler value.
         self.assertEqual(
             cluster_m2_config["tcgen05_l2_swizzle_size"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
         )
         self.assertEqual(
             cluster_m2_config["l2_groupings"],
-            [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+            [4],
+            msg="the drawn l2_groupings was re-projected onto the edge perf row",
         )
         self.assertEqual(
             cluster_m2_config["indexing"],
@@ -18426,37 +18443,47 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             config_dict["tcgen05_ab_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
         )
+        # ⚠ THE FOUR PROJECTED-VALUE ASSERTIONS BECAME SURVIVAL ASSERTIONS. They
+        # required the 6-key blanket
+        # ``config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())`` to have
+        # rewritten this DRAWN config onto the measured WIDE-N edge row:
+        # ``acc_stages`` 2 -> 1, ``l2_groupings``, ``l2_swizzle_size``, and the two
+        # ``*_placement`` keys added from scratch. The drawn ``block_n=128`` now
+        # settles as its OWN valid cluster_m=2 tile instead of snapping to 256, so
+        # this candidate is no longer in the wide-N row's scope and keeps what it
+        # drew. The measured row is still in the population, as a seed.
         self.assertEqual(
             config_dict["tcgen05_acc_stages"],
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+            2,
+            msg="the drawn acc_stages was re-projected onto the wide-N edge row",
         )
         self.assertEqual(
             config_dict["tcgen05_c_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
         )
-        self.assertEqual(
-            config_dict[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY],
-            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
-        )
-        self.assertEqual(
-            config_dict[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY],
-            TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
-        )
-        self.assertEqual(
-            config_dict["tcgen05_l2_swizzle_size"],
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
-        )
+        self.assertNotIn(TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY, config_dict)
+        self.assertNotIn(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY, config_dict)
+        # The drawn swizzle (8) and grouping ([4]) survive for the same reason.
+        self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 8)
         self.assertEqual(
             config_dict["l2_groupings"],
-            [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+            [4],
+            msg="the drawn l2_groupings was re-projected onto the wide-N edge row",
         )
         self.assertEqual(
             config_dict["indexing"],
             ["tensor_descriptor"] * spec.indexing.length,
         )
+        # A sampled block_n=128 survives as its own valid cm2 tile for the
+        # edge-K-tail family (block_m still pinned to 256), instead of snapping to
+        # the canonical block_n=256.
         self.assertEqual(
             config_dict["block_sizes"],
-            [256, 256, TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K],
+            [
+                256,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
         )
         self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
         self.assertNotIn("epilogue_subtile", config_dict)
