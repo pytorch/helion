@@ -27,7 +27,6 @@ class DmaTransfer:
     tensor: torch.Tensor
     subscript: tuple[object, ...]
     direction: DmaDirection
-    vmem_shape: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -63,6 +62,7 @@ def allocate_dma_resources(
     device_function: DeviceFunction,
     transfer: DmaTransfer,
     *,
+    vmem_shape: tuple[int, ...],
     buffer_count: int,
     scratch_hint: str,
     semaphore_hint: str,
@@ -70,11 +70,7 @@ def allocate_dma_resources(
 ) -> DmaResources:
     """Allocate the scratch and semaphore used by a local DMA transfer."""
     assert buffer_count in (1, 2)
-    scratch_shape = (
-        (buffer_count, *transfer.vmem_shape)
-        if buffer_count > 1
-        else transfer.vmem_shape
-    )
+    scratch_shape = (buffer_count, *vmem_shape) if buffer_count > 1 else vmem_shape
     if buffer_count > 1 and shape_sources is not None:
         shape_sources = (None, *shape_sources)
     scratch = device_function.register_scratch(

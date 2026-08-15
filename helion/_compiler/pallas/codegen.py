@@ -119,11 +119,11 @@ def _remote_hbm_load_expr(
         tensor=tensor,
         subscript=tuple(subscript),
         direction="load",
-        vmem_shape=tuple(scratch_shape),
     )
     resources = allocate_dma_resources(
         state.device_function,
         transfer,
+        vmem_shape=tuple(scratch_shape),
         buffer_count=1,
         scratch_hint=f"{name}_load",
         semaphore_hint=f"{name}_load_sem",

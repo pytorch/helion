@@ -3263,22 +3263,24 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
     }
 
-    dma_transfers: list[DmaTransfer] = []
+    dma_transfers: list[tuple[DmaTransfer, tuple[int, ...]]] = []
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
         if id(fake) not in pipelined_tensor_ids:
             continue
         dma_transfers.append(
-            DmaTransfer(
-                tensor=fake,
-                subscript=tuple(sub_meta),
-                direction=cast("DmaDirection", direction),
-                vmem_shape=vmem_shape,
+            (
+                DmaTransfer(
+                    tensor=fake,
+                    subscript=tuple(sub_meta),
+                    direction=cast("DmaDirection", direction),
+                ),
+                vmem_shape,
             )
         )
 
-    for transfer in dma_transfers:
+    for transfer, vmem_shape in dma_transfers:
         fake = transfer.tensor
         storage_id = id(fake.untyped_storage())
         input_slots = input_slots_by_id.get(
@@ -3301,7 +3303,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             graph_info.graph_id,
             hbm_name,
             transfer.direction,
-            transfer.vmem_shape,
+            vmem_shape,
             load_buffer_count,
         )
         resource_cache = (
@@ -3324,6 +3326,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             resources = allocate_dma_resources(
                 state.device_function,
                 transfer,
+                vmem_shape=vmem_shape,
                 buffer_count=load_buffer_count,
                 scratch_hint=hbm_name.replace("_hbm", "") + "_buf",
                 semaphore_hint=hbm_name.replace("_hbm", "") + "_sem",
@@ -3359,7 +3362,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     tensor=fake,
                     subscript=tuple(sub_meta),
                     direction="load",
-                    vmem_shape=scheduled.transfer.vmem_shape,
                 ),
                 scheduled.resources,
             )
