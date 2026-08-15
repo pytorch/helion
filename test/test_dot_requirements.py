@@ -346,9 +346,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
-        # tile_k upper bound is now 128 (the static_k=8192 case; capped at 128
-        # to keep AB SMEM staging budget sane).
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 128])
+        # tile_k DRAW bound is 256: the compiler ships pretuned entries at bk=256
+        # that its own search could not otherwise reach, and with a bound of 128 a
+        # seeded bk=256 is a one-way dead end for the hill-climber
+        # (``pattern_neighbors(256)`` clamps to ``[128]``). Per-tile SMEM is what
+        # actually bounds bk, and it is enforced downstream. Note this is the DRAW
+        # bound only: the tiling-divisibility gates keep the old 128-based value,
+        # so cluster_m=2 eligibility and the persistent pid types do not move.
+        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 256])
         default_block_sizes = spec.default_config().config["block_sizes"]
         self.assertGreaterEqual(default_block_sizes[2], 16)
         self.assertLessEqual(default_block_sizes[2], 128)
@@ -366,14 +371,38 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # only the default itself moved back to cluster_m=1.
         self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
+        # An over-K-tile-cap ``bk`` is now REPAIRED, not demoted. ``bk=16`` at
+        # K=8192 needs 512 K-tiles against a 256 cap, so the stage used to answer
+        # "not a legal cluster_m=2 bk" by setting cluster_m=1 -- which additionally
+        # cost the tile, because the cluster_m=1 clamp then pinned ``bm`` to 128
+        # (measured: this config came out as ``[128,256,256] cm1``). The stage snaps
+        # ``bk`` to a legal value instead, and keeps the tile.
+        #
+        # The repaired value is the NEAREST legal ``bk``, not the largest: at K=8192
+        # the legal set is {32, 64, 128, 256} and ``bk=32`` gives exactly 256
+        # K-tiles, right at the cap. So this asserts the repair POLICY, not
+        # legality -- nearest-legal moves the key as little as possible.
+        #
+        # THE CAP ITSELF IS UNCHANGED AND STILL BINDING -- it is enforced inside
+        # ``cluster_m2_bk_is_valid``, which the repair consults, so the repaired
+        # value satisfies it by construction whichever candidate is chosen.
         over_cap_config = {
             "block_sizes": [256, 256, 16],
             "pid_type": "flat",
             "tcgen05_cluster_m": 2,
         }
         spec.normalize(over_cap_config, _fix_invalid=True)
-        self.assertEqual(over_cap_config["tcgen05_cluster_m"], 1)
-        self.assertEqual(over_cap_config["pid_type"], "flat")
+        self.assertEqual(over_cap_config["tcgen05_cluster_m"], 2)
+        self.assertEqual(over_cap_config["pid_type"], "persistent_interleaved")
+        over_cap_block_sizes = cast("list[int]", over_cap_config["block_sizes"])
+        self.assertEqual(over_cap_block_sizes[2], 32)
+        cluster_m2_constraints = spec._tcgen05_cluster_m2_search_constraints
+        assert cluster_m2_constraints is not None
+        self.assertLessEqual(
+            -(-cluster_m2_constraints.static_k // over_cap_block_sizes[2]),
+            cluster_m2_constraints.max_k_tiles,
+            msg=f"repair broke the K-tile cap: {over_cap_config}",
+        )
         valid_config = {
             "block_sizes": [128, 256, 32],
             "pid_type": "flat",
@@ -468,25 +497,64 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(config["l2_groupings"], [1])
         self.assertIs(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], False)
 
-        # ── AN EXPLICIT FFI REQUEST IS NO LONGER PROJECTED ONTO THE SEED ──
+        # ── ``tvm_ffi_launch=True`` NO LONGER PROJECTS ONTO THE SEED ──
         #
-        # These subtests used to assert the opposite: whatever pid_type / bk /
+        # These five subtests used to assert the opposite: whatever pid_type / bk /
         # l2_grouping was asked for, an ``ffi=True`` config came back as the seed's
-        # ``[256,256,128]`` tile with the seed's ``l2=[2]``. Repairing a partial
-        # request ONTO the seed is exactly what this commit stops doing, so the
-        # drawn ``bk`` and ``l2_groupings`` SURVIVE.
+        # ``[256,256,128] / l2=[2] / persistent_interleaved``. That behaviour was
+        # correct only while the flag was undrawable (``search_choices=(False,)``), so
+        # a True could only be a deliberate, partial request.
         #
-        # ``bm``/``bn`` still move, but that is a DIFFERENT stage
-        # (``_fix_cluster_m2_search_config``) snapping the tile onto the validated
-        # CtaGroup.TWO envelope, and it is unchanged here -- which is why the
-        # expected tile below is the 256x256 envelope carrying the REQUESTED bk
-        # rather than the seed's 128.
-        for override in (
-            {"pid_type": "flat"},
-            {"block_sizes": [128, 256, 16]},
-            {"block_sizes": [256, 128, 16]},
-            {"l2_groupings": [16]},
-            {"pid_type": "persistent_interleaved"},
+        # The flag is now a FREE SEARCH AXIS, and the projection is what made that
+        # worthless: measured, with the flag un-clamped and the projection still in
+        # place, 300 draws collapsed to **152 distinct** configs, the ~150 ``ffi=True``
+        # draws landing on ~2. The flag has no codegen dependencies *within* the
+        # tcgen05 family (bit-exact on 5 varied configs, and on 20 of the 30 sampled
+        # newly-reachable draws below), so there is nothing about an ``ffi=True``
+        # config on its own tile to repair.
+        #
+        # What IS enforced is the flag's one real precondition, per-config and at the
+        # END of the pipeline: the config must lower on the tcgen05 path, or
+        # ``cute/backend.py`` raises when it emits ``--enable-tvm-ffi``. So the
+        # assertions invert: the drawn tile SURVIVES, and the flag survives with it
+        # when the tile is tcgen05-emittable.
+        for override, tcgen05_emittable in (
+            ({"pid_type": "flat"}, True),
+            ({"block_sizes": [128, 256, 16]}, True),
+            ({"block_sizes": [256, 128, 16]}, True),
+            ({"l2_groupings": [16]}, True),
+            ({"pid_type": "persistent_interleaved"}, True),
+            # ⚠ THE OLD NEGATIVE WITNESS WAS RETIRED HERE (2026-08-07), and this comment
+            # block is why. It was ``[256,64,256]`` at ``cluster_m=1, pid_type='flat'``,
+            # expecting the flag CLEARED because that tile is not tcgen05-emittable
+            # (``bn=64`` with ``bk=256`` fails ``_mma_impl_matches_problem_shape``).
+            #
+            # The comment that used to sit here spelled out the mechanism it depended on:
+            # "``pid_type='flat'`` is load-bearing, not decoration: at
+            # ``persistent_blocked`` the cluster_m=1 persistent clamp rewrites bm
+            # 256 -> 128, and ``[128,64,256]`` IS emittable, so the flag correctly
+            # SURVIVES there." Exactly so — and the clamp is no longer gated on a
+            # persistent ``pid_type``, because that gate was letting ``bm=256 ∧
+            # cluster_m=1`` reach codegen on the non-tensor-core ``universal`` scalar
+            # path (~1500-2000x slower, silently, on 6.8-8.8% of draws across six
+            # measured shapes). So ``flat`` now takes the same clamp, the final tile is
+            # ``[128,64,256]``, and the flag correctly survives.
+            #
+            # The negative polarity did not disappear — it moved to
+            # ``test_cute_tcgen05_tvm_ffi_launch_is_a_free_searchable_axis``, which drives
+            # stage 10 directly on an off-envelope FINAL tile. That is the honest home
+            # for it: the property is "stage 10 clears the flag on a non-emittable final
+            # tile", and after the clamp NO drawable ``cluster_m=1`` tile on this shape is
+            # non-emittable (probed 10/10), so the public-``normalize`` route can no
+            # longer construct the witness at all.
+            (
+                {
+                    "block_sizes": [256, 64, 256],
+                    "tcgen05_cluster_m": 1,
+                    "pid_type": "flat",
+                },
+                True,
+            ),
         ):
             with self.subTest(override=override):
                 config = {
@@ -497,24 +565,57 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
                     **override,
                 }
+                requested_tile = list(cast("list[int]", config["block_sizes"]))
                 requested_l2 = list(cast("list[int]", config["l2_groupings"]))
-                requested_bk = cast("list[int]", config["block_sizes"])[2]
                 spec.normalize(config, _fix_invalid=True)
-                self.assertEqual(config["tcgen05_cluster_m"], 2)
-                self.assertEqual(config["pid_type"], "persistent_interleaved")
-                self.assertEqual(
-                    config["block_sizes"][:3],
-                    [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, requested_bk],
-                )
-                self.assertEqual(
-                    config["l2_groupings"],
-                    requested_l2,
+                self.assertIs(
+                    config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
+                    tcgen05_emittable,
                     msg=(
-                        "the FFI stage overwrote l2_groupings; a launch flag has no "
-                        "business touching the scheduler grouping"
+                        "tvm_ffi_launch must survive on a tcgen05-emittable tile and "
+                        "be cleared otherwise -- it is a free axis with exactly one "
+                        "precondition"
                     ),
                 )
-                self.assertIs(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
+                if config["tcgen05_cluster_m"] == 2:
+                    # The cluster_m=2 shaping still owns the tile (bm=256, bn snapped
+                    # to {128,256}, bk pinned on the edge family) -- that is a
+                    # different stage and is unchanged here. What must NOT happen is
+                    # the FFI stage overwriting l2_groupings with the seed's value.
+                    self.assertEqual(
+                        config["l2_groupings"],
+                        requested_l2,
+                        msg=(
+                            f"the FFI stage overwrote l2_groupings "
+                            f"{requested_l2} -> {config['l2_groupings']}; a launch "
+                            f"flag has no business touching the scheduler grouping"
+                        ),
+                    )
+                else:
+                    # ⚠ ``bm`` is EXEMPT from this check at cluster_m=1 (2026-08-07).
+                    # The property under test is "the FFI/layout stage did not overwrite
+                    # the drawn tile", but ``_fix_cluster_m1_persistent_search_config``
+                    # (a DIFFERENT stage, and the one whose whole job this is) clamps
+                    # ``bm`` to ``TCGEN05_ONE_CTA_MAX_BLOCK_M`` on every cluster_m=1
+                    # candidate — it used to skip non-persistent ``pid_type`` values,
+                    # which is exactly the defect that let ``bm=256 ∧ cluster_m=1`` reach
+                    # the non-tensor-core ``universal`` path. Asserting the full tile here
+                    # would re-pin that hole from a test whose subject is a different
+                    # stage. ``bn``/``bk`` are still asserted, which is what the FFI stage
+                    # could plausibly touch.
+                    self.assertEqual(
+                        config["block_sizes"][1:3],
+                        requested_tile[1:3],
+                        msg="the FFI stage overwrote the drawn bn/bk",
+                    )
+                    self.assertLessEqual(
+                        cast("list[int]", config["block_sizes"])[0],
+                        TCGEN05_ONE_CTA_MAX_BLOCK_M,
+                        msg=(
+                            "bm exceeds the CtaGroup.ONE cap at cluster_m=1, so codegen "
+                            "will silently emit the non-tensor-core 'universal' path"
+                        ),
+                    )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_small_shape_wave_quantization_gate(self) -> None:
@@ -803,13 +904,40 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                     [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16],
                 )
 
-        flat_config = {
-            "block_sizes": [256, 32, 16],
-            "pid_type": "flat",
-            "tcgen05_cluster_m": 1,
-        }
-        spec.normalize(flat_config, _fix_invalid=True)
-        self.assertEqual(flat_config["block_sizes"][:3], [256, 32, 16])
+        # ⚠ THE NON-PERSISTENT ARM IS NOW CLAMPED TOO. This block used to assert
+        # ``[256, 32, 16]`` survives at ``pid_type='flat'`` — i.e. it PINNED the
+        # defect. ``bm=256`` at ``cluster_m=1`` fails
+        # ``_mma_impl_matches_problem_shape`` (which admits ``bm in {64,128}``, or
+        # ``bm==256`` only with ``cluster_m==2``), so ``_choose_mma_impl`` fell
+        # through to the non-tensor-core ``universal`` scalar path: numerically
+        # correct, ~1500-2000x slower, and emitted with NO warning (the
+        # SMEM-downgrade warning is gated on ``tcgen05_ok``, which that path never
+        # reaches).
+        #
+        # The clamp itself was always correct; the STAGE was gated on a persistent
+        # ``pid_type``, so it never ran on these. That gate term is gone. ``xyz``
+        # behaves identically to ``flat`` (both non-persistent), which is why the
+        # hazard is stated as "non-persistent" rather than "flat".
+        for non_persistent_pid in ("flat", "xyz"):
+            with self.subTest(pid_type=non_persistent_pid):
+                non_persistent_config = {
+                    "block_sizes": [256, 32, 16],
+                    "pid_type": non_persistent_pid,
+                    "tcgen05_cluster_m": 1,
+                }
+                spec.normalize(non_persistent_config, _fix_invalid=True)
+                self.assertEqual(
+                    non_persistent_config["block_sizes"][:3],
+                    [TCGEN05_ONE_CTA_MAX_BLOCK_M, 32, 16],
+                    msg=(
+                        f"bm=256 at cluster_m=1 with pid_type={non_persistent_pid!r} was "
+                        "not clamped, so codegen will silently emit the non-tensor-core "
+                        "'universal' scalar path (~1500-2000x slower)"
+                    ),
+                )
+                # The redirect in clamp (2) is scoped to the persistent enum, so a
+                # non-persistent pid_type is left exactly as drawn.
+                self.assertEqual(non_persistent_config["pid_type"], non_persistent_pid)
 
         two_cta_config = {
             "block_sizes": [256, 32, 16],
@@ -820,8 +948,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(two_cta_config["tcgen05_cluster_m"], 2)
         self.assertEqual(two_cta_config["pid_type"], "persistent_interleaved")
         # The ordinary cluster_m=2 arm preserves its valid bk=16 sample instead
-        # of collapsing into the distinct bk=128 FFI direct-entry seed.
-        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 256, 16])
+        # of collapsing into the distinct bk=128 FFI direct-entry seed. The
+        # sub-128 sampled block_n rounds UP to the narrow 128 cm2 tile (the
+        # un-seeded [256,128,*] tile that only search can reach), not to 256.
+        self.assertEqual(two_cta_config["block_sizes"][:3], [256, 128, 16])
         self.assertIs(two_cta_config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], False)
 
     @onlyBackends(["cute"])
@@ -936,13 +1066,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-        # Cycle 97: ab=3 is BUDGET-AWARE-SEARCHABLE — the for_search cap is lifted
-        # to 3 wherever the SMEM-budget constraints were recorded (here: the mocked
-        # B200 budget), so the autotuner can SAMPLE ab=3 directly. A sampled ab=3
-        # that does not fit is then demoted by ``_fix_ab_stages_search_config`` (the
-        # over-budget cases below). The validation surface is independently 3 for
-        # explicit configs.
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+        # Cycle 97: a deep AB ring is BUDGET-AWARE-SEARCHABLE — the for_search cap is
+        # lifted to the 16-bit dtype hard cap of 6 wherever the SMEM-budget
+        # constraints were recorded (here: the mocked B200 budget), so the autotuner
+        # can SAMPLE ab=3 directly. A sampled ab=3 that does not fit is then demoted
+        # by ``_fix_ab_stages_search_config`` (the over-budget cases below). The
+        # validation surface is independently 3 for explicit configs.
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the validation
         # surface admits the deeper FFI direct-entry stage tuples — up to ab=6
@@ -1063,7 +1193,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 )
             self.assertIsNotNone(spec._tcgen05_ab_stages_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
@@ -1089,23 +1219,33 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(b200_budget_bytes)
         spec = bound.config_spec
 
-        # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the initial
-        # population now carries TWO cluster_m=2 seeds: the DEFAULT-layout
-        # cluster_m=2 ab=3 seed and the generalized TVM-FFI direct-entry seed.
-        # Both must carry the canonical ab=3 fast-config envelope (the point of
-        # this test — that ab=3 is seeded rather than discovered by mutation).
+        # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity). The initial
+        # population carries the DEFAULT-layout cluster_m=2 seed and the
+        # generalized TVM-FFI direct-entry seed, and the two no longer share a K
+        # rung: the widened ``bk`` draw bound lets the DEFAULT-layout seed sit at
+        # 256 while the FFI seed keeps its validated 128. So this test asserts the
+        # canonical ab=3 envelope is PRESENT among the cluster_m=2 seeds (the point
+        # of the test — ab=3 is seeded rather than discovered by mutation) rather
+        # than requiring every cluster_m=2 seed to be it.
         cluster_m2_seeds = [
             config.config
             for config in spec.compiler_seed_configs
             if config.config.get("tcgen05_cluster_m") == 2
         ]
         self.assertGreaterEqual(len(cluster_m2_seeds), 1)
-        for seed in cluster_m2_seeds:
-            self.assertEqual(
-                seed["block_sizes"][:3],
-                [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
-            )
-            self.assertEqual(seed["tcgen05_ab_stages"], 3)
+        canonical_ab3_seeds = [
+            seed
+            for seed in cluster_m2_seeds
+            if seed["block_sizes"][:3]
+            == [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128]
+            and seed["tcgen05_ab_stages"] == 3
+        ]
+        self.assertGreaterEqual(
+            len(canonical_ab3_seeds),
+            1,
+            f"canonical [256,256,128] ab=3 seed missing from cluster_m=2 seeds: "
+            f"{[s['block_sizes'] for s in cluster_m2_seeds]}",
+        )
 
     @onlyBackends(["cute"])
     def test_cute_universal_matmul_lane_loop_correctness(self) -> None:
@@ -1626,7 +1766,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertTrue(spec.cute_tcgen05_search_enabled)
-        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 128])
+        # bk DRAW bound is 256 (see the widening note in
+        # ``test_cute_tcgen05_equal_dims_keep_default_within_max_bound``); the
+        # edge-family gates below still key on the 128-based divisibility value,
+        # which is why cluster_m=2 and persistent_interleaved survive here.
+        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 256])
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1, 2))
         self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)

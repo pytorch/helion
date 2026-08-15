@@ -429,6 +429,16 @@ TCGEN05_EXPLICIT_D_STORE_BOX_N = 32
 TCGEN05_DIRECT_ENTRY_SEED_AB_STAGES = 3
 
 TCGEN05_DIRECT_ENTRY_SEED_C_STAGES = 2
+# Candidate order for A5's illegal-``bk`` REPAIR in
+# ``_fix_cluster_m2_search_config`` (item 9). Descending, because a larger K tile
+# means fewer k-iterations and fewer per-stage boundaries, and it is what every
+# cluster_m=2 seed builder picks. This is a PREFERENCE ORDER over candidates, not a
+# legality set -- ``cluster_m2_bk_is_valid`` decides legality, and it enforces both
+# the divisibility/K-tail rule and the ``max_k_tiles`` cap, so a value taken from
+# this tuple is only ever accepted when that predicate already accepts it.
+# Bounded below by the tcgen05 MMA-K minimum (16), so no entry can be smaller than
+# a legal K tile.
+TCGEN05_CLUSTER_M2_REPAIR_BLOCK_K_ORDER: tuple[int, ...] = (256, 128, 64, 32, 16)
 
 
 TCGEN05_DIRECT_ENTRY_LEGAL_BK: frozenset[int] = frozenset({64, 128})

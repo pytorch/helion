@@ -85,6 +85,7 @@ from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_C_STORE_MODES
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CLUSTER_M2_REPAIR_BLOCK_K_ORDER
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
@@ -144,7 +145,6 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
 from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
-from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
@@ -443,6 +443,33 @@ class CuteTcgen05Config:
             allow_fp8_small_grid=allow_fp8_small_grid,
         )
         self.restrict_cluster_m_search((1, 2))
+
+    def _cluster_m2_capability_holds(self, config: dict[str, object]) -> bool:
+        """Whether ``cluster_m=2`` is EMITTABLE for this config, ignoring search scope."""
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return False
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return False
+        block_sizes, m_index, _, k_index = config_view
+        bm = block_sizes[m_index]
+        if type(bm) is not int:
+            return False
+        if bm == TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M:
+            if self.matmul_input_dtype is not torch.float8_e4m3fn:
+                return False
+        elif bm != TCGEN05_TWO_CTA_BLOCK_M:
+            return False
+        bk = block_sizes[k_index]
+        if type(bk) is not int or bk <= 0:
+            return False
+        for fact in self.config_spec.matmul_facts:
+            static_k = fact.static_k
+            if static_k is None:
+                continue
+            if -(-static_k // bk) > TCGEN05_TWO_CTA_MAX_K_TILES:
+                return False
+        return True
 
     @staticmethod
     def cluster_m2_bk_is_valid(
@@ -849,11 +876,28 @@ class CuteTcgen05Config:
         return seeds
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
+        # ── A bm=256 EXPLICIT-EPI-TILE CONFIG IS CtaGroup.TWO ──
+        #
+        # This stage OWNS ``tcgen05_cluster_m``: the six demotes below plus this promotion
+        if (
+            self.search_enabled
+            and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+        ):
+            explicit_view = self._matmul_config_view(config)
+            if explicit_view is not None:
+                explicit_block_sizes, explicit_m_index, _, _ = explicit_view
+                if explicit_block_sizes[explicit_m_index] == TCGEN05_TWO_CTA_BLOCK_M:
+                    config["tcgen05_cluster_m"] = 2
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
             return
         constraints = self.cluster_m2_search_constraints
         if constraints is None:
-            config["tcgen05_cluster_m"] = 1
+            # ── SCOPE IS NOT CAPABILITY ──
+            #
+            # ``cluster_m2_search_constraints is None`` means the SAMPLER does not draw
+            if not self._cluster_m2_capability_holds(config):
+                config["tcgen05_cluster_m"] = 1
             return
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             config["tcgen05_cluster_m"] = 1
@@ -864,20 +908,49 @@ class CuteTcgen05Config:
             return
         block_sizes, m_index, n_index, k_index = config_view
         edge_k_tail_family = constraints.allow_edge_k_tail_family
-        is_narrow_clc_aux_tma = self._is_clc_aux_tma_narrow_n_request(config)
-        if edge_k_tail_family:
-            block_sizes[k_index] = (
-                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
-                if is_narrow_clc_aux_tma
-                else TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-            )
+        drawn_bn = block_sizes[n_index]
+        layout = config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        )
+        if (
+            layout != Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            and isinstance(drawn_bn, int)
+            and not isinstance(drawn_bn, bool)
+            and drawn_bn <= TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        ):
+            block_sizes[n_index] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        else:
+            block_sizes[n_index] = TCGEN05_TWO_CTA_BLOCK_N
+        # Derived from the SETTLED tile. Every read of this flag below is now reading
+        # a predicate over the same ``bn`` that will reach codegen, so a second pass
+        # computes the same value and the stage is idempotent by construction.
         bk = block_sizes[k_index]
         if not isinstance(bk, int) or isinstance(bk, bool):
             config["tcgen05_cluster_m"] = 1
             return
-        if not self.cluster_m2_bk_is_valid(bk, constraints):
-            config["tcgen05_cluster_m"] = 1
-            return
+        #
+        # was inconsistent with the function's own behaviour on every other axis:
+        # ``bm`` is snapped, ``bn`` is snapped, and the joint solve re-tunes
+        if bk not in TCGEN05_CLUSTER_M2_REPAIR_BLOCK_K_ORDER:
+            if not self.cluster_m2_bk_is_valid(bk, constraints):
+                config["tcgen05_cluster_m"] = 1
+                return
+        elif not self.cluster_m2_bk_is_valid(bk, constraints):
+            repaired_bk = min(
+                (
+                    candidate
+                    for candidate in TCGEN05_CLUSTER_M2_REPAIR_BLOCK_K_ORDER
+                    if self.cluster_m2_bk_is_valid(candidate, constraints)
+                ),
+                key=lambda candidate: (abs(candidate - bk), -candidate),
+                default=None,
+            )
+            if repaired_bk is None:
+                config["tcgen05_cluster_m"] = 1
+                return
+            block_sizes[k_index] = repaired_bk
+            bk = repaired_bk
         config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
         # The tcgen05 CtaGroup.TWO MMA path does not emit the per-block-id
         # indices/masks that a fused epilogue subtile needs, so a sampled
@@ -885,53 +958,35 @@ class CuteTcgen05Config:
         # ``BackendUnsupported`` at codegen. Drop it here (rather than letting
         # the candidate fail to compile and waste autotune budget) -- every
         # cluster_m=2 search candidate that survives to this point is committed
-        # to the 2-CTA path. The edge-family prefixes below also pop it for
-        # their sub-paths; doing it once here covers the full-tile and
-        # small-grid paths too.
+        # to the 2-CTA path.
         config.pop("epilogue_subtile", None)
-        # fp8 small-grid family: a sampled bm<=128 routes to the fp8-validated
-        # per-CTA 64xbn 2-CTA tile (bm=128/bn=128) instead of the bm=256 full
-        # tile, which underfills the device on small/wave-limited fp8 GEMMs. The
-        # bm=256 full tile is still reachable from a sampled bm>128. The codegen
-        # + runtime own this tile via ``_tcgen05_use_2cta_instrs``
-        # (``bm == 128 and is_fp8``). Edge+K-tail candidates keep the bm=256
-        # double-edge family unconditionally.
+        # ── The fp8 small-grid family is a SCOPE EXCLUSION, not a special case ──
         sampled_bm = block_sizes[m_index]
-        if (
+        fp8_small_grid_family = (
             constraints.allow_fp8_small_grid
             and not edge_k_tail_family
             and isinstance(sampled_bm, int)
             and not isinstance(sampled_bm, bool)
             and sampled_bm <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
-        ):
+        )
+        if fp8_small_grid_family:
+            # ``bm`` is LEGALITY and stays pinned: ``_tcgen05_use_2cta_instrs`` admits
+            # ``bm == 256`` at any 16-bit dtype but ``bm == 128`` only for fp8, and at
+            # bf16 that config point belongs to the legacy clustered ``CtaGroup.ONE``
+            # family. This is a family-ownership pin, not a tuned value. Note both ``bm``
+            # values already COMPETE on an fp8 shape: this branch keys on the DRAWN ``bm``,
+            # so a drawn 256 falls through to the main path below and gets the 256-wide
+            # 2-CTA tile (verified on fp8 512x2048x4096: drawn ``bm=256`` exits as
+            # ``[256, {64,128,256}, *]`` with ``use_2cta=True``).
             block_sizes[m_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
-            block_sizes[n_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            # the SETTLE above, which is the same rule the non-fp8 arm gets: ``bn <= 128``
+            # snaps to 128, otherwise 256. So the fp8 arm's band goes ``{128}`` ->
+            # ``{128, 256}`` and stops being a special case.
             return
         block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
-        # Only the fully validated narrow-N CLC+aux-TMA seed may keep
-        # block_n=128; other candidates use the canonical block_n=256.
-        if is_narrow_clc_aux_tma:
-            block_sizes[n_index] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
-        else:
-            block_sizes[n_index] = TCGEN05_TWO_CTA_BLOCK_N
-        if edge_k_tail_family:
-            # This family is pinned to measured production stage/pipeline
-            # values after search projection.
-            # Placement keys remain available for non-edge diagnostic/search
-            # paths, but edge+K-tail candidates do not explore partially
-            # mutated placement variants.
-            config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
-            if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
-                self._set_aux_edge_cluster_m2_prefix(config)
-            if self._is_clc_aux_tma_config(config):
-                self._set_clc_aux_tma_edge_perf_knobs(config)
-            if is_narrow_clc_aux_tma:
-                config["tcgen05_acc_stages"] = (
-                    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES
-                )
-                config["l2_groupings"] = [
-                    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
-                ]
+        # Block-N shaping for the surviving cluster_m=2 candidates. A CtaGroup.TWO
+        # matmul has exactly two validated N tiles: 128 (a 256x128 output tile)
+        # and 256. Both are hardware-legal because the 2-CTA MMA decision keys
 
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -1554,6 +1609,37 @@ class CuteTcgen05Config:
         if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
             config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
+    def _is_validated_cluster_m2_full_tile_search_candidate(
+        self, config: dict[str, object]
+    ) -> bool:
+        # Cycle 46: full-tile cluster_m=2 candidate gate for aux-TMA admission.
+        # After ``_fix_cluster_m2_search_config`` projects a full-tile sample to
+        # the canonical 256x256x bk shape with ``persistent_interleaved`` pid,
+        # this returns True so aux-TMA stays during the search-time fixup.
+        # bk validity is already enforced by ``_fix_cluster_m2_search_config``;
+        # we re-check it here so a stale/unprojected config cannot slip through.
+        if config.get("tcgen05_cluster_m") != 2:
+            return False
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return False
+        if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
+            return False
+        if config.get("tcgen05_cluster_n", 1) != 1:
+            return False
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return False
+        block_sizes, m_index, n_index, k_index = config_view
+        if block_sizes[m_index] != TCGEN05_TWO_CTA_BLOCK_M:
+            return False
+        if block_sizes[n_index] != TCGEN05_TWO_CTA_BLOCK_N:
+            return False
+        bk = block_sizes[k_index]
+        if not isinstance(bk, int) or isinstance(bk, bool):
+            return False
+        return self.cluster_m2_bk_is_valid(bk, constraints)
+
     def _fix_aux_tma_search_config(self, config: dict[str, object]) -> None:
         if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) != TCGEN05_AUX_LOAD_MODE_TMA:
             return
@@ -2092,61 +2178,38 @@ class CuteTcgen05Config:
             return False
         return constraints.allow_edge_k_tail_family
 
-    def _is_validated_cluster_m2_full_tile_search_candidate(
-        self, config: dict[str, object]
-    ) -> bool:
-        # Cycle 46: full-tile cluster_m=2 candidate gate for aux-TMA admission.
-        # After ``_fix_cluster_m2_search_config`` projects a full-tile sample to
-        # the canonical 256x256x bk shape with ``persistent_interleaved`` pid,
-        # this returns True so aux-TMA stays during the search-time fixup.
-        # bk validity is already enforced by ``_fix_cluster_m2_search_config``;
-        # we re-check it here so a stale/unprojected config cannot slip through.
-        if config.get("tcgen05_cluster_m") != 2:
-            return False
-        constraints = self.cluster_m2_search_constraints
-        if constraints is None or constraints.allow_edge_k_tail_family:
-            return False
-        if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
-            return False
-        if config.get("tcgen05_cluster_n", 1) != 1:
-            return False
-        config_view = self._matmul_config_view(config)
-        if config_view is None:
-            return False
-        block_sizes, m_index, n_index, k_index = config_view
-        if block_sizes[m_index] != TCGEN05_TWO_CTA_BLOCK_M:
-            return False
-        if block_sizes[n_index] != TCGEN05_TWO_CTA_BLOCK_N:
-            return False
-        bk = block_sizes[k_index]
-        if not isinstance(bk, int) or isinstance(bk, bool):
-            return False
-        return self.cluster_m2_bk_is_valid(bk, constraints)
+    # ``_fix_aux_tma_search_config``'s arm-4 tile-shape envelope (8 clauses:
+    # cluster_m, constraints/edge-family, pid_type, cluster_n, config_view,
+    # bm == 256, bn == 256, bk validity) and that arm-4 call site was its ONLY
 
     def _fix_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
     ) -> None:
-        if not (
-            self.search_enabled
-            and config.get("tcgen05_cluster_m", 1) == 1
-            and config.get("pid_type")
-            in {"persistent_blocked", "persistent_interleaved"}
-        ):
+        #
+        #     and config.get("pid_type") in {"persistent_blocked", "persistent_interleaved"}
+        if not (self.search_enabled and config.get("tcgen05_cluster_m", 1) == 1):
             return
         config_view = self._matmul_config_view(config)
         if config_view is None:
             return
         block_sizes, m_index, _, _ = config_view
-        constraints = self.cluster_m2_search_constraints
-        if constraints is not None and constraints.allow_edge_k_tail_family:
-            # persistent_interleaved stays in the flat enum so cluster_m=2
-            # edge-family samples can encode; cluster_m=1 samples from the
-            # same surface must use the validated flat edge fallback.
-            config["pid_type"] = "flat"
-            return
+        # TWO INDEPENDENT legality clamps. They must NOT sit in an if/else: they
+        # constrain different keys for different reasons, and either one being
+        # skipped is a defect.
         bm = block_sizes[m_index]
         if isinstance(bm, int) and not isinstance(bm, bool):
             block_sizes[m_index] = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+        # (2) pid_type: ``persistent_interleaved`` stays in the flat enum so
+        #     cluster_m=2 edge-family samples can encode; cluster_m=1 samples from
+        #     the same surface must use the validated flat edge fallback.
+        constraints = self.cluster_m2_search_constraints
+        if (
+            constraints is not None
+            and constraints.allow_edge_k_tail_family
+            and config.get("pid_type")
+            in {"persistent_blocked", "persistent_interleaved"}
+        ):
+            config["pid_type"] = "flat"
 
     def restrict_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
         assert choices, "tcgen05_num_epi_warps search must allow at least one value"
@@ -2247,44 +2310,17 @@ class CuteTcgen05Config:
         else:
             num_epi_warps_fragment = IntegerFragment(1, 4, 4)
         if not for_search:
-            # Validation admits what the direct-entry codegen supports: bk=64
-            # accepts the deep (ab=6, c=4) tuple (see
-            # ``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``), so the validation
-            # surface lifts the AB cap to 6 for structurally identified 16-bit
-            # direct-entry matmuls. The actual (bk, ab, c) tuple is gated by
-            # ``_validate_direct_entry_ab_stage_envelope``;
-            # SEARCH stays capped at 3 (budget-aware) since the generalized seed
-            # runs at ab=3 and deeper pipelines are not worth searching.
-            ab_stages_max = 6 if self.deep_direct_entry_validation_enabled else 3
-            # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
-            # cap; admit a frozen deep-staged fp8 config on the validation
-            # surface too (``_validate_direct_entry_ab_stage_envelope`` clamps it to
-            # the actual per-CTA SMEM budget for the chosen block sizes).
+            # Validation admits the dtype's deepest AB pipeline; the depth walk trims it.
             constraints = self.ab_stages_search_constraints
-            if constraints is not None and constraints.dtype_bytes == 1:  # FP8
+            if constraints is None:
+                ab_stages_max = 3
+            else:
                 ab_stages_max = self._get_dtype_ab_stages_hard_cap(
                     constraints.dtype_bytes
                 )
         elif self.ab_stages_search_constraints is not None:
-            # Cycle 97: make ab=3 BUDGET-AWARE-SEARCHABLE. Where the device/dtype
-            # admits ab=3 at all (the SMEM-budget constraints were recorded by
-            # ``allow_ab_stages_search`` at bind time — B200-class optin cap,
-            # bf16/fp16), lift the ``for_search`` cap to 3 so the autotuner can
-            # SAMPLE ab=3 directly instead of reaching it only through the per-shape
-            # FFI / gelu seeds. ``_fix_ab_stages_search_config`` then demotes any
-            # sampled ab=3 that does not fit (the residual/source-C ring overflows;
-            # cluster_m=1 256x256 overflows bare-AB) before codegen, so admission is
-            # free but an overflowing kernel is never generated.
-            ab_stages_max = 3
-            # FP8 (1-byte) operands fit a deeper AB pipeline; widen the
-            # validation range so an explicit deep-staged fp8 config is
-            # accepted (``_validate_direct_entry_ab_stage_envelope`` clamps it to
-            # the actual per-CTA SMEM budget for the chosen block sizes).
             constraints = self.ab_stages_search_constraints
-            if constraints is not None and constraints.dtype_bytes == 1:  # FP8
-                ab_stages_max = self._get_dtype_ab_stages_hard_cap(
-                    constraints.dtype_bytes
-                )
+            ab_stages_max = self._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes)
         else:
             ab_stages_max = 2
         if for_search:
@@ -2321,7 +2357,7 @@ class CuteTcgen05Config:
             # configs. Layout overrides already have a generic validation path
             # below; only the seed/search surface narrows them to its fixed tile.
             tvm_ffi_launch_fragment: ConfigSpecFragment = (
-                EnumFragment((True,)) if for_search else BooleanFragment()
+                EnumFragment((False, True)) if for_search else BooleanFragment()
             )
             fragments.update(
                 {
