@@ -2,7 +2,7 @@
 
 Recognises the supported jagged loop nest, captures each axis's ``(base,
 length)`` as resolvable host AST, and renders the per-kernel ``jnp`` gathers
-that feed :func:`helion.runtime.compact_worklist.flatten_worklist`.
+that feed :func:`helion.runtime.pallas.compact_worklist.flatten_worklist`.
 
 The supported loop shape is::
 
