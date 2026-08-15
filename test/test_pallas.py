@@ -671,6 +671,43 @@ def pallas_scaled_add_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_prefetched_aligned_dynamic_window(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for _ in hl.grid(1):
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            out[tile, :, :] = table[:, begin + hl.arange(128)][None, :, :]
+    return out
+
+
+@helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(pallas_loop_type="fori_loop"),
+)
+def pallas_two_aligned_dynamic_windows(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    """Read two distinct aligned windows from one HBM tensor per iteration."""
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for _ in hl.grid(1):
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            first = table[:, begin + hl.arange(128)]
+            second = table[:, begin + 128 + hl.arange(128)]
+            out[tile, :, :] = (first + second)[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
     out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
@@ -841,6 +878,72 @@ class TestPallas(TestCase):
         self.assertIn("one_hot", code)
         lanes = torch.arange(128, device=DEVICE)
         expected = torch.stack((table[:, lanes], table[:, 256 + lanes]))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_aligned_dynamic_window_prefetch_codegen(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+
+        for loop_type, loop_marker in (
+            ("fori_loop", "jax.lax.fori_loop"),
+            ("unroll", "for _j in range("),
+        ):
+            with self.subTest(pallas_loop_type=loop_type):
+                code = pallas_prefetched_aligned_dynamic_window.bind(
+                    (table, starts)
+                ).to_triton_code(
+                    helion.Config(
+                        pallas_load_buffer_count=[2, 1],
+                        pallas_loop_type=loop_type,
+                    )
+                )
+                self.assertIn(loop_marker, code)
+                self.assertIn("def _prime_fori_loads", code)
+                self.assertIn("def _prefetch_fori_loads", code)
+                self.assertIn(
+                    "pltpu.make_async_copy(table.at[:, pl.ds(pl.multiple_of(",
+                    code,
+                )
+                self.assertRegex(code, r"table_buf\.at\[\(_j \+ 1\) % 2\]")
+                self.assertNotIn("one_hot", code)
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_aligned_dynamic_window_prefetch_correctness(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        expected = torch.stack(
+            [table[:, begin : begin + 128] for begin in range(0, 512, 128)]
+        )
+
+        for loop_type in ("fori_loop", "unroll"):
+            with self.subTest(pallas_loop_type=loop_type):
+                code, result = code_and_output(
+                    pallas_prefetched_aligned_dynamic_window,
+                    (table, starts),
+                    pallas_load_buffer_count=[2, 1],
+                    pallas_loop_type=loop_type,
+                )
+                self.assertIn("def _prefetch_fori_loads", code)
+                torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_two_aligned_dynamic_windows_codegen(self) -> None:
+        table = torch.randn(8, 640, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        code = pallas_two_aligned_dynamic_windows.bind((table, starts)).to_triton_code()
+        self.assertNotIn("def _prime_fori_loads", code)
+        self.assertGreaterEqual(code.count("pltpu.make_async_copy(table.at["), 2)
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_two_aligned_dynamic_windows(self) -> None:
+        table = torch.randn(8, 640, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(pallas_two_aligned_dynamic_windows, (table, starts))
+        expected = torch.stack(
+            [
+                table[:, begin : begin + 128] + table[:, begin + 128 : begin + 256]
+                for begin in range(0, 512, 128)
+            ]
+        )
         torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_computed_static_slice(self) -> None:
