@@ -462,6 +462,21 @@ TCGEN05_AUX_PRODUCER_WARP_MAX_AB_STAGES = 2
 # direct-entry legal set, and the block fragments do not draw below it), so the
 # concession stops there rather than emitting a bk no codegen path can use.
 TCGEN05_MIN_CONCEDED_BLOCK_K = 32
+# Shallowest AB pipeline a cluster_m=2 full-tile seed is willing to be emitted
+# with. The seed's bk descent requires room for at least this depth at
+# (bm=bn=256, cluster_m=2), so it never proposes a tile whose per-stage SMEM cost
+# forces the AB-budget walk to demote it to a 1-deep (i.e. unpipelined) AB ring
+# the moment it enters the population. bk=256 at that tile costs 131072 B/stage,
+# so it fails this test at 262144 B against the 203776 B per-CTA budget.
+TCGEN05_CLUSTER_M2_SEED_MIN_AB_STAGES = 2
+
+# Aux-EDGE seed tile (§2.3). The aux-edge regime is the cluster_m=1 monolithic
+# path, so the seed pairs the CtaGroup.ONE M cap with the canonical 128-wide N/K
+# tiles -- the tile every profiled aux-edge winner uses. These are SEED values,
+# not bounds: the search still draws the whole (bn, bk) domain around them.
+TCGEN05_AUX_EDGE_SEED_BLOCK_N = 128
+
+TCGEN05_AUX_EDGE_SEED_BLOCK_K = 128
 
 
 TCGEN05_DIRECT_ENTRY_LEGAL_BK: frozenset[int] = frozenset({64, 128})

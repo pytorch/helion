@@ -7,9 +7,11 @@ from typing import cast
 import torch
 
 from ...runtime.config import Config
+from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import Tcgen05PersistenceModel
 from ..cute.tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+from ..cute.tcgen05_constants import TCGEN05_CLUSTER_M2_SEED_MIN_AB_STAGES
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
@@ -18,6 +20,7 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
@@ -809,9 +812,51 @@ class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
         )
 
 
+#: The fp8 small-grid seed's own AB depth. Mirrors the ``tcgen05_ab_stages`` literal in
+#: ``CuteTcgen05ClusterM2Heuristic._fp8_small_grid_seed_config`` — the two must agree or
+#: the ``bk`` picker scores a depth the seed does not emit.
+_FP8_SMALL_GRID_SEED_AB_STAGES = 12
+
+
+def _cluster_m2_seed_tile_and_depth(
+    env: CompileEnvironment, spec: ConfigSpec
+) -> tuple[int, int, int]:
+    """The ``(bm, bn, ab_stages)`` ``CuteTcgen05ClusterM2Heuristic`` will actually emit."""
+    constraints = spec._tcgen05_cluster_m2_search_constraints
+    edge_k_tail_family = (
+        constraints is not None and constraints.allow_edge_k_tail_family
+    )
+    cls = CuteTcgen05ClusterM2Heuristic
+    if (
+        constraints is not None
+        and constraints.allow_fp8_small_grid
+        and not edge_k_tail_family
+        and cls._small_grid_tile_reachable(spec)
+        and (cls._small_grid_within_one_wave(env) or not cls._full_tile_reachable(spec))
+    ):
+        return (
+            TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M,
+            TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N,
+            _FP8_SMALL_GRID_SEED_AB_STAGES,
+        )
+    return (
+        TCGEN05_TWO_CTA_BLOCK_M,
+        TCGEN05_TWO_CTA_BLOCK_N,
+        TCGEN05_CLUSTER_M2_SEED_MIN_AB_STAGES,
+    )
+
+
 class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
+    """DEFAULT-layout cluster_m=2 seed, and the PROMOTED default where the formula"""
+
     name = "cute_tcgen05_cluster_m2"
     backend = "cute"
+
+    @classmethod
+    def should_promote(cls, env: CompileEnvironment) -> bool:
+        """Promote only on BATCHED matmul, where no other producer promotes."""
+        facts = env.config_spec.matmul_facts
+        return len(facts) == 1 and (facts[0].lhs_ndim != 2 or facts[0].rhs_ndim != 2)
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -914,6 +959,12 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         }
         if edge_k_tail_family:
             seed.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
+            # cluster_m=2 FIX-UP too, which made the swizzle a projected key on this
+            # family and nowhere else, and was the pipeline's only non-idempotent
+            # write). This seed is MONOLITHIC, so it wants the monolithic edge value;
+            seed[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = (
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE
+            )
         else:
             seed["l2_groupings"] = [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
             seed["tcgen05_c_stages"] = 2
@@ -961,11 +1012,25 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             ):
                 return TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
             return None
-        bk = bk_fragment.high
-        while bk >= bk_fragment.low:
-            if spec._tcgen05_cluster_m2_bk_is_valid(bk, constraints):
-                return bk
-            bk //= 2
+        # Descend from the fragment's high, preferring a bk that also leaves a
+        # WORKABLE AB pipeline rather than merely tiling the K axis.
+        # ``bk_fragment.high`` is the general DRAW bound and reaches 256; at
+        bm, bn, seed_ab = _cluster_m2_seed_tile_and_depth(env, spec)
+        for require_ab_headroom in (True, False):
+            bk = bk_fragment.high
+            while bk >= bk_fragment.low:
+                if spec._tcgen05_cluster_m2_bk_is_valid(bk, constraints) and (
+                    not require_ab_headroom
+                    or spec._tcgen05_ab_stages_fits(
+                        bm=bm,
+                        bn=bn,
+                        bk=bk,
+                        cluster_m=2,
+                        ab_stages=seed_ab,
+                    )
+                ):
+                    return bk
+                bk //= 2
         return None
 
     @staticmethod
@@ -1031,20 +1096,7 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     def _fp8_small_grid_seed_config(cls, env: CompileEnvironment, bk: int) -> Config:
         """Seed the fp8 small-grid 2-CTA family (per-CTA 64xbn, bm=128/bn=128).
 
-        Pins the small-grid tile plus the deep-prefetch pipeline the cold-L2
-        sweeps found optimal on the small/wave-limited fp8 serving GEMMs:
-        ``ab_stages=12`` (max A/B prefetch to hide the cold DRAM read),
-        ``acc_stages=1`` and ``c_stages=2`` (lean accumulator + C ring),
-        ``l2_groupings=1`` (no scheduler swizzle). Measured cold-L2 vs
-        torch._scaled_mm on B200: 512x2048x4096 1.14x and 512x2048x2048 1.01x,
-        both ahead of the shallower ab=8/acc=2/c=4/l2=4 seed (1.02x / 0.88x).
-        The bm=256 full-tile seed underfills this regime (16 clusters), so this
-        small-grid seed is the strong starting point the autotuner needs.
-
-        ``ab_stages=12`` is the validator max and sits near the B200 SMEM optin
-        budget; on a lower-SMEM Blackwell SKU it is dropped gracefully by the
         seed transfer (``seed_flat_config_pairs`` catches ``InvalidConfig``) and
-        the search falls back to shallower samples, so seeding the max is safe.
         """
         spec = env.config_spec
         block_sizes = spec._tcgen05_matmul_seed_block_sizes(
@@ -1063,7 +1115,7 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             "tcgen05_cluster_n": 1,
             "tcgen05_acc_stages": 1,
             "tcgen05_c_stages": 2,
-            "tcgen05_ab_stages": 12,
+            "tcgen05_ab_stages": _FP8_SMALL_GRID_SEED_AB_STAGES,
             "tcgen05_num_epi_warps": 4,
             "l2_groupings": [1],
             TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
@@ -1142,25 +1194,7 @@ class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
 
 
 class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
-    """Generalized TVM-FFI seed for full-tile CtaGroup.TWO 16-bit GEMMs.
-
-    The generic ``--enable-tvm-ffi`` launcher builds its A/B/D TMA descriptors
-    from the runtime tensor shapes, so the fast launch path is shape-GENERAL:
-    the only real constraints are structural (256x256 CTA tile, cluster_m=2, a
-    bk in the direct-entry stage-tuple table, bf16/fp16 operands, the 128x32
-    explicit epilogue subtile). This heuristic emits that full
-    ``explicit_epi_tile`` + flat-role + ``tvm_ffi_launch`` config for ANY
-    eligible shape, replacing the bank of hand-pinned per-shape seeds.
-
-    The DEFAULT-layout sibling (``CuteTcgen05ClusterM2Heuristic``) still seeds
-    the non-FFI config, so the autotuner benchmarks both and keeps whichever
-    wins: full-autotune A/B measured the FFI direct entry ~7-21% faster on
-    smaller / square GEMMs (1024x4096x1024, 2048^3) where launch + epilogue
-    overhead dominates, and tied on large compute-bound shapes
-    (8192x1024x1024, 8192x2048x2048). An FFI config that fails to compile or
-    the accuracy check for a given shape is dropped by the autotuner,
-    degrading gracefully to the DEFAULT seed.
-    """
+    """Generalized TVM-FFI seed for full-tile CtaGroup.TWO 16-bit GEMMs."""
 
     name = "cute_tcgen05_cluster_m2_ffi"
     backend = "cute"
@@ -1177,3 +1211,30 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         # search-projection (``_fix_target1_tvm_ffi_search_config``) and this
         # population seed emit the identical FFI envelope.
         return env.config_spec._tcgen05_full_tile_direct_entry_seed_config()
+
+
+class CuteTcgen05AuxEdgeHeuristic(AutotunerHeuristic):
+    """Seed for the aux (fused-epilogue) EDGE-tile family — §2.3's extraction."""
+
+    name = "cute_tcgen05_aux_edge"
+    backend = "cute"
+    promote_seed_to_default = False
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        tcgen05 = spec._cute_tcgen05_config
+        if not tcgen05.aux_kernel_detected:
+            return False
+        # The stage keys on the DRAWN tile having a partial edge; a seed has no
+        # drawn tile, so key on the SHAPE instead: does any matmul fact have a
+        # dimension the seed's own tile cannot cover exactly? That is the
+        # shape-structural version of the same question, and it is what makes
+        # this seed's regime the right one for the kernel.
+        return tcgen05.aux_edge_seed_shape_eligible()
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        return env.config_spec._cute_tcgen05_config.aux_edge_seed_config()

@@ -1835,9 +1835,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         config: dict[str, object],
         *,
         expected_l2_grouping: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING,
-        expected_l2_swizzle_size: int | None = (
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE
-        ),
+        expected_l2_swizzle_size: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
         expect_placement_keys: bool = True,
     ) -> None:
         self.assertEqual(
@@ -1856,19 +1854,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             config["l2_groupings"],
             [expected_l2_grouping],
         )
-        # ``expected_l2_swizzle_size=None`` pins the key's ABSENCE. The deleted
-        # FFI/layout projection was the only writer that put a swizzle on the
-        # MONOLITHIC arm of this family, so a raw monolithic seed no longer carries
-        # one and neither does a drawn candidate; the scheduler arm keeps the value
-        # its own seed builder sets, and a NORMALIZED config always has the key
-        # because the fragment fills it.
-        if expected_l2_swizzle_size is None:
-            self.assertNotIn("tcgen05_l2_swizzle_size", config)
-        else:
-            self.assertEqual(
-                config["tcgen05_l2_swizzle_size"],
-                expected_l2_swizzle_size,
-            )
+        self.assertEqual(
+            config["tcgen05_l2_swizzle_size"],
+            expected_l2_swizzle_size,
+        )
         # The two placement keys are diagnostic-only: they have no flat slot, so a
         # RAW seed carries them but a seed that has round-tripped through
         # flatten/unflatten no longer does (the fixup no longer re-imposes them).
@@ -1953,8 +1942,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             assert seed_config is not None
             self._assert_cute_tcgen05_cluster_m2_seeded(
                 [seed_config],
-                # The DEFAULT-layout direct seed now rides the widened bk bound at 256.
-                expected_block_ks=(256,),
+                expected_block_ks=(128,),
                 expected_indexing_length=3,
             )
             self.assertEqual(
@@ -3499,15 +3487,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         direct_seed = CuteTcgen05ClusterM2Heuristic.get_seed_config(
             bound.env, bound.host_function.device_ir
         ).config
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
-            direct_seed, expected_l2_swizzle_size=None
-        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(direct_seed)
         raw_seeded = [
             config.config
             for config in spec.compiler_seed_configs
             if config.config.get("tcgen05_cluster_m") == 2
         ]
-        self.assertEqual(len(raw_seeded), 6)
+        # 7 cluster_m=2 compiler seeds: the base + scheduler + CLC + aux-TMA +
+        # CLC/aux-TMA wide-N and narrow-N rows, plus the staged work-tile mailbox.
+        self.assertEqual(len(raw_seeded), 7)
         raw_seed = next(
             config
             for config in raw_seeded
@@ -3532,7 +3520,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             if config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
             == Tcgen05PersistenceModel.CLC_PERSISTENT.value
         ]
-        self.assertEqual(len(raw_clc_seeds), 3)
+        self.assertEqual(len(raw_clc_seeds), 4)
         raw_wide_clc_aux_tma_seed = next(
             config
             for config in raw_clc_seeds
@@ -3553,9 +3541,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             ],
         )
         self.assertEqual(raw_seed["pid_type"], "persistent_interleaved")
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
-            raw_seed, expected_l2_swizzle_size=None
-        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(raw_seed)
         self.assertEqual(
             raw_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
         )
@@ -3583,7 +3569,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in spec.autotune_seed_configs()
             if config.config.get("tcgen05_warp_spec_c_input_warps") == 1
         ]
-        self.assertEqual(len(c_input_seeds), 5)
+        self.assertEqual(len(c_input_seeds), 6)
         c_input_seed = next(
             seed
             for seed in c_input_seeds
@@ -3684,7 +3670,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         config_gen = spec.create_config_generation()
         seed_pairs = config_gen.seed_flat_config_pairs()
-        self.assertEqual(len(seed_pairs), 6)
+        # 7 = the cluster_m=1 universal default plus the 7 cluster_m=2 rows, one of
+        # which dedups against the default after normalization.
+        self.assertEqual(len(seed_pairs), 7)
         normalized_seeds = [normalized.config for _flat, normalized in seed_pairs]
         normalized_seed = next(
             config
@@ -3711,7 +3699,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             if config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
             == Tcgen05PersistenceModel.CLC_PERSISTENT.value
         ]
-        self.assertEqual(len(normalized_clc_seeds), 3)
+        self.assertEqual(len(normalized_clc_seeds), 4)
         normalized_wide_clc_aux_tma_seed = next(
             config
             for config in normalized_clc_seeds
@@ -3868,16 +3856,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
-        # ⚠ 1, NOT ``TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE`` (= 4). The deleted
-        # FFI/layout projection was the only writer that put the tuned 4 on the
-        # MONOLITHIC arm of this family, and the monolithic seed builder does not
-        # carry it, so ``normalize`` fills the key from its fragment default
-        # instead. (The scheduler / aux-TMA arms below are unaffected: their own
-        # seed builders set the swizzle.)
         self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
-            normalized_seed,
-            expected_l2_swizzle_size=1,
-            expect_placement_keys=False,
+            normalized_seed, expect_placement_keys=False
         )
         self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
             normalized_scheduler_seed,
@@ -3978,14 +3958,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
             )
 
-        configs = config_gen.random_population(7)
+        # 9 = the 7 seeds (the cluster_m=1 universal default + 7 cluster_m=2 rows,
+        # one of which dedups against the default) plus random draws; sized so the
+        # population is not truncated before the narrow-N row asserted just below.
+        configs = config_gen.random_population(9)
         self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
         cluster_m2_population = [
             config.config
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
         ]
-        self.assertEqual(len(cluster_m2_population), 6)
+        # >=, not ==: every cluster_m=2 SEED row must be present, and the random
+        # draws padding the population out to 9 may legitimately add more.
+        self.assertGreaterEqual(len(cluster_m2_population), 7)
         self.assertTrue(
             any(
                 config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
@@ -4012,12 +3997,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             population_seed["indexing"],
             ["tensor_descriptor"] * spec.indexing.length,
         )
-        # 1, not the tuned 4 -- same cause as ``normalized_seed`` above: the
-        # monolithic arm's swizzle came from the deleted projection.
         self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
-            population_seed,
-            expected_l2_swizzle_size=1,
-            expect_placement_keys=False,
+            population_seed, expect_placement_keys=False
         )
         self.assertTrue(
             any(
@@ -4337,13 +4318,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
-        # The drawn ``clc_persistent`` does NOT stand on this candidate: the CLC
-        # persistence admission still keys on the wide-N edge row, so a narrow-N
-        # tile is rolled back to the plain static-persistent model. (The narrow-N
-        # CLC aux-TMA row reaches the population as a seed instead.)
         self.assertEqual(
             narrow_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
-            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
         )
 
     @onlyBackends(["cute"])
@@ -4445,7 +4422,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
         flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
         self.assertNotIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, flat_keys)
-        self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
+        # The persistence axis is now offered wherever a CLC-persistent kernel is
+        # EMITTABLE (``_clc_persistence_codegen_supported``), paired with the repair
+        # that lets ``clc_persistent`` stand — it is no longer keyed on the seed-side
+        # exact-shape-aux family test, which still withholds the SEED (below).
+        self.assertIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
+        self.assertTrue(spec._cute_tcgen05_config._clc_persistence_codegen_supported())
+        self.assertFalse(spec._cute_tcgen05_config._clc_persistence_search_enabled())
         self.assertFalse(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
@@ -4715,8 +4698,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 for config in spec.autotune_seed_configs()
             )
         )
-        # A cluster_m=2 SIMT monolithic ab=3 candidate is projected onto the
-        # aux-TMA regime (role_local_with_scheduler + warps + ab=2 + tma).
+        # COMPLETE-OR-DECLINE: a cluster_m=2 SIMT monolithic ab=3 candidate is no
+        # longer projected onto the aux-TMA regime — it keeps the topology it drew
+        # (no aux_load_mode key at all, monolithic, 0 role warps, ab=3, c=2). The
+        # aux-TMA regime enters the population as the seed asserted above instead.
         cm2 = helion.Config(
             block_sizes=[256, 256, 128],
             indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
@@ -4732,20 +4717,51 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # The budget was recorded into the constraints at bind time (mocked to
         # B200 above), so ``c_stages_fits`` is deterministic here.
         spec.normalize(cm2, _fix_invalid=True)
-        self.assertEqual(
-            cm2.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY], TCGEN05_AUX_LOAD_MODE_TMA
-        )
+        self.assertNotIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, cm2.config)
         self.assertEqual(
             cm2.config["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        self.assertEqual(cm2.config["tcgen05_ab_stages"], 3)
+        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 0)
+        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 0)
+        # The deeper C ring is likewise no longer projected: the c=4 ring is
+        # carried by the aux-TMA SEED, and a drawn c=2 keeps the depth it drew.
+        self.assertEqual(cm2.config["tcgen05_c_stages"], 2)
+        # The aux-TMA regime the projection used to impose is now reachable only by
+        # REQUESTING it: an explicit ``aux_load_mode=tma`` request on the same tile
+        # is COMPLETED (c_input_warps=1 + the ab cap), not rewritten.
+        cm2_tma_request = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            tcgen05_persistence_model="static_persistent",
+            **{
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+                TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+            },
+        )
+        spec.normalize(cm2_tma_request, _fix_invalid=True)
+        self.assertEqual(
+            cm2_tma_request.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        self.assertEqual(
+            cm2_tma_request.config["tcgen05_strategy"],
             Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
         )
-        self.assertEqual(cm2.config["tcgen05_ab_stages"], 2)
-        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 1)
-        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 1)
-        # Cycle 90 (Workstream A Stage 2): the same projection deepens the C
-        # ring to 4 (foundation for the Stage-4 store-warp split). At ab=2 the
-        # c=4 ring fits under the 232 KB B200 cap, so the budget gate admits it.
-        self.assertEqual(cm2.config["tcgen05_c_stages"], 4)
+        self.assertEqual(cm2_tma_request.config["tcgen05_ab_stages"], 2)
+        self.assertEqual(
+            cm2_tma_request.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 1
+        )
+        self.assertEqual(cm2_tma_request.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 1)
         # A cluster_m=1 candidate is left in its own regime (not forced to TMA),
         # and the deeper C ring is NOT projected onto it.
         cm1 = helion.Config(
@@ -5126,11 +5142,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         residual_tcfg._fix_ab_stages_search_config(residual_cm2_ab3.config)
         self.assertEqual(residual_cm2_ab3.config["tcgen05_ab_stages"], 3)
 
-        # Full chain on the cluster_m=2 residual: the aux-TMA projection still forces
-        # ab=2 there, and the walk is consistent with it (it only lowers).
+        # Full chain on the cluster_m=2 residual: no projection lowers it any more
+        # (complete-or-decline), so the drawn ab=3 survives the chain too.
         residual_full = _ab3_config(cluster_m=2)
         residual_tcfg.fix_search_config(residual_full.config)
-        self.assertEqual(residual_full.config["tcgen05_ab_stages"], 2)
+        self.assertEqual(residual_full.config["tcgen05_ab_stages"], 3)
 
         # cluster_m=1 256x256 plain ab=3 overflows bare-AB (384 KiB > budget) and is
         # demoted even without a source-C. (The full chain also clamps bm to 128 for
