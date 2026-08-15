@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
 
 RESIDENT_PLAN_META = "pallas_resident_ref_plan"
+STATIC_BASIC_VALUE_SUBSCRIPT_META = "pallas_static_basic_value_subscript"
 
 # These Aten operations may preserve the address interpretation of a resident
 # Ref. Membership only permits planning; ``_reshape_variants`` still proves the
@@ -123,6 +124,127 @@ def _narrowed_dims(indices: object) -> list[int]:
         for dim, index in enumerate(indices)
         if index is not None and index != slice(None)
     ]
+
+
+class _StaticIndexRange(NamedTuple):
+    """A compile-time contiguous tensor index represented as a Python slice."""
+
+    start: int
+    length: int
+
+
+def _static_index(
+    value: object, seen: set[torch.fx.Node] | None = None
+) -> int | _StaticIndexRange | None:
+    """Evaluate a scalar or contiguous compile-time tensor index.
+
+    Mosaic does not implement general advanced indexing on materialized VMEM
+    values. Helion's ``hl.arange`` commonly traces as an iota, however, and an
+    iota shifted by a constant is exactly a basic Python slice. Recognize that
+    deliberately small subset so Pallas codegen can retain basic indexing
+    semantics without introducing a gather.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, torch.fx.Node):
+        return None
+    seen = set() if seen is None else seen
+    if value in seen:
+        return None
+    seen.add(value)
+    if value.op != "call_function":
+        return None
+    if value.target is torch.ops.prims.iota.default:
+        length = value.args[0]
+        start = value.kwargs.get("start", 0)
+        step = value.kwargs.get("step", 1)
+        if not isinstance(length, int) or isinstance(length, bool):
+            return None
+        if not isinstance(start, int) or isinstance(start, bool):
+            return None
+        if not isinstance(step, int) or isinstance(step, bool):
+            return None
+        if length < 0 or start < 0 or step != 1:
+            return None
+        return _StaticIndexRange(start=start, length=length)
+
+    shift_arithmetic = {
+        torch.ops.aten.add.Scalar,
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Scalar,
+        torch.ops.aten.sub.Tensor,
+    }
+    if value.target not in shift_arithmetic or value.kwargs.get("alpha", 1) != 1:
+        return None
+    if len(value.args) != 2:
+        return None
+    lhs = _static_index(value.args[0], seen)
+    rhs = _static_index(value.args[1], seen)
+    if value.target in {torch.ops.aten.add.Scalar, torch.ops.aten.add.Tensor}:
+        if isinstance(lhs, _StaticIndexRange) and isinstance(rhs, int):
+            start = lhs.start + rhs
+            return _StaticIndexRange(start, lhs.length) if start >= 0 else None
+        if isinstance(lhs, int) and isinstance(rhs, _StaticIndexRange):
+            start = lhs + rhs.start
+            return _StaticIndexRange(start, rhs.length) if start >= 0 else None
+        if isinstance(lhs, int) and isinstance(rhs, int):
+            return lhs + rhs
+        return None
+    if isinstance(lhs, _StaticIndexRange) and isinstance(rhs, int):
+        start = lhs.start - rhs
+        return _StaticIndexRange(start, lhs.length) if start >= 0 else None
+    if isinstance(lhs, int) and isinstance(rhs, int):
+        return lhs - rhs
+    return None
+
+
+def _is_static_basic_value_subscript(node: torch.fx.Node, config: Config) -> bool:
+    """Whether static narrowing can use ordinary JAX basic indexing."""
+    indices = node.args[1]
+    if not isinstance(indices, (list, tuple)):
+        return False
+    if not all(
+        index is None or index == slice(None) or _static_index(index) is not None
+        for index in indices
+    ):
+        return False
+
+    input_value = _node_value(node.args[0])
+    if not isinstance(input_value, torch.Tensor):
+        return False
+    tensor_dim = 0
+    for index in indices:
+        if index is None:
+            continue
+        if tensor_dim >= input_value.ndim:
+            return False
+        if index != slice(None):
+            static_index = _static_index(index)
+            assert static_index is not None
+            size = _concrete_size(input_value.shape[tensor_dim], config, 1)
+            if size is None:
+                return False
+            if isinstance(static_index, _StaticIndexRange):
+                if static_index.start + static_index.length > size:
+                    return False
+            elif not -size <= static_index < size:
+                return False
+        tensor_dim += 1
+
+    source = node.args[0]
+    seen: set[torch.fx.Node] = set()
+    while isinstance(source, torch.fx.Node) and source not in seen:
+        seen.add(source)
+        if source.op != "call_function":
+            return False
+        if source.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
+            source = source.args[0]
+            continue
+        # An earlier narrowing subscript may still carry a resident Ref and its
+        # boundary-mask invariants. A root load, by contrast, can materialize as
+        # an ordinary value before applying this compile-time basic index.
+        return source.target is not subscript
+    return False
 
 
 def _resident_plan(node: torch.fx.Node) -> _ResidentPlan | None:
@@ -1089,7 +1211,11 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
     # so only this completeness pass decides whether a recorded failure is fatal.
     for info in graphs:
         for node in info.graph.find_nodes(op="call_function", target=subscript):
+            node.meta.pop(STATIC_BASIC_VALUE_SUBSCRIPT_META, None)
             if _resident_plan(node) is not None or not _narrowed_dims(node.args[1]):
+                continue
+            if _is_static_basic_value_subscript(node, config):
+                node.meta[STATIC_BASIC_VALUE_SUBSCRIPT_META] = True
                 continue
             failure = context.failures.get(node)
             if failure is None:
@@ -1179,6 +1305,29 @@ def _(state: CodegenState) -> ast.AST:
     assert state.fx_node is not None
     if _resident_plan(state.fx_node) is not None:
         return _codegen_resident_subscript(state)
+    indices = state.fx_node.args[1]
+    if state.fx_node.meta.get(STATIC_BASIC_VALUE_SUBSCRIPT_META):
+        assert isinstance(indices, (list, tuple))
+        placeholders: dict[str, ast.AST] = {"base": state.ast_arg(0)}
+        rendered: list[str] = []
+        for index in indices:
+            if index is None:
+                rendered.append("None")
+            elif index == slice(None):
+                rendered.append(":")
+            else:
+                static_index = _static_index(index)
+                assert static_index is not None
+                if isinstance(static_index, _StaticIndexRange):
+                    rendered.append(
+                        f"{static_index.start}:{static_index.start + static_index.length}"
+                    )
+                else:
+                    rendered.append(repr(static_index))
+        return expr_from_string(
+            f"{{base}}[{', '.join(rendered)}]",
+            **placeholders,
+        )
     # pyrefly: ignore [missing-attribute]
     return subscript._codegen["common"](state)
 
