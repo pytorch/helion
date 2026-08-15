@@ -17,6 +17,7 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion._compiler.pallas.dma import DmaResources
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import _bound_test_config
@@ -5576,6 +5577,15 @@ class TestPallas(TestCase):
 
         return outer_in_inner
 
+    def test_dma_resource_refs(self) -> None:
+        single = DmaResources("scratch", "semaphore", 1)
+        self.assertEqual(single.scratch_ref(None), "scratch")
+        self.assertEqual(single.semaphore_ref(None), "semaphore")
+
+        double = DmaResources("scratch", "semaphore", 2)
+        self.assertEqual(double.scratch_ref("stage"), "scratch.at[stage]")
+        self.assertEqual(double.semaphore_ref("stage"), "semaphore.at[stage]")
+
     def test_dma_buffer_offset_nested_tile_codegen(self) -> None:
         """A read-modify-write output must be loaded before its nested update."""
         kernel = self._dma_buffer_offset_nested_tile_kernel()
@@ -5588,7 +5598,11 @@ class TestPallas(TestCase):
             helion.Config(block_sizes=[32, 32], pallas_loop_type="fori_loop")
         )
 
-        self.assertIn("pltpu.make_async_copy(out.at[", code)
+        load = "pltpu.make_async_copy(out.at["
+        nested_update = "out_buf[0, :, :] ="
+        self.assertIn(load, code)
+        self.assertIn(nested_update, code)
+        self.assertLess(code.index(load), code.index(nested_update))
 
     @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_dma_buffer_offset_nested_tile(self) -> None:

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 DmaDirection = Literal["load", "store"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class DmaTransfer:
     """One local HBM/VMEM transfer before resources are allocated."""
 
@@ -51,7 +51,7 @@ class DmaResources:
         return f"{self.semaphore}.at[{stage}]"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ScheduledDmaTransfer:
     """A transfer paired with resources allocated for one compiled config."""
 

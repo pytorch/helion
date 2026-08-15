@@ -41,6 +41,7 @@ from ..host_function import HostFunction
 from .dma import DmaTransfer
 from .dma import ScheduledDmaTransfer
 from .dma import allocate_dma_resources
+from .dma import async_copy_statements
 
 log = logging.getLogger(__name__)
 
@@ -3344,9 +3345,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             prefetched_loads.append(scheduled)
 
     # ``all_tensor_info`` represents a read-modify-write tensor only by its
-    # store record so that its load and store share one VMEM buffer.  Build
-    # immediate loads from the original load sites, as the pre-refactor path
-    # did, while reusing the resource selected for that tensor.
+    # store record so that its load and store share one VMEM buffer. Rebuild
+    # the immediate load from its original load site to preserve ordering
+    # before nested updates while reusing the store record's resources.
     for fake, _tensor_node, sub_meta in loaded_tensors.values():
         hbm_name = state.device_function.tensor_arg(fake).name
         scheduled = scheduled_by_hbm_name.get(hbm_name)
@@ -3544,8 +3545,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         stage_expr: str | None,
         methods: tuple[str, ...],
     ) -> list[ast.stmt]:
-        from .dma import async_copy_statements
-
         transfer = scheduled.transfer
         resources = scheduled.resources
         fake = transfer.tensor
