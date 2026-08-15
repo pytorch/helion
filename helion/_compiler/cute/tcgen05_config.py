@@ -89,8 +89,14 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_LEGAL_BK
+from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_SEED_AB_STAGES
+from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_SEED_C_STAGES
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
+from .tcgen05_constants import TCGEN05_EXPLICIT_D_STORE_BOX_N
+from .tcgen05_constants import TCGEN05_EXPLICIT_EPI_TILE_M
+from .tcgen05_constants import TCGEN05_EXPLICIT_EPI_TILE_N
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_MODES
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
@@ -144,7 +150,6 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
-from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 
 if TYPE_CHECKING:
@@ -461,12 +466,7 @@ class CuteTcgen05Config:
         return False
 
     def full_tile_direct_entry_seed_bk(self) -> int | None:
-        """Largest valid full-tile direct-entry K tile for the live shape.
-
-        Mirrors the full-tile branch of the heuristic bk selection: the highest
-        power-of-two ``bk`` within the K block-size fragment that divides
-        ``static_k`` within the ``max_k_tiles`` cap.
-        """
+        """Largest valid full-tile direct-entry K tile for the live shape."""
         constraints = self.cluster_m2_search_constraints
         fragments = self._matmul_block_fragments()
         if (
@@ -476,29 +476,19 @@ class CuteTcgen05Config:
         ):
             return None
         bk_fragment = fragments[2]
-        bk = bk_fragment.high
+        bk = min(bk_fragment.high, max(TCGEN05_DIRECT_ENTRY_LEGAL_BK))
         while bk >= bk_fragment.low:
-            if self.cluster_m2_bk_is_valid(bk, constraints):
+            if bk in TCGEN05_DIRECT_ENTRY_LEGAL_BK and self.cluster_m2_bk_is_valid(
+                bk, constraints
+            ):
                 return bk
             bk //= 2
         return None
 
-    def full_tile_direct_entry_seed_eligible(self) -> bool:
-        """Structural eligibility for the generalized TVM-FFI direct-entry seed.
-
-        The direct-entry codegen + runtime validator build their A/B/D TMA
-        descriptors from the runtime tensor shapes, so the fast launch path is
-        shape-general; the constraints are purely structural: a full-tile (NOT
-        edge+K-tail) CtaGroup.TWO 16-bit (bf16/fp16) GEMM, the 256x256 CTA tile
-        reachable, a direct-entry-valid ``bk``, and the ``(ab=3, c=2)`` stage
-        tuple admitted
-        and SMEM-fitting. Both ``optional_fragments`` (to add the FFI search
-        surface) and ``CuteTcgen05ClusterM2FfiHeuristic`` (to gate the seed) use
-        this so they cannot disagree.
-        """
-        # A non-tcgen05-native matmul operand (e.g. an int16 tensor cast to
-        # bf16) forces the dot through the non-tcgen05 fallback, where the
-        # flat-role / FFI seed config is rejected.
+    def explicit_epi_tile_family_exists(self) -> bool:
+        """Bind-time facts: can the ``explicit_epi_tile`` family exist on this shape?"""
+        # A non-tcgen05-native operand forces the dot through the fallback, which
+        # rejects the flat-role / FFI config.
         if self.matmul_has_non_tcgen05_operand:
             return False
         constraints = self.cluster_m2_search_constraints
@@ -506,11 +496,7 @@ class CuteTcgen05Config:
             return False
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return False
-        # The direct-entry TMA descriptors, SMEM layout, and epilogue tile are
-        # dtype-general for any 16-bit operand (the byte math keys on
-        # ``dtype_bytes``, and bf16/fp16 are both 2 bytes), so admit bf16 and
-        # fp16 with matching operand dtypes. fp32 stays excluded (no tcgen05
-        # fp32 SMEM-staged MMA path).
+        # 16-bit only: there is no tcgen05 fp32 SMEM-staged MMA path.
         if self.matmul_input_dtype not in (torch.bfloat16, torch.float16):
             return False
         if self.matmul_explicit_epi_tile_compatible is not True:
@@ -526,29 +512,28 @@ class CuteTcgen05Config:
         bk = self.full_tile_direct_entry_seed_bk()
         if bk is None:
             return False
-        if not tcgen05_direct_entry_stage_tuple_allowed(
-            bk=bk, ab_stage_count=3, c_stage_count=2
-        ):
+        # cute_mma.py raises for any other bk: the flat-role launch shape and the
+        # D-descriptor box are built only for {64, 128}.
+        return bk in TCGEN05_DIRECT_ENTRY_LEGAL_BK
+
+    def full_tile_direct_entry_seed_emittable(self) -> bool:
+        """Can the FFI direct-entry SEED actually be emitted on this shape?"""
+        if not self.explicit_epi_tile_family_exists():
+            return False
+        bk = self.full_tile_direct_entry_seed_bk()
+        if bk is None:
             return False
         return self.ab_stages_fits(
             bm=TCGEN05_TWO_CTA_BLOCK_M,
             bn=TCGEN05_TWO_CTA_BLOCK_N,
             bk=bk,
             cluster_m=2,
+            ab_stages=TCGEN05_DIRECT_ENTRY_SEED_AB_STAGES,
         )
 
     def full_tile_direct_entry_seed_config(self) -> Config | None:
-        """Generalized TVM-FFI direct-entry seed config for the live shape.
-
-        Single source of truth for the FFI ``explicit_epi_tile`` + flat-role +
-        ``tvm_ffi_launch`` config: emitted into the autotuner population by
-        ``CuteTcgen05ClusterM2FfiHeuristic`` AND used by
-        ``_fix_target1_tvm_ffi_search_config`` to project FFI-requesting search
-        candidates onto the validated CtaGroup.TWO envelope (this is what the
-        per-shape ``_target{N}`` seeds used to do, generalized to any eligible
-        shape). Returns ``None`` for ineligible shapes.
-        """
-        if not self.full_tile_direct_entry_seed_eligible():
+        """Generalized TVM-FFI direct-entry seed config for the live shape."""
+        if not self.full_tile_direct_entry_seed_emittable():
             return None
         bk = self.full_tile_direct_entry_seed_bk()
         if bk is None:
@@ -568,9 +553,9 @@ class CuteTcgen05Config:
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
             "tcgen05_cluster_m": 2,
             "tcgen05_cluster_n": 1,
-            "tcgen05_ab_stages": 3,
+            "tcgen05_ab_stages": TCGEN05_DIRECT_ENTRY_SEED_AB_STAGES,
             "tcgen05_acc_stages": 2,
-            "tcgen05_c_stages": 2,
+            "tcgen05_c_stages": TCGEN05_DIRECT_ENTRY_SEED_C_STAGES,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
             "tcgen05_num_epi_warps": 4,
             TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
@@ -579,10 +564,14 @@ class CuteTcgen05Config:
             TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
                 Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
             ),
-            # The flat-role launch path uses this fixed explicit subtile.
-            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
-            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
-            TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+            # The flat-role launch path uses this fixed explicit subtile: it is the
+            # only triple the D-descriptor codegen accepts, so it is the same for
+            # every eligible shape.
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: TCGEN05_EXPLICIT_EPI_TILE_M,
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: TCGEN05_EXPLICIT_EPI_TILE_N,
+            TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: (
+                TCGEN05_EXPLICIT_D_STORE_BOX_N
+            ),
             TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
         }
@@ -1747,21 +1736,31 @@ class CuteTcgen05Config:
             and k_block_index < len(block_sizes)
             else None
         )
+        # ``c_stages`` is read only to confirm the key is present and well-typed:
+        # its VALUE no longer gates admission (that was the enumerated ``(ab, c)``
+        # pairing), but a config missing a valid c_stages is still not a
+        # well-formed direct-entry config.
         c_stages = config.get("tcgen05_c_stages")
         if (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             and isinstance(bk, int)
             and not isinstance(bk, bool)
+            and bk in TCGEN05_DIRECT_ENTRY_LEGAL_BK
             and type(c_stages) is int
-            and tcgen05_direct_entry_stage_tuple_allowed(
-                bk=bk, ab_stage_count=ab_stages, c_stage_count=c_stages
-            )
         ):
-            return
-        # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
-        # cap of 3; admit ab_stages > 3 for fp8 as long as the AB SMEM fits the
-        # per-CTA budget. This lets Helion emit the same deeply-pipelined
-        # CtaGroup.TWO kernel CUTLASS uses for fp8 compute-bound GEMMs.
+            config_view = self._matmul_config_view(config)
+            if config_view is not None:
+                view_block_sizes, m_index, n_index, k_index = config_view
+                if self.ab_stages_fits(
+                    bm=cast("int", view_block_sizes[m_index]),
+                    bn=cast("int", view_block_sizes[n_index]),
+                    bk=cast("int", view_block_sizes[k_index]),
+                    cluster_m=cast("int", config.get("tcgen05_cluster_m", 1)),
+                    ab_stages=ab_stages,
+                ):
+                    return
+        # fp8 (1-byte) operands fit a deeper AB pipeline than the 16-bit cap of 3,
+        # so admit ab>3 there whenever the per-CTA AB SMEM fits the budget.
         constraints = self.ab_stages_search_constraints
         if constraints is not None and constraints.dtype_bytes == 1:  # FP8
             config_view = self._matmul_config_view(config)
@@ -2314,7 +2313,7 @@ class CuteTcgen05Config:
             fragments[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
             )
-        direct_entry_seed_eligible = self.full_tile_direct_entry_seed_eligible()
+        direct_entry_seed_eligible = self.explicit_epi_tile_family_exists()
         if direct_entry_seed_eligible or (
             not for_search and self._direct_entry_k_block_index() is not None
         ):
@@ -2334,23 +2333,53 @@ class CuteTcgen05Config:
                 fragments.update(
                     {
                         TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: EnumFragment(
-                            (None, 128)
+                            (None, TCGEN05_EXPLICIT_EPI_TILE_M),
                         ),
                         TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: EnumFragment(
-                            (None, 32)
+                            (None, TCGEN05_EXPLICIT_EPI_TILE_N),
                         ),
                         TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: EnumFragment(
-                            (None, 32)
+                            (None, TCGEN05_EXPLICIT_D_STORE_BOX_N),
                         ),
                     }
                 )
         return fragments
 
+    def _derive_layout_override_bundle(self, config: dict[str, object]) -> None:
+        """Make the three epi-tile overrides agree with ``layout_strategy``."""
+        present = [
+            key
+            for key in (
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
+            )
+            if key in config
+        ]
+        if not present:
+            return
+        if (
+            config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+        ):
+            derived = {
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: TCGEN05_EXPLICIT_EPI_TILE_M,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: TCGEN05_EXPLICIT_EPI_TILE_N,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: (
+                    TCGEN05_EXPLICIT_D_STORE_BOX_N
+                ),
+            }
+            for key in present:
+                config[key] = derived[key]
+            return
+        for key in present:
+            config[key] = None
+
     @staticmethod
     def _target1_tvm_ffi_promotion_requested(config: dict[str, object]) -> bool:
+        """Does *config* request the LAYOUT family this stage governs?"""
         return (
-            config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
-            or config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
+            config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
             or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
             == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
             or config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY) is not None
@@ -2358,39 +2387,147 @@ class CuteTcgen05Config:
             or config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) is not None
         )
 
-    @staticmethod
-    def _clear_target1_tvm_ffi_promotion_surface(config: dict[str, object]) -> None:
-        for key in list(config):
-            if key.startswith("tcgen05_") or key == "epilogue_subtile":
-                config.pop(key, None)
+    def _strip_target1_tvm_ffi_promotion_surface(
+        self, config: dict[str, object]
+    ) -> None:
+        """Repair a config AWAY from the LAYOUT envelope, in place.
+
+        has no reason to lose its launch mechanism. Clearing it here would silently
+        """
+        config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
+        if (
+            config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+        ):
+            config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
+                Tcgen05LayoutStrategy.DEFAULT.value
+            )
+        for key in (
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
+            TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
+        ):
+            config[key] = None
+
+    # Keys that define the LAYOUT direct-entry envelope: the five promotion-request
+    _TARGET1_TVM_FFI_ENVELOPE_KEYS: tuple[str, ...] = (
+        TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+        TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+        TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
+        TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
+        TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
+        "block_sizes",
+        "tcgen05_cluster_m",
+        "tcgen05_cluster_n",
+    )
 
     def _fix_target1_tvm_ffi_search_config(self, config: dict[str, object]) -> None:
-        # The generalized direct-entry seed projects FFI-requesting search
-        # candidates onto the validated CtaGroup.TWO envelope for ANY eligible
-        # shape (returns None for ineligible shapes, in which case the
-        # promotion surface is stripped back to the DEFAULT layout below).
-        seed = self.full_tile_direct_entry_seed_config()
+        self._settle_layout_group(config)
         if not self._target1_tvm_ffi_promotion_requested(config):
             return
-        if seed is None:
-            config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
-            config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
-            if (
-                config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
-                == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
-            ):
-                config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
-                    Tcgen05LayoutStrategy.DEFAULT.value
-                )
-            for key in (
-                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
-                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
-                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
-            ):
-                config[key] = None
+        #
+        # The remaining population asked for ``explicit_epi_tile`` (possibly with
+        # ``flat_role``) but does not match the seed's layout envelope. Stripping it
+        if self._fix_towards_explicit_epi_tile_envelope(config):
             return
-        self._clear_target1_tvm_ffi_promotion_surface(config)
-        config.update(seed.config)
+        self._strip_target1_tvm_ffi_promotion_surface(config)
+
+    def _fix_towards_explicit_epi_tile_envelope(
+        self, config: dict[str, object]
+    ) -> bool:
+        """Complete an ``explicit_epi_tile`` request in place. True if completed.
+
+        | ``cluster_m = 2`` | the envelope is CtaGroup.TWO (``tcgen05_is_two_cta``). At ``cluster_m=1`` a ``bm=256`` tile silently emits **Triton**, so this is legality, and it is derivable from a tile the draw already chose |
+        """
+        # PRECONDITION-FACT: the shape. ``static_full_tiles``, 16-bit dtype and
+        # aux-descriptor compatibility are bind-time facts no knob can repair.
+        if not self._flat_role_shape_facts_hold():
+            return False
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return False
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return False
+        block_sizes, m_index, n_index, k_index = config_view
+        # PRECONDITION-KNOB: the CTA tile. Checked, never written — see the
+        # docstring's measurement for why.
+        if (
+            block_sizes[m_index] != TCGEN05_TWO_CTA_BLOCK_M
+            or block_sizes[n_index] != TCGEN05_TWO_CTA_BLOCK_N
+        ):
+            return False
+        if config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True:
+            # flat-role's guard adds two TILE conjuncts over plain explicit-epi-tile:
+            # ``bk in {64, 128}`` and ``cluster_n == 1``. Both are drawn values, so
+            # both are checked here; a draw that misses either keeps ``flat_role``
+            # cleared by the caller rather than having its K tile rewritten.
+            #
+            # The guard's remaining config-dependent conjuncts — the FLAT warp topology
+            bk = block_sizes[k_index]
+            # ``_flat_role_shape_facts_hold`` above already requires the cm2
+            # constraints, so this narrowing is what makes that invariant explicit
+            # rather than an unstated non-local assumption.
+            cm2_constraints = self.cluster_m2_search_constraints
+            if not (
+                cm2_constraints is not None
+                and isinstance(bk, int)
+                and not isinstance(bk, bool)
+                and bk in TCGEN05_DIRECT_ENTRY_LEGAL_BK
+                and self.cluster_m2_bk_is_valid(bk, cm2_constraints)
+            ):
+                return False
+            if config.get("tcgen05_cluster_n", 1) != 1:
+                return False
+        # WRITES NOTHING. Every term above is a precondition, checked and never written,
+        # so this function only ever ANSWERS "is this request completable" — the layout
+        # keys were already settled by ``_settle_layout_group`` and the ``cluster_m = 2``
+        # the envelope needs is written by ``_fix_cluster_m2_search_config``, which owns
+        # that key (see its entry block). Returning True is what tells the caller to keep
+        # the request instead of stripping it.
+        return True
+
+    def _settle_layout_group(self, config: dict[str, object]) -> None:
+        """Settle the layout group: promote or demote flat_role, then derive the overrides."""
+        if config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True:
+            if self._flat_role_config_can_hold(config):
+                # COMPLETE the request: ``flat_role=True`` is what the draw asked for and
+                # is left alone; ``explicit_epi_tile`` is the value it REQUIRES.
+                config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                )
+                # The flat WARP topology this request also needs is supplied at the top of
+                # ``_fix_with_scheduler_search_config`` (stage 5), keyed on the same
+                # ``flat_role is True`` test, so all four warp keys are written in one
+                # place. Nothing between here and there reads any of them.
+            else:
+                # DEMOTE. The unmet term is either a shape fact (static_full_tiles,
+                # 16-bit dtype, aux-descriptor compatibility) or the strategy, which this
+                # stage does not own, so the flag is what gives.
+                config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
+        # Tier 2, from the FINAL ``layout_strategy``. Keep this last, and keep its
+        # ``present`` guard: on a non-matmul kernel the override keys are absent by
+        # design and ``normalize_strategy`` raises ``InvalidConfig`` for any that
+        # appears, so writing ``None`` is not harmless (it broke 12 pointwise tests).
+        self._derive_layout_override_bundle(config)
+
+    def _flat_role_config_can_hold(self, config: dict[str, object]) -> bool:
+        """Can ``flat_role_coordinates=True`` hold for THIS CONFIG (not just this shape)?
+
+        Not checked here, deliberately: the tile terms (``bm``/``bn``/``bk``/
+        """
+        if not self._flat_role_shape_facts_hold():
+            return False
+        # The STRATEGY only. The warp keys it determines are verified at the end of
+        # ``_settle_layout_group``, once stage 5's derivation has had its say.
+        return config.get(TCGEN05_STRATEGY_CONFIG_KEY) in (
+            None,
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value,
+        )
+
+    def _flat_role_shape_facts_hold(self) -> bool:
+        """Can ``flat_role_coordinates=True`` hold on THIS SHAPE at all?"""
+        return self.explicit_epi_tile_family_exists()
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._aux_tma_search_enabled():
@@ -2467,7 +2604,7 @@ class CuteTcgen05Config:
         # Aux kernels are the only current trigger for scheduler/c_input warp
         # search. The surface is derived from aux_kernel_detected so repeated
         # detection or repeated fragment construction stays idempotent.
-        direct_entry_seed_eligible = self.full_tile_direct_entry_seed_eligible()
+        direct_entry_seed_eligible = self.explicit_epi_tile_family_exists()
         if self.aux_kernel_detected:
             strategy_choices: tuple[str, ...] = (
                 Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
@@ -2598,6 +2735,23 @@ class CuteTcgen05Config:
                     config[key] = None
                 else:
                     config[key] = self.strategy_field_default(key, pid_type=pid_type)
+            # The loop just put ``layout_strategy`` back to DEFAULT, and
+            # ``flat_role_coordinates=True`` is illegal there -- ``cute_mma.py`` raises
+            # ``BackendUnsupported`` for the flag outside the guarded explicit-epi-tile
+            # path, which is why ``_settle_layout_group`` promotes layout whenever the
+            # flag holds. The flag is NOT in ``TCGEN05_STRATEGY_CONFIG_KEYS`` (and
+            # ``strategy_field_default`` has no branch for it), so the loop cannot clear
+            # it. Clearing it here keeps the pair settled: left True, the next
+            # ``normalize`` pass re-promotes layout off the surviving flag and the
+            # pipeline has no fixed point -- which the post-fix write-back requires.
+            #
+            # Only rewritten when already PRESENT: the key is absent by design on a
+            # family that cannot draw it (``optional_fragments(for_search=True)`` omits
+            # it off the direct-entry surface), and introducing it there makes the
+            # config differ from what the same vector decodes to, which is what the
+            # write-back checks before adopting.
+            if TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY in config:
+                config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
             return
         message = "; ".join(errors)
         raise InvalidConfig(f"tcgen05 strategy invariants violated: {message}")

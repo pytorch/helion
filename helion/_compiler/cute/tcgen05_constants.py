@@ -67,7 +67,9 @@ assert (
 # 512x2048x4096 -> 16 clusters on a 148-SM B200).
 TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M = 128
 TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N = 128
-# Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
+# ``bm=128`` the CuTe MMA atom raises ``OpError: expects the N-mode to satisfy
+# 512x2048x4096 with the integer-data bit-exact oracle at both ``bk=64`` and
+# ``bk=128``: ``bn=16`` raises, ``bn in {32, 64, 128, 256}`` are all bit-exact.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
 # This pid order stays slightly ahead of persistent_blocked in the validated
 # CtaGroup.TWO envelope.
@@ -76,13 +78,6 @@ TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 # SMEM budget reserved for non-AB allocations on B200 when sampling the
 # ``tcgen05_ab_stages=3`` search arm. The role-local persistent kernel also
 # allocates space for the C accumulator stages, pipeline mailboxes, and TMEM
-# bookkeeping; the canonical 256x256x128 cluster_m=2 ab=3 path measured
-# 196 608 bytes (192 KiB) AB + ~24 KiB other under the 227 KiB optin cap.
-# Hold 28 KiB back from the per-CTA budget so candidates we admit keep a
-# comfortable margin against ptxas's hard limit. This is intentionally
-# conservative because the search space cannot enumerate every C-stage /
-# acc-stage variant cheaply and ``ptxas: shared > 232KB`` is bad UX during
-# tuning.
 TCGEN05_AB_STAGES_RESERVED_SMEM_BYTES = 28 * 1024
 # Hard floor on the per-CTA SMEM optin cap required to admit
 # ``tcgen05_ab_stages=3`` into autotune search. B200's optin reports
@@ -114,7 +109,7 @@ def tcgen05_ab_smem_bytes_per_cta(
     The autotune search-space gate uses this helper to admit
     ``tcgen05_ab_stages=3`` candidates only when the per-CTA cost fits
     the B200 SMEM optin budget after the non-AB reservation in
-    ``TCGEN05_AB_STAGES_RESERVED_SMEM_BYTES``. The numbers were
+    ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES``. The numbers were
     cross-checked against ``cute.cosize`` for the canonical tile shapes
     (256x256x128 CtaGroup.TWO ab=3 = 196 608 bytes; 128x256x128
     CtaGroup.ONE ab=3 = 294 912 bytes / overflows the 232 KB optin cap).
@@ -245,7 +240,6 @@ def tcgen05_two_cta_edge_k_tail_seed_overrides() -> dict[str, object]:
         "tcgen05_acc_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
         "tcgen05_c_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
         "l2_groupings": [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
-        "tcgen05_l2_swizzle_size": TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
         TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY: (
             TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
         ),
@@ -363,6 +357,17 @@ TCGEN05_SCHED_CONSUMER_WAIT_MODES = (
 )
 TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY = "tcgen05_sched_stage_count"
 TCGEN05_SCHED_STAGE_COUNTS = (1, 2)
+# The depth the STAGED work-tile mailbox uses: the CLC scheduler warp publishes tile N+1
+# while the consumers still read tile N, instead of waiting for them to drain slot 0.
+# Named so the seed producer (``_staged_mailbox_seed_config``), the search fragment
+# (``sched_stage_count_autotune_fragments``) and the two raises that enforce the regime
+# (``_validate_sched_stage_count_config`` and ``program_id.py``'s
+# ``_tcgen05_uses_staged_work_tile_mailbox`` guard) all read one definition.
+TCGEN05_STAGED_WORK_TILE_MAILBOX_SCHED_STAGES = 2
+
+assert TCGEN05_STAGED_WORK_TILE_MAILBOX_SCHED_STAGES in TCGEN05_SCHED_STAGE_COUNTS, (
+    "the staged-mailbox depth must be a legal tcgen05_sched_stage_count"
+)
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 
@@ -404,27 +409,29 @@ TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
 TCGEN05_CONSUMER_REGS_CONFIG_KEY = "tcgen05_consumer_regs"
 TCGEN05_CONSUMER_REGS_DEFAULT = 256
 TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
+# THE ONLY explicit-epilogue subtile the D-descriptor codegen accepts:
+# 128x32 bf16 gives the validated 64 Ki-bit D-store TMA box and x32 TMEM drain.
+# ``cute_mma.py`` raises ``BackendUnsupported`` on any other triple.
+#
+# Because there is exactly one legal value per key, the three
+# ``tcgen05_layout_overrides_*`` keys are NOT search axes: they are DERIVED from
+# ``tcgen05_layout_strategy`` (see ``_derive_layout_override_bundle``). Named here
+# so the derivation, the seed builders and ``cute_mma.py``'s
+# ``_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE`` all read one definition.
+TCGEN05_EXPLICIT_EPI_TILE_M = TCGEN05_TWO_CTA_BLOCK_M // 2
 
-# Stage tuples that the TVM-FFI flat-role seed accepts, keyed by ``bk``. The
-# general FFI seed eligibility (``tcgen05_config.py``) consumes this table via
-# ``tcgen05_direct_entry_stage_tuple_allowed``. ``bk=64`` admits the shallow
-# ``(3, 2)`` and deep ``(6, 4)`` A/B pipelines; ``bk=128`` admits the
-# ``(3, 2)`` pipeline. The admission is otherwise structural (any CtaGroup.TWO
-# ``bm=bn=256`` shape) — these stage tuples are the only per-``bk`` constraint.
-TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK: dict[int, tuple[tuple[int, int], ...]] = {
-    64: ((3, 2), (6, 4)),
-    128: ((3, 2),),
-}
+TCGEN05_EXPLICIT_EPI_TILE_N = 32
+
+TCGEN05_EXPLICIT_D_STORE_BOX_N = 32
+
+# The shallow stage tuple the direct-entry seed itself emits. Used as the
+# seed's own depth, NOT as an admission filter.
+TCGEN05_DIRECT_ENTRY_SEED_AB_STAGES = 3
+
+TCGEN05_DIRECT_ENTRY_SEED_C_STAGES = 2
 
 
-def tcgen05_direct_entry_stage_tuple_allowed(
-    *, bk: int, ab_stage_count: int, c_stage_count: int
-) -> bool:
-    """Return True iff ``(ab_stage_count, c_stage_count)`` is admitted for ``bk``."""
-    return (
-        ab_stage_count,
-        c_stage_count,
-    ) in TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK.get(bk, ())
+TCGEN05_DIRECT_ENTRY_LEGAL_BK: frozenset[int] = frozenset({64, 128})
 
 
 # Diagnostic-only G4 admission proof. This key lets tests exercise the

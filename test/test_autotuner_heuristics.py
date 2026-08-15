@@ -1833,7 +1833,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         config: dict[str, object],
         *,
         expected_l2_grouping: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING,
-        expected_l2_swizzle_size: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+        expected_l2_swizzle_size: int | None = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE
+        ),
     ) -> None:
         self.assertEqual(
             config["tcgen05_ab_stages"],
@@ -1851,10 +1853,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             config["l2_groupings"],
             [expected_l2_grouping],
         )
-        self.assertEqual(
-            config["tcgen05_l2_swizzle_size"],
-            expected_l2_swizzle_size,
-        )
+        # ``expected_l2_swizzle_size=None`` pins the key's ABSENCE. The deleted
+        # FFI/layout projection was the only writer that put a swizzle on the
+        # MONOLITHIC arm of this family, so a raw monolithic seed no longer carries
+        # one and neither does a drawn candidate; the scheduler arm keeps the value
+        # its own seed builder sets, and a NORMALIZED config always has the key
+        # because the fragment fills it.
+        if expected_l2_swizzle_size is None:
+            self.assertNotIn("tcgen05_l2_swizzle_size", config)
+        else:
+            self.assertEqual(
+                config["tcgen05_l2_swizzle_size"],
+                expected_l2_swizzle_size,
+            )
         self.assertEqual(
             config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY],
             TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
@@ -3112,7 +3123,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         ):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_emittable())
         seed_config = spec._tcgen05_full_tile_direct_entry_seed_config()
         self.assertIsNotNone(seed_config)
         seed = seed_config.config
@@ -3301,7 +3312,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # With no recorded SMEM budget the generalized FFI seed is ineligible
         # (ab=3 cannot fit) and the for_search ab cap stays at 2.
         self.assertFalse(
-            no_ab3_budget_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+            no_ab3_budget_bound.config_spec._tcgen05_full_tile_direct_entry_seed_emittable()
         )
         no_budget_ab_stages_fragment = (
             no_ab3_budget_bound.config_spec._tcgen05_optional_fragments(
@@ -3325,7 +3336,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         ):
             fp16_bound = cute_matmul_mma.bind(fp16_args)
         self.assertTrue(
-            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_emittable()
         )
         self.assertIsNotNone(
             fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_config()
@@ -3336,7 +3347,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self,
     ) -> None:
         # The structural shape guard for the generalized FFI seed lives entirely
-        # in ``_tcgen05_full_tile_direct_entry_seed_eligible`` (the per-shape
+        # in ``_tcgen05_full_tile_direct_entry_seed_emittable`` (the per-shape
         # TargetN codegen gate and the runtime direct-entry validator were
         # removed). A shape whose N is not a multiple of the 256 CtaGroup.TWO
         # CTA tile is not a full-tile matmul, so the seed must be ineligible and
@@ -3365,7 +3376,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         ):
             invalid_bound = cute_matmul_mma.bind(invalid_args)
         spec = invalid_bound.config_spec
-        self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_emittable())
         self.assertIsNone(spec._tcgen05_full_tile_direct_entry_seed_config())
 
     @onlyBackends(["cute"])
@@ -3476,7 +3487,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         direct_seed = CuteTcgen05ClusterM2Heuristic.get_seed_config(
             bound.env, bound.host_function.device_ir
         ).config
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(direct_seed)
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            direct_seed, expected_l2_swizzle_size=None
+        )
         raw_seeded = [
             config.config
             for config in spec.compiler_seed_configs
@@ -3528,7 +3541,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             ],
         )
         self.assertEqual(raw_seed["pid_type"], "persistent_interleaved")
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(raw_seed)
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            raw_seed, expected_l2_swizzle_size=None
+        )
         self.assertEqual(
             raw_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
         )
@@ -3843,7 +3858,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(normalized_seed)
+        # ⚠ 1, NOT ``TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE`` (= 4). The deleted
+        # FFI/layout projection was the only writer that put the tuned 4 on the
+        # MONOLITHIC arm of this family, and the monolithic seed builder does not
+        # carry it, so ``normalize`` fills the key from its fragment default
+        # instead. (The scheduler / aux-TMA arms below are unaffected: their own
+        # seed builders set the swizzle.)
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            normalized_seed, expected_l2_swizzle_size=1
+        )
         self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
             normalized_scheduler_seed,
             expected_l2_swizzle_size=(
@@ -3971,7 +3994,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             population_seed["indexing"],
             ["tensor_descriptor"] * spec.indexing.length,
         )
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(population_seed)
+        # 1, not the tuned 4 -- same cause as ``normalized_seed`` above: the
+        # monolithic arm's swizzle came from the deleted projection.
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            population_seed, expected_l2_swizzle_size=1
+        )
         self.assertTrue(
             any(
                 config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
@@ -5188,7 +5215,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             config_dict["tcgen05_ab_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
         )
-        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(config_dict)
+        # ``tcgen05_l2_swizzle_size`` is no longer written onto a drawn candidate in
+        # this family: the deleted FFI/layout projection was its only writer on the
+        # monolithic arm, so the key stays absent.
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            config_dict, expected_l2_swizzle_size=None
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
@@ -5215,23 +5247,24 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound.config_spec.autotuner_heuristics,
         )
 
-        # fp16 4096³ is now FFI-eligible, so the leading compiler seed is the
-        # generalized TVM-FFI direct-entry cluster_m=2 seed (previously fp16 was
-        # bf16-only for the FFI seed, so the leading seed was the cluster_m=1
-        # universal default). The DEFAULT-layout cluster_m=2 seed is also
-        # emitted and remains distinct after normalization.
+        # The LEADING seed is ``default_config()``, and it is the cluster_m=1
+        # universal default again: the TVM-FFI direct-entry seed only reached the
+        # default because a partial FFI candidate was repaired ONTO the seed, which
+        # this commit stops doing. Both cluster_m=2 seeds (FFI direct-entry and
+        # DEFAULT-layout) still enter the population behind it, and remain distinct
+        # after normalization — which is what this test is actually for.
         config_gen = bound.config_spec.create_config_generation()
         zero_flat = config_gen.random_population_flat(0)
         self.assertEqual(len(zero_flat), 1)
         zero_config = config_gen.unflatten(zero_flat[0])
-        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 2)
+        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 1)
         one_flat = config_gen.random_population_flat(1)
         self.assertEqual(len(one_flat), 1)
         one_config = config_gen.unflatten(one_flat[0])
-        self.assertEqual(one_config.config["tcgen05_cluster_m"], 2)
+        self.assertEqual(one_config.config["tcgen05_cluster_m"], 1)
         one_config_population = config_gen.random_population(1)
         self.assertEqual(len(one_config_population), 1)
-        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 2)
+        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
         seeded_configs = config_gen.random_population(3)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             seeded_configs,
