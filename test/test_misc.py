@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import cast
 import unittest
 from unittest.mock import patch
@@ -204,28 +206,33 @@ class TestMisc(RefEagerTestBase, TestCase):
         def foo(x: torch.Tensor) -> torch.Tensor:
             return x
 
-        # Case 1: Register new lowering for the custom op
-        @register_inductor_lowering(
-            torch.ops.helion_test.foo, lowering_dict=inductor_lowering_dispatch
-        )
-        def foo_lowering(x):
-            return x
-
-        # Case 2: Register a patched lowering for add.Tensor
-        @register_inductor_lowering(
-            torch.ops.aten.add.Tensor, lowering_dict=inductor_lowering_dispatch
-        )
-        def add_lowering(*args, **kwargs):
-            pass
-
-        # Check that within `patch_inductor_lowerings()` context manager, the patched lowerings are used.
-        with patch_inductor_lowerings():
-            assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
-            assert torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
-            assert (
-                torch._inductor.lowering.lowerings[torch.ops.aten.add.Tensor]
-                != inductor_lowerings_orig[torch.ops.aten.add.Tensor]
+        with patch.dict(inductor_lowering_dispatch):
+            # Case 1: Register new lowering for the custom op
+            @register_inductor_lowering(
+                torch.ops.helion_test.foo, lowering_dict=inductor_lowering_dispatch
             )
+            def foo_lowering(x):
+                return x
+
+            # Case 2: Register a patched lowering for add.Tensor
+            @register_inductor_lowering(
+                torch.ops.aten.add.Tensor, lowering_dict=inductor_lowering_dispatch
+            )
+            def add_lowering(*args, **kwargs):
+                pass
+
+            # Check that the patched lowerings are installed only in the context.
+            with patch_inductor_lowerings():
+                assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
+                assert torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
+                assert (
+                    torch._inductor.lowering.lowerings[torch.ops.aten.add.Tensor]
+                    != inductor_lowerings_orig[torch.ops.aten.add.Tensor]
+                )
+                with pytest.raises(KeyError):
+                    torch._inductor.lowering.lowerings[torch.ops.helion_test.foo](
+                        object()
+                    )
 
         # Check that outside the context manager, the original lowerings are restored.
         assert len(torch._inductor.lowering.lowerings.keys()) == len(
@@ -233,6 +240,136 @@ class TestMisc(RefEagerTestBase, TestCase):
         )
         for op in torch._inductor.lowering.lowerings:
             assert torch._inductor.lowering.lowerings[op] == inductor_lowerings_orig[op]
+
+    @skipIfRefEager("Inductor lowering tests not applicable in ref eager mode")
+    def test_overlapping_inductor_lowering_patches_restore_once(self):
+        from helion._compiler.inductor_lowering_extra import patch_inductor_lowerings
+
+        lowerings = torch._inductor.lowering.lowerings
+        restored_op = torch.ops.aten.rsqrt.default
+        replaced_op = torch.ops.aten.sqrt.default
+        restored_original = lowerings[restored_op]
+        replaced_original = lowerings[replaced_op]
+
+        def replacement_lowering() -> None:
+            pass
+
+        entered = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+
+        def use_patch(index: int) -> None:
+            with patch_inductor_lowerings():
+                entered[index].set()
+                self.assertTrue(release[index].wait(5))
+                if index == 0:
+                    raise RuntimeError("test exceptional cleanup")
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(use_patch, index) for index in range(2)]
+                try:
+                    self.assertTrue(entered[0].wait(5))
+                    self.assertTrue(entered[1].wait(5))
+                    installed = lowerings[restored_op]
+                    self.assertIsNot(installed, restored_original)
+                    lowerings[replaced_op] = replacement_lowering
+
+                    release[0].set()
+                    with self.assertRaisesRegex(
+                        RuntimeError, "test exceptional cleanup"
+                    ):
+                        futures[0].result(timeout=5)
+                    self.assertIs(lowerings[restored_op], installed)
+                    self.assertIs(lowerings[replaced_op], replacement_lowering)
+
+                    release[1].set()
+                    futures[1].result(timeout=5)
+                finally:
+                    release[0].set()
+                    release[1].set()
+
+            self.assertIs(torch._inductor.lowering.lowerings, lowerings)
+            self.assertIs(lowerings[restored_op], restored_original)
+            self.assertIs(lowerings[replaced_op], replacement_lowering)
+        finally:
+            lowerings[restored_op] = restored_original
+            lowerings[replaced_op] = replaced_original
+
+    @skipIfRefEager("Inductor lowering tests not applicable in ref eager mode")
+    def test_inductor_lowering_override_is_helion_scoped(self):
+        from helion._compiler.compile_environment import CompileEnvironment
+        from helion._compiler.inductor_lowering_extra import (
+            _compile_environment_lowering,
+        )
+
+        previous_result = object()
+        patched_result = object()
+        scoped = _compile_environment_lowering(
+            "test_op",
+            lambda: patched_result,
+            lambda: previous_result,
+        )
+
+        self.assertIs(scoped(), previous_result)
+        with patch.object(CompileEnvironment, "has_current", return_value=True):
+            self.assertIs(scoped(), patched_result)
+
+    @skipIfRefEager("Inductor lowering tests not applicable in ref eager mode")
+    def test_fp32_fallback_is_scoped_to_helion_triton(self):
+        from helion._compiler import inductor_lowering_extra
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        class FakeTensorBox:
+            def __init__(self, dtype: torch.dtype) -> None:
+                self.dtype = dtype
+
+            def get_dtype(self) -> torch.dtype:
+                return self.dtype
+
+        value = FakeTensorBox(torch.bfloat16)
+        fp32_value = FakeTensorBox(torch.float32)
+        fp32_result = FakeTensorBox(torch.float32)
+        final_result = FakeTensorBox(torch.bfloat16)
+        bypass_result = object()
+        calls: list[FakeTensorBox] = []
+
+        def original(arg: object) -> object:
+            assert isinstance(arg, FakeTensorBox)
+            calls.append(arg)
+            return fp32_result if arg is fp32_value else bypass_result
+
+        with (
+            patch.object(inductor_lowering_extra, "TensorBox", FakeTensorBox),
+            patch.object(
+                inductor_lowering_extra,
+                "to_dtype",
+                side_effect=(fp32_value, final_result),
+            ) as to_dtype,
+        ):
+            fallback = (
+                inductor_lowering_extra.create_fp16_to_fp32_unary_fallback_lowering(
+                    original
+                )
+            )
+            self.assertIs(fallback(value), bypass_result)
+            with (
+                patch.object(CompileEnvironment, "has_current", return_value=True),
+                patch.object(CompileEnvironment, "current") as current,
+            ):
+                current.return_value.backend_name = "pallas"
+                self.assertIs(fallback(value), bypass_result)
+
+                current.return_value.backend_name = "triton"
+                self.assertIs(fallback(value), final_result)
+
+        self.assertEqual(calls, [value, value, fp32_value])
+        self.assertEqual(
+            to_dtype.call_args_list,
+            [
+                unittest.mock.call(value, torch.float32),
+                unittest.mock.call(fp32_result, torch.bfloat16),
+            ],
+        )
 
     @skipIfRefEager("Inductor config tests not applicable in ref eager mode")
     def test_patched_inductor_config(self):

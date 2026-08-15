@@ -26,6 +26,9 @@ import helion.exc as exc
 from helion.runtime.kernel import Kernel
 
 _SYM_SCALAR_TYPES = (torch.SymInt, torch.SymFloat)
+_HOST_SEMANTIC_FINGERPRINT = "_host_semantic_fingerprint"
+_HOST_SEMANTIC_INPUT_NORMALIZATION = "_host_semantic_input_normalization"
+_REQUIRES_ISOLATED_LOWERING = "_requires_isolated_lowering"
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
@@ -138,10 +141,20 @@ def infer_output_spec(
         n: v for n, v in zip(names, args, strict=True) if isinstance(v, torch.Tensor)
     }
 
-    bound = kernel.bind(args)
-    assert bound.host_function, "kernel.bind() succeeded but host_function is None"
+    # Dynamo capture must not publish fake-tensor-derived bounds into eager caches.
+    bound = kernel._bind_isolated(args)
+    assert bound.host_function, "kernel binding succeeded but host_function is None"
+    # Any user global can be rebound or mutated between capture and lowering.
+    # The host fingerprint is intentionally conservative rather than a complete
+    # serializer for arbitrary Python state, so such bounds lower in isolation.
+    requires_isolated_lowering = bool(bound.host_function.global_imports)
 
     flat_leaves, tree_spec, return_value = _get_flat_output(bound.host_function)
+    host_semantic_input_normalization = bound._get_host_semantic_input_normalization()
+    host_semantic_fingerprint = bound._get_host_semantic_fingerprint(
+        flat_leaves,
+        input_normalization=host_semantic_input_normalization,
+    )
 
     if tree_spec is None:
         return {
@@ -150,6 +163,9 @@ def infer_output_spec(
             "mutated_inputs": _detect_mutated_inputs(
                 bound.host_function.body, set(param_tensors.keys())
             ),
+            _HOST_SEMANTIC_FINGERPRINT: host_semantic_fingerprint,
+            _HOST_SEMANTIC_INPUT_NORMALIZATION: host_semantic_input_normalization,
+            _REQUIRES_ISOLATED_LOWERING: requires_isolated_lowering,
         }
 
     assert return_value is not None
@@ -187,7 +203,7 @@ def infer_output_spec(
             )
 
     # Remap helion-internal SymInts back to the caller's values.
-    # kernel.bind() creates FakeTensors in helion's own ShapeEnv, so output
+    # Kernel binding creates FakeTensors in Helion's own ShapeEnv, so output
     # SymInts aren't tracked by external tracers (make_fx, Dynamo). Build a
     # mapping from helion's input symbols to the caller's original values
     # (which may be tracer SymInts or concrete ints), then substitute.
@@ -268,6 +284,9 @@ def infer_output_spec(
         "tree_spec_str": pytree.treespec_dumps(tree_spec),
         "mutated_inputs": mutated,
         "direct_aliases": direct_aliases,
+        _HOST_SEMANTIC_FINGERPRINT: host_semantic_fingerprint,
+        _HOST_SEMANTIC_INPUT_NORMALIZATION: host_semantic_input_normalization,
+        _REQUIRES_ISOLATED_LOWERING: requires_isolated_lowering,
     }
 
 

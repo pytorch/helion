@@ -40,6 +40,7 @@ from helion.runtime import default_cute_launcher
 if TYPE_CHECKING:
     from collections.abc import Hashable
     from collections.abc import Sequence
+    from typing_extensions import Self
 
     from helion.autotuner.config_spec import ConfigSpec
 
@@ -9281,6 +9282,115 @@ class TestCuteBackend(TestCase):
 
         self.assertNotEqual(key0, key1)
         self.assertIsNot(identity.bind(args), bound)
+
+    def test_isolated_bound_does_not_publish_cute_specializations(self) -> None:
+        identity = _runtime_identity_kernel()
+        args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
+        bound = identity._bind_isolated(args)
+        kernel_mod = importlib.import_module("helion.runtime.kernel")
+
+        with (
+            patch.object(
+                kernel_mod,
+                "_cute_grouped_static_tail_extra_descriptors",
+                return_value=(("cute_grouped_static_tail", 1, 1, 128, None, None),),
+            ),
+            patch.object(
+                identity,
+                "_extend_bound_kernel_specializations",
+                side_effect=AssertionError("isolated bind published specialization"),
+            ),
+        ):
+            bound._register_cute_grouped_static_tail_specializations()
+
+        self.assertFalse(identity._cute_grouped_static_tail_extra_descriptors)
+
+    def test_concurrent_cute_specialization_registration_deduplicates(self) -> None:
+        identity = _runtime_identity_kernel()
+        args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
+        bound = identity.bind(args)
+        descriptor = ("cute_grouped_static_tail", 1, 1, 128, None, None)
+        extractor_entered = threading.Event()
+        release_extractor = threading.Event()
+
+        class TrackedRLock:
+            def __init__(self) -> None:
+                self._lock = threading.RLock()
+                self._state_lock = threading.Lock()
+                self._owner: int | None = None
+                self._depth = 0
+                self.contended = threading.Event()
+
+            def __enter__(self) -> Self:
+                thread_id = threading.get_ident()
+                with self._state_lock:
+                    if self._owner is not None and self._owner != thread_id:
+                        self.contended.set()
+                self._lock.acquire()
+                with self._state_lock:
+                    if self._owner == thread_id:
+                        self._depth += 1
+                    else:
+                        self._owner = thread_id
+                        self._depth = 1
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                with self._state_lock:
+                    self._depth -= 1
+                    if self._depth == 0:
+                        self._owner = None
+                self._lock.release()
+
+        tracked_lock = TrackedRLock()
+        extractor_calls = 0
+        extractor_calls_lock = threading.Lock()
+
+        def blocking_extractor(_args: object) -> Hashable:
+            nonlocal extractor_calls
+            with extractor_calls_lock:
+                extractor_calls += 1
+                first_call = extractor_calls == 1
+            if first_call:
+                extractor_entered.set()
+                self.assertTrue(release_extractor.wait(5))
+            return (1,)
+
+        kernel_mod = importlib.import_module("helion.runtime.kernel")
+        with (
+            patch.object(identity, "_bind_lock", tracked_lock),
+            patch.object(
+                kernel_mod,
+                "_cute_grouped_static_tail_extra_descriptors",
+                return_value=(descriptor,),
+            ),
+            patch.object(
+                kernel_mod,
+                "_make_cute_grouped_static_tail_extractor",
+                return_value=blocking_extractor,
+            ),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            first = pool.submit(
+                bound._register_cute_grouped_static_tail_specializations
+            )
+            self.assertTrue(extractor_entered.wait(5))
+            second = pool.submit(
+                bound._register_cute_grouped_static_tail_specializations
+            )
+            try:
+                self.assertTrue(tracked_lock.contended.wait(5))
+            finally:
+                release_extractor.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+        signature = bound._base_spec_key
+        self.assertEqual(len(identity._specialize_extra[signature]), 1)
+        self.assertEqual(
+            identity._cute_grouped_static_tail_extra_descriptors[signature],
+            {descriptor},
+        )
 
     def test_kernel_growing_late_specialization_evicts_all_stale_keys(self) -> None:
         identity = _runtime_identity_kernel()
