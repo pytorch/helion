@@ -742,6 +742,26 @@ def pallas_refilled_dynamic_matmul(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_fixed_dynamic_window(
+    x: torch.Tensor,
+    starts: torch.Tensor,
+    EXTENT: hl.constexpr,
+) -> torch.Tensor:
+    """Sum a fixed-size window whose starting row is selected at runtime."""
+    A = hl.specialize(x.size(1))
+    B = hl.specialize(x.size(2))
+    out = torch.empty([1, A, B], dtype=torch.float32, device=x.device)
+    for owner in hl.grid(1):
+        start = starts[owner]
+        end = start + EXTENT
+        acc = hl.zeros([A, B], dtype=torch.float32)
+        for tile in hl.tile(start, end):
+            acc = acc + x[tile, :, :].to(torch.float32).sum(dim=0)
+        out[owner, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
     out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
@@ -983,6 +1003,20 @@ class TestPallas(TestCase):
             ]
         ).to(torch.bfloat16)
         torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_dynamic_begin_fixed_extent(self) -> None:
+        x = torch.randn(256, 8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([3], device=DEVICE, dtype=torch.int32)
+        for extent in (128, 127):
+            with self.subTest(extent=extent):
+                _, result = code_and_output(
+                    pallas_fixed_dynamic_window,
+                    (x, starts, extent),
+                    block_sizes=[16],
+                    pallas_loop_type="fori_loop",
+                )
+                expected = x[3 : 3 + extent].sum(dim=0, keepdim=True)
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
     def test_computed_static_slice(self) -> None:
         x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
