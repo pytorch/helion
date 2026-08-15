@@ -3583,6 +3583,51 @@ class TestPallas(TestCase):
         self.assertGreaterEqual(sum(i < compute for i in waits), 2)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_static_unroll_tensor_load_buffering(self) -> None:
+        """Static unroll retains the selected depth-two DMA pipeline."""
+        args = (
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+        )
+        _, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+            pallas_load_buffer_count=[2, 1],
+        )
+
+        torch.testing.assert_close(result.cpu(), (args[0] + args[1]).cpu())
+
+    def test_static_unroll_uses_python_if_for_tile_predicate(self) -> None:
+        """A static tile predicate does not leave a side-effectful lax.cond."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def alternating_add(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    if tile_n.begin == 0:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+                    else:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + 2
+            return out
+
+        x = torch.randn(16, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            alternating_add,
+            (x,),
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+            pallas_load_buffer_count=[2],
+        )
+
+        expected = x.clone()
+        expected[:, :128] += 1
+        expected[:, 128:] += 2
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
     def test_fori_loop_repeated_loads_share_buffer(self) -> None:
         """Repeated loads of one input reuse its tensor-keyed DMA route."""
 
