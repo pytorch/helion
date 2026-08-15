@@ -1193,6 +1193,69 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(new_config["indexing"], "tensor_descriptor")
         self.assertEqual(mutated[indexing_index], "pointer")
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    def test_config_generation_overrides_pinned_in_the_drawn_vector(self):
+        """A frozen key must not be NOISE in the surrogate's training data.
+
+        ``autotune_config_overrides`` freezes a key: it is stamped into every decoded
+        config and the mutation operators skip its slot. But the random samplers used to
+        draw into that slot freely, and the LFBO / DE surrogates build ``train_x`` from
+        the VECTOR, not the config (``encode_config(member.flat_values)``). So a frozen
+        key contributed a VARYING one-hot block while every benchmarked kernel ran with
+        the SAME value -- a column of pure label noise a tree surrogate can split on.
+
+        Measured before the fix (this kernel, 200 members): **8** distinct encoded
+        patterns for the frozen slot against ``indexing='tensor_descriptor'`` in
+        200/200 configs. The two training entry points also disagreed, because
+        ``seed_training_data`` re-encodes from the Config
+        (``flatten(result.config)``) and so carried the override value.
+
+        Both random-draw entry points must pin, and the pin must go through the slot's
+        own fragment: ``indexing`` is a ``ListOf`` occupying ONE slot and holding a
+        LIST, while its override is the SCALAR ``'tensor_descriptor'`` meaning "every
+        element". A naive scalar stamp puts a bare ``str`` in that slot, and
+        ``ListOf.encode`` asserts ``isinstance(value, list)`` -- i.e. it breaks the
+        exact consumer this pin exists to serve.
+        """
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        gen = ConfigGeneration(spec, overrides={"indexing": "tensor_descriptor"})
+        (slot,) = sorted(gen.overridden_flat_indices)
+        expected = ["tensor_descriptor"] * gen.flat_spec[slot].length
+
+        # BOTH random entry points pin the slot, and the value is BROADCAST to the
+        # ListOf's length rather than stamped as a scalar.
+        for draw in (gen.random_flat, gen.biased_random_flat):
+            for _ in range(20):
+                flat = draw()
+                self.assertEqual(
+                    flat[slot],
+                    expected,
+                    msg=f"{draw.__name__} left a non-override value in a frozen slot",
+                )
+                # the surrogate's own encoder must accept it
+                gen.encode_config(flat)
+
+        # ...so the surrogate sees a CONSTANT feature column for the frozen key.
+        encoded = [tuple(gen.encode_config(gen.random_flat())) for _ in range(20)]
+        start = sum(gen.flat_spec[i].dim() for i in range(slot))
+        width = gen.flat_spec[slot].dim()
+        self.assertEqual(
+            len({row[start : start + width] for row in encoded}),
+            1,
+            msg="frozen key still varies in train_x; the surrogate sees label noise",
+        )
+
+        # And the pin must not disturb the round-trip invariant the sibling test pins:
+        # a slot the CALLER writes keeps the caller's value.
+        mutated = gen.random_flat()
+        mutated[slot] = ["pointer"] * gen.flat_spec[slot].length
+        self.assertEqual(gen.unflatten(mutated)["indexing"], "tensor_descriptor")
+        self.assertEqual(mutated[slot], ["pointer"] * gen.flat_spec[slot].length)
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_save_load_config(self):
         config = helion.Config(

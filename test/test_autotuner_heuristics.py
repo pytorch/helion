@@ -1808,11 +1808,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             if config.config["tcgen05_cluster_m"] == 2
         ]
         # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds, and
-        # the two no longer share a K rung: the widened ``bk`` draw bound lets the
-        # DEFAULT-layout seed sit at 256 while the FFI direct-entry seed stays at
-        # its validated 128. Callers decide which K rungs are expected; every
-        # cluster_m=2 seed must still match the common 256x256 tile envelope at one
-        # of them.
+        # the formula matmul heuristic contributes its own bk. Callers decide which
+        # K rungs are expected; every cluster_m=2 seed must still match the common
+        # 256x256 tile envelope at one of them.
         self.assertGreaterEqual(len(seeded), 1)
         for seed in seeded:
             self.assertIn(
@@ -3272,11 +3270,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for_search=True
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
-        # Cycle 97: the for_search ab cap is BUDGET-AWARE — lifted to the 16-bit
-        # dtype hard cap of 8 wherever a deep AB ring is admissible (the SMEM-budget
-        # constraints were recorded at bind time, i.e. bf16/fp16 on a B200-class
-        # optin cap), else 2. Conditioning on the recorded constraints keeps the
-        # assertion deterministic across hosts.
+        # The for_search ab cap is now the DTYPE HARD CAP (8 for 16-bit) wherever the
+        # SMEM-budget constraints were recorded at bind time, else 2 — the per-tile
+        # budget walk, not the cap, trims a drawn depth that does not fit.
+        # Conditioning on the recorded constraints keeps this deterministic per host.
         expected_search_ab_high = (
             8
             if bound.config_spec._cute_tcgen05_config.ab_stages_search_constraints
@@ -3731,11 +3728,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
-        # The measured CLC aux-TMA perf ROW is carried by the wide-N SEED (asserted
-        # above) and is no longer re-imposed on a drawn candidate, so the mutated l2
-        # grouping / acc depth / range knobs stay as they were set. Only
-        # ``scheduler_warps`` is still DERIVED, because it is strategy-determined (a
-        # biconditional, not a tuned value).
+        # COMPLETE-OR-DECLINE: the measured CLC aux-TMA perf ROW is carried by the
+        # wide-N SEED (asserted above) and is no longer re-imposed on a drawn
+        # candidate, so the mutated l2 grouping / acc depth / range knobs stay as
+        # they were set. Only ``scheduler_warps`` is still DERIVED, because it is
+        # strategy-determined (a biconditional, not a tuned value).
         self.assertEqual(
             projected_wide_clc_aux_tma_config["l2_groupings"],
             [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
@@ -3885,8 +3882,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         # The K-range knob triple has NO flat slot on the tcgen05 path, so it cannot
         # survive the flatten/unflatten round trip now that normalize no longer
-        # re-imposes the CLC aux-TMA perf row. The RAW seed asserted above still
-        # carries it; the normalized seed reads neutral.
+        # re-imposes the CLC aux-TMA perf row (complete-or-decline). The RAW seed
+        # asserted above still carries it; the normalized seed reads neutral.
         self.assertEqual(
             normalized_wide_clc_aux_tma_seed["range_flattens"],
             [None] * len(expected_clc_aux_tma_range_flattens),
@@ -3956,9 +3953,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
             )
 
-        # 9 = the 7 seeds (the cluster_m=1 universal default + 7 cluster_m=2 rows,
-        # one of which dedups against the default) plus random draws; sized so the
-        # population is not truncated before the narrow-N row asserted just below.
+        # 9 = the 8 seeds (2 cluster_m=1 defaults + 7 cluster_m=2 rows, one of which
+        # dedups against a default) plus a random draw; sized so the population is
+        # not truncated before the narrow-N row asserted just below.
         configs = config_gen.random_population(9)
         self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
         cluster_m2_population = [
@@ -3966,9 +3963,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
         ]
-        # >=, not ==: every cluster_m=2 SEED row must be present, and the random
-        # draws padding the population out to 9 may legitimately add more.
-        self.assertGreaterEqual(len(cluster_m2_population), 7)
+        self.assertEqual(len(cluster_m2_population), 7)
         self.assertTrue(
             any(
                 config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
@@ -4129,12 +4124,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
             ],
         )
-        # The measured CLC aux-TMA perf ROW (l2_grouping=8 plus the K-range
-        # flatten/multi-buffer/warp-specialize triple) is no longer projected onto a
-        # drawn candidate -- ``_fix_cluster_m2_search_config`` completes a request
-        # rather than enumerating the tuples it recognizes -- so this candidate keeps
-        # its own (default) l2 grouping and neutral range knobs. The row still enters
-        # the population as the wide-N/narrow-N SEEDS asserted in the edge/K-tail test.
+        # COMPLETE-OR-DECLINE: the measured CLC aux-TMA perf ROW (l2_grouping=8 plus
+        # the K-range flatten/multi-buffer/warp-specialize triple) is no longer
+        # projected onto a drawn candidate — it now enters the population only as the
+        # wide-N/narrow-N SEEDS asserted in the edge/K-tail test. So this candidate
+        # keeps its own (default) l2 grouping and neutral range knobs.
         self.assertEqual(minimal_preprojection_clc_aux_tma_config["l2_groupings"], [1])
         neutral_range_knobs = [None] * len(expected_clc_aux_tma_range_flattens)
         self.assertNotEqual(neutral_range_knobs, expected_clc_aux_tma_range_flattens)
@@ -5264,10 +5258,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             config_dict["tcgen05_ab_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
         )
-        # The edge/K-tail perf regime is no longer IMPOSED on a drawn candidate (the
-        # stage completes a cluster_m=2 request rather than enumerating the tuples it
-        # recognizes), so this config keeps the pipeline knobs and the L2 grouping it
-        # drew, and gains no placement keys.
+        # The edge/K-tail perf regime is no longer IMPOSED on a drawn candidate (it
+        # is a seed now), so this config keeps the pipeline knobs it drew and gains
+        # no placement keys.
         self.assertEqual(
             config_dict["tcgen05_acc_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
@@ -5307,10 +5300,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound.config_spec.autotuner_heuristics,
         )
 
-        # fp16 4096³ is a full-wave compute shape, so the leading compiler seed is
-        # the promote-to-default formula heuristic's cluster_m=2 compute tile. The
-        # generalized TVM-FFI direct-entry seed and the DEFAULT-layout cluster_m=2
-        # seed are also emitted and remain distinct after normalization.
+        # fp16 4096³ is now FFI-eligible, so the leading compiler seed is the
+        # generalized TVM-FFI direct-entry cluster_m=2 seed (previously fp16 was
+        # bf16-only for the FFI seed, so the leading seed was the cluster_m=1
+        # universal default). The DEFAULT-layout cluster_m=2 seed is also
+        # emitted and remains distinct after normalization.
         config_gen = bound.config_spec.create_config_generation()
         zero_flat = config_gen.random_population_flat(0)
         self.assertEqual(len(zero_flat), 1)
@@ -5326,6 +5320,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         seeded_configs = config_gen.random_population(3)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             seeded_configs,
+            # The formula matmul heuristic seeds bk=64 alongside the FFI/DEFAULT
+            # bk=128 seeds, so the population spans both validated K rungs.
             expected_block_ks=(64, 128),
             expected_indexing_length=3,
         )
