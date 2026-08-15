@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
+    from ..aten_lowering import Lowering
     from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
@@ -1480,6 +1481,13 @@ class PallasBackend(Backend):
         except NoCurrentFunction:
             return self.default_launcher_name
         return self.build_launcher_name(device_fn.config)
+
+    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .aten_lowering import cat_lowering_pallas
+
+        if node.target is torch.ops.aten.cat.default:
+            return cat_lowering_pallas
+        return None
 
     def pre_codegen(
         self,
