@@ -145,6 +145,7 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
@@ -202,6 +203,7 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
 )
@@ -257,7 +259,8 @@ from helion.runtime import _append_cute_wrapper_plan
 # (ab=6, c=4) A/B pipeline. The per-target constants were removed when the
 # direct-entry admission became structural; these tests still drive the
 # bk=64 (6, 4) stage tuple, which remains in
-# ``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``.
+# the direct-entry path, whose admission is now ``TCGEN05_DIRECT_ENTRY_LEGAL_BK``
+# plus the per-tile SMEM budget rather than an enumerated ``(ab, c)`` table.
 TCGEN05_TARGET1_TVM_FFI_AB_STAGES = 6
 TCGEN05_TARGET1_TVM_FFI_C_STAGES = 4
 
@@ -18023,7 +18026,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             instead of a deep ``ptxas: uses too much shared
             data`` raise; and
           - the autotune search-time fixup
-            (``_fix_tcgen05_with_scheduler_search_config``)
+            (``_fix_tcgen05_ab_stages_search_config``)
             can demote affected ``ab=3`` candidates rather
             than aborting tuning at ptxas.
 
@@ -18806,19 +18809,20 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             config_dict["tcgen05_ab_stages"],
             TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
         )
-        # ⚠ THE FOUR PROJECTED-VALUE ASSERTIONS BECAME SURVIVAL ASSERTIONS. They
-        # required the 6-key blanket
-        # ``config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())`` to have
-        # rewritten this DRAWN config onto the measured WIDE-N edge row:
-        # ``acc_stages`` 2 -> 1, ``l2_groupings``, ``l2_swizzle_size``, and the two
-        # ``*_placement`` keys added from scratch. The drawn ``block_n=128`` now
-        # settles as its OWN valid cluster_m=2 tile instead of snapping to 256, so
-        # this candidate is no longer in the wide-N row's scope and keeps what it
-        # drew. The measured row is still in the population, as a seed.
+        # ⚠ THE FOUR PROJECTED-VALUE ASSERTIONS BECAME SURVIVAL ASSERTIONS (2026-08-07).
+        # They required the 6-key blanket
+        # ``config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())`` to have rewritten
+        # this DRAWN config onto the measured edge row: ``acc_stages`` 2 -> 1, ``c_stages``,
+        # and the two ``*_placement`` keys added from scratch. That dict was deleted from the
+        # fix-up path -- every constant behind it is a throughput claim, so it was steering,
+        # and it was the last writer clobbering this family's own seeds.
+        #
+        # So the DRAWN values must now survive, and absent keys must stay absent. The seed
+        # builders still call the dict, so the measured row is in the population as a seed.
         self.assertEqual(
             config_dict["tcgen05_acc_stages"],
             2,
-            msg="the drawn acc_stages was re-projected onto the wide-N edge row",
+            msg="the drawn acc_stages was re-projected; that perf write was deleted",
         )
         self.assertEqual(
             config_dict["tcgen05_c_stages"],
@@ -18826,20 +18830,27 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertNotIn(TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY, config_dict)
         self.assertNotIn(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY, config_dict)
-        # The drawn swizzle (8) and grouping ([4]) survive for the same reason.
+        # SURVIVES AS DRAWN (2026-08-05) -- see the note in
+        # ``test_aux_edge_autotune_fixup_uses_validated_edge_paths``. The two
+        # projecting writers were removed together; the tuned values live in the
+        # seed builders. The drawn value here is 8.
         self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 8)
+        # ⚠ ``l2_groupings`` SURVIVES AS DRAWN TOO (2026-08-07). Same cause as the swizzle
+        # note above, one writer later: the 6-key blanket override dict used to force
+        # ``[TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING]`` (= [2]) here, and it was deleted from
+        # the fix-up path as steering. The drawn value is [4].
         self.assertEqual(
             config_dict["l2_groupings"],
             [4],
-            msg="the drawn l2_groupings was re-projected onto the wide-N edge row",
+            msg="the drawn l2_groupings was re-projected; that perf write was deleted",
         )
         self.assertEqual(
             config_dict["indexing"],
             ["tensor_descriptor"] * spec.indexing.length,
         )
-        # A sampled block_n=128 survives as its own valid cm2 tile for the
-        # edge-K-tail family (block_m still pinned to 256), instead of snapping to
-        # the canonical block_n=256.
+        # Stage 2b: a sampled block_n=128 now survives as its own valid cm2 tile
+        # for the edge-K-tail family (block_m still pinned to 256), instead of
+        # snapping to the canonical block_n=256.
         self.assertEqual(
             config_dict["block_sizes"],
             [
@@ -18850,6 +18861,99 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
         self.assertNotIn("epilogue_subtile", config_dict)
+
+    def test_aux_tma_demotes_cluster_n2_to_simt_on_every_family(self) -> None:
+        """LEDGER C018: ``cluster_n=2 + aux_load_mode=tma`` must never reach codegen.
+
+        Mechanism: the CLC scheduler warp publishes work through a DSMEM mailbox
+        and iterates lanes ``< cluster_m`` only, so at ``cluster_n > 1`` the extra
+        N-direction CTAs never receive the publish and block forever on
+        ``producer_acquire``. Observed: silently WRONG output plus a ~7.5 minute
+        GPU hang. This test asserts the demotion, never the combination -- it
+        deliberately does NOT compile or execute anything.
+
+        Why it exists: the guard used to be one of ~11 clauses inside
+        ``_fix_aux_tma_search_config``'s arm-4 tile-shape envelope, which probe P2
+        classified as coverage, so a cleanup of the coverage clauses could have
+        deleted the hang guard by accident. It is now a single explicit clause.
+
+        BOTH families are covered on purpose. The old envelope was NOT a complete
+        guard: only its full-tile helper had a ``cluster_n`` clause, while
+        ``_is_validated_cluster_m2_edge_search_candidate`` has none -- so on the
+        edge/K-tail family a ``cluster_n=2 + tma`` config SURVIVED normalize
+        (measured 2026-08-01). The edge arm below is therefore a regression guard
+        for a hazard that was live, not a restatement of prior behaviour.
+        """
+        from helion._compiler.cute.strategies import Tcgen05Strategy
+
+        kernel = self._residual_kernel()
+        for label, dim, tile_n in (
+            ("edge_k_tail", 5000, TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N),
+            ("full_tile", 6144, TCGEN05_TWO_CTA_BLOCK_N),
+        ):
+            with self.subTest(family=label):
+                kernel._bound_kernels.clear()
+                args = tuple(
+                    torch.empty([dim, dim], device=DEVICE, dtype=torch.bfloat16)
+                    for _ in range(3)
+                )
+                with patch_cute_mma_support():
+                    bound = kernel.bind(args)
+                spec = bound.env.config_spec
+                constraints = spec._tcgen05_cluster_m2_search_constraints
+                assert constraints is not None
+                self.assertEqual(
+                    constraints.allow_edge_k_tail_family, label == "edge_k_tail"
+                )
+
+                def _cfg(
+                    cluster_n: int,
+                    *,
+                    tile_n: int = tile_n,
+                    indexing_length: int = spec.indexing.length,
+                ) -> dict[str, object]:
+                    return {
+                        "block_sizes": [256, tile_n, 128],
+                        "indexing": ["tensor_descriptor"] * indexing_length,
+                        "l2_groupings": [1],
+                        "pid_type": "persistent_interleaved",
+                        "tcgen05_cluster_m": 2,
+                        "tcgen05_cluster_n": cluster_n,
+                        "tcgen05_ab_stages": 2,
+                        "tcgen05_acc_stages": 2,
+                        "tcgen05_c_stages": 2,
+                        "tcgen05_strategy": (
+                            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                        ),
+                        "tcgen05_warp_spec_scheduler_warps": 1,
+                        "tcgen05_warp_spec_c_input_warps": 1,
+                        TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+                    }
+
+                # cluster_n=1 KEEPS tma -- proves the arm below is not demoting
+                # everything, i.e. the cluster_n=2 assertion is not vacuous.
+                keeps = _cfg(1)
+                spec.normalize(keeps, _fix_invalid=True)
+                self.assertEqual(
+                    keeps[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+                    TCGEN05_AUX_LOAD_MODE_TMA,
+                    msg=(
+                        "cluster_n=1 aux-TMA candidate was demoted, so the "
+                        "cluster_n=2 assertion below proves nothing"
+                    ),
+                )
+
+                demoted = _cfg(2)
+                spec.normalize(demoted, _fix_invalid=True)
+                self.assertEqual(
+                    demoted[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+                    TCGEN05_AUX_LOAD_MODE_SIMT,
+                    msg=(
+                        f"[{label}] cluster_n=2 kept aux_load_mode=tma. This is "
+                        f"ledger C018: silently wrong output plus a ~7.5 min GPU "
+                        f"hang. Full config: {demoted}"
+                    ),
+                )
 
     def test_aux_autotune_surface_widens_for_hldot_residual_kernel(self) -> None:
         """Detector recognizes ``hl.dot`` MMA anchors in
