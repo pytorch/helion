@@ -4485,6 +4485,56 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             ):
                 state.codegen.add_statement(statement)
 
+    for drain in fori_state._remote_recv_drains.values():
+        if not drain.waits_deferred:
+            continue
+        assert drain.starts_per_iteration > 0 or drain.dynamic_start_counter is not None
+        recv_copy = state.device_function.new_var("_recv_drain", dce=False)
+        recv_index = state.device_function.new_var("_recv_index", dce=False)
+        loop_iterations = " * ".join(f"({part})" for part in grid_parts)
+        static_receive_count = (
+            "0"
+            if drain.starts_per_iteration == 0
+            else loop_iterations
+            if drain.starts_per_iteration == 1
+            else f"{drain.starts_per_iteration} * ({loop_iterations})"
+        )
+        receive_count = static_receive_count
+        if drain.dynamic_start_counter is not None:
+            dynamic_receive_count = f"{drain.dynamic_start_counter}[0]"
+            receive_count = (
+                dynamic_receive_count
+                if static_receive_count == "0"
+                else f"({static_receive_count}) + {dynamic_receive_count}"
+            )
+        fori_state.outer_suffix.append(
+            statement_from_string(
+                f"{recv_copy} = pltpu.make_async_copy({{reference}}, "
+                f"{{reference}}, {drain.semaphore})",
+                reference=drain.reference,
+            )
+        )
+        if drain.dynamic_start_counter is None:
+            fori_state.outer_suffix.append(
+                statement_from_string(
+                    f"for {recv_index} in range({receive_count}):\n"
+                    f"    {recv_copy}.wait()"
+                )
+            )
+        else:
+            recv_wait_body = state.device_function.new_var("_recv_wait_body", dce=False)
+            fori_state.outer_suffix.extend(
+                (
+                    statement_from_string(
+                        f"def {recv_wait_body}({recv_index}, _):\n"
+                        f"    {recv_copy}.wait()"
+                    ),
+                    statement_from_string(
+                        f"jax.lax.fori_loop(0, {receive_count}, {recv_wait_body}, None)"
+                    ),
+                )
+            )
+
     # Compact-worklist outer tile: it IS the grid (exactly one static compact
     # body per work item), so emit the body
     # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
@@ -4498,6 +4548,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         state.add_statement(statement_from_string(f"{loop_vars[0]} = 0"))
         for stmt in body_stmts or [ast.Pass()]:
             state.add_statement(stmt)
+        for statement in fori_state.outer_suffix:
+            state.add_statement(statement)
         return None
 
     if not static_unroll:
@@ -4525,6 +4577,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 current_body = [loop]
         for statement in current_body:
             state.add_statement(statement)
+        for statement in fori_state.outer_suffix:
+            state.add_statement(statement)
         if has_loop_state:
             return _read_final_loop_state(state, result_vars)
         return None
@@ -4547,6 +4601,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         else:
             # Inner: wrap in the next outer function's body
             current_body = [fn_def, *call_prefix, fori_call]
+
+    for statement in fori_state.outer_suffix:
+        state.add_statement(statement)
 
     # After fori_loop: read final loop-carried state from scratch
     if has_loop_state:
