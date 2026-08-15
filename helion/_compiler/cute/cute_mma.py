@@ -7913,7 +7913,7 @@ def _emit_mma_pipeline(
         #   - the autotune search-time fixup can demote
         #     ``tcgen05_ab_stages=3`` candidates that would
         #     otherwise trigger this raise mid-tuning (see
-        #     ``_fix_tcgen05_ab_stages_three_search_config``).
+        #     ``_fix_tcgen05_with_scheduler_search_config``).
         # The predicate mirrors the productive-body aux-pipeline
         # allocation gate at ``_emit_mma_pipeline`` below
         # (``has_aux_producer_warp AND aux_tensor_descriptors AND
