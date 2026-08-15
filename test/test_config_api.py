@@ -232,6 +232,12 @@ class TestPallasLoadBufferCountConfig(TestCase):
         spec.normalize(config)
         self.assertEqual(config.pallas_load_buffer_count, [2, 1])
 
+        unroll_config = helion.Config(
+            pallas_loop_type="unroll", pallas_load_buffer_count=[2, 1]
+        )
+        spec.normalize(unroll_config)
+        self.assertEqual(unroll_config.pallas_load_buffer_count, [2, 1])
+
     def test_inactive_field_is_ignored(self) -> None:
         cases = (
             (self._config_spec(2), "emit_pipeline", [2], True),
