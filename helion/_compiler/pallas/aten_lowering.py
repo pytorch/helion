@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 
 cat_lowering_pallas = AtenLowering(target=torch.ops.aten.cat.default)
+static_index_lowering_pallas = AtenLowering(target=torch.ops.aten.index.Tensor)
 
 
 @cat_lowering_pallas.register_codegen("pallas")
@@ -77,6 +78,46 @@ def codegen_cat_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return expr_from_string(
         f"jnp.concatenate(({values}), axis={dim})",
         **placeholders,
+    )
+
+
+def can_lower_static_index_pallas(node: Node) -> bool:
+    """Whether an ``aten.index`` is compile-time basic indexing in disguise."""
+    from .view_ops import _static_index
+
+    indices = node.args[1]
+    return isinstance(indices, (list, tuple)) and all(
+        index is None or _static_index(index) is not None for index in indices
+    )
+
+
+@static_index_lowering_pallas.register_codegen("pallas")
+def codegen_static_index_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
+    """Render static advanced indices as ordinary JAX basic indexing."""
+    from .view_ops import _static_index
+    from .view_ops import _StaticIndexRange
+
+    tensor = _env_arg(ctx, cast("Node", node.args[0]))
+    assert isinstance(tensor, ast.AST)
+    indices = node.args[1]
+    assert isinstance(indices, (list, tuple))
+    rendered: list[str] = []
+    for index in indices:
+        # In aten.index, None means that this source dimension is not indexed.
+        if index is None:
+            rendered.append(":")
+            continue
+        static_index = _static_index(index)
+        assert static_index is not None
+        if isinstance(static_index, _StaticIndexRange):
+            rendered.append(
+                f"{static_index.start}:{static_index.start + static_index.length}"
+            )
+        else:
+            rendered.append(repr(static_index))
+    return expr_from_string(
+        f"{{tensor}}[{', '.join(rendered)}]",
+        tensor=tensor,
     )
 
 
