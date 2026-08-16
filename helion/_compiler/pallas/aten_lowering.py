@@ -268,6 +268,10 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
 
     assert isinstance(lhs_node_arg, Node)
     assert isinstance(rhs_node_arg, Node)
+    from .view_ops import maybe_materialize_resident_value
+
+    lhs = maybe_materialize_resident_value(lhs_node_arg, lhs)
+    rhs = maybe_materialize_resident_value(rhs_node_arg, rhs)
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
     lhs_ndim = lhs_node_arg.meta["val"].ndim
