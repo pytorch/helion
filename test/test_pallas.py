@@ -2086,6 +2086,53 @@ class TestPallas(TestCase):
         _, actual = code_and_output(select_panel, (x,), pallas_loop_type="fori_loop")
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
+    def test_aligned_hbm_window_reused_by_matmul_and_static_slice(self) -> None:
+        """One staged HBM window remains a Ref across multiple matmuls."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def project_window(
+            lhs: torch.Tensor,
+            weight: torch.Tensor,
+            panel: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            rows = hl.specialize(lhs.size(0))
+            full = torch.empty([rows, 256], dtype=lhs.dtype, device=lhs.device)
+            half = torch.empty([rows, 128], dtype=lhs.dtype, device=lhs.device)
+            for tile_m in hl.tile(rows):
+                scaled = lhs[tile_m, :] + 1
+                begin = panel[0] * 128
+                local_weight = weight[:, begin + hl.arange(256)]
+                full[tile_m, :] = torch.matmul(scaled, local_weight)
+                half[tile_m, :] = torch.matmul(
+                    scaled,
+                    local_weight[:, 0:128],
+                )
+            return full, half
+
+        lhs = torch.randn(8, 128, device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn(128, 512, device=DEVICE, dtype=torch.bfloat16)
+        panel = torch.tensor([1], device=DEVICE, dtype=torch.int32)
+        _, (full, half) = code_and_output(
+            project_window,
+            (lhs, weight, panel),
+            block_size=8,
+        )
+
+        scaled = lhs.float() + 1
+        selected = weight[:, 128:384].float()
+        torch.testing.assert_close(
+            full,
+            torch.matmul(scaled, selected).bfloat16(),
+            rtol=2e-2,
+            atol=0.25,
+        )
+        torch.testing.assert_close(
+            half,
+            torch.matmul(scaled, selected[:, :128]).bfloat16(),
+            rtol=2e-2,
+            atol=0.25,
+        )
+
     def test_resident_subview_composed_views(self) -> None:
         """Subview and reshape transforms compose without materializing."""
 
