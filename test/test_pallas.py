@@ -2666,6 +2666,30 @@ class TestPallas(TestCase):
         expected[2] = values
         torch.testing.assert_close(result, expected)
 
+    def test_computed_scalar_tensor_index_store(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def computed_scalar_tensor_index_store(
+            values: torch.Tensor, output_row: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = values.size()
+            out = torch.zeros([4, m, n], dtype=values.dtype, device=values.device)
+            row = (output_row[0] + 1) % 4
+            for tile_m, tile_n in hl.tile(values.size()):
+                out[row, tile_m, tile_n] = values[tile_m, tile_n]
+            return out
+
+        values = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        output_row = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            computed_scalar_tensor_index_store,
+            (values, output_row),
+            block_sizes=[8, 128],
+        )
+
+        expected = torch.zeros(4, 8, 128, device=DEVICE)
+        expected[3] = values
+        torch.testing.assert_close(result, expected)
+
     def test_tensor_index_atomic_add_raises(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def atomic_add_tensor_index(
