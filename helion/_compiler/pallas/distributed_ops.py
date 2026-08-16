@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import ForiLoopState
     from ..tile_strategy import RemoteRecvDrain
+    from ..tile_strategy import RemoteSendDrain
 
 
 _PALLAS_SRC_MATERIALIZATION_META = "_helion_pallas_remote_copy_src_materialization"
@@ -56,6 +57,8 @@ class _PallasRemoteCopyInfo:
     op_name: str
     source_materialization: tuple[ast.AST, ast.AST] | None
     deferred_recv: RemoteRecvDrain | None = None
+    deferred_send: RemoteSendDrain | None = None
+    started: bool = False
 
 
 @_decorators.codegen(remote_barrier, "pallas")
@@ -193,6 +196,19 @@ def _canonical_recv_ref(dst_ref: ast.AST, indexed_dims: int) -> ast.AST | None:
         placeholders[key] = part
         rendered.append(f"{{{key}}}")
     return expr_from_string(f"{{base}}[{', '.join(rendered)}]", **placeholders)
+
+
+def _static_send_slot_refs(
+    src_ref: ast.AST,
+    send_slot_shape: tuple[int, ...],
+) -> tuple[ast.AST, ...] | None:
+    """Enumerate the refs in a one-dimensional computed-source send ring."""
+    if len(send_slot_shape) != 1 or not isinstance(src_ref, ast.Subscript):
+        return None
+    return tuple(
+        expr_from_string(f"{{base}}[{slot}]", base=src_ref.value)
+        for slot in range(send_slot_shape[0])
+    )
 
 
 def _active_fori_loop(state: CodegenState) -> ForiLoopState | None:
@@ -472,6 +488,22 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
     materialization = state.fx_node.meta.get(_PALLAS_SRC_MATERIALIZATION_META)
     if materialization is not None:
         assert isinstance(materialization, tuple)
+    deferred_send: RemoteSendDrain | None = None
+    if fori_loop is not None and computed_source and send_slot_shape:
+        send_slot_refs = _static_send_slot_refs(src_ref, send_slot_shape)
+        if send_slot_refs is not None and len(ast_src_index) == 1:
+            slot = ast_src_index[0]
+            if isinstance(slot, int):
+                slot = expr_from_string(repr(slot))
+            assert isinstance(slot, ast.AST)
+            from ..tile_strategy import RemoteSendDrain
+
+            deferred_send = RemoteSendDrain(
+                semaphore=send_sem_name,
+                references=send_slot_refs,
+                slot=slot,
+            )
+            fori_loop._remote_send_drains.append(deferred_send)
     op_name = device_fn.new_var("remote_copy", dce=False)
     dst_ref = _remote_ref_expr(
         state,
@@ -513,6 +545,7 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
         op_name=op_name,
         source_materialization=materialization,
         deferred_recv=deferred_recv,
+        deferred_send=deferred_send,
     )
     return expr_from_string(op_name)
 
@@ -559,6 +592,32 @@ def _emit_source_materialization(
     return True
 
 
+def _defer_send_wait(state: CodegenState, drain: RemoteSendDrain) -> None:
+    fori_loop = _active_fori_loop(state)
+    assert fori_loop is not None
+    counter_size = ((len(drain.references) + 127) // 128) * 128
+    counter = drain.pending_counter
+    if counter is None:
+        counter = state.device_function.register_scratch(
+            (counter_size,),
+            torch.int32,
+            name_hint="remote_send_pending",
+        )
+        drain.pending_counter = counter
+        fori_loop.outer_prefix.append(
+            statement_from_string(f"{counter}[...] = jnp.zeros_like({counter}[...])")
+        )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{counter}[...] = jnp.maximum("
+            f"{counter}[...], jax.nn.one_hot({{slot}}, {counter_size}, "
+            "dtype=jnp.int32))",
+            slot=drain.slot,
+        )
+    )
+    drain.waits_deferred = True
+
+
 def _emit_wait(state: CodegenState, method: str) -> ast.AST:
     info = _paired_copy_info(state)
     if method == "start":
@@ -587,9 +646,14 @@ def _emit_wait(state: CodegenState, method: str) -> ast.AST:
                         f"jnp.ones_like({counter}[...])"
                     )
                 )
+        info.started = True
+    if method == "wait_send" and info.started and info.deferred_send is not None:
+        _defer_send_wait(state, info.deferred_send)
     if method == "wait_recv" and info.deferred_recv is not None:
         info.deferred_recv.waits_deferred = True
-    else:
+    elif not (
+        method == "wait_send" and info.started and info.deferred_send is not None
+    ):
         state.codegen.add_statement(statement_from_string(f"{info.op_name}.{method}()"))
     return expr_from_string("None")
 

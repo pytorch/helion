@@ -4485,6 +4485,33 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             ):
                 state.codegen.add_statement(statement)
 
+    for drain in fori_state._remote_send_drains:
+        if not drain.waits_deferred:
+            continue
+        assert drain.pending_counter is not None
+        for slot, reference in enumerate(drain.references):
+            send_copy = state.device_function.new_var("_send_drain", dce=False)
+            send_index = state.device_function.new_var("_send_index", dce=False)
+            send_wait_body = state.device_function.new_var("_send_wait_body", dce=False)
+            fori_state.outer_suffix.extend(
+                (
+                    statement_from_string(
+                        f"{send_copy} = pltpu.make_async_copy("
+                        f"{{reference}}, {{reference}}, {drain.semaphore}.at[{slot}])",
+                        reference=reference,
+                    ),
+                    statement_from_string(
+                        f"def {send_wait_body}({send_index}, _):\n"
+                        f"    {send_copy}.wait()"
+                    ),
+                    statement_from_string(
+                        f"jax.lax.fori_loop(0, "
+                        f"{drain.pending_counter}[{slot}], "
+                        f"{send_wait_body}, None)"
+                    ),
+                )
+            )
+
     for drain in fori_state._remote_recv_drains.values():
         if not drain.waits_deferred:
             continue
