@@ -331,6 +331,9 @@ def _tensor_argument_name(state: CodegenState, tensor: torch.Tensor) -> str | No
     """Return a kernel argument name, or ``None`` for a computed device value."""
     from ..host_function import HostFunction
 
+    scratch = state.device_function.pallas_internal_scratch_name(tensor)
+    if scratch is not None:
+        return scratch
     if tensor not in HostFunction.current().tensor_to_origin:
         return None
     return state.device_function.tensor_arg(tensor).name

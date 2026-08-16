@@ -363,6 +363,10 @@ class DeviceFunction:
         # their load sites, rather than launcher-managed VMEM BlockSpecs.
         self.pallas_direct_hbm_load_tensor_ids: set[int] = set()
         self.pallas_hoisted_direct_dma_copy_names: set[str] = set()
+        # Body-local ``torch.empty`` tensors that are read and written but do
+        # not escape the kernel return can live entirely in compiler-managed
+        # VMEM scratch instead of becoming hidden HBM in/out arguments.
+        self.pallas_internal_scratch_storage_names: dict[int, str] = {}
         # Pallas: id(fake_tensor) → memory space, determined during
         # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
         # NOTE: Currently each tensor can only have one memory space.
@@ -399,6 +403,15 @@ class DeviceFunction:
 
     def is_pallas_direct_hbm_load(self, tensor: torch.Tensor) -> bool:
         return id(tensor) in self.pallas_direct_hbm_load_tensor_ids
+
+    def pallas_internal_scratch_name(self, tensor: torch.Tensor) -> str | None:
+        return self.pallas_internal_scratch_storage_names.get(
+            id(tensor.untyped_storage())
+        )
+
+    def pallas_tensor_ref_name(self, tensor: torch.Tensor) -> str:
+        scratch = self.pallas_internal_scratch_name(tensor)
+        return scratch if scratch is not None else self.tensor_arg(tensor).name
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -885,7 +898,14 @@ class DeviceFunction:
 
     def sorted_args(self) -> list[Argument]:
         self.arguments.sort(key=lambda arg: arg.sort_key())
-        return self.arguments
+        return [
+            arg
+            for arg in self.arguments
+            if not (
+                isinstance(arg, TensorArg)
+                and self.pallas_internal_scratch_name(arg.fake_value) is not None
+            )
+        ]
 
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
