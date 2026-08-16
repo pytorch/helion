@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
 
 RESIDENT_PLAN_META = "pallas_resident_ref_plan"
+RESIDENT_VALUE_USE_META = "pallas_resident_ref_value_use"
 STATIC_BASIC_VALUE_SUBSCRIPT_META = "pallas_static_basic_value_subscript"
 
 # These Aten operations may preserve the address interpretation of a resident
@@ -61,6 +62,16 @@ _RESIDENT_REF_ATEN_VIEW_TARGETS = frozenset(
         torch.ops.aten.squeeze.dim,
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.view.default,
+    }
+)
+
+# Matrix multiplication consumes an array value, but may receive a resident Ref
+# through identity-only loop captures. Materialize only at the operation itself
+# so other users can keep composing addressable Ref views.
+_RESIDENT_REF_VALUE_TARGETS = frozenset(
+    {
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.mm.default,
     }
 )
 
@@ -253,6 +264,13 @@ def _resident_plan(node: torch.fx.Node) -> _ResidentPlan | None:
     # can be an instance of the pre-reload NamedTuple class. The private metadata
     # key is the stable type boundary across that reload.
     return cast("_ResidentPlan | None", node.meta.get(RESIDENT_PLAN_META))
+
+
+def maybe_materialize_resident_value(node: torch.fx.Node, result: ast.AST) -> ast.AST:
+    """Load a Ref transported to an operation that requires an array value."""
+    if not node.meta.get(RESIDENT_VALUE_USE_META):
+        return result
+    return expr_from_string("{result}[...]", result=result)
 
 
 def _where(node: torch.fx.Node) -> str:
@@ -450,10 +468,6 @@ def _root_variants(
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} has no tensor value metadata"
         )
-    if tensor.ndim != value.ndim:
-        raise exc.BackendUnsupported(
-            "pallas", f"the source load at {location} changes the tensor rank"
-        )
     if producer.args[2] is not None:
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} has an explicit mask"
@@ -480,6 +494,34 @@ def _root_variants(
         )
 
     selected = _narrowed_dims(indices)
+    from .plan_tiling import ContiguousRangeIndexPattern
+
+    patterns = producer.meta.get("indexing_patterns", ())
+    has_narrowing_user = any(
+        user.target is subscript and _narrowed_dims(user.args[1])
+        for user, _transports in _effective_users(producer, context.captures)
+    )
+    contiguous_range_selection = (
+        tensor.ndim == value.ndim
+        and len(selected) == 1
+        and len(patterns) == tensor.ndim
+        and isinstance(patterns[selected[0]], ContiguousRangeIndexPattern)
+        and has_narrowing_user
+    )
+    if contiguous_range_selection:
+        shape = _physical_shape(value, context.config, 1)
+        if shape is None:
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the source load at {location} has no concrete physical shape "
+                "for this config",
+            )
+        return (_ResidentVariant(1, shape, (), None),)
+
+    if tensor.ndim != value.ndim:
+        raise exc.BackendUnsupported(
+            "pallas", f"the source load at {location} changes the tensor rank"
+        )
     if len(selected) != 1:
         raise exc.BackendUnsupported(
             "pallas",
@@ -1064,7 +1106,15 @@ def _record_descendant_failure(
             # Keep the first failure found below this node. Later transactional
             # rollback errors are broader and must not hide the local diagnostic.
             context.failures.setdefault(node, failure)
+        if node is not producer and node.target in _RESIDENT_REF_VALUE_TARGETS:
+            # A matrix multiplication result starts a new value chain; a
+            # failure on one input Ref must not leak into narrowing its output.
+            continue
         for user, _transports in _effective_users(node, context.captures):
+            if user.target is load and user.args and user.args[0] is not node:
+                # Address expressions do not carry the loaded tensor's Ref.
+                # The load is analyzed independently as a new resident root.
+                continue
             stack.append(user)
 
 
@@ -1093,6 +1143,7 @@ def _analyze_resident_chain(
         ],
     ] = {}
     unsupported: list[tuple[torch.fx.Node, exc.BackendUnsupported]] = []
+    value_boundaries: list[tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]] = []
     for user, transports in users:
         user_info = context.graph_infos.get(user.graph)
         if user_info is None:
@@ -1111,15 +1162,25 @@ def _analyze_resident_chain(
                 context,
             )
         except exc.BackendUnsupported as failure:
+            if user.target in _RESIDENT_REF_VALUE_TARGETS and all(
+                variant.live_guard is None for variant in node_variants
+            ):
+                value_boundaries.append((user, transports))
+                continue
             unsupported.append((user, failure))
-            _record_descendant_failure(user, context, failure)
+            if (
+                root
+                or user.target is subscript
+                or user.target in _RESIDENT_REF_ATEN_VIEW_TARGETS
+            ):
+                _record_descendant_failure(user, context, failure)
         else:
             planned[user] = (transports, result.variants, result.selector)
 
     # A root load has one codegen representation. If any branch needs its ordinary
     # value, it cannot simultaneously remain a Ref for a narrowing branch.
-    if root and (unsupported or not planned):
-        if planned and unsupported:
+    if root and (unsupported or (not planned and not value_boundaries)):
+        if (planned or value_boundaries) and unsupported:
             blockers = [_where(user) for user, _failure in unsupported]
             reason = "the block is also consumed whole at " + ", ".join(blockers[:3])
             failure = exc.BackendUnsupported("pallas", reason)
@@ -1135,7 +1196,9 @@ def _analyze_resident_chain(
     # Past the root, an unsupported or terminal user is normally a legal boundary:
     # materialize this view and let ordinary Pallas codegen continue from its value.
     if not root and (
-        (selector is not None and selector.mask) or unsupported or not planned
+        (selector is not None and selector.mask)
+        or unsupported
+        or (not planned and not value_boundaries)
     ):
         masked_boundary = selector is not None and selector.mask and bool(planned)
         if masked_boundary:
@@ -1180,10 +1243,15 @@ def _analyze_resident_chain(
         return
 
     annotations[node] = _ResidentPlan(False, node_variants, selector)
+    transport_plan = _ResidentPlan(False, node_variants, None)
+    for _user, transports in value_boundaries:
+        for transport in transports:
+            annotations[transport] = transport_plan
+        value_node = transports[-1] if transports else node
+        value_node.meta[RESIDENT_VALUE_USE_META] = True
     for user, (transports, output, user_spec) in planned.items():
         # Identity transports retain the input physical state; the semantic user
         # receives the transformed state returned by _registered_transform.
-        transport_plan = _ResidentPlan(False, node_variants, None)
         for transport in transports:
             annotations[transport] = transport_plan
         _analyze_resident_chain(
@@ -1211,6 +1279,10 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
     for info in graphs:
         for producer in info.graph.find_nodes(op="call_function", target=load):
             tensor = _node_value(producer.args[0])
+            value = producer.meta.get("val")
+            if isinstance(value, torch.Tensor) and value.ndim == 0:
+                # Scalar loads are address values, not resident tensor blocks.
+                continue
             dma_plan = _indirect_dma_plan(producer)
             # Keeping a Ref defers the physical read until its consumer. A device
             # write through an alias could therefore change program semantics.
