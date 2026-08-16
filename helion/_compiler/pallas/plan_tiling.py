@@ -366,7 +366,7 @@ def _analyze_subscript_patterns(
     from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
-    patterns = _detect_subscript_patterns(tensor, subscript, node)
+    patterns = _detect_subscript_patterns(tensor, subscript, node, config)
     tensor_dim = 0  # Track which tensor dimension we're indexing
     for pattern in patterns:
         if isinstance(pattern, NonePattern):
@@ -381,6 +381,7 @@ def _detect_subscript_patterns(
     tensor: torch.Tensor,
     subscript: list[object],
     node: torch.fx.Node,
+    config: Config | None = None,
 ) -> list[IndexingPattern]:
     """Describe an access without applying config-dependent tiling decisions."""
     from ..compile_environment import CompileEnvironment
@@ -397,7 +398,15 @@ def _detect_subscript_patterns(
                 f"Indexing {tensor_dim}th dim but tensor only has {tensor.ndim} dims"
             )
         patterns.append(
-            _detect_indexing_pattern(index, tensor, tensor_dim, node, position, env)
+            _detect_indexing_pattern(
+                index,
+                tensor,
+                tensor_dim,
+                node,
+                position,
+                env,
+                config,
+            )
         )
         tensor_dim += 1
     return patterns
@@ -441,7 +450,9 @@ def _is_scalar_value(value: object) -> bool:
         return True
     if isinstance(value, torch.fx.Node):
         value = value.meta.get("val")
-    return isinstance(value, torch.Tensor) and value.ndim == 0
+    return isinstance(value, (int, torch.SymInt)) or (
+        isinstance(value, torch.Tensor) and value.ndim == 0
+    )
 
 
 def _constant_int(value: object) -> int | None:
@@ -454,11 +465,55 @@ def _constant_int(value: object) -> int | None:
     return None
 
 
-def _is_proven_multiple(value: object, alignment: int) -> bool:
+def _is_proven_multiple(value: object, alignment: int, config: Config | None) -> bool:
     """Conservatively prove that a scalar FX expression is alignment-multiple."""
     constant = _constant_int(value)
     if constant is not None:
         return constant % alignment == 0
+
+    symbolic_value = (
+        value.meta.get("val") if isinstance(value, torch.fx.Node) else value
+    )
+    if isinstance(value, torch.fx.Node) and isinstance(symbolic_value, torch.SymInt):
+        from ...language import _tracing_ops
+        from ..compile_environment import CompileEnvironment
+
+        if value.target is _tracing_ops._get_symnode:
+            return (
+                CompileEnvironment.current().size_hint(symbolic_value) % alignment == 0
+            )
+    tile_begin = _maybe_get_tile_begin_with_offset_info(symbolic_value)
+    if (
+        config is not None
+        and tile_begin is not None
+        and isinstance(tile_begin.offset, int)
+    ):
+        from ..compile_environment import CompileEnvironment
+
+        block_size = (
+            CompileEnvironment.current()
+            .block_sizes[tile_begin.block_id]
+            .from_config(config)
+        )
+        return (
+            isinstance(block_size, int)
+            and block_size % alignment == 0
+            and tile_begin.offset % alignment == 0
+        )
+    if isinstance(symbolic_value, torch.SymInt):
+        from ..compile_environment import CompileEnvironment
+        from ..compile_environment import _symint_expr
+        from ..host_function import HostFunction
+
+        expression = _symint_expr(symbolic_value)
+        if expression is not None and all(
+            (origin := HostFunction.current().expr_to_origin.get(symbol)) is not None
+            and origin.origin.is_host()
+            for symbol in expression.free_symbols
+        ):
+            return (
+                CompileEnvironment.current().size_hint(symbolic_value) % alignment == 0
+            )
     if not isinstance(value, torch.fx.Node) or value.op != "call_function":
         return False
 
@@ -469,7 +524,9 @@ def _is_proven_multiple(value: object, alignment: int) -> bool:
     ):
         if value.kwargs.get("alpha", 1) != 1:
             return False
-        return all(_is_proven_multiple(arg, alignment) for arg in value.args[:2])
+        return all(
+            _is_proven_multiple(arg, alignment, config) for arg in value.args[:2]
+        )
     if value.target in (
         operator.sub,
         torch.ops.aten.sub.Scalar,
@@ -477,19 +534,58 @@ def _is_proven_multiple(value: object, alignment: int) -> bool:
     ):
         if value.kwargs.get("alpha", 1) != 1:
             return False
-        return all(_is_proven_multiple(arg, alignment) for arg in value.args[:2])
+        return all(
+            _is_proven_multiple(arg, alignment, config) for arg in value.args[:2]
+        )
     if value.target in (
         operator.mul,
         torch.ops.aten.mul.Scalar,
         torch.ops.aten.mul.Tensor,
     ):
         lhs, rhs = value.args[:2]
-        lhs_constant = _constant_int(lhs)
-        rhs_constant = _constant_int(rhs)
-        return (lhs_constant is not None and lhs_constant % alignment == 0) or (
-            rhs_constant is not None and rhs_constant % alignment == 0
+        return _is_proven_multiple(lhs, alignment, config) or _is_proven_multiple(
+            rhs, alignment, config
         )
     return False
+
+
+def _may_be_aligned_tile_begin(value: object, alignment: int) -> bool:
+    """Return whether a tile begin has an alignment-compatible configuration.
+
+    Config-independent memory-access discovery runs before a concrete block size
+    is selected.  At that point, recognize a tile begin as a possible direct
+    HBM window when at least one legal block size provides the required
+    alignment.  The config-specific pass still calls ``_is_proven_multiple``
+    and rejects configurations that do not provide it.
+    """
+    symbolic_value = (
+        value.meta.get("val") if isinstance(value, torch.fx.Node) else value
+    )
+    tile_begin = _maybe_get_tile_begin_with_offset_info(symbolic_value)
+    if (
+        tile_begin is None
+        or not isinstance(tile_begin.offset, int)
+        or tile_begin.offset % alignment != 0
+    ):
+        return False
+
+    from ..compile_environment import CompileEnvironment
+    from ..compile_environment import FixedBlockSizeSource
+
+    env = CompileEnvironment.current()
+    block_id = env.canonical_block_id(tile_begin.block_id)
+    source = env.block_sizes[block_id].block_size_source
+    if isinstance(source, FixedBlockSizeSource):
+        block_size = env.try_concretize_symint(source.value)
+        return isinstance(block_size, int) and block_size % alignment == 0
+    try:
+        spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+    except KeyError:
+        return False
+    # Block-size choices are powers of two.  Therefore a maximum at least as
+    # large as this power-of-two alignment guarantees that an aligned choice
+    # exists in the search space.
+    return spec.max_size >= alignment
 
 
 def _iota_length(node: object) -> int | None:
@@ -504,6 +600,12 @@ def _iota_length(node: object) -> int | None:
     if start != 0 or step != 1 or len(node.args) != 1:
         return None
     length = node.args[0]
+    if isinstance(length, torch.fx.Node):
+        length = length.meta.get("val")
+    if isinstance(length, torch.SymInt):
+        from ..compile_environment import CompileEnvironment
+
+        length = CompileEnvironment.current().size_hint(length)
     return length if isinstance(length, int) and length > 0 else None
 
 
@@ -512,10 +614,14 @@ def _match_contiguous_range_index(
     tensor: torch.Tensor,
     tensor_dim: int,
     load_value: object,
+    config: Config | None,
 ) -> ContiguousRangeIndexPattern | None:
     """Match an aligned scalar base plus an explicit unit-stride ``hl.arange``."""
+    from ..host_function import HostFunction
+
+    origin = HostFunction.current().tensor_to_origin.get(tensor)
     if (
-        tensor_dim != tensor.ndim - 1
+        origin is None
         or node.op != "call_function"
         or node.target
         not in (operator.add, torch.ops.aten.add.Scalar, torch.ops.aten.add.Tensor)
@@ -523,16 +629,30 @@ def _match_contiguous_range_index(
         or node.kwargs.get("alpha", 1) != 1
     ):
         return None
-    if not isinstance(load_value, torch.Tensor) or not all(
-        isinstance(size, int) for size in load_value.shape
-    ):
+    if not isinstance(load_value, torch.Tensor):
+        return None
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    load_shape = tuple(
+        env.size_hint(size) if isinstance(size, torch.SymInt) else size
+        for size in load_value.shape
+    )
+    if not all(isinstance(size, int) for size in load_shape):
         return None
     from .dma import is_tpu_dma_aligned_shape
 
-    if not is_tpu_dma_aligned_shape(tuple(load_value.shape), tensor.dtype):
+    if not is_tpu_dma_aligned_shape(load_shape, tensor.dtype):
         return None
     bitwidth = min(tensor.dtype.itemsize * 8, 32)
-    alignment = 128 if tensor.ndim > 1 else 128 * (32 // bitwidth)
+    if tensor.ndim == 1:
+        alignment = 128 * (32 // bitwidth)
+    elif tensor_dim == tensor.ndim - 1:
+        alignment = 128
+    elif tensor_dim == tensor.ndim - 2:
+        alignment = 8
+    else:
+        alignment = 1
     lhs, rhs = node.args
     for base, iota in ((lhs, rhs), (rhs, lhs)):
         length = _iota_length(iota)
@@ -540,7 +660,12 @@ def _match_contiguous_range_index(
             continue
         if not isinstance(base, (int, torch.SymInt, torch.fx.Node)):
             continue
-        if not _is_scalar_value(base) or not _is_proven_multiple(base, alignment):
+        if not _is_scalar_value(base):
+            continue
+        aligned = _is_proven_multiple(base, alignment, config)
+        if config is None and not aligned:
+            aligned = _may_be_aligned_tile_begin(base, alignment)
+        if not aligned:
             continue
         value = node.meta.get("val")
         if (
@@ -563,6 +688,7 @@ def _detect_indexing_pattern(
     node: torch.fx.Node,
     subscript_index: int,
     env: CompileEnvironment,
+    config: Config | None = None,
 ) -> IndexingPattern:
     """Detect the specific indexing pattern for a subscript element."""
     from ..indexing_strategy import _get_tile_with_offset_info
@@ -601,6 +727,7 @@ def _detect_indexing_pattern(
                 tensor,
                 tensor_dim,
                 node.meta.get("val"),
+                config,
             )
             if contiguous_range is not None:
                 return contiguous_range
