@@ -245,6 +245,7 @@ def _is_static_basic_value_subscript(node: torch.fx.Node, config: Config) -> boo
 
     source = node.args[0]
     seen: set[torch.fx.Node] = set()
+    follows_static_subscript = False
     while isinstance(source, torch.fx.Node) and source not in seen:
         seen.add(source)
         if source.op != "call_function":
@@ -252,10 +253,20 @@ def _is_static_basic_value_subscript(node: torch.fx.Node, config: Config) -> boo
         if source.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
             source = source.args[0]
             continue
-        # An earlier narrowing subscript may still carry a resident Ref and its
-        # boundary-mask invariants. A root load, by contrast, can materialize as
-        # an ordinary value before applying this compile-time basic index.
-        return source.target is not subscript
+        if source.target is subscript and source.meta.get(
+            STATIC_BASIC_VALUE_SUBSCRIPT_META
+        ):
+            follows_static_subscript = True
+            source = source.args[0]
+            continue
+        # A direct root load may materialize before one compile-time basic
+        # index. Do not let that fallback chain into a second narrowing: the
+        # first selection may have lost resident-Ref padding invariants. Static
+        # indices may chain safely when their root is an ordinary computed
+        # value, such as a matrix multiplication result.
+        return source.target is not subscript and (
+            not follows_static_subscript or source.target is not load
+        )
     return False
 
 

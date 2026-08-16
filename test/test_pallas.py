@@ -796,6 +796,23 @@ def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _static_index_helper(value: torch.Tensor) -> torch.Tensor:
+    """Exercise ordinary Python helper indexing during Helion tracing."""
+    left = value[:, hl.arange(32)]
+    right = value[:, 32 + hl.arange(32)]
+    return left + 2 * right
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_static_index_helper(x: torch.Tensor) -> torch.Tensor:
+    rows = hl.specialize(x.size(0))
+    out = torch.empty([rows, 32], dtype=x.dtype, device=x.device)
+    for _program in hl.grid(1):
+        computed = x[:, :] + 1
+        out[:, :] = _static_index_helper(computed)
+    return out
+
+
 @helion.kernel(backend="pallas", static_shapes=True)
 def pallas_loaded_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
@@ -1489,6 +1506,18 @@ class TestPallas(TestCase):
         )
         self.assertIn("jnp.pad", code)
         expected = torch.nn.functional.pad(x, (0, 128), value=0.0)
+        torch.testing.assert_close(result, expected)
+
+    def test_static_index_in_python_helper_uses_basic_slices(self) -> None:
+        x = torch.randn(16, 64, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_static_index_helper,
+            (x,),
+            block_sizes=[],
+        )
+
+        computed = x + 1
+        expected = computed[:, :32] + 2 * computed[:, 32:64]
         torch.testing.assert_close(result, expected)
 
     def test_constant_pad_nd_non_finite_fill(self) -> None:
