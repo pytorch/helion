@@ -379,6 +379,68 @@ def _route_forward_then_consume(
 
 
 @helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _body_local_remote_scratch(
+    src: torch.Tensor,
+    peers: torch.Tensor,
+) -> torch.Tensor:
+    """Exchange through a private VMEM buffer that does not escape the kernel."""
+    output = torch.empty_like(src)
+    scratch = torch.empty(
+        [2, 1, 128],
+        dtype=src.dtype,
+        device=src.device,
+    )
+    for _program in hl.grid(1):
+        scratch[0, :, :] = src[0, :, :]
+        hl.remote_barrier(peers[0, 0])
+        copy = hl.make_async_remote_copy(
+            scratch,
+            [0],
+            peers[0, 0],
+            dst=scratch,
+            dst_index=[1],
+        )
+        copy.start()
+        copy.wait()
+        output[0, :, :] = scratch[1, :, :] + 1
+    return output
+
+
+@helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _returned_remote_scratch_alias(
+    src: torch.Tensor,
+    peers: torch.Tensor,
+) -> torch.Tensor:
+    """Return an alias of a remote-copy buffer; it must remain an output."""
+    scratch = torch.empty(
+        [2, 1, 128],
+        dtype=src.dtype,
+        device=src.device,
+    )
+    for _program in hl.grid(1):
+        scratch[0, :, :] = src[0, :, :]
+        copy = hl.make_async_remote_copy(
+            scratch,
+            [0],
+            peers[0, 0],
+            dst=scratch,
+            dst_index=[1],
+        )
+        copy.start()
+        copy.wait()
+    result = scratch
+    return result  # noqa: RET504 - exercise return-alias escape analysis
+
+
+@helion.kernel(
     static_shapes=False,
     config=helion.Config(block_sizes=[_HBM_TILE]),
 )
@@ -867,6 +929,20 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
 @onlyBackends(["pallas"])
 class TestRemoteCopyJaxRuntime(TestCase):
     @staticmethod
+    def _body_local_remote_scratch_source() -> str:
+        return _body_local_remote_scratch.bind(
+            (
+                torch.zeros(1, 1, _WIDTH),
+                torch.zeros(1, 1, dtype=torch.int32),
+            )
+        ).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+
+    @staticmethod
     def _run_one_shot_copy(mesh, mesh_axis, kernel_fn) -> None:
         import jax
         import jax.numpy as jnp
@@ -1129,6 +1205,73 @@ class TestRemoteCopyJaxRuntime(TestCase):
         world_size = 2
         mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
         self._run_ring_all_gather(mesh)
+
+    def test_returned_remote_scratch_alias_remains_an_output(self) -> None:
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "wrapper-created in-place outputs",
+        ):
+            _returned_remote_scratch_alias.bind(
+                (
+                    torch.zeros(1, 1, _WIDTH),
+                    torch.zeros(1, 1, dtype=torch.int32),
+                )
+            ).to_code(
+                options=helion.OutputCodeOptions(
+                    allow_helion_deps=False,
+                    jax_fn=True,
+                )
+            )
+
+    @skipIfPallasInterpret("body-local remote scratch requires physical TPU devices")
+    def test_body_local_remote_scratch(self) -> None:
+        import types
+
+        import jax
+        import jax.numpy as jnp
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+
+        source = self._body_local_remote_scratch_source()
+
+        name = "precompiled_body_local_remote_scratch_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(source, name, "exec"), module.__dict__)
+
+        world_size = 2
+        mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
+        partition = jax.sharding.PartitionSpec
+        src_spec = partition("peer", None, None)
+        peer_spec = partition("peer", None)
+        ranks = jnp.arange(world_size, dtype=jnp.float32)[:, None, None]
+        columns = jnp.arange(_WIDTH, dtype=jnp.float32)[None, None, :]
+        src = ranks * 1000 + columns
+        peers = (1 - jnp.arange(world_size, dtype=jnp.int32))[:, None]
+        inputs = tuple(
+            jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
+            for value, spec in zip(
+                (src, peers),
+                (src_spec, peer_spec),
+                strict=True,
+            )
+        )
+        exchange = jax.jit(
+            jax.shard_map(
+                module._body_local_remote_scratch,
+                mesh=mesh,
+                in_specs=(src_spec, peer_spec),
+                out_specs=src_spec,
+                check_vma=False,
+            )
+        )
+        expected = np.asarray(src)[::-1] + 1
+        for _invocation in range(2):
+            result = np.asarray(jax.block_until_ready(exchange(*inputs)))
+            np.testing.assert_array_equal(result, expected)
 
     @skipIfPallasInterpret("remote-copy pipelines require TPU VMEM lowering")
     def test_computed_pipeline_copy(self) -> None:
