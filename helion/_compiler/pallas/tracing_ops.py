@@ -3377,6 +3377,12 @@ def _classify_pipelined_tensors(
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
+        if state.device_function.pallas_internal_scratch_name(fake) is not None:
+            # This tensor already names a VMEM allocation owned by the kernel.
+            # Routing it through the inner-loop HBM DMA path would allocate a
+            # second VMEM buffer and emit pointless copies from an HBM argument
+            # that no longer exists.
+            continue
         if direction == "load":
             first_load = loaded_tensors[id(fake)][1]
             if int(first_load.meta.get(_PALLAS_LOOP_LOAD_COUNT_META, 1)) > 1:
