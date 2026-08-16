@@ -1460,6 +1460,54 @@ def _try_splice_tcgen05_unary_epilogue(
     return ast.Constant(value=None)
 
 
+def _try_codegen_tcgen05_pair_epilogue(
+    state: CodegenState,
+    tensor: object,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+) -> ast.AST | None:
+    plan = state.device_function.cute_state.tcgen05_pair_epilogue_plan_for_store(
+        state.fx_node
+    )
+    if plan is None:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        raise exc.BackendUnsupported("cute", "planned tcgen05 store is not a tensor")
+    from ..inductor_lowering import is_deferred_tcgen05_pair_epilogue
+
+    value_node = state.fx_node.args[2] if state.fx_node is not None else None
+    if value_node is not plan.value_node or not is_deferred_tcgen05_pair_epilogue(
+        state.ast_args[2]
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "committed tcgen05 pair epilogue received the wrong store value"
+        )
+    result_var = state.device_function.cute_state.matmul_fx_node_result_vars.get(
+        plan.anchor
+    )
+    if result_var is None:
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 pair epilogue store ran before its MMA anchor"
+        )
+    rewritten = _codegen_cute_store_tcgen05_tile(
+        state,
+        tensor,
+        subscript,
+        ast_subscript,
+        extra_mask,
+        result_var,
+        pair_epilogue=plan,
+    )
+    if rewritten is None:
+        raise exc.BackendUnsupported(
+            "cute", "committed tcgen05 pair epilogue could not render its store"
+        )
+    for statement in rewritten if isinstance(rewritten, list) else [rewritten]:
+        state.add_statement(statement)
+    return ast.Constant(value=None)
+
+
 def _try_splice_tcgen05_grouped_tail_epilogue(
     state: CodegenState,
     tensor: object,
@@ -1510,6 +1558,12 @@ def _(state: CodegenState) -> ast.AST:
     raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    if (
+        planned := _try_codegen_tcgen05_pair_epilogue(
+            state, tensor, subscript, ast_subscript, extra_mask
+        )
+    ) is not None:
+        return planned
     value_node = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         maybe_value_node = state.fx_node.args[2]

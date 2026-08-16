@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
-from helion._compiler.ast_extension import statement_from_string
+from helion._compiler.pallas.dma import DmaTransfer
+from helion._compiler.pallas.dma import allocate_dma_resources
+from helion._compiler.pallas.dma import async_copy_statements
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
 
@@ -22,24 +24,31 @@ if TYPE_CHECKING:
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
 
+def _load_route(
+    state: CodegenState, tensor: torch.Tensor
+) -> tuple[str, str, list[object]]:
+    arg_name = state.device_function.tensor_arg(tensor).name
+    active_name = vmem_name(state, arg_name)
+    state.device_function.device_load_index += 1
+    state.device_function.device_memory_op_index += 1
+    assert state.fx_node is not None
+    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
+    return arg_name, active_name, patterns
+
+
 def load_expr(
     state: CodegenState,
     subscript: list[object],
     tensor: torch.Tensor,
 ) -> ast.AST:
-    """Emit a normal load or a selected TensorCore gather plan."""
+    """Emit a normal Pallas load or a selected TensorCore gather."""
     from helion._compiler.pallas.gather import emit_gather
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
-    name = state.device_function.tensor_arg(tensor).name
-    active_name = vmem_name(state, name)
+    arg_name, active_name, patterns = _load_route(state, tensor)
     device_fn = state.device_function
-    device_fn.device_load_index += 1
-    device_fn.device_memory_op_index += 1
-
     assert state.fx_node is not None
-    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
     if isinstance(plan, OneHotGatherPlan):
         return emit_gather(state, plan.plan, active_name)
@@ -47,11 +56,11 @@ def load_expr(
     from helion._compiler.device_function import PallasMemorySpace
 
     if (
-        active_name == name
+        active_name == arg_name
         and device_fn.pallas_memory_space.get(id(tensor)) == PallasMemorySpace.HBM
         and device_fn.is_pallas_remote_copy_operand(tensor)
     ):
-        return _remote_hbm_load_expr(state, subscript, tensor, name)
+        return _remote_hbm_load_expr(state, subscript, tensor, arg_name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
@@ -106,23 +115,31 @@ def _remote_hbm_load_expr(
     if not scratch_shape:
         raise NotImplementedError("Pallas cannot DMA a scalar HBM load into VMEM")
 
-    scratch = state.device_function.register_scratch(
-        tuple(scratch_shape), value.dtype, name_hint=f"{name}_load"
+    transfer = DmaTransfer(
+        tensor=tensor,
+        subscript=tuple(subscript),
+        direction="load",
     )
-    semaphore = state.device_function.register_dma_semaphore(
-        name_hint=f"{name}_load_sem"
+    resources = allocate_dma_resources(
+        state.device_function,
+        transfer,
+        vmem_shape=tuple(scratch_shape),
+        buffer_count=1,
+        scratch_hint=f"{name}_load",
+        semaphore_hint=f"{name}_load_sem",
     )
-    copy = state.device_function.new_var(f"{name}_load_copy", dce=False)
     source = f"{name}.at[{', '.join(parts)}]"
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{copy} = pltpu.make_async_copy({source}, {scratch}, {semaphore})"
-        )
-    )
-    state.codegen.add_statement(statement_from_string(f"{copy}.start()"))
-    state.codegen.add_statement(statement_from_string(f"{copy}.wait()"))
+    for statement in async_copy_statements(
+        state,
+        source,
+        resources.scratch,
+        resources.semaphore,
+        ("start", "wait"),
+        f"{name}_load_copy",
+    ):
+        state.codegen.add_statement(statement)
 
-    result = expr_from_string(f"{scratch}[...]")
+    result = expr_from_string(f"{resources.scratch}[...]")
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(
@@ -133,6 +150,34 @@ def _remote_hbm_load_expr(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def resident_ref_load_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+) -> ast.AST:
+    """Keep a proven direct VMEM load as a Pallas Ref."""
+    from helion import exc
+    from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
+
+    arg_name, name, _patterns = _load_route(state, tensor)
+    device_fn = state.device_function
+
+    assert state.fx_node is not None
+    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, OneHotGatherPlan):
+        raise exc.InvalidConfig("resident Ref cannot follow an indirect gather")
+    parts, none_dims = index_parts(state, subscript, tensor)
+    if none_dims or len(parts) != tensor.ndim:
+        raise exc.InvalidConfig("resident Ref producer must preserve rank")
+    if name == arg_name and (
+        device_fn.pallas_memory_space.get(id(tensor)) is not PallasMemorySpace.VMEM
+    ):
+        raise exc.InvalidConfig("resident Ref producer did not resolve to VMEM")
+    return expr_from_string(f"{name}.at[{', '.join(parts)}]")
 
 
 def maybe_codegen_resident_prep_cache_read(

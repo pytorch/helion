@@ -486,19 +486,35 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
+
+    def codegen_from_input_asts(
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        input_asts: list[ast.AST],
+    ) -> object:
+        """Lower this pointwise node with explicitly supplied tensor values."""
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
-        with self.install_kernel_handlers(ctx, node):
+        assert len(input_asts) == len(self.input_names)
+        with install_inductor_kernel_handlers(
+            ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
+        ):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
 
-        return self._reshape_for_size1_reduction(ctx, node, result)
+        return self._reshape_for_size1_reduction(ctx, node, result, input_asts)
 
     def _reshape_for_size1_reduction(
-        self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
+        self,
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        result: ast.AST,
+        input_asts: list[ast.AST] | None = None,
     ) -> ast.AST:
         # When Inductor converts a size-1 reduction to a Pointwise op, the
         # buffer has fewer ranges than the inputs.  This happens when the
@@ -516,7 +532,9 @@ class PointwiseLowering(InductorLowering):
             # Cute lowers one element per thread, so synthetic size-1 view dims
             # (from unsqueeze/keepdim paths rewritten to pointwise) must collapse
             # back to the underlying scalar expression.
-            inputs = self.input_asts(ctx, node)
+            inputs = (
+                input_asts if input_asts is not None else self.input_asts(ctx, node)
+            )
             if len(inputs) == 1:
                 return inputs[0]
 
@@ -1478,6 +1496,25 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
+                    cute_state = self.cg.device_function.cute_state
+                    if cute_state.has_tcgen05_pair_epilogue_plan:
+                        if cute_state.is_deferred_tcgen05_pair_epilogue_node(n):
+                            n.meta["codegen"] = _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                            return _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                        if (
+                            any(
+                                self.env.get(input_node)
+                                is _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                                for input_node in n.all_input_nodes
+                            )
+                            and cute_state.tcgen05_pair_epilogue_plan_for_store(n)
+                            is None
+                        ):
+                            raise exc.BackendUnsupported(
+                                "cute",
+                                "deferred tcgen05 pair epilogue escaped its "
+                                "committed store",
+                            )
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result
@@ -1532,6 +1569,13 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
         return super().run_node(n)
+
+
+_DEFERRED_TCGEN05_PAIR_EPILOGUE = object()
+
+
+def is_deferred_tcgen05_pair_epilogue(value: object) -> bool:
+    return value is _DEFERRED_TCGEN05_PAIR_EPILOGUE
 
 
 def codegen_call_with_graph(

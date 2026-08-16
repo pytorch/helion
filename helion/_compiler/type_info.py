@@ -306,16 +306,11 @@ class TensorType(TypeInfo):
             )
 
     def __str__(self) -> str:
+        env = CompileEnvironment.current()
         shape: list[str] = []
         for s in self.fake_value.size():
             if isinstance(s, torch.SymInt):
-                shape.append(
-                    str(
-                        s._sympy_().xreplace(
-                            CompileEnvironment.current().debug_shape_renames
-                        )
-                    )
-                )
+                shape.append(env.sympy_debug(s._sympy_()))
             else:
                 shape.append(str(s))
         dtype = self.fake_value.dtype
@@ -918,7 +913,15 @@ class NumericType(TypeInfo):
         raise NotImplementedError
 
     def __str__(self) -> str:
-        return f"{type(self).__name__}({self.value})"
+        env = CompileEnvironment.current()
+        # Preserve the existing debug/golden rendering except while semantic
+        # fingerprinting supplies canonical symbolic-shape names.
+        value = (
+            env.sympy_debug(self.value._sympy_())
+            if env.has_debug_shape_rename_override
+            else self.value
+        )
+        return f"{type(self).__name__}({value})"
 
     def proxy(self) -> torch.SymInt | torch.SymBool | torch.SymFloat | int:
         return self.value

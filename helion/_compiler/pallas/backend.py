@@ -20,6 +20,7 @@ from ..ast_extension import expr_from_string
 from ..backend import Backend
 from ..backend import LauncherInfo
 from ..backend import _loop_contains_matmul
+from ..backend import _validate_subscript_indices
 from ..backend import dedupe_preserve_order
 from ..backend import read_launcher_source
 
@@ -55,7 +56,7 @@ def _embedded_helper_source(body: str) -> str:
             ]
         )
     if "flatten_worklist" in body:
-        from ...runtime import compact_worklist
+        from ...runtime.pallas import compact_worklist
 
         blocks.append(_embed_source(inspect.getsource(compact_worklist)))
     return "\n\n\n".join(blocks)
@@ -267,7 +268,7 @@ class PallasBackend(Backend):
             # dependency-free path drops these imports and embeds the source instead
             # (see ``embedded_helper_source`` / ``build_dependency_free_code``).
             "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
-            "flatten_worklist": "from helion.runtime.compact_worklist import flatten_worklist",
+            "flatten_worklist": "from helion.runtime.pallas.compact_worklist import flatten_worklist",
         }
 
     def embedded_helper_source(self, body: str) -> str:
@@ -551,6 +552,19 @@ class PallasBackend(Backend):
         if not hasattr(self, "fake_tensor_loads"):
             self.fake_tensor_loads = []
         self.fake_tensor_loads.append((tensor, index))
+
+    def fake_subscript_shape(
+        self,
+        tensor: torch.Tensor,
+        index: list[object],
+    ) -> list[int | torch.SymInt]:
+        from ..indexing_strategy import SubscriptIndexing
+
+        _validate_subscript_indices(index)
+
+        # Lowerability depends on block sizes and Ref provenance, so fake
+        # propagation only validates forms whose output shape is well-defined.
+        return SubscriptIndexing.compute_shape(tensor, index)
 
     def adjust_block_size_constraints(
         self,
@@ -1510,6 +1524,10 @@ class PallasBackend(Backend):
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
 
+        from .view_ops import plan_resident_ref_views
+
+        plan_resident_ref_views(graphs, config)
+
     def _setup_compact_worklist(self, graphs: list[GraphInfo], config: Config) -> None:
         """Detect + stash the compact-worklist plan before device codegen.
 
@@ -1613,7 +1631,7 @@ class PallasBackend(Backend):
         ``cdiv(total, BLOCK * grouping) + num_owners - 1`` provably holds. All
         terms are concrete ints under ``static_shapes=True``.
         """
-        from ...runtime.compact_worklist import packed_upper_bound
+        from ...runtime.pallas.compact_worklist import packed_upper_bound
         from ..compile_environment import CompileEnvironment
 
         params = dict(host_fn.params.arguments)

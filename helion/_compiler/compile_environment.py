@@ -10,7 +10,6 @@ import threading
 import types
 import typing
 from typing import TYPE_CHECKING
-from typing import Protocol
 import warnings
 
 import sympy
@@ -207,11 +206,12 @@ if TYPE_CHECKING:
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
 
-    class _TLS(Protocol):
-        env: CompileEnvironment | None
+
+class _TLS(threading.local):
+    env: CompileEnvironment | None = None
 
 
-tls: _TLS = typing.cast("_TLS", threading.local())
+tls = _TLS()
 
 
 class HelionKernelSource(EphemeralSource):
@@ -305,6 +305,12 @@ class CompileEnvironment:
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
+        self._debug_shape_rename_override: contextvars.ContextVar[
+            dict[sympy.Basic, sympy.Basic] | None
+        ] = contextvars.ContextVar(
+            f"helion_debug_shape_renames_{id(self)}",
+            default=None,
+        )
         try:
             from ..runtime import get_num_sm
 
@@ -465,6 +471,26 @@ class CompileEnvironment:
             yield
         finally:
             self._runtime_arg_values_by_name.reset(token)
+
+    @property
+    def active_debug_shape_renames(self) -> dict[sympy.Basic, sympy.Basic]:
+        return self._debug_shape_rename_override.get() or self.debug_shape_renames
+
+    @property
+    def has_debug_shape_rename_override(self) -> bool:
+        return self._debug_shape_rename_override.get() is not None
+
+    @contextlib.contextmanager
+    def use_debug_shape_renames(
+        self, values: dict[sympy.Basic, sympy.Basic]
+    ) -> typing.Iterator[None]:
+        token = self._debug_shape_rename_override.set(
+            {**self.debug_shape_renames, **values}
+        )
+        try:
+            yield
+        finally:
+            self._debug_shape_rename_override.reset(token)
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -1298,10 +1324,10 @@ class CompileEnvironment:
         return self.index_type()
 
     def sympy_debug(self, expr: sympy.Basic) -> str:
-        return str(expr.xreplace(self.debug_shape_renames))
+        return str(expr.xreplace(self.active_debug_shape_renames))
 
     def __enter__(self) -> Self:
-        assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
+        assert tls.env is None, "CompileEnvironment already active"
         self.fake_mode.__enter__()
         tls.env = self
         return self
@@ -1317,20 +1343,13 @@ class CompileEnvironment:
 
     @staticmethod
     def current() -> CompileEnvironment:
-        try:
-            if (env := tls.env) is not None:
-                return env
-        except AttributeError:
-            pass
+        if (env := tls.env) is not None:
+            return env
         raise NoCurrentEnvironment from None
 
     @staticmethod
     def has_current() -> bool:
-        try:
-            CompileEnvironment.current()
-            return True
-        except NoCurrentEnvironment:
-            return False
+        return tls.env is not None
 
     def get_block_id(self, size: int | torch.SymInt | sympy.Basic) -> int | None:
         """

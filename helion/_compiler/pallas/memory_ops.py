@@ -63,6 +63,12 @@ def _(state: CodegenState) -> None:
 
 @_decorators.codegen(load, "pallas")
 def _(state: CodegenState) -> ast.AST:
+    from .view_ops import _resident_plan
+
+    assert state.fx_node is not None
+    if _resident_plan(state.fx_node) is not None:
+        return _codegen_resident_load(state)
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
@@ -73,3 +79,11 @@ def _(state: CodegenState) -> ast.AST:
         return tile_index_result
 
     return pallas_codegen.load_expr(state, list(subscript), tensor)
+
+
+def _codegen_resident_load(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
+    return pallas_codegen.resident_ref_load_expr(state, list(subscript), tensor)
