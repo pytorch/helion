@@ -908,14 +908,30 @@ def _contiguous_range_base_expr(
     begin_exprs: list[str],
     iter_step_exprs: list[str],
     iteration_indices: list[str],
+    captured_exprs: dict[torch.fx.Node, str] | None = None,
 ) -> str | None:
     """Render a supported scalar address expression for one loop iteration."""
     if isinstance(value, int):
         return str(value)
     if isinstance(value, torch.SymInt):
         return state.device_function.literal_expr(value)
-    if not isinstance(value, torch.fx.Node) or value.op != "call_function":
+    if not isinstance(value, torch.fx.Node):
         return None
+    if value.op == "placeholder":
+        return captured_exprs.get(value) if captured_exprs is not None else None
+    if value.op != "call_function":
+        return None
+
+    if value.target is _new_var and value.args:
+        return _contiguous_range_base_expr(
+            value.args[0],
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+            captured_exprs=captured_exprs,
+        )
 
     from ...language import memory_ops
     from ...language.tile_ops import tile_begin
@@ -965,6 +981,7 @@ def _contiguous_range_base_expr(
             begin_exprs=begin_exprs,
             iter_step_exprs=iter_step_exprs,
             iteration_indices=iteration_indices,
+            captured_exprs=captured_exprs,
         )
         rhs = _contiguous_range_base_expr(
             value.args[1],
@@ -973,6 +990,7 @@ def _contiguous_range_base_expr(
             begin_exprs=begin_exprs,
             iter_step_exprs=iter_step_exprs,
             iteration_indices=iteration_indices,
+            captured_exprs=captured_exprs,
         )
         if lhs is None or rhs is None:
             return None
@@ -994,6 +1012,7 @@ def _contiguous_range_base_expr(
             begin_exprs=begin_exprs,
             iter_step_exprs=iter_step_exprs,
             iteration_indices=iteration_indices,
+            captured_exprs=captured_exprs,
         )
         if index is None:
             return None
@@ -3642,6 +3661,37 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
+    placeholder_exprs = {
+        placeholder: ast.unparse(arg)
+        for placeholder, arg in zip(placeholders, args, strict=True)
+    }
+    captured_scalar_exprs: dict[int, str] = {}
+    scalar_index_nodes: dict[int, torch.fx.Node] = {}
+    for _fake, load_node, _subscript in loaded_tensors.values():
+        load_indices = load_node.args[1]
+        if not isinstance(load_indices, (list, tuple)):
+            continue
+        for index_node in load_indices:
+            if not isinstance(index_node, torch.fx.Node):
+                continue
+            index_value = index_node.meta.get("val")
+            if not isinstance(index_value, torch.Tensor) or index_value.ndim != 0:
+                continue
+            scalar_index_nodes[id(index_value)] = index_node
+            source = index_node
+            seen: set[torch.fx.Node] = set()
+            while (
+                source not in seen
+                and source.op == "call_function"
+                and source.target is _new_var
+                and source.args
+                and isinstance(source.args[0], torch.fx.Node)
+            ):
+                seen.add(source)
+                source = source.args[0]
+            if source in placeholder_exprs:
+                captured_scalar_exprs[id(index_value)] = placeholder_exprs[source]
     contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
@@ -4030,6 +4080,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                     begin_exprs=begin_exprs,
                     iter_step_exprs=iter_step_exprs,
                     iteration_indices=iteration_indices,
+                    captured_exprs=placeholder_exprs,
                 )
                 if base_expr is None:
                     raise RuntimeError(
@@ -4137,7 +4188,23 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 from helion._utils import is_scalar_index
 
                 if is_scalar_index(idx_meta):
-                    offset_expr = state.device_function.literal_expr(idx_meta)
+                    offset_expr = None
+                    if isinstance(idx_meta, torch.Tensor):
+                        index_node = scalar_index_nodes.get(id(idx_meta))
+                        if index_node is not None:
+                            offset_expr = _contiguous_range_base_expr(
+                                index_node,
+                                state=state,
+                                block_ids=block_ids,
+                                begin_exprs=begin_exprs,
+                                iter_step_exprs=iter_step_exprs,
+                                iteration_indices=iteration_indices,
+                                captured_exprs=placeholder_exprs,
+                            )
+                        if offset_expr is None:
+                            offset_expr = captured_scalar_exprs.get(id(idx_meta))
+                    if offset_expr is None:
+                        offset_expr = state.device_function.literal_expr(idx_meta)
                     hbm_parts.append(
                         offset_expr if resident_source else f"pl.ds({offset_expr}, 1)"
                     )
@@ -4150,7 +4217,6 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                             "Pallas DMA requires concrete bounded slice extents"
                         )
                     hbm_parts.append(f"pl.ds({start}, {stop - start})")
-                    hbm_needs_slice = True
                 else:
                     hbm_parts.append(":")
                 vmem_parts.append(":")
