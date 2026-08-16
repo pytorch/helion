@@ -359,6 +359,10 @@ class DeviceFunction:
         # nested control-flow graphs.
         self.pallas_remote_copy_tensor_ids: set[int] = set()
         self.pallas_remote_copy_storage_ids: set[int] = set()
+        # Read-only inputs selected for explicit local HBM-to-VMEM DMA at
+        # their load sites, rather than launcher-managed VMEM BlockSpecs.
+        self.pallas_direct_hbm_load_tensor_ids: set[int] = set()
+        self.pallas_hoisted_direct_dma_copy_names: set[str] = set()
         # Pallas: id(fake_tensor) → memory space, determined during
         # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
         # NOTE: Currently each tensor can only have one memory space.
@@ -392,6 +396,9 @@ class DeviceFunction:
             id(tensor) in self.pallas_remote_copy_tensor_ids
             or id(tensor.untyped_storage()) in self.pallas_remote_copy_storage_ids
         )
+
+    def is_pallas_direct_hbm_load(self, tensor: torch.Tensor) -> bool:
+        return id(tensor) in self.pallas_direct_hbm_load_tensor_ids
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
