@@ -571,6 +571,7 @@ def _apply_selector_to_variants(
     config: Config,
 ) -> _ResidentTransform:
     """Validate and apply a logical selector to every physical Ref variant."""
+    from .backend import PallasBackend
     from .backend import SliceAddressing
     from .backend import _slice_addressing
 
@@ -581,15 +582,6 @@ def _apply_selector_to_variants(
             logical_dim, variant.squeezed_dims, len(variant.shape)
         )
         lane_block = variant.shape[-1]
-        if (
-            _slice_addressing(input_value, logical_dim, lane_block)
-            is not SliceAddressing.DIRECT
-        ):
-            raise exc.BackendUnsupported(
-                "pallas",
-                f"the selector at {location} does not have direct VMEM "
-                "addressing for this config",
-            )
         width = (
             _variant_block_size(
                 selector.local_block_id, config, variant.worklist_factor
@@ -603,6 +595,28 @@ def _apply_selector_to_variants(
                 f"the selector at {location} has no concrete positive width "
                 "for this config",
             )
+        addressing = _slice_addressing(input_value, logical_dim, lane_block)
+        if addressing is not SliceAddressing.DIRECT:
+            dim_from_end = input_value.ndim - logical_dim - 1
+            bitwidth = input_value.dtype.itemsize * 8
+            backend = CompileEnvironment.current().backend
+            assert isinstance(backend, PallasBackend)
+            alignment = backend._get_pallas_required_alignment(
+                dim_from_end,
+                input_value.ndim,
+                bitwidth,
+            )
+            if (
+                selector.kind != "static"
+                or not isinstance(selector.begin, int)
+                or selector.begin % alignment
+                or width % alignment
+            ):
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    f"the selector at {location} is not aligned for direct "
+                    "VMEM addressing in this config",
+                )
         if squeeze and width != 1:
             raise exc.BackendUnsupported(
                 "pallas",
