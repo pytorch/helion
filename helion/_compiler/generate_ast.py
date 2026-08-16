@@ -155,6 +155,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.grouped_fori_dma_resource_cache: dict[
             tuple[object, ...], DmaResources
         ] = {}
+        self.pallas_immediate_hbm_dma_resource_cache: dict[
+            tuple[object, ...], DmaResources
+        ] = {}
         self._statements_by_owner_node_id: dict[
             int, list[tuple[list[ast.AST], ast.AST]]
         ] = {}
