@@ -50,6 +50,37 @@ log = logging.getLogger(__name__)
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
 
 
+@dataclasses.dataclass(frozen=True)
+class ConfigValueExpression:
+    """Small integer expression whose leaves are emitted config values."""
+
+    operation: str
+    arguments: tuple[int | str | ConfigValueExpression, ...]
+
+    def evaluate(self, config: Config) -> int:
+        def value(arg: int | str | ConfigValueExpression) -> int:
+            if isinstance(arg, ConfigValueExpression):
+                return arg.evaluate(config)
+            if isinstance(arg, str):
+                result = config[arg]
+                if not isinstance(result, int):
+                    raise TypeError(f"config value {arg!r} is not an integer")
+                return result
+            return arg
+
+        args = tuple(value(arg) for arg in self.arguments)
+        if self.operation == "config":
+            assert len(self.arguments) == 1 and isinstance(self.arguments[0], str)
+            return value(self.arguments[0])
+        if self.operation == "cdiv":
+            assert len(args) == 2
+            return (args[0] + args[1] - 1) // args[1]
+        if self.operation == "next_power_of_2":
+            assert len(args) == 1
+            return next_power_of_2(args[0])
+        raise ValueError(f"unknown config expression operation {self.operation!r}")
+
+
 @dataclasses.dataclass
 class TensorDescriptorLayoutGuard:
     ndim: int
@@ -303,6 +334,11 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        # Host integer helpers such as cdiv/next_power_of_2 deliberately return
+        # unbacked SymInts during tracing. Preserve the config expression beside
+        # that symbol so a fixed block size derived from a user tunable can still
+        # be resolved for each candidate configuration.
+        self.config_value_expressions: dict[sympy.Expr, ConfigValueExpression] = {}
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         self._debug_shape_rename_override: contextvars.ContextVar[
