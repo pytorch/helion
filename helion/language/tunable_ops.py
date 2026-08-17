@@ -11,6 +11,8 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import AutoSize
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import ConfigValueExpression
+from .._compiler.compile_environment import _symint_expr
 from .._compiler.type_info import TileIndexType
 from .._compiler.type_info import TypeInfo
 from .._compiler.type_info import _to_proxy
@@ -178,7 +180,14 @@ def _register_tunable_type(
     python_type = type(fragment_val.default())
     if not issubclass(python_type, (int, float, bool)):
         raise exc.TunableTypeNotSupported(python_type)
-    return NumericType.subtype(python_type).new_unbacked(origin)
+    result = NumericType.subtype(python_type).new_unbacked(origin)
+    if isinstance(result.value, torch.SymInt):
+        expr = _symint_expr(result.value)
+        if expr is not None:
+            env.config_value_expressions[expr] = ConfigValueExpression(
+                "config", (name_val,)
+            )
+    return result
 
 
 @_decorators.codegen(register_tunable, "common")

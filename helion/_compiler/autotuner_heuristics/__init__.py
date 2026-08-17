@@ -20,6 +20,7 @@ from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MatmulHeuristic
+from .triton import TritonB200MultiMatmulHeuristic
 from .triton import TritonH100MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonNarrowReductionHeuristic
@@ -62,6 +63,10 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         # The sm100 formula, promoted; registered after the table so it wins the
         # last-promote-wins compiler_default_config loop.
         TritonB200FormulaMatmulHeuristic,
+        # Front end 2: the multi-contraction path. Registered AFTER the single-matmul
+        # formula so the last-promote-wins compiler-default loop is unambiguous; it also
+        # declines whenever front end 1 fires, so exactly one of the two owns a kernel.
+        TritonB200MultiMatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
         TritonStandardReductionHeuristicSM90,
         TritonStandardReductionHeuristicSM100,
