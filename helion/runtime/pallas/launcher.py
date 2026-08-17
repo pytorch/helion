@@ -1648,10 +1648,14 @@ def _pallas_pl_kernel_jit_fn(
             )(*pipe_any)
 
         kernel_kwargs: dict[str, object] = {scratch_kw: scratch_shapes}
-        if collective_id is not None:
-            kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr]
-                collective_id=collective_id
-            )
+        # The VMEM estimator above uses the capacity reported by this TPU. Pass
+        # the same value to Mosaic; otherwise ``pl.kernel`` keeps its platform
+        # default and may compile a schedule that does not use the capacity
+        # Helion already proved is available.
+        kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr, bad-instantiation]
+            vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
+            collective_id=collective_id,
+        )
         return pl.kernel(  # type: ignore[union-attr]
             kernel_body,
             kernel_out_shape,

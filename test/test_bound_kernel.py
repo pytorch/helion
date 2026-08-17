@@ -413,6 +413,7 @@ class TestToCodePallas(TestCase):
         # Reuses the real pl.kernel compile core via the inlined _pallas_jax_call.
         self.assertIn("def _pallas_jax_call(", code)
         self.assertIn("pl.kernel(", code)
+        self.assertIn("vmem_limit_bytes=_get_vmem_limit_bytes", code)
         self.assertIn("def pallas_add(", code)
         with tempfile.TemporaryDirectory() as tmp:
             name = "pallas_add_jax_test"
