@@ -111,7 +111,7 @@ def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
         if (m, k, n) == (2, 4096, 256)
         else "persistent_blocked"
     )
-    return {
+    config = {
         "block_sizes": block_sizes,
         "l2_groupings": [1],
         "indexing": ["tensor_descriptor"] * 5,
@@ -125,6 +125,9 @@ def _small_m_swap_config(m: int, k: int, n: int) -> dict[str, Any]:
         "tcgen05_l2_swizzle_size": 1,
         "tcgen05_persistence_model": "static_persistent",
     }
+    if m in (16, 32):
+        config["tcgen05_aux_load_placement"] = "pre_acc_wait"
+    return config
 
 
 _KEYS_scale_mm_cute_swap_ab = _SMALL_M_SWAP_KEYS

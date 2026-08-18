@@ -2827,6 +2827,56 @@ def _codegen_cute_store_tcgen05_tile(
                     + "\n",
                 ]
             )
+        # Broadcast auxiliaries are partitioned against the same accumulator
+        # carrier, so their fragments share an index domain, coordinates, and
+        # validity predicate. Load all of them in one scalar edge loop instead
+        # of traversing that coordinate fragment once per auxiliary tensor.
+        if (
+            force_simt_edge_aux
+            and len(aux_step_records) >= 2
+            and all(rec.broadcast_axis is not None for rec in aux_step_records)
+        ):
+            for rec in aux_step_records:
+                lines.extend(
+                    [
+                        (
+                            f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                            f"{rec.ttr_aux_grouped}[(None, None, None, "
+                            "cutlass.Int32(_tcgen05_subtile))]\n"
+                        ),
+                        (
+                            f"{prelude_indent}{rec.aux_rmem} = "
+                            f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
+                            f"{rec.aux_dtype})\n"
+                        ),
+                        f"{prelude_indent}{rec.aux_rmem}.fill(0)\n",
+                    ]
+                )
+            first_rec = aux_step_records[0]
+            lines.extend(
+                [
+                    _simt_edge_coord_subtile_source(prelude_indent),
+                    (
+                        f"{prelude_indent}for _edge_i in range(cute.size("
+                        f"{first_rec.ttr_aux_subtile}.shape)):\n"
+                    ),
+                    f"{prelude_indent}    _coord = {ttr_cc_subtile}[_edge_i]\n",
+                    (
+                        f"{prelude_indent}    if cute.elem_less("
+                        f"_coord, ({m_size}, {n_size})):\n"
+                    ),
+                ]
+            )
+            for rec in aux_step_records:
+                lines.append(
+                    f"{prelude_indent}        {rec.aux_rmem}[_edge_i] = "
+                    f"{rec.ttr_aux_subtile}[_edge_i]\n"
+                )
+            for rec in aux_step_records:
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
+                )
+            return "".join(lines)
         for aux_idx, rec in enumerate(aux_step_records):
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
             if (
@@ -3489,6 +3539,26 @@ def _codegen_cute_store_tcgen05_tile(
         force_simt_edge_aux=simt_edge_only,
     )
     simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
+    # SIMT auxiliary loads are independent of the accumulator. Edge-only
+    # stores always issue them early; full-tile SIMT stores do so when the
+    # placement config explicitly requests it. In either case their GMEM
+    # latency overlaps the MMA tail, and TMEM is copied only after the wait.
+    prefetch_simt_aux = (
+        (
+            simt_edge_only
+            or (
+                tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                and not tcgen05_value.use_tma_store_epilogue
+            )
+        )
+        and bool(aux_steps_in_chain)
+        and not is_secondary_store
+    )
+    simt_acc_wait = (
+        "        if _tcgen05_subtile == 0:\n"
+        f"            {tcgen05_lifecycle.acc_pipeline}.consumer_wait("
+        f"{tcgen05_lifecycle.acc_consumer_state})\n"
+    )
     if tcgen05_value.use_tma_store_epilogue:
         tma_static_store_setup, tma_tile_store_setup = store_common_setup(
             tcgen05_value.tma_store_tensor,
@@ -3701,14 +3771,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
         *(
-            []
-            if is_secondary_store
-            else [
+            [
                 (
                     f"if {tcgen05_lifecycle.epi_active}:\n"
                     f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
                 )
             ]
+            if not (is_secondary_store or prefetch_simt_aux)
+            else []
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
@@ -3763,9 +3833,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"    if {tcgen05_lifecycle.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"{simt_acc_vec_prelude}"
-            f"        {acc_vec} = {simt_acc_vec_rhs}\n"
+            + (f"{simt_early_aux}{simt_acc_wait}" if prefetch_simt_aux else "")
+            + f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            + (
+                f"{simt_late_prelude}"
+                if prefetch_simt_aux
+                else f"{simt_acc_vec_prelude}"
+            )
+            + f"        {acc_vec} = {simt_acc_vec_rhs}\n"
             f"        {ttr_rd}.store({acc_vec})\n"
             # The secondary fan-out store reuses the still-live accumulator and
             # must not release it; the primary store owns the release + advance.

@@ -488,6 +488,31 @@ class TestPretunedCuteCodegen(TestCase):
                     (64, 64, 64),
                 )
 
+    def test_scale_mm_pretuned_swap_ab_aux_load_placement(self) -> None:
+        """Checked-in M=16/32 configs opt into pre-wait auxiliary loads."""
+
+        path = (
+            PRETUNED_KERNELS_DIR
+            / "scale_mm_cute"
+            / "_helion_aot_scale_mm_cute_cuda_sm100.py"
+        )
+        spec = importlib.util.spec_from_file_location("_scale_mm_cute_aot", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+
+        configs = dict(
+            zip(
+                heuristic._KEYS_scale_mm_cute_swap_ab,
+                heuristic._CONFIGS_scale_mm_cute_swap_ab,
+                strict=True,
+            )
+        )
+        selected = [config for (m, _k, _n), config in configs.items() if m in (16, 32)]
+        self.assertTrue(selected)
+        for config in selected:
+            self.assertEqual(config["tcgen05_aux_load_placement"], "pre_acc_wait")
+
     def test_scale_mm_explicit_epilogue_tile(self) -> None:
         module = _import_pretuned_kernel_module("scale_mm_cute")
         args = module._make_inputs(64, 128, 64)
@@ -534,8 +559,42 @@ class TestPretunedCuteCodegen(TestCase):
 
         module = _import_pretuned_kernel_module("scale_mm_cute")
         x, y, scale_a, scale_b = module._make_inputs(2, 4096, 256)
+        swap_args = (x, y, scale_a[:, 0], scale_b)
+        config = helion.Config(
+            block_sizes=[64, 16, 256],
+            l2_groupings=[1],
+            indexing=["tensor_descriptor"] * 5,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=9,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+        code = module.scale_mm_cute_swap_ab.bind(swap_args).to_triton_code(config)
         actual = module._scale_mm_cute(x, y, scale_a, scale_b)
         expected = module._scale_mm_torch(x, y, scale_a, scale_b)
+
+        aux0_loaded = code.index("tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()")
+        aux1_loaded = code.index("tcgen05_aux_loaded_1 = tcgen05_aux_rmem_1.load()")
+        acc_wait = code.index("if _tcgen05_subtile == 0:")
+        tmem_copy = code.index("cute.copy(tcgen05_tiled_copy_t2r")
+        self.assertLess(aux0_loaded, acc_wait)
+        self.assertLess(aux1_loaded, acc_wait)
+        self.assertLess(acc_wait, tmem_copy)
+        self.assertEqual(
+            code.count(
+                "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_0.shape))"
+            ),
+            1,
+        )
+        self.assertNotIn(
+            "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_1.shape))",
+            code,
+        )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
@@ -588,6 +647,52 @@ class TestPretunedCuteCodegen(TestCase):
         )
         self.assertNotIn("while tcgen05_work_tile_valid", one_shot_code)
         self.assertNotIn("while tcgen05_work_tile_valid", persistent_code)
+
+    def test_scale_mm_swap_ab_aux_load_placement(self) -> None:
+        """The placement config hoists full-tile SIMT scale loads."""
+
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs(16, 4096, 256)
+        swap_args = (x, y, scale_a[:, 0], scale_b)
+        base = {
+            "block_sizes": [64, 16, 256],
+            "l2_groupings": [1],
+            "indexing": ["tensor_descriptor"] * 5,
+            "pid_type": "persistent_blocked",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 9,
+            "tcgen05_acc_stages": 1,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_l2_swizzle_size": 1,
+            "tcgen05_persistence_model": "static_persistent",
+        }
+        with patch_cute_mma_support():
+            bound = module.scale_mm_cute_swap_ab.bind(swap_args)
+            codes = {
+                placement: bound.to_triton_code(
+                    helion.Config(
+                        **base,
+                        tcgen05_aux_load_placement=placement,
+                    )
+                )
+                for placement in ("pre_acc_wait", "post_acc_wait")
+            }
+
+        for placement, code in codes.items():
+            loop = code.index("for _tcgen05_subtile in cutlass.range")
+            aux_load = code.index("tcgen05_aux_loaded_0", loop)
+            tmem_copy = code.index("cute.copy(tcgen05_tiled_copy_t2r", loop)
+            if placement == "pre_acc_wait":
+                acc_wait = code.index("tcgen05_acc_pipeline.consumer_wait", loop)
+                self.assertLess(aux_load, acc_wait)
+                self.assertLess(acc_wait, tmem_copy)
+            else:
+                acc_wait = code.index("tcgen05_acc_pipeline.consumer_wait")
+                self.assertLess(acc_wait, loop)
+                self.assertLess(acc_wait, tmem_copy)
+                self.assertLess(tmem_copy, aux_load)
 
 
 @onlyBackends(["triton"])
