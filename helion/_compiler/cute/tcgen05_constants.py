@@ -497,13 +497,21 @@ TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY = (
 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY = (
     "tcgen05_grouped_worklist_source_m_tile"
 )
-TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE = 224
+# Compact source rows avoid padding small-M experts to the historical 224-row
+# default while retaining the 32-row granularity of the validated store wave.
+TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE = 32
+TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT = 224
 TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE = 256
 TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES = (64, 128)
 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES = (
-    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
+# N,M orientation maps the packed source-M tile onto the physical MMA-N mode.
+# Keep the role-specific alias so descriptor assertions do not appear to be
+# validating an MMA dimension against an unrelated packing knob.
+TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 TCGEN05_GROUPED_WORKLIST_MMA_M_TILE = 256
 TCGEN05_GROUPED_WORKLIST_STORE_SHAPE = (128, 32, 32)
 # The grouped scheduler publishes CTA M/N, validity, metadata/group indices,
@@ -528,3 +536,109 @@ TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY = (
 # CtaGroup.ONE tcgen05 MMA covers 64/128 M tiles; 256 M tiles are validated only
 # after projecting onto the CtaGroup.TWO path.
 TCGEN05_ONE_CTA_MAX_BLOCK_M = 128
+
+
+def resolve_tcgen05_grouped_worklist_mma_shape(
+    *,
+    cluster_m: object,
+    block_k: object,
+    source_m_tile: object,
+) -> tuple[int, int] | None:
+    """Resolve the physical ``(M, N)`` UMMA tile for a worklist profile.
+
+    The public DSL tile remains 256x128 for every grouped N,M worklist.  The
+    physical collective is instead 256x``source_m_tile`` for CtaGroup.TWO, or
+    128x32 for the compact CtaGroup.ONE profile.  Keep this policy shared by
+    MMA selection, codegen, and SMEM validation so logical tile dimensions do
+    not accidentally leak into physical resource accounting.
+    """
+    if (
+        type(cluster_m) is not int
+        or type(block_k) is not int
+        or type(source_m_tile) is not int
+        or block_k not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+    ):
+        return None
+    if cluster_m == 1:
+        if source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+            return None
+        return TCGEN05_ONE_CTA_MAX_BLOCK_M, source_m_tile
+    if cluster_m == 2:
+        return TCGEN05_GROUPED_WORKLIST_MMA_M_TILE, source_m_tile
+    return None
+
+
+def _append_aligned_tcgen05_smem(offset: int, size: int, alignment: int) -> int:
+    assert offset >= 0 and size >= 0 and alignment > 0
+    return ((offset + alignment - 1) // alignment) * alignment + size
+
+
+def tcgen05_grouped_worklist_smem_bytes(
+    *,
+    group_count: int,
+    device_split_sizes: bool,
+    sched_stage_count: int,
+    bm: int,
+    bn: int,
+    bk: int,
+    dtype_bytes: int,
+    ab_stages: int,
+    acc_stages: int,
+    c_stages: int,
+    cluster_m: int,
+) -> int:
+    """Return the conservative ordered SMEM footprint of an N,M worklist.
+
+    Charge the device-search dynamic-TensorMap allocation, the largest current
+    worklist mode. Runtime-direct and fixed-map modes omit some of these objects,
+    but every validated profile rounds to the same total at the final 1024-byte
+    C-ring alignment. Keeping one allocation model avoids coupling resource
+    admission to scheduler implementation details.
+    Keep allocation ordering synchronized with codegen because alignment padding
+    makes reordering observable at the admission boundary.
+    """
+    assert group_count > 0 and sched_stage_count > 0 and cluster_m in (1, 2)
+    assert bm > 0 and bn > 0 and bk > 0 and dtype_bytes > 0
+    assert ab_stages > 0 and acc_stages > 0 and c_stages > 0
+    a_stage_bytes = bm * bk * dtype_bytes
+    b_stage_bytes = bn * bk * dtype_bytes
+    assert a_stage_bytes % cluster_m == 0
+    assert b_stage_bytes % cluster_m == 0
+
+    offset = 0
+    # Scheduler work-tile mailbox, followed by optional device-derived problem
+    # metadata. Host worklists supply problem sizes and starts from global
+    # wrapper tensors, so they do not allocate either metadata array in SMEM.
+    offset = _append_aligned_tcgen05_smem(
+        offset,
+        TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT * sched_stage_count * 4,
+        16,
+    )
+    if device_split_sizes:
+        offset = _append_aligned_tcgen05_smem(offset, group_count * 4 * 4, 16)
+        offset = _append_aligned_tcgen05_smem(offset, group_count * 4, 16)
+    # TMEM allocator state and accumulator/scheduler pipeline mbarriers.
+    offset = _append_aligned_tcgen05_smem(offset, 4, 4)
+    offset = _append_aligned_tcgen05_smem(offset, 8, 8)
+    offset = _append_aligned_tcgen05_smem(offset, acc_stages * 2 * 8, 8)
+    offset = _append_aligned_tcgen05_smem(offset, sched_stage_count * 2 * 8, 8)
+    # A/B stages, mutable input TensorMaps, and AB barriers.
+    offset = _append_aligned_tcgen05_smem(
+        offset, ab_stages * a_stage_bytes // cluster_m, 128
+    )
+    offset = _append_aligned_tcgen05_smem(
+        offset, ab_stages * b_stage_bytes // cluster_m, 128
+    )
+    # Fixed-TensorMap modes overpay the 384 B below at the 227-KiB boundary.
+    offset = _append_aligned_tcgen05_smem(offset, 2 * 128, 128)
+    offset = _append_aligned_tcgen05_smem(offset, ab_stages * 8, 8)
+    # Mutable output TensorMap and the aligned TMA-store ring.
+    offset = _append_aligned_tcgen05_smem(offset, 128, 128)
+    c_smem_bytes = tcgen05_c_smem_bytes_per_cta(
+        epi_tile_m=TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[0],
+        epi_tile_n=TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[1],
+        dtype_bytes=dtype_bytes,
+        c_stages=c_stages,
+    )
+    return _append_aligned_tcgen05_smem(offset, c_smem_bytes, 1024)

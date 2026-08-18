@@ -20187,7 +20187,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):
-    """The cute backend hard-requires the 4.5.1 CuTe DSL API (enforced up front
+    """The cute backend hard-requires the 4.7 CuTe DSL API (enforced up front
     by ``CuteBackend.validate_environment``), so the pipeline emitters render
     the native CuTe calls directly with no per-build workarounds."""
 
@@ -21930,6 +21930,8 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tcgen05_frag_a="tCrA",
             tcgen05_frag_b="tCrB",
             mma_stage="mma_stage",
+            input_dtype_str="cutlass.BFloat16",
+            acc_dtype_str="cutlass.Float32",
             is_two_cta=True,
         )
         self.assertIsInstance(node, ast.If)
@@ -21946,11 +21948,45 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             body_src,
         )
 
+    def test_tcgen05_runtime_mma_issue_requires_bf16_fp32(self) -> None:
+        def build(input_dtype_str: str) -> ast.stmt:
+            return _build_tcgen05_mma_issue_stmt(
+                exec_active="exec_active",
+                tiled_mma="tiled_mma",
+                acc_frag="acc_frag",
+                tcgen05_frag_a="tCrA",
+                tcgen05_frag_b="tCrB",
+                mma_stage="mma_stage",
+                input_dtype_str=input_dtype_str,
+                acc_dtype_str="cutlass.Float32",
+                runtime_mma_n="runtime_mma_n",
+                runtime_instr_desc="runtime_instr_desc",
+                static_mma_n=224,
+                is_two_cta=True,
+            )
+
+        node = build("cutlass.BFloat16")
+        self.assertIn(
+            "tcgen05.mma.cta_group::2.kind::f16",
+            ast.unparse(node),
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "validated only for BF16/FP32",
+        ):
+            build("cutlass.Float16")
+
     def test_tcgen05_mma_accumulate_reset_two_cta_gates_to_leader(self) -> None:
-        node = _build_tcgen05_mma_accumulate_reset_stmt(
-            "exec_active", tiled_mma="tiled_mma", is_two_cta=True
+        stmts = _build_tcgen05_mma_accumulate_reset_stmt(
+            "exec_active",
+            tiled_mma="tiled_mma",
+            input_dtype_str="cutlass.BFloat16",
+            acc_dtype_str="cutlass.Float32",
+            is_two_cta=True,
         )
 
+        self.assertEqual(len(stmts), 1)
+        node = stmts[0]
         self.assertIsInstance(node, ast.If)
         self.assertEqual(
             ast.unparse(node.test),
