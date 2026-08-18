@@ -5125,7 +5125,7 @@ def _analyze_mma_output_stores(
             return None
         explicit_epi_tile_compatible &= (
             tensor_fake.dtype == analysis.lhs.source_fake.dtype
-            and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_steps)
+            and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_loads)
         )
         store_major = _tcgen05_tma_matrix_major(tensor_fake)
         if store_major is None:

@@ -73,7 +73,7 @@ from .stack_tensor import StackTensor
 if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
-    from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
+    from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
     from .._compiler.cute.fragment_epilogue import Tcgen05PairEpiloguePlan
     from .._compiler.inductor_lowering import CodegenState
@@ -99,6 +99,7 @@ class _AuxStepRecord:
     the per-output-tile setup and per-subtile load helpers.
     """
 
+    expr: _AuxiliaryTensorLoadExpr
     aux_tensor_name: str
     broadcast_axis: int | None
     has_leading_passthrough: bool
@@ -1873,7 +1874,7 @@ def _codegen_cute_store_tcgen05_tile(
         epi_warp_ids += ","
 
     # Per-aux-step plumbing: per-thread auxiliary tensor reads at
-    # the splice site. For each ``_AuxiliaryTensorStep`` in the
+    # the splice site. For each ``_AuxiliaryTensorLoadExpr`` in the
     # chain we register the auxiliary tensor as a kernel arg,
     # allocate fresh AST var names for the partitioning chain, and
     # later (inside each per-thread splice site) emit per-subtile
@@ -1882,8 +1883,8 @@ def _codegen_cute_store_tcgen05_tile(
     # ``ttr_aux_subtile.load()`` form. SIMT-store edge tiles use a
     # predicated GMEM-to-register copy first, so the aux read observes
     # the same runtime predicate as the output store.
-    aux_steps_in_chain: tuple[_AuxiliaryTensorStep, ...] = (
-        epilogue_chain.auxiliary_tensor_steps if epilogue_chain is not None else ()
+    aux_steps_in_chain: tuple[_AuxiliaryTensorLoadExpr, ...] = (
+        epilogue_chain.auxiliary_tensor_loads if epilogue_chain is not None else ()
     )
     tcgen05_aux_load_placement = df.config.get(
         TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
@@ -1929,6 +1930,7 @@ def _codegen_cute_store_tcgen05_tile(
         )
         aux_step_records.append(
             _AuxStepRecord(
+                expr=aux_step,
                 aux_tensor_name=aux_tensor_name,
                 broadcast_axis=aux_step.broadcast_axis,
                 has_leading_passthrough=aux_torch_tensor.ndim == 3,
@@ -2463,7 +2465,7 @@ def _codegen_cute_store_tcgen05_tile(
 
         For the broadcast form the helper first builds a 2-D view
         of the underlying rank-1 tensor with stride 0 on the
-        orthogonal axis (see :class:`_AuxiliaryTensorStep` for the
+        orthogonal axis (see :class:`_AuxiliaryTensorLoadExpr` for the
         canonical contract).
 
         When ``define_thr_copy_t2r`` is True the helper emits the
@@ -3118,12 +3120,35 @@ def _codegen_cute_store_tcgen05_tile(
             force_simt_edge_aux=force_simt_edge_aux,
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
         )
-        aux_locals: tuple[str, ...] = tuple(rec.aux_loaded for rec in aux_step_records)
+        aux_locals_by_expr = {rec.expr: rec.aux_loaded for rec in aux_step_records}
+        assert len(aux_locals_by_expr) == len(aux_step_records)
+        if (
+            len(epilogue_chain.steps) == 1
+            and epilogue_chain.steps[0].hoistable_aux_expr is not None
+        ):
+            # The auxiliary expression does not depend on the accumulator.
+            # Form it with the auxiliary-load prelude so pre-wait placement can
+            # overlap its loads and elementwise operations with the MMA tail.
+            expr_step = epilogue_chain.steps[0]
+            aux_expr_prelude, aux_expr = (
+                expr_step.render_hoistable_aux_prelude_and_expr(
+                    aux_locals_by_expr,
+                    df.new_var,
+                    prelude_indent,
+                )
+            )
+            final_expr = df.new_var("tcgen05_chain_step")
+            rendered_step = expr_step.render_with_hoisted_aux(loaded, aux_expr)
+            return (
+                early_aux_prelude + aux_expr_prelude,
+                prelude_load + f"{prelude_indent}{final_expr} = {rendered_step}\n",
+                f"({final_expr}).to({target_dtype})",
+            )
         chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
             loaded,
             df.new_var,
             prelude_indent,
-            aux_locals_by_step=aux_locals or None,
+            aux_locals_by_expr=aux_locals_by_expr or None,
         )
         return (
             early_aux_prelude,
