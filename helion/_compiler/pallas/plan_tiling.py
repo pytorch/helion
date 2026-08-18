@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 import torch
@@ -16,11 +17,14 @@ import torch
 from ... import exc
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
     from ..host_function import SymbolOrigin
     from ..tile_dispatch import TileStrategyDispatch
+    from .memory_access import MemoryAccess
 
 
 @dataclass
@@ -343,30 +347,59 @@ def _analyze_subscript_patterns(
     from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
-    patterns: list[IndexingPattern] = []
+    patterns = _detect_subscript_patterns(tensor, subscript, node)
     tensor_dim = 0  # Track which tensor dimension we're indexing
+    for pattern in patterns:
+        if isinstance(pattern, NonePattern):
+            continue
+        # Update dim_tilings based on the detected pattern
+        _update_tiling_decision(tensor, pattern, tensor_dim, dim_tilings, env, config)
+        tensor_dim += 1
+    return patterns
 
-    for i, idx in enumerate(subscript):
-        if idx is None:
-            # None adds an unsqueezed dimension but doesn't consume a tensor dimension
+
+def _detect_subscript_patterns(
+    tensor: torch.Tensor,
+    subscript: list[object],
+    node: torch.fx.Node,
+) -> list[IndexingPattern]:
+    """Describe an access without applying config-dependent tiling decisions."""
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    patterns: list[IndexingPattern] = []
+    tensor_dim = 0
+    for position, index in enumerate(subscript):
+        if index is None:
             patterns.append(NonePattern())
             continue
-
         if tensor_dim >= tensor.ndim:
             raise AssertionError(
                 f"Indexing {tensor_dim}th dim but tensor only has {tensor.ndim} dims"
             )
-
-        # Detect different indexing patterns
-        pattern = _detect_indexing_pattern(idx, tensor, tensor_dim, node, i, env)
-        patterns.append(pattern)
-
-        # Update dim_tilings based on the detected pattern
-        _update_tiling_decision(tensor, pattern, tensor_dim, dim_tilings, env, config)
-
+        patterns.append(
+            _detect_indexing_pattern(index, tensor, tensor_dim, node, position, env)
+        )
         tensor_dim += 1
-
     return patterns
+
+
+def build_pallas_memory_access(node: torch.fx.Node) -> MemoryAccess:
+    """Build shared memory metadata before config-dependent tiling is available."""
+    from .memory_access import build_memory_access
+
+    tensor_node, raw_subscript = node.args[:2]
+    assert isinstance(tensor_node, torch.fx.Node)
+    assert isinstance(raw_subscript, (list, tuple))
+    tensor = tensor_node.meta.get("val")
+    assert isinstance(tensor, torch.Tensor)
+    subscript = list(cast("list[object] | tuple[object, ...]", raw_subscript))
+    return build_memory_access(
+        node,
+        tensor,
+        subscript,
+        _detect_subscript_patterns(tensor, subscript, node),
+    )
 
 
 def _is_supported_slice(idx: slice) -> bool:
@@ -535,6 +568,69 @@ def resident_block_elements(
     from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
+    return _resident_block_elements(
+        tensor,
+        patterns,
+        lambda block_id: env.block_sizes[block_id].from_config(config),
+    )
+
+
+def minimum_resident_block_elements(
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    block_size_minimums: dict[int, int],
+) -> int | None:
+    """Minimum resident elements permitted by any block-size configuration."""
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    patterns: list[IndexingPattern] = []
+    tensor_dim = 0
+    for position, index in enumerate(subscript):
+        if tensor_dim >= tensor.ndim:
+            return None
+        pattern = _detect_indexing_pattern(
+            index,
+            tensor,
+            tensor_dim,
+            node,
+            position,
+            env,
+        )
+        patterns.append(pattern)
+        if not isinstance(pattern, NonePattern):
+            tensor_dim += 1
+    patterns.extend(
+        ArbitrarySlicePattern(slice(None)) for _ in range(tensor_dim, tensor.ndim)
+    )
+
+    def minimum_block_size(block_id: int) -> int:
+        from ..compile_environment import FixedBlockSizeSource
+
+        canonical_id = env.canonical_block_id(block_id)
+        if minimum := block_size_minimums.get(canonical_id):
+            return minimum
+        source = env.block_sizes[canonical_id].block_size_source
+        if isinstance(source, FixedBlockSizeSource):
+            value = env.try_concretize_symint(source.value)
+            if isinstance(value, int):
+                return value
+        # Unknown non-tunable sources cannot prove structural impossibility.
+        return 1
+
+    return _resident_block_elements(
+        tensor,
+        patterns,
+        minimum_block_size,
+    )
+
+
+def _resident_block_elements(
+    tensor: torch.Tensor,
+    patterns: list[IndexingPattern],
+    block_size_for: Callable[[int], int | torch.SymInt | None],
+) -> int | None:
     elements = 1
     tdim = 0
     for p in patterns:
@@ -545,7 +641,7 @@ def resident_block_elements(
             # No support for dynamic shapes.
             return None
         if isinstance(p, (TilePattern, TileIndexWithOffsetPattern)):
-            bs = env.block_sizes[p.block_id].from_config(config)
+            bs = block_size_for(p.block_id)
             if isinstance(bs, int):
                 dim_size = min(bs, dim_size)
         elif isinstance(p, (TileBeginWithOffsetPattern, ArbitraryIndexPattern)):

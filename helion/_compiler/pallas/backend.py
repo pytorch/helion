@@ -294,6 +294,7 @@ class PallasBackend(Backend):
             "pallas_worklist_grouping",
             "pallas_loop_type",
             "pallas_load_buffer_count",
+            "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
         }
     )
@@ -1523,6 +1524,10 @@ class PallasBackend(Backend):
 
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
+
+        from .tracing_ops import plan_grid_indirect_accesses
+
+        plan_grid_indirect_accesses(graphs)
 
         from .view_ops import plan_resident_ref_views
 

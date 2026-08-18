@@ -1,11 +1,4 @@
-"""Pallas indirect-gather/scatter lowering.
-
-No native gather in Pallas. Floating ``table[idx]`` emits
-``one_hot(idx, V) @ table``; int32 ``table[idx]`` emits a boolean one-hot
-select and reduction. Scatter store projects source lanes to target rows with
-one-hot matrices, resolves duplicate lanes within one program, and merges
-updates with the existing target block.
-"""
+"""Pallas one-hot gather/scatter planning and fallback lowering."""
 
 from __future__ import annotations
 
@@ -20,12 +13,64 @@ from ..ast_extension import expr_from_string
 if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..inductor_lowering import CodegenState
+    from .memory_access import MemoryAccess
     from .plan_tiling import IndexingPattern
+
+
+def one_hot_access_supported(access: MemoryAccess) -> bool:
+    """Whether one-hot lowering supports the access independent of tiling."""
+    from .memory_access import MemoryAccessKind
+    from .memory_access import memory_access_mask
+    from .memory_access import tensor_index_positions
+
+    positions = tensor_index_positions(access)
+    if len(positions) != 1 or memory_access_mask(access) is not None:
+        return False
+    position = positions[0]
+    if access.kind is MemoryAccessKind.LOAD:
+        return access.tensor.dtype.is_floating_point or (
+            position == 0 and access.tensor.dtype == torch.int32
+        )
+    if access.kind is not MemoryAccessKind.STORE:
+        return False
+    index = access.subscript[position]
+    index_value = index.meta.get("val") if isinstance(index, torch.fx.Node) else None
+    return (
+        access.tensor.dtype.is_floating_point
+        and position == 0
+        and isinstance(index_value, torch.Tensor)
+        and index_value.ndim == 1
+    )
 
 
 # Fail early on oversized tables instead of a generic Mosaic OOM.
 # Replace with real VMEM budget accounting once available.
 _GATHER_VMEM_THRESHOLD_BYTES: int = 16 << 20  # 16 MiB
+
+
+def one_hot_access_may_fit_vmem(
+    node: torch.fx.Node,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    block_size_minimums: dict[int, int],
+) -> bool:
+    """Whether some tiling could keep a one-hot access below the VMEM guard.
+
+    Unknown symbolic extents are left to per-config planning rather than
+    rejecting the kernel structurally.
+    """
+    from .plan_tiling import minimum_resident_block_elements
+
+    resident_elements = minimum_resident_block_elements(
+        node,
+        tensor,
+        subscript,
+        block_size_minimums,
+    )
+    return (
+        resident_elements is None
+        or resident_elements * tensor.dtype.itemsize <= _GATHER_VMEM_THRESHOLD_BYTES
+    )
 
 
 @dataclass(frozen=True)
@@ -53,11 +98,16 @@ def build_gather_plan(
     indirect_positions: list[int],
     patterns: list[IndexingPattern],
     config: Config,
+    has_extra_mask: bool,
 ) -> GatherPlan:
     """Validate the gather site and return its plan. Runs during plan_tiling."""
     from ..compile_environment import CompileEnvironment
     from .plan_tiling import resident_block_elements
 
+    if has_extra_mask:
+        raise NotImplementedError(
+            "Pallas gather: extra_mask is not supported for tensor indices"
+        )
     if len(indirect_positions) > 1:
         raise NotImplementedError(
             "Pallas gather: multiple indirect dims are not supported"
@@ -75,15 +125,9 @@ def build_gather_plan(
         )
 
     elements = resident_block_elements(tensor, patterns, config)
-    if elements is not None:
-        table_bytes = elements * tensor.dtype.itemsize
-        if table_bytes > _GATHER_VMEM_THRESHOLD_BYTES:
-            raise NotImplementedError(
-                f"Pallas gather: resident block is {table_bytes} bytes, exceeds "
-                f"the {_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The "
-                "current codegen requires the full gather axis in VMEM; reduce "
-                "V, tile the broadcast dims, or use a half-precision dtype."
-            )
+    _check_resident_block_size(
+        elements * tensor.dtype.itemsize if elements is not None else None
+    )
 
     # MXU truncates fp32 to bf16 without HIGHEST. For bf16/fp16 the truncation is a no-op.
     use_highest = tensor.dtype not in (torch.bfloat16, torch.float16)
@@ -104,18 +148,39 @@ def build_gather_plan(
     )
 
 
+def _check_resident_block_size(table_bytes: int | None) -> None:
+    from ...exc import InvalidConfig
+
+    if table_bytes is None or table_bytes <= _GATHER_VMEM_THRESHOLD_BYTES:
+        return
+    raise InvalidConfig(
+        f"Pallas gather: resident block is {table_bytes} bytes, exceeds "
+        f"the {_GATHER_VMEM_THRESHOLD_BYTES} byte VMEM threshold. The "
+        "current codegen requires the full gather axis in VMEM; reduce "
+        "V, tile the broadcast dims, or use a half-precision dtype."
+    )
+
+
 def build_scatter_plan(
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
     indirect_positions: list[int],
+    patterns: list[IndexingPattern],
+    config: Config,
+    has_extra_mask: bool,
 ) -> ScatterPlan:
     """Validate a Pallas scatter site and return its one-hot plan."""
     from ..compile_environment import CompileEnvironment
+    from .plan_tiling import resident_block_elements
 
     if not tensor.dtype.is_floating_point:
         raise NotImplementedError(
             f"Pallas scatter: only floating-point output dtypes are supported, "
             f"got {tensor.dtype}"
+        )
+    if has_extra_mask:
+        raise NotImplementedError(
+            "Pallas scatter: extra_mask is not supported for tensor indices"
         )
     if len(indirect_positions) > 1:
         raise NotImplementedError(
@@ -131,6 +196,10 @@ def build_scatter_plan(
             "Pallas scatter: only rank-1 tensor indices are supported"
         )
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    elements = resident_block_elements(tensor, patterns, config)
+    _check_resident_block_size(
+        elements * tensor.dtype.itemsize if elements is not None else None
+    )
     return ScatterPlan(
         indirect_pos=indirect_pos,
         jnp_dtype=jnp_dtype,
@@ -152,6 +221,8 @@ def emit_gather(
 
     Contracting dim is ``jnp.ndim(idx)``: one_hot adds one trailing axis.
     """
+    from . import codegen as pallas_codegen
+
     ast_subscripts = state.ast_args[1]
     assert isinstance(ast_subscripts, list)
     ast_idx = ast_subscripts[plan.indirect_pos]
@@ -161,8 +232,6 @@ def emit_gather(
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
-
-    from . import codegen as pallas_codegen
 
     parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
     base_index = ", ".join(parts)
@@ -262,6 +331,7 @@ def emit_scatter_store(
     this Pallas program; duplicate writes from different programs have the same
     unspecified winner semantics as regular parallel stores in other backends.
     """
+
     oh = _scatter_one_hot_name(state, plan, name)
     m = f"jnp.shape({oh})[0]"
     eye = f"jnp.eye({m}, dtype=jnp.float32)"

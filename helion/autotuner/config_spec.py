@@ -515,6 +515,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_load_buffer_count",
+        "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "xcd_remap",
     }
@@ -545,6 +546,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_load_buffer_count",
+        "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "cute_vector_widths",
         *BACKEND_TUNABLE_KEYS,
@@ -747,6 +749,8 @@ class ConfigSpec:
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
+        self.pallas_indirect_access_modes: tuple[str, ...] = ()
+        self.pallas_indirect_dma_requires_fori: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
@@ -2047,8 +2051,38 @@ class ConfigSpec:
                 config,
                 fix_invalid=_fix_invalid,
             )
+        indirect_modes = (
+            self.pallas_indirect_access_modes
+            if self.supports_config_key("pallas_indirect_access_mode")
+            else ()
+        )
+        if indirect_modes:
+            mode = config.setdefault("pallas_indirect_access_mode", indirect_modes[0])
+            if mode not in indirect_modes:
+                if _fix_invalid:
+                    config["pallas_indirect_access_mode"] = indirect_modes[0]
+                else:
+                    raise InvalidConfig(
+                        "pallas_indirect_access_mode must be one of "
+                        f"{indirect_modes!r}, got {mode!r}"
+                    )
+        else:
+            config.pop("pallas_indirect_access_mode", None)
         if self.has_pallas_inner_loops:
-            if self.has_symbolic_or_data_dependent_bounds:
+            if (
+                self.pallas_indirect_dma_requires_fori
+                and config.get("pallas_indirect_access_mode") == "dma"
+            ):
+                loop_type = config.setdefault("pallas_loop_type", "fori_loop")
+                if loop_type != "fori_loop":
+                    if _fix_invalid:
+                        config["pallas_loop_type"] = "fori_loop"
+                    else:
+                        raise InvalidConfig(
+                            "pallas_indirect_access_mode='dma' requires "
+                            "pallas_loop_type='fori_loop' for inner-loop gathers"
+                        )
+            elif self.has_symbolic_or_data_dependent_bounds:
                 # "unroll" uses Python range() which can't handle traced bounds.
                 # Between the remaining options, prefer "fori_loop": it handles
                 # both DMA-aligned and unaligned inner blocks, while
@@ -2081,7 +2115,6 @@ class ConfigSpec:
                 config.pop("pallas_load_buffer_count")
         else:
             config.pop("pallas_load_buffer_count", None)
-
         if (
             self.supports_config_key("pallas_pre_broadcast")
             and self.has_pallas_inner_loops
@@ -2619,6 +2652,13 @@ class ConfigSpec:
             and self.pallas_load_buffer_count.length > 0
         ):
             fields["pallas_load_buffer_count"] = self.pallas_load_buffer_count
+        if (
+            self.supports_config_key("pallas_indirect_access_mode")
+            and self.pallas_indirect_access_modes
+        ):
+            fields["pallas_indirect_access_mode"] = EnumFragment(
+                choices=self.pallas_indirect_access_modes
+            )
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
@@ -2650,7 +2690,12 @@ class ConfigSpec:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
             choices = AUTOTUNED_PALLAS_LOOP_TYPES
-            if self.has_symbolic_or_data_dependent_bounds:
+            if (
+                self.pallas_indirect_dma_requires_fori
+                and self.pallas_indirect_access_modes == ("dma",)
+            ):
+                choices = ("fori_loop",)
+            elif self.has_symbolic_or_data_dependent_bounds:
                 # Exclude "unroll" (uses Python range(), can't handle traced
                 # bounds) and put "fori_loop" first: it handles both DMA-aligned
                 # and unaligned inner blocks, while "emit_pipeline" fails on
