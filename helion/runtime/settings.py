@@ -762,8 +762,9 @@ class Settings(_Settings):
             "without constraining the search space."
         ),
         "disable_autotuner_heuristics": (
-            "If True, disable compiler/autotuner heuristics such as compiler seed "
-            "configs. User-provided autotune_seed_configs are unaffected. "
+            "If True, disable compiler seed generation and promotion. Correctness "
+            "fact hooks still run so explicit configs normalize safely. User-provided "
+            "autotune_seed_configs are unaffected. "
             "Set HELION_DISABLE_AUTOTUNER_HEURISTICS=1 to disable globally."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",

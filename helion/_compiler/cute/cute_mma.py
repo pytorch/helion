@@ -28,6 +28,8 @@ import os
 import textwrap
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
+from typing import NamedTuple
 from typing import cast
 
 import torch
@@ -135,7 +137,6 @@ from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
@@ -147,7 +148,7 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
-from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_shape
+from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -503,6 +504,21 @@ class _Rank3RhsGroupedProof:
     @property
     def is_worklist(self) -> bool:
         return self.worklist_lhs is not None
+
+
+class Tcgen05GroupedWorklistSeedFacts(NamedTuple):
+    """Structural proof plus first-binding hints for worklist seed ranking.
+
+    The integer fields are deliberately named ``*_hint``: they are not static
+    compiler facts and must not escape the grouped-worklist heuristic.
+    """
+
+    groups_hint: int
+    packed_m_hint: int
+    n_hint: int
+    k_hint: int
+    b_major: Literal["k", "n"]
+    device_split_sizes: bool
 
 
 @dataclass(frozen=True)
@@ -1734,6 +1750,7 @@ def _trace_rank3_grouped_rhs_nt_operand(
     *,
     m_block_id: int | None = None,
     allow_grouped_k_mask: bool = False,
+    allow_mn_major: bool = False,
 ) -> _MmaOperandInfo | None:
     """Recognize ``B_grouped[group, tile_n, tile_k].T`` as logical ``[K, N]``.
 
@@ -1847,7 +1864,8 @@ def _trace_rank3_grouped_rhs_nt_operand(
         (source_fake.shape[2], source_fake.shape[1]),
         (source_fake.stride(2), source_fake.stride(1)),
     )
-    if _tcgen05_tma_matrix_major(logical_fake) not in ("row", "col"):
+    matrix_major = _tcgen05_tma_matrix_major(logical_fake)
+    if matrix_major != "col" and not (allow_mn_major and matrix_major == "row"):
         return None
     return _MmaOperandInfo(
         load=load_node,
@@ -1874,6 +1892,7 @@ def _trace_to_mma_operand(
     cg: GenerateAST | None = None,
     rank3_rhs_m_block_id: int | None = None,
     allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
 ) -> _MmaOperandInfo | None:
     if role == "rhs" and allow_rank3_rhs_nt:
         rank3_rhs = _trace_rank3_grouped_rhs_nt_operand(
@@ -1881,6 +1900,7 @@ def _trace_to_mma_operand(
             node,
             m_block_id=rank3_rhs_m_block_id,
             allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_mn_major=allow_rank3_rhs_mn_major,
         )
         if rank3_rhs is not None:
             return rank3_rhs
@@ -2404,6 +2424,7 @@ def _has_mma_operands(
     cg: GenerateAST | None = None,
     rank3_rhs_m_block_id: int | None = None,
     allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
 ) -> bool:
     """Check if lhs/rhs come from loads with MMA-compatible dtypes."""
     lhs_info = _trace_to_mma_operand(
@@ -2419,6 +2440,7 @@ def _has_mma_operands(
         cg=cg,
         rank3_rhs_m_block_id=rank3_rhs_m_block_id,
         allow_grouped_k_mask=allow_grouped_k_mask,
+        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
     )
     if lhs_info is None or rhs_info is None:
         return False
@@ -2777,6 +2799,9 @@ def _analyze_rank3_rhs_grouped_search_operands(
         rhs_node,
         role="rhs",
         allow_rank3_rhs_nt=True,
+        # This early DeviceIR pass only recovers axes. Mode-specific layout
+        # admission is repeated by ``_prove_rank3_rhs_grouped_mma``.
+        allow_rank3_rhs_mn_major=True,
         cg=graph_view,
         allow_grouped_k_mask=True,
     )
@@ -2792,6 +2817,16 @@ def _analyze_rank3_rhs_grouped_search_operands(
     canonical_block_id = env.canonical_block_id
     n_block_id = canonical_block_id(rhs.rhs_n_block_id)
     k_block_id = canonical_block_id(rhs.rhs_k_block_id)
+    lhs_indices = lhs.load.args[1] if len(lhs.load.args) > 1 else None
+    lhs_k_block_id = (
+        _rank3_rhs_exact_index_block_id(lhs_indices[-1], reduction=None)
+        if isinstance(lhs_indices, list | tuple)
+        and lhs_indices
+        and isinstance(lhs_indices[-1], Node)
+        else None
+    )
+    if lhs_k_block_id is None or canonical_block_id(lhs_k_block_id) != k_block_id:
+        return None
     if len(device_ir.grid_block_ids) != 1:
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
@@ -2851,8 +2886,9 @@ def _analyze_rank3_rhs_grouped_search_operands(
     )
     if lhs.source_fake.dtype != rhs.source_fake.dtype:
         return None
-    if not env.known_equal(lhs.source_fake.size(-1), rhs.source_fake.size(-1)):
-        return None
+    # Dynamic inputs can carry distinct K symbols. Admission relies on the
+    # proven shared reduction block-id above, never coincidentally equal size
+    # hints; the host K-equality guard and full grouped proof stay authoritative.
     return _MmaOperandAnalysis(lhs=lhs, rhs=rhs)
 
 
@@ -2864,6 +2900,7 @@ def is_mma_compatible_aten(
     cg: GenerateAST | None = None,
     rank3_rhs_m_block_id: int | None = None,
     allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
 ) -> bool:
     """Check if an aten addmm/mm node can use MMA."""
     args = node.args
@@ -2889,6 +2926,7 @@ def is_mma_compatible_aten(
         cg=cg,
         rank3_rhs_m_block_id=rank3_rhs_m_block_id,
         allow_grouped_k_mask=allow_grouped_k_mask,
+        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
     )
 
 
@@ -3095,6 +3133,7 @@ def can_codegen_cute_mma_aten(
     cg: GenerateAST | None = None,
     rank3_rhs_m_block_id: int | None = None,
     allow_grouped_k_mask: bool = False,
+    allow_rank3_rhs_mn_major: bool = False,
 ) -> bool:
     return (
         is_mma_compatible_aten(
@@ -3104,6 +3143,7 @@ def can_codegen_cute_mma_aten(
             cg=cg,
             rank3_rhs_m_block_id=rank3_rhs_m_block_id,
             allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
         )
         and _mma_result_can_be_deferred(node)
         and _mma_loop_is_exclusive(node)
@@ -3174,6 +3214,35 @@ def analyze_cute_mma_node(
                         node,
                         worklist_lhs,
                         n_block_id=operands.n_block_id,
+                    )
+                    if worklist_store is not None:
+                        output_store_analysis = _analyze_packed_split_mma_output_store(
+                            node,
+                            operands,
+                            worklist_store,
+                            graphs=device_ir.graphs,
+                        )
+            elif (segment_group := operands.rhs.rhs_segment_group) is not None:
+                graph_view = cast(
+                    "GenerateAST",
+                    _MmaSearchGraphView(device_ir.graphs),
+                )
+                segment_lhs = _rank3_rhs_segment_lhs_info(
+                    graph_view,
+                    operands.lhs,
+                    operands.rhs,
+                    segment_block_id=segment_group.segment_block_id,
+                    m_block_id=operands.m_block_id,
+                    k_block_id=operands.k_block_id,
+                )
+                if segment_lhs is not None:
+                    worklist_store = _rank3_rhs_worklist_store_info(
+                        graph_view,
+                        node,
+                        segment_lhs,
+                        segment_group,
+                        n_block_id=operands.n_block_id,
+                        allow_store_extent_metadata=True,
                     )
                     if worklist_store is not None:
                         output_store_analysis = _analyze_packed_split_mma_output_store(
@@ -3259,6 +3328,7 @@ def _prove_rank3_rhs_grouped_mma(
     with_acc = True
     grouped_mode = _tcgen05_grouped_mode(config)
     allow_grouped_k_mask = grouped_mode is not None
+    allow_rank3_rhs_mn_major = grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
     if not can_codegen_cute_mma_aten(
         node,
         with_acc,
@@ -3266,6 +3336,7 @@ def _prove_rank3_rhs_grouped_mma(
         cg=cg,
         rank3_rhs_m_block_id=axes.m_block_id,
         allow_grouped_k_mask=allow_grouped_k_mask,
+        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
     ):
         return None
     lhs_node = node.args[1] if with_acc else node.args[0]
@@ -3287,6 +3358,7 @@ def _prove_rank3_rhs_grouped_mma(
         cg=cg,
         rank3_rhs_m_block_id=axes.m_block_id,
         allow_grouped_k_mask=allow_grouped_k_mask,
+        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
     )
     if lhs_info is None or rhs_info is None or not rhs_info.rhs_rank3_grouped_nt:
         return None
@@ -3300,10 +3372,11 @@ def _prove_rank3_rhs_grouped_mma(
         lhs_info.grouped_k_mask is not None or rhs_info.grouped_k_mask is not None
     ) and k_mask is None:
         return None
+    rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
     if not (
         lhs_fake.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and _tcgen05_tma_matrix_major(lhs_fake) == "row"
-        and _tcgen05_tma_matrix_major(rhs_fake) in ("row", "col")
+        and (rhs_major == "col" or (allow_rank3_rhs_mn_major and rhs_major == "row"))
         and rhs_info.rhs_n_block_id == canonical_block_id(axes.n_block_id)
         and rhs_info.rhs_k_block_id == canonical_block_id(axes.k_block_id)
         and (
@@ -3439,6 +3512,106 @@ def _prove_rank3_rhs_grouped_mma(
         worklist_store=worklist_store,
         packed_split=packed_split,
     )
+
+
+def tcgen05_grouped_worklist_seed_facts(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    fact: MatmulFact,
+    *,
+    source_m_tile: int,
+) -> Tcgen05GroupedWorklistSeedFacts | None:
+    """Prove a grouped N,M worklist and expose ranking-only shape hints.
+
+    The source-row tile is an explicit kernel constexpr.  Passing it into the
+    proof keeps compiler seeds tied to the physical A packing chosen by the
+    caller. Shape hints only rank shape-general seeds; config normalization and
+    the runtime worklist validator remain the correctness gates.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    host_function = device_ir.host_function
+    if (
+        host_function is None
+        or fact.m_block_id is None
+        or fact.n_block_id is None
+        or fact.k_block_id is None
+        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        or len(device_ir.root_ids) != 1
+        or len(device_ir.grid_block_ids) != 1
+    ):
+        return None
+    grid_block_ids = device_ir.grid_block_ids[0]
+    if len(grid_block_ids) != 3 or grid_block_ids[1:] != [
+        fact.m_block_id,
+        fact.n_block_id,
+    ]:
+        return None
+    cluster_m = (
+        1 if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE else 2
+    )
+    axes = _GroupedMmaAxes(
+        m_block_id=fact.m_block_id,
+        n_block_id=fact.n_block_id,
+        k_block_id=fact.k_block_id,
+        segment_block_id=grid_block_ids[0],
+    )
+    # BK64 only makes this probe structurally valid; the proof is block-K
+    # agnostic, and seed ranking still emits both reviewed BK64/BK128 families.
+    probe_config = {
+        "block_sizes": [256, 128, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": cluster_m,
+        "tcgen05_cluster_n": 1,
+        TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_WORKLIST_NM,
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY: source_m_tile,
+    }
+    graph_view = _MmaSearchGraphView(device_ir.graphs)
+    if CompileEnvironment.has_current():
+        assert CompileEnvironment.current() is env, (
+            "grouped worklist seed proof must use the provided compile environment"
+        )
+        env_context = contextlib.nullcontext()
+    else:
+        env_context = env
+    with env_context, host_function:
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if (
+                    node.op != "call_function"
+                    or node.target is not torch.ops.aten.addmm.default
+                ):
+                    continue
+                proof = _prove_rank3_rhs_grouped_mma(
+                    cast("GenerateAST", graph_view),
+                    node,
+                    config=probe_config,
+                    axes=axes,
+                )
+                if proof is None or not proof.is_worklist:
+                    continue
+                rhs_major = proof.rhs.matrix_major
+                if rhs_major == "col":
+                    b_major: Literal["k", "n"] = "k"
+                elif rhs_major == "row":
+                    b_major = "n"
+                else:
+                    continue
+                groups = env.size_hint(proof.rhs.source_fake.shape[0])
+                packed_m = env.size_hint(proof.lhs.source_fake.shape[0])
+                n = env.size_hint(proof.rhs.source_fake.shape[1])
+                k = env.size_hint(proof.rhs.source_fake.shape[2])
+                if min(groups, packed_m, n, k) <= 0:
+                    continue
+                return Tcgen05GroupedWorklistSeedFacts(
+                    groups,
+                    packed_m,
+                    n,
+                    k,
+                    b_major,
+                    proof.packed_split is not None,
+                )
+    return None
 
 
 def _tcgen05_grouped_static_seed_has_proof(
@@ -3913,7 +4086,9 @@ def prepare_cute_collective_lane_loop_suppression(
     env = CompileEnvironment.current()
     if env.backend_name != "cute":
         return
-    allow_grouped_k_mask = _tcgen05_grouped_mode(cg.device_function.config) is not None
+    grouped_mode = _tcgen05_grouped_mode(cg.device_function.config)
+    allow_grouped_k_mask = grouped_mode is not None
+    allow_rank3_rhs_mn_major = grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
     cute_state = cg.device_function.cute_state
     if not tcgen05_fragment_epilogue_has_unique_anchor(
         cg.codegen_graphs
@@ -4020,6 +4195,7 @@ def prepare_cute_collective_lane_loop_suppression(
                 allow_rank3_rhs_nt=True,
                 cg=cg,
                 allow_grouped_k_mask=allow_grouped_k_mask,
+                allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
             ):
                 continue
         elif node.target is torch.ops.aten.mm.default:
@@ -4032,6 +4208,7 @@ def prepare_cute_collective_lane_loop_suppression(
                 allow_rank3_rhs_nt=True,
                 cg=cg,
                 allow_grouped_k_mask=allow_grouped_k_mask,
+                allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
             ):
                 continue
         elif can_codegen_cute_mma_dot(node):
@@ -4055,6 +4232,7 @@ def prepare_cute_collective_lane_loop_suppression(
             allow_rank3_rhs_nt=True,
             cg=cg,
             allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
         )
         if lhs_info is None or rhs_info is None:
             continue
@@ -4190,33 +4368,22 @@ def prepare_cute_collective_lane_loop_suppression(
                     is None
                 ):
                     continue
-        collective_bm = bm
-        collective_bn = bn
-        if (
+        worklist_lowering = (
             rhs_rank3_worklist_lhs_info is not None
-            and _requested_tcgen05_grouped_schedule(
-                cast(
-                    "str | None",
-                    cast("_ConfigLike", cg.device_function.config).get(
-                        TCGEN05_GROUPED_MODE_CONFIG_KEY
-                    ),
-                )
-            )
-            is Tcgen05Orientation.NM
-        ):
-            source_m_tile = _tcgen05_config_int(
+            and grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        )
+        worklist_profile = (
+            resolve_tcgen05_grouped_worklist_mma_profile(
                 cg.device_function.config,
-                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-            )
-            physical_shape = resolve_tcgen05_grouped_worklist_mma_shape(
-                cluster_m=_tcgen05_cluster_m(cg.device_function.config),
                 block_k=bk,
-                source_m_tile=source_m_tile,
             )
-            if physical_shape is None:
-                continue
-            collective_bm, collective_bn = physical_shape
+            if worklist_lowering
+            else None
+        )
+        if worklist_lowering and worklist_profile is None:
+            continue
+        collective_bm = worklist_profile.mma_m if worklist_profile is not None else bm
+        collective_bn = worklist_profile.mma_n if worklist_profile is not None else bn
         if (
             _choose_mma_impl(
                 lhs_fake.dtype,
@@ -4225,6 +4392,7 @@ def prepare_cute_collective_lane_loop_suppression(
                 bk=bk,
                 config=cg.device_function.config,
                 input_device=lhs_fake.device,
+                defer_grouped_worklist_smem_check=worklist_profile is not None,
             )
             != "tcgen05"
         ):
@@ -5797,6 +5965,7 @@ def _emit_mma_pipeline(
             allow_rank3_rhs_nt=lowering_ctx is not None,
             cg=cg,
             allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=(grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM),
         )
         if lhs_info is None or rhs_info is None:
             return _unsupported_schedule("MMA operand tracing failed")
@@ -6220,36 +6389,25 @@ def _emit_mma_pipeline(
     # B becomes physical operand A, while packed A becomes physical operand B.
     tcgen05_mma_a_k_major = not tcgen05_nm_orientation or tcgen05_b_k_major
     tcgen05_mma_b_k_major = True if tcgen05_nm_orientation else tcgen05_b_k_major
+    worklist_profile = None
     tcgen05_worklist_source_m_tile: int | None = None
     tcgen05_one_cta_worklist_shape = False
     if tcgen05_nm_orientation:
-        if bk not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES:
-            return _unsupported_schedule("block_k must be 64 or 128")
-        tcgen05_worklist_source_m_tile = _tcgen05_config_int(
+        worklist_profile = resolve_tcgen05_grouped_worklist_mma_profile(
             df.config,
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-        )
-        if (
-            tcgen05_worklist_source_m_tile
-            not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
-        ):
-            return _unsupported_schedule(
-                f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY} must be "
-                f"one of {TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}"
-            )
-        physical_shape = resolve_tcgen05_grouped_worklist_mma_shape(
-            cluster_m=tcgen05_cluster_m,
             block_k=bk,
-            source_m_tile=tcgen05_worklist_source_m_tile,
         )
-        if physical_shape is None:
+        if worklist_profile is None:
             return _unsupported_schedule(
-                "worklist N,M requires cluster_m=2, or cluster_m=1 with "
+                "worklist N,M requires block_k in (64, 128), cluster_m=2, "
+                "or cluster_m=1 with "
                 f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY}="
                 f"{TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE}"
             )
-        tcgen05_mma_bm, tcgen05_mma_bn = physical_shape
+        tcgen05_cluster_m = worklist_profile.cluster_m
+        tcgen05_worklist_source_m_tile = worklist_profile.source_m_tile
+        tcgen05_mma_bm = worklist_profile.mma_m
+        tcgen05_mma_bn = worklist_profile.mma_n
         tcgen05_one_cta_worklist_shape = tcgen05_cluster_m == 1
         tcgen05_source_bm = tcgen05_worklist_source_m_tile
         tcgen05_source_bn = tcgen05_mma_bm
@@ -6290,6 +6448,7 @@ def _emit_mma_pipeline(
         bk=bk,
         config=df.config,
         input_device=lhs_fake.device,
+        defer_grouped_worklist_smem_check=worklist_profile is not None,
     )
     if (
         mma_impl == "tcgen05"
@@ -6376,6 +6535,7 @@ def _emit_mma_pipeline(
                 bn=bn,
                 bk=bk,
                 config=df.config,
+                defer_grouped_worklist_smem_check=worklist_profile is not None,
             )
         )
     ):
@@ -6418,19 +6578,14 @@ def _emit_mma_pipeline(
             "tcgen05 matmul with a leading passthrough axis does not support "
             "tcgen05_cluster_n != 1",
         )
-    # The one-CTA N,M worklist keeps the public 256x128 logical tile for the
-    # scheduler, but its physical output tile is source_m_tile x 128.  Edge
-    # admission must use that physical orientation; otherwise an N tail such
-    # as N=160 is misclassified as a double edge against the logical tile.
+    # N,M worklists keep the public 256x128 logical scheduler tile, while their
+    # physical output tile is source_m_tile x physical_mma_m. Edge admission
+    # must use that physical orientation for both CTA-group sizes.
     tcgen05_output_bm = (
-        tcgen05_source_bm
-        if tcgen05_grouped_worklist_static_full_tiles and tcgen05_one_cta_worklist_shape
-        else bm
+        tcgen05_source_bm if tcgen05_grouped_worklist_static_full_tiles else bm
     )
     tcgen05_output_bn = (
-        tcgen05_source_bn
-        if tcgen05_grouped_worklist_static_full_tiles and tcgen05_one_cta_worklist_shape
-        else bn
+        tcgen05_source_bn if tcgen05_grouped_worklist_static_full_tiles else bn
     )
     tcgen05_static_output_tiles = (
         m_size % tcgen05_output_bm == 0 and n_size % tcgen05_output_bn == 0
@@ -7056,6 +7211,7 @@ def _emit_mma_pipeline(
         if (
             tcgen05_grouped_worklist_persistent
             and not tcgen05_grouped_device_split_sizes
+            and not tcgen05_grouped_runtime_nm_direct
         ):
             if grouped_layout_tensor.ndim != 2 or grouped_layout_tensor.shape[1] != 4:
                 raise exc.BackendUnsupported(
@@ -7669,7 +7825,6 @@ def _emit_mma_pipeline(
         # MMA-M tile and K to be a whole BK tile. Every A/B TMA transaction is
         # therefore full even when the logical valid-row mask zeros D padding.
         tcgen05_static_full_tma_fast_path = True
-    nm_worklist = tcgen05_nm_orientation
     rhs_rank3_tma_group_expr = rhs_rank3_group_expr
     rhs_rank3_tma_group_setup: list[str] = []
     if (
@@ -7872,7 +8027,7 @@ def _emit_mma_pipeline(
     )
     if tcgen05_runtime_n_specialization:
         assert tcgen05_worklist_source_m_tile is not None
-        # Runtime UMMA-N narrows ragged runtime-direct source-M tails. Mailbox
+        # Runtime UMMA-N narrows ragged runtime-direct source-M tails.  Mailbox
         # scheduling and the newer-DSL fallback retain public typed static-width
         # MMA. The exact BF16/FP32 shape envelope below fails closed; the pinned
         # CuTe/CUTLASS environment is validation provenance, and upgrades require
@@ -8212,8 +8367,7 @@ def _emit_mma_pipeline(
         tcgen05_warp_spec = warp_spec_from_config(df.config)
         # The public NM profile reserves its scheduler warp internally.
         nm_scheduler_decode = (
-            nm_worklist
-            and tcgen05_nm_orientation
+            tcgen05_nm_orientation
             and tcgen05_grouped_static_persistent
             and tcgen05_grouped_worklist_persistent
             and (
@@ -8480,7 +8634,7 @@ def _emit_mma_pipeline(
             )
             and explicit_epi_aux_supported
         )
-        if nm_worklist:
+        if tcgen05_nm_orientation:
             nm_worklist_metadata_checks = {
                 "supported_physical_store": nm_explicit_store_wave,
                 "dynamic_rank2_ab_tensormaps": (
@@ -9928,7 +10082,7 @@ def _emit_mma_pipeline(
                             if grouped_plan.static_group_quota_args
                             else {}
                         ),
-                        **({"orientation": "nm"} if nm_worklist else {}),
+                        **({"orientation": "nm"} if tcgen05_nm_orientation else {}),
                         **(
                             {"worklist_metadata": True}
                             if tcgen05_grouped_worklist_persistent
@@ -10015,7 +10169,7 @@ def _emit_mma_pipeline(
                 "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
-            if nm_worklist:
+            if tcgen05_nm_orientation:
                 ab_tma_plan["orientation"] = "nm"
             if tcgen05_grouped_fixed_tensormaps:
                 ab_tma_plan["fixed_ab_tensormaps"] = True
@@ -10392,7 +10546,8 @@ def _emit_mma_pipeline(
                 )
                 _emit_per_tile(
                     f"if {tcgen05_grouped_valid_m} <= "
-                    f"cutlass.Int32({tcgen05_mma_bn - 16}):\n"
+                    f"cutlass.Int32("
+                    f"{tcgen05_mma_bn - _TCGEN05_RUNTIME_MMA_N_GRANULARITY}):\n"
                     f"    {tma_runtime_mma_n} = "
                     f"{_tcgen05_runtime_mma_n_expr(tcgen05_grouped_valid_m, tcgen05_mma_bn)}\n"
                     f"    {tma_b_peer_delta} = {mma_slice_linear} * "
@@ -10955,7 +11110,7 @@ def _emit_mma_pipeline(
                 )
                 and tcgen05_static_full_tiles
                 and tcgen05_is_two_cta
-                and (bk == 64 or nm_worklist)
+                and (bk == 64 or tcgen05_nm_orientation)
             )
             tma_kloop_args = _PerKiterTmaArgs(
                 tma_pipeline=tma_pipeline,
@@ -11508,7 +11663,7 @@ def _emit_mma_pipeline(
             segment_store_actual_m = (
                 tcgen05_grouped_store_m
                 if (
-                    nm_worklist
+                    tcgen05_nm_orientation
                     and tcgen05_grouped_store_m
                     and rhs_rank3_worklist_store_info.uses_scheduler_store_extent
                 )
@@ -11516,7 +11671,7 @@ def _emit_mma_pipeline(
             )
             segment_store_valid_m_bound = (
                 tcgen05_grouped_valid_m
-                if nm_worklist and tcgen05_grouped_valid_m
+                if tcgen05_nm_orientation and tcgen05_grouped_valid_m
                 else rhs_rank3_worklist_lhs_info.group_m.name
             )
             segment_store_node = rhs_rank3_worklist_store_info.store_node
@@ -11832,19 +11987,27 @@ def _tcgen05_candidate_exceeds_smem(
     bn: int,
     bk: int,
     config: object | None,
+    defer_grouped_worklist_smem_check: bool = False,
 ) -> bool:
     """Whether tcgen05 A/B staging exceeds the device's per-CTA budget."""
     if input_device is None or config is None:
         return False
-    if (
-        cast("_ConfigLike", config).get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
-        == TCGEN05_GROUPED_MODE_WORKLIST_NM
+    worklist_profile = (
+        resolve_tcgen05_grouped_worklist_mma_profile(
+            cast("_ConfigLike", config), block_k=bk
+        )
+        if defer_grouped_worklist_smem_check
+        else None
+    )
+    if worklist_profile is not None and (bm, bn) == (
+        worklist_profile.mma_m,
+        worklist_profile.mma_n,
     ):
-        # The grouped worklist owns scheduler mailboxes, TensorMap storage,
-        # and an explicit C ring. Its exact ordered allocation is checked by
-        # ``tcgen05_grouped_worklist_smem_bytes`` after the physical N,M tile
-        # has been resolved; the generic AB-only reserve is too conservative
-        # for the source-224 AB7 profile.
+        # The grouped worklist owns scheduler mailboxes, TensorMap storage, and
+        # an explicit C ring. Its conservative allocation upper bound is checked
+        # by ``tcgen05_grouped_worklist_smem_bytes`` in the resolved worklist
+        # lowering. The explicit defer flag prevents unrelated MMA nodes that
+        # share this config from bypassing ordinary AB admission.
         return False
     env_choice = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
     if env_choice not in ("auto", "tcgen05"):
@@ -11895,6 +12058,7 @@ def _choose_mma_impl(
     bk: int,
     config: object | None = None,
     input_device: torch.device | None = None,
+    defer_grouped_worklist_smem_check: bool = False,
 ) -> str:
     tcgen05_cluster_m = 1
     if config is not None:
@@ -11927,6 +12091,7 @@ def _choose_mma_impl(
                 bn=bn,
                 bk=bk,
                 config=config,
+                defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
             ):
                 return "universal"
             return env_choice
@@ -11952,6 +12117,7 @@ def _choose_mma_impl(
             bn=bn,
             bk=bk,
             config=config,
+            defer_grouped_worklist_smem_check=defer_grouped_worklist_smem_check,
         ):
             return "tcgen05"
     if _mma_impl_matches_problem_shape("warp", input_dtype, bm=bm, bn=bn, bk=bk):
@@ -12663,8 +12829,8 @@ def _validate_tcgen05_smem_swizzle_override(
     """Reject illegal ``smem_swizzle_a/b`` overrides at codegen time.
 
     CuTe's ``make_smem_layout_atom`` requires the major-mode bytes-per-row
-    to be a multiple of the swizzle pattern's contiguous bytes. For
-    The resolved operand major mode determines the contiguous extent: K-major
+    to be a multiple of the swizzle pattern's contiguous bytes. The resolved
+    operand major mode determines the contiguous extent: K-major
     operands use ``bk``; MN-major A uses ``bm`` and MN-major B uses ``bn``.
 
     This helper computes the active bytes-per-row from the live tile
@@ -12759,6 +12925,7 @@ def codegen_cute_mma(
             allow_rank3_rhs_nt=True,
             cg=ctx.cg,
             allow_grouped_k_mask=allow_grouped_k_mask,
+            allow_rank3_rhs_mn_major=(grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM),
         )
         if rhs_info is None or not rhs_info.rhs_rank3_grouped_nt:
             return _unsupported_schedule("MMA RHS was not grouped rank-3")
