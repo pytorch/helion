@@ -19,6 +19,7 @@ requires-python = ">=3.10"
 dependencies = [
     "typing_extensions>=4.0.0",
     "filecheck",
+    "filelock",
     "psutil",
     "rich",
     "numpy",

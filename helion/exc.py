@@ -58,6 +58,12 @@ class AutotuneError(BaseError):
     message = "{0}"
 
 
+class AOTHardwareManifestError(BaseError):
+    """Raised when AOT hardware provenance cannot be established safely."""
+
+    message = "{0}"
+
+
 class BackendImplementationMissing(BaseError):
     message = "Backend '{backend}' is missing required implementation: {detail}"
 
