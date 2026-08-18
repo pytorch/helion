@@ -165,13 +165,10 @@ def build_scatter_plan(
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
     indirect_positions: list[int],
-    patterns: list[IndexingPattern],
-    config: Config,
     has_extra_mask: bool,
 ) -> ScatterPlan:
     """Validate a Pallas scatter site and return its one-hot plan."""
     from ..compile_environment import CompileEnvironment
-    from .plan_tiling import resident_block_elements
 
     if not tensor.dtype.is_floating_point:
         raise NotImplementedError(
@@ -196,10 +193,6 @@ def build_scatter_plan(
             "Pallas scatter: only rank-1 tensor indices are supported"
         )
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
-    elements = resident_block_elements(tensor, patterns, config)
-    _check_resident_block_size(
-        elements * tensor.dtype.itemsize if elements is not None else None
-    )
     return ScatterPlan(
         indirect_pos=indirect_pos,
         jnp_dtype=jnp_dtype,

@@ -600,11 +600,14 @@ def indirect_access_modes(device_ir: DeviceIR) -> tuple[str, ...]:
     one_hot_capable_nodes = {
         node
         for node in one_hot_structural_nodes
-        if one_hot_access_may_fit_vmem(
-            node,
-            indirect_accesses[node].tensor,
-            indirect_accesses[node].subscript,
-            block_size_minimums,
+        if (
+            indirect_accesses[node].kind is not MemoryAccessKind.LOAD
+            or one_hot_access_may_fit_vmem(
+                node,
+                indirect_accesses[node].tensor,
+                indirect_accesses[node].subscript,
+                block_size_minimums,
+            )
         )
     }
     # DMA-capable accesses use DMA in that mode; every other indirect access
@@ -733,7 +736,7 @@ def _one_hot_gather(
 
 
 def _one_hot_scatter(
-    access: MemoryAccess, positions: list[int], config: Config
+    access: MemoryAccess, positions: list[int], _config: Config
 ) -> OneHotScatterPlan:
     from .gather import build_scatter_plan
 
@@ -741,8 +744,6 @@ def _one_hot_scatter(
         access.tensor,
         list(access.subscript),
         positions,
-        list(access.patterns),
-        config,
         len(access.node.args) > 3 and access.node.args[3] is not None,
     )
     return OneHotScatterPlan(access, tuple(positions), plan)
