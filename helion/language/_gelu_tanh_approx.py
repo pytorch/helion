@@ -19,7 +19,7 @@ node and splice the polynomial inline as one chain step against the
 already-bound carrier local.
 
 Inside the tcgen05 chain analyzer, ``_gelu_tanh_approx`` is registered
-as a ``_UnaryStep`` row in ``_ZERO_ARG_TARGETS`` keyed on the api
+as a ``_UnaryOp`` row in ``_ZERO_ARG_TARGETS`` keyed on the api
 wrapper itself (the FX target). The template references the carrier
 local four times in the standard polynomial; the renderer keeps that
 carrier bound before formatting the template.
@@ -60,7 +60,7 @@ GELU_ERF_INV_SQRT2: float = 0.7071067811865476
 # Templates for backend codegen.
 #
 # The cute template uses ``{inner}`` directly so it plugs into the
-# tcgen05 chain analyzer's ``_UnaryStep.template`` slot
+# tcgen05 chain analyzer's ``_UnaryOp.template`` slot
 # (``cute_epilogue.py`` substitutes ``{inner}`` with the current
 # carrier local). The cute-backend codegen below also calls
 # ``.format(inner=...)`` against the lifted local name to share the

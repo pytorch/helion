@@ -33,7 +33,7 @@ from ...language import matmul_ops
 from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
-from .cute_epilogue import _AuxiliaryTensorStep
+from .cute_epilogue import _AuxiliaryTensorLoadExpr
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
@@ -84,7 +84,7 @@ class Tcgen05AuxTensorDescriptor:
 
     - ``load_node``: the FX node for the ``helion.language.load``
       call that reads the aux tensor inside the chain. Same node
-      :class:`_AuxiliaryTensorStep` already carries; preserved here
+      :class:`_AuxiliaryTensorLoadExpr` already carries; preserved here
       verbatim so the productive-body splice can recover the
       per-thread index expression.
     - ``host_tensor_fx_node``: the FX node for the aux tensor itself
@@ -97,7 +97,7 @@ class Tcgen05AuxTensorDescriptor:
     - ``broadcast_axis``: ``None`` for the exact-shape rank-2 form
       (``residual[tile_m, tile_n]``); ``1`` for the trailing-axis
       rowvec broadcast form (``bias[tile_n]``). Matches the field on
-      :class:`_AuxiliaryTensorStep` so the productive body uses the
+      :class:`_AuxiliaryTensorLoadExpr` so the productive body uses the
       same axis convention as the existing per-thread splice.
     - ``store_value_node``: the FX node of the store value whose
       chain produced this descriptor. One matmul may be consumed by
@@ -180,7 +180,7 @@ def analyze_tcgen05_matmul_store_chains(
 
 
 def _step_host_tensor(
-    step: _AuxiliaryTensorStep,
+    step: _AuxiliaryTensorLoadExpr,
 ) -> tuple[torch.fx.Node, torch.Tensor]:
     """Return ``(host_tensor_fx_node, host_tensor_val)`` for an aux step.
 
@@ -192,23 +192,23 @@ def _step_host_tensor(
     confusing downstream codegen error.
     """
     load_node = step.load_node
-    assert load_node.args, "_AuxiliaryTensorStep.load_node missing args"
+    assert load_node.args, "_AuxiliaryTensorLoadExpr.load_node missing args"
     host_tensor_fx_node = load_node.args[0]
     assert isinstance(host_tensor_fx_node, torch.fx.Node), (
-        "_AuxiliaryTensorStep.load_node.args[0] is not an FX node"
+        "_AuxiliaryTensorLoadExpr.load_node.args[0] is not an FX node"
     )
     host_tensor_val = host_tensor_fx_node.meta.get("val")
     assert isinstance(host_tensor_val, torch.Tensor), (
-        "_AuxiliaryTensorStep host-tensor FX node has no torch.Tensor meta"
+        "_AuxiliaryTensorLoadExpr host-tensor FX node has no torch.Tensor meta"
     )
     return host_tensor_fx_node, host_tensor_val
 
 
 def _aux_descriptor_from_step(
-    step: _AuxiliaryTensorStep, store_value_node: torch.fx.Node
+    step: _AuxiliaryTensorLoadExpr, store_value_node: torch.fx.Node
 ) -> Tcgen05AuxTensorDescriptor:
     """Build a :class:`Tcgen05AuxTensorDescriptor` from one
-    :class:`_AuxiliaryTensorStep` plus the store-value node whose
+    :class:`_AuxiliaryTensorLoadExpr` plus the store-value node whose
     chain produced it.
     """
     host_tensor_fx_node, host_tensor_val = _step_host_tensor(step)
@@ -296,7 +296,7 @@ def discover_tcgen05_aux_tensor_descriptors(
         if store_value in seen_values:
             continue
         seen_values.add(store_value)
-        for step in chain.auxiliary_tensor_steps:
+        for step in chain.auxiliary_tensor_loads:
             descriptors.append(_aux_descriptor_from_step(step, store_value))
     return tuple(descriptors)
 
@@ -307,7 +307,7 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     """Conservative pre-codegen detector for kernels whose tcgen05
     matmul is followed by an aux-fused store
     (``out[tile] = (acc + residual[tile]).to(...)`` and the
-    bias / rowvec variants — see :class:`_AuxiliaryTensorStep`
+    bias / rowvec variants — see :class:`_AuxiliaryTensorLoadExpr`
     for the accepted forms).
 
     Runs at autotune-surface configuration time (post-FX-graph
@@ -559,7 +559,7 @@ def _has_tma_compatible_analyzed_aux_store(
             continue
         chain, _anchor = analyzed
         exact_steps = [
-            step for step in chain.auxiliary_tensor_steps if step.broadcast_axis is None
+            step for step in chain.auxiliary_tensor_loads if step.broadcast_axis is None
         ]
         if not exact_steps:
             continue
