@@ -36,7 +36,6 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..indexing_strategy import exact_tile_block_ids
-from ._mlir_compat import ir
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
@@ -205,6 +204,8 @@ def _query_tcgen05_fragment_ownership(
     from cutlass.utils import blackwell_helpers
     from cutlass.utils.gemm import sm100
     from cutlass.utils.layout import LayoutEnum
+
+    from ._mlir_compat import ir
 
     input_type = cutlass.BFloat16 if input_dtype is torch.bfloat16 else cutlass.Float16
     output_type = (
