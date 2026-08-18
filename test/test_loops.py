@@ -21,13 +21,13 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
@@ -1563,7 +1563,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfNotTriton(
         "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
     )
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_sequential_loops_global_memory_barrier(self):
@@ -1650,7 +1650,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         "tl.debug_barrier() is Triton codegen-specific; "
         "the negative assertion is trivially true on non-Triton backends"
     )
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         65536, reason="block sizes exceed device shared memory limit"
     )
     def test_sequential_loops_no_barrier_without_cross_loop_raw(self):

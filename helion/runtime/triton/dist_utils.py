@@ -3,6 +3,196 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language import core
+
+
+@triton.jit
+def _local_copy_block(dest, source, nelems):  # noqa: ANN001, ANN202
+    for offset in range(0, nelems, 256):
+        offsets = offset + tl.arange(0, 256)
+        mask = offsets < nelems
+        values = tl.load(source + offsets, mask=mask)
+        tl.store(dest + offsets, values, mask=mask)
+    tl.debug_barrier()
+
+
+@triton.jit
+def _nvshmem_put_nbi_block(  # noqa: ANN202
+    dest,  # noqa: ANN001
+    source,  # noqa: ANN001
+    nelems,  # noqa: ANN001
+    pe,  # noqa: ANN001
+    my_pe,  # noqa: ANN001
+):
+    """Issue a block-scoped put whose local completion is deferred to quiet."""
+    tl.static_assert(dest.type == source.type)
+    if pe == my_pe:
+        _local_copy_block(dest, source, nelems)
+    else:
+        nbytes = nelems * dest.type.element_ty.itemsize
+        _nvshmem_putmem_nbi_block(
+            dest.to(tl.int64),
+            source.to(tl.int64),
+            nbytes.to(tl.int64),
+            pe,
+        )
+
+
+@core.extern
+def _nvshmem_putmem_nbi_block(  # noqa: ANN202
+    dest,  # noqa: ANN001
+    source,  # noqa: ANN001
+    size_bytes,  # noqa: ANN001
+    pe,  # noqa: ANN001
+    _semantic=None,  # noqa: ANN001
+):
+    return core.extern_elementwise(
+        "",
+        "",
+        [dest, source, size_bytes, pe],
+        {
+            (
+                core.dtype("int64"),
+                core.dtype("int64"),
+                core.dtype("int64"),
+                core.dtype("int32"),
+            ): ("nvshmemx_putmem_nbi_block", core.dtype("int32"))
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _nvshmem_put_signal_nbi_block(  # noqa: ANN202
+    dest,  # noqa: ANN001
+    source,  # noqa: ANN001
+    nelems,  # noqa: ANN001
+    signal,  # noqa: ANN001
+    signal_value,  # noqa: ANN001
+    signal_op,  # noqa: ANN001
+    pe,  # noqa: ANN001
+    my_pe,  # noqa: ANN001
+):
+    """Issue a block-scoped NBI put with an ordered completion signal."""
+    tl.static_assert(dest.type == source.type)
+    nbytes = nelems * dest.type.element_ty.itemsize
+    if pe == my_pe:
+        _local_copy_block(dest, source, nelems)
+        tl.atomic_add(
+            signal,
+            signal_value,
+            sem="release",
+            scope="sys",
+        )
+        tl.debug_barrier()
+    else:
+        _nvshmem_putmem_signal_nbi_block(
+            dest.to(tl.int64),
+            source.to(tl.int64),
+            nbytes.to(tl.int64),
+            signal.to(tl.int64),
+            signal_value.to(tl.uint64),
+            signal_op,
+            pe,
+        )
+
+
+@core.extern
+def _nvshmem_putmem_signal_nbi_block(  # noqa: ANN202
+    dest,  # noqa: ANN001
+    source,  # noqa: ANN001
+    size_bytes,  # noqa: ANN001
+    signal,  # noqa: ANN001
+    signal_value,  # noqa: ANN001
+    signal_op,  # noqa: ANN001
+    pe,  # noqa: ANN001
+    _semantic=None,  # noqa: ANN001
+):
+    return core.extern_elementwise(
+        "",
+        "",
+        [dest, source, size_bytes, signal, signal_value, signal_op, pe],
+        {
+            (
+                core.dtype("int64"),
+                core.dtype("int64"),
+                core.dtype("int64"),
+                core.dtype("int64"),
+                core.dtype("uint64"),
+                core.dtype("int32"),
+                core.dtype("int32"),
+            ): ("nvshmemx_putmem_signal_nbi_block", core.dtype("int32"))
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _publish_signal(  # noqa: ANN202
+    signal,  # noqa: ANN001
+    value,  # noqa: ANN001
+    signal_op,  # noqa: ANN001
+    pe,  # noqa: ANN001
+    my_pe,  # noqa: ANN001
+):
+    """Publish a counted signal to a local or remote PE."""
+    if pe == my_pe:
+        tl.atomic_add(signal, value, sem="release", scope="sys")
+    else:
+        _nvshmem_signal_op(
+            signal.to(tl.int64),
+            value.to(tl.int64),
+            signal_op,
+            pe,
+        )
+
+
+@core.extern
+def _nvshmem_signal_op(  # noqa: ANN202
+    signal,  # noqa: ANN001
+    value,  # noqa: ANN001
+    signal_op,  # noqa: ANN001
+    pe,  # noqa: ANN001
+    _semantic=None,  # noqa: ANN001
+):
+    return core.extern_elementwise(
+        "",
+        "",
+        [signal, value, signal_op, pe],
+        {
+            (
+                core.dtype("int64"),
+                core.dtype("int64"),
+                core.dtype("int32"),
+                core.dtype("int32"),
+            ): ("nvshmemx_signal_op", core.dtype("int32"))
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _wait_and_consume_signal(signal, count):  # noqa: ANN001, ANN202
+    """Acquire and consume counted completions from CUDA or NVSHMEM atomics."""
+    value = tl.atomic_cas(
+        signal,
+        tl.cast(0, tl.int64),
+        tl.cast(0, tl.int64),
+        sem="acquire",
+        scope="sys",
+    )
+    while value < count:
+        value = tl.atomic_cas(
+            signal,
+            tl.cast(0, tl.int64),
+            tl.cast(0, tl.int64),
+            sem="acquire",
+            scope="sys",
+        )
+    tl.atomic_add(signal, -count, sem="relaxed", scope="sys")
 
 
 @triton.jit

@@ -26,6 +26,7 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
 from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
 from helion.exc import InvalidConfig
@@ -40,6 +41,7 @@ from helion.runtime import default_cute_launcher
 if TYPE_CHECKING:
     from collections.abc import Hashable
     from collections.abc import Sequence
+    from typing_extensions import Self
 
     from helion.autotuner.config_spec import ConfigSpec
 
@@ -598,6 +600,29 @@ def cute_matmul_mma_fp8_rowwise_colwise_scale(
         for tile_k in hl.tile(k):
             acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         acc = acc * scale_m[tile_m, tile_n] * scale_n[tile_n]
+        out[tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_fp8_three_broadcast_scales(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_m: torch.Tensor,
+    scale_n0: torch.Tensor,
+    scale_n1: torch.Tensor,
+) -> torch.Tensor:
+    """FP8 matmul with three separately chained broadcast auxiliaries."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        acc = acc * scale_m[tile_m, tile_n]
+        acc = acc * scale_n0[tile_n]
+        acc = acc * scale_n1[tile_n]
         out[tile_m, tile_n] = acc.to(torch.bfloat16)
     return out
 
@@ -6948,6 +6973,50 @@ class TestCuteBackend(TestCase):
         self.assertFalse(out.float().isnan().any().item())
         self.assertIn("cute.nvgpu.tcgen05", code)
 
+    def test_matmul_mma_tcgen05_fuses_three_broadcast_edge_loads(self) -> None:
+        m, k, n = 64, 256, 8
+        x = torch.empty((m, k), device=DEVICE, dtype=torch.float8_e4m3fn)
+        y = torch.empty((k, n), device=DEVICE, dtype=torch.float8_e4m3fn)
+        scale_m = torch.empty((m, 1), device=DEVICE).expand(m, n)
+        scale_n0 = torch.empty(n, device=DEVICE)
+        scale_n1 = torch.empty(n, device=DEVICE)
+        args = (x, y, scale_m, scale_n0, scale_n1)
+        config = helion.Config(
+            block_sizes=[64, 16, 256],
+            indexing=["tensor_descriptor"] * len(args),
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=4,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+        )
+        with patch_cute_mma_support():
+            code = cute_matmul_mma_fp8_three_broadcast_scales.bind(args).to_triton_code(
+                config
+            )
+
+        self.assertIn(
+            "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_0.shape))",
+            code,
+        )
+        for aux_idx in (1, 2):
+            self.assertNotIn(
+                f"for _edge_i in range(cute.size("
+                f"tcgen05_tTR_gAux_subtile_{aux_idx}.shape))",
+                code,
+            )
+        for aux_idx in range(3):
+            self.assertIn(
+                f"tcgen05_aux_rmem_{aux_idx}[_edge_i] = "
+                f"tcgen05_tTR_gAux_subtile_{aux_idx}[_edge_i]",
+                code,
+            )
+
     def _run_colvec_scale_row_dependent(
         self,
         block_sizes: list[int],
@@ -9282,6 +9351,115 @@ class TestCuteBackend(TestCase):
         self.assertNotEqual(key0, key1)
         self.assertIsNot(identity.bind(args), bound)
 
+    def test_isolated_bound_does_not_publish_cute_specializations(self) -> None:
+        identity = _runtime_identity_kernel()
+        args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
+        bound = identity._bind_isolated(args)
+        kernel_mod = importlib.import_module("helion.runtime.kernel")
+
+        with (
+            patch.object(
+                kernel_mod,
+                "_cute_grouped_static_tail_extra_descriptors",
+                return_value=(("cute_grouped_static_tail", 1, 1, 128, None, None),),
+            ),
+            patch.object(
+                identity,
+                "_extend_bound_kernel_specializations",
+                side_effect=AssertionError("isolated bind published specialization"),
+            ),
+        ):
+            bound._register_cute_grouped_static_tail_specializations()
+
+        self.assertFalse(identity._cute_grouped_static_tail_extra_descriptors)
+
+    def test_concurrent_cute_specialization_registration_deduplicates(self) -> None:
+        identity = _runtime_identity_kernel()
+        args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
+        bound = identity.bind(args)
+        descriptor = ("cute_grouped_static_tail", 1, 1, 128, None, None)
+        extractor_entered = threading.Event()
+        release_extractor = threading.Event()
+
+        class TrackedRLock:
+            def __init__(self) -> None:
+                self._lock = threading.RLock()
+                self._state_lock = threading.Lock()
+                self._owner: int | None = None
+                self._depth = 0
+                self.contended = threading.Event()
+
+            def __enter__(self) -> Self:
+                thread_id = threading.get_ident()
+                with self._state_lock:
+                    if self._owner is not None and self._owner != thread_id:
+                        self.contended.set()
+                self._lock.acquire()
+                with self._state_lock:
+                    if self._owner == thread_id:
+                        self._depth += 1
+                    else:
+                        self._owner = thread_id
+                        self._depth = 1
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                with self._state_lock:
+                    self._depth -= 1
+                    if self._depth == 0:
+                        self._owner = None
+                self._lock.release()
+
+        tracked_lock = TrackedRLock()
+        extractor_calls = 0
+        extractor_calls_lock = threading.Lock()
+
+        def blocking_extractor(_args: object) -> Hashable:
+            nonlocal extractor_calls
+            with extractor_calls_lock:
+                extractor_calls += 1
+                first_call = extractor_calls == 1
+            if first_call:
+                extractor_entered.set()
+                self.assertTrue(release_extractor.wait(5))
+            return (1,)
+
+        kernel_mod = importlib.import_module("helion.runtime.kernel")
+        with (
+            patch.object(identity, "_bind_lock", tracked_lock),
+            patch.object(
+                kernel_mod,
+                "_cute_grouped_static_tail_extra_descriptors",
+                return_value=(descriptor,),
+            ),
+            patch.object(
+                kernel_mod,
+                "_make_cute_grouped_static_tail_extractor",
+                return_value=blocking_extractor,
+            ),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            first = pool.submit(
+                bound._register_cute_grouped_static_tail_specializations
+            )
+            self.assertTrue(extractor_entered.wait(5))
+            second = pool.submit(
+                bound._register_cute_grouped_static_tail_specializations
+            )
+            try:
+                self.assertTrue(tracked_lock.contended.wait(5))
+            finally:
+                release_extractor.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+        signature = bound._base_spec_key
+        self.assertEqual(len(identity._specialize_extra[signature]), 1)
+        self.assertEqual(
+            identity._cute_grouped_static_tail_extra_descriptors[signature],
+            {descriptor},
+        )
+
     def test_kernel_growing_late_specialization_evicts_all_stale_keys(self) -> None:
         identity = _runtime_identity_kernel()
         x = torch.empty(1)
@@ -10487,7 +10665,12 @@ class TestCuteBackendRequirements(TestCase):
         from helion._compiler.cute import cutedsl_compat
 
         self.addCleanup(cutedsl_compat.cute_math_min_max_available.cache_clear)
-        for version, expected in (("4.5.1", False), ("4.6.0", True), ("4.6.1", True)):
+        for version, expected in (
+            ("4.5.1", False),
+            ("4.6.0", True),
+            ("4.6.1", True),
+            ("4.7.0", True),
+        ):
             with self.subTest(version=version):
                 cutedsl_compat.cute_math_min_max_available.cache_clear()
                 with patch.object(

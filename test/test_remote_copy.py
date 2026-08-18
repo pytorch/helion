@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import contextlib
+from datetime import timedelta
 import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import sys
 from typing import TYPE_CHECKING
+from typing import ClassVar
 from typing import TypeVar
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+from torch.testing._internal.common_distributed import MultiProcessTestCase
 
 import helion
 import helion.language as hl
@@ -178,6 +184,53 @@ def _remote_copy_with_unrelated_loop_input(
             copy.wait()
             output[0, step, :] = dst[0, step, :] + bias[0, :]
     return dst, output
+
+
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _ordered_reused_descriptor_pipeline_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+    gate_src: torch.Tensor,
+    gate: torch.Tensor,
+    rank: torch.Tensor,
+) -> torch.Tensor:
+    """Force two completions to reach rank 0 before it consumes either."""
+    num_steps = hl.specialize(src.size(1))
+    for _program in hl.grid(1):
+        hl.remote_barrier(peers[0, :])
+        # This one-way control message is not a balanced in-place transfer.
+        gate_copy = hl.make_async_remote_copy(
+            gate_src,
+            [0],
+            peers[0, 0],
+            dst=gate,
+            dst_index=[0],
+        )
+        # Ranks 1-3 advance the ring while rank 0 waits. Rank 3 releases the
+        # gate only after its second put into rank 0's reused completion slot.
+        if rank[0] == 0:
+            gate_copy.wait()
+        for step in hl.tile(num_steps, block_size=1):
+            copy = hl.make_async_remote_copy(
+                src,
+                [0, step.begin],
+                peers[0, 0],
+                dst=dst,
+                dst_index=[0, step.begin],
+            )
+            if step.begin > 0:
+                copy.wait()
+            copy.start()
+            if step.begin == 1:
+                if rank[0] == 3:
+                    gate_copy.start()
+            if step.begin == num_steps - 1:
+                copy.wait()
+    return dst
 
 
 @helion.kernel(
@@ -374,6 +427,416 @@ def _pipelined_remote_hbm_consume(
                 current = dst[0, :, tile, :]
                 output[0, tile, :] = torch.sum(current, dim=0)
     return output
+
+
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _peer_scoped_remote_barrier(
+    peers: torch.Tensor,
+    output: torch.Tensor,
+    GROUP_NAME: hl.ProcessGroupName,
+) -> torch.Tensor:
+    for _program in hl.grid(1):
+        for step in hl.tile(2, block_size=1):
+            hl.remote_barrier(peers[0, 0])
+            output[step] = 1
+    return output
+
+
+@unittest.skipUnless(
+    torch.version.cuda is not None and torch.cuda.device_count() >= 4,
+    "requires four NVIDIA CUDA devices",
+)
+@onlyBackends(["triton"])
+class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
+    """Execute the Triton lowering with four NVSHMEM-connected GPUs."""
+
+    _nvshmem_env: ClassVar[dict[str, str]] = {
+        "NVSHMEM_SYMMETRIC_SIZE": "1G",
+        "NVSHMEM_DISABLE_NVLS": "1",
+        "NCCL_NVLS_ENABLE": "0",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._class_stack = contextlib.ExitStack()
+        cls._class_stack.enter_context(patch.dict(os.environ, cls._nvshmem_env))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._class_stack.close()
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._spawn_processes()
+
+    def tearDown(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        super().tearDown()
+
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(f"cuda:{self.rank}")
+
+    def _init_process(self) -> dist.Store:
+        torch.cuda.set_device(self.device)
+        store = dist.FileStore(self.file_name, self.world_size)
+        dist.init_process_group(
+            backend="nccl",
+            world_size=self.world_size,
+            rank=self.rank,
+            store=store,
+            device_id=self.device,
+        )
+        self.addCleanup(self._cleanup_process)
+        torch.distributed.distributed_c10d._set_pg_timeout(
+            timedelta(seconds=60), dist.group.WORLD
+        )
+        symm_mem.set_backend("NVSHMEM")
+        return store
+
+    def _cleanup_process(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    def _make_symmetric_buffer(self, shape: tuple[int, ...]) -> torch.Tensor:
+        dst = symm_mem.empty(*shape, dtype=torch.float32, device=self.device)
+        group = dist.group.WORLD
+        assert group is not None
+        dst_handle = symm_mem.rendezvous(dst, group=group)
+        self.assertEqual(dst_handle.world_size, self.world_size)
+        return dst
+
+    def test_one_shot_remote_copy(self) -> None:
+        store = self._init_process()
+        src = torch.from_numpy(_rank_values(self.rank)).to(self.device)
+        src = src.reshape(1, 1, _WIDTH)
+        dst = self._make_symmetric_buffer((1, 2, _WIDTH))
+        peers = torch.tensor(
+            [[(self.rank + 1) % self.world_size]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        slots = torch.full((1, 1), _REMOTE_SLOT, dtype=torch.int32, device=self.device)
+        expected = torch.from_numpy(
+            _expected_cyclic_destination(self.world_size)[self.rank]
+        ).to(self.device)
+        for _invocation in range(2):
+            dst.fill_(-1)
+            dist.barrier()
+            if self.rank == 0 and _invocation == 1:
+                # Enter the cached launch only after rank 3 has signaled us.
+                store.wait(["rank_3_completed_one_shot_copy"])
+            result = _one_shot_remote_copy(src, dst, peers, slots)
+            torch.cuda.synchronize()
+            if self.rank == self.world_size - 1 and _invocation == 1:
+                store.set("rank_3_completed_one_shot_copy", "1")
+            torch.testing.assert_close(result[0], expected)
+
+    def test_reused_descriptor_pipeline(self) -> None:
+        self._init_process()
+        src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
+        src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
+        dst = self._make_symmetric_buffer(src.shape)
+        peers = torch.tensor(
+            [
+                [
+                    (self.rank + 1) % self.world_size,
+                    (self.rank - 1) % self.world_size,
+                ]
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        expected = torch.from_numpy(
+            _expected_pipeline_destination(self.world_size)[self.rank]
+        ).to(self.device)
+        for _invocation in range(2):
+            dst.fill_(-1)
+            dist.barrier()
+            result = _reused_descriptor_pipeline_copy(src, dst, peers)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result[0], expected)
+
+    def test_queued_reused_descriptor_completions(self) -> None:
+        self._init_process()
+        src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
+        src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
+        dst = self._make_symmetric_buffer(src.shape)
+        gate_src = torch.full((1,), self.rank, dtype=torch.float32, device=self.device)
+        gate = self._make_symmetric_buffer((1,))
+        gate.fill_(self.rank)
+        peers = torch.tensor(
+            [
+                [
+                    (self.rank + 1) % self.world_size,
+                    (self.rank - 1) % self.world_size,
+                ]
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        rank = torch.tensor([self.rank], dtype=torch.int32, device=self.device)
+        expected = torch.from_numpy(
+            _expected_pipeline_destination(self.world_size)[self.rank]
+        ).to(self.device)
+        for _invocation in range(2):
+            dst.fill_(-1)
+            dist.barrier()
+            result = _ordered_reused_descriptor_pipeline_copy(
+                src, dst, peers, gate_src, gate, rank
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result[0], expected)
+
+    def test_ring_all_gather(self) -> None:
+        self._init_process()
+        gathered = self._make_symmetric_buffer(
+            (self.world_size, 1, _GATHER_ROWS, _WIDTH)
+        )
+        peers = torch.from_numpy(_ring_peers(self.rank, self.world_size)).to(
+            self.device
+        )
+        slots = torch.from_numpy(_ring_slots(self.rank, self.world_size)).to(
+            self.device
+        )
+        local_values = (
+            torch.from_numpy(_rank_gather_values(self.rank))
+            .to(self.device)
+            .unsqueeze(0)
+        )
+        expected = torch.from_numpy(_expected_all_gather(self.world_size)).to(
+            self.device
+        )
+        for _invocation in range(2):
+            gathered.fill_(-1)
+            dist.barrier()
+            result = _ring_all_gather(local_values, gathered, peers, slots)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result[:, 0], expected)
+
+    def test_remote_copy_does_not_reclassify_unrelated_loop_input(self) -> None:
+        self._init_process()
+        src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
+        src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
+        dst = self._make_symmetric_buffer(src.shape)
+        bias = torch.arange(_WIDTH, dtype=torch.float32, device=self.device)
+        bias = bias.reshape(1, _WIDTH) * 0.25
+        output = torch.full_like(src, -1)
+        peers = torch.tensor(
+            [[(self.rank + 1) % self.world_size]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        expected = torch.from_numpy(
+            _expected_pipeline_destination(self.world_size)[self.rank]
+        ).to(self.device)
+        for _invocation in range(2):
+            dst.fill_(-1)
+            output.fill_(-1)
+            dist.barrier()
+            result_dst, result_output = _remote_copy_with_unrelated_loop_input(
+                src, dst, bias, output, peers
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result_dst[0], expected)
+            torch.testing.assert_close(result_output[0], expected + bias)
+
+    def test_computed_pipeline_copy(self) -> None:
+        self._init_process()
+        rank_value = torch.tensor(
+            self.rank * 10, dtype=torch.float32, device=self.device
+        )
+        tile_values = torch.arange(
+            _PIPELINE_STEPS, dtype=torch.float32, device=self.device
+        ).reshape(1, _PIPELINE_STEPS, 1, 1)
+        src = (
+            (rank_value + tile_values)
+            .expand(1, _PIPELINE_STEPS, 16, _WIDTH)
+            .contiguous()
+        )
+        stage = torch.zeros(1, 16, _WIDTH, device=self.device)
+        dst = self._make_symmetric_buffer(
+            (1, self.world_size, _PIPELINE_STEPS, 16, _WIDTH)
+        )
+        peers = torch.full(
+            (1, _PIPELINE_STEPS),
+            (self.rank + 1) % self.world_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        positions = torch.full(
+            (1, _PIPELINE_STEPS),
+            self.rank,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        previous_rank = (self.rank - 1) % self.world_size
+        previous_values = (previous_rank * 10 + tile_values).expand_as(src)
+        expected = torch.full_like(dst, -7)
+        expected[0, previous_rank] = previous_values[0]
+        for _invocation in range(2):
+            stage.zero_()
+            dst.fill_(-7)
+            dist.barrier()
+            _stage, result = _pipeline_remote_copy(src, stage, dst, peers, positions)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result, expected)
+
+    def test_parent_store_nested_remote_copy(self) -> None:
+        self._init_process()
+        src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
+        src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
+        exchange = self._make_symmetric_buffer((1, 2, _PIPELINE_STEPS, _WIDTH))
+        peers = torch.tensor(
+            [[(self.rank + 1) % self.world_size]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        expected_local = src[0]
+        expected_remote = torch.from_numpy(
+            _rank_pipeline_values((self.rank - 1) % self.world_size)
+        ).to(self.device)
+        for _invocation in range(2):
+            exchange.fill_(-1)
+            dist.barrier()
+            result = _parent_store_nested_remote_copy(src, exchange, peers)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result[0, 0], expected_local)
+            torch.testing.assert_close(result[0, 1], expected_remote)
+
+    def test_route_forward_then_local_consume(self) -> None:
+        self._init_process()
+        rows = 4
+        values_per_rank = rows * 16 * _WIDTH
+        src = torch.arange(
+            values_per_rank, dtype=torch.float32, device=self.device
+        ).reshape(rows, 16, _WIDTH)
+        src = src + self.rank * values_per_rank
+        routed = self._make_symmetric_buffer((1, 1, rows, 16, _WIDTH))
+        output = torch.full_like(routed, -1)
+        peers = torch.tensor(
+            [[(self.rank + 1) % self.world_size]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        source_rank = (self.rank - 2) % self.world_size
+        expected = torch.arange(
+            values_per_rank, dtype=torch.float32, device=self.device
+        ).reshape(1, 1, rows, 16, _WIDTH)
+        expected = expected + source_rank * values_per_rank
+        for _invocation in range(2):
+            routed.zero_()
+            output.fill_(-1)
+            dist.barrier()
+            result_routed, result_output = _route_forward_then_consume(
+                src, routed, output, peers
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result_routed, expected)
+            torch.testing.assert_close(result_output, expected + 1)
+
+    def test_computed_tile_to_remote_hbm(self) -> None:
+        self._init_process()
+        tokens = 13
+        channels = 5
+        values_per_rank = tokens * channels * _WIDTH
+        src = torch.arange(
+            values_per_rank, dtype=torch.float32, device=self.device
+        ).reshape(1, tokens, channels, _WIDTH)
+        src = src + self.rank * values_per_rank
+        dst = self._make_symmetric_buffer((1, self.world_size, tokens, _WIDTH))
+        peers = torch.tensor(
+            [[(self.rank + 1) % self.world_size]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        ranks = torch.tensor([[self.rank]], dtype=torch.int32, device=self.device)
+        source_rank = (self.rank - 1) % self.world_size
+        source = torch.arange(
+            values_per_rank, dtype=torch.float32, device=self.device
+        ).reshape(tokens, channels, _WIDTH)
+        source = source + source_rank * values_per_rank
+        expected = torch.full_like(dst, -7)
+        expected[0, source_rank] = source.sum(dim=1)
+        for _invocation in range(2):
+            dst.fill_(-7)
+            dist.barrier()
+            result = _computed_tiled_hbm_copy(src, dst, peers, ranks)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result, expected)
+
+    def test_pipeline_remote_hbm_then_consume_previous_tile(self) -> None:
+        self._init_process()
+        tokens = 13
+        channels = 3
+        values_per_rank = tokens * channels * _WIDTH
+        src = torch.arange(
+            values_per_rank, dtype=torch.float32, device=self.device
+        ).reshape(1, tokens, channels, _WIDTH)
+        src = src + self.rank * values_per_rank
+        dst = self._make_symmetric_buffer((1, 2, tokens, _WIDTH))
+        output = torch.full((1, tokens, _WIDTH), -11.0, device=self.device)
+        partner = self.rank ^ 1
+        peers = torch.tensor(
+            [[self.rank, partner]], dtype=torch.int32, device=self.device
+        )
+        ranks = torch.tensor([[self.rank % 2]], dtype=torch.int32, device=self.device)
+        own_reduced = src[0].sum(dim=1)
+        partner_values = torch.arange(
+            values_per_rank, dtype=torch.float32, device=self.device
+        ).reshape(tokens, channels, _WIDTH)
+        partner_values = partner_values + partner * values_per_rank
+        expected = own_reduced + partner_values.sum(dim=1)
+        for _invocation in range(2):
+            dst.fill_(-7)
+            output.fill_(-11)
+            dist.barrier()
+            result = _pipelined_remote_hbm_consume(src, dst, output, peers, ranks)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result[0], expected)
+
+    def test_remote_barrier_is_peer_scoped(self) -> None:
+        store = self._init_process()
+        group = dist.group.WORLD
+        assert group is not None
+        peers = torch.tensor(
+            [[self.rank ^ 1]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        output = torch.zeros(2, dtype=torch.int32, device=self.device)
+
+        # Warm compilation and compiler-owned symmetric barrier storage while
+        # every rank is participating.
+        result = _peer_scoped_remote_barrier(peers, output, group.group_name)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.ones_like(result))
+        dist.barrier()
+
+        output.zero_()
+        if self.rank < 2:
+            result = _peer_scoped_remote_barrier(peers, output, group.group_name)
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                store.set("first_pair_completed", "1")
+        else:
+            store.wait(["first_pair_completed"])
+            result = _peer_scoped_remote_barrier(peers, output, group.group_name)
+            torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.ones_like(result))
 
 
 @onlyBackends(["pallas"])

@@ -605,32 +605,6 @@ def skipIfCudaCapabilityLessThan(
     )
 
 
-def skipIfCudaSharedMemoryLessThan(
-    min_shared_memory: int,
-    *,
-    reason: str | None = None,
-) -> Callable[[Callable], Callable]:
-    """Skip test if GPU shared memory per block is below min_shared_memory."""
-
-    def cond() -> bool:
-        if not torch.cuda.is_available():
-            return False
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        default_shared = cast("int", props.shared_memory_per_block)
-        optin_shared = cast(
-            "int | None", getattr(props, "shared_memory_per_block_optin", None)
-        )
-        max_shared = default_shared if optin_shared is None else optin_shared
-        return max_shared < min_shared_memory
-
-    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(
-        cond,
-        reason=reason
-        or f"Requires GPU shared memory per block >= {min_shared_memory} bytes",
-    )
-
-
 def skipIfSharedMemoryLessThan(
     required_memory_for_config: int,
     *,

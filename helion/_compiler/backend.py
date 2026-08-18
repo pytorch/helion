@@ -412,6 +412,10 @@ class Backend(abc.ABC):
         """Whether tile strategies must emit explicit masks for all tiles."""
         return False
 
+    def launches_surplus_tile_threads(self) -> bool:
+        """Whether an axis may be launched wider than the tile it indexes."""
+        return False
+
     def supports_config_key(self, key: str) -> bool:
         from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
 
