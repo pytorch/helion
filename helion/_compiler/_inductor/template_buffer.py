@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import dataclasses
 import functools
 import hashlib
+import logging
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -39,6 +40,9 @@ from .._dynamo.higher_order_ops import _rebuild_container_args
 from .._dynamo.higher_order_ops import get_helion_kernel
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_functional
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
+from .._dynamo.variables import _HOST_SEMANTIC_FINGERPRINT
+from .._dynamo.variables import _HOST_SEMANTIC_INPUT_NORMALIZATION
+from .._dynamo.variables import _REQUIRES_ISOLATED_LOWERING
 from .._dynamo.variables import _get_flat_output
 from ..ast_extension import unparse
 from ..generate_ast import generate_ast
@@ -60,6 +64,9 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
+
+
+log = logging.getLogger(__name__)
 
 
 class _CodeExpr(str):
@@ -943,6 +950,23 @@ def _flatten_return_ast(
     return result
 
 
+def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> BoundKernel:
+    """Reuse eager state without waiting for a concurrent eager bind."""
+    # Inductor owns Dynamo's compile lock here. Eager binding can hold
+    # _bind_lock while waiting for that lock, so blocking would form an ABBA
+    # deadlock. Contention is rare; keep the fallback private and diagnosable.
+    if not kernel._bind_lock.acquire(blocking=False):
+        log.debug(
+            "kernel bind lock busy while lowering %s; using an isolated bind",
+            kernel.name,
+        )
+        return kernel._bind_isolated(args)
+    try:
+        return kernel._bind(args)
+    finally:
+        kernel._bind_lock.release()
+
+
 @register_lowering(helion_kernel_wrapper_mutation, type_promotion_kind=None)
 def lower_helion_kernel(
     *,
@@ -1004,14 +1028,56 @@ def lower_helion_kernel(
         for n, p in kernel.signature.parameters.items()
         if n in all_args or p.default is not p.empty
     ]
-    bound = kernel.bind(tuple(fake_tensors))
-
-    # Derive output structure from bound kernel using inductor-time input layouts.
-    # This gives correct strides even when inductor changes input memory layouts.
+    bind_args = tuple(fake_tensors)
+    if output_spec.get(_REQUIRES_ISOLATED_LOWERING):
+        bound = kernel._bind_isolated(bind_args)
+    else:
+        bound = _bind_kernel_for_lowering(kernel, bind_args)
+    expected_semantic_fingerprint = output_spec.get(_HOST_SEMANTIC_FINGERPRINT)
+    input_normalization = output_spec.get(_HOST_SEMANTIC_INPUT_NORMALIZATION)
+    if not isinstance(input_normalization, tuple):
+        input_normalization = ()
     host_function = bound.host_function
     assert host_function is not None
     flat_leaves, tree_spec, return_ast = _get_flat_output(host_function)
+    actual_semantic_fingerprint: str | None = None
+    needs_isolated_bind = bound._cache_managed and bool(host_function.global_imports)
+    if isinstance(expected_semantic_fingerprint, str) and not needs_isolated_bind:
+        actual_semantic_fingerprint = bound._get_host_semantic_fingerprint(
+            flat_leaves,
+            input_normalization=input_normalization,
+        )
+        needs_isolated_bind = (
+            bound._cache_managed
+            and actual_semantic_fingerprint != expected_semantic_fingerprint
+        )
+    if needs_isolated_bind:
+        log.debug(
+            "cached bound for %s depends on external state or does not match "
+            "the Dynamo host trace; using an isolated bind",
+            kernel.name,
+        )
+        bound = kernel._bind_isolated(bind_args)
+        host_function = bound.host_function
+        assert host_function is not None
+        flat_leaves, tree_spec, return_ast = _get_flat_output(host_function)
+        actual_semantic_fingerprint = None
 
+    if isinstance(expected_semantic_fingerprint, str):
+        if actual_semantic_fingerprint is None:
+            actual_semantic_fingerprint = bound._get_host_semantic_fingerprint(
+                flat_leaves,
+                input_normalization=input_normalization,
+            )
+        if actual_semantic_fingerprint != expected_semantic_fingerprint:
+            raise RuntimeError(
+                "Helion kernel trace or compile environment differed between "
+                "Dynamo capture and Inductor lowering for kernel "
+                f"{kernel.fn.__name__!r}; this configuration cannot be lowered safely"
+            )
+
+    # Derive output structure from bound kernel using inductor-time input layouts.
+    # This gives correct strides even when inductor changes input memory layouts.
     if not flat_leaves:
         # No outputs — create still creates the buffer for mutations.
         buf, _ = HelionTemplateBuffer.create(

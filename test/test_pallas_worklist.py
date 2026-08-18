@@ -53,8 +53,8 @@ try:
     import jax.numpy as jnp
     import numpy as np
 
-    from helion.runtime.compact_worklist import flatten_worklist
-    from helion.runtime.compact_worklist import packed_upper_bound
+    from helion.runtime.pallas.compact_worklist import flatten_worklist
+    from helion.runtime.pallas.compact_worklist import packed_upper_bound
 
     HAS_JAX = True
 except ImportError:  # pragma: no cover - jax optional
@@ -1403,7 +1403,7 @@ class TestWorklistConfig(unittest.TestCase):
         # Regular output imports ``flatten_worklist`` from helion (the builder calls
         # it as a module-level name); the dependency-free path embeds it instead.
         self.assertIn(
-            "from helion.runtime.compact_worklist import flatten_worklist", code
+            "from helion.runtime.pallas.compact_worklist import flatten_worklist", code
         )
         ast.parse(code)
         # Dependency-free output embeds the helper source at module scope (no helion
@@ -1413,7 +1413,7 @@ class TestWorklistConfig(unittest.TestCase):
             options=helion.OutputCodeOptions(allow_helion_deps=False),
         )
         self.assertIn("def flatten_worklist(", free)
-        self.assertNotIn("from helion.runtime.compact_worklist import", free)
+        self.assertNotIn("from helion.runtime.pallas.compact_worklist import", free)
         self.assertNotIn("import helion", free)
         ast.parse(free)
         # Offsets arg index is non-empty (q_offsets feeds the builder).

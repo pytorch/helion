@@ -56,7 +56,7 @@ def _embedded_helper_source(body: str) -> str:
             ]
         )
     if "flatten_worklist" in body:
-        from ...runtime import compact_worklist
+        from ...runtime.pallas import compact_worklist
 
         blocks.append(_embed_source(inspect.getsource(compact_worklist)))
     return "\n\n\n".join(blocks)
@@ -268,7 +268,7 @@ class PallasBackend(Backend):
             # dependency-free path drops these imports and embeds the source instead
             # (see ``embedded_helper_source`` / ``build_dependency_free_code``).
             "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
-            "flatten_worklist": "from helion.runtime.compact_worklist import flatten_worklist",
+            "flatten_worklist": "from helion.runtime.pallas.compact_worklist import flatten_worklist",
         }
 
     def embedded_helper_source(self, body: str) -> str:
@@ -1631,7 +1631,7 @@ class PallasBackend(Backend):
         ``cdiv(total, BLOCK * grouping) + num_owners - 1`` provably holds. All
         terms are concrete ints under ``static_shapes=True``.
         """
-        from ...runtime.compact_worklist import packed_upper_bound
+        from ...runtime.pallas.compact_worklist import packed_upper_bound
         from ..compile_environment import CompileEnvironment
 
         params = dict(host_fn.params.arguments)

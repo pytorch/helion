@@ -150,6 +150,11 @@ class MetalBackend(Backend):
     def force_tile_mask(self) -> bool:
         return True
 
+    def launches_surplus_tile_threads(self) -> bool:
+        # MPP requires num_warps * 32 threads on tid[0], which is independent
+        # of the row block size; see the base docstring.
+        return True
+
     def inductor_op_overrides(self) -> InductorOpOverrides:
         from .metal_overrides import MetalOverrides
 

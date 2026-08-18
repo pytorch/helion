@@ -16,6 +16,7 @@ Parameterized by:
 from __future__ import annotations
 
 from enum import Enum
+import functools
 from typing import Any
 from typing import Callable
 from typing import Literal
@@ -2110,6 +2111,7 @@ def chunk_fwd_A_diag_anchored_varlen_helion(
     A: torch.Tensor,
     Akk: torch.Tensor,
     scale: float,
+    l2norm_q: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> None:
     """chunk_fwd_A_diag_anchored_helion over a varlen batch, q/k read token-major.
 
@@ -2164,6 +2166,8 @@ def chunk_fwd_A_diag_anchored_varlen_helion(
             hl.load(q, [base + rows0, h, dcols], extra_mask=m0[:, None]),
             0,
         ).float()  # [BC_DIAG, D]
+        if l2norm_q:
+            q0 = q0 * torch.rsqrt((q0 * q0).sum(dim=-1, keepdim=True) + 1e-6)
         k0 = torch.where(
             m0[:, None],
             hl.load(k, [base + rows0, h, dcols], extra_mask=m0[:, None]),
@@ -2188,6 +2192,8 @@ def chunk_fwd_A_diag_anchored_varlen_helion(
                 hl.load(q, [base + rows1, h, dcols], extra_mask=m1[:, None]),
                 0,
             ).float()
+            if l2norm_q:
+                q1 = q1 * torch.rsqrt((q1 * q1).sum(dim=-1, keepdim=True) + 1e-6)
             k1 = torch.where(
                 m1[:, None],
                 hl.load(k, [base + rows1, h, dcols], extra_mask=m1[:, None]),
@@ -2219,6 +2225,8 @@ def chunk_fwd_A_diag_anchored_varlen_helion(
                 hl.load(q, [base + rows2, h, dcols], extra_mask=m2[:, None]),
                 0,
             ).float()
+            if l2norm_q:
+                q2 = q2 * torch.rsqrt((q2 * q2).sum(dim=-1, keepdim=True) + 1e-6)
             k2 = torch.where(
                 m2[:, None],
                 hl.load(k, [base + rows2, h, dcols], extra_mask=m2[:, None]),
@@ -2250,6 +2258,8 @@ def chunk_fwd_A_diag_anchored_varlen_helion(
                 hl.load(q, [base + rows3, h, dcols], extra_mask=m3[:, None]),
                 0,
             ).float()
+            if l2norm_q:
+                q3 = q3 * torch.rsqrt((q3 * q3).sum(dim=-1, keepdim=True) + 1e-6)
             k3 = torch.where(
                 m3[:, None],
                 hl.load(k, [base + rows3, h, dcols], extra_mask=m3[:, None]),
@@ -2323,6 +2333,7 @@ def chunk_fwd_o_diag_anchored_varlen_helion(
     valid_len: torch.Tensor,
     out: torch.Tensor,
     scale: float,
+    l2norm_q: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> None:
     """chunk_fwd_o_diag_anchored_helion over a varlen batch, q read and out written
     token-major.
@@ -2360,6 +2371,8 @@ def chunk_fwd_o_diag_anchored_varlen_helion(
             hl.load(q, [base + idx, head, dcols], extra_mask=valid[:, None]),
             0,
         ).float()  # [C, D]
+        if l2norm_q:
+            qt = qt * torch.rsqrt((qt * qt).sum(dim=-1, keepdim=True) + 1e-6)
         gct = gc[tile_r.begin, :, :]
         qg = (qt * torch.exp2(gct * RCP_LN2)).to(q.dtype)
         ht = h[tile_r.begin, :, :]
@@ -2862,6 +2875,42 @@ def _helion_chunked_fwd_delta(
     return o.reshape(B, H, T, DV), h_all, v_new_all, A_inv, w, final_state
 
 
+@functools.lru_cache(maxsize=4)
+def _kda_varlen_chunk_tables(
+    cu_seqlens: torch.Tensor,
+    C: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Place every chunk: sequence n owns chunk_offsets[n] : chunk_offsets[n + 1], and
+    chunk j of it starts at token_base[j] with valid_len[j] rows of its own.
+        lens          = diff(cu_seqlens)                    # [N]
+        chunk_offsets = pad(cumsum(ceil(lens / C)), 1, 0)   # [N + 1]
+        token_base[j] = cu_seqlens[n] + i * C               # [NT], i within seq n
+        valid_len[j]  = min(lens[n] - i * C, C)             # [NT], rows in 1..C
+
+    Every table is a pure function of cu_seqlens and C, so a caller that reuses one
+    cu_seqlens across forwards, as a stack of layers does, builds them once. NT comes
+    from int(chunk_offsets[-1]), a device-to-host sync, so rebuilding them per call
+    also drains the launch queue between forwards.
+
+    Keyed by identity, which is what a tensor hashes as, so refilling one cu_seqlens
+    in place returns that tensor's first tables: a new batch needs a new tensor, not
+    an edited one. Comparing values instead would need the same device-to-host sync
+    this exists to skip. FLA holds its own varlen tables under the same rule, in
+    fla.utils.tensor_cache.
+    """
+    N = cu_seqlens.numel() - 1
+    device = cu_seqlens.device
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    chunk_offsets = torch.nn.functional.pad(((lens + C - 1) // C).cumsum(0), (1, 0))
+    counts = chunk_offsets[1:] - chunk_offsets[:-1]
+    seq_id = torch.repeat_interleave(torch.arange(N, device=device), counts)
+    NT = int(chunk_offsets[-1])
+    local = torch.arange(NT, device=device) - chunk_offsets[seq_id]
+    token_base = cu_seqlens[seq_id] + local * C
+    valid_len = (lens[seq_id] - local * C).clamp(max=C)
+    return chunk_offsets, token_base, valid_len, NT
+
+
 def _helion_chunked_fwd_kda_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2876,6 +2925,7 @@ def _helion_chunked_fwd_kda_varlen(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    l2norm_q: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """KDA forward over a varlen batch (cu_seqlens), forward only.
 
@@ -2909,20 +2959,7 @@ def _helion_chunked_fwd_kda_varlen(
     DV = v.shape[-1]
     N = cu_seqlens.numel() - 1
 
-    # Place every chunk: sequence n owns chunk_offsets[n] : chunk_offsets[n + 1], and
-    # chunk j of it starts at token_base[j] with valid_len[j] rows of its own.
-    #     lens          = diff(cu_seqlens)                    # [N]
-    #     chunk_offsets = pad(cumsum(ceil(lens / C)), 1, 0)   # [N + 1]
-    #     token_base[j] = cu_seqlens[n] + i * C               # [NT], i within seq n
-    #     valid_len[j]  = min(lens[n] - i * C, C)             # [NT], rows in 1..C
-    lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    chunk_offsets = torch.nn.functional.pad(((lens + C - 1) // C).cumsum(0), (1, 0))
-    counts = chunk_offsets[1:] - chunk_offsets[:-1]
-    seq_id = torch.repeat_interleave(torch.arange(N, device=cu_seqlens.device), counts)
-    NT = int(chunk_offsets[-1])
-    local = torch.arange(NT, device=cu_seqlens.device) - chunk_offsets[seq_id]
-    token_base = cu_seqlens[seq_id] + local * C
-    valid_len = (lens[seq_id] - local * C).clamp(max=C)
+    chunk_offsets, token_base, valid_len, NT = _kda_varlen_chunk_tables(cu_seqlens, C)
 
     HNT = H * NT
     g_cs = torch.empty(HNT, C, D, dtype=torch.float32, device=q.device)
@@ -2943,7 +2980,7 @@ def _helion_chunked_fwd_kda_varlen(
     Aqk = torch.zeros(HNT, C, C, dtype=q.dtype, device=q.device)
     Akk = torch.zeros(HNT, C, C, dtype=q.dtype, device=q.device)
     chunk_fwd_A_diag_anchored_varlen_helion(
-        q, k, g_cs, token_base, valid_len, Aqk, Akk, scale
+        q, k, g_cs, token_base, valid_len, Aqk, Akk, scale, l2norm_q=l2norm_q
     )
 
     w = torch.empty(HNT, C, D, dtype=k.dtype, device=k.device)
@@ -2975,7 +3012,7 @@ def _helion_chunked_fwd_kda_varlen(
     # to the real token count on return.
     o = q.new_zeros(q.size(0), H, DV)
     chunk_fwd_o_diag_anchored_varlen_helion(
-        q, v_new, g_cs, h_all, Aqk, token_base, valid_len, o, scale
+        q, v_new, g_cs, h_all, Aqk, token_base, valid_len, o, scale, l2norm_q=l2norm_q
     )
     o = o[:T_total]
 
@@ -3772,8 +3809,12 @@ def helion_chunk_kda(
     if state_v_first and initial_state is not None:
         initial_state = initial_state.transpose(-2, -1).contiguous()
 
+    fuse_q_l2norm = use_qk_l2norm_in_kernel and cu_seqlens is not None
     if use_qk_l2norm_in_kernel:
-        q, k = (l2norm_fwd_helion(t.reshape(-1, t.size(-1))).view_as(t) for t in (q, k))
+        norm = lambda t: l2norm_fwd_helion(t.reshape(-1, t.size(-1))).view_as(t)  # noqa: E731
+        k = norm(k)
+        if not fuse_q_l2norm:
+            q = norm(q)
     if use_beta_sigmoid_in_kernel:
         beta = torch.sigmoid(beta)
     if use_gate_in_kernel:
@@ -3834,6 +3875,7 @@ def helion_chunk_kda(
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            l2norm_q=fuse_q_l2norm,
         )
         o = o.unsqueeze(0)
         if return_final_state:
