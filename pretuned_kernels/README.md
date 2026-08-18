@@ -41,7 +41,9 @@ pretuned_kernels/
 ├── rms_norm_dynamic_per_token_quant/
 ├── rms_norm_per_block_quant/
 ├── silu_and_mul_per_block_quant/
-└── fused_qk_norm_rope/
+├── fused_qk_norm_rope/
+├── causal_conv1d/                    # TPU/Pallas fixed-config decode kernel
+└── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -68,6 +70,8 @@ At runtime Helion picks the file matching the current GPU.
 | `rms_norm_per_block_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native RMSNorm + per-block fp8 quant |
 | `silu_and_mul_per_block_quant` | vLLM `(num_tokens, intermediate, group)` shapes | torch-native silu-and-mul + per-block fp8 quant |
 | `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
+| `causal_conv1d` | TPU decode `N=512, H=4, D=128, W=4` | tpu-inference `ragged_causal_conv1d` |
+| `gdn_decode` | TPU decode `N=512, H=2, K=V=128` | tpu-inference `fused_decoding_gdn` |
 
 Most kernels additionally benchmark against `torch.compile` of the listed
 PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
@@ -93,6 +97,14 @@ The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
 Helion kernel under CUDA graphs against a torch-native (unfused, eager)
 reference; `silu_mul_fp8` ships an `sm90` heuristic only, the rest ship both
 `sm90` and `sm100`.
+
+`causal_conv1d` and `gdn_decode` are Pallas kernels with checked-in fixed
+configurations rather than CUDA AOT heuristic files. Their module-level
+`main()` functions run real-TPU JAX-export correctness checks. They are not
+registered in the CUDA-only aggregate runner. The implementations and
+baselines follow the Apache-licensed `vllm-project/tpu-inference` state-cache
+contracts; `gdn_decode` currently targets `H=2` because larger recurrent-state
+tiles exceed Helion's current aligned indirect-DMA VMEM plan.
 
 ## Scope
 
