@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import CompiledConfig
+    from helion.runtime.kernel import Kernel
 
 
 OFFICIAL_SHAPES: tuple[OfficialShape, ...] = _HARNESS.OFFICIAL_SHAPES
@@ -159,16 +160,6 @@ def _deepgemm_aot_autotuner(
     return AOTAutotuneCache(make_search(), autotuner_factory=make_search)
 
 
-@helion.aot_kernel(
-    backend="cute",
-    key=_selected_key,
-    static_shapes=False,
-    autotuner_fn=_deepgemm_aot_autotuner,
-    autotune_precompile=None,
-    autotune_baseline_fn=_reference,
-    autotune_baseline_atol=3e-2,
-    autotune_baseline_rtol=3e-2,
-)
 def grouped_gemm_deepgemm(
     a_packed: torch.Tensor,
     b_grouped: torch.Tensor,
@@ -222,6 +213,30 @@ def grouped_gemm_deepgemm(
             extra_mask=store_rows[:, None],  # pyrefly: ignore[bad-index]
         )
     return out
+
+
+_GROUPED_GEMM_DEEPGEMM_BODY = grouped_gemm_deepgemm
+
+
+def create_grouped_gemm_deepgemm_kernel() -> Kernel[torch.Tensor]:
+    """Create an independent grouped-GEMM kernel and binding cache."""
+    return helion.aot_kernel(
+        _GROUPED_GEMM_DEEPGEMM_BODY,
+        backend="cute",
+        key=_selected_key,
+        static_shapes=False,
+        autotuner_fn=_deepgemm_aot_autotuner,
+        autotune_precompile=None,
+        autotune_baseline_fn=_reference,
+        autotune_baseline_atol=3e-2,
+        autotune_baseline_rtol=3e-2,
+    )
+
+
+grouped_gemm_deepgemm = cast(
+    "Kernel[torch.Tensor]",
+    create_grouped_gemm_deepgemm_kernel(),
+)
 
 
 @dataclass

@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import ClassVar
+from typing import Literal
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .common import HardwareTarget
+
+
+CompilerHeuristicSpecializationFact = Literal[
+    "config_num_sm",
+    "device_num_sm",
+    "input_tensor_metadata",
+]
 
 
 class AutotunerHeuristic:
@@ -24,6 +32,47 @@ class AutotunerHeuristic:
     # be offered everywhere as a search candidate but only defaulted on validated
     # arches.
     PROMOTE_TARGETS: ClassVar[tuple[HardwareTarget, ...] | None] = None
+    # Optional exact device-name fence layered on PROMOTE_TARGETS.  This is for
+    # seeds validated on one product that shares a compute capability with
+    # another (for example B200 and GB300); it never limits where a seed fires.
+    PROMOTE_HARDWARE_NAMES: ClassVar[frozenset[str] | None] = None
+    # Runtime facts that can change this heuristic's emitted seed configs.  The
+    # bound-kernel cache adds these facts only after the heuristic actually
+    # fires, so a shape- or SM-sensitive heuristic does not force unrelated
+    # kernels on the same backend to specialize on those facts.
+    #
+    # ``device_num_sm`` is the physical count returned by get_num_sm(device).
+    # ``config_num_sm`` is ConfigSpec.num_sm, which also applies the kernel's
+    # persistent_reserved_sms setting.
+    # ``input_tensor_metadata`` is the exact shape and stride of every input
+    # tensor. Dynamic kernels request it when first-binding shape/layout hints
+    # affect their seed population or the generated schedule's validity. It
+    # intentionally creates a distinct bound kernel for each metadata tuple;
+    # heuristics should request it only when coarser reuse would be unsound.
+    CACHE_SPECIALIZATION_FACTS: ClassVar[
+        frozenset[CompilerHeuristicSpecializationFact]
+    ] = frozenset()
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        """Register correctness facts before optional seed generation.
+
+        Overrides must be idempotent because callers may regenerate compiler
+        seeds for the same bound kernel. This hook runs even when autotuner
+        heuristics are disabled; it must not itself add or promote seed configs.
+        Exceptions intentionally propagate and fail binding because silently
+        dropping correctness facts could make later normalization unsound.
+
+        Return the runtime facts that can change either the registration
+        outcome or the registered correctness facts. An input-dependent hook
+        must return its requirements even when this binding registers nothing,
+        so a later binding that would register facts cannot reuse it. These
+        requirements are independent of ``CACHE_SPECIALIZATION_FACTS``, which
+        applies only when this heuristic actually emits seeds.
+        """
+        return frozenset()
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -42,11 +91,15 @@ class AutotunerHeuristic:
         promotion to ``PROMOTE_TARGETS`` without changing where the seed fires."""
         if not cls.promote_seed_to_default:
             return False
-        if cls.PROMOTE_TARGETS is None:
+        if cls.PROMOTE_TARGETS is None and cls.PROMOTE_HARDWARE_NAMES is None:
             return True
         from .common import matches_hardware
 
-        return matches_hardware(env, cls.PROMOTE_TARGETS)
+        return matches_hardware(
+            env,
+            cls.PROMOTE_TARGETS,
+            hardware_names=cls.PROMOTE_HARDWARE_NAMES,
+        )
 
     @classmethod
     def get_seed_configs(

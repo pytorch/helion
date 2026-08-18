@@ -149,10 +149,12 @@ class LocalAutotuneCache(AutotuneCacheBase):
             )
             specialization_key = in_memory_cache_key.specialization_key
             extra_results = in_memory_cache_key.extra_results
+            compiler_seed_results = in_memory_cache_key.compiler_seed_results
             dev = extract_device(self.args)
         else:
             specialization_key = multi_args.workload_key
             extra_results = ()
+            compiler_seed_results = ()
             dev = multi_args.cases[0][0].env.device
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
@@ -201,6 +203,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         return LooseAutotuneCacheKey(
             specialization_key=specialization_key,
             extra_results=extra_results,
+            compiler_seed_results=compiler_seed_results,
             kernel_source_hash=kernel_source_hash,
             hardware=hardware,
             runtime_name=runtime_name,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,7 @@ from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
 from .cute import CuteTcgen05GroupedStaticCommonKHeuristic
+from .cute import CuteTcgen05GroupedWorklistHeuristic
 from .cute import CuteTcgen05ThreadLocalEpilogueHeuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
@@ -32,10 +34,13 @@ from .triton import TritonUserTiledReductionHeuristicSM90
 from .triton import TritonUserTiledReductionHeuristicSM100
 
 if TYPE_CHECKING:
+    import torch
+
     from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .registry import AutotunerHeuristicType
+    from .registry import CompilerHeuristicSpecializationFact
 
 # All active heuristics by backend
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
@@ -45,6 +50,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFlashAttentionCausalLptHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
+        CuteTcgen05GroupedWorklistHeuristic,
         CuteTcgen05GroupedStaticCommonKHeuristic,
         CuteTcgen05GroupedDynamicBk64Heuristic,
         CuteTcgen05ThreadLocalEpilogueHeuristic,
@@ -85,18 +91,133 @@ def get_heuristics(backend: str) -> tuple[AutotunerHeuristicType, ...]:
     return HEURISTICS_BY_BACKEND.get(backend, ())
 
 
+_PromotionRegistryState = tuple[tuple[str, bool, frozenset[str]], ...]
+_PromotionRegistrySignature = tuple[tuple[str, frozenset[str]], ...]
+
+
+def _promotion_registry_state(
+    heuristics: tuple[AutotunerHeuristicType, ...],
+) -> _PromotionRegistryState:
+    """Snapshot the mutable class policy used by promotion-key caching.
+
+    This snapshot is deliberately rebuilt: heuristic policy attributes may be
+    replaced at runtime by tests or downstream registries, while the derived
+    signature remains cached by the immutable snapshot value.
+    """
+    return tuple(
+        (
+            heuristic.name,
+            heuristic.promote_seed_to_default,
+            frozenset(heuristic.PROMOTE_HARDWARE_NAMES or ()),
+        )
+        for heuristic in heuristics
+    )
+
+
+@functools.cache
+def _promotion_registry_signature(
+    registry_state: _PromotionRegistryState,
+) -> _PromotionRegistrySignature:
+    """Return the immutable exact-name gate signature for one registry entry."""
+    return tuple(
+        (heuristic_name, hardware_names)
+        for heuristic_name, promote_seed_to_default, hardware_names in registry_state
+        if promote_seed_to_default and hardware_names
+    )
+
+
+@functools.cache
+def _promotion_key_from_identity(
+    hardware_name: str | None,
+    registry_signature: _PromotionRegistrySignature,
+) -> tuple[tuple[str, str | None], ...]:
+    """Map pure promotion-relevant identity to the bound-kernel cache key."""
+    return tuple(
+        (
+            heuristic_name,
+            hardware_name if hardware_name in hardware_names else None,
+        )
+        for heuristic_name, hardware_names in registry_signature
+    )
+
+
+def compiler_promotion_specialization_key(
+    backend: str,
+    device: torch.device,
+) -> tuple[tuple[str, str | None], ...]:
+    """Return exact-name facts that can change a promoted compiler default.
+
+    Compute capability is already part of the bound-kernel specialization key.
+    Only heuristics with an additional exact-name promotion fence need more
+    device identity.  Non-matching products share the ``None`` bucket because
+    they all decline that promotion; capability-only heuristics add no key at
+    all. Registry analysis and result construction are cached from immutable
+    signatures. ``get_hardware_info`` is cached per device; the resolver call
+    here selects that cached identity for the current device.
+    """
+    registry_signature = _promotion_registry_signature(
+        _promotion_registry_state(get_heuristics(backend))
+    )
+    if not registry_signature:
+        return ()
+
+    from ..._argument_device import _canonicalize_argument_device
+    from ..._hardware import get_hardware_info
+
+    try:
+        hardware_name = get_hardware_info(
+            _canonicalize_argument_device(device)
+        ).hardware_name
+    except RuntimeError:
+        hardware_name = None
+    return _promotion_key_from_identity(
+        hardware_name,
+        registry_signature,
+    )
+
+
+def compiler_seed_specialization_facts(
+    backend: str,
+    fired_heuristics: tuple[str, ...] | list[str],
+) -> frozenset[CompilerHeuristicSpecializationFact]:
+    """Return device facts needed by compiler seeds that actually fired.
+
+    Eligibility is known only after tracing the kernel.  Deferring this lookup
+    until then avoids putting SM count in every bound-kernel key merely because
+    one heuristic registered for the backend happens to depend on it.
+    """
+    fired = frozenset(fired_heuristics)
+    return frozenset(
+        fact
+        for heuristic in get_heuristics(backend)
+        if heuristic.name in fired
+        for fact in heuristic.CACHE_SPECIALIZATION_FACTS
+    )
+
+
 def compiler_seed_configs(
     env: CompileEnvironment,
     device_ir: DeviceIR,
 ) -> list[Config]:
     configs: list[Config] = []
+    heuristics = get_heuristics(env.backend_name)
+    registered_fact_specialization_facts: set[CompilerHeuristicSpecializationFact] = (
+        set()
+    )
+    for heuristic in heuristics:
+        registered_fact_specialization_facts.update(
+            heuristic.register_facts(env, device_ir)
+        )
+    env.compiler_fact_specialization_facts = frozenset(
+        registered_fact_specialization_facts
+    )
     env.config_spec.autotuner_heuristics = []
     env.config_spec.compiler_default_config = None
     env.config_spec.compiler_seed_timeout_retry_repetitions = None
     if env.settings.disable_autotuner_heuristics:
         return configs
 
-    for heuristic in get_heuristics(env.backend_name):
+    for heuristic in heuristics:
         try:
             if not heuristic.is_eligible(env, device_ir):
                 continue
