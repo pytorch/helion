@@ -1338,12 +1338,12 @@ def _ensure_cpu_tpu_info() -> None:
     """
     try:
         from jax._src.pallas.mosaic.tpu_info import ChipVersion
-        from jax._src.pallas.mosaic.tpu_info import _get_tpu_info_impl
+        from jax._src.pallas.mosaic.tpu_info import get_tpu_info_for_chip
         from jax._src.pallas.mosaic.tpu_info import registry
     except ImportError:
         return
     if "cpu" not in registry:
-        registry["cpu"] = lambda: _get_tpu_info_impl(ChipVersion.TPU_7X, 1)
+        registry["cpu"] = lambda: get_tpu_info_for_chip(ChipVersion.TPU_7X, 1)
 
 
 def _pallas_apply_ds_padding(

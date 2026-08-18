@@ -8678,7 +8678,7 @@ class TestCuteLowerings(unittest.TestCase):
         analyzer's linear-chain assumption (negative pinned by
         ``test_tcgen05_fused_gelu_tanh_approx_eager_polynomial_rejected``);
         the device_ir decomp folds the whole expression into a single
-        ``_UnaryStep`` row so the splice site emits the polynomial
+        ``_UnaryOp`` row so the splice site emits the polynomial
         against the already-bound carrier local.
         """
 
