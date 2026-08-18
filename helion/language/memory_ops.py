@@ -142,6 +142,7 @@ class _RowvecAuxStageRecord:
     copy_bits: int
     copy_elems: int
     aux_extent: int
+    warp_private: bool
 
 
 def _tcgen05_rowvec_aux_stage_copy_elems(
@@ -1905,6 +1906,50 @@ def _codegen_cute_store_tcgen05_tile(
                 "partial-output TMA-store epilogue"
             )
 
+    _TCGEN05_TMEM_DATAPATH_M = 128
+    if tcgen05_value.has_explicit_epilogue_tile:
+        assert tcgen05_value.explicit_epi_tile_m is not None
+        tcgen05_epi_tile_m = tcgen05_value.explicit_epi_tile_m
+    elif tcgen05_is_two_cta_m128(
+        is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
+    ):
+        tcgen05_epi_tile_m = tcgen05_value.bm // 2
+    else:
+        tcgen05_epi_tile_m = tcgen05_value.bm
+
+    aux_matmul_plan = df.cute_state.matmul_plan
+
+    def can_stage_rowvec_per_warp(
+        broadcast_axis: int | None,
+        copy_elems: int | None,
+        *,
+        has_full_register_hoist: bool,
+    ) -> bool:
+        """Whether this rowvec can use a warp-private full-tile SMEM stage."""
+
+        return (
+            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and tcgen05_value.use_tma_store_epilogue
+            and not tcgen05_value.partial_output_tma_store
+            and not tcgen05_value.output_column_major
+            and tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
+            and broadcast_axis == 1
+            and copy_elems is not None
+            and not has_full_register_hoist
+        )
+
+    def is_profitable_rowvec_per_warp_config(aux_dtype_bits: int) -> bool:
+        """Whether reuse should amortize this warp-private FP32 stage."""
+
+        if aux_dtype_bits != 32:
+            return False
+        stage_bytes = (
+            tcgen05_value.epi_warp_count * tcgen05_value.bn * (aux_dtype_bits // 8)
+        )
+        # B200 sweep boundaries: bn=32 only breaks even, and the largest
+        # winning stage used 4 KiB without changing occupancy.
+        return tcgen05_value.bn >= 64 and stage_bytes <= 4 * 1024
+
     aux_step_records: list[_AuxStepRecord] = []
     for aux_idx, aux_step in enumerate(aux_steps_in_chain):
         aux_tensor_node = aux_step.load_node.args[0]
@@ -2030,16 +2075,6 @@ def _codegen_cute_store_tcgen05_tile(
     # threshold needs revisiting: the materialize fallback below is always
     # correct, so the worst case is the fast-path mis-firing (caught by the
     # row-dependent colvec tests).
-    _TCGEN05_TMEM_DATAPATH_M = 128
-    if tcgen05_value.has_explicit_epilogue_tile:
-        assert tcgen05_value.explicit_epi_tile_m is not None
-        tcgen05_epi_tile_m = tcgen05_value.explicit_epi_tile_m
-    elif tcgen05_is_two_cta_m128(
-        is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
-    ):
-        tcgen05_epi_tile_m = tcgen05_value.bm // 2
-    else:
-        tcgen05_epi_tile_m = tcgen05_value.bm
     tcgen05_colvec_fragment_single_m_row = (
         tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
     )
@@ -2064,7 +2099,6 @@ def _codegen_cute_store_tcgen05_tile(
     # subtile ``cute.copy(s2r, sC[..., stage], rmem)`` →
     # ``rmem.load()``). Gate-closed configs keep the historical
     # GMEM path byte-identical.
-    aux_matmul_plan = df.cute_state.matmul_plan
     aux_pipeline_plan_obj = df.cute_state.aux_pipeline_plan
     # Workstream A Stage 4 (cycle 93, Path B): when the plan carries a store
     # warp, the per-subtile R2S->TMA-D tail is split by warp role and the
@@ -2183,13 +2217,20 @@ def _codegen_cute_store_tcgen05_tile(
             rec.aux_extent,
             copy_bits=copy_bits,
         )
-        if (
+        stage_partial_tma_rowvec = (
             tcgen05_value.partial_output_tma_store
             and tcgen05_value.use_tma_store_epilogue
             and rec.broadcast_axis == 1
             and copy_elems is not None
-        ):
+        )
+        stage_rowvec_per_warp = can_stage_rowvec_per_warp(
+            rec.broadcast_axis,
+            copy_elems,
+            has_full_register_hoist=rec.aux_rmem_full is not None,
+        ) and is_profitable_rowvec_per_warp_config(rec.aux_dtype_bits)
+        if stage_partial_tma_rowvec or stage_rowvec_per_warp:
             assert rec.aux_extent is not None
+            assert copy_elems is not None
             rowvec_aux_stage_records.append(
                 _RowvecAuxStageRecord(
                     smem_layout=df.new_var(f"tcgen05_aux_rowvec_smem_layout_{aux_idx}"),
@@ -2206,6 +2247,7 @@ def _codegen_cute_store_tcgen05_tile(
                     copy_bits=copy_bits,
                     copy_elems=copy_elems,
                     aux_extent=rec.aux_extent,
+                    warp_private=stage_rowvec_per_warp,
                 )
             )
         else:
@@ -2229,7 +2271,12 @@ def _codegen_cute_store_tcgen05_tile(
                 [
                     (
                         f"{stage.smem_layout} = cute.make_layout("
-                        f"({tcgen05_aux_bn},), stride=(1,))"
+                        + (
+                            f"({tcgen05_aux_epi_warp_count}, {tcgen05_aux_bn}), "
+                            f"stride=({tcgen05_aux_bn}, 1))"
+                            if stage.warp_private
+                            else f"({tcgen05_aux_bn},), stride=(1,))"
+                        )
                     ),
                     (
                         f"{stage.smem_ptr} = cute.arch.alloc_smem("
@@ -2252,37 +2299,55 @@ def _codegen_cute_store_tcgen05_tile(
             stage = rowvec_aux_stage_records[aux_idx]
             if stage is None:
                 continue
+            if stage.warp_private:
+                copy_thread_layout = "32"
+                copy_tidx = f"{tcgen05_aux_epi_tidx} % cutlass.Int32(32)"
+                copy_smem = (
+                    f"{stage.smem}[{tcgen05_aux_epi_tidx} // cutlass.Int32(32), None]"
+                )
+                copy_source = (
+                    f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
+                    f"{stage.smem_part})"
+                )
+            else:
+                copy_thread_layout = str(tcgen05_aux_epi_warp_count * 32)
+                copy_tidx = tcgen05_aux_epi_tidx
+                copy_smem = stage.smem
+                copy_source = (
+                    f"    {stage.coord} = {stage.thr_copy}.partition_S("
+                    f"cute.make_identity_tensor({tcgen05_aux_bn}))\n"
+                    f"    {stage.limit} = min({n_size} - ({n_index}), "
+                    f"cutlass.Int32({stage.aux_extent}) - ({n_index}), "
+                    f"cutlass.Int32({tcgen05_aux_bn}))\n"
+                    f"    {stage.pred} = cute.make_rmem_tensor("
+                    f"(1, cute.size({stage.smem_part}.shape[1])), "
+                    "cutlass.Boolean)\n"
+                    f"    for _rowvec_i in cutlass.range("
+                    f"cute.size({stage.smem_part}.shape[1]), unroll_full=True):\n"
+                    f"        {stage.pred}[0, _rowvec_i] = "
+                    f"{stage.coord}[0, _rowvec_i] < {stage.limit}\n"
+                    f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
+                    f"{stage.smem_part}, pred={stage.pred})\n"
+                    "    cute.arch.fence_acq_rel_cta()\n"
+                    f"    {epilog_sync_barrier}.arrive_and_wait()"
+                )
             lines.append(
                 f"if {tcgen05_aux_epi_active}:\n"
                 f"    {stage.tiled_copy} = cute.make_tiled_copy_tv("
                 f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
                 f"{rec.aux_dtype}, num_bits_per_copy={stage.copy_bits}), "
-                f"cute.make_layout({tcgen05_aux_epi_warp_count * 32}), "
+                f"cute.make_layout({copy_thread_layout}), "
                 f"cute.make_layout({stage.copy_elems}))\n"
                 f"    {stage.thr_copy} = {stage.tiled_copy}.get_slice("
-                f"{tcgen05_aux_epi_tidx})\n"
+                f"{copy_tidx})\n"
                 f"    {stage.gmem_tile} = cute.local_tile("
                 f"{rec.aux_tensor_name}, ({tcgen05_aux_bn},), "
                 f"({tile_coord_n},))\n"
                 f"    {stage.gmem_part} = {stage.thr_copy}.partition_S("
                 f"{stage.gmem_tile})\n"
                 f"    {stage.smem_part} = {stage.thr_copy}.partition_D("
-                f"{stage.smem})\n"
-                f"    {stage.coord} = {stage.thr_copy}.partition_S("
-                f"cute.make_identity_tensor({tcgen05_aux_bn}))\n"
-                f"    {stage.limit} = min({n_size} - ({n_index}), "
-                f"cutlass.Int32({stage.aux_extent}) - ({n_index}), "
-                f"cutlass.Int32({tcgen05_aux_bn}))\n"
-                f"    {stage.pred} = cute.make_rmem_tensor("
-                f"(1, cute.size({stage.smem_part}.shape[1])), cutlass.Boolean)\n"
-                f"    for _rowvec_i in cutlass.range("
-                f"cute.size({stage.smem_part}.shape[1]), unroll_full=True):\n"
-                f"        {stage.pred}[0, _rowvec_i] = "
-                f"{stage.coord}[0, _rowvec_i] < {stage.limit}\n"
-                f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
-                f"{stage.smem_part}, pred={stage.pred})\n"
-                f"    cute.arch.fence_acq_rel_cta()\n"
-                f"    {epilog_sync_barrier}.arrive_and_wait()"
+                f"{copy_smem})\n"
+                f"{copy_source}"
             )
         return lines
 
@@ -2568,10 +2633,18 @@ def _codegen_cute_store_tcgen05_tile(
                 assert rec.broadcast_axis == 1
                 assert rec.aux_view2d is not None
                 # The compact SMEM rowvec is allocated and populated per output
-                # tile, so its 2-D broadcast view is already tile-sized.
+                # tile, so its 2-D broadcast view is already tile-sized. The
+                # full-tile bm256 path gives every epilogue warp a private copy,
+                # avoiding a CTA barrier between the copy and its first read.
+                rowvec_smem_iterator = (
+                    f"{rowvec_stage.smem}[{tcgen05_aux_epi_tidx} // "
+                    "cutlass.Int32(32), None].iterator"
+                    if rowvec_stage.warp_private
+                    else f"{rowvec_stage.smem}.iterator"
+                )
                 lines.append(
                     f"{rec.aux_view2d} = cute.make_tensor("
-                    f"{rowvec_stage.smem}.iterator, "
+                    f"{rowvec_smem_iterator}, "
                     f"cute.make_layout(({tcgen05_bm}, {tcgen05_bn}), "
                     f"stride=(0, 1)))"
                 )
@@ -2984,7 +3057,7 @@ def _codegen_cute_store_tcgen05_tile(
                     lines.append(
                         f"{prelude_indent}{rec.aux_loaded} = "
                         f"{rec.ttr_aux_grouped}"
-                        f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                        "[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
                     )
                 else:
                     lines.append(
