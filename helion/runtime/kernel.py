@@ -44,6 +44,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
+from .._argument_device import _find_argument_device_with_path
 from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._compile_time import measure
@@ -82,6 +83,8 @@ if TYPE_CHECKING:
 
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
+    from ..autotuner.aot_kernel import InputFn
+    from ..autotuner.aot_kernel import KeyFunction
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
     ConfigLike = Config | dict[str, object]
@@ -429,6 +432,12 @@ class OutputCodeOptions:
 
 
 class Kernel(Generic[_R]):
+    _aot_collect_fn: InputFn | None = None
+    _aot_measure_fn: InputFn | None = None
+    _aot_standalone: bool = True
+    _aot_user_key: KeyFunction | None = None
+    _aot_workflow_done: bool = False
+
     def __init__(
         self,
         fn: Callable[..., _R],
@@ -436,6 +445,7 @@ class Kernel(Generic[_R]):
         configs: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
+        bound_call_validator: Callable[[], None] | None = None,
     ) -> None:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
@@ -445,6 +455,8 @@ class Kernel(Generic[_R]):
             configs: A list of configurations to use for the kernel.
             settings: The settings to be used by the Kernel. If None, a new `Settings()` instance is created.
             key: Optional callable that returns an extra hashable component for specialization.
+            bound_call_validator: Optional process-setting validator for direct
+                BoundKernel calls.
         """
         super().__init__()
         assert isinstance(fn, types.FunctionType)
@@ -455,6 +467,7 @@ class Kernel(Generic[_R]):
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
+        self._bound_call_validator: Callable[[], None] | None = bound_call_validator
         # Whether the kernel declares distributed intent via an hl.ProcessGroupName
         # argument. Computed once so the per-call is_distributed check stays cheap
         # on the dispatch hot path (avoids re-running inspect.signature). See #3024.
@@ -2502,6 +2515,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
+        if self.kernel._bound_call_validator is not None:
+            self.kernel._bound_call_validator()
+
         if self._cache_managed and self.kernel._has_specialization_extras:
             rebound = self.kernel.bind(args)
             if rebound is not self:
@@ -2659,6 +2675,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    _bound_call_validator: Callable[[], None] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -2670,6 +2687,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    _bound_call_validator: Callable[[], None] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
 
@@ -2680,6 +2698,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    _bound_call_validator: Callable[[], None] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
     """
@@ -2723,12 +2742,14 @@ def kernel(
             configs=configs,
             settings=settings_obj,
             key=key,
+            _bound_call_validator=_bound_call_validator,
         )
     return Kernel(
         fn,
         configs=configs,
         settings=settings_obj,
         key=key,
+        bound_call_validator=_bound_call_validator,
     )
 
 
@@ -3088,26 +3109,10 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
     Returns:
         torch.device: The extracted device
     """
-    for arg in args:
-        if isinstance(arg, torch.device):
-            return arg
-        if isinstance(arg, torch.Tensor):
-            return arg.device
-        if isinstance(arg, ConstExpr):
-            continue  # a constexpr-wrapped value carries no device; skip it
-        if isinstance(arg, (tuple, list)):
-            for item in arg:
-                try:
-                    return _find_device((item,))
-                except exc.NoTensorArgs:
-                    pass
-        elif isinstance(arg, dict):
-            for item in arg.values():
-                try:
-                    return _find_device((item,))
-                except exc.NoTensorArgs:
-                    pass
-    raise exc.NoTensorArgs
+    result = _find_argument_device_with_path(args)
+    if result is None:
+        raise exc.NoTensorArgs
+    return result[0]
 
 
 def _maybe_skip_dtype_check_in_meta_registrations() -> (

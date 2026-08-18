@@ -12,7 +12,9 @@ Usage::
     python -m helion.autotuner.aot_runner --standalone \\
         -- python examples/aot_compile_example.py
 
-Writes ``<source>_<kernel>_standalone.py`` next to each kernel source file.
+Writes ``<source>_<kernel>_standalone.py`` next to each canonical kernel source
+file, or ``<kernel>_standalone.py`` in the requested output directory when the
+source is unavailable or cannot be resolved safely.
 Static dispatch keys include tensor dtype, shape, and stride, but never tensor
 contents. Any tensor-derived value that affects generated code must therefore
 also be exposed as a scalar/container argument or checked by the emitted runtime
@@ -22,17 +24,23 @@ wrapper.
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import logging
+import marshal
 from pathlib import Path
 import re
 import tempfile
 import textwrap
+from typing import TYPE_CHECKING
 
 import torch
 
 from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
 from .._compiler.output_code_utils import dependency_free_runtime_source
+
+if TYPE_CHECKING:
+    from types import CodeType
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -227,12 +235,59 @@ def _extract_heuristic_body(heuristic_code: str, kernel_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def canonical_kernel_source_path(
+    kernel_source_file: str | Path | None,
+) -> Path | None:
+    """Return one durable file-backed source identity, or ``None`` for fallback."""
+    if kernel_source_file is None:
+        return None
+    try:
+        source_path = Path(kernel_source_file).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    return source_path if source_path.is_file() else None
+
+
+def kernel_source_identity(
+    kernel_source_file: str | Path | None,
+    code_object: CodeType | None = None,
+) -> tuple[Path | None, str]:
+    """Return canonical source placement and one durable cache identity.
+
+    Production callers provide the code object so distinct interactive kernels
+    sharing labels such as ``<string>`` remain isolated. String-only callers
+    retain a stable label hash when no code object is available.
+    """
+    source_path = canonical_kernel_source_path(kernel_source_file)
+    if source_path is not None:
+        return source_path, str(source_path)
+    identity_bytes = (
+        str(kernel_source_file).encode("utf-8", errors="surrogatepass")
+        if code_object is None
+        else marshal.dumps(code_object)
+    )
+    return None, f"<non-file-kernel:{hashlib.sha256(identity_bytes).hexdigest()}>"
+
+
+def standalone_output_path(
+    *,
+    kernel_name: str,
+    output_dir: Path,
+    kernel_source_file: str | Path | None,
+) -> Path:
+    """Return the canonical standalone output path shared by writers and checks."""
+    source_path = canonical_kernel_source_path(kernel_source_file)
+    if source_path is not None:
+        return source_path.parent / f"{source_path.stem}_{kernel_name}_standalone.py"
+    return output_dir / f"{kernel_name}_standalone.py"
+
+
 def generate_standalone_file(
     kernel_name: str,
     triton_codes: list[str],
     heuristic_code: str,
     output_dir: Path,
-    kernel_source_file: str | None = None,
+    kernel_source_file: str | Path | None = None,
     dispatch_keys: list[tuple[object, ...]] | None = None,
 ) -> Path:
     """
@@ -249,8 +304,8 @@ def generate_standalone_file(
         kernel_name: Name of the kernel function.
         triton_codes: Triton code strings, one per selected config.
         heuristic_code: Generated heuristic Python source.
-        output_dir: Fallback directory when *kernel_source_file* is ``None``.
-        kernel_source_file: When set, writes next to the source file.
+        output_dir: Fallback directory when the source is not a resolvable file.
+        kernel_source_file: Optional source identity used for canonical placement.
         dispatch_keys: Optional static call keys parallel to *triton_codes*.
 
     Returns:
@@ -404,13 +459,11 @@ def generate_standalone_file(
     _check_kernel_name_not_shadowed(ast.parse(content), [], kernel_name)
 
     # -- write --------------------------------------------------------------
-    if kernel_source_file is not None:
-        source_path = Path(kernel_source_file)
-        out_file = (
-            source_path.parent / f"{source_path.stem}_{kernel_name}_standalone.py"
-        )
-    else:
-        out_file = output_dir / f"{kernel_name}_standalone.py"
+    out_file = standalone_output_path(
+        kernel_name=kernel_name,
+        output_dir=output_dir,
+        kernel_source_file=kernel_source_file,
+    )
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
