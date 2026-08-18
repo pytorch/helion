@@ -33,9 +33,14 @@ import weakref
 import torch
 
 from ... import exc
+from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from ..._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ..._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from ..._compiler.cute.strategies import tcgen05_smem_layout_expr
+from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS,
+)
+from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_TILE_FIELD_COUNT
 from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
@@ -44,6 +49,7 @@ from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..triton.launcher import get_num_sm
 
 if TYPE_CHECKING:
@@ -215,6 +221,47 @@ def _tcgen05_grouped_dynamic_ab_tensormap_rank(plan: dict[str, object]) -> int:
             "requires dynamic or fixed full-allocation A/B TensorMaps",
         )
     return rank
+
+
+def _tcgen05_grouped_scheduler_mode(
+    plan: dict[str, object],
+) -> Tcgen05GroupedSchedulerMode:
+    value = plan.get("scheduler_mode", Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH)
+    mode: Tcgen05GroupedSchedulerMode | None = None
+    if isinstance(value, Tcgen05GroupedSchedulerMode):
+        mode = value
+    elif isinstance(value, str):
+        with suppress(ValueError):
+            mode = Tcgen05GroupedSchedulerMode(value)
+    if mode is None:
+        choices = ", ".join(
+            candidate.value for candidate in Tcgen05GroupedSchedulerMode
+        )
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 grouped scheduler mode must be one of: {choices}",
+        )
+    uses_runtime_table = mode in (
+        Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+        Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+    )
+    has_runtime_table = isinstance(plan.get("runtime_tile_records_arg"), str)
+    if uses_runtime_table != has_runtime_table:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped runtime scheduler state requires matching tile-table metadata",
+        )
+    if uses_runtime_table and _tcgen05_plan_orientation(plan) != "nm":
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 grouped runtime scheduling requires N,M orientation"
+        )
+    if mode is Tcgen05GroupedSchedulerMode.RUNTIME_CLC and not bool(
+        plan.get("fixed_tensormaps")
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "grouped runtime CLC requires fixed full-allocation TensorMaps"
+        )
+    return mode
 
 
 def _append_cute_wrapper_plan(
@@ -705,12 +752,19 @@ def _append_cute_wrapper_plan(
             )
         )
         quotas: tuple[int, ...] = ()
+        scheduler_mode = _tcgen05_grouped_scheduler_mode(plan)
+        runtime_direct_tile_table = scheduler_mode in (
+            Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+            Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+        )
+        runtime_direct_clc = scheduler_mode is Tcgen05GroupedSchedulerMode.RUNTIME_CLC
         if quota_args:
-            assert cluster_m == 1 and cluster_n == 1
             problem_shapes = cast(
                 "tuple[tuple[int, int, int], ...]", plan["static_problem_shapes"]
             )
             assert len(quota_args) == len(problem_shapes)
+            assert _tcgen05_plan_orientation(plan) != "nm"
+            assert cluster_m == 1 and cluster_n == 1
             quotas = _tcgen05_grouped_static_quotas(
                 problem_shapes,
                 bm=plan_int("bm"),
@@ -718,24 +772,40 @@ def _append_cute_wrapper_plan(
                 bk=plan_int("bk"),
                 max_active_clusters=max_active_clusters,
             )
-        body.extend(
-            (
+        if runtime_direct_clc:
+            # The host table is exact: one real output record per z cluster, with
+            # no padded/phantom tail. Launching the full request grid lets CLC
+            # cancel each pending z cluster at most once and makes response bidz
+            # the record index consumed identically by every CTA in the cluster.
+            body.extend(
                 (
-                    f"    {sched_params_arg} = cutlass.utils.PersistentTileSchedulerParams("
-                    f"({cluster_m}, {cluster_n}, {total_clusters_arg}), "
-                    f"({cluster_m}, {cluster_n}, 1))"
-                ),
-                (
-                    "    _tcgen05_grouped_grid = "
-                    "cutlass.utils.StaticPersistentGroupTileScheduler.get_grid_shape("
-                    f"{sched_params_arg}, cutlass.Int32({max_active_clusters}))"
-                ),
-                "    grid_x = _tcgen05_grouped_grid[0]",
-                "    grid_y = _tcgen05_grouped_grid[1]",
-                "    grid_z = _tcgen05_grouped_grid[2]",
+                    f"    grid_x = cutlass.Int32({cluster_m})",
+                    f"    grid_y = cutlass.Int32({cluster_n})",
+                    f"    grid_z = {total_clusters_arg}",
+                )
             )
-        )
-        call_args.append(sched_params_arg)
+        else:
+            body.append(
+                f"    {sched_params_arg} = cutlass.utils.PersistentTileSchedulerParams("
+                f"({cluster_m}, {cluster_n}, {total_clusters_arg}), "
+                f"({cluster_m}, {cluster_n}, 1))"
+            )
+            body.extend(
+                (
+                    (
+                        "    _tcgen05_grouped_grid = "
+                        "cutlass.utils.StaticPersistentGroupTileScheduler.get_grid_shape("
+                        f"{sched_params_arg}, cutlass.Int32({max_active_clusters}))"
+                    ),
+                    "    grid_x = _tcgen05_grouped_grid[0]",
+                    "    grid_y = _tcgen05_grouped_grid[1]",
+                    "    grid_z = _tcgen05_grouped_grid[2]",
+                )
+            )
+            if not runtime_direct_tile_table:
+                call_args.append(sched_params_arg)
+        if runtime_direct_tile_table:
+            call_args.append(total_clusters_arg)
         call_args.extend(f"cutlass.Int32({quota})" for quota in quotas)
         return
     if kind != "tcgen05_ab_tma":
@@ -1174,6 +1244,39 @@ def _create_cute_wrapper(
                 f"({stride_literals[0]},)"
                 if rank == 1
                 else f"({', '.join(stride_literals)})"
+            )
+            body.append(
+                f"    {name} = cute.make_tensor({ptr_name}, layout=cute.make_layout({shape_tuple}, stride={stride_tuple}))"
+            )
+            call_args.append(name)
+            continue
+
+        if kind == "wrapper_tensor_runtime_leading_extent":
+            (_, name, _dtype, rank, tail_sizes, strides) = entry
+            assert isinstance(name, str)
+            assert isinstance(rank, int)
+            assert isinstance(tail_sizes, tuple) and len(tail_sizes) == rank - 1
+            assert isinstance(strides, tuple) and len(strides) == rank
+            ptr_name = f"{name}_ptr"
+            leading_extent_name = f"{name}_shape0"
+            params.extend(
+                (
+                    f"{ptr_name}: cute.Pointer",
+                    f"{leading_extent_name}: cutlass.Int64",
+                )
+            )
+            shape_values = [
+                leading_extent_name,
+                *(repr(int(size)) for size in tail_sizes),
+            ]
+            stride_values = [repr(int(stride)) for stride in strides]
+            shape_tuple = (
+                f"({shape_values[0]},)" if rank == 1 else f"({', '.join(shape_values)})"
+            )
+            stride_tuple = (
+                f"({stride_values[0]},)"
+                if rank == 1
+                else f"({', '.join(stride_values)})"
             )
             body.append(
                 f"    {name} = cute.make_tensor({ptr_name}, layout=cute.make_layout({shape_tuple}, stride={stride_tuple}))"
@@ -1792,18 +1895,24 @@ def cute_cuda_graph(
 
 @dataclass(frozen=True)
 class _Tcgen05GroupedStaticMetadataResult:
-    problem_sizes: torch.Tensor
-    starts: torch.Tensor
+    problem_sizes: torch.Tensor | None
+    starts: torch.Tensor | None
     total_clusters: int
     real_groups: torch.Tensor | None = None
+    runtime_tile_records: torch.Tensor | None = None
     direct_pointers: torch.Tensor | None = None
     direct_strides: torch.Tensor | None = None
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         return (
-            self.problem_sizes,
-            self.starts,
+            *((self.problem_sizes,) if self.problem_sizes is not None else ()),
+            *((self.starts,) if self.starts is not None else ()),
             *((self.real_groups,) if self.real_groups is not None else ()),
+            *(
+                (self.runtime_tile_records,)
+                if self.runtime_tile_records is not None
+                else ()
+            ),
             *((self.direct_pointers,) if self.direct_pointers is not None else ()),
             *((self.direct_strides,) if self.direct_strides is not None else ()),
         )
@@ -2669,6 +2778,11 @@ def _validate_tcgen05_grouped_dynamic_ab_tensormaps(
         and rhs.stride(2) == rhs.size(1)
         and rhs.stride(0) == rhs.size(1) * rhs.size(2)
     )
+    if rhs_mn_contiguous and _tcgen05_plan_orientation(plan) != "nm":
+        raise exc.BackendUnsupported(
+            "cute",
+            "MN-major grouped B is validated only for the N,M worklist path",
+        )
     if not (rhs_k_contiguous or rhs_mn_contiguous):
         raise exc.BackendUnsupported(
             "cute",
@@ -2835,6 +2949,30 @@ def _validate_tcgen05_grouped_worklist_nm(
                 "tcgen05 N,M worklist requires group starts aligned "
                 f"to {source_m_tile} rows",
             )
+        if actual_m < 0 or actual_m > aligned_m:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist requires 0 <= actual_m <= aligned_m",
+            )
+        if aligned_m < 0 or aligned_m % source_m_tile != 0:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist requires aligned_m to be a "
+                f"nonnegative multiple of {source_m_tile}",
+            )
+        if (actual_m == 0) != (aligned_m == 0):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist requires actual_m and aligned_m to be "
+                "zero together",
+            )
+        if start + aligned_m > int(lhs.size(0)):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist aligned extent exceeds A extent",
+            )
+        if aligned_m == 0:
+            continue
         if start < expected_store_end:
             raise exc.BackendUnsupported(
                 "cute",
@@ -2844,22 +2982,6 @@ def _validate_tcgen05_grouped_worklist_nm(
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 N,M worklist has row holes",
-            )
-        if actual_m <= 0 or actual_m > aligned_m:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist requires 0 < actual_m <= aligned_m",
-            )
-        if aligned_m <= 0 or aligned_m % source_m_tile != 0:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist requires aligned_m to be a "
-                f"positive multiple of {source_m_tile}",
-            )
-        if start + aligned_m > int(lhs.size(0)):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist aligned extent exceeds A extent",
             )
         expected_store_end = start + aligned_m
     if expected_store_end != int(lhs.size(0)):
@@ -2872,6 +2994,124 @@ def _validate_tcgen05_grouped_worklist_nm(
             "cute",
             "tcgen05 N,M worklist requires dense real group ids",
         )
+
+
+def _validate_tcgen05_grouped_runtime_direct_clc_grid(total_clusters: int) -> None:
+    if total_clusters > TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped runtime-direct CLC requires at most "
+            f"{TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS} exact tile "
+            "records because CUDA grid.z is "
+            "limited to 65535",
+        )
+
+
+def _tcgen05_grouped_runtime_nm_tile_records(
+    worklist_rows: list[list[int]],
+    problem_sizes: list[tuple[int, int, int, int]],
+    *,
+    source_tile_m: int,
+    source_tile_n: int,
+    l2_swizzle_size: int,
+) -> torch.Tensor:
+    """Expand runtime per-group worklist rows into logical N,M tile records."""
+    metadata: list[tuple[int, ...]] = []
+    tile_counts: list[int] = []
+    for row, problem_size in zip(worklist_rows, problem_sizes, strict=True):
+        real_group, global_m_start, actual_m, aligned_m = (int(value) for value in row)
+        problem_n, problem_m, problem_k, batch = problem_size
+        if batch != 1 or problem_m != aligned_m:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped runtime N,M tile records require batch 1 and "
+                "problem M matching the aligned worklist extent",
+            )
+        m_tiles = aligned_m // source_tile_m
+        n_tiles = (problem_n + source_tile_n - 1) // source_tile_n
+        metadata.append(
+            (
+                real_group,
+                global_m_start,
+                actual_m,
+                aligned_m,
+                problem_n,
+                problem_k,
+                m_tiles,
+                n_tiles,
+            )
+        )
+        tile_counts.append(m_tiles * n_tiles)
+
+    total_tiles = sum(tile_counts)
+    metadata_tensor = torch.tensor(metadata, dtype=torch.int32)
+    counts = torch.tensor(tile_counts, dtype=torch.int64)
+    metadata_idx = torch.repeat_interleave(
+        torch.arange(len(metadata), dtype=torch.int64), counts
+    )
+    group_starts = torch.repeat_interleave(counts.cumsum(0) - counts, counts)
+    local_idx = torch.arange(total_tiles, dtype=torch.int64) - group_starts
+    selected = metadata_tensor[metadata_idx]
+    (
+        real_group,
+        global_m_start,
+        actual_m,
+        aligned_m,
+        problem_n,
+        problem_k,
+        m_tiles,
+        n_tiles,
+    ) = (selected[:, field] for field in range(8))
+    # CUTLASS scheduling excludes zero-tile groups: repeat_interleave omits their
+    # zero-count rows, so every source-M raster divisor below is strictly positive.
+    if l2_swizzle_size > 1:
+        panel_size = torch.minimum(torch.full_like(n_tiles, l2_swizzle_size), n_tiles)
+        panel_span = panel_size * m_tiles
+        panel_idx = torch.div(local_idx, panel_span, rounding_mode="floor")
+        panel_linear = local_idx % panel_span
+        panel_width = torch.minimum(panel_size, n_tiles - panel_idx * panel_size)
+        cta_tile_idx_m = torch.div(panel_linear, panel_width, rounding_mode="floor")
+        cta_tile_idx_n = panel_idx * panel_size + panel_linear % panel_width
+        cta_tile_idx_m = torch.where(
+            panel_idx % 2 == 1,
+            m_tiles - 1 - cta_tile_idx_m,
+            cta_tile_idx_m,
+        )
+    else:
+        m_first = m_tiles <= n_tiles
+        cta_tile_idx_m = torch.where(
+            m_first,
+            local_idx % m_tiles,
+            torch.div(local_idx, n_tiles, rounding_mode="floor"),
+        )
+        cta_tile_idx_n = torch.where(
+            m_first,
+            torch.div(local_idx, m_tiles, rounding_mode="floor"),
+            local_idx % n_tiles,
+        )
+    tile_start = cta_tile_idx_m * source_tile_m
+    # STORE_M remains explicit for parity with the mailbox/device schema.
+    # Host-expanded rows always reserve one full physical source tile.
+    columns = {
+        Tcgen05GroupedRuntimeTileField.CTA_M: cta_tile_idx_m,
+        Tcgen05GroupedRuntimeTileField.CTA_N: cta_tile_idx_n,
+        Tcgen05GroupedRuntimeTileField.METADATA_IDX: metadata_idx,
+        Tcgen05GroupedRuntimeTileField.GROUP_IDX: real_group,
+        Tcgen05GroupedRuntimeTileField.PROBLEM_M: aligned_m,
+        Tcgen05GroupedRuntimeTileField.PROBLEM_N: problem_n,
+        Tcgen05GroupedRuntimeTileField.PROBLEM_K: problem_k,
+        Tcgen05GroupedRuntimeTileField.GLOBAL_M_START: global_m_start,
+        Tcgen05GroupedRuntimeTileField.VALID_M: (actual_m - tile_start).clamp(
+            0, source_tile_m
+        ),
+        Tcgen05GroupedRuntimeTileField.STORE_M: torch.full_like(
+            cta_tile_idx_m, source_tile_m
+        ),
+    }
+    return torch.stack(
+        tuple(columns[field] for field in Tcgen05GroupedRuntimeTileField),
+        dim=1,
+    ).to(torch.int32)
 
 
 def _tcgen05_grouped_static_metadata_cache_key(
@@ -3085,6 +3325,11 @@ def _build_tcgen05_grouped_static_metadata(
     else:
         worklist_m_tile = scheduler_bm = bm
         scheduler_bn = bn
+    scheduler_mode = _tcgen05_grouped_scheduler_mode(plan)
+    runtime_direct_tile_table = scheduler_mode in (
+        Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+        Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+    )
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
     dynamic_d_tensormap = bool(plan.get("dynamic_d_tensormap"))
     fixed_tensormaps = bool(plan.get("fixed_tensormaps"))
@@ -3190,6 +3435,7 @@ def _build_tcgen05_grouped_static_metadata(
     sizes: list[int] = []
     has_m_tail = False
     real_groups: list[int] | None = [] if worklist_metadata else None
+    worklist_rows: list[list[int]] | None = None
     if worklist_metadata:
         if int(layout.size(0)) != group_count:
             raise exc.BackendUnsupported(
@@ -3203,9 +3449,9 @@ def _build_tcgen05_grouped_static_metadata(
             )
         lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
         rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
-        rows = cast("list[list[int]]", layout.detach().cpu().tolist())
-        _validate_tcgen05_grouped_worklist_nm(plan, args, rows)
-        for row in rows:
+        worklist_rows = cast("list[list[int]]", layout.detach().cpu().tolist())
+        _validate_tcgen05_grouped_worklist_nm(plan, args, worklist_rows)
+        for row in worklist_rows:
             real_group, start, valid_m, reserved_or_store_m = (
                 int(value) for value in row
             )
@@ -3301,6 +3547,13 @@ def _build_tcgen05_grouped_static_metadata(
                 "last ordered group",
             )
 
+    if not any(sizes):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped scheduler does not launch an all-empty worklist; "
+            "all groups are empty, so the caller must skip the GEMM invocation",
+        )
+
     problem_sizes = []
     total_clusters = 0
     has_n_tail = False
@@ -3360,6 +3613,8 @@ def _build_tcgen05_grouped_static_metadata(
         raise exc.BackendUnsupported(
             "cute", "tcgen05 grouped scheduler found zero work clusters"
         )
+    if scheduler_mode is Tcgen05GroupedSchedulerMode.RUNTIME_CLC:
+        _validate_tcgen05_grouped_runtime_direct_clc_grid(total_clusters)
     expected_has_m_tail = plan.get("grouped_static_has_m_tail")
     if isinstance(expected_has_m_tail, bool) and has_m_tail != expected_has_m_tail:
         raise exc.BackendUnsupported(
@@ -3498,18 +3753,52 @@ def _build_tcgen05_grouped_static_metadata(
             direct_strides_tensor = torch.tensor(
                 direct_stride_rows, dtype=torch.int32, device=device
             )
-    problem_tensor = torch.tensor(problem_sizes, dtype=torch.int32, device=device)
-    starts_tensor = torch.tensor(starts, dtype=torch.int32, device=device)
-    real_groups_tensor = (
-        torch.tensor(real_groups, dtype=torch.int32, device=device)
-        if real_groups is not None
-        else None
-    )
+    problem_tensor: torch.Tensor | None = None
+    starts_tensor: torch.Tensor | None = None
+    real_groups_tensor: torch.Tensor | None = None
+    if not runtime_direct_tile_table:
+        problem_tensor = torch.tensor(problem_sizes, dtype=torch.int32, device=device)
+        starts_tensor = torch.tensor(starts, dtype=torch.int32, device=device)
+        if real_groups is not None:
+            real_groups_tensor = torch.tensor(
+                real_groups, dtype=torch.int32, device=device
+            )
+    runtime_tile_records_tensor: torch.Tensor | None = None
+    if runtime_direct_tile_table:
+        if not worklist_nm or worklist_rows is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped runtime tile tables require N,M worklist metadata",
+            )
+        l2_swizzle_size = _plan_int_value(plan, "l2_swizzle_size")
+        runtime_tile_records = _tcgen05_grouped_runtime_nm_tile_records(
+            worklist_rows,
+            problem_sizes,
+            source_tile_m=worklist_m_tile,
+            source_tile_n=scheduler_bm,
+            l2_swizzle_size=l2_swizzle_size,
+        )
+        if len(runtime_tile_records) != total_clusters:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 runtime N,M tile table row count does not match "
+                "the grouped launch cluster count",
+            )
+        if (
+            runtime_tile_records.ndim != 2
+            or runtime_tile_records.size(1) != TCGEN05_GROUPED_RUNTIME_TILE_FIELD_COUNT
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 runtime N,M tile table does not match the shared field schema",
+            )
+        runtime_tile_records_tensor = runtime_tile_records.to(device=device)
     result = _Tcgen05GroupedStaticMetadataResult(
         problem_sizes=problem_tensor,
         starts=starts_tensor,
         total_clusters=total_clusters,
         real_groups=real_groups_tensor,
+        runtime_tile_records=runtime_tile_records_tensor,
         direct_pointers=direct_pointers_tensor,
         direct_strides=direct_strides_tensor,
     )
@@ -3775,6 +4064,7 @@ def _build_cute_schema_and_args(
         tensor: torch.Tensor,
         *,
         owned: bool = False,
+        runtime_leading_extent: bool = False,
     ) -> None:
         _validate_cute_launcher_tensor(tensor)
         sizes = tuple(int(tensor.size(d)) for d in range(tensor.ndim))
@@ -3787,16 +4077,29 @@ def _build_cute_schema_and_args(
                 assumed_align=16,
             )
         )
-        schema.append(
-            (
-                "wrapper_tensor",
-                name,
-                str(tensor.dtype),
-                tensor.ndim,
-                sizes,
-                strides,
+        if runtime_leading_extent:
+            schema.append(
+                (
+                    "wrapper_tensor_runtime_leading_extent",
+                    name,
+                    str(tensor.dtype),
+                    tensor.ndim,
+                    sizes[1:],
+                    strides,
+                )
             )
-        )
+            launch_args.append(sizes[0])
+        else:
+            schema.append(
+                (
+                    "wrapper_tensor",
+                    name,
+                    str(tensor.dtype),
+                    tensor.ndim,
+                    sizes,
+                    strides,
+                )
+            )
         if owned:
             owned_tensors.append(tensor)
 
@@ -3837,20 +4140,26 @@ def _build_cute_schema_and_args(
         problem_tensor = metadata_result.problem_sizes
         starts_tensor = metadata_result.starts
         real_groups_tensor = metadata_result.real_groups
+        runtime_tile_records_tensor = metadata_result.runtime_tile_records
         direct_pointers_tensor = metadata_result.direct_pointers
         direct_strides_tensor = metadata_result.direct_strides
         total_clusters = metadata_result.total_clusters
         grouped_static_metadata.append(metadata_entry)
-        for name, tensor in (
-            (_plan_str_value(plan, "problem_sizes_arg"), problem_tensor),
-            (_plan_str_value(plan, "starts_arg"), starts_tensor),
-            *(
-                ((_plan_str_value(plan, "real_groups_arg"), real_groups_tensor),)
-                if real_groups_tensor is not None
-                else ()
-            ),
-        ):
-            append_wrapper_tensor(name, tensor)
+        if problem_tensor is not None and starts_tensor is not None:
+            append_wrapper_tensor(
+                _plan_str_value(plan, "problem_sizes_arg"), problem_tensor
+            )
+            append_wrapper_tensor(_plan_str_value(plan, "starts_arg"), starts_tensor)
+        if real_groups_tensor is not None:
+            append_wrapper_tensor(
+                _plan_str_value(plan, "real_groups_arg"), real_groups_tensor
+            )
+        if runtime_tile_records_tensor is not None:
+            append_wrapper_tensor(
+                _plan_str_value(plan, "runtime_tile_records_arg"),
+                runtime_tile_records_tensor,
+                runtime_leading_extent=True,
+            )
         append_grouped_tensormap_workspace(plan, layout)
         if direct_pointers_tensor is not None and direct_strides_tensor is not None:
             append_wrapper_tensor(

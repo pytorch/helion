@@ -20453,6 +20453,25 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             work_tile_release_stmts=[],
         )
 
+    def test_clustered_pid_mailbox_rendezvous_precedes_first_acquire(self) -> None:
+        """Peer mailbox mbarriers must be initialized cluster-wide first."""
+        _stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        splitter._tcgen05_l2_swizzle_size = lambda: 1  # type: ignore[attr-defined]
+        layout = self._make_minimal_layout(cluster_m=2)
+        layout.work_tile_publish_stmts = [self._stmt("sp.producer_acquire(ps)")]
+
+        emitted = splitter._build_tcgen05_persistent_prelude(layout)
+        source = "\n".join(ast.unparse(stmt) for stmt in emitted)
+        create = source.index("sp = cutlass.pipeline.PipelineAsync.create(")
+        arrive = source.index("cutlass.pipeline.pipeline_init_arrive(")
+        wait = source.index("cutlass.pipeline.pipeline_init_wait(")
+        acquire = source.index("sp.producer_acquire(ps)")
+
+        self.assertLess(create, arrive)
+        self.assertLess(arrive, wait)
+        self.assertLess(wait, acquire)
+        self.assertIn("cute.make_layout((2, 1, 1))", source)
+
     def test_tcgen05_persistent_foreach_multi_root_keeps_host_guard(self) -> None:
         """Multi-root tcgen05 role-local codegen is guarded as unvalidated.
 

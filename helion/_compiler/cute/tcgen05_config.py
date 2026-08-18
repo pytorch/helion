@@ -87,6 +87,7 @@ from .tcgen05_constants import TCGEN05_C_STORE_MODES
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
@@ -101,11 +102,13 @@ from .tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from .tcgen05_constants import TCGEN05_GROUPED_MODES
+from .tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
@@ -144,7 +147,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
-from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_shape
+from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
@@ -227,6 +230,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY,
         TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY,
         TCGEN05_GROUPED_MODE_CONFIG_KEY,
+        TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
         TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY,
         TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
@@ -905,6 +909,23 @@ class CuteTcgen05Config:
         # their sub-paths; doing it once here covers the full-tile and
         # small-grid paths too.
         config.pop("epilogue_subtile", None)
+        if (
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
+            and block_sizes[n_index] == 128
+            and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+            in (
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            )
+        ):
+            # Worklist configs keep their 256x128 logical DSL tile. Their
+            # source-M metadata selects the physical 256x224/256 MMA profile
+            # through ``resolve_tcgen05_grouped_worklist_mma_profile``.
+            return
         # fp8 small-grid family: a sampled bm<=128 routes to the fp8-validated
         # per-CTA 64xbn 2-CTA tile (bm=128/bn=128) instead of the bm=256 full
         # tile, which underfills the device on small/wave-limited fp8 GEMMs. The
@@ -963,6 +984,41 @@ class CuteTcgen05Config:
                 raise InvalidConfig(
                     "tcgen05 grouped kernels require num_sm_multiplier=1"
                 )
+        grouped_clc = (
+            grouped_mode in TCGEN05_GROUPED_MODES
+            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+        if grouped_clc and (
+            config.get(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, 0) != 0
+        ):
+            if fix_invalid:
+                config.pop(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, None)
+            else:
+                raise InvalidConfig(
+                    "tcgen05 grouped CLC launches its exact full tile-record grid; "
+                    "reserved_sms cannot limit that grid"
+                )
+        if grouped_clc and not (
+            grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is True
+            and TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY not in config
+        ):
+            if fix_invalid:
+                config.pop(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, None)
+                config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+                    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+                )
+                config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+            else:
+                raise InvalidConfig(
+                    "tcgen05 grouped CLC persistence requires "
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r}, "
+                    f"{TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY}=True, and no "
+                    f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY}; the "
+                    "launcher must build an exact one-record-per-cluster tile table"
+                )
         source_m_tile_key = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
         source_m_tile = config.get(source_m_tile_key)
         if source_m_tile_key in config and (
@@ -982,6 +1038,37 @@ class CuteTcgen05Config:
                     f"{source_m_tile!r}"
                 )
         signature_key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
+        runtime_direct_key = TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
+        if config.get(runtime_direct_key) is True and (
+            grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM or signature_key in config
+        ):
+            if fix_invalid:
+                config.pop(runtime_direct_key)
+            else:
+                raise InvalidConfig(
+                    f"{runtime_direct_key}=True requires "
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} and no "
+                    f"{signature_key}; unsupported requests must not silently "
+                    "fall back to the legacy grouped scheduler"
+                )
+        l2_swizzle_size = config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1)
+        if (
+            grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and type(l2_swizzle_size) is int
+            and l2_swizzle_size > 1
+            and config.get(runtime_direct_key) is not True
+        ):
+            if fix_invalid:
+                config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY}>1 for "
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} requires "
+                    f"{runtime_direct_key}=True so the host runtime tile table "
+                    "owns panel rastering"
+                )
         if signature_key in config:
             try:
                 parse_tcgen05_grouped_static_problem_signature(config[signature_key])
@@ -1235,31 +1322,23 @@ class CuteTcgen05Config:
             and all(config.get(key) is None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
         )
 
-    def _grouped_worklist_nm_deep_ab_config_matches(
+    def _grouped_worklist_nm_ab_config_matches(
         self, config: dict[str, object], ab_stages: object
     ) -> bool:
         block_sizes = config.get("block_sizes")
-        cluster_m = config.get("tcgen05_cluster_m")
-        source_m_tile = config.get(
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-        )
         block_k = (
             block_sizes[2]
             if isinstance(block_sizes, list) and len(block_sizes) >= 3
             else None
         )
-        physical_shape = resolve_tcgen05_grouped_worklist_mma_shape(
-            cluster_m=cluster_m,
+        profile = resolve_tcgen05_grouped_worklist_mma_profile(
+            config,
             block_k=block_k,
-            source_m_tile=source_m_tile,
         )
         if not (
             type(ab_stages) is int
             and 2 <= ab_stages <= 7
-            and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
-            == TCGEN05_GROUPED_MODE_WORKLIST_NM
-            and physical_shape is not None
+            and profile is not None
             and config.get("tcgen05_cluster_n", 1) == 1
             and config.get("tcgen05_acc_stages", 2) == 2
             and config.get("tcgen05_c_stages", 2) == 2
@@ -1275,13 +1354,12 @@ class CuteTcgen05Config:
         sched_stage_count = config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1)
         if type(sched_stage_count) is not int or sched_stage_count <= 0:
             return False
-        physical_bm, physical_bn = physical_shape
+        physical_bm, physical_bn = profile.mma_m, profile.mma_n
         # The generic AB search budget reserves 28 KiB, which is deliberately
         # conservative for general matmuls but would reject the valid
         # BK64/source-224/AB7 worklist at B200's exact 227-KiB cap. Reconstruct
-        # the raw target cap and account for this path's full ordered allocation.
-        # Use the same conservative ordered allocation as codegen. Current
-        # scheduler modes all round to the same final 1024-byte C-ring boundary.
+        # the raw target cap and apply the same conservative worklist upper bound
+        # across scheduler modes as codegen.
         required_bytes = tcgen05_grouped_worklist_smem_bytes(
             group_count=1,
             device_split_sizes=False,
@@ -1293,7 +1371,7 @@ class CuteTcgen05Config:
             ab_stages=ab_stages,
             acc_stages=2,
             c_stages=2,
-            cluster_m=cast("int", cluster_m),
+            cluster_m=profile.cluster_m,
         )
         target_capacity_bytes = (
             constraints.per_cta_smem_budget_bytes
@@ -1786,11 +1864,11 @@ class CuteTcgen05Config:
             return
         if self._grouped_dynamic_deep_config_matches(config):
             return
-        if self._grouped_worklist_nm_deep_ab_config_matches(config, ab_stages):
+        if self._grouped_worklist_nm_ab_config_matches(config, ab_stages):
             return
-        # ab>3 is only valid on the TVM-FFI direct-entry path, and only for the
-        # (bk, ab, c) stage tuples the direct-entry codegen accepts (bk=64
-        # admits (ab=6, c=4)). Everything else clamps (or rejects) to ab=3.
+        # After the grouped dynamic/worklist exceptions above, ab>3 is only valid
+        # on the TVM-FFI direct-entry path and for its accepted (bk, ab, c) tuples
+        # (bk=64 admits (ab=6, c=4)). Everything else clamps or rejects to ab=3.
         block_sizes = config.get("block_sizes")
         k_block_index = self._direct_entry_k_block_index()
         bk = (
@@ -2376,8 +2454,16 @@ class CuteTcgen05Config:
             fragments[TCGEN05_GROUPED_MODE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_MODES
             )
+            fragments[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = BooleanFragment()
             fragments[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = EnumFragment(
-                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+                (
+                    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                    *(
+                        choice
+                        for choice in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+                        if choice != TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+                    ),
+                )
             )
         direct_entry_seed_eligible = self.full_tile_direct_entry_seed_eligible()
         if direct_entry_seed_eligible or (
@@ -2502,8 +2588,26 @@ class CuteTcgen05Config:
         even though ``_aux_tma_search_enabled`` was widened (see
         ``aux_stages_autotune_fragments``).
         """
+        seed_choices = tuple(
+            dict.fromkeys(
+                value
+                for config in self.config_spec.compiler_seed_configs
+                if (value := config.config.get(TCGEN05_CONSUMER_REGS_CONFIG_KEY))
+                in TCGEN05_CONSUMER_REGS_CHOICES
+            )
+        )
         if not self._aux_tma_edge_search_enabled():
-            return {}
+            if not seed_choices:
+                return {}
+            choices = tuple(
+                dict.fromkeys((TCGEN05_CONSUMER_REGS_DEFAULT, *seed_choices))
+            )
+            return {
+                TCGEN05_CONSUMER_REGS_CONFIG_KEY: EnumFragment(
+                    choices,
+                    search_choices=(TCGEN05_CONSUMER_REGS_DEFAULT,),
+                )
+            }
         return {
             TCGEN05_CONSUMER_REGS_CONFIG_KEY: EnumFragment(
                 TCGEN05_CONSUMER_REGS_CHOICES
@@ -2511,11 +2615,32 @@ class CuteTcgen05Config:
         }
 
     def persistence_model_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
-        if not self._clc_persistence_search_enabled():
-            return {}
         default_model = derive_persistence_model_from_pid_type(
             self.allowed_pid_types[0]
         ).value
+        seed_override_models = tuple(
+            dict.fromkeys(
+                model
+                for config in self.config_spec.compiler_seed_configs
+                if isinstance(
+                    model := config.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY),
+                    str,
+                )
+                and model in {item.value for item in Tcgen05PersistenceModel}
+                and model
+                != self.persistence_model_default_from_config(config.config).value
+            )
+        )
+        if not self._clc_persistence_search_enabled():
+            if not seed_override_models:
+                return {}
+            choices = tuple(dict.fromkeys((default_model, *seed_override_models)))
+            return {
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: EnumFragment(
+                    choices,
+                    search_choices=(default_model,),
+                )
+            }
         choices = tuple(
             dict.fromkeys(
                 (
@@ -2544,6 +2669,36 @@ class CuteTcgen05Config:
             strategy_choices = (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
             scheduler_warps_choices = (0,)
             c_input_warps_choices = (0,)
+        strategy_seed_choices = tuple(
+            dict.fromkeys(
+                strategy
+                for config in self.config_spec.compiler_seed_configs
+                if isinstance(
+                    strategy := config.config.get(TCGEN05_STRATEGY_CONFIG_KEY),
+                    str,
+                )
+                and strategy in {item.value for item in Tcgen05Strategy}
+            )
+        )
+        scheduler_seed_choices = tuple(
+            dict.fromkeys(
+                scheduler_warps
+                for config in self.config_spec.compiler_seed_configs
+                if type(
+                    scheduler_warps := config.config.get(
+                        TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
+                    )
+                )
+                is int
+                and scheduler_warps in (0, 1)
+            )
+        )
+        all_strategy_choices = tuple(
+            dict.fromkeys((*strategy_choices, *strategy_seed_choices))
+        )
+        all_scheduler_warps_choices = tuple(
+            dict.fromkeys((*scheduler_warps_choices, *scheduler_seed_choices))
+        )
         # The store-warp slot stays narrowed to ``0`` in the autotune surface —
         # only an explicit ``helion.Config(tcgen05_warp_spec_store_warps=1)``
         # activates it. Cycle 93 (Workstream A Stage 4) landed the productive
@@ -2560,13 +2715,25 @@ class CuteTcgen05Config:
         else:
             layout_choices = (Tcgen05LayoutStrategy.DEFAULT.value,)
         return {
-            TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(strategy_choices),
+            TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(
+                all_strategy_choices,
+                search_choices=(
+                    strategy_choices
+                    if all_strategy_choices != strategy_choices
+                    else None
+                ),
+            ),
             TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(layout_choices),
             TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
             TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment(
-                scheduler_warps_choices
+                all_scheduler_warps_choices,
+                search_choices=(
+                    scheduler_warps_choices
+                    if all_scheduler_warps_choices != scheduler_warps_choices
+                    else None
+                ),
             ),
             TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: EnumFragment(c_input_warps_choices),
             TCGEN05_WARP_SPEC_STORE_WARPS_KEY: EnumFragment(store_warps_choices),
@@ -2668,6 +2835,15 @@ class CuteTcgen05Config:
         raise InvalidConfig(f"tcgen05 strategy invariants violated: {message}")
 
     def _clamp_l2_swizzle_size_to_shape(self, config: dict[str, object]) -> None:
+        if (
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ):
+            # Runtime-direct grouped N,M builds the panel raster from each
+            # group's host-visible tile count, so there is no single static
+            # shape to clamp against here. ``prepare_normalization`` already
+            # forces the legacy device-search scheduler to use swizzle 1.
+            return
         # CuTe layout construction assumes the L2 swizzle does not exceed the
         # number of N tile-clusters; clamp before layout objects are built.
         swizzle_value = config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
@@ -2724,9 +2900,13 @@ class CuteTcgen05Config:
                 if key in config:
                     if key == "tcgen05_ab_stages" and (
                         self._grouped_dynamic_deep_config_matches(config)
-                        or self._grouped_worklist_nm_deep_ab_config_matches(
-                            config,
-                            config[key],
+                        or (
+                            type(config[key]) is int
+                            and config[key] > 3
+                            and self._grouped_worklist_nm_ab_config_matches(
+                                config,
+                                config[key],
+                            )
                         )
                     ):
                         config[key] = int(cast("Any", config[key]))
@@ -3184,6 +3364,28 @@ class CuteTcgen05Config:
         ):
             fields["loop_orders"] = self.config_spec.loop_orders
         fields.update(self.optional_fragments(for_search=True))
+        seed_l2_swizzles = tuple(
+            dict.fromkeys(
+                value
+                for config in self.config_spec.compiler_seed_configs
+                if type(value := config.config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY))
+                is int
+                and value in TCGEN05_LEGAL_L2_SWIZZLE_SIZES
+            )
+        )
+        l2_swizzle_fragment = fields.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
+        if seed_l2_swizzles and isinstance(l2_swizzle_fragment, EnumFragment):
+            choices = tuple(
+                dict.fromkeys((*l2_swizzle_fragment.choices, *seed_l2_swizzles))
+            )
+            if choices != l2_swizzle_fragment.choices:
+                fields[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = EnumFragment(
+                    choices,
+                    search_choices=(
+                        l2_swizzle_fragment.search_choices
+                        or l2_swizzle_fragment.choices
+                    ),
+                )
         grouped_seed_modes = tuple(
             dict.fromkeys(
                 mode
@@ -3196,8 +3398,30 @@ class CuteTcgen05Config:
             mode in TCGEN05_GROUPED_DYNAMIC_MODES for mode in grouped_seed_modes
         )
         if has_grouped_dynamic_seed:
+            seed_reserved_sms = tuple(
+                dict.fromkeys(
+                    reserved_sms
+                    for config in self.config_spec.compiler_seed_configs
+                    if type(
+                        reserved_sms := config.config.get(
+                            TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+                        )
+                    )
+                    is int
+                    and 0 <= reserved_sms <= TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+                )
+            )
+            reserved_sms_choices = tuple(
+                dict.fromkeys(
+                    (
+                        *TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES,
+                        *seed_reserved_sms,
+                    )
+                )
+            )
             fields[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = EnumFragment(
-                TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
+                reserved_sms_choices,
+                search_choices=TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES,
             )
         if grouped_seed_modes:
             # Seed-only encoding: random/default search stays off the grouped
@@ -3205,6 +3429,14 @@ class CuteTcgen05Config:
             fields[TCGEN05_GROUPED_MODE_CONFIG_KEY] = EnumFragment(
                 (None, *grouped_seed_modes),
                 search_choices=(None,),
+            )
+        if any(
+            config.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is True
+            for config in self.config_spec.compiler_seed_configs
+        ):
+            fields[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = EnumFragment(
+                (False, True),
+                search_choices=(False,),
             )
         grouped_source_m_tiles = tuple(
             dict.fromkeys(

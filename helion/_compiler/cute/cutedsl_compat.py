@@ -54,6 +54,32 @@ def tcgen05_runtime_n_ptx_compatible() -> bool:
 
 
 @lru_cache(maxsize=1)
+def warn_tcgen05_runtime_n_ptx_fallback() -> None:
+    """Warn once when a grouped worklist needs the newer-DSL fallback.
+
+    This is intentionally separate from the side-effect-free compatibility
+    probe. Callers invoke the warning only after proving a grouped N,M worklist
+    candidate or selecting its explicit runtime-direct codegen path.
+    """
+
+    installed = _installed_cute_dsl_version().version
+    if installed is None:
+        return
+    if installed > CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION:
+        log.warning(
+            "Installed nvidia-cutlass-dsl %s is newer than the exact %s version "
+            "validated for grouped tcgen05 runtime-N PTX. Grouped runtime-N "
+            "compiler seeds and promoted defaults are disabled; explicit "
+            "runtime-direct worklist configs fall back to typed static-width "
+            "MMA, including for ragged source-M tails. Use %s for the validated "
+            "narrow runtime-N path.",
+            installed,
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+        )
+
+
+@lru_cache(maxsize=1)
 def _cute_backend_requirement_error() -> str | None:
     """Return why the cute backend cannot run here, or ``None`` if it can.
 

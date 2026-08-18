@@ -6,6 +6,7 @@ import dataclasses
 from dataclasses import dataclass
 import gc
 import importlib
+import linecache
 import math
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ import torch
 
 import helion
 from helion._compiler.cute.attention_plan import causal_score_plan
+from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
@@ -8390,6 +8392,26 @@ class TestCuteBackend(TestCase):
 
         self.assertNotEqual(wrapper_default, wrapper_lineinfo)
 
+    def test_grouped_static_active_clusters_honors_reserved_sms(self) -> None:
+        launcher = importlib.import_module("helion.runtime.cute.launcher")
+
+        self.assertEqual(
+            launcher._tcgen05_grouped_static_active_clusters(
+                num_sm=148,
+                cluster_m=1,
+                reserved_sms=0,
+            ),
+            148,
+        )
+        self.assertEqual(
+            launcher._tcgen05_grouped_static_active_clusters(
+                num_sm=148,
+                cluster_m=2,
+                reserved_sms=4,
+            ),
+            72,
+        )
+
     def test_cute_launcher_reuses_compiled_wrapper(self) -> None:
         cute_kernel = type("DummyCuteKernel", (), {})()
         schema_key = (("tensor", 2, "float32"),)
@@ -8427,6 +8449,185 @@ class TestCuteBackend(TestCase):
         self.assertEqual(launched_args, [(1, 2, 3), (4, 5, 6)])
         self.assertEqual(first, ("launched", (1, 2, 3)))
         self.assertEqual(second, ("launched", (4, 5, 6)))
+
+    def test_cute_runtime_leading_extent_wrapper_bakes_tail_layout(self) -> None:
+        launcher = importlib.import_module("helion.runtime.cute.launcher")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        captured_source: list[str] = []
+        wrapper = object()
+
+        def fake_exec(code: Any, namespace: dict[str, Any]) -> None:
+            source = "".join(linecache.getlines(code.co_filename))
+            captured_source.append(source)
+            definition = next(
+                line for line in source.splitlines() if line.startswith("def ")
+            )
+            namespace[definition[4:].split("(", 1)[0]] = wrapper
+
+        schema = (
+            (
+                "wrapper_tensor_runtime_leading_extent",
+                "runtime_tile_records",
+                "torch.int32",
+                2,
+                (10,),
+                (10, 1),
+            ),
+        )
+        with patch("builtins.exec", side_effect=fake_exec):
+            created = launcher._create_cute_wrapper(
+                cute_kernel,
+                schema,
+                (32, 1, 1),
+            )
+
+        self.assertIs(created, wrapper)
+        self.assertEqual(len(captured_source), 1)
+        source = captured_source[0]
+        self.assertIn("runtime_tile_records_shape0: cutlass.Int64", source)
+        self.assertNotIn("runtime_tile_records_shape1:", source)
+        self.assertNotIn("runtime_tile_records_stride0:", source)
+        self.assertNotIn("runtime_tile_records_stride1:", source)
+        self.assertIn(
+            "cute.make_layout((runtime_tile_records_shape0, 10), stride=(10, 1))",
+            source,
+        )
+
+    def test_grouped_runtime_tile_record_rows_reuse_compiled_launcher(self) -> None:
+        launcher = importlib.import_module("helion.runtime.cute.launcher")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_disable_bake_tensor_shapes = True
+        plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT.value,
+            "orientation": "nm",
+            "layout_idx": 0,
+            "problem_sizes_arg": "problem_sizes",
+            "starts_arg": "starts",
+            "runtime_tile_records_arg": "runtime_tile_records",
+            "total_clusters_arg": "total_clusters",
+        }
+        cute_kernel._helion_cute_wrapper_plans = [plan]
+        layout = torch.empty(2, dtype=torch.int32)
+        runtime_record_tensors = iter(
+            (
+                torch.empty((2, 10), dtype=torch.int32),
+                torch.empty((5, 10), dtype=torch.int32),
+                torch.empty((2, 11), dtype=torch.int32),
+                torch.empty((2, 20), dtype=torch.int32)[:, ::2],
+            )
+        )
+
+        class FakeMetadataResult:
+            def __init__(self, runtime_tile_records: torch.Tensor) -> None:
+                self.problem_sizes = torch.empty((2, 4), dtype=torch.int32)
+                self.starts = torch.empty(2, dtype=torch.int32)
+                self.real_groups = None
+                self.runtime_tile_records = runtime_tile_records
+                self.direct_pointers = None
+                self.direct_strides = None
+                self.total_clusters = int(runtime_tile_records.size(0))
+
+            def tensors(self) -> tuple[torch.Tensor, ...]:
+                return (
+                    self.problem_sizes,
+                    self.starts,
+                    self.runtime_tile_records,
+                )
+
+        class FakeMetadataEntry:
+            def __init__(self, runtime_tile_records: torch.Tensor) -> None:
+                self.result = FakeMetadataResult(runtime_tile_records)
+
+        def fake_metadata(*_args: object) -> FakeMetadataEntry:
+            return FakeMetadataEntry(next(runtime_record_tensors))
+
+        def fake_imports() -> tuple[object, object, object]:
+            def make_ptr(
+                _dtype: object,
+                data_ptr: int,
+                _space: object,
+                *,
+                assumed_align: int,
+            ) -> tuple[str, int]:
+                self.assertEqual(assumed_align, 16)
+                return ("ptr", data_ptr)
+
+            return object(), make_ptr, object()
+
+        with (
+            patch.object(launcher, "_validate_cute_launcher_tensor"),
+            patch.object(
+                launcher,
+                "_tcgen05_grouped_static_layout_arg",
+                return_value=layout,
+            ),
+            patch.object(
+                launcher,
+                "_build_tcgen05_grouped_static_metadata",
+                side_effect=fake_metadata,
+            ),
+            patch.object(
+                launcher,
+                "_get_cute_launcher_imports",
+                side_effect=fake_imports,
+            ),
+            patch.object(launcher, "_torch_dtype_to_cutlass", side_effect=str),
+        ):
+            first = launcher._build_cute_schema_and_args(
+                cute_kernel, (layout,), (1, 1, 1)
+            )
+            second = launcher._build_cute_schema_and_args(
+                cute_kernel, (layout,), (1, 1, 1)
+            )
+            changed_tail = launcher._build_cute_schema_and_args(
+                cute_kernel, (layout,), (1, 1, 1)
+            )
+            changed_stride = launcher._build_cute_schema_and_args(
+                cute_kernel, (layout,), (1, 1, 1)
+            )
+
+        self.assertEqual(first.schema, second.schema)
+        self.assertIn(
+            (
+                "wrapper_tensor_runtime_leading_extent",
+                "runtime_tile_records",
+                "torch.int32",
+                2,
+                (10,),
+                (10, 1),
+            ),
+            first.schema,
+        )
+        self.assertEqual(first.launch_args[-5], 2)
+        self.assertEqual(second.launch_args[-5], 5)
+        self.assertNotEqual(first.schema, changed_tail.schema)
+        self.assertNotEqual(first.schema, changed_stride.schema)
+        first_key = launcher._cute_compiled_launcher_discriminator(
+            first.schema, (32, 1, 1), None, None
+        )[0]
+        second_key = launcher._cute_compiled_launcher_discriminator(
+            second.schema, (32, 1, 1), None, None
+        )[0]
+        self.assertEqual(first_key, second_key)
+
+        with patch.object(launcher, "_create_cute_wrapper", return_value=object()):
+            first_compiled = launcher._get_compiled_cute_launcher(
+                cute_kernel, first.schema, (32, 1, 1)
+            )
+            second_compiled = launcher._get_compiled_cute_launcher(
+                cute_kernel, second.schema, (32, 1, 1)
+            )
+            tail_compiled = launcher._get_compiled_cute_launcher(
+                cute_kernel, changed_tail.schema, (32, 1, 1)
+            )
+            stride_compiled = launcher._get_compiled_cute_launcher(
+                cute_kernel, changed_stride.schema, (32, 1, 1)
+            )
+        self.assertIs(first_compiled, second_compiled)
+        self.assertIsNot(first_compiled, tail_compiled)
+        self.assertIsNot(first_compiled, stride_compiled)
+        self.assertEqual(len(cute_kernel._helion_cute_compiled_launchers), 3)
 
     def test_cute_launcher_passes_compile_options(self) -> None:
         cute_kernel = type("DummyCuteKernel", (), {})()
@@ -8650,6 +8851,9 @@ class TestCuteBackend(TestCase):
         cute_kernel._helion_cute_wrapper_plans = [
             {
                 "kind": "tcgen05_grouped_static_persistent",
+                "scheduler_mode": (
+                    Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value
+                ),
                 "layout_idx": 0,
                 "dynamic_ab_tensormaps": True,
             }
@@ -8707,7 +8911,13 @@ class TestCuteBackend(TestCase):
             self.skipTest("grouped capture context test needs CUDA")
         cute_kernel = type("DummyCuteKernel", (), {})()
         cute_kernel._helion_cute_wrapper_plans = [
-            {"kind": "tcgen05_grouped_static_persistent", "layout_idx": 0}
+            {
+                "kind": "tcgen05_grouped_static_persistent",
+                "scheduler_mode": (
+                    Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value
+                ),
+                "layout_idx": 0,
+            }
         ]
         layout = torch.zeros(1, dtype=torch.int32, device=DEVICE)
 
@@ -8728,6 +8938,9 @@ class TestCuteBackend(TestCase):
         cute_kernel._helion_cute_wrapper_plans = [
             {
                 "kind": "tcgen05_grouped_static_persistent",
+                "scheduler_mode": (
+                    Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value
+                ),
                 "layout_idx": 0,
                 "dynamic_ab_tensormaps": True,
             }
@@ -8883,9 +9096,13 @@ class TestCuteBackend(TestCase):
 
     def test_grouped_static_metadata_match_filters_device_plans(self) -> None:
         launcher = importlib.import_module("helion.runtime.cute.launcher")
-        host_plan = {"kind": "tcgen05_grouped_static_persistent"}
+        host_plan = {
+            "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value,
+        }
         device_plan = {
             "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value,
             "device_split_sizes": True,
         }
         unrelated_plan = {"kind": "unrelated"}
@@ -8942,6 +9159,7 @@ class TestCuteBackend(TestCase):
         cute_kernel = type("DummyCuteKernel", (), {})()
         plan = {
             "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value,
             "layout_idx": 0,
             "n_sizes_idx": 1,
             "group_count": 2,
@@ -9094,6 +9312,7 @@ class TestCuteBackend(TestCase):
         runtime_mod = importlib.import_module("helion.runtime")
         plan = {
             "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value,
             "layout_idx": 2,
             "lhs_idx": 0,
             "rhs_idx": 1,
@@ -9196,6 +9415,7 @@ class TestCuteBackend(TestCase):
         runtime_mod = importlib.import_module("helion.runtime")
         base_plan = {
             "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value,
             "layout_idx": 0,
             "n_sizes_idx": 1,
             "group_count": 2,
@@ -9250,6 +9470,7 @@ class TestCuteBackend(TestCase):
         kernel_mod = importlib.import_module("helion.runtime.kernel")
         plan = {
             "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value,
             "layout_idx": 0,
             "n_sizes_idx": 1,
             "group_count": 2,
@@ -9839,6 +10060,63 @@ class TestCuteBackend(TestCase):
         self.assertEqual(build_calls[0][3], build_calls[1][3])
         self.assertNotEqual(build_calls[1][3], build_calls[2][3])
 
+    def test_grouped_scheduler_mode_requires_complete_runtime_state(self) -> None:
+        launcher = importlib.import_module("helion.runtime.cute.launcher")
+        direct_plan = {
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT.value,
+            "orientation": "nm",
+            "runtime_tile_records_arg": "runtime_tile_records",
+        }
+        self.assertIs(
+            launcher._tcgen05_grouped_scheduler_mode(direct_plan),
+            Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+        )
+        self.assertIs(
+            launcher._tcgen05_grouped_scheduler_mode(
+                {
+                    **direct_plan,
+                    "scheduler_mode": Tcgen05GroupedSchedulerMode.RUNTIME_CLC.value,
+                    "fixed_tensormaps": True,
+                }
+            ),
+            Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+        )
+
+        invalid_plans = (
+            (
+                {"scheduler_mode": (Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT.value)},
+                "matching tile-table",
+            ),
+            (
+                {
+                    **direct_plan,
+                    "scheduler_mode": (
+                        Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value
+                    ),
+                },
+                "matching tile-table",
+            ),
+            ({**direct_plan, "orientation": "mn"}, "requires N,M orientation"),
+            (
+                {
+                    **direct_plan,
+                    "scheduler_mode": Tcgen05GroupedSchedulerMode.RUNTIME_CLC.value,
+                },
+                "requires fixed full-allocation TensorMaps",
+            ),
+        )
+        for invalid_plan, message in invalid_plans:
+            with (
+                self.subTest(plan=invalid_plan),
+                self.assertRaisesRegex(BackendUnsupported, message),
+            ):
+                launcher._tcgen05_grouped_scheduler_mode(invalid_plan)
+
+        self.assertIs(
+            launcher._tcgen05_grouped_scheduler_mode({}),
+            Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH,
+        )
+
     def test_kernel_late_cute_specialization_rekeys_bound_kernel(self) -> None:
         identity = _runtime_identity_kernel()
         x = torch.empty(1)
@@ -9848,6 +10126,7 @@ class TestCuteBackend(TestCase):
         signature = identity._base_specialization_key(args)
         plan: dict[str, object] = {
             "kind": "tcgen05_grouped_static_persistent",
+            "scheduler_mode": Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value,
             "layout_bind_idx": 1,
             "group_count": 1,
             "bm": 128,
