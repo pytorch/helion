@@ -36,6 +36,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..indexing_strategy import exact_tile_block_ids
+from ._mlir_compat import ir
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
@@ -199,7 +200,6 @@ def _query_tcgen05_fragment_ownership(
         raise _UnsupportedFragment
 
     import cutlass
-    from cutlass._mlir import ir
     import cutlass.cute as cute
     from cutlass.cute.nvgpu import tcgen05
     from cutlass.utils import blackwell_helpers
