@@ -40,7 +40,6 @@ from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
-from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
 from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
 )
@@ -203,12 +202,17 @@ def _tcgen05_grouped_dynamic_ab_tensormap_rank(plan: dict[str, object]) -> int:
     if (
         not isinstance(rank, int)
         or rank not in (2, 3)
-        or (rank == 2 and not bool(plan.get("dynamic_ab_tensormaps")))
+        or (
+            rank == 2
+            and not bool(plan.get("dynamic_ab_tensormaps"))
+            and not bool(plan.get("fixed_ab_tensormaps"))
+            and not bool(plan.get("fixed_tensormaps"))
+        )
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 grouped dynamic A/B TensorMap rank must be 2 or 3, "
-            "and rank 2 requires dynamic A/B TensorMaps",
+            "tcgen05 grouped A/B TensorMap rank must be 2 or 3, and rank 2 "
+            "requires dynamic or fixed full-allocation A/B TensorMaps",
         )
     return rank
 
@@ -760,6 +764,7 @@ def _append_cute_wrapper_plan(
     smem_swizzle_b: int | None = (
         int(smem_swizzle_b_raw) if isinstance(smem_swizzle_b_raw, int) else None
     )
+    a_k_major = bool(plan.get("a_k_major", True))
     # K-major (column-major / K-contiguous) B. Absent on the MN-major
     # (row-major B) default path.
     b_k_major = bool(plan.get("b_k_major"))
@@ -770,13 +775,27 @@ def _append_cute_wrapper_plan(
     orientation = _tcgen05_plan_orientation(plan)
     swapped_nm = orientation == "nm"
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
-    if swapped_nm and not dynamic_ab_tensormaps:
+    fixed_ab_tensormaps = bool(plan.get("fixed_ab_tensormaps"))
+    fixed_grouped_b_rank3 = bool(plan.get("fixed_grouped_b_rank3"))
+    if fixed_grouped_b_rank3 and not fixed_ab_tensormaps:
+        raise exc.BackendUnsupported(
+            "cute", "rank-3 immutable grouped B requires fixed A/B TensorMaps"
+        )
+    if fixed_ab_tensormaps and (not swapped_nm or dynamic_ab_tensormaps):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 N,M-oriented A/B TensorMaps without dynamic A/B "
-            "TensorMaps are unsupported",
+            "fixed full-allocation A/B TensorMaps require the N,M worklist "
+            "orientation and cannot also be dynamic",
         )
-    dynamic_ab_tensormap_rank2 = _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
+    if swapped_nm and not (dynamic_ab_tensormaps or fixed_ab_tensormaps):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M-oriented A/B TensorMaps require dynamic per-group or "
+            "fixed full-allocation descriptors",
+        )
+    dynamic_ab_tensormap_rank2 = (
+        dynamic_ab_tensormaps and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
+    )
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -812,7 +831,12 @@ def _append_cute_wrapper_plan(
     lhs_tma = f"{tma_atom_a}_lhs_tma"
     lhs_tma_arg = (
         lhs_tma
-        if (dynamic_ab_tensormaps or swapped_nm or lhs_tma_order is not None)
+        if (
+            dynamic_ab_tensormaps
+            or fixed_ab_tensormaps
+            or swapped_nm
+            or lhs_tma_order is not None
+        )
         else f"arg{lhs_idx}"
     )
     rhs_tma = f"{tma_atom_b}_rhs_tma"
@@ -822,7 +846,23 @@ def _append_cute_wrapper_plan(
                 "cute",
                 "tcgen05 N,M-oriented A/B TensorMaps require grouped rank-3 logical A",
             )
-        if dynamic_ab_tensormap_rank2:
+        if fixed_ab_tensormaps:
+            if fixed_grouped_b_rank3:
+                lhs_tma_layout = (
+                    f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape2, "
+                    f"arg{lhs_idx}_shape0), "
+                    f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride2, "
+                    f"arg{lhs_idx}_stride0)"
+                )
+            else:
+                # K-major grouped B can flatten to one immutable [G*N,K]
+                # allocation. Device coordinates add the group base.
+                lhs_tma_layout = (
+                    f"(arg{lhs_idx}_shape0 * arg{lhs_idx}_shape1, "
+                    f"arg{lhs_idx}_shape2), stride=(arg{lhs_idx}_stride1, "
+                    f"arg{lhs_idx}_stride2)"
+                )
+        elif dynamic_ab_tensormap_rank2:
             lhs_tma_layout = (
                 f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape2), "
                 f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride2)"
@@ -834,7 +874,11 @@ def _append_cute_wrapper_plan(
                 f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride2, "
                 f"arg{lhs_idx}_stride0)"
             )
-        if dynamic_ab_tensormap_rank2 or not dynamic_ab_tensormaps:
+        if (
+            fixed_ab_tensormaps
+            or dynamic_ab_tensormap_rank2
+            or not dynamic_ab_tensormaps
+        ):
             rhs_tma_layout = (
                 f"(arg{rhs_idx}_shape0, arg{rhs_idx}_shape1), "
                 f"stride=(arg{rhs_idx}_stride0, arg{rhs_idx}_stride1)"
@@ -913,6 +957,7 @@ def _append_cute_wrapper_plan(
         num_stages=ab_stage_count,
         operand="a",
         swizzle_override=smem_swizzle_a,
+        k_major=a_k_major,
     )
     smem_b_layout_expr = tcgen05_smem_layout_expr(
         tiled_mma=tiled_mma,
@@ -923,7 +968,7 @@ def _append_cute_wrapper_plan(
         num_stages=ab_stage_count,
         operand="b",
         swizzle_override=smem_swizzle_b,
-        b_k_major=b_k_major,
+        k_major=b_k_major,
     )
     if lhs_tma_order is not None:
         append_permuted_cute_tensor_view(lhs_tma, lhs_idx, lhs_tma_order)
@@ -937,7 +982,11 @@ def _append_cute_wrapper_plan(
                 f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
                 f"{input_dtype}, "
                 f"{input_dtype}, "
-                "cute.nvgpu.OperandMajorMode.K, "
+                + (
+                    "cute.nvgpu.OperandMajorMode.K, "
+                    if a_k_major
+                    else "cute.nvgpu.OperandMajorMode.MN, "
+                )
                 + (
                     "cute.nvgpu.OperandMajorMode.K, "
                     if b_k_major
@@ -2252,10 +2301,12 @@ def _tcgen05_grouped_device_split_total_clusters(
     m_size = _plan_int_value(plan, "m_size")
     n_size = _plan_int_value(plan, "n_size")
     source_m_tile = _plan_int_value(plan, "source_m_tile")
+    physical_mma_m = _plan_int_value(plan, "bm")
     if (
         group_count <= 0
         or m_size <= 0
         or n_size <= 0
+        or physical_mma_m <= 0
         or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
     ):
         raise exc.BackendUnsupported(
@@ -2263,9 +2314,7 @@ def _tcgen05_grouped_device_split_total_clusters(
             "tcgen05 grouped device split_sizes requires positive G, M, and N "
             "and a validated source M tile",
         )
-    n_clusters = (
-        n_size + TCGEN05_GROUPED_WORKLIST_MMA_M_TILE - 1
-    ) // TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+    n_clusters = (n_size + physical_mma_m - 1) // physical_mma_m
     packed_m_clusters = (m_size + source_m_tile - 1) // source_m_tile
     total_clusters = n_clusters * group_count * packed_m_clusters
     if total_clusters > torch.iinfo(torch.int32).max:
@@ -2614,10 +2663,17 @@ def _validate_tcgen05_grouped_dynamic_ab_tensormaps(
             "cute",
             "tcgen05 grouped dynamic A/B TensorMaps require K-contiguous A",
         )
-    if rhs.stride(2) != 1:
+    rhs_k_contiguous = rhs.stride(2) == 1
+    rhs_mn_contiguous = (
+        rhs.stride(1) == 1
+        and rhs.stride(2) == rhs.size(1)
+        and rhs.stride(0) == rhs.size(1) * rhs.size(2)
+    )
+    if not (rhs_k_contiguous or rhs_mn_contiguous):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 grouped dynamic A/B TensorMaps require K-contiguous grouped B",
+            "tcgen05 grouped dynamic A/B TensorMaps require contiguous K-major "
+            "or MN-major grouped B",
         )
     if rank == 2:
         if lhs.stride(0) != lhs.size(1):
@@ -2626,7 +2682,14 @@ def _validate_tcgen05_grouped_dynamic_ab_tensormaps(
                 "tcgen05 grouped rank-2 dynamic A/B TensorMaps require "
                 "contiguous A[M,K] outer stride",
             )
-        if rhs.stride(1) != rhs.size(2) or rhs.stride(0) != rhs.size(1) * rhs.size(2):
+        if not (
+            (
+                rhs_k_contiguous
+                and rhs.stride(1) == rhs.size(2)
+                and rhs.stride(0) == rhs.size(1) * rhs.size(2)
+            )
+            or rhs_mn_contiguous
+        ):
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 grouped rank-2 dynamic A/B TensorMaps require "
@@ -2635,18 +2698,109 @@ def _validate_tcgen05_grouped_dynamic_ab_tensormaps(
     alignment = 16
     lhs_stride0_bytes = int(lhs.stride(0)) * lhs.element_size()
     rhs_stride0_bytes = int(rhs.stride(0)) * rhs.element_size()
-    rhs_stride1_bytes = int(rhs.stride(1)) * rhs.element_size()
+    rhs_outer_matrix_stride_bytes = (
+        int(rhs.stride(1) if rhs_k_contiguous else rhs.stride(2)) * rhs.element_size()
+    )
     if (
         int(lhs.data_ptr()) % alignment != 0
         or int(rhs.data_ptr()) % alignment != 0
         or lhs_stride0_bytes % alignment != 0
         or rhs_stride0_bytes % alignment != 0
-        or rhs_stride1_bytes % alignment != 0
+        or rhs_outer_matrix_stride_bytes % alignment != 0
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 grouped dynamic A/B TensorMaps require 16-byte-aligned "
             "A/B bases and outer strides",
+        )
+
+
+def _validate_tcgen05_grouped_fixed_tensormaps(
+    cute_kernel: object,
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> None:
+    """Validate the immutable full-allocation worklist TensorMap envelope."""
+    if not bool(plan.get("fixed_tensormaps")):
+        return
+    if (
+        _tcgen05_plan_orientation(plan) != "nm"
+        or not bool(plan.get("worklist_metadata"))
+        or _tcgen05_grouped_device_split_sizes(plan)
+        or bool(plan.get("dynamic_ab_tensormaps"))
+        or bool(plan.get("dynamic_d_tensormap"))
+        or _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) != 2
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "fixed full-allocation TensorMaps require a host N,M worklist with "
+            "rank-2 immutable A/B/D descriptors",
+        )
+    _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, args)
+    lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
+    rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
+    n_size = _plan_int_value(plan, "n_size")
+    k_total_size = _plan_int_value(plan, "k_total_size")
+    bk = _plan_int_value(plan, "bk")
+    physical_mma_m = _plan_int_value(plan, "bm")
+    if (
+        lhs.dtype is not torch.bfloat16
+        or rhs.dtype is not torch.bfloat16
+        or int(lhs.size(1)) != k_total_size
+        or int(rhs.size(1)) != n_size
+        or int(rhs.size(2)) != k_total_size
+        or physical_mma_m not in (128, 256)
+        or n_size % physical_mma_m != 0
+        or k_total_size % bk != 0
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "fixed full-allocation TensorMaps require contiguous BF16 "
+            "A[Mtotal,K] and B[G,N,K], N divisible by the physical MMA-M "
+            "tile, and K divisible by block_k",
+        )
+
+    d_plans = [
+        cast("dict[str, object]", candidate)
+        for candidate in getattr(
+            cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()
+        )
+        if cast("dict[str, object]", candidate).get("kind") == "tcgen05_d_tma"
+        and bool(cast("dict[str, object]", candidate).get("fixed_tensormap"))
+    ]
+    if len(d_plans) != 1:
+        raise exc.BackendUnsupported(
+            "cute",
+            "fixed full-allocation TensorMaps require exactly one packed D "
+            "TensorMap wrapper plan",
+        )
+    d_idx = d_plans[0].get("d_idx")
+    if not isinstance(d_idx, int) or d_idx >= len(args):
+        raise exc.BackendUnsupported(
+            "cute", "fixed full-allocation D TensorMap argument is missing"
+        )
+    output = args[d_idx]
+    if not isinstance(output, torch.Tensor):
+        raise exc.BackendUnsupported(
+            "cute", "fixed full-allocation D TensorMap argument must be a tensor"
+        )
+    if (
+        output.device.type != "cuda"
+        or output.dtype is not torch.bfloat16
+        or output.ndim != 2
+        or tuple(int(size) for size in output.shape) != (int(lhs.size(0)), n_size)
+        or tuple(int(stride) for stride in output.stride()) != (n_size, 1)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "fixed full-allocation TensorMaps require contiguous BF16 "
+            "D[Mtotal,N] matching packed A and grouped B",
+        )
+    alignment = 16
+    if int(output.data_ptr()) % alignment != 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            "fixed full-allocation TensorMaps require a 16-byte-aligned D base",
         )
 
 
@@ -2880,6 +3034,7 @@ def _build_tcgen05_grouped_static_metadata(
 ) -> _Tcgen05GroupedStaticMetadataCacheEntry:
     layout = _tcgen05_grouped_static_layout_arg(plan, args)
     _validate_tcgen05_grouped_tensor_devices(layout, args)
+    _validate_tcgen05_grouped_fixed_tensormaps(cute_kernel, plan, args)
     n_sizes_arg = _tcgen05_grouped_static_size_arg(plan, args, "n_sizes")
     k_sizes_arg = _tcgen05_grouped_static_size_arg(plan, args, "k_sizes")
     cache_key = _tcgen05_grouped_static_metadata_cache_key(
@@ -2925,13 +3080,14 @@ def _build_tcgen05_grouped_static_metadata(
                 "cute",
                 "tcgen05 N,M worklist scheduler requires a validated source M tile",
             )
-        scheduler_bm = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+        scheduler_bm = bm
         scheduler_bn = worklist_m_tile
     else:
         worklist_m_tile = scheduler_bm = bm
         scheduler_bn = bn
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
     dynamic_d_tensormap = bool(plan.get("dynamic_d_tensormap"))
+    fixed_tensormaps = bool(plan.get("fixed_tensormaps"))
     direct_pointer_metadata = bool(plan.get("direct_pointer_metadata"))
     external_direct_metadata = _tcgen05_grouped_external_direct_metadata_args(
         plan,
@@ -2988,15 +3144,25 @@ def _build_tcgen05_grouped_static_metadata(
             "tcgen05 grouped scheduler requires common N/K dimensions divisible "
             "by the CTA tile",
         )
-    if worklist_nm and (
-        not dynamic_ab_tensormaps
-        or _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) != 2
-        or not dynamic_d_tensormap
+    if worklist_nm and not (
+        (
+            dynamic_ab_tensormaps
+            and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
+            and dynamic_d_tensormap
+            and not fixed_tensormaps
+        )
+        or (
+            fixed_tensormaps
+            and not dynamic_ab_tensormaps
+            and not dynamic_d_tensormap
+            and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
+        )
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 N,M worklist metadata requires rank-2 dynamic "
-            "A/B TensorMaps and a dynamic D TensorMap",
+            "tcgen05 N,M worklist metadata requires either rank-2 dynamic "
+            "per-group A/B/D TensorMaps or fixed full-allocation A/B/D "
+            "TensorMaps",
         )
     n_sizes_values: list[int] | None = None
     if n_sizes_arg is not None:
@@ -3511,11 +3677,12 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         return False
     if kind != "tcgen05_ab_tma":
         return True
-    for extent_key, block_key in (
-        ("m_size", "bm"),
-        ("n_size", "bn"),
-        ("k_total_size", "bk"),
-    ):
+    extent_blocks = (
+        (("n_size", "bm"), ("m_size", "bn"), ("k_total_size", "bk"))
+        if _tcgen05_plan_orientation(plan) == "nm"
+        else (("m_size", "bm"), ("n_size", "bn"), ("k_total_size", "bk"))
+    )
+    for extent_key, block_key in extent_blocks:
         extent = plan.get(extent_key)
         block = plan.get(block_key)
         if type(extent) is not int or type(block) is not int or extent % block:
