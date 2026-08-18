@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import abc
-import ast
 import collections
 import dataclasses
 import functools
@@ -411,6 +410,10 @@ class Backend(abc.ABC):
 
     def force_tile_mask(self) -> bool:
         """Whether tile strategies must emit explicit masks for all tiles."""
+        return False
+
+    def launches_surplus_tile_threads(self) -> bool:
+        """Whether an axis may be launched wider than the tile it indexes."""
         return False
 
     def supports_config_key(self, key: str) -> bool:
@@ -3018,6 +3021,7 @@ def _grouped_rank3_specialized_mma_plan(
 def _analyzed_specialized_mma_plan(
     node: torch.fx.Node,
     *,
+    fn: DeviceFunction,
     k_block_id: int,
     bk: int,
     config: Config,
@@ -3026,6 +3030,7 @@ def _analyzed_specialized_mma_plan(
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import _mma_tiles_are_static_full
     from .cute.cute_mma import analyze_cute_mma_node
+    from .cute.cute_mma import ensure_tcgen05_pair_epilogue_plan
 
     candidate = analyze_cute_mma_node(node)
     if (
@@ -3055,6 +3060,16 @@ def _analyzed_specialized_mma_plan(
         input_device=lhs_val.device,
     )
     if mma_impl == "universal":
+        return None
+    if mma_impl == "tcgen05" and not ensure_tcgen05_pair_epilogue_plan(
+        fn,
+        node,
+        candidate,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        config=config,
+    ):
         return None
     return _SpecializedMmaPlan(mma_impl, *root_mn_block_ids)
 
@@ -3089,6 +3104,7 @@ def _kernel_specialized_mma_plan(
         for node in graph_info.graph.nodes:
             plan = _analyzed_specialized_mma_plan(
                 node,
+                fn=fn,
                 k_block_id=block_ids[0],
                 bk=bk,
                 config=config,

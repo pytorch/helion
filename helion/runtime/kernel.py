@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import inspect
 import itertools
 import logging
@@ -21,12 +22,14 @@ from typing import Callable
 from typing import Generic
 from typing import Hashable
 from typing import Literal
+from typing import NamedTuple
 from typing import TypeVar
 from typing import cast
 from typing import overload
 from typing_extensions import Protocol
 import weakref
 
+import sympy
 import torch
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
@@ -41,12 +44,14 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
+from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import _is_supported_tensor_input_source
 from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
@@ -118,6 +123,39 @@ _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
 _INT32_INDEX_LIMIT = torch.iinfo(torch.int32).max
 _CUSTOM_KEY_UNSET = object()
+
+_HostSemanticInputNormalization = tuple[tuple[int, str, int, int], ...]
+
+
+class _FastDispatchEntry(NamedTuple):
+    """A dispatch key together with the state used to build it."""
+
+    key: tuple[Hashable, ...]
+    extra_guards: tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...]
+    specialization_generation: int
+
+
+class _SpecializationAlias:
+    """An omitted-default signature backed by a normalized signature."""
+
+    __slots__ = ("schemas", "canonical_signature", "trailing_defaults")
+
+    def __init__(
+        self,
+        schemas: dict[Hashable, list[Callable[[Sequence[object]], Hashable]]],
+        canonical_signature: tuple[Hashable, ...],
+        trailing_defaults: tuple[object, ...],
+    ) -> None:
+        self.schemas = schemas
+        self.canonical_signature = canonical_signature
+        self.trailing_defaults = trailing_defaults
+
+    def __call__(self, values: Sequence[object]) -> Hashable:
+        normalized = (*values, *self.trailing_defaults)
+        return tuple(
+            extractor(normalized)
+            for extractor in self.schemas[self.canonical_signature]
+        )
 
 
 def _make_prepared_arg_guard(
@@ -234,8 +272,8 @@ class _PreparedCall:
             or kernel._key_fn is not None
         ):
             return None
-        # Both call sites already obtained a non-None ``_fast_dispatch_key``,
-        # which proves every argument has an exact supported type.
+        # The caller already obtained a non-None ``_fast_dispatch_key``, which
+        # proves every argument has an exact supported type.
         try:
             return cls(
                 bound,
@@ -428,6 +466,7 @@ class Kernel(Generic[_R]):
             for config in configs or []
         ]
         self._bind_lock = threading.RLock()
+        self._specialize_extra_lock = threading.Lock()
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         # Fast dispatch cache: maps a cheap, fine-grained argument key (exact
         # dtype/shape/stride/device per tensor) directly to a BoundKernel,
@@ -437,6 +476,11 @@ class Kernel(Generic[_R]):
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
+        self._specialization_aliases: dict[
+            tuple[Hashable, ...], _SpecializationAlias
+        ] = {}
+        self._specialization_generation = 0
+        self._reset_generation = 0
         self._has_specialization_extras = False
         self._cute_grouped_static_tail_extra_descriptors: dict[
             Hashable, set[Hashable]
@@ -501,25 +545,81 @@ class Kernel(Generic[_R]):
     ) -> BoundKernelInMemoryCacheKey | None:
         from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
-        extra_fns = self._specialize_extra.get(signature)
-        if extra_fns is not None:
-            extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
-            return BoundKernelInMemoryCacheKey(signature, extra_results)
-        return None
+        extra_results = self._stable_specialization_extra_results(args, signature)
+        if extra_results is None:
+            return None
+        return BoundKernelInMemoryCacheKey(signature, extra_results)
+
+    def _stable_specialization_extra_results(
+        self,
+        args: Sequence[object],
+        signature: tuple[Hashable, ...],
+    ) -> tuple[Hashable, ...] | None:
+        # Evaluate outside the schema lock because some backend extractors may
+        # synchronize device data. Schema changes are finite and retry here.
+        while True:
+            with self._specialize_extra_lock:
+                extra_fns = self._specialize_extra.get(signature)
+                generation = self._specialization_generation
+            extra_results = (
+                None if extra_fns is None else tuple(fn(args) for fn in extra_fns)
+            )
+            with self._specialize_extra_lock:
+                if (
+                    self._specialization_generation == generation
+                    and self._specialize_extra.get(signature) is extra_fns
+                ):
+                    return extra_results
 
     def _create_bound_kernel_cache_key(
         self,
         bound_kernel: BoundKernel,
         args: tuple[object, ...],
         signature: tuple[Hashable, ...],
+        *,
+        extra_fns: list[Callable[[Sequence[object]], Hashable]] | None = None,
     ) -> BoundKernelInMemoryCacheKey:
         from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
-        self._specialize_extra[signature] = extra_fns = bound_kernel._specialize_extra()
-        if extra_fns:
-            self._has_specialization_extras = True
-        extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
-        return BoundKernelInMemoryCacheKey(signature, extra_results)
+        if extra_fns is None:
+            extra_fns = bound_kernel._specialize_extra()
+        if not bound_kernel._cache_managed:
+            extra_results = tuple(s(args) for s in extra_fns)
+            return BoundKernelInMemoryCacheKey(signature, extra_results)
+
+        # Autotune cache keys can be generated outside eager binding, so
+        # schema synchronization must not wait for the eager bind lock or hold
+        # the schema lock while backend extractors run.
+        while True:
+            with self._specialize_extra_lock:
+                if bound_kernel._reset_generation != self._reset_generation:
+                    active_extra_fns = extra_fns
+                    generation = None
+                else:
+                    published_extra_fns = self._specialize_extra.get(signature)
+                    if published_extra_fns is None:
+                        self._specialize_extra[signature] = extra_fns
+                        if extra_fns:
+                            self._has_specialization_extras = True
+                    else:
+                        # Late specialization can extend this schema after the
+                        # bound is constructed. The published list is the
+                        # authoritative schema.
+                        extra_fns = published_extra_fns
+                    generation = self._specialization_generation
+                    active_extra_fns = extra_fns
+            extra_results = tuple(s(args) for s in active_extra_fns)
+            cache_key = BoundKernelInMemoryCacheKey(signature, extra_results)
+            if generation is None:
+                return cache_key
+            with self._specialize_extra_lock:
+                if bound_kernel._reset_generation != self._reset_generation:
+                    return cache_key
+                if (
+                    self._specialization_generation == generation
+                    and self._specialize_extra.get(signature) is active_extra_fns
+                ):
+                    return cache_key
 
     def _extend_bound_kernel_specializations(
         self,
@@ -527,33 +627,68 @@ class Kernel(Generic[_R]):
         signature: tuple[Hashable, ...],
         extractors: list[Callable[[Sequence[object]], Hashable]],
         args: Sequence[object],
-    ) -> None:
+    ) -> bool:
         if not extractors:
-            return
+            return False
 
         from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
         with self._bind_lock:
-            existing_extractors = self._specialize_extra.get(signature, [])
-            updated_extractors = [*existing_extractors, *extractors]
-            with unset_fake_temporarily():
-                current_results = tuple(
-                    extractor(args) for extractor in updated_extractors
-                )
-            updated_cache_key = BoundKernelInMemoryCacheKey(signature, current_results)
-            hash(updated_cache_key)
+            if bound_kernel._reset_generation != self._reset_generation:
+                return False
+            full_args = tuple(args)
+            aliases = {
+                alias_signature: alias
+                for alias_signature, alias in self._specialization_aliases.items()
+                if alias.canonical_signature == signature
+            }
+            # Keep cache-key generation from snapshotting the old schema while
+            # this extension is being validated and published.
+            with self._specialize_extra_lock:
+                updated_extractors = [
+                    *self._specialize_extra.get(signature, []),
+                    *extractors,
+                ]
+                with unset_fake_temporarily():
+                    current_results = tuple(
+                        extractor(full_args) for extractor in updated_extractors
+                    )
+                    updated_cache_key = BoundKernelInMemoryCacheKey(
+                        signature, current_results
+                    )
+                    hash(updated_cache_key)
+                    for alias_signature, alias in aliases.items():
+                        alias_arg_count = len(full_args) - len(alias.trailing_defaults)
+                        alias_args = full_args[:alias_arg_count]
+                        alias_normalized_args = (
+                            *alias_args,
+                            *alias.trailing_defaults,
+                        )
+                        alias_results = tuple(
+                            extractor(alias_normalized_args)
+                            for extractor in updated_extractors
+                        )
+                        hash(
+                            BoundKernelInMemoryCacheKey(
+                                alias_signature,
+                                (alias_results,),
+                            )
+                        )
 
-            # Publish the extended specialization only after every extractor
-            # succeeds. Otherwise a failed extension could leave a prepared
-            # call guarding an already-mutated extractor list.
-            self._specialize_extra[signature] = updated_extractors
-            self._has_specialization_extras = True
+                # Publish the extended specialization only after every extractor
+                # succeeds. Otherwise a failed extension could leave a prepared
+                # call guarding an already-mutated extractor list.
+                self._has_specialization_extras = True
+                self._specialize_extra[signature] = updated_extractors
+                for alias_signature, alias in aliases.items():
+                    self._specialize_extra[alias_signature] = [alias]
+                self._specialization_generation += 1
 
+            affected_signatures = {signature, *aliases}
             stale_keys = [
                 key
                 for key in self._bound_kernels
-                if key.specialization_key == signature
-                and len(key.extra_results) < len(updated_extractors)
+                if key.specialization_key in affected_signatures
             ]
             for stale_key in stale_keys:
                 self._bound_kernels.pop(stale_key)
@@ -562,6 +697,7 @@ class Kernel(Generic[_R]):
                     self._dispatch_cache.pop(fast_key)
             self._prepared_call = None
             self._bound_kernels[updated_cache_key] = bound_kernel
+            return True
 
     def _compute_is_distributed(
         self,
@@ -591,49 +727,11 @@ class Kernel(Generic[_R]):
         *,
         is_distributed: bool | None = None,
         signature: tuple[Hashable, ...] | None = None,
-    ) -> Hashable | None:
-        entry = self._fast_dispatch_key_and_guards(
-            args,
-            is_distributed=is_distributed,
-            signature=signature,
-        )
-        return None if entry is None else entry[0]
-
-    def _fast_dispatch_key_and_guards(
-        self,
-        args: tuple[object, ...],
-        *,
-        is_distributed: bool | None = None,
-        signature: tuple[Hashable, ...] | None = None,
-    ) -> (
-        tuple[
-            Hashable,
-            tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
-        ]
-        | None
-    ):
-        """
-        Build a cheap dispatch key for the fast-path cache in ``__call__``.
-
-        The key records exact per-argument metadata (dtype/shape/stride/device
-        for tensors, type and value for scalars), which is strictly finer than
-        the full specialization key: any two argument lists that produce
-        different full keys also produce different fast keys.  That makes it
-        safe to map a fast key directly to the BoundKernel that a full
-        ``bind()`` resolved for the same arguments.
-
-        If a base signature has extra specialization extractors, their results
-        are appended to preserve the same no-collision invariant for
-        value-based specializations.
-
-        Returns None when an argument type is not handled (tensor subclasses,
-        containers, ...), or when there is no tensor argument to pin down the
-        device; callers must then take the regular ``bind()`` path.
-        """
+        _extra_guards: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]]
+        | None = None,
+    ) -> tuple[Hashable, ...] | None:
+        """Build the exact eager dispatch key, optionally collecting its guards."""
         key: list[Hashable] = []
-        extra_guards: tuple[
-            tuple[Callable[[Sequence[object]], Hashable], Hashable], ...
-        ] = ()
         has_tensor = False
         for a in args:
             t = type(a)
@@ -672,135 +770,113 @@ class Kernel(Generic[_R]):
         if signature is not None:
             extra_fns = self._specialize_extra.get(signature)
             if extra_fns:
-                extra_guards = tuple(
-                    (extractor, extractor(args)) for extractor in extra_fns
-                )
-                key.append(tuple(expected for _, expected in extra_guards))
-        return tuple(key), extra_guards
+                extra_results: list[Hashable] = []
+                for extractor in extra_fns:
+                    result = extractor(args)
+                    extra_results.append(result)
+                    if _extra_guards is not None:
+                        _extra_guards.append((extractor, result))
+                key.append(tuple(extra_results))
+        return tuple(key)
+
+    def _fast_dispatch_key_and_guards(
+        self,
+        args: tuple[object, ...],
+        *,
+        is_distributed: bool | None = None,
+        signature: tuple[Hashable, ...] | None = None,
+    ) -> _FastDispatchEntry | None:
+        """
+        Build a cheap dispatch key for the fast-path cache in ``__call__``.
+
+        The key records exact per-argument metadata (dtype/shape/stride/device
+        for tensors, type and value for scalars), which is strictly finer than
+        the full specialization key: any two argument lists that produce
+        different full keys also produce different fast keys.  That makes it
+        safe to map a fast key directly to the BoundKernel that a full
+        ``bind()`` resolved for the same arguments.
+
+        If a base signature has extra specialization extractors, their results
+        are appended to preserve the same no-collision invariant for
+        value-based specializations.
+
+        Returns None when an argument type is not handled (tensor subclasses,
+        containers, ...), or when there is no tensor argument to pin down the
+        device; callers must then take the regular ``bind()`` path.
+        """
+        specialization_generation = self._specialization_generation
+        extra_guards: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
+        key = self._fast_dispatch_key(
+            args,
+            is_distributed=is_distributed,
+            signature=signature,
+            _extra_guards=extra_guards,
+        )
+        if key is None:
+            return None
+        return _FastDispatchEntry(
+            key,
+            tuple(extra_guards),
+            specialization_generation,
+        )
 
     def _prepare_dispatch_entry(
         self,
         args: tuple[object, ...],
         bound: BoundKernel[_R],
-        known_fast_key: Hashable | None = None,
-    ) -> tuple[Hashable, _PreparedCall | None] | None:
+        fast_entry: _FastDispatchEntry,
+    ) -> tuple[_PreparedCall | None, bool] | None:
         """Validate and construct eager fast paths from one runtime snapshot."""
-        if known_fast_key is not None and self._key_fn is not None:
-            # Validate the already-evaluated custom-key hit without invoking
-            # user code a second time.  In particular, do not let a process-
-            # group transition reuse a bound kernel compiled for the old state.
-            try:
-                normalized_args = self.normalize_args(*args)
-                dist_initialized = dist.is_initialized()
-                is_distributed = self._compute_is_distributed(
-                    normalized_args, dist_initialized=dist_initialized
-                )
-                if (
-                    not isinstance(known_fast_key, tuple)
-                    or len(known_fast_key) < len(args) + 2
-                ):
-                    return None
-                custom_key = known_fast_key[len(args) + 1]
-                signature = self._base_specialization_key(
-                    normalized_args,
-                    is_distributed=is_distributed,
-                    custom_key=custom_key,
-                )
-                if signature != bound._base_spec_key:
-                    return None
-                current_entry = self._fast_dispatch_key_and_guards(
-                    args,
-                    is_distributed=is_distributed,
-                    signature=signature,
-                )
-                if current_entry is None or current_entry[0] != known_fast_key:
-                    return None
-                extra_guards = current_entry[1]
-
-                from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
-
-                cache_key = BoundKernelInMemoryCacheKey(
-                    signature,
-                    tuple(expected for _, expected in extra_guards),
-                )
-                if (
-                    self._bound_kernels.get(cache_key) is not bound
-                    or dist.is_initialized() != dist_initialized
-                ):
-                    return None
-                return known_fast_key, None
-            except Exception:
-                return None
         try:
-            normalized_args = self.normalize_args(*args)
+            if fast_entry.specialization_generation != self._specialization_generation:
+                return None
+            if bound._reset_generation != self._reset_generation:
+                return None
             dist_initialized = dist.is_initialized()
             is_distributed = self._compute_is_distributed(
-                normalized_args, dist_initialized=dist_initialized
+                args, dist_initialized=dist_initialized
             )
-            signature = self._base_specialization_key(
-                normalized_args, is_distributed=is_distributed
-            )
-            if signature != bound._base_spec_key:
+            if fast_entry.key[len(args)] != is_distributed:
                 return None
-            fast_key = known_fast_key
-            can_prepare = True
-            extra_guards: tuple[
-                tuple[Callable[[Sequence[object]], Hashable], Hashable], ...
-            ] = ()
-            if fast_key is None:
-                current_entry = self._fast_dispatch_key_and_guards(
+            if self._key_fn is None:
+                raw_signature = self._base_specialization_key(
+                    args, is_distributed=is_distributed
+                )
+            else:
+                # Reuse the custom key captured by the dispatch lookup; user
+                # key functions must execute exactly once per launch.
+                raw_signature = self._base_specialization_key(
                     args,
                     is_distributed=is_distributed,
-                    signature=signature,
+                    custom_key=fast_entry.key[len(args) + 1],
                 )
-                if current_entry is None:
-                    return None
-                fast_key, extra_guards = current_entry
-            elif self._has_specialization_extras:
-                # The dispatch lookup already evaluated every late guard. A
-                # second evaluation is only needed before retaining those
-                # values in a prepared call; failure must not reject the valid
-                # dispatch hit that was just obtained.
-                try:
-                    current_entry = self._fast_dispatch_key_and_guards(
-                        args,
-                        is_distributed=is_distributed,
-                        signature=signature,
-                    )
-                except Exception:
-                    can_prepare = False
-                else:
-                    if current_entry is None:
-                        return None
-                    current_fast_key, extra_guards = current_entry
-                    if current_fast_key != fast_key:
-                        return None
-            if can_prepare:
-                from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+            alias = self._specialization_aliases.get(raw_signature)
+            signature = raw_signature if alias is None else alias.canonical_signature
+            if signature != bound._base_spec_key:
+                return None
 
-                current_cache_key = BoundKernelInMemoryCacheKey(
-                    signature,
-                    tuple(expected for _, expected in extra_guards),
-                )
-                if self._bound_kernels.get(current_cache_key) is not bound:
-                    return None
-            prepared = (
-                _PreparedCall.build(
+            if self._key_fn is None:
+                prepared = _PreparedCall.build(
                     self,
                     bound,
                     args,
                     dist_initialized=dist_initialized,
-                    extra_guards=extra_guards,
+                    extra_guards=fast_entry.extra_guards,
                     is_distributed=is_distributed,
                 )
-                if can_prepare
-                else None
-            )
+                keyed_direct_dispatch = False
+            else:
+                prepared = None
+                keyed_direct_dispatch = (
+                    not self.settings.distributed
+                    and not self._declares_process_group
+                    and not bound._env._is_distributed
+                )
             # Process-group initialization is external to ``_bind_lock``. Do
             # not publish a key assembled across a state transition.
             if dist.is_initialized() != dist_initialized:
                 return None
-            return fast_key, prepared
+            return prepared, keyed_direct_dispatch
         except Exception:
             # Fast-path publication is optional and must not add a failure
             # after the compiled kernel has already run successfully.
@@ -817,21 +893,44 @@ class Kernel(Generic[_R]):
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
         # Dynamo executes bind while capturing the call but cannot trace an RLock.
-        # Eager binds, including all cache mutations, remain serialized.
+        # Capture only needs an independent host function and compile environment.
         if torch.compiler.is_compiling():
-            return self._bind(args)
+            return self._bind_isolated(args)
         with self._bind_lock:
             return self._bind(args)
 
+    def _validate_bind_args(
+        self, args: tuple[object, ...] | list[object]
+    ) -> tuple[object, ...]:
+        if not isinstance(args, tuple):
+            assert isinstance(args, list), "args must be a tuple or list"
+            args = tuple(args)
+        if len(args) > self._num_params:
+            raise TypeError(
+                f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
+            )
+        return args
+
+    def _bind_isolated(self, args: tuple[object, ...]) -> BoundKernel[_R]:
+        """Construct a canonical bound without reading or publishing shared caches."""
+        args = self._validate_bind_args(args)
+        args = self.normalize_args(*args)
+        dist_initialized = dist.is_initialized()
+        is_distributed = self._compute_is_distributed(
+            args, dist_initialized=dist_initialized
+        )
+        signature = self._base_specialization_key(args, is_distributed=is_distributed)
+        return BoundKernel(
+            self,
+            args,
+            base_spec_key=signature,
+            is_distributed=is_distributed,
+            cache_managed=False,
+        )
+
     def _bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         with measure("Kernel.bind"):
-            if not isinstance(args, tuple):
-                assert isinstance(args, list), "args must be a tuple or list"
-                args = tuple(args)
-            if len(args) > self._num_params:
-                raise TypeError(
-                    f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
-                )
+            args = self._validate_bind_args(args)
             dist_initialized = dist.is_initialized()
             is_distributed = self._compute_is_distributed(
                 args, dist_initialized=dist_initialized
@@ -845,9 +944,25 @@ class Kernel(Generic[_R]):
             )
             if bound_kernel is None:
                 normalized_args: tuple[object, ...] = self.normalize_args(*args)
+                extra_fns: list[Callable[[Sequence[object]], Hashable]] | None = None
                 if len(normalized_args) != len(args):
                     # we had default args that needed to be applied
-                    bound_kernel = self.bind(normalized_args)
+                    bound_kernel = self._bind(normalized_args)
+                    canonical_signature = bound_kernel._base_spec_key
+                    alias = self._specialization_aliases.get(signature)
+                    if alias is None:
+                        trailing_defaults = normalized_args[len(args) :]
+                        alias = _SpecializationAlias(
+                            self._specialize_extra,
+                            canonical_signature,
+                            trailing_defaults,
+                        )
+                        self._specialization_aliases[signature] = alias
+                    extra_fns = (
+                        [alias]
+                        if self._specialize_extra.get(canonical_signature)
+                        else []
+                    )
                 else:
                     bound_kernel = BoundKernel(
                         self,
@@ -857,7 +972,10 @@ class Kernel(Generic[_R]):
                     )
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
-                        bound_kernel, args, signature
+                        bound_kernel,
+                        args,
+                        signature,
+                        extra_fns=extra_fns,
                     )
                 self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
@@ -915,10 +1033,8 @@ class Kernel(Generic[_R]):
             Hashable: A hashable key representing the specialization of the arguments.
         """
         base = self._base_specialization_key(args)
-        extra_fns = self._specialize_extra.get(base)
-        if extra_fns is not None:
-            return base + tuple([s(args) for s in extra_fns])
-        return base
+        extra_results = self._stable_specialization_extra_results(args, base)
+        return base if extra_results is None else (*base, *extra_results)
 
     def _specialization_key(self, obj: object) -> Hashable:
         """
@@ -1276,27 +1392,51 @@ class Kernel(Generic[_R]):
             # path below, so hitting it cannot skip autotuning/compilation.
             # (The cache stays empty under TPU compile capture, so this
             # cannot bypass auto_capture_call below.)
-            fast_key = self._fast_dispatch_key(args)
-            if fast_key is not None:
+            fast_entry: _FastDispatchEntry | None = None
+            if (
+                self._key_fn is not None
+                and not self.settings.distributed
+                and not self._declares_process_group
+            ):
+                # Keyed kernels cannot use a prepared call. Build their legacy
+                # exact key without allocating guard metadata on every launch.
+                specialization_generation = self._specialization_generation
+                dist_initialized = dist.is_initialized()
+                is_distributed = self._compute_is_distributed(
+                    args, dist_initialized=dist_initialized
+                )
+                fast_key = self._fast_dispatch_key(args, is_distributed=is_distributed)
+                if fast_key is not None:
+                    bound = self._dispatch_cache.get(fast_key)
+                    if bound is not None and bound._run is not None:
+                        run = bound._run
+                        if is_compiling:
+                            return run(*args)
+                        if (
+                            bound._dispatch_generation == specialization_generation
+                            and bound._run is run
+                            and self._specialization_generation
+                            == specialization_generation
+                            and dist.is_initialized() == dist_initialized
+                        ):
+                            return run(*args)
+                    fast_entry = _FastDispatchEntry(
+                        fast_key,
+                        (),
+                        specialization_generation,
+                    )
+            if fast_entry is None:
+                fast_entry = self._fast_dispatch_key_and_guards(args)
+            if fast_entry is not None:
+                fast_key = fast_entry.key
                 bound = self._dispatch_cache.get(fast_key)
                 if bound is not None and bound._run is not None:
                     run = bound._run
                     if is_compiling:
                         return run(*args)
-                    # Keyed calls cannot produce a prepared call.  The exact
-                    # dispatch key is sufficient when no late or distributed
-                    # guards require the locked revalidation below.
-                    if (
-                        self._key_fn is not None
-                        and not self._has_specialization_extras
-                        and not self.settings.distributed
-                        and not self._declares_process_group
-                        and not bound._env._is_distributed
-                    ):
-                        return run(*args)
                     # A compilation can discover a late specialization while a
-                    # different thread is reading this cache. Publish a prepared
-                    # entry only while the mapping is still current; the same
+                    # different thread is reading this cache. Revalidate fast-
+                    # path state while the mapping is still current; the same
                     # lock protects specialization-driven invalidation.
                     with self._bind_lock:
                         if (
@@ -1304,10 +1444,16 @@ class Kernel(Generic[_R]):
                             and bound._run is run
                         ):
                             entry = self._prepare_dispatch_entry(
-                                args, bound, known_fast_key=fast_key
+                                args,
+                                bound,
+                                fast_entry,
                             )
-                            if entry is not None and entry[0] == fast_key:
-                                self._prepared_call = entry[1]
+                            if entry is not None:
+                                self._prepared_call = entry[0]
+                                if entry[1]:
+                                    bound._dispatch_generation = (
+                                        fast_entry.specialization_generation
+                                    )
                             else:
                                 run = None
                         else:
@@ -1327,29 +1473,30 @@ class Kernel(Generic[_R]):
         bound = self.bind(args)
         result = bound(*args)
         if is_compiling:
-            if self._has_specialization_extras:
-                bound = self.bind(args)
-            if bound._run is not None:
-                fast_key = self._fast_dispatch_key(args)
-                if fast_key is not None:
-                    self._dispatch_cache[fast_key] = bound
-        else:
-            # Avoid a second bind for signatures the fast paths cannot support.
-            # This cheap key check also captures a custom key exactly once.
-            fast_key = self._fast_dispatch_key(args)
-            if fast_key is not None:
-                # Resolve any late specialization and publish both fast paths as
-                # one atomic update with respect to discovery and reset.
-                with self._bind_lock:
-                    if self._has_specialization_extras:
-                        bound = self._bind(args)
-                    if bound._run is not None:
-                        entry = self._prepare_dispatch_entry(
-                            args, bound, known_fast_key=fast_key
-                        )
-                        if entry is not None and entry[0] == fast_key:
-                            self._dispatch_cache[fast_key] = bound
-                            self._prepared_call = entry[1]
+            return result
+        # Avoid a second bind for signatures the fast paths cannot support.
+        # This cheap key check also captures a custom key exactly once.
+        fast_entry = self._fast_dispatch_key_and_guards(args)
+        if fast_entry is not None:
+            fast_key = fast_entry.key
+            # Resolve any late specialization and publish both fast paths as
+            # one atomic update with respect to discovery and reset.
+            with self._bind_lock:
+                if self._has_specialization_extras:
+                    bound = self._bind(args)
+                if bound._run is not None:
+                    entry = self._prepare_dispatch_entry(
+                        args,
+                        bound,
+                        fast_entry,
+                    )
+                    if entry is not None:
+                        self._dispatch_cache[fast_key] = bound
+                        self._prepared_call = entry[0]
+                        if entry[1]:
+                            bound._dispatch_generation = (
+                                fast_entry.specialization_generation
+                            )
         return result
 
     def reset(self) -> None:
@@ -1361,6 +1508,18 @@ class Kernel(Generic[_R]):
             self._bound_kernels.clear()
             self._dispatch_cache.clear()
             self._prepared_call = None
+            # Specialization extractors are discovered by tracing the host
+            # function and can change after an explicit reset. Keeping the old
+            # schema could hide newly discovered hl.specialize() calls.
+            with self._specialize_extra_lock:
+                # Replace rather than clear: in-flight omitted-default aliases
+                # retain the old schema mapping while new work starts fresh.
+                self._specialize_extra = {}
+                self._specialization_aliases = {}
+                self._cute_grouped_static_tail_extra_descriptors = {}
+                self._has_specialization_extras = False
+                self._specialization_generation += 1
+                self._reset_generation += 1
 
     @property
     def jax_fn(self) -> Callable[..., Any]:
@@ -1393,6 +1552,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         *,
         base_spec_key: tuple[Hashable, ...] | None = None,
         is_distributed: bool | None = None,
+        cache_managed: bool = True,
     ) -> None:
         """
         Initialize a BoundKernel object.
@@ -1403,9 +1563,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             kernel: The Kernel object to bind.
             args: A tuple of arguments to bind to the kernel.
+            cache_managed: Whether this bound participates in the kernel's shared
+                specialization and bound caches.
         """
         super().__init__()
         self.kernel = kernel
+        self._reset_generation = kernel._reset_generation
+        # Extending this bound's schema evicts all of its dispatch mappings.
+        self._dispatch_generation: int | None = None
+        self._cache_managed = cache_managed
         if is_distributed is None:
             dist_initialized = dist.is_initialized()
             is_distributed = kernel._compute_is_distributed(
@@ -1426,6 +1592,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
+        self._host_semantic_fingerprints: dict[
+            tuple[_HostSemanticInputNormalization, tuple[object, ...]], str
+        ] = {}
         # Direct to_code() has no call arguments, so keep this bound kernel's
         # construction-time tensor values as its stable weak fallback.
         self._runtime_tensor_refs_by_name = {
@@ -1851,6 +2020,170 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env:
             return self.host_function.debug_str()
 
+    def _get_host_semantic_input_normalization(
+        self,
+    ) -> _HostSemanticInputNormalization:
+        """Return capture-time equivalence classes for dynamic input symbols."""
+        if self.settings.static_shapes:
+            return ()
+
+        canonical_by_expr: dict[sympy.Expr, int] = {}
+        normalization: list[tuple[int, str, int, int]] = []
+        with self.env:
+            tensor_args = self._host_semantic_input_tensors()
+            for tensor_index, arg in enumerate(tensor_args):
+                for property_name, values in (
+                    ("size", arg.size()),
+                    ("stride", arg.stride()),
+                ):
+                    for index, value in enumerate(values):
+                        if not isinstance(value, torch.SymInt):
+                            continue
+                        expr = self.env.shape_env.simplify(value._sympy_())
+                        if isinstance(expr, sympy.Integer):
+                            continue
+                        canonical = canonical_by_expr.get(expr)
+                        if canonical is None:
+                            canonical = len(canonical_by_expr)
+                            canonical_by_expr[expr] = canonical
+                        normalization.append(
+                            (tensor_index, property_name, index, canonical)
+                        )
+        return tuple(normalization)
+
+    def _host_semantic_debug_renames(
+        self,
+        normalization: _HostSemanticInputNormalization,
+    ) -> tuple[dict[sympy.Basic, sympy.Basic], bool]:
+        tensor_args = self._host_semantic_input_tensors()
+        renames: dict[sympy.Basic, sympy.Basic] = {}
+        class_by_expr: dict[sympy.Basic, int] = {}
+        compatible = True
+        for tensor_index, property_name, index, canonical in normalization:
+            # A missing or concretized property is left unnormalized. If it is
+            # semantically used, the rendered host/device trace still differs.
+            if tensor_index >= len(tensor_args):
+                continue
+            tensor = tensor_args[tensor_index]
+            values = tensor.size() if property_name == "size" else tensor.stride()
+            if index >= len(values):
+                continue
+            value = values[index]
+            if not isinstance(value, torch.SymInt):
+                continue
+            expr = self.env.shape_env.simplify(value._sympy_())
+            existing = class_by_expr.get(expr)
+            if existing is not None and existing != canonical:
+                compatible = False
+                continue
+            class_by_expr[expr] = canonical
+            renames[expr] = sympy.Symbol(
+                f"<helion_input_symbol_{canonical}>",
+                integer=True,
+            )
+        return renames, compatible
+
+    def _host_semantic_input_tensors(self) -> list[torch.Tensor]:
+        return [
+            tensor
+            for tensor, source in self.env.input_sources.items()
+            if _is_supported_tensor_input_source(source)
+        ]
+
+    def _host_semantic_external_tensor_keys(self) -> tuple[object, ...]:
+        return tuple(
+            (
+                type(source).__name__,
+                tuple(self._semantic_dimension_key(dim) for dim in tensor.shape),
+                tuple(self._semantic_dimension_key(dim) for dim in tensor.stride()),
+                str(tensor.dtype),
+                str(tensor.device),
+                str(tensor.layout),
+                tensor.requires_grad,
+            )
+            for tensor, source in self.env.input_sources.items()
+            if not _is_supported_tensor_input_source(source)
+        )
+
+    def _get_host_semantic_fingerprint(
+        self,
+        outputs: Sequence[object],
+        *,
+        input_normalization: _HostSemanticInputNormalization | None = None,
+    ) -> str:
+        assert self.host_function is not None
+        if input_normalization is None:
+            input_normalization = self._get_host_semantic_input_normalization()
+
+        output_keys: list[object] = []
+        for output in outputs:
+            if isinstance(output, torch.Tensor):
+                if self.settings.static_shapes:
+                    shape = tuple(
+                        self._semantic_dimension_key(dim) for dim in output.shape
+                    )
+                else:
+                    shape = ("rank", output.ndim)
+                output_keys.append(
+                    (
+                        "tensor",
+                        shape,
+                        str(output.dtype),
+                        str(output.device),
+                        str(output.layout),
+                    )
+                )
+            elif isinstance(output, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+                output_keys.append((type(output).__name__,))
+            elif output is None or type(output) in (bool, float, int, str):
+                output_type = type(output)
+                output_keys.append(
+                    (
+                        f"{output_type.__module__}.{output_type.__qualname__}",
+                        repr(output),
+                    )
+                )
+            else:
+                raise TypeError(
+                    f"Unsupported Helion host output in semantic fingerprint: "
+                    f"{type(output).__name__}"
+                )
+
+        output_key = tuple(output_keys)
+        cache_key = (input_normalization, output_key)
+        fingerprint = self._host_semantic_fingerprints.get(cache_key)
+        if fingerprint is not None:
+            return fingerprint
+
+        normalization_compatible = True
+        with self.env:
+            if input_normalization:
+                renames, normalization_compatible = self._host_semantic_debug_renames(
+                    input_normalization
+                )
+                with self.env.use_debug_shape_renames(renames):
+                    host_source = self.host_function.semantic_debug_str()
+            else:
+                host_source = self.host_function.semantic_debug_str()
+
+        payload = (
+            input_normalization,
+            normalization_compatible,
+            self.env.backend_name,
+            str(self.env.index_dtype),
+            self._host_semantic_external_tensor_keys(),
+            host_source,
+            output_key,
+        )
+        fingerprint = hashlib.sha256(repr(payload).encode()).hexdigest()
+        self._host_semantic_fingerprints[cache_key] = fingerprint
+        return fingerprint
+
+    def _semantic_dimension_key(self, dim: object) -> object:
+        if isinstance(dim, torch.SymInt) and dim.node.shape_env is self.env.shape_env:
+            return shape_env_size_hint(self.env.shape_env, dim.node.expr)
+        return dim
+
     def autotune(
         self,
         args: Sequence[object],
@@ -2062,7 +2395,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             yield
 
     def _register_cute_grouped_static_tail_specializations(self) -> None:
-        if self.kernel.settings.backend != "cute":
+        if self.kernel.settings.backend != "cute" or not self._cache_managed:
             return
         signature = self._base_spec_key
         descriptors = _cute_grouped_static_tail_extra_descriptors(
@@ -2070,28 +2403,35 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         if not descriptors:
             return
-        seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
-            signature,
-            set(),
-        )
-        new_descriptors: list[Hashable] = []
-        new_extractors: list[Callable[[Sequence[object]], Hashable]] = []
-        for descriptor in descriptors:
-            if descriptor in seen:
-                continue
-            new_descriptors.append(descriptor)
-            new_extractors.append(_make_cute_grouped_static_tail_extractor(descriptor))
-        runtime_args = tuple(
-            self.env.runtime_arg_values_by_name.get(name)
-            for name in self.kernel.signature.parameters
-        )
-        self.kernel._extend_bound_kernel_specializations(
-            self,
-            signature,
-            new_extractors,
-            runtime_args,
-        )
-        seen.update(new_descriptors)
+        # Serialize descriptor discovery with schema extension so concurrent
+        # code generation cannot publish duplicate equivalent extractors.
+        with self.kernel._bind_lock:
+            if self._reset_generation != self.kernel._reset_generation:
+                return
+            seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
+                signature,
+                set(),
+            )
+            new_descriptors: list[Hashable] = []
+            new_extractors: list[Callable[[Sequence[object]], Hashable]] = []
+            for descriptor in descriptors:
+                if descriptor in seen:
+                    continue
+                new_descriptors.append(descriptor)
+                new_extractors.append(
+                    _make_cute_grouped_static_tail_extractor(descriptor)
+                )
+            runtime_args = tuple(
+                self.env.runtime_arg_values_by_name.get(name)
+                for name in self.kernel.signature.parameters
+            )
+            if self.kernel._extend_bound_kernel_specializations(
+                self,
+                signature,
+                new_extractors,
+                runtime_args,
+            ):
+                seen.update(new_descriptors)
 
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
@@ -2188,7 +2528,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
-        if self.kernel._has_specialization_extras:
+        if self._cache_managed and self.kernel._has_specialization_extras:
             rebound = self.kernel.bind(args)
             if rebound is not self:
                 return rebound(*args)
@@ -2197,7 +2537,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             with self._first_compile_lock:
                 # Another caller may have discovered a late specialization while
                 # this caller waited for the first compile.
-                if self.kernel._has_specialization_extras:
+                if self._cache_managed and self.kernel._has_specialization_extras:
                     rebound = self.kernel.bind(args)
                     if rebound is not self:
                         return rebound(*args)

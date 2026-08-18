@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
+    from .._compiler.cute.fragment_epilogue import Tcgen05PairEpiloguePlan
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
 
@@ -1527,6 +1528,7 @@ def _codegen_cute_store_tcgen05_tile(
     value_name: str,
     epilogue_chain: Tcgen05UnaryEpilogueChain | None = None,
     grouped_tail_epilogue: Tcgen05GroupedTailEpilogueMatch | None = None,
+    pair_epilogue: Tcgen05PairEpiloguePlan | None = None,
 ) -> list[ast.AST] | ast.AST | None:
     df = state.device_function
     candidate_names = df.variable_aliases(value_name)
@@ -1581,20 +1583,30 @@ def _codegen_cute_store_tcgen05_tile(
             "tcgen05 matmul store requires the exact zero-offset output tile axes",
         )
     if tcgen05_value.pure_matmul_role_lifecycle:
-        if epilogue_chain is not None or grouped_tail_epilogue is not None:
+        if (
+            epilogue_chain is not None
+            or grouped_tail_epilogue is not None
+            or pair_epilogue is not None
+        ):
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 pure role-lifecycle supports only identity pure-matmul stores",
             )
     if tcgen05_value.orientation is Tcgen05Orientation.NM and (
-        epilogue_chain is not None or grouped_tail_epilogue is not None
+        epilogue_chain is not None
+        or grouped_tail_epilogue is not None
+        or pair_epilogue is not None
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 N,M-oriented worklist path supports only an identity BF16 store",
         )
     assert (
-        sum(value is not None for value in (epilogue_chain, grouped_tail_epilogue)) <= 1
+        sum(
+            value is not None
+            for value in (epilogue_chain, grouped_tail_epilogue, pair_epilogue)
+        )
+        <= 1
     )
     # When one matmul accumulator fans out to multiple output stores (e.g.
     # aux = pre-activation and out = gelu(pre)), the per-matmul TMA-store
@@ -3014,6 +3026,21 @@ def _codegen_cute_store_tcgen05_tile(
         chain.
         """
         load_expr = f"{carrier_name}.load()"
+        if pair_epilogue is not None:
+            coordinate_setup, coordinate_name = _coord_subtile_source(
+                prelude_indent, coord_layout, include_setup=True
+            )
+            from .._compiler.cute.fragment_epilogue import render_tcgen05_pair_epilogue
+
+            pair_prelude, pair_expression = render_tcgen05_pair_epilogue(
+                state,
+                pair_epilogue,
+                carrier_name=carrier_name,
+                coordinate_name=coordinate_name,
+                target_dtype=target_dtype,
+                indent=prelude_indent,
+            )
+            return "", coordinate_setup + pair_prelude, pair_expression
         if epilogue_chain is None or not epilogue_chain.steps:
             rhs = load_expr
             late_prelude = ""
@@ -4789,6 +4816,11 @@ def _codegen_cute_store_tcgen05_tile(
                 "cutlass.utils.gemm.sm100.epilogue_tmem_copy_and_partition("
                 f"{kernel_desc}, {tcgen05_aux_epi_tidx}, {tacc}, "
                 f"{tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
+            ),
+            *(
+                [f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"]
+                if pair_epilogue is not None
+                else []
             ),
             f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
             (

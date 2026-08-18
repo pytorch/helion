@@ -28,7 +28,6 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
@@ -36,6 +35,7 @@ from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
@@ -105,7 +105,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "add", args, sum(args), block_sizes=[256, 128], loop_orders=[[1, 0]]
         )
 
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_matmul(self):
@@ -2244,7 +2244,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
@@ -2563,7 +2563,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @skipIfCudaSharedMemoryLessThan(
+    @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_broadcast_matmul(self):

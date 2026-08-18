@@ -8,6 +8,10 @@ Launching a distributed Pallas kernel is a host-side concern.  The generated
 local-shard function must execute under ``jax.shard_map``.  This is true for
 both a single-process JAX program and a multi-process TorchTPU program (where
 ``torch_tpu._internal.pallas.jax_op`` exports the shard-mapped function).
+
+The Triton host must allocate the destination as symmetric memory.  Helion's
+launcher rendezvouses that allocation and reserves completion slots in its
+signal pad.  The local source tensor need not be symmetric.
 """
 
 from __future__ import annotations
@@ -76,9 +80,10 @@ def remote_barrier(
 
     ``device_ids`` may be one logical peer, a one-dimensional tensor of peers,
     or a Python list. Every rank must name each peer with which it communicates.
-    Pallas statically unrolls one-dimensional peer tensors and uses a two-phase
-    neighbor barrier so a fast rank cannot enter the next invocation on a
-    reused collective ID while a peer is still finishing the prior one.
+    Both backends use a two-phase neighbor barrier so a fast rank cannot enter
+    the next invocation on a reused completion slot while a peer is still
+    finishing the prior one. Pallas statically unrolls peer tensors; Triton
+    exchanges counted NVSHMEM signals with the listed peers.
 
     Pallas derives a stable best-effort collective ID from the kernel definition.
     Kernels whose runtime communication groups are incompatible despite sharing
@@ -127,7 +132,9 @@ def make_async_remote_copy(
     dtypes and element counts.
 
     Completion storage is backend-managed. Pallas allocates DMA semaphores in
-    compiler scratch.
+    compiler scratch. Triton/NVSHMEM reserves compiler-assigned slots in the
+    symmetric destination allocation's signal pad; ``dst`` must therefore be a
+    symmetric-memory tensor on GPU.
     """
     raise exc.NotInsideKernel
 

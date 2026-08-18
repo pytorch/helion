@@ -1459,15 +1459,23 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
 
     @classmethod
     def _has_reduced_away_grid(cls, spec: ConfigSpec) -> bool:
-        """True iff some grid axis is REDUCED AWAY — a grid block_id that appears in NO live tile,
-        i.e. a sequential cross-grid reduction loop whose partial is finalized by a later
-        ``.sum(0)`` (the grad-parameter M-collapse idiom). Uses the shared ``_resident_block_ids``
-        residency test. False if no kernel fact."""
+        """True iff some grid axis is REDUCED AWAY — in no live tile, and batching more than one
+        row per program — i.e. a sequential cross-grid reduction finalized by a later ``.sum(0)``
+        (the grad-parameter M-collapse idiom). False if no kernel fact.
+
+        Both clauses are needed: non-residency alone also covers a ``block_size=1`` axis used as a
+        scalar index, which batches nothing, so consumers get neither cross-warp work to spread nor
+        a row that reloads from L2. A kernel property, not a target one, so both arches share it
+        and tune the RESPONSE instead.
+        """
         kf = spec.reduction_kernel_fact
         if kf is None:
             return False
         resident = cls._resident_block_ids(spec)
-        return any(g not in resident for g in kf.grid_axis_block_ids)
+        return any(
+            g not in resident and cls._m_axis_block_size(spec, g) > 1
+            for g in kf.grid_axis_block_ids
+        )
 
     @staticmethod
     def _max_group_footprint(
@@ -2016,6 +2024,10 @@ class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
 
     name = "triton_reduction_tile"
 
+    # Warp floor when a grid axis is reduced away: the batched rows give cross-warp work to
+    # spread. Per-arch, since it trades occupancy against that parallelism.
+    M_COLLAPSE_MIN_NUM_WARPS = 8
+
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         if not matches_hardware(env, cls.HARDWARE_TARGETS):
@@ -2047,7 +2059,7 @@ class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
         # >=8 warps even when the primary reduction's extent is small. A floor, so it never lowers a
         # large-rdim ramp. Independent of co-residency, so not gated on a co-resident sibling.
         if cls._has_reduced_away_grid(spec):
-            num_warps = max(8, num_warps)
+            num_warps = max(cls.M_COLLAPSE_MIN_NUM_WARPS, num_warps)
 
         # standard rides persistent-vs-looped on the rolled ``reduction_loops`` knob (the primary
         # rdim is NOT a block_sizes entry). MATERIALIZED rdim (rms/ln/instance bwd, the roller
@@ -2197,6 +2209,16 @@ class _TritonReductionSeedSM100(_TritonReductionSeedBase):
     NW8_MAX_ROW_TRAFFIC = 64 * 1024
     # Element cap for a non-reduction apply loop (see non_reduction_loop_block_cap).
     NON_REDUCTION_LOOP_MAX_ELEMS = 4096
+    # Row extent at or below which there is too little parallelism to fill 4 warps.
+    NARROW_ROW_MAX_ELEMS = 1024
+    NARROW_ROW_NUM_WARPS = 2
+    # Warp count for a light-traffic row above the narrow cap (was an always-8 split).
+    WIDE_ROW_NUM_WARPS = 4
+    # Heavy-traffic rows up to this extent cap here instead of taking the base ramp's 16/32.
+    HEAVY_ROW_MAX_ELEMS = 16384
+    HEAVY_ROW_NUM_WARPS = 8
+    # M-collapse floor (see TritonStandardReductionHeuristicSM90); 8 overshoots on B200.
+    M_COLLAPSE_MIN_NUM_WARPS = 4
 
     @classmethod
     def non_reduction_loop_block_cap(
@@ -2250,9 +2272,15 @@ class _TritonReductionSeedSM100(_TritonReductionSeedBase):
         # Load traffic per row = elems × load-width × #loads.
         traffic = pd.size_hint * max(1, pd.input_load_itemsize) * max(1, pd.num_load)
         if traffic <= cls.NW8_MAX_ROW_TRAFFIC:
-            # keep the base's small-extent 4-warp floor (<=1024 elems); else 8.
-            return 4 if pd.size_hint <= 1024 else 8
-        return None  # heavy-traffic streamed row -> base ramp (16/32) is right
+            # Warps past the useful ones idle while still holding registers and scheduler slots.
+            if pd.size_hint <= cls.NARROW_ROW_MAX_ELEMS:
+                return cls.NARROW_ROW_NUM_WARPS
+            return cls.WIDE_ROW_NUM_WARPS
+        # Heavy traffic: the base ramp's 16/32 is an H100 port that overshoots here up to
+        # HEAVY_ROW_MAX_ELEMS. Genuinely huge rows keep the base ramp.
+        if pd.size_hint <= cls.HEAVY_ROW_MAX_ELEMS:
+            return cls.HEAVY_ROW_NUM_WARPS
+        return None
 
 
 class TritonStandardReductionHeuristicSM100(

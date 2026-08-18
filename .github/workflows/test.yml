@@ -293,7 +293,11 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
-          elif [[ "${{ matrix.alias }}" == "tpu" || "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
+          elif [[ "${{ matrix.alias }}" == "tpu" ]]; then
+            TEST_PATH="."
+            EXTRA_FLAGS="--ignore=test/test_examples_dist.py --ignore=test/test_remote_copy.py"
+            PARALLEL=""
+          elif [[ "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
             PARALLEL=""
@@ -325,6 +329,17 @@ jobs:
             TIMEOUT=180
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          # JAX and TorchTPU initialize the TPU runtime differently. Run the
+          # physical remote-copy suites in fresh, sequential pytest processes.
+          if [[ "${{ matrix.alias }}" == "tpu" ]]; then
+            pytest -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
+            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
+          fi
+          # Each remote-copy test launches one process per GPU, so run this class
+          # serially rather than assigning its tests to concurrent xdist workers.
+          if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+            pytest -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
+          fi
 
   test-notebooks:
     name: test-notebooks-cu130-py3.12-pytorch-2.9-a10g
