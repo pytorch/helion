@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from enum import IntEnum
+from typing import TYPE_CHECKING
+from typing import NamedTuple
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 # Validated CtaGroup.TWO autotune/runtime envelope for the B200 CuTe path.
 # Re-verify the K-cap runtime and guard-boundary tests before raising the
 # K-tile threshold or broadening the tile shape.
@@ -497,6 +504,14 @@ TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY = (
 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY = (
     "tcgen05_grouped_worklist_source_m_tile"
 )
+# Reviewed runtime-variable-M profiles may opt into the host-expanded direct
+# tile table.  Absence or explicit ``False`` retains the established
+# scheduler-warp/SMEM-mailbox path, so profiles can choose between the two
+# generic schedulers without specializing on the runtime M vector.
+TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY = "tcgen05_grouped_runtime_direct"
+# CUDA exposes grid.z as an unsigned 16-bit launch dimension. Runtime-direct
+# CLC emits one exact tile record per cluster into that dimension.
+TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS = (1 << 16) - 1
 # Compact source rows avoid padding small-M experts to the historical 224-row
 # default while retaining the 32-row granularity of the validated store wave.
 TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE = 32
@@ -504,8 +519,8 @@ TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT = 224
 TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE = 256
 TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES = (64, 128)
 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES = (
-    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
     TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
 # N,M orientation maps the packed source-M tile onto the physical MMA-N mode.
@@ -517,6 +532,26 @@ TCGEN05_GROUPED_WORKLIST_STORE_SHAPE = (128, 32, 32)
 # The grouped scheduler publishes CTA M/N, validity, metadata/group indices,
 # problem M/N/K, and the packed-output row start through one Int32 mailbox.
 TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT = 9
+
+
+# Runtime-direct N,M scheduling expands one row per logical output tile on the
+# host. It deliberately contains no validity sentinel: the runtime
+# ``total_clusters`` scalar bounds every role-local loop. This shared enum is
+# the schema contract between the host table builder and generated device loads.
+class Tcgen05GroupedRuntimeTileField(IntEnum):
+    CTA_M = 0
+    CTA_N = 1
+    METADATA_IDX = 2
+    GROUP_IDX = 3
+    PROBLEM_M = 4
+    PROBLEM_N = 5
+    PROBLEM_K = 6
+    GLOBAL_M_START = 7
+    VALID_M = 8
+    STORE_M = 9
+
+
+TCGEN05_GROUPED_RUNTIME_TILE_FIELD_COUNT = len(Tcgen05GroupedRuntimeTileField)
 
 
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
@@ -569,6 +604,41 @@ def resolve_tcgen05_grouped_worklist_mma_shape(
     return None
 
 
+class Tcgen05GroupedWorklistMmaProfile(NamedTuple):
+    cluster_m: int
+    source_m_tile: int
+    mma_m: int
+    mma_n: int
+
+
+def resolve_tcgen05_grouped_worklist_mma_profile(
+    config: Mapping[str, object],
+    *,
+    block_k: object,
+) -> Tcgen05GroupedWorklistMmaProfile | None:
+    """Resolve one normalized worklist config to its physical MMA profile."""
+    if config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) != TCGEN05_GROUPED_MODE_WORKLIST_NM:
+        return None
+    cluster_m = config.get("tcgen05_cluster_m", 1)
+    source_m_tile = config.get(
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+    )
+    shape = resolve_tcgen05_grouped_worklist_mma_shape(
+        cluster_m=cluster_m,
+        block_k=block_k,
+        source_m_tile=source_m_tile,
+    )
+    if shape is None:
+        return None
+    assert type(cluster_m) is int and type(source_m_tile) is int
+    return Tcgen05GroupedWorklistMmaProfile(
+        cluster_m,
+        source_m_tile,
+        *shape,
+    )
+
+
 def _append_aligned_tcgen05_smem(offset: int, size: int, alignment: int) -> int:
     assert offset >= 0 and size >= 0 and alignment > 0
     return ((offset + alignment - 1) // alignment) * alignment + size
@@ -588,13 +658,11 @@ def tcgen05_grouped_worklist_smem_bytes(
     c_stages: int,
     cluster_m: int,
 ) -> int:
-    """Return the conservative ordered SMEM footprint of an N,M worklist.
+    """Return a conservative SMEM upper bound across all worklist modes.
 
     Charge the device-search dynamic-TensorMap allocation, the largest current
-    worklist mode. Runtime-direct and fixed-map modes omit some of these objects,
-    but every validated profile rounds to the same total at the final 1024-byte
-    C-ring alignment. Keeping one allocation model avoids coupling resource
-    admission to scheduler implementation details.
+    allocation set. Other scheduler modes may omit objects; sharing this upper
+    bound keeps resource admission independent of scheduler implementation.
     Keep allocation ordering synchronized with codegen because alignment padding
     makes reordering observable at the admission boundary.
     """
