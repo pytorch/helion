@@ -17,8 +17,11 @@ from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute.cute_mma import _collective_load_dependency_nodes
 from helion._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
+from helion._compiler.cute.device_state import CuteTcgen05GroupedPlan
 from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
 from helion._compiler.cute.device_state import CuteTcgen05StoreValue
+from helion._compiler.cute.device_state import Tcgen05GroupedDMode
+from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.device_state import Tcgen05Orientation
 from helion._compiler.cute.tcgen05_lifecycle import Tcgen05LifecycleContext
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
@@ -54,6 +57,27 @@ def _plan(**overrides: object) -> CuteTcgen05MatmulPlan:
     }
     kwargs.update(overrides)
     return CuteTcgen05MatmulPlan(**kwargs)
+
+
+def _grouped_plan(**overrides: object) -> CuteTcgen05GroupedPlan:
+    kwargs: dict[str, Any] = {
+        "orientation": Tcgen05Orientation.MN,
+        "layout": "layout",
+        "count": "2",
+        "sched_params": "sched_params",
+        "problem_sizes": "problem_sizes",
+        "starts": "starts",
+        "metadata_idx": "metadata_idx",
+        "group_idx": "group_idx",
+        "cta_tile_idx_m": "cta_tile_idx_m",
+        "cta_tile_idx_n": "cta_tile_idx_n",
+        "problem_m": "problem_m",
+        "problem_n": "problem_n",
+        "problem_k": "problem_k",
+        "global_m_start": "global_m_start",
+    }
+    kwargs.update(overrides)
+    return CuteTcgen05GroupedPlan(**kwargs)
 
 
 def _lifecycle(**overrides: object) -> Tcgen05LifecycleContext:
@@ -151,6 +175,92 @@ class _StatementCaptureGenerateAST(GenerateAST):
 
 @onlyBackends(["cute"])
 class TestCuteDeviceFunctionState(unittest.TestCase):
+    def test_grouped_scheduler_modes_enforce_complete_state(self) -> None:
+        device_search = _grouped_plan()
+        self.assertFalse(device_search.uses_runtime_tile_table)
+
+        runtime_direct = _grouped_plan(
+            orientation=Tcgen05Orientation.NM,
+            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+            runtime_tile_records="runtime_tile_records",
+            runtime_total_clusters="runtime_total_clusters",
+            real_groups="real_groups",
+            valid_m="valid_m",
+            store_m="store_m",
+            source_m_tile=32,
+            d_mode=Tcgen05GroupedDMode.ALL_TILES,
+            d_tensormap="d_tensormap",
+        )
+        self.assertTrue(runtime_direct.uses_runtime_tile_table)
+
+        with self.assertRaises(AssertionError):
+            dataclasses.replace(
+                runtime_direct,
+                scheduler_mode=Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH,
+            )
+        with self.assertRaises(AssertionError):
+            _grouped_plan(
+                scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+            )
+        with self.assertRaises(AssertionError):
+            _grouped_plan(fixed_tensormaps=True)
+        with self.assertRaises(AssertionError):
+            dataclasses.replace(
+                runtime_direct,
+                scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+            )
+
+        runtime_clc = dataclasses.replace(
+            runtime_direct,
+            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+            fixed_tensormaps=True,
+            d_mode=Tcgen05GroupedDMode.NONE,
+            d_tensormap=None,
+        )
+        self.assertTrue(runtime_clc.uses_runtime_tile_table)
+
+    def test_grouped_runtime_mode_matches_parent_warp_topology(self) -> None:
+        runtime_direct = _grouped_plan(
+            orientation=Tcgen05Orientation.NM,
+            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+            runtime_tile_records="runtime_tile_records",
+            runtime_total_clusters="runtime_total_clusters",
+            real_groups="real_groups",
+            valid_m="valid_m",
+            store_m="store_m",
+            source_m_tile=32,
+            d_mode=Tcgen05GroupedDMode.ALL_TILES,
+            d_tensormap="d_tensormap",
+        )
+        _plan(grouped=runtime_direct)
+        with self.assertRaises(AssertionError):
+            _plan(grouped=runtime_direct, scheduler_warp_count=1)
+
+        device_search_nm = dataclasses.replace(
+            runtime_direct,
+            scheduler_mode=Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH,
+            runtime_tile_records=None,
+            runtime_total_clusters=None,
+        )
+        _plan(grouped=device_search_nm, scheduler_warp_count=1)
+        with self.assertRaises(AssertionError):
+            _plan(grouped=device_search_nm)
+
+        runtime_clc = dataclasses.replace(
+            runtime_direct,
+            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+            fixed_tensormaps=True,
+            d_mode=Tcgen05GroupedDMode.NONE,
+            d_tensormap=None,
+        )
+        _plan(
+            grouped=runtime_clc,
+            scheduler_warp_count=1,
+            persistence_model="clc_persistent",
+        )
+        with self.assertRaises(AssertionError):
+            _plan(grouped=runtime_clc, persistence_model="clc_persistent")
+
     def test_tcgen05_store_value_d_store_layout_uses_output_layout(self) -> None:
         value = CuteTcgen05StoreValue(
             lifecycle_context=_lifecycle(), output_block_ids=(0, 1)
