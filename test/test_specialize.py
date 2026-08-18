@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from typing import Any
+from typing import cast
 import unittest
 
 import torch
@@ -754,6 +756,32 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         key_a_after = fn.specialization_key((a,))
         key_b_after = fn.specialization_key((b,))
         self.assertNotEqual(key_a_after, key_b_after)
+
+    @skipIfRefEager("Specialization-key schemas are not used in ref eager mode")
+    def test_specialization_key_keeps_independent_extra_schemas(self) -> None:
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        a = torch.empty([8], device=DEVICE)
+        b = torch.empty([16], device=DEVICE)
+        signature = fn._base_specialization_key((a,))
+        dynamic_fn = cast("Any", fn)
+
+        dynamic_fn._specialize_extra[signature] = [
+            lambda values: cast("torch.Tensor", values[0]).size(0)
+        ]
+        dynamic_fn._compiler_seed_specialize_extra.pop(signature, None)
+        self.assertNotEqual(fn.specialization_key((a,)), fn.specialization_key((b,)))
+
+        dynamic_fn._specialize_extra.pop(signature)
+        dynamic_fn._compiler_seed_specialize_extra[signature] = (
+            lambda values: (
+                "config_num_sm",
+                cast("torch.Tensor", values[0]).size(0),
+            ),
+        )
+        self.assertNotEqual(fn.specialization_key((a,)), fn.specialization_key((b,)))
 
 
 if __name__ == "__main__":

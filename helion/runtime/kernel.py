@@ -44,12 +44,17 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
+from .._argument_device import _ArgumentDeviceResolver
+from .._argument_device import _canonicalize_argument_device
+from .._argument_device import _current_device_index
 from .._argument_device import _find_argument_device_with_path
 from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
+from .._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from .._compiler.autotuner_heuristics import compiler_seed_configs
+from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
 from .._compiler.compile_environment import _is_supported_tensor_input_source
@@ -77,10 +82,12 @@ from .settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-    from collections.abc import Hashable
 
     from torch._guards import Source
 
+    from .._compiler.autotuner_heuristics.registry import (
+        CompilerHeuristicSpecializationFact,
+    )
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.aot_kernel import InputFn
@@ -135,6 +142,106 @@ class _FastDispatchEntry(NamedTuple):
     key: tuple[Hashable, ...]
     extra_guards: tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...]
     specialization_generation: int
+
+
+_TensorMetadataPathStep = (
+    tuple[Literal["sequence"], type[object], int]
+    | tuple[Literal["mapping"], type[object], type[object], Hashable]
+    | tuple[Literal["dataclass"], type[object], str]
+)
+
+
+def _mapping_metadata_sort_key(key: object) -> tuple[str, str, str]:
+    key_type = type(key)
+    return key_type.__module__, key_type.__qualname__, repr(key)
+
+
+def _input_tensor_metadata(values: Sequence[object]) -> tuple[Hashable, ...]:
+    """Return exact tensor metadata keyed by deterministic structural roles."""
+    metadata: list[Hashable] = []
+
+    def collect(
+        value: object,
+        path: tuple[_TensorMetadataPathStep, ...],
+    ) -> None:
+        if isinstance(value, torch.Tensor):
+            metadata.append(
+                (
+                    path,
+                    _hashable_dims(value.size()),
+                    _hashable_dims(value.stride()),
+                )
+            )
+            return
+        if isinstance(value, ConstExpr):
+            return
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            container_type = type(value)
+            for field in dataclasses.fields(value):
+                collect(
+                    getattr(value, field.name),
+                    (*path, ("dataclass", container_type, field.name)),
+                )
+        elif isinstance(value, (tuple, list)):
+            container_type = type(value)
+            for index, item in enumerate(value):
+                collect(item, (*path, ("sequence", container_type, index)))
+        elif isinstance(value, dict):
+            container_type = type(value)
+            for key, item in sorted(
+                value.items(),
+                key=lambda entry: _mapping_metadata_sort_key(entry[0]),
+            ):
+                collect(
+                    item,
+                    (
+                        *path,
+                        (
+                            "mapping",
+                            container_type,
+                            type(key),
+                            cast("Hashable", key),
+                        ),
+                    ),
+                )
+
+    collect(values, ())
+    return tuple(metadata)
+
+
+@dataclasses.dataclass(frozen=True)
+class _CompilerSeedSpecializationExtractor:
+    fact: CompilerHeuristicSpecializationFact
+    reserved_sms: int
+
+    def for_device(self, device: torch.device) -> Hashable:
+        from . import get_num_sm
+
+        if self.fact == "device_num_sm":
+            return self.fact, get_num_sm(device)
+        assert self.fact == "config_num_sm"
+        return self.fact, get_num_sm(device, reserved_sms=self.reserved_sms)
+
+    def __call__(self, values: Sequence[object]) -> Hashable:
+        if self.fact == "input_tensor_metadata":
+            return self.fact, _input_tensor_metadata(values)
+
+        device = _canonicalize_argument_device(_find_device(tuple(values)))
+        return self.for_device(device)
+
+
+def _compiler_seed_specialization_extractors(
+    facts: frozenset[CompilerHeuristicSpecializationFact],
+    reserved_sms: int,
+    *,
+    static_shapes: bool,
+) -> tuple[_CompilerSeedSpecializationExtractor, ...]:
+    if static_shapes:
+        facts = frozenset(fact for fact in facts if fact != "input_tensor_metadata")
+    return tuple(
+        _CompilerSeedSpecializationExtractor(fact, reserved_sms)
+        for fact in sorted(facts)
+    )
 
 
 class _SpecializationAlias:
@@ -315,24 +422,6 @@ class _PreparedCall:
             return False
 
 
-def _current_device_index(device_type: str) -> int:
-    device_module = getattr(torch, device_type, None)
-    current_device = getattr(device_module, "current_device", None)
-    if callable(current_device):
-        return cast("int", current_device())
-
-    accelerator = getattr(torch, "accelerator", None)
-    current_accelerator = getattr(accelerator, "current_accelerator", None)
-    current_device_index = getattr(accelerator, "current_device_index", None)
-    if callable(current_accelerator) and callable(current_device_index):
-        accelerator_device = cast("torch.device", current_accelerator())
-        if accelerator_device.type == device_type:
-            return cast("int", current_device_index())
-    raise exc.InvalidAPIUsage(
-        f"autotune_multi requires a current indexed accelerator, got {device_type!r}"
-    )
-
-
 def _canonicalize_multi_shape_device(device: torch.device) -> torch.device:
     if device.type in ("cpu", "meta", "mps"):
         raise exc.InvalidAPIUsage(
@@ -340,7 +429,14 @@ def _canonicalize_multi_shape_device(device: torch.device) -> torch.device:
         )
     if device.index is not None:
         return device
-    return torch.device(device.type, _current_device_index(device.type))
+    try:
+        index = _current_device_index(device.type)
+    except exc.InvalidAPIUsage as error:
+        raise exc.InvalidAPIUsage(
+            "autotune_multi requires a current indexed accelerator, "
+            f"got {device.type!r}"
+        ) from error
+    return torch.device(device.type, index)
 
 
 def _has_unspecialized_numeric_value(value: object) -> bool:
@@ -394,19 +490,33 @@ def _resolve_index_dtype(
 
 def _device_specialization_key(
     args: Sequence[object],
-) -> tuple[str | None, tuple[int, int] | None]:
+    *,
+    backend: str,
+    compiler_heuristics_enabled: bool,
+) -> tuple[
+    str | None,
+    tuple[int, int] | None,
+    tuple[tuple[str, str | None], ...],
+]:
     """Return the recursive argument device key used by bound-kernel caching.
 
     `_find_device` intentionally searches tensors and bare `torch.device`
     objects inside supported containers to match binding device selection.
-    Capability splits mixed-sm cache entries. Device index remains excluded so
-    same-capability devices share bound kernels, matching prior behavior.
+    Capability splits mixed-sm cache entries. Exact hardware identity is added
+    only when an active compiler heuristic uses it to gate default promotion.
+    Device index remains excluded so otherwise-compatible devices share bound
+    kernels, matching prior behavior.
     """
     try:
-        device = _find_device(tuple(args))
+        device = _canonicalize_argument_device(_find_device(tuple(args)))
     except exc.NoTensorArgs:
-        return None, None
-    return device.type, target_device_capability(device)
+        return None, None, ()
+    promotion_key = (
+        compiler_promotion_specialization_key(backend, device)
+        if compiler_heuristics_enabled
+        else ()
+    )
+    return device.type, target_device_capability(device), promotion_key
 
 
 @dataclasses.dataclass
@@ -488,6 +598,9 @@ class Kernel(Generic[_R]):
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
+        self._compiler_seed_specialize_extra: dict[
+            Hashable, tuple[_CompilerSeedSpecializationExtractor, ...]
+        ] = {}
         self._specialization_aliases: dict[
             tuple[Hashable, ...], _SpecializationAlias
         ] = {}
@@ -560,7 +673,14 @@ class Kernel(Generic[_R]):
         extra_results = self._stable_specialization_extra_results(args, signature)
         if extra_results is None:
             return None
-        return BoundKernelInMemoryCacheKey(signature, extra_results)
+        compiler_seed_results = self._stable_compiler_seed_results(args, signature)
+        if compiler_seed_results is None:
+            return None
+        return BoundKernelInMemoryCacheKey(
+            signature,
+            extra_results,
+            compiler_seed_results=compiler_seed_results,
+        )
 
     def _stable_specialization_extra_results(
         self,
@@ -583,6 +703,28 @@ class Kernel(Generic[_R]):
                 ):
                     return extra_results
 
+    def _stable_compiler_seed_results(
+        self,
+        args: Sequence[object],
+        signature: tuple[Hashable, ...],
+    ) -> tuple[Hashable, ...] | None:
+        while True:
+            with self._specialize_extra_lock:
+                extractors = self._compiler_seed_specialize_extra.get(signature)
+                generation = self._specialization_generation
+            results = (
+                None
+                if extractors is None
+                else tuple(extractor(args) for extractor in extractors)
+            )
+            with self._specialize_extra_lock:
+                if (
+                    self._specialization_generation == generation
+                    and self._compiler_seed_specialize_extra.get(signature)
+                    is extractors
+                ):
+                    return results
+
     def _create_bound_kernel_cache_key(
         self,
         bound_kernel: BoundKernel,
@@ -595,9 +737,15 @@ class Kernel(Generic[_R]):
 
         if extra_fns is None:
             extra_fns = bound_kernel._specialize_extra()
+        compiler_seed_fns = bound_kernel._compiler_seed_specialization_extractors
         if not bound_kernel._cache_managed:
             extra_results = tuple(s(args) for s in extra_fns)
-            return BoundKernelInMemoryCacheKey(signature, extra_results)
+            compiler_seed_results = tuple(s(args) for s in compiler_seed_fns)
+            return BoundKernelInMemoryCacheKey(
+                signature,
+                extra_results,
+                compiler_seed_results=compiler_seed_results,
+            )
 
         # Autotune cache keys can be generated outside eager binding, so
         # schema synchronization must not wait for the eager bind lock or hold
@@ -606,11 +754,15 @@ class Kernel(Generic[_R]):
             with self._specialize_extra_lock:
                 if bound_kernel._reset_generation != self._reset_generation:
                     active_extra_fns = extra_fns
+                    active_compiler_seed_fns = compiler_seed_fns
                     generation = None
                 else:
                     published_extra_fns = self._specialize_extra.get(signature)
                     if published_extra_fns is None:
                         self._specialize_extra[signature] = extra_fns
+                        self._compiler_seed_specialize_extra[signature] = (
+                            compiler_seed_fns
+                        )
                         if extra_fns:
                             self._has_specialization_extras = True
                     else:
@@ -618,10 +770,23 @@ class Kernel(Generic[_R]):
                         # bound is constructed. The published list is the
                         # authoritative schema.
                         extra_fns = published_extra_fns
+                    active_compiler_seed_fns = self._compiler_seed_specialize_extra.get(
+                        signature
+                    )
+                    if active_compiler_seed_fns is None:
+                        active_compiler_seed_fns = compiler_seed_fns
+                        self._compiler_seed_specialize_extra[signature] = (
+                            active_compiler_seed_fns
+                        )
                     generation = self._specialization_generation
                     active_extra_fns = extra_fns
             extra_results = tuple(s(args) for s in active_extra_fns)
-            cache_key = BoundKernelInMemoryCacheKey(signature, extra_results)
+            compiler_seed_results = tuple(s(args) for s in active_compiler_seed_fns)
+            cache_key = BoundKernelInMemoryCacheKey(
+                signature,
+                extra_results,
+                compiler_seed_results=compiler_seed_results,
+            )
             if generation is None:
                 return cache_key
             with self._specialize_extra_lock:
@@ -630,6 +795,8 @@ class Kernel(Generic[_R]):
                 if (
                     self._specialization_generation == generation
                     and self._specialize_extra.get(signature) is active_extra_fns
+                    and self._compiler_seed_specialize_extra.get(signature)
+                    is active_compiler_seed_fns
                 ):
                     return cache_key
 
@@ -661,12 +828,21 @@ class Kernel(Generic[_R]):
                     *self._specialize_extra.get(signature, []),
                     *extractors,
                 ]
+                compiler_seed_fns = self._compiler_seed_specialize_extra.get(
+                    signature,
+                    (),
+                )
                 with unset_fake_temporarily():
                     current_results = tuple(
                         extractor(full_args) for extractor in updated_extractors
                     )
+                    current_compiler_seed_results = tuple(
+                        extractor(full_args) for extractor in compiler_seed_fns
+                    )
                     updated_cache_key = BoundKernelInMemoryCacheKey(
-                        signature, current_results
+                        signature,
+                        current_results,
+                        compiler_seed_results=current_compiler_seed_results,
                     )
                     hash(updated_cache_key)
                     for alias_signature, alias in aliases.items():
@@ -680,10 +856,15 @@ class Kernel(Generic[_R]):
                             extractor(alias_normalized_args)
                             for extractor in updated_extractors
                         )
+                        alias_compiler_seed_results = tuple(
+                            extractor(alias_normalized_args)
+                            for extractor in compiler_seed_fns
+                        )
                         hash(
                             BoundKernelInMemoryCacheKey(
                                 alias_signature,
                                 (alias_results,),
+                                compiler_seed_results=alias_compiler_seed_results,
                             )
                         )
 
@@ -694,6 +875,9 @@ class Kernel(Generic[_R]):
                 self._specialize_extra[signature] = updated_extractors
                 for alias_signature, alias in aliases.items():
                     self._specialize_extra[alias_signature] = [alias]
+                    self._compiler_seed_specialize_extra[alias_signature] = (
+                        compiler_seed_fns
+                    )
                 self._specialization_generation += 1
 
             affected_signatures = {signature, *aliases}
@@ -1014,7 +1198,16 @@ class Kernel(Generic[_R]):
                 result.append(value)
             else:
                 result.append(self._specialization_key(value))
-        device_type, device_capability = _device_specialization_key(args)
+        device_type, device_capability, promotion_hardware_key = (
+            _device_specialization_key(
+                args,
+                backend=self.settings.backend,
+                compiler_heuristics_enabled=(
+                    not self.settings.disable_autotuner_heuristics
+                ),
+            )
+        )
+        promotion_key = (promotion_hardware_key,) if promotion_hardware_key else ()
         if is_distributed is None:
             is_distributed = self._compute_is_distributed(args)
         if self._key_fn is not None:
@@ -1024,10 +1217,17 @@ class Kernel(Generic[_R]):
                 *result,
                 device_type,
                 device_capability,
+                *promotion_key,
                 is_distributed,
                 cast("Hashable", custom_key),
             )
-        return (*result, device_type, device_capability, is_distributed)
+        return (
+            *result,
+            device_type,
+            device_capability,
+            *promotion_key,
+            is_distributed,
+        )
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -1046,7 +1246,13 @@ class Kernel(Generic[_R]):
         """
         base = self._base_specialization_key(args)
         extra_results = self._stable_specialization_extra_results(args, base)
-        return base if extra_results is None else (*base, *extra_results)
+        compiler_seed_results = self._stable_compiler_seed_results(args, base)
+        compiler_seed_key = (
+            ()
+            if compiler_seed_results is None or not compiler_seed_results
+            else (("compiler_seed_results", compiler_seed_results),)
+        )
+        return (*base, *compiler_seed_key, *(extra_results or ()))
 
     def _specialization_key(self, obj: object) -> Hashable:
         """
@@ -1342,7 +1548,11 @@ class Kernel(Generic[_R]):
                 relative_to,
                 cache_tag,
                 tuple(
-                    (case_key.specialization_key, case_key.extra_results)
+                    (
+                        case_key.specialization_key,
+                        case_key.extra_results,
+                        case_key.compiler_seed_results,
+                    )
                     for case_key in case_keys
                 ),
             ),
@@ -1527,6 +1737,7 @@ class Kernel(Generic[_R]):
                 # Replace rather than clear: in-flight omitted-default aliases
                 # retain the old schema mapping while new work starts fresh.
                 self._specialize_extra = {}
+                self._compiler_seed_specialize_extra = {}
                 self._specialization_aliases = {}
                 self._cute_grouped_static_tail_extra_descriptors = {}
                 self._has_specialization_extras = False
@@ -1602,6 +1813,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
+        self._compiler_seed_specialization_extractors: tuple[
+            _CompilerSeedSpecializationExtractor, ...
+        ] = ()
+        self._compiler_seed_specialization_results: tuple[Hashable, ...] = ()
+        # Direct BoundKernel calls bypass Kernel's dispatch cache. Remember the
+        # first device-bearing argument path and the immutable SM-derived facts
+        # per device so their hot path does not recursively walk args or query
+        # device properties on every launch.
+        self._compiler_seed_device_resolver: _ArgumentDeviceResolver | None = None
+        self._compiler_seed_device_results: dict[
+            torch.device,
+            tuple[Hashable | None, ...],
+        ] = {}
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
         self._host_semantic_fingerprints: dict[
@@ -1623,7 +1847,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         # symmetric-memory call from ever aliasing a non-distributed compiled
         # kernel of the same shape. See GitHub issue #3024.
         self._env = CompileEnvironment(
-            _find_device(args),
+            _canonicalize_argument_device(_find_device(args)),
             self.kernel.settings,
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
             is_distributed=is_distributed,
@@ -1688,6 +1912,36 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.env,
                     self.host_function.device_ir,
                 )
+                self._compiler_seed_specialization_extractors = (
+                    _compiler_seed_specialization_extractors(
+                        compiler_seed_specialization_facts(
+                            self.env.backend_name,
+                            self.config_spec.autotuner_heuristics,
+                        )
+                        | self.env.compiler_fact_specialization_facts,
+                        self.settings.persistent_reserved_sms,
+                        static_shapes=self.settings.static_shapes,
+                    )
+                )
+                self._compiler_seed_specialization_results = tuple(
+                    extractor(args)
+                    for extractor in self._compiler_seed_specialization_extractors
+                )
+                if any(
+                    extractor.fact != "input_tensor_metadata"
+                    for extractor in self._compiler_seed_specialization_extractors
+                ):
+                    self._compiler_seed_device_resolver = (
+                        _ArgumentDeviceResolver.from_values(args)
+                    )
+                    self._compiler_seed_device_results[self.env.device] = tuple(
+                        (None if extractor.fact == "input_tensor_metadata" else result)
+                        for extractor, result in zip(
+                            self._compiler_seed_specialization_extractors,
+                            self._compiler_seed_specialization_results,
+                            strict=True,
+                        )
+                    )
 
                 # Post-compile FX-graph scan to detect kernels
                 # whose tcgen05 matmul is followed by an
@@ -1789,10 +2043,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         return Config(**config)
 
     def _normalized_config_copy(self, config: ConfigLike) -> Config:
-        normalized = self._normalize_config(config)
-        normalized = Config(**normalized.config)  # pyrefly: ignore[bad-argument-type]
-        self.env.config_spec.normalize(normalized)
-        return normalized
+        return self.env.config_spec.normalized_config(self._normalize_config(config))
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
@@ -2517,6 +2768,41 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if self.kernel._bound_call_validator is not None:
             self.kernel._bound_call_validator()
+
+        if self._cache_managed and self._compiler_seed_specialization_extractors:
+            device_results: tuple[Hashable | None, ...] | None = None
+            new_compiler_seed_device = False
+            if self._compiler_seed_device_resolver is not None:
+                device = self._compiler_seed_device_resolver(args)
+                device_results = self._compiler_seed_device_results.get(device)
+                if device_results is None:
+                    new_compiler_seed_device = True
+                    device_results = tuple(
+                        (
+                            None
+                            if extractor.fact == "input_tensor_metadata"
+                            else extractor.for_device(device)
+                        )
+                        for extractor in self._compiler_seed_specialization_extractors
+                    )
+                    self._compiler_seed_device_results[device] = device_results
+            compiler_seed_results = tuple(
+                (
+                    extractor(args)
+                    if extractor.fact == "input_tensor_metadata"
+                    else cast("tuple[Hashable | None, ...]", device_results)[index]
+                )
+                for index, extractor in enumerate(
+                    self._compiler_seed_specialization_extractors
+                )
+            )
+            if (
+                new_compiler_seed_device
+                or compiler_seed_results != self._compiler_seed_specialization_results
+            ):
+                rebound = self.kernel.bind(args)
+                if rebound is not self:
+                    return rebound(*args)
 
         if self._cache_managed and self.kernel._has_specialization_extras:
             rebound = self.kernel.bind(args)

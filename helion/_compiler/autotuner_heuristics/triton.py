@@ -403,6 +403,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     name = "triton_h100_matmul"
     backend = "triton"
     promote_seed_to_default = True
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
     # Annotated so a hardware-specific subclass may override the arch (e.g. sm100).
     HARDWARE_TARGETS: ClassVar[tuple[tuple[str, str], ...]] = (("cuda", "sm90"),)
 
@@ -983,6 +984,7 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
 
     name = "triton_pointwise"
     backend = "triton"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
     # Fires arch-agnostically (is_eligible keys only on the pointwise fact), but
     # its byte/register constants were hill-climbed and validated on H100 (sm90).
     # Promote to the autotune-off default ONLY on the arches the correctness hunt
@@ -1382,6 +1384,7 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     """
 
     backend = "triton"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
     # Widen the declared type so the sm100 subclass can retarget it (the base is sm90-only).
     HARDWARE_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", "sm90"),)
     # Promote the reduction seed to the compiler default (autotune off) for every tuned track

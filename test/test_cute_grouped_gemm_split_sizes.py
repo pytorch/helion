@@ -9,8 +9,13 @@ import torch
 
 import helion
 from helion._compat import requires_cuda_version
+from helion._compiler.cute.cute_mma import tcgen05_grouped_worklist_seed_facts
+from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
+)
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
@@ -20,6 +25,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
 )
+from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
@@ -77,6 +83,10 @@ def _device_split_sizes_kernel(
     assert k == k2
     assert groups == 8
     assert split_sizes.size(0) == 8
+    hl.register_heuristic_metadata(
+        "tcgen05_grouped_worklist_source_m_tile",
+        224,
+    )
     block_m = hl.register_block_size(256)
     block_n = hl.register_block_size(128)
     block_k = hl.register_block_size(64)
@@ -416,6 +426,14 @@ def _grouped_plan(code: str) -> dict[str, object]:
     )
 
 
+def _assert_plan_fields(plan: dict[str, object], **expected: object) -> None:
+    for name, value in expected.items():
+        if isinstance(value, bool):
+            assert plan[name] is value
+        else:
+            assert plan[name] == value
+
+
 def _bk64_device_split_smem_bytes(group_count: int) -> int:
     from helion._compiler.cute.tcgen05_constants import (
         tcgen05_grouped_worklist_smem_bytes,
@@ -441,6 +459,62 @@ def test_grouped_device_split_smem_accounting_includes_fixed_allocations() -> No
     # mailboxes, TensorMaps, barriers, and alignment are included.
     assert _bk64_device_split_smem_bytes(8) == 227 * 1024
     assert _bk64_device_split_smem_bytes(51) > 227 * 1024
+
+
+def test_grouped_device_split_compiler_seeds_use_mailbox_scheduler() -> None:
+    _require_codegen_cuda()
+    with torch.cuda.device(DEVICE):
+        if torch.cuda.get_device_capability(DEVICE) != (10, 0):
+            pytest.skip("grouped worklist compiler seeds require SM100")
+
+    args = _make_device_split_sizes_args(
+        (0, 1, 127, 224, 256, 449, 0, 991),
+        n=512,
+        k=64,
+    )
+    _device_split_sizes_kernel.reset()
+    with (
+        patch_cute_mma_support(),
+        patch(
+            "helion._hardware.get_hardware_info",
+            return_value=HardwareInfo(
+                device_kind="cuda",
+                hardware_name="NVIDIA B200",
+                runtime_version="13.0",
+                compute_capability="sm100",
+            ),
+        ),
+    ):
+        bound = _device_split_sizes_kernel.bind(args)
+
+    seed_facts = tcgen05_grouped_worklist_seed_facts(
+        bound.env,
+        bound.host_function.device_ir,
+        bound.config_spec.matmul_facts[0],
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+    )
+    assert seed_facts is not None
+    assert seed_facts.device_split_sizes
+    assert bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts == (
+        8,
+        True,
+    )
+    seeds = [
+        config
+        for config in bound.config_spec.compiler_seed_configs
+        if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+        == TCGEN05_GROUPED_MODE_WORKLIST_NM
+    ]
+    assert seeds
+    assert all(
+        config.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is not True
+        for config in seeds
+    )
+    assert all(
+        config.config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 1
+        for config in seeds
+    )
+    assert bound.config_spec.compiler_default_config == seeds[0]
 
 
 @pytest.mark.parametrize(
@@ -483,33 +557,21 @@ def test_grouped_device_split_sizes_codegen_and_wrapper_plan(
     assert "tcgen05_grouped_real_groups" not in kernel_args
 
     plan = _grouped_plan(code)
-    assert {
-        "device_split_sizes": plan["device_split_sizes"],
-        "group_count": plan["group_count"],
-        "bk": plan["bk"],
-        "source_m_tile": plan["source_m_tile"],
-        "cluster_m": plan["cluster_m"],
-        "cluster_n": plan["cluster_n"],
-        "m_size": plan["m_size"],
-        "orientation": plan["orientation"],
-        "worklist_metadata": plan["worklist_metadata"],
-        "dynamic_ab_tensormaps": plan["dynamic_ab_tensormaps"],
-        "dynamic_ab_tensormap_rank": plan["dynamic_ab_tensormap_rank"],
-        "dynamic_d_tensormap": plan["dynamic_d_tensormap"],
-    } == {
-        "device_split_sizes": True,
-        "group_count": 8,
-        "bk": block_k,
-        "source_m_tile": source_m_tile,
-        "cluster_m": 2,
-        "cluster_n": 1,
-        "m_size": args[0].size(0),
-        "orientation": "nm",
-        "worklist_metadata": True,
-        "dynamic_ab_tensormaps": True,
-        "dynamic_ab_tensormap_rank": 2,
-        "dynamic_d_tensormap": True,
-    }
+    _assert_plan_fields(
+        plan,
+        device_split_sizes=True,
+        group_count=8,
+        bk=block_k,
+        source_m_tile=source_m_tile,
+        cluster_m=2,
+        cluster_n=1,
+        m_size=args[0].size(0),
+        orientation="nm",
+        worklist_metadata=True,
+        dynamic_ab_tensormaps=True,
+        dynamic_ab_tensormap_rank=2,
+        dynamic_d_tensormap=True,
+    )
     assert "real_groups_arg" not in plan
     assert "iterator + cutlass.Int64(7) * cutlass.Int64(" in code
 
@@ -549,10 +611,13 @@ def test_grouped_device_split_sizes_two_group_codegen() -> None:
     code = _code_for(_device_split_sizes_two_groups_kernel, args)
 
     plan = _grouped_plan(code)
-    assert plan["device_split_sizes"] is True
-    assert plan["group_count"] == 2
-    assert plan["m_size"] == args[0].size(0)
-    assert plan["orientation"] == "nm"
+    _assert_plan_fields(
+        plan,
+        device_split_sizes=True,
+        group_count=2,
+        m_size=args[0].size(0),
+        orientation="nm",
+    )
 
 
 def test_grouped_device_split_sizes_without_grouped_mode_falls_back() -> None:
@@ -661,13 +726,16 @@ def test_grouped_device_split_sizes_runtime_edges_and_graph_replay(
             captured = bound(*args)
         torch.cuda.synchronize()
 
+        def replay(split_sizes: tuple[int, ...]) -> None:
+            args[0].normal_()
+            args[2].copy_(args[2].new_tensor(split_sizes))
+            captured.fill_(-7.0)
+            graph.replay()
+            torch.cuda.synchronize()
+
         new_split_sizes = (113, 0, 224, 200, 0, 1, 300, 1210)
         assert sum(new_split_sizes) == args[0].size(0)
-        args[0].normal_()
-        args[2].copy_(torch.tensor(new_split_sizes, device=DEVICE, dtype=args[2].dtype))
-        captured.fill_(-7.0)
-        graph.replay()
-        torch.cuda.synchronize()
+        replay(new_split_sizes)
 
         _assert_device_split_sizes_output(captured, args)
 
@@ -675,13 +743,7 @@ def test_grouped_device_split_sizes_runtime_edges_and_graph_replay(
         # length exceeds M.  The replacement scheduler must preserve that
         # finite extent rather than constructing an out-of-bounds TensorMap.
         oversized_split_sizes = (args[0].size(0) + 1, 0, 0, 0, 0, 0, 0, 0)
-        args[0].normal_()
-        args[2].copy_(
-            torch.tensor(oversized_split_sizes, device=DEVICE, dtype=args[2].dtype)
-        )
-        captured.fill_(-7.0)
-        graph.replay()
-        torch.cuda.synchronize()
+        replay(oversized_split_sizes)
 
         expected = (args[0].float() @ args[1][0].float().T).to(captured.dtype)
         torch.testing.assert_close(captured, expected, rtol=3e-2, atol=3e-2)
@@ -699,13 +761,7 @@ def test_grouped_device_split_sizes_runtime_edges_and_graph_replay(
             0,
             0,
         )
-        args[0].normal_()
-        args[2].copy_(
-            torch.tensor(negative_split_sizes, device=DEVICE, dtype=args[2].dtype)
-        )
-        captured.fill_(-7.0)
-        graph.replay()
-        torch.cuda.synchronize()
+        replay(negative_split_sizes)
 
         visible_rows = args[0].size(0) - 50
         expected = (args[0][:visible_rows].float() @ args[1][2].float().T).to(
@@ -735,13 +791,7 @@ def test_grouped_device_split_sizes_runtime_edges_and_graph_replay(
                 0,
                 0,
             )
-            args[0].normal_()
-            args[2].copy_(
-                torch.tensor(wide_split_sizes, device=DEVICE, dtype=args[2].dtype)
-            )
-            captured.fill_(-7.0)
-            graph.replay()
-            torch.cuda.synchronize()
+            replay(wide_split_sizes)
 
             expected = (args[0].float() @ args[1][0].float().T).to(captured.dtype)
             torch.testing.assert_close(captured, expected, rtol=3e-2, atol=3e-2)

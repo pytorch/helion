@@ -149,6 +149,17 @@ def _record_restriction(
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
 
 
+def _copy_config_structure(value: object) -> object:
+    """Copy built-in config containers while preserving opaque leaf objects."""
+    if type(value) is dict:
+        return {key: _copy_config_structure(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_copy_config_structure(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_copy_config_structure(item) for item in value)
+    return value
+
+
 class TensorNumelConstraint(NamedTuple):
     """Tensor element count must stay within Triton's max numel limit."""
 
@@ -158,7 +169,11 @@ class TensorNumelConstraint(NamedTuple):
 
 
 class MatmulFact(NamedTuple):
-    """Shape facts recorded when matmul requirements are applied."""
+    """Shape facts recorded when matmul requirements are applied.
+
+    ``static_m``, ``static_n``, and ``static_k`` are proven compile-time
+    extents or ``None``. Runtime size hints must not be stored in these fields.
+    """
 
     lhs_ndim: int
     rhs_ndim: int
@@ -776,6 +791,7 @@ class ConfigSpec:
         # retry. ``None`` leaves all benchmark behavior unchanged.
         self.compiler_seed_timeout_retry_repetitions: int | None = None
         self.autotuner_heuristics: list[str] = []
+        self.compiler_heuristic_metadata: dict[str, object] = {}
         self.matmul_facts: list[MatmulFact] = []
         # The Stage-1 categorizing product the reduction seed + allocator consume.
         self.reduction_kernel_fact: ReductionKernelFact | None = None
@@ -1543,6 +1559,14 @@ class ConfigSpec:
             device=device,
         )
 
+    def register_cute_tcgen05_grouped_worklist_smem_facts(
+        self, *, group_count: int, device_split_sizes: bool
+    ) -> None:
+        self._cute_tcgen05_config.register_grouped_worklist_smem_facts(
+            group_count=group_count,
+            device_split_sizes=device_split_sizes,
+        )
+
     @staticmethod
     def _cute_per_cta_ab_smem_budget_bytes(device: torch.device) -> int:
         return CuteTcgen05Config.per_cta_ab_smem_budget_bytes(device)
@@ -1710,6 +1734,21 @@ class ConfigSpec:
 
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
+
+    def normalized_config(
+        self,
+        config: helion.Config | Mapping[str, object],
+    ) -> helion.Config:
+        """Return a normalized copy without mutating the requested config."""
+        values = config.config if isinstance(config, helion.Config) else config
+        copied_values = {
+            key: _copy_config_structure(value) for key, value in values.items()
+        }
+        normalized = helion.Config(
+            **copied_values  # pyrefly: ignore[bad-argument-type]
+        )
+        self.normalize(normalized)
+        return normalized
 
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False

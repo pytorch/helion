@@ -503,6 +503,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._effective_source_results: dict[str, BenchmarkResult] = {}
         self._compiler_seed_configs: set[Config] = set()
         self._compiler_seed_source_hashes: set[str] = set()
+        self._has_compiled_search_config = False
         # budget_exceeded_fn inherits the class-level _never_exceeded default
         # until BaseSearch._prepare installs the search's real hook.
 
@@ -977,8 +978,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             try:
                 with capture_output() as captured:
                     compiled[i] = self.kernel.compile_config(config, allow_print=False)
+                    self._has_compiled_search_config = True
             except Exception as e:
-                if not compiled and i == len(all_configs) - 1:
+                # Surface an entirely broken initial search, but once a known-
+                # compilable config exists, an all-failed neighborhood is an
+                # ordinary exhausted search branch. This matches a mixed batch,
+                # where the same failures are skipped whenever one sibling compiles.
+                if (
+                    not compiled
+                    and i == len(all_configs) - 1
+                    and not self._has_compiled_search_config
+                ):
                     raise
                 maybe_dump_triton_failure(
                     self.kernel, config, e, captured_output=captured[0] or None

@@ -424,8 +424,16 @@ class TestMultiShapeRuntime(unittest.TestCase):
             _RuntimeBoundKernel(backend, settings),
         ]
         case_keys = [
-            SimpleNamespace(specialization_key=("shape", 8), extra_results=()),
-            SimpleNamespace(specialization_key=("shape", 16), extra_results=()),
+            SimpleNamespace(
+                specialization_key=("shape", 8),
+                extra_results=(),
+                compiler_seed_results=(),
+            ),
+            SimpleNamespace(
+                specialization_key=("shape", 16),
+                extra_results=(),
+                compiler_seed_results=(),
+            ),
         ]
         kernel = object.__new__(Kernel)
         kernel.settings = settings  # pyrefly: ignore [bad-assignment]
@@ -452,7 +460,7 @@ class TestMultiShapeRuntime(unittest.TestCase):
                 "geomean",
                 None,
                 "numeric-shapes-v1",
-                ((("shape", 8), ()), (("shape", 16), ())),
+                ((("shape", 8), (), ()), (("shape", 16), (), ())),
             ),
         )
         self.assertEqual(backend.finalized, bounds)
