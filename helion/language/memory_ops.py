@@ -1750,8 +1750,7 @@ def _codegen_cute_store_tcgen05_tile(
             for size in pair_epilogue.store_tile_sizes
         ]
         column_ratio = (
-            pair_epilogue.source_shape[-1]
-            // pair_epilogue.destination_shape[-1]
+            pair_epilogue.source_shape[-1] // pair_epilogue.destination_shape[-1]
         )
         base_indices = [
             *source_base_indices[:-1],
@@ -3066,19 +3065,15 @@ def _codegen_cute_store_tcgen05_tile(
             coordinate_setup, coordinate_name = _coord_subtile_source(
                 prelude_indent, coord_layout, include_setup=True
             )
-            from .._compiler.cute.fragment_epilogue import (
-                render_tcgen05_pair_epilogue,
-            )
+            from .._compiler.cute.fragment_epilogue import render_tcgen05_pair_epilogue
 
-            fragment_prelude, fragment_expression = (
-                render_tcgen05_pair_epilogue(
-                    state,
-                    pair_epilogue,
-                    carrier_name=carrier_name,
-                    coordinate_name=coordinate_name,
-                    target_dtype=target_dtype,
-                    indent=prelude_indent,
-                )
+            fragment_prelude, fragment_expression = render_tcgen05_pair_epilogue(
+                state,
+                pair_epilogue,
+                carrier_name=carrier_name,
+                coordinate_name=coordinate_name,
+                target_dtype=target_dtype,
+                indent=prelude_indent,
             )
             return "", coordinate_setup + fragment_prelude, fragment_expression
         if epilogue_chain is None or not epilogue_chain.steps:
