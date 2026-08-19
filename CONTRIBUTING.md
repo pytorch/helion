@@ -26,6 +26,12 @@ Meta has a [bounty program](https://bugbounty.meta.com/) for the safe
 disclosure of security bugs. In those cases, please go through the process
 outlined on that page and do not file a public issue.
 
+## Governance
+
+The project's Maintainers and other technical roles are documented in
+[GOVERNANCE.md](GOVERNANCE.md). Technical oversight and TSC voting are governed
+by the [Technical Charter](technical-charter.md).
+
 ## Coding Style
 * Code is formatted and checked using [ruff](https://docs.astral.sh/ruff/formatter/).
 * All files must be typed with [pyrefly](https://pyrefly.org/).
