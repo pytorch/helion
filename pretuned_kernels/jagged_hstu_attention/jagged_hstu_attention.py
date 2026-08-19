@@ -262,14 +262,10 @@ def jagged_hstu_attention_bwd_dk_dv(
                 key = tile_kv.index.unsqueeze(1)
                 query = tile_q.index.unsqueeze(0)
                 keep_t = ((query >= key) & (key < history_end)) | (query == key)
-                probability_t = torch.where(
-                    keep_t[None, :, :], probability_t, 0.0
-                )
+                probability_t = torch.where(keep_t[None, :, :], probability_t, 0.0)
                 d_scores_t = torch.where(keep_t[None, :, :], d_scores_t, 0.0)
                 acc_dk = acc_dk + torch.bmm(d_scores_t.to(q.dtype), q_block)
-                acc_dv = acc_dv + torch.bmm(
-                    probability_t.to(grad_out.dtype), do_block
-                )
+                acc_dv = acc_dv + torch.bmm(probability_t.to(grad_out.dtype), do_block)
 
             dk[tile_kv, :, :] = acc_dk.transpose(0, 1).to(dk.dtype)
             dv[tile_kv, :, :] = acc_dv.transpose(0, 1).to(dv.dtype)
@@ -355,8 +351,7 @@ def _bounded_jagged_distribution(
             remaining_count = variable_count - index - 1
             minimum = max(
                 1,
-                remaining_tokens
-                - remaining_count * case.declared_max_seq_len,
+                remaining_tokens - remaining_count * case.declared_max_seq_len,
             )
             maximum = min(
                 case.declared_max_seq_len,
