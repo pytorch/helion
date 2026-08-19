@@ -1,5 +1,5 @@
 Helion's technical governance is defined by the
-[Technical Charter](technical-charter.md).
+[Technical Charter](TECHNICAL_CHARTER.md).
 
 ### Core Maintainers:
 - Jason Ansel, https://github.com/jansel
