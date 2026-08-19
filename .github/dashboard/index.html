@@ -1242,13 +1242,36 @@ function showPretunedFailures(failures) {
   html += '</ul>';
   openModal(html);
 }
+function pretunedBenchmarkScope(metadata) {
+  const api = metadata && metadata.deepgemm_api;
+  if (!api) return '';
+  const scope = [
+    api.function || 'DeepGEMM public API',
+    api.b_major ? `${String(api.b_major).toUpperCase()}-major B` : '',
+    api.compiled_dims ? `compiled_dims=${api.compiled_dims}` : '',
+    api.use_psum_layout === false ? 'non-PSUM' : '',
+    api.ensure_zero_padding === false ? 'zero-padding disabled' : '',
+    api.m_alignment ? `M alignment ${api.m_alignment}` : '',
+  ].filter(Boolean).map(value => escHtml(String(value))).join(' · ');
+  const provenance = metadata.deepgemm_provenance || {};
+  const identities = [];
+  if (provenance.git_head) identities.push(`DeepGEMM ${provenance.git_head}`);
+  if (metadata.reviewed_profile_manifest_sha256) {
+    identities.push(`profiles ${metadata.reviewed_profile_manifest_sha256}`);
+  }
+  const identity = identities.length
+    ? `<div style="margin-top:4px;color:var(--text-dim);font-family:monospace;font-size:11px">${identities.map(value => escHtml(String(value))).join(' · ')}</div>`
+    : '';
+  return `<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px"><strong>DeepGEMM baseline scope:</strong> ${scope}${identity}</div>`;
+}
 function showPretunedBaselines(kernel, ps) {
   const e = (PRETUNED_DATA && PRETUNED_DATA.summary || []).find(
     s => s.kernel === kernel && s.platform_short === ps);
   if (!e || !e.baselines) return;
   let html = modalHeader(
     `${escHtml(kernel)} — speedup vs each baseline`,
-    `${platName(ps)} · helion's geomean / wins / best over each baseline (headline row uses the fastest)`);
+    `${platName(ps)} · helion's geomean / wins / best over each baseline (headline uses the fastest baseline per shape)`);
+  html += pretunedBenchmarkScope(e.benchmark_metadata);
   html += '<div class="table-scroll"><table class="data-table"><thead><tr>'
     + '<th>Baseline</th><th>Geomean</th><th>Wins</th><th>Best</th></tr></thead><tbody>';
   Object.keys(e.baselines).forEach(name => {
