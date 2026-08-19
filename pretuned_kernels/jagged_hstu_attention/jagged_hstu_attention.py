@@ -248,7 +248,7 @@ def jagged_hstu_attention_bwd_dk_dv(
             acc_dk = hl.zeros([heads, tile_kv, head_dim], dtype=torch.float32)
             acc_dv = hl.zeros([heads, tile_kv, head_dim], dtype=torch.float32)
 
-            for tile_q in hl.tile(start, end):
+            for tile_q in hl.tile(max(start, tile_kv.begin), end):
                 q_block = q[tile_q, :, :].transpose(0, 1)
                 do_block = grad_out[tile_q, :, :].transpose(0, 1)
                 scores_t = torch.bmm(k_block, q_block.transpose(-2, -1))
