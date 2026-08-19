@@ -1962,7 +1962,12 @@ def _codegen_cute_store_tcgen05_tile(
         TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
     )
     if tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT:
-        if not aux_steps_in_chain:
+        fragment_host_prefetch = (
+            fragment_epilogue is not None
+            and fragment_epilogue.streaming_program is not None
+            and fragment_epilogue.has_host_loads
+        )
+        if not aux_steps_in_chain and not fragment_host_prefetch:
             raise exc.InvalidConfig(
                 f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
                 f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the epilogue has "
@@ -3221,14 +3226,14 @@ def _codegen_cute_store_tcgen05_tile(
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
         coord_layout: str = "ttr",
+        prefetch_fragment_host_loads: bool = False,
     ) -> tuple[str, str, str]:
         """Return ``(early_aux_prelude, late_prelude, assignment_rhs)``.
 
-        ``early_aux_prelude`` is the per-subtile auxiliary-tensor LDG
-        block (``ttr_aux_subtile = ...``; ``aux_loaded = .load()``) and
-        is empty when the chain has no aux steps. ``late_prelude``
-        holds the ``acc_loaded = carrier.load()`` and the chain-step
-        renderings. ``assignment_rhs`` is the right-hand side of
+        ``early_aux_prelude`` holds auxiliary host loads that may run before
+        the accumulator wait: either an epilogue-chain LDG block or fragment
+        prefetch buffers. ``late_prelude`` holds the accumulator reads and
+        pointwise renderings. ``assignment_rhs`` is the right-hand side of
         ``acc_vec = ...`` (without leading whitespace or the trailing
         newline). Both preludes are empty for the identity epilogue
         (no chain) — in that case ``assignment_rhs`` is the original
@@ -3265,15 +3270,24 @@ def _codegen_cute_store_tcgen05_tile(
                 render_tcgen05_fragment_epilogue,
             )
 
-            fragment_prelude, fragment_expression = render_tcgen05_fragment_epilogue(
-                state,
-                fragment_epilogue,
-                carrier_name=carrier_name,
-                coordinate_name=coordinate_name,
-                target_dtype=target_dtype,
-                indent=prelude_indent,
+            fragment_early, fragment_late, fragment_expression = (
+                render_tcgen05_fragment_epilogue(
+                    state,
+                    fragment_epilogue,
+                    carrier_name=carrier_name,
+                    coordinate_name=coordinate_name,
+                    target_dtype=target_dtype,
+                    indent=prelude_indent,
+                    prefetch_host_loads=prefetch_fragment_host_loads,
+                )
             )
-            return "", coordinate_setup + fragment_prelude, fragment_expression
+            if fragment_early:
+                return (
+                    coordinate_setup + fragment_early,
+                    fragment_late,
+                    fragment_expression,
+                )
+            return "", coordinate_setup + fragment_late, fragment_expression
         if epilogue_chain is None or not epilogue_chain.steps:
             rhs = load_expr
             late_prelude = ""
@@ -4709,8 +4723,9 @@ def _codegen_cute_store_tcgen05_tile(
 
         The default path renders the aux prelude after the TMEM→register
         copy to keep large residual fragments out of the store prefix. The
-        compact M64 and two-CTA M128 scaled-FP8 paths prefetch their small
-        scale fragments before the accumulator wait to hide the LDG latency.
+        compact M64 and two-CTA M128 scaled-FP8 paths, plus selected register
+        fragments, prefetch their host loads before the accumulator wait to
+        hide LDG latency.
         """
         assert allow_aux_chain or not aux_steps_in_chain, (
             "split/helper epilogue layouts reject aux-tensor chains at validate "
@@ -4723,11 +4738,15 @@ def _codegen_cute_store_tcgen05_tile(
             worklist_nm_segment_valid_m_bound
             and (epilogue_chain is None or not epilogue_chain.steps)
         )
+        pre_wait_aux = (
+            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        )
         early_aux_prelude, late_prelude, rhs = _splice_acc_vec(
             carrier,
             "            " if worklist_nm_identity_store else "        ",
             safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
             coord_layout="trs",
+            prefetch_fragment_host_loads=pre_wait_aux,
         )
         # The secondary fan-out store reuses the still-live accumulator TMEM and
         # must not release it: the primary store already owns the accumulator
@@ -4742,9 +4761,6 @@ def _codegen_cute_store_tcgen05_tile(
                 f"            with cute.arch.elect_one():\n"
                 f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
             )
-        )
-        pre_wait_aux = (
-            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
         )
         if worklist_nm_identity_store:
             # Identity-store means the epilogue chain is empty, so
@@ -4930,10 +4946,9 @@ def _codegen_cute_store_tcgen05_tile(
             tma_desc_arg = tma_store_desc_arg
         if tma_store_atom is None:
             tma_store_atom = tcgen05_tma_store_atom
-        # The aux LDG depends on ``_tcgen05_subtile`` and stays inside
-        # the per-subtile T2R body. It intentionally runs after the
-        # c_pipeline acquire and TMEM→register copy so the residual/bias
-        # fragments are not live through the store-prefix waits.
+        # Auxiliary LDGs stay inside the per-subtile T2R body. The placement
+        # knob decides whether they precede the accumulator wait or remain
+        # after T2R to shorten their live ranges.
         t2r_body = tma_store_acc_t2r_region_body(
             acc_wait=acc_wait,
             allow_aux_chain=True,
