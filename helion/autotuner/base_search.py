@@ -792,7 +792,7 @@ class BaseSearch(BaseAutotuner):
         if current_hardware is None or current_spec_key is None:
             return []
 
-        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash(
+        current_fingerprint_hash = self.config_spec.cache_fingerprint_hash(
             advanced_controls_files=self.settings.autotune_search_acf or None
         )
 

@@ -747,6 +747,9 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
             has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
             requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
             small_biased_candidate=spec._cute_flash_small_biased_candidate,
+            standard_dense_output=spec._cute_flash_standard_dense_output,
+            standard_causal_output=spec._cute_flash_standard_causal_output,
+            target_device_capability=spec.target_device_capability,
             block_size_targets=spec._cute_flash_block_size_target_list(),
         )
         if seed is not None:

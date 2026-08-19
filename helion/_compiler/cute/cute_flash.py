@@ -54,6 +54,7 @@ from .causal_range import CausalRangeProof
 from .causal_range import IntegerInterval
 from .causal_range import TileLayout
 from .causal_range import prove_descending_causal_prefix_unmasked
+from .flash_policy import get_flash_target_policy
 from .flash_schedule import FlashScheduleSpec
 from .flash_schedule import build_fa4_schedule
 from .flash_schedule import verify_flash_schedule
@@ -64,6 +65,10 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from .flash_tuning import FlashCausalTuningPolicy
+    from .flash_tuning import FlashDenseTuningPolicy
+    from .flash_tuning import FlashTuningPolicy
 
 
 class FlashGraphOutputPlan(NamedTuple):
@@ -3864,6 +3869,7 @@ def _flash_causal_degree2_seed_config(
     requires_ws_overlap: bool,
     small_biased_candidate: bool,
     standard_causal_output: bool,
+    target_device_capability: tuple[int, int] | None = None,
     block_size_targets: Sequence[int],
 ) -> Config | None:
     """Return a validated causal degree-2 seed."""
@@ -3891,10 +3897,23 @@ def _flash_causal_degree2_seed_config(
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
+        standard_causal_output=standard_causal_output,
+        target_device_capability=target_device_capability,
         pipeline_family_override="fa4",
     )
     values = {key: fragment.default() for key, fragment in fragments.items()}
-    overrides: dict[str, object] = {
+    overrides = _flash_causal_degree2_seed_overrides(num_kv)
+    if not _flash_seed_set_all(values, fragments, overrides):
+        return None
+    return Config.from_dict({"block_sizes": block_sizes, **values})
+
+
+def _flash_causal_degree2_seed_overrides(num_kv: int) -> dict[str, object]:
+    """Return the versioned causal degree-2 template's explicit values."""
+    seed_params = _flash_causal_degree2_seed_params(num_kv)
+    assert seed_params is not None
+    return {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
         FLASH_E2E_SCHEDULE_KEY: "16/6",
         FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
         FLASH_E2E_OFFSET_KEY: seed_params.e2e_offset,
@@ -3907,9 +3926,148 @@ def _flash_causal_degree2_seed_config(
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
         FLASH_ROLE_MAP_KEY: seed_params.role_map,
     }
+
+
+def _flash_dense_tuning_overrides(
+    policy: FlashDenseTuningPolicy,
+) -> dict[str, object]:
+    values: dict[str, object] = {
+        FLASH_PIPELINE_FAMILY_KEY: policy.pipeline_family,
+        FLASH_KV_STAGE_KEY: policy.kv_stage,
+        FLASH_PERSISTENT_KEY: policy.persistent,
+        FLASH_E2E_SCHEDULE_KEY: policy.e2e_schedule,
+        FLASH_E2E_OFFSET_KEY: policy.e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: policy.e2e_offset0,
+        FLASH_EXP2_PACKET_KEY: policy.exp2_packet,
+        FLASH_STAT_TRANSPORT_KEY: policy.stat_transport,
+    }
+    if policy.corr_regs is not None:
+        values[FLASH_CORR_REGS_KEY] = policy.corr_regs
+    if policy.other_regs is not None:
+        values[FLASH_OTHER_REGS_KEY] = policy.other_regs
+    return values
+
+
+def _flash_causal_tuning_values(
+    policy: FlashCausalTuningPolicy,
+) -> dict[str, object]:
+    values = {
+        **_flash_causal_degree2_seed_overrides(policy.num_kv),
+        FLASH_KV_STAGE_KEY: policy.kv_stage,
+        FLASH_Q_TILE_COUNT_KEY: policy.q_tile_count,
+    }
+    if policy.softmax_regs is not None:
+        values[FLASH_SOFTMAX_REGS_KEY] = policy.softmax_regs
+    if policy.first_load_order is not None:
+        values[FLASH_FIRST_LOAD_ORDER_KEY] = policy.first_load_order
+    return values
+
+
+def _flash_tuning_seed_config(
+    tuning_policy: FlashTuningPolicy,
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    standard_causal_output: bool,
+    target_device_capability: tuple[int, int] | None,
+    block_size_targets: Sequence[int],
+) -> Config | None:
+    if (
+        dtype is not torch.float16
+        or head_dim != 64
+        or has_kv_tile_pruning
+        or requires_ws_overlap
+        or small_biased_candidate
+    ):
+        return None
+
+    if is_causal:
+        causal_policy = tuning_policy.causal_policy(num_kv)
+        if not standard_causal_output or causal_policy is None:
+            return None
+        seed = _flash_causal_degree2_seed_config(
+            head_dim,
+            num_kv,
+            dtype=dtype,
+            is_causal=True,
+            has_kv_tile_pruning=False,
+            requires_ws_overlap=False,
+            small_biased_candidate=False,
+            standard_causal_output=True,
+            target_device_capability=target_device_capability,
+            block_size_targets=block_size_targets,
+        )
+        if seed is None:
+            return None
+        config = {**seed.config, **_flash_causal_tuning_values(causal_policy)}
+        return Config.from_dict(config)
+
+    dense_policy = tuning_policy.dense_policy(num_kv)
+    if not standard_dense_output or dense_policy is None:
+        return None
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return None
+    fragments = flash_autotune_fragments(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=False,
+        has_kv_tile_pruning=False,
+        requires_ws_overlap=False,
+        small_biased_candidate=False,
+        standard_dense_output=True,
+        target_device_capability=target_device_capability,
+        pipeline_family_override=dense_policy.pipeline_family,
+    )
+    values = {key: fragment.default() for key, fragment in fragments.items()}
+    overrides = _flash_dense_tuning_overrides(dense_policy)
     if not _flash_seed_set_all(values, fragments, overrides):
         return None
-    return Config.from_dict({"block_sizes": block_sizes, **values})
+    return Config.from_dict(
+        {
+            "block_sizes": block_sizes,
+            **values,
+            FLASH_Q_TILE_COUNT_KEY: dense_policy.q_tile_count,
+        }
+    )
+
+
+def _flash_target_seed_config(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    standard_causal_output: bool,
+    target_device_capability: tuple[int, int] | None,
+    block_size_targets: Sequence[int],
+) -> Config | None:
+    tuning_policy = get_flash_target_policy(target_device_capability).tuning
+    return _flash_tuning_seed_config(
+        tuning_policy,
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        target_device_capability=target_device_capability,
+        block_size_targets=block_size_targets,
+    )
 
 
 def flash_attention_seed_config(
@@ -3921,18 +4079,36 @@ def flash_attention_seed_config(
     has_kv_tile_pruning: bool = False,
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
+    standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
     seed_kind: str = "default",
 ) -> Config | None:
     """Return a fragment-valid seed config for the detected flash surface.
 
-    The seed policy is shape-family based rather than exact sequence-length
-    based. ``block_size_targets`` comes from the flash detector's search-surface
-    facts; this helper only emits a seed for the fused 1x128x128 envelope.
+    Target-specific seeds may be exact-length policies. ``block_size_targets``
+    comes from the flash detector's search-surface facts; this helper only emits
+    a seed for the fused 1x128x128 envelope.
     """
     if num_kv is None:
         return None
     if seed_kind == "default":
+        target_seed = _flash_target_seed_config(
+            head_dim,
+            num_kv,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            standard_dense_output=standard_dense_output,
+            standard_causal_output=standard_causal_output,
+            target_device_capability=target_device_capability,
+            block_size_targets=block_size_targets,
+        )
+        if target_seed is not None:
+            return target_seed
         return _flash_default_seed_config(
             head_dim,
             num_kv,
@@ -4046,6 +4222,7 @@ def flash_attention_seed_configs(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
 ) -> tuple[Config, ...]:
     seeds: list[Config] = []
@@ -4057,6 +4234,9 @@ def flash_attention_seed_configs(
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        target_device_capability=target_device_capability,
         block_size_targets=block_size_targets,
     )
     if default_seed is not None:
@@ -4124,7 +4304,14 @@ def flash_attention_seed_configs(
             block_size_targets=block_size_targets,
         )
         if causal_degree2_seed is not None:
-            seeds.append(causal_degree2_seed)
+            causal_degree2_identity = Config.from_dict(
+                {
+                    **causal_degree2_seed.config,
+                    FLASH_Q_TILE_COUNT_KEY: 2,
+                }
+            )
+            if causal_degree2_identity not in seeds:
+                seeds.append(causal_degree2_seed)
     for family_seed in _flash_canonical_family_seed_configs(
         head_dim,
         num_kv,
@@ -4152,6 +4339,7 @@ def flash_autotune_fragments(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
     topology_override: str | None = None,
     pipeline_family_override: str | None = None,
 ) -> dict[str, ConfigSpecFragment]:
@@ -4267,6 +4455,9 @@ def flash_autotune_fragments(
         and _flash_causal_hd64_seed_num_kv_supported(num_kv)
         and defaults.topology == "fa4"
     )
+    target_tuning_policy = get_flash_target_policy(target_device_capability).tuning
+    dense_tuning_policy = target_tuning_policy.dense_policy(num_kv)
+    causal_tuning_policy = target_tuning_policy.causal_policy(num_kv)
     long_causal_hd64_seeded_fa4 = (
         causal_hd64_seeded_fa4 and num_kv >= _FLASH_CAUSAL_HD64_LONG_AUTOTUNE_MIN_KV
     )
@@ -5084,7 +5275,7 @@ def flash_autotune_fragments(
     else:
         stat_transport_choices = ("ring2",)
         stat_transport_search_choices = None
-    return {
+    fragments: dict[str, ConfigSpecFragment] = {
         FLASH_S_STAGE_KEY: EnumFragment(s_stage_choices, s_stage_search_choices),
         FLASH_KV_STAGE_KEY: EnumFragment(kv_stage_choices, kv_stage_search_choices),
         FLASH_PERSISTENT_KEY: EnumFragment(
@@ -5194,6 +5385,21 @@ def flash_autotune_fragments(
             causal_loop_split_choices, causal_loop_split_search_choices
         ),
     }
+    policy_values: dict[str, object] = {}
+    if not is_causal and standard_dense_output and dense_tuning_policy is not None:
+        policy_values = _flash_dense_tuning_overrides(dense_tuning_policy)
+    elif is_causal and standard_causal_output and causal_tuning_policy is not None:
+        policy_values = _flash_causal_tuning_values(causal_tuning_policy)
+    for key, value in policy_values.items():
+        if key not in fragments:
+            continue
+        fragment = cast("EnumFragment", fragments[key])
+        if value not in fragment.choices:
+            search_choices = fragment.search_choices
+            if search_choices is None:
+                search_choices = (fragment.default(),)
+            fragments[key] = EnumFragment((*fragment.choices, value), search_choices)
+    return fragments
 
 
 def flash_config_from_config(

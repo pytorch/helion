@@ -4,6 +4,7 @@ import enum
 import functools
 import hashlib
 import itertools
+import json
 import logging
 import math
 import operator
@@ -1037,6 +1038,7 @@ class ConfigSpec:
             small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
             standard_causal_output=self._cute_flash_standard_causal_output,
+            target_device_capability=self.target_device_capability,
             topology_override=cast("str | None", topology_override),
             pipeline_family_override=pipeline_family_override,
         )
@@ -1517,6 +1519,7 @@ class ConfigSpec:
                     small_biased_candidate=self._cute_flash_small_biased_candidate,
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
+                    target_device_capability=self.target_device_capability,
                     block_size_targets=self._cute_flash_block_size_target_list(),
                 )
             )
@@ -2540,6 +2543,7 @@ class ConfigSpec:
                         standard_causal_output=(
                             self._cute_flash_standard_causal_output
                         ),
+                        target_device_capability=self.target_device_capability,
                         pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )
@@ -2711,6 +2715,64 @@ class ConfigSpec:
             repr(
                 self.structural_fingerprint(
                     advanced_controls_files=advanced_controls_files
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def cache_fingerprint_hash(
+        self, *, advanced_controls_files: list[str] | None = None
+    ) -> str:
+        """Return the ConfigSpec identity used by persistent autotune caches.
+
+        Compiler-owned defaults and seeds affect which configs are tried first,
+        but are intentionally absent from :meth:`structural_fingerprint`: two
+        shapes with different promoted seeds can still share the same flat
+        layout during multi-shape autotuning.  Persistent cache reuse is
+        different: a result selected under an old compiler seed policy must not
+        bypass a newly promoted policy, so include the ordered compiler configs
+        in that identity.
+
+        Target lowering policy also affects generated code even when its
+        promoted seed is unchanged, so include its stable identity.  Generic
+        targets with no compiler default or seed retain the historical
+        structural hash verbatim.
+        """
+        structural_hash = self.structural_fingerprint_hash(
+            advanced_controls_files=advanced_controls_files
+        )
+        target_policy_identity: object | None = None
+        if self.backend_name == "cute" and self.cute_flash_search_enabled:
+            from .._compiler.cute.flash_policy import flash_target_policy_cache_identity
+
+            target_policy_identity = flash_target_policy_cache_identity(
+                self.target_device_capability
+            )
+        if (
+            self.compiler_default_config is None
+            and not self.compiler_seed_configs
+            and target_policy_identity is None
+        ):
+            return structural_hash
+
+        def canonical_config(config: helion.Config | None) -> str | None:
+            if config is None:
+                return None
+            return json.dumps(
+                config.config,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        compiler_config_identity = (
+            canonical_config(self.compiler_default_config),
+            tuple(canonical_config(config) for config in self.compiler_seed_configs),
+        )
+        return hashlib.sha256(
+            repr(
+                (
+                    structural_hash,
+                    compiler_config_identity,
+                    target_policy_identity,
                 )
             ).encode("utf-8")
         ).hexdigest()

@@ -216,6 +216,11 @@ class _RuntimeConfigSpec:
     ) -> str:
         return "fake-config-spec"
 
+    def cache_fingerprint_hash(
+        self, *, advanced_controls_files: list[str] | None
+    ) -> str:
+        return "fake-config-spec"
+
     def normalize(self, config: Config) -> None:
         config.config.setdefault("num_warps", 4)
 
@@ -293,6 +298,12 @@ class TestMultiShapeRuntime(unittest.TestCase):
     ) -> None:
         settings = _runtime_settings()
         bound = _RuntimeBoundKernel(_RuntimeBackend(), settings)
+        bound.config_spec.cache_fingerprint_hash = Mock(  # pyrefly: ignore[bad-assignment]
+            return_value="cache-policy-fingerprint"
+        )
+        bound.config_spec.structural_fingerprint_hash = Mock(  # pyrefly: ignore[bad-assignment]
+            side_effect=AssertionError("structural-only cache key used")
+        )
         workload_key = (
             "multi_shape:v1",
             "max",
@@ -314,6 +325,11 @@ class TestMultiShapeRuntime(unittest.TestCase):
 
         self.assertEqual(key.specialization_key, workload_key)
         self.assertEqual(key.extra_results, ())
+        self.assertEqual(key.config_spec_hash, "cache-policy-fingerprint")
+        bound.config_spec.cache_fingerprint_hash.assert_called_once_with(  # pyrefly: ignore[missing-attribute]
+            advanced_controls_files=None
+        )
+        bound.config_spec.structural_fingerprint_hash.assert_not_called()  # pyrefly: ignore[missing-attribute]
         bound.kernel._base_specialization_key.assert_not_called()
         bound.kernel._create_bound_kernel_cache_key.assert_not_called()
 
