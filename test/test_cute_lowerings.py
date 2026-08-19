@@ -489,6 +489,45 @@ def cute_projection_rotary_bf16(
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_pair_shifted_table_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    table: torch.Tensor,
+) -> torch.Tensor:
+    """Keep the bounds mask when pair-derived table indices can overflow."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_h, tile_k, tile_d],
+                acc=acc,
+            )
+        pair_index = hl.split(tile_d.index.view(tile_d.block_size // 2, 2))[0]
+        pair_index = pair_index // 2
+        scale = table[
+            tile_m.index[:, None],
+            d // 2 + 1 + pair_index[None, :],
+        ]
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        left, right = hl.split(pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(left * scale[None, :, :], right * scale[None, :, :])
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
 @helion.kernel(backend="cute", fast_math=True)
 def cute_projection_interleaved_swiglu_bf16(
     x: torch.Tensor,
@@ -15991,8 +16030,49 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("for tcgen05_epi_position", code)
                 self.assertIn("table.iterator", code)
                 self.assertIn("bias.iterator", code)
+                table_loads = [
+                    line for line in code.splitlines() if "table.iterator" in line
+                ]
+                self.assertTrue(table_loads)
+                self.assertTrue(all(" else " not in line for line in table_loads))
                 self.assertNotIn("split_smem", code)
                 self.assertNotIn("permute_smem", code)
+
+                prefetch_config = _make_tcgen05_persistent_config(
+                    block_sizes=[1, 128, head_dim, 32],
+                    loop_orders=[[0, 1, 2]],
+                    pid_type="persistent_interleaved",
+                    **{
+                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                        )
+                    },
+                )
+                prefetch_code = bound.to_triton_code(prefetch_config)
+                acc_wait = "tcgen05_acc_pipeline.consumer_wait"
+                self.assertGreater(code.index("table.iterator"), code.index(acc_wait))
+                self.assertLess(
+                    prefetch_code.index("table.iterator"),
+                    prefetch_code.index(acc_wait),
+                )
+                self.assertIn("tcgen05_epi_prefetch", prefetch_code)
+
+        with patch_cute_mma_support():
+            args = (
+                x,
+                torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
+                torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            )
+            config = _make_tcgen05_persistent_config(
+                block_sizes=[1, 128, 128, 32],
+                loop_orders=[[0, 1, 2]],
+                pid_type="persistent_interleaved",
+            )
+            code = cute_pair_shifted_table_bf16.bind(args).to_triton_code(config)
+            table_loads = [
+                line for line in code.splitlines() if "table.iterator" in line
+            ]
+            self.assertTrue(any(" else " in line for line in table_loads))
 
     def test_tcgen05_thread_local_heuristic_promotes_seed(self) -> None:
         dtype = torch.bfloat16
@@ -16084,6 +16164,11 @@ class TestCuteLowerings(unittest.TestCase):
                     block_sizes=[1, 128, head_dim, 32],
                     loop_orders=[[0, 1, 2]],
                     pid_type="persistent_interleaved",
+                    **{
+                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                        )
+                    },
                 )
                 bound.set_config(config)
                 torch.testing.assert_close(

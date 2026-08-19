@@ -125,6 +125,7 @@ class Tcgen05FragmentEpiloguePlan:
     value_node: Node
     boundary_nodes: frozenset[Node]
     owned_nodes: frozenset[Node]
+    unmasked_host_loads: frozenset[Node]
     source_shape: tuple[int, ...]
     destination_shape: tuple[int, ...]
     store_tile_sizes: tuple[int | torch.SymInt, ...]
@@ -135,6 +136,19 @@ class Tcgen05FragmentEpiloguePlan:
     @property
     def changes_shape(self) -> bool:
         return self.source_shape != self.destination_shape
+
+    @property
+    def has_host_loads(self) -> bool:
+        """Whether the fragment reads tensors other than the MMA carrier."""
+        for node in self.owned_nodes:
+            source = node.args[0] if node.args else None
+            if (
+                node.target is memory_ops.load
+                and isinstance(source, Node)
+                and _is_host_tensor(source)
+            ):
+                return True
+        return False
 
     @property
     def streaming_program(self) -> _SourceSubtileProgram | None:
@@ -1411,6 +1425,86 @@ def _logical_index_value(
     return result
 
 
+def _host_load_is_statically_in_bounds(
+    node: Node,
+    flat: _Index,
+    *,
+    config: Config,
+) -> bool:
+    """Prove every arithmetic tensor index stays inside its host tensor."""
+    try:
+        source = node.args[0] if node.args else None
+        indices = node.args[1] if len(node.args) > 1 else None
+        tensor = source.meta.get("val") if isinstance(source, Node) else None
+        if not isinstance(tensor, torch.Tensor) or not isinstance(
+            indices, (list, tuple)
+        ):
+            raise _UnsupportedFragment
+        output_shape = _shape(node, config)
+        env = CompileEnvironment.current()
+        for tensor_dim, index in enumerate(indices):
+            if not (
+                isinstance(index, Node)
+                and isinstance(index.meta.get("val"), torch.Tensor)
+                and _tile_index_uses_arithmetic(index)
+            ):
+                continue
+            tile_origins: dict[int, _Index] = {}
+            tile_extents: dict[int, int] = {}
+            for root in _tile_index_roots(index):
+                size_node = root.args[0] if root.args else None
+                size = (
+                    size_node.meta.get("val")
+                    if isinstance(size_node, Node)
+                    else size_node
+                )
+                block_id = (
+                    env.get_block_id(size)
+                    if isinstance(size, (int, torch.SymInt, sympy.Basic))
+                    else None
+                )
+                root_shape = _shape(root, config)
+                if block_id is None or len(root_shape) != 1:
+                    raise _UnsupportedFragment
+                tile_extent = root_shape[0]
+                canonical = env.canonical_block_id(block_id)
+                global_size = env.block_sizes[canonical].size
+                if not isinstance(global_size, (int, torch.SymInt)):
+                    raise _UnsupportedFragment
+                global_extent = env.size_hint(global_size)
+                if (
+                    global_extent <= 0
+                    or tile_extent <= 0
+                    or global_extent % tile_extent
+                ):
+                    raise _UnsupportedFragment
+                previous = tile_extents.setdefault(canonical, tile_extent)
+                if previous != tile_extent:
+                    raise _UnsupportedFragment
+                tile_count = global_extent // tile_extent
+                tile_origins[canonical] = _mul(
+                    _Index.variable(f"tile_{canonical}", tile_count - 1),
+                    tile_extent,
+                )
+            index_flat = _broadcast_flat(flat, output_shape, _shape(index, config))
+            logical = _logical_index_value(
+                index,
+                index_flat,
+                config=config,
+                tile_origins=tile_origins,
+            )
+            interval = _semantic_interval(
+                logical.semantic,
+                {symbol: (lower, upper) for symbol, lower, upper in logical.bounds},
+            )
+            tensor_extent = env.size_hint(tensor.shape[tensor_dim])
+            if interval is None or interval[0] < 0 or interval[1] >= tensor_extent:
+                return False
+    except (_UnsupportedFragment, IndexError, StopIteration, ValueError):
+        return False
+    return True
+
+
 def _store_indices_are_tile_identity(
     region: _Region,
     source_shape: Sequence[int],
@@ -1634,6 +1728,85 @@ def _collect_demands(
     return result
 
 
+def _collect_host_loads(
+    node: Node,
+    flat: _Index,
+    *,
+    region: _Region,
+    config: Config,
+    projection: int | None = None,
+    memo: dict[tuple[Node, _Index, int | None], frozenset[tuple[Node, _Index]]]
+    | None = None,
+) -> frozenset[tuple[Node, _Index]]:
+    if memo is None:
+        memo = {}
+    key = (node, flat, projection)
+    if key in memo:
+        return memo[key]
+
+    def evaluate(
+        current: Node, current_flat: _Index, current_projection: int | None
+    ) -> object:
+        if (
+            current is not node
+            or current_flat != flat
+            or current_projection != projection
+        ):
+            return _collect_host_loads(
+                current,
+                current_flat,
+                region=region,
+                config=config,
+                projection=current_projection,
+                memo=memo,
+            )
+        if current in region.boundaries or current.target is tile_index:
+            return frozenset()
+        source = current.args[0] if current.args else None
+        if (
+            current.target is memory_ops.load
+            and isinstance(source, Node)
+            and _is_host_tensor(source)
+        ):
+            return frozenset({(current, current_flat)})
+        inputs = _pointwise_inputs(current)
+        if inputs is not None:
+            loads: set[tuple[Node, _Index]] = set()
+            output_shape = _shape(current, config)
+            for input_node in inputs:
+                loads.update(
+                    _collect_host_loads(
+                        input_node,
+                        _broadcast_flat(
+                            current_flat, output_shape, _shape(input_node, config)
+                        ),
+                        region=region,
+                        config=config,
+                        memo=memo,
+                    )
+                )
+            return frozenset(loads)
+        raise _UnsupportedFragment
+
+    def choose(selector: _Index, left: object, right: object) -> object:
+        if not isinstance(left, frozenset) or not isinstance(right, frozenset):
+            raise _UnsupportedFragment
+        return left | right
+
+    result = _resolve_shape(
+        node,
+        flat,
+        config=config,
+        evaluate=evaluate,
+        choose=choose,
+        projection=projection,
+    )
+    if not isinstance(result, frozenset):
+        raise _UnsupportedFragment
+    memo[key] = result
+    return result
+
+
 def analyze_tcgen05_fragment_epilogue_plan(
     graphs: Sequence[GraphInfo],
     anchor: Node,
@@ -1724,6 +1897,21 @@ def analyze_tcgen05_fragment_epilogue_plan(
         output_flat = _flat_from_coords(
             [_Index.constant(0), row, column], destination_shape
         )
+        host_loads = _collect_host_loads(
+            region.value,
+            output_flat,
+            region=region,
+            config=config,
+        )
+        unmasked_host_loads = frozenset(
+            node
+            for node in {node for node, _ in host_loads}
+            if all(
+                _host_load_is_statically_in_bounds(node, flat, config=config)
+                for current, flat in host_loads
+                if current is node
+            )
+        )
         demands = tuple(
             sorted(
                 _collect_demands(
@@ -1809,6 +1997,7 @@ def analyze_tcgen05_fragment_epilogue_plan(
             value_node=region.value,
             boundary_nodes=region.boundaries,
             owned_nodes=region.owned,
+            unmasked_host_loads=unmasked_host_loads,
             source_shape=source_shape,
             destination_shape=destination_shape,
             store_tile_sizes=store_tile_sizes,
@@ -1863,6 +2052,14 @@ def _register_index_expression(registers: Sequence[int], position: str) -> str:
     return f"({expression})"
 
 
+@dataclasses.dataclass(frozen=True)
+class _HostPrefetch:
+    node: Node
+    flat: _Index
+    buffer: str
+    dtype: str
+
+
 class _Evaluator:
     def __init__(
         self,
@@ -1871,20 +2068,24 @@ class _Evaluator:
         *,
         carrier: str,
         destination_position: str,
+        destination_register: str,
         destination_coordinate: str,
         output_flat: _Index,
         boundary_registers: tuple[_BoundaryRegisterMap, ...],
         indent: str,
         terminals: dict[tuple[str, Node, _Index], ast.AST],
+        host_prefetches: dict[tuple[Node, _Index], _HostPrefetch] | None = None,
     ) -> None:
         self.state = state
         self.plan = plan
         self.carrier = carrier
         self.destination_position = destination_position
+        self.destination_register = destination_register
         self.output_flat = output_flat
         self.boundary_registers = boundary_registers
         self.indent = indent
         self.terminals = terminals
+        self.host_prefetches = host_prefetches
         self.memo: dict[tuple[Node, _Index, int | None], ast.AST] = {}
         self.lines: list[str] = []
         tile_shape = plan.destination_shape
@@ -1966,6 +2167,19 @@ class _Evaluator:
         assert isinstance(source, Node) and isinstance(indices, (list, tuple))
         tensor = source.meta["val"]
         assert isinstance(tensor, torch.Tensor)
+        if self.host_prefetches is not None:
+            prefetch = self.host_prefetches.get((node, flat))
+            if prefetch is None:
+                prefetch = _HostPrefetch(
+                    node=node,
+                    flat=flat,
+                    buffer=self.state.device_function.new_var("tcgen05_epi_prefetch"),
+                    dtype=CompileEnvironment.current().backend.dtype_str(tensor.dtype),
+                )
+                self.host_prefetches[(node, flat)] = prefetch
+            result = expr_from_string(f"{prefetch.buffer}[{self.destination_register}]")
+            self.terminals[key] = result
+            return result
         tensor_name = self.state.device_function.tensor_arg(tensor).name
         self.state.device_function.placeholder_args.add(tensor_name)
         output_shape = _shape(node, self.state.device_function.config)
@@ -2014,7 +2228,7 @@ class _Evaluator:
                 )
                 output_dim += 1
         load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
-        if bounds:
+        if bounds and node not in self.plan.unmasked_host_loads:
             dtype = env.backend.dtype_str(tensor.dtype)
             load_expr = f"({load_expr} if {' and '.join(bounds)} else {dtype}(0))"
         result = self._bind(
@@ -2146,7 +2360,8 @@ def _render_tcgen05_fragment_group(
     target_dtype: str,
     indent: str,
     output_name: str | None = None,
-) -> tuple[str, str]:
+    prefetch_host_loads: bool = False,
+) -> tuple[str, str, str]:
     output_shape = plan.destination_shape
     row = _Index.variable("row", output_shape[-2] - 1)
     column = _Index.variable("column", output_shape[-1] - 1)
@@ -2157,29 +2372,69 @@ def _render_tcgen05_fragment_group(
     destination_index = df.new_var("tcgen05_epi_register")
     destination_coordinate = df.new_var("tcgen05_epi_coord")
     body_indent = indent + "    "
+    destination_register = _register_index_expression(
+        program.destination_registers, destination_position
+    )
+    host_prefetches: dict[tuple[Node, _Index], _HostPrefetch] | None = (
+        {} if prefetch_host_loads else None
+    )
     terminals: dict[tuple[str, Node, _Index], ast.AST] = {}
     evaluator = _Evaluator(
         state,
         plan,
         carrier=carrier_name,
         destination_position=destination_position,
+        destination_register=destination_index,
         destination_coordinate=destination_coordinate,
         output_flat=output_flat,
         boundary_registers=program.boundary_registers,
         indent=body_indent,
         terminals=terminals,
+        host_prefetches=host_prefetches,
     )
     value = evaluator.evaluate(plan.value_node, output_flat)
-    destination_register = _register_index_expression(
-        program.destination_registers, destination_position
-    )
+    early_prelude = ""
+    if host_prefetches:
+        prefetch_evaluator = _Evaluator(
+            state,
+            plan,
+            carrier=carrier_name,
+            destination_position=destination_position,
+            destination_register=destination_index,
+            destination_coordinate=destination_coordinate,
+            output_flat=output_flat,
+            boundary_registers=program.boundary_registers,
+            indent=body_indent,
+            terminals={},
+        )
+        prefetch_body: list[str] = []
+        for prefetch in host_prefetches.values():
+            previous_line_count = len(prefetch_evaluator.lines)
+            loaded = prefetch_evaluator.evaluate(prefetch.node, prefetch.flat)
+            prefetch_body.extend(prefetch_evaluator.lines[previous_line_count:])
+            prefetch_body.append(
+                f"{body_indent}{prefetch.buffer}[{destination_index}] = "
+                f"{prefetch.dtype}({ast.unparse(loaded)})\n"
+            )
+        early_prelude = (
+            "".join(
+                f"{indent}{prefetch.buffer} = cute.make_rmem_tensor("
+                f"cute.make_layout({carrier_name}.shape), {prefetch.dtype})\n"
+                for prefetch in host_prefetches.values()
+            )
+            + f"{indent}for {destination_position} in "
+            f"range({len(program.destination_registers)}):\n"
+            f"{body_indent}{destination_index} = {destination_register}\n"
+            f"{body_indent}{destination_coordinate} = "
+            f"{coordinate_name}[{destination_index}]\n" + "".join(prefetch_body)
+        )
     output_setup = (
         f"{indent}{output} = cute.make_rmem_tensor("
         f"cute.make_layout({carrier_name}.shape), {target_dtype})\n"
         if output_name is None
         else ""
     )
-    prelude = (
+    late_prelude = (
         f"{indent}assert cute.size({carrier_name}.shape) == "
         f"{plan.source_register_count}, "
         '"tcgen05 source fragment must be complete"\n'
@@ -2194,7 +2449,7 @@ def _render_tcgen05_fragment_group(
         f"{body_indent}{output}[{destination_index}] = "
         f"{target_dtype}({ast.unparse(value)})\n"
     )
-    return prelude, output
+    return early_prelude, late_prelude, output
 
 
 def render_tcgen05_fragment_epilogue(
@@ -2205,12 +2460,13 @@ def render_tcgen05_fragment_epilogue(
     coordinate_name: str,
     target_dtype: str,
     indent: str,
-) -> tuple[str, str]:
+    prefetch_host_loads: bool = False,
+) -> tuple[str, str, str]:
     """Render a uniform same-shape thread-local register program."""
     program = plan.streaming_program
     if program is None:
         raise RuntimeError("shape-changing fragment requires the scheduled renderer")
-    prelude, output = _render_tcgen05_fragment_group(
+    early_prelude, late_prelude, output = _render_tcgen05_fragment_group(
         state,
         plan,
         program,
@@ -2218,8 +2474,9 @@ def render_tcgen05_fragment_epilogue(
         coordinate_name=coordinate_name,
         target_dtype=target_dtype,
         indent=indent,
+        prefetch_host_loads=prefetch_host_loads,
     )
-    return prelude, f"{output}.load()"
+    return early_prelude, late_prelude, f"{output}.load()"
 
 
 def render_tcgen05_fragment_epilogue_group(
@@ -2234,7 +2491,7 @@ def render_tcgen05_fragment_epilogue_group(
     indent: str,
 ) -> str:
     """Fill one destination fragment from its resident source subtile."""
-    prelude, _ = _render_tcgen05_fragment_group(
+    early_prelude, late_prelude, _ = _render_tcgen05_fragment_group(
         state,
         plan,
         program,
@@ -2244,4 +2501,5 @@ def render_tcgen05_fragment_epilogue_group(
         indent=indent,
         output_name=destination_name,
     )
-    return prelude
+    assert not early_prelude
+    return late_prelude

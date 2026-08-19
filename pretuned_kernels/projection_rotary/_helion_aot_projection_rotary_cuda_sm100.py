@@ -16,7 +16,7 @@ _CONFIG = {
     "tcgen05_c_stages": 2,
     "tcgen05_num_epi_warps": 4,
     "tcgen05_l2_swizzle_size": 1,
-    "tcgen05_aux_load_placement": "post_acc_wait",
+    "tcgen05_aux_load_placement": "pre_acc_wait",
     "tcgen05_strategy": "role_local_monolithic",
     "tcgen05_layout_strategy": "default",
     "tcgen05_warp_spec_mma_warps": 1,
