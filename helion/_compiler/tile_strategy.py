@@ -3327,13 +3327,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             state.add_statement(f"{index_var} = {idx_expr}")
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
-                state,
-                block_idx,
-                block_size,
-                index_var,
-                end,
-                thread_axis=axis if uses_thread_axis else None,
-                block_size_var=bs if uses_thread_axis else None,
+                state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 state.add_statement(mask_statement)
@@ -3488,13 +3482,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             ]
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
-                state,
-                block_idx,
-                block_size,
-                index_var,
-                end,
-                thread_axis=axis if uses_thread_axis else None,
-                block_size_var=bs if uses_thread_axis else None,
+                state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 extra_body.append(mask_statement)
@@ -3541,11 +3529,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
         block_size: SymIntLike,
         index_var: str,
         end: object,
-        *,
-        thread_axis: int | None = None,
-        block_size_var: str | None = None,
     ) -> ast.stmt | None:
-        """Build the bounds mask for one tile axis."""
         env = CompileEnvironment.current()
         if (
             not env.backend.force_tile_mask()
@@ -3590,19 +3574,8 @@ class NDTileStrategy(_BaseNDTileStrategy):
                 parent=self._to_ast(jagged_tile_parent),
             )
 
-        mask_terms = [f"({index_var}) < {{end}}"]
-        if (
-            thread_axis is not None
-            and block_size_var is not None
-            and env.backend.launches_surplus_tile_threads()
-        ):
-            thread_mask = env.backend.thread_in_tile_mask_expr(
-                block_size_var, axis=thread_axis
-            )
-            if thread_mask is not None:
-                mask_terms.insert(0, f"({thread_mask})")
         return statement_from_string(
-            f"{mask_var} = {' and '.join(mask_terms)}", end=self._to_ast(end)
+            f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )
 
     def select_pid_strategy(self) -> ProgramIDs:
@@ -3931,7 +3904,6 @@ class CuteNDTileStrategy(NDTileStrategy):
                 block_idx, block_size
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
-            static_extent: int | None = None
             if uses_thread_axis:
                 idx_expr = env.backend.lane_index_expr(
                     offset_var, elements_per_thread, axis=axis
@@ -3958,19 +3930,8 @@ class CuteNDTileStrategy(NDTileStrategy):
                 target = outer_setup_statements
             target.append(statement_from_string(f"{index_var} = {idx_expr}"))
 
-            # Bound by the *thread* extent rather than the block size: this
-            # axis advances ``elements_per_thread`` per thread, so the threads
-            # belonging to the tile number block_size / that stride.
             mask_statement = self._setup_mask(
-                state,
-                block_idx,
-                block_size,
-                index_var,
-                end,
-                thread_axis=axis if isinstance(static_extent, int) else None,
-                block_size_var=(
-                    str(static_extent) if isinstance(static_extent, int) else None
-                ),
+                state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 target.append(mask_statement)
@@ -4146,7 +4107,6 @@ class CuteNDTileStrategy(NDTileStrategy):
                 block_idx, block_size
             )
             axis = thread_axis_offset + thread_axis_map[block_idx]
-            static_extent: int | None = None
             if uses_thread_axis:
                 idx_expr = env.backend.lane_index_expr(
                     offset_var, elements_per_thread, axis=axis
@@ -4200,18 +4160,8 @@ class CuteNDTileStrategy(NDTileStrategy):
                 else:
                     idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
-            # Same thread-extent bound as the grid lane path: a device loop is
-            # equally able to be launched wider than the tile it indexes.
             mask_statement = self._setup_mask(
-                state,
-                block_idx,
-                block_size,
-                index_var,
-                end,
-                thread_axis=axis if isinstance(static_extent, int) else None,
-                block_size_var=(
-                    str(static_extent) if isinstance(static_extent, int) else None
-                ),
+                state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 index_setup.append(mask_statement)

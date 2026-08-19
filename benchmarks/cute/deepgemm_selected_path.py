@@ -27,15 +27,16 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 
 import helion
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+)
 import helion.language as hl
 import helion.runtime as helion_runtime
 
 DEEPGEMM_SELECTED_TILE_M = 256
 DEEPGEMM_SELECTED_TILE_N = 128
 DEEPGEMM_SELECTED_TILE_K = 64
-# Pin the historical DeepGEMM-selected BK64 schedule.  This benchmark must not
-# silently change when compiler defaults evolve.
-M_ALIGNMENT = 224
+M_ALIGNMENT = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
 DEEPGEMM_COMMIT = "559d79fb6994a58b8a15b4b93bf13ccc16edf247"
 DEEPGEMM_CUTLASS_COMMIT = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
 DEFAULT_L2_FLUSH_BYTES = 8_000_000_000
@@ -202,7 +203,6 @@ def selected_config() -> helion.Config:
         tcgen05_c_stages=2,
         tcgen05_num_epi_warps=4,
         tcgen05_grouped_mode="worklist_nm",
-        tcgen05_grouped_worklist_source_m_tile=M_ALIGNMENT,
     )
 
 

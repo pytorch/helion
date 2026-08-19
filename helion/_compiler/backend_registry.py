@@ -6,12 +6,10 @@ All backend lookup and instantiation should go through this module.
 from __future__ import annotations
 
 import importlib
-import sys
-import threading
-import types
 from typing import TYPE_CHECKING
 
 from .backend import CuteBackend
+from .backend import FlyDSLBackend
 from .backend import MetalBackend
 from .backend import PallasBackend
 from .backend import TileIRBackend
@@ -26,11 +24,10 @@ _BUILTIN_BACKENDS: list[type[Backend]] = [
     CuteBackend,
     TileIRBackend,
     MetalBackend,
+    FlyDSLBackend,
 ]
 
 _REGISTRY: dict[str, type[Backend]] = {}
-_CODEGEN_REPAIR_LOCK = threading.RLock()
-_REPAIRED_CODEGEN_NAMES: frozenset[str] = frozenset()
 
 
 def register_compiler_backend(backend_class: type[Backend]) -> None:
@@ -42,13 +39,7 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
     Args:
         backend_class: A :class:`Backend` subclass.
     """
-    global _REPAIRED_CODEGEN_NAMES
-
-    backend = backend_class()
-    with _CODEGEN_REPAIR_LOCK:
-        _REGISTRY[backend.name] = backend_class
-        codegen_names, _ = _codegen_repair_scope(backend.codegen_name)
-        _REPAIRED_CODEGEN_NAMES = _REPAIRED_CODEGEN_NAMES.difference(codegen_names)
+    _REGISTRY[backend_class().name] = backend_class
 
 
 def get_backend_class(name: str) -> type[Backend]:
@@ -111,114 +102,6 @@ def import_backend_codegen() -> None:
             # broken import inside it.
             if e.name != module:
                 raise
-
-
-def _codegen_repair_scope(
-    codegen_name: str,
-) -> tuple[frozenset[str], frozenset[str]]:
-    entries = [
-        (
-            backend_class().codegen_name,
-            backend_class.__module__.rsplit(".", 1)[0],
-        )
-        for backend_class in _REGISTRY.values()
-    ]
-    codegen_names = {codegen_name}
-    packages: set[str] = set()
-    while True:
-        next_packages = packages.union(
-            package for name, package in entries if name in codegen_names
-        )
-        next_codegen_names = codegen_names.union(
-            name for name, package in entries if package in next_packages
-        )
-        if next_packages == packages and next_codegen_names == codegen_names:
-            return frozenset(codegen_names), frozenset(packages)
-        packages = next_packages
-        codegen_names = next_codegen_names
-
-
-def _reload_backend_codegen(codegen_name: str) -> None:
-    if not _REGISTRY:
-        for _cls in _BUILTIN_BACKENDS:
-            register_compiler_backend(_cls)
-
-    _, packages = _codegen_repair_scope(codegen_name)
-    preexisting_modules = frozenset(sys.modules)
-    seen_packages: set[str] = set()
-    for backend_cls in _REGISTRY.values():
-        package = backend_cls.__module__.rsplit(".", 1)[0]
-        if package not in packages or package in seen_packages:
-            continue
-        seen_packages.add(package)
-        module_name = f"{package}._codegen_modules"
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError as e:
-            if e.name != module_name:
-                raise
-            continue
-
-        # Reload the registry module first so all of its leaf modules are bound,
-        # then rerun each leaf module's registration decorators.
-        if module_name in preexisting_modules:
-            importlib.reload(module)
-        reloaded_modules: set[str] = set()
-        for value in list(vars(module).values()):
-            if (
-                isinstance(value, types.ModuleType)
-                and value.__name__.startswith(package + ".")
-                and value.__name__ in preexisting_modules
-                and value.__name__ not in reloaded_modules
-            ):
-                reloaded_modules.add(value.__name__)
-                importlib.reload(value)
-
-
-def repair_backend_codegen(codegen_name: str) -> None:
-    """Force-complete backend codegen registrations skipped due to partial import.
-
-    :func:`import_backend_codegen` relies on ``importlib.import_module`` to run
-    each backend's ``@_decorators.codegen`` / ``register_codegen`` handlers. When
-    a codegen module is already present in ``sys.modules`` in a partially
-    initialized state -- a circular import during package init cached it before
-    its module-scope registrations ran -- ``import_module`` returns the
-    incomplete module and the registrations are silently skipped, leaving
-    ``APIFunc._codegen`` empty for that backend. That surfaces later as
-    :class:`~helion.exc.BackendImplementationMissing` at codegen time (notably
-    under ``torch.compile`` in a packaged runtime, where the init import order
-    differs).
-
-    This reloads the requested backend's codegen leaf modules so their
-    registrations run. Repairs are serialized across compilation threads and a
-    backend is marked repaired only after a successful reload, allowing a failed
-    attempt to be retried. Every backend dispatch crosses this barrier before
-    reading a handler, so no compiler thread can use a handler while its module
-    is being reloaded.
-    """
-    global _REPAIRED_CODEGEN_NAMES
-
-    if codegen_name in _REPAIRED_CODEGEN_NAMES:
-        return
-    with _CODEGEN_REPAIR_LOCK:
-        from ..language._decorators import _begin_codegen_repair
-        from ..language._decorators import _codegen_repair_in_progress
-        from ..language._decorators import _end_codegen_repair
-
-        if codegen_name in _REPAIRED_CODEGEN_NAMES:
-            return
-        if _codegen_repair_in_progress():
-            return
-        if not _REGISTRY:
-            for _cls in _BUILTIN_BACKENDS:
-                register_compiler_backend(_cls)
-        codegen_names, _ = _codegen_repair_scope(codegen_name)
-        _begin_codegen_repair(codegen_names)
-        try:
-            _reload_backend_codegen(codegen_name)
-            _REPAIRED_CODEGEN_NAMES = _REPAIRED_CODEGEN_NAMES.union(codegen_names)
-        finally:
-            _end_codegen_repair()
 
 
 # register built-in backends

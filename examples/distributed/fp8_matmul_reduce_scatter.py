@@ -25,7 +25,7 @@ from helion._testing import DEVICE
 from helion._testing import assert_close_with_mismatch_tolerance
 from helion._testing import run_example
 import helion.language as hl
-from helion.runtime.triton.dist_utils import symm_mem_sync
+from helion.runtime.dist_utils import symm_mem_sync
 
 tolerance = {
     "atol": 5e-1,

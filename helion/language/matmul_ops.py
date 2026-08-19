@@ -322,12 +322,6 @@ class CuteTcgen05SearchPlan:
     static_k: int
     leading_work_multiplier: int
     is_fp8: bool
-    is_small_n: bool
-    # Small N is necessarily a partial tcgen05 N tile, so it needs explicit
-    # edge-path capabilities. Regular N uses the existing full-tile
-    # divisibility and validated edge-family gates instead.
-    small_n_supports_role_local_tma: bool
-    small_n_requires_role_local_tma: bool
     mma_k: int
     max_tcgen05_m: int
     max_tcgen05_n: int
@@ -335,7 +329,6 @@ class CuteTcgen05SearchPlan:
     max_search_n: int
     max_search_k: int
     min_search_m: int
-    min_search_n: int
 
 
 def plan_cute_tcgen05_search(
@@ -343,8 +336,6 @@ def plan_cute_tcgen05_search(
     rhs: torch.Tensor,
     *,
     has_leading_passthrough: bool,
-    supports_small_n_role_local_tma: bool = False,
-    supports_small_n_scalar_fallback: bool = False,
 ) -> CuteTcgen05SearchPlan | None:
     """Return search limits without mutating the shared ``ConfigSpec``."""
     m, n, k = _dot_dimensions(lhs, rhs)
@@ -354,8 +345,6 @@ def plan_cute_tcgen05_search(
     static_k = _static_problem_extent(env, k)
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     mma_k = 32 if is_fp8 else 16
-    min_tcgen05_n = 16 if is_fp8 else 8
-    is_small_n = static_n is not None and static_n < min_tcgen05_n
     if (
         env.backend_name != "cute"
         or lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
@@ -364,21 +353,10 @@ def plan_cute_tcgen05_search(
         or static_n is None
         or static_k is None
         or static_m < 64
-        # Size-one tile axes are fixed to block size one before this analysis,
-        # so they cannot carry the minimum tcgen05 instruction tile.
-        or static_n < 2
-        or (
-            is_small_n
-            and not (
-                supports_small_n_role_local_tma or supports_small_n_scalar_fallback
-            )
-        )
+        or static_n < 8
         or static_k < mma_k
     ):
         return None
-    small_n_requires_role_local_tma = (
-        is_small_n and not supports_small_n_scalar_fallback
-    )
 
     from .._compiler.cute.mma_support import get_cute_mma_support
 
@@ -389,16 +367,12 @@ def plan_cute_tcgen05_search(
     def pow2_floor_at_least(value: int, minimum: int) -> int:
         return 1 << (max(minimum, value).bit_length() - 1)
 
-    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, min_tcgen05_n))
+    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
     max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
     max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
     max_search_n = max_tcgen05_n
     max_search_k = min(128, pow2_floor_at_least(static_k, mma_k))
     min_search_m = 128 if max_tcgen05_m >= 256 else 64
-    if is_small_n and supports_small_n_scalar_fallback and not is_fp8:
-        min_search_n = 1 << (static_n - 1).bit_length()
-    else:
-        min_search_n = min_tcgen05_n
     leading_work_multiplier = 1
     if has_leading_passthrough:
         leading_operand = lhs if lhs.ndim == 3 else rhs
@@ -410,18 +384,10 @@ def plan_cute_tcgen05_search(
         max_search_m = min(max_search_m, static_m & -static_m)
         max_search_n = min(max_search_n, static_n & -static_n)
         max_search_k = min(max_search_k, static_k & -static_k)
-        if (
-            max_search_m < min_search_m
-            or max_search_n < min_search_n
-            or max_search_k < mma_k
-        ):
+        if max_search_m < min_search_m or max_search_n < 8 or max_search_k < mma_k:
             return None
     if static_m % max_search_m != 0 and static_n % max_search_n != 0:
         max_search_m = min(max_search_m, 128)
-    if small_n_requires_role_local_tma and (
-        static_m % max_search_m != 0 or static_k % max_search_k != 0
-    ):
-        return None
     return CuteTcgen05SearchPlan(
         m=m,
         n=n,
@@ -431,9 +397,6 @@ def plan_cute_tcgen05_search(
         static_k=static_k,
         leading_work_multiplier=leading_work_multiplier,
         is_fp8=is_fp8,
-        is_small_n=is_small_n,
-        small_n_supports_role_local_tma=supports_small_n_role_local_tma,
-        small_n_requires_role_local_tma=small_n_requires_role_local_tma,
         mma_k=mma_k,
         max_tcgen05_m=max_tcgen05_m,
         max_tcgen05_n=max_tcgen05_n,
@@ -441,7 +404,6 @@ def plan_cute_tcgen05_search(
         max_search_n=max_search_n,
         max_search_k=max_search_k,
         min_search_m=min_search_m,
-        min_search_n=min_search_n,
     )
 
 
@@ -477,13 +439,6 @@ def enable_cute_tcgen05_search(
     allow_full_tile_persistent_pid_types = (
         static_m % max_search_m == 0
         and static_n % max_search_n == 0
-        and static_k % max_search_k == 0
-    )
-    allow_small_n_persistent_pid_types = (
-        plan.is_small_n
-        and plan.small_n_supports_role_local_tma
-        and 0 < static_n < max_search_n
-        and static_m % max_search_m == 0
         and static_k % max_search_k == 0
     )
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
@@ -537,26 +492,14 @@ def enable_cute_tcgen05_search(
                 allow_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
     spec.narrow_tcgen05_autotune_to_validated_configs(
-        allow_persistent_pid_types=(
-            allow_full_tile_persistent_pid_types or allow_small_n_persistent_pid_types
-        ),
+        allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
         allow_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
         allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
         allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
         ab_stages_three_dtype_bytes=lhs.dtype.itemsize,
         ab_stages_three_device=lhs.device,
-        reason="matmul kernel with CuTe tcgen05 backend",
     )
-    if plan.small_n_requires_role_local_tma:
-        spec.disallow_pid_type(
-            "flat",
-            reason="small-N MMA operands require role-local TMA loads",
-        )
-        spec.disallow_pid_type(
-            "xyz",
-            reason="small-N MMA operands require role-local TMA loads",
-        )
     for axis_name, shape, max_size in (
         ("m", plan.m, max_search_m),
         ("n", plan.n, max_search_n),
@@ -570,7 +513,7 @@ def enable_cute_tcgen05_search(
         elif axis_name == "m":
             min_size = plan.min_search_m
         else:
-            min_size = plan.min_search_n
+            min_size = 8
         env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
         env.block_sizes[block_idx].update_max_block(max_size)
 

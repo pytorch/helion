@@ -405,9 +405,8 @@ class AutotuneLogSink:
         """
         if self._csv_writer is None:
             return None
-        from .search_space_logger import canonical_config_id
-
-        config_id = canonical_config_id(config)
+        canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
+        config_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
         if self._collect_dataset:
             self._configs[config_id] = config.config
         return config_id

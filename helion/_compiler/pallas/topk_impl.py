@@ -52,12 +52,8 @@ def num_bins_for(k: int, vocab: int, recall_target: float = 0.99) -> int:
     rounded up to a lane multiple and capped at the padded vocab. Default recall
     is 0.99 -- callers that feed the top-k into an exact threshold (e.g. a top-p
     nucleus) need high recall; raising it costs more bins (i.e. more work)."""
-    if not 0.0 < recall_target <= 1.0:
-        raise ValueError(f"top-k recall_target must be in (0, 1], got {recall_target}")
     if k <= 1:
         nb = 1
-    elif recall_target == 1.0:
-        nb = vocab
     else:
         nb = math.ceil((k - 1) / (1.0 - recall_target))
     nb = ((nb + _NUM_LANES - 1) // _NUM_LANES) * _NUM_LANES

@@ -87,10 +87,6 @@ class TypeInfo:
             return SymIntType(origin, value)
         if isinstance(value, torch.SymFloat):
             return SymFloatType(origin, value)
-        from ..language.distributed_ops import AsyncCopyDescriptor
-
-        if isinstance(value, AsyncCopyDescriptor):
-            return AsyncCopyDescriptorType(origin=origin, element_types={})
         if type(value) in (int, float, bool, type(None), range):
             return LiteralType(origin, value)
         if type(value) in (str, torch.dtype, torch.device):
@@ -306,11 +302,16 @@ class TensorType(TypeInfo):
             )
 
     def __str__(self) -> str:
-        env = CompileEnvironment.current()
         shape: list[str] = []
         for s in self.fake_value.size():
             if isinstance(s, torch.SymInt):
-                shape.append(env.sympy_debug(s._sympy_()))
+                shape.append(
+                    str(
+                        s._sympy_().xreplace(
+                            CompileEnvironment.current().debug_shape_renames
+                        )
+                    )
+                )
             else:
                 shape.append(str(s))
         dtype = self.fake_value.dtype
@@ -913,15 +914,7 @@ class NumericType(TypeInfo):
         raise NotImplementedError
 
     def __str__(self) -> str:
-        env = CompileEnvironment.current()
-        # Preserve the existing debug/golden rendering except while semantic
-        # fingerprinting supplies canonical symbolic-shape names.
-        value = (
-            env.sympy_debug(self.value._sympy_())
-            if env.has_debug_shape_rename_override
-            else self.value
-        )
-        return f"{type(self).__name__}({value})"
+        return f"{type(self).__name__}({self.value})"
 
     def proxy(self) -> torch.SymInt | torch.SymBool | torch.SymFloat | int:
         return self.value
@@ -1583,68 +1576,6 @@ class StackTensorType(ClassType):
             .proxy()
             .new_empty(self._device_indexing_size(key)),
         )
-
-
-class AsyncCopyDescriptorType(ClassType):
-    """Type of a Helion asynchronous remote-copy handle."""
-
-    # pyrefly: ignore [bad-override]
-    def proxy(self) -> object:
-        from ..language.distributed_ops import AsyncCopyDescriptor
-
-        return AsyncCopyDescriptor()
-
-    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        if attr in ("start", "wait", "wait_send", "wait_recv"):
-            return _AsyncCopyDescriptorMethodType(origin, self, attr)
-        return super().propagate_attribute(attr, origin)
-
-
-class _AsyncCopyDescriptorMethodType(TypeInfo):
-    descriptor_type: AsyncCopyDescriptorType
-    method_name: str
-
-    def __init__(
-        self,
-        origin: Origin,
-        descriptor_type: AsyncCopyDescriptorType,
-        method_name: str,
-    ) -> None:
-        super().__init__(origin)
-        self.descriptor_type = descriptor_type
-        self.method_name = method_name
-
-    def propagate_call(
-        self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
-    ) -> TypeInfo:
-        if args or kwargs:
-            raise exc.TypeInferenceError(
-                f"AsyncCopyDescriptor.{self.method_name}() takes no arguments"
-            )
-        from ..language.distributed_ops import start_async_remote_copy_descriptor
-        from ..language.distributed_ops import wait_async_remote_copy
-        from ..language.distributed_ops import wait_recv_async_remote_copy
-        from ..language.distributed_ops import wait_send_async_remote_copy
-
-        descriptor_ops = {
-            "start": start_async_remote_copy_descriptor,
-            "wait": wait_async_remote_copy,
-            "wait_send": wait_send_async_remote_copy,
-            "wait_recv": wait_recv_async_remote_copy,
-        }
-        result = CallableType(origin, descriptor_ops[self.method_name]).propagate_call(
-            (self.descriptor_type,), {}, origin
-        )
-        assert result is not None
-        return result
-
-    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
-        if (
-            isinstance(other, _AsyncCopyDescriptorMethodType)
-            and self.method_name == other.method_name
-        ):
-            return self
-        return super().merge(other, var_name=var_name)
 
 
 class SliceType(CollectionType):

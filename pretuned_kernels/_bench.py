@@ -15,31 +15,15 @@ and via run.py's importlib loader.
 
 from __future__ import annotations
 
-import abc
 import math
-import statistics
-import time
 from typing import TYPE_CHECKING
-from typing import TypeVar
-from typing import cast
 
 import torch
-
-from helion import exc
-from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
-from helion.autotuner.logger import classify_triton_exception
-from helion.autotuner.logger import match_unrecoverable_runtime_error
+import triton.testing as tt
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
-    from collections.abc import Sequence
-
-    import helion
-    from helion.runtime.kernel import CompiledConfig
-
-
-ShapeT = TypeVar("ShapeT")
 
 
 def geomean(values: Iterable[float]) -> float:
@@ -57,149 +41,9 @@ def bench_cudagraph(call: Callable[[], object], rep: int = 100) -> float:
     numbers are always measured with cache clearing -- install it before running
     a cudagraph kernel's ``main()`` (the nightly benchmark workflow does).
     """
-    from tritonbench.components.do_bench.run import (  # pyrefly: ignore[missing-import]
-        _do_bench_cudagraph_with_cache_clear,
-    )
+    from tritonbench.components.do_bench.run import _do_bench_cudagraph_with_cache_clear
 
     return _do_bench_cudagraph_with_cache_clear(call, rep=rep, return_mode="median")
-
-
-def bench_pre_captured_cudagraphs(
-    calls: Sequence[Callable[[], object]], rep: int = 100
-) -> list[float]:
-    """Median graph device latencies (ms), with cold L2 and balanced ordering.
-
-    Some external references must be captured before benchmarking so their
-    graph nodes, including captured copies, are represented faithfully. CUDA
-    does not allow a graph replay inside the outer capture used by
-    ``bench_cudagraph``. Queue an L2 clear before every event pair, matching
-    ``triton.testing.do_bench``.
-
-    Do not synchronize between the clear and the start event. On an idle GPU,
-    doing so lets the start event execute while Python is still submitting the
-    graph, which incorrectly includes host-side graph wrapper work as idle time
-    in the CUDA-event interval. The clear keeps the GPU busy while the next
-    replay is submitted, so the events measure device execution consistently.
-    Calls rotate through every position, then reverse the rotations, so no
-    implementation always sees the hottest GPU clocks.
-    """
-    import triton
-
-    if not calls:
-        raise ValueError("calls must not be empty")
-    if rep <= 0:
-        raise ValueError("rep must be positive")
-
-    driver = triton.runtime.driver.active
-    device_interface = driver.get_device_interface()  # pyrefly: ignore[missing-attribute]
-    cache = driver.get_empty_cache_for_benchmark()  # pyrefly: ignore[missing-attribute]
-    cycle = 2 * len(calls)
-    repetitions = rep
-
-    def call_order(sample: int) -> tuple[int, ...]:
-        indices = tuple(range(len(calls)))
-        rotation = sample % len(indices)
-        order = indices[rotation:] + indices[:rotation]
-        return order[::-1] if (sample // len(indices)) % 2 else order
-
-    for sample in range(cycle):
-        for index in call_order(sample):
-            calls[index]()
-    device_interface.synchronize()
-
-    starts = [
-        [device_interface.Event(enable_timing=True) for _ in range(repetitions)]
-        for _ in calls
-    ]
-    ends = [
-        [device_interface.Event(enable_timing=True) for _ in range(repetitions)]
-        for _ in calls
-    ]
-    for sample in range(repetitions):
-        for index in call_order(sample):
-            driver.clear_cache(cache)  # pyrefly: ignore[missing-attribute]
-            starts[index][sample].record()
-            calls[index]()
-            ends[index][sample].record()
-    device_interface.synchronize()
-    return [
-        statistics.median(
-            start.elapsed_time(end)
-            for start, end in zip(call_starts, call_ends, strict=True)
-        )
-        for call_starts, call_ends in zip(starts, ends, strict=True)
-    ]
-
-
-def bench_pre_captured_cudagraph(call: Callable[[], object], rep: int = 100) -> float:
-    """Median latency for one graph; see the balanced multi-graph timer."""
-    return bench_pre_captured_cudagraphs([call], rep=rep)[0]
-
-
-def thermal_warmup(duration_ms: int) -> None:
-    """Raise GPU clocks with device work before a latency sweep."""
-    if duration_ms <= 0:
-        return
-    value = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-    end = time.monotonic() + duration_ms / 1000
-    while time.monotonic() < end:
-        for _ in range(50):
-            value = value @ value
-        torch.cuda.synchronize()
-
-
-class CapturedCudagraphBenchmarkProvider(LocalBenchmarkProvider, abc.ABC):
-    """Shared error handling and cold-L2 timing for captured-graph tuning."""
-
-    def __init__(self, *args: object, repetitions: int, **kwargs: object) -> None:
-        self._repetitions = repetitions
-        super().__init__(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
-
-    @abc.abstractmethod
-    def _capture_validated_replay(
-        self, config: helion.Config, fn: CompiledConfig
-    ) -> Callable[[], object] | None: ...
-
-    def _benchmark_function(
-        self,
-        config: helion.Config,
-        fn: CompiledConfig,
-        *,
-        effective_source_hash: str | None = None,
-    ) -> float:
-        self._autotune_metrics.num_configs_tested += 1
-        try:
-            replay = self._capture_validated_replay(config, fn)
-            if replay is None:
-                return float("inf")
-            return bench_pre_captured_cudagraph(replay, rep=self._repetitions)
-        except Exception as error:
-            error.__traceback__ = None
-            if match_unrecoverable_runtime_error(error):
-                self.kernel.maybe_log_repro(self.log.error, self.args, config)
-                raise exc.TritonUnrecoverableRuntimeError(
-                    reason=str(error),
-                    decorator=self.kernel.format_kernel_decorator(
-                        config, self.settings
-                    ),
-                    error=f"{type(error).__qualname__}: {error}",
-                ) from error
-            backend = getattr(self.config_spec, "backend", None)
-            action = (
-                backend.classify_autotune_exception(error)
-                if backend is not None
-                else None
-            ) or classify_triton_exception(error)
-            if action == "raise" and not self.settings.autotune_ignore_errors:
-                raise
-            self.log.debug(
-                f"Skipping captured-graph candidate after "
-                f"{type(error).__name__}: {error}"
-            )
-            self._record_compile_failure(config)
-            return float("inf")
-        finally:
-            self._clear_jit_fast_path_caches(fn)
 
 
 def _bench(
@@ -207,31 +51,17 @@ def _bench(
 ) -> float:
     if use_cudagraph:
         return bench_cudagraph(call, rep=rep)
-    from triton.testing import do_bench
-
-    return cast(
-        "float",
-        do_bench(call, warmup=warmup, rep=rep, return_mode="median"),
-    )
+    return tt.do_bench(call, warmup=warmup, rep=rep, return_mode="median")
 
 
 def run_sweep(
-    shapes: Iterable[ShapeT],
-    make_calls: Callable[
-        [ShapeT],
-        tuple[
-            Callable[[], object],
-            list[tuple[str, Callable[[], object]]],
-            str,
-        ],
-    ],
+    shapes: Iterable[object],
+    make_calls: Callable[[object], tuple],
     *,
     use_cudagraph: bool,
-    pre_captured_cudagraph: bool = False,
     shape_header: str,
     warmup: int = 25,
     rep: int = 100,
-    thermal_warmup_ms: int = 0,
     verbose: bool = True,
 ) -> dict:
     """Benchmark helion vs baselines over ``shapes``; return metrics (print if verbose).
@@ -242,17 +72,12 @@ def run_sweep(
     The metrics dict is always returned; the per-shape table is printed only when
     ``verbose``.
     """
-    if use_cudagraph and pre_captured_cudagraph:
-        raise ValueError(
-            "use_cudagraph and pre_captured_cudagraph are mutually exclusive"
-        )
 
     def _p(*args: object) -> None:
         if verbose:
             print(*args)
 
-    if verbose:
-        _p(f"GPU: {torch.cuda.get_device_name()}")
+    _p(f"GPU: {torch.cuda.get_device_name()}")
     speedups_by_base: dict[str, list[float]] = {}
     best_speedups: list[float] = []
     helion_wins = 0
@@ -268,25 +93,15 @@ def run_sweep(
             _p(f"{shape_header}  {'helion (us)':>12s}  {base_hdr}  {'speedup':>8s}")
             header_printed = True
 
-        if pre_captured_cudagraph:
-            thermal_warmup(thermal_warmup_ms)
-            timings = bench_pre_captured_cudagraphs(
-                [helion_call, *(call for _name, call in baseline_calls)], rep=rep
-            )
-            ms_helion, *baseline_timings = timings
-            base_ms = dict(zip(names, baseline_timings, strict=True))
-        else:
-            helion_call()  # warmup / compile
-            ms_helion = _bench(helion_call, use_cudagraph, warmup, rep)
-            base_ms = {
-                name: _bench(call, use_cudagraph, warmup, rep)
-                for name, call in baseline_calls
-            }
-        for name in names:
+        helion_call()  # warmup / compile
+        ms_helion = _bench(helion_call, use_cudagraph, warmup, rep)
+        base_ms: dict[str, float] = {}
+        for name, call in baseline_calls:
+            base_ms[name] = _bench(call, use_cudagraph, warmup, rep)
             speedups_by_base[name].append(
                 base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
             )
-        best_name = min(base_ms, key=lambda name: base_ms[name])
+        best_name = min(base_ms, key=base_ms.get)
         speedup = base_ms[best_name] / ms_helion if ms_helion > 0 else float("nan")
         best_speedups.append(speedup)
         if speedup > 1.0:

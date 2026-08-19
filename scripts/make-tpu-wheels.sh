@@ -36,10 +36,7 @@ git checkout "${TORCH_TPU_COMMIT}"
 
 export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
 "$BAZELISK" build -c opt //ci/wheel:torch_tpu_wheel \
-  --config=wheel_common \
-  --config=no_rbe \
-  --config=helion_public_caching_readonly \
-  --config=local_torch \
+  --define TORCH_SOURCE=local \
   --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
   --action_env=JAX_PLATFORMS=cpu
 uv pip install bazel-bin/ci/wheel/*.whl

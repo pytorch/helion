@@ -270,42 +270,6 @@ def mbarrier_arrive(
 
 
 @dsl_user_op
-def named_barrier_arrive_unaligned(
-    barrier_id: object,
-    number_of_threads: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """Arrive at a named barrier from a divergent warp-role branch."""
-    cute.arch.barrier_arrive(
-        barrier_id=barrier_id,
-        number_of_threads=number_of_threads,
-        aligned=False,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def named_barrier_wait_unaligned(
-    barrier_id: object,
-    number_of_threads: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """Arrive and wait at a named barrier from a divergent warp-role branch."""
-    nvvm.barrier_cta_sync(
-        cutlass.Int32(barrier_id).ir_value(loc=loc, ip=ip),
-        thread_count=cutlass.Int32(number_of_threads).ir_value(loc=loc, ip=ip),
-        aligned=False,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def rcp_approx_ftz(x: object, *, loc: object = None, ip: object = None) -> Float32:
     """FA4-style approximate reciprocal that lowers to ``rcp.approx.ftz.f32``."""
     return cutlass.Float32(
@@ -348,6 +312,10 @@ _POLY_EX2_DEG2 = (
     1.0017247632060873,
     0.65763628,
     0.33718943,
+)
+_POLY_EX2_DEG1 = (
+    0.97017879,
+    0.97017879,
 )
 _FP32_ROUND_INT = float(2**23 + 2**22)
 
@@ -498,13 +466,56 @@ def ex2_emulation_deg2_batch(pairs: list[tuple]) -> list[tuple]:
 
 
 def ex2_emulation_deg1_2(x: Float32, y: Float32) -> tuple:
-    """Accurate compatibility route for legacy degree-1 packet schedules."""
-    return ex2_emulation_deg2_2(x, y)
+    """Packed degree-1 software exp2 with a relative minimax approximation."""
+    # The linear polynomial starts below 1.0 (FP32 exponent 126), so clamping
+    # at -127 would wrap the reconstructed exponent field to 255.
+    xy_clamped = (cute.arch.fmax(x, -126.0), cute.arch.fmax(y, -126.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped,
+        (_FP32_ROUND_INT, _FP32_ROUND_INT),
+        rnd="rm",
+    )
+    xy_rounded_back = _sub_packed_f32x2(xy_rounded, (_FP32_ROUND_INT, _FP32_ROUND_INT))
+    xy_frac = _sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac_ex2 = _evaluate_polynomial_2(xy_frac[0], xy_frac[1], _POLY_EX2_DEG1)
+    x_out = _combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0])
+    y_out = _combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1])
+    return x_out, y_out
 
 
 def ex2_emulation_deg1_batch(pairs: list[tuple]) -> list[tuple]:
-    """Accurate compatibility route for legacy degree-1 packet schedules."""
-    return ex2_emulation_deg2_batch(pairs)
+    """Level-schedule independent packed degree-1 software exp2 pairs."""
+    xy_clamped = [
+        (cute.arch.fmax(x, -126.0), cute.arch.fmax(y, -126.0)) for x, y in pairs
+    ]
+    xy_rounded = [
+        cute.arch.add_packed_f32x2(
+            pair,
+            (_FP32_ROUND_INT, _FP32_ROUND_INT),
+            rnd="rm",
+        )
+        for pair in xy_clamped
+    ]
+    xy_rounded_back = [
+        _sub_packed_f32x2(pair, (_FP32_ROUND_INT, _FP32_ROUND_INT))
+        for pair in xy_rounded
+    ]
+    xy_frac = list(
+        starmap(_sub_packed_f32x2, zip(xy_clamped, xy_rounded_back, strict=True))
+    )
+    xy_frac_ex2 = [(_POLY_EX2_DEG1[-1], _POLY_EX2_DEG1[-1]) for _ in pairs]
+    for coefficient in reversed(_POLY_EX2_DEG1[:-1]):
+        xy_frac_ex2 = [
+            _fma_packed_f32x2(poly, frac, (coefficient, coefficient))
+            for poly, frac in zip(xy_frac_ex2, xy_frac, strict=True)
+        ]
+    return [
+        (
+            _combine_int_frac_ex2(rounded[0], frac_ex2[0]),
+            _combine_int_frac_ex2(rounded[1], frac_ex2[1]),
+        )
+        for rounded, frac_ex2 in zip(xy_rounded, xy_frac_ex2, strict=True)
+    ]
 
 
 def exp2_split_inplace(
@@ -2378,7 +2389,6 @@ def _fa4_sp_exp_convert_store_impl(
     early_split_publish: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
-    degree2: bool = False,
     degree1: bool = False,
     *,
     loc: object = None,
@@ -2404,7 +2414,7 @@ def _fa4_sp_exp_convert_store_impl(
                 ci >= frag_count - 1,
                 pair_batch,
                 emu_batch,
-                degree2,
+                False,
                 degree1,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
@@ -2424,7 +2434,7 @@ def _fa4_sp_exp_convert_store_impl(
                 ci >= frag_count - 1,
                 pair_batch,
                 emu_batch,
-                degree2,
+                False,
                 degree1,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
@@ -2445,7 +2455,7 @@ def _fa4_sp_exp_convert_store_impl(
                 ci >= frag_count - 1,
                 pair_batch,
                 emu_batch,
-                degree2,
+                False,
                 degree1,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
@@ -2491,7 +2501,6 @@ def fa4_sp_exp_convert_store(
     early_split_publish: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
-    degree2: bool = False,
     degree1: bool = False,
     *,
     loc: object = None,
@@ -2519,7 +2528,6 @@ def fa4_sp_exp_convert_store(
         early_split_publish,
         pair_batch,
         emu_batch,
-        degree2,
         degree1,
     )
 
@@ -2545,7 +2553,6 @@ def fa4_sp_exp_convert_store_whole_rowsum(
     early_split_publish: bool = False,
     pair_batch: int = 1,
     emu_batch: int = 1,
-    degree2: bool = False,
     degree1: bool = False,
     *,
     loc: object = None,
@@ -2573,7 +2580,6 @@ def fa4_sp_exp_convert_store_whole_rowsum(
         early_split_publish,
         pair_batch,
         emu_batch,
-        degree2,
         degree1,
     )
 

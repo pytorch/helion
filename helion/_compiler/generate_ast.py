@@ -50,7 +50,6 @@ if TYPE_CHECKING:
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
     from .pallas.compact_worklist import ResidentPrepHoist
-    from .pallas.dma import DmaResources
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
 
@@ -153,7 +152,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         ] = {}
         self.grouped_resident_prep_refill_cache: dict[tuple[object, ...], str] = {}
         self.grouped_fori_dma_resource_cache: dict[
-            tuple[object, ...], DmaResources
+            tuple[object, ...], tuple[str, str]
         ] = {}
         self._statements_by_owner_node_id: dict[
             int, list[tuple[list[ast.AST], ast.AST]]

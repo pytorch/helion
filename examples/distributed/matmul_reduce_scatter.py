@@ -21,7 +21,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
-from helion.runtime.triton.dist_utils import symm_mem_sync
+from helion.runtime.dist_utils import symm_mem_sync
 
 
 @helion.kernel(

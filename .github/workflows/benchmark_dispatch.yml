@@ -66,10 +66,10 @@ on:
         type: string
         default: "vector_add,layer_norm,rms_norm,vector_exp,sum"
       kernels_linattn:
-        description: 'Comma-separated list of linear-attention variants (vs FLA) from benchmarks/run_linattn.py::VARIANTS; the matrix shards these and each run emits a forward and a forward+backward ("-bwd") dashboard row, except forward-only variants which emit only the forward.'
+        description: 'Comma-separated list of linear-attention variants (vs FLA) from benchmarks/run_linattn.py::VARIANTS; the matrix shards these and each run emits a forward and a forward+backward ("-bwd") dashboard row.'
         required: false
         type: string
-        default: "vanilla_linear_attn,simple_gla,retention,full_gla,delta_rule,gated_delta_rule,kda,kda_fused,kda_varlen"
+        default: "vanilla_linear_attn,simple_gla,retention,full_gla,delta_rule,gated_delta_rule,kda"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -183,11 +183,9 @@ jobs:
     with:
       runner: linux.rocm.gpu.ecosystem.gfx950.1
       python-version: "3.12"
-      image: rocm/dev-ubuntu-24.04:7.14.0-full
-      runtime-version: rocm7.14
-      # TorchInductor 2.11 keeps benchmark-only ROCm modules loaded; Welford
-      # 8192 exhausts the container's 1024-file limit with 1002 open HSACO files.
-      container-options: --device=/dev/kfd --device=/dev/dri --ulimit nofile=65536:65536
+      image: rocm/dev-ubuntu-24.04:7.1.1-complete
+      runtime-version: rocm7.1
+      container-options: --device=/dev/kfd --device=/dev/dri
       alias: mi350x
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
@@ -207,7 +205,7 @@ jobs:
     if: ${{ github.event.inputs.run_b200_linattn == 'true' }}
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     with:
-      max-runners: 9
+      max-runners: 7
       kernels: ${{ github.event.inputs.kernels_linattn }}
 
   run-b200-linattn:
@@ -234,7 +232,7 @@ jobs:
     if: ${{ github.event.inputs.run_h100_linattn == 'true' }}
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     with:
-      max-runners: 9
+      max-runners: 7
       kernels: ${{ github.event.inputs.kernels_linattn }}
 
   run-h100-linattn:

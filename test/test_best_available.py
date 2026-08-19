@@ -32,8 +32,6 @@ from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import SavedBestConfig
 from helion.autotuner.local_cache import iter_cache_entries
 from helion.autotuner.pattern_search import InitialPopulationStrategy
-from helion.autotuner.pattern_search import PatternSearch
-from helion.exc import InvalidConfig
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 from helion.runtime.settings import _get_initial_population_strategy
@@ -1384,100 +1382,6 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         mock_search._autotune_seed_configs = MagicMock(return_value=[])
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
         return mock_search
-
-    def test_unique_random_padding_retries_invalid_and_duplicate_configs(self):
-        config_gen = self._make_config_gen()
-        default_flat = config_gen.default_flat()
-        first_flat = config_gen.flatten(
-            Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
-        )
-        second_flat = config_gen.flatten(
-            Config(block_sizes=[128, 256], num_warps=2, num_stages=4)
-        )
-        invalid_flat = [object()]
-        original_canonicalize = config_gen.canonicalize_flat
-
-        def canonicalize(flat):
-            if flat is invalid_flat:
-                raise InvalidConfig("synthetic invalid config")
-            return original_canonicalize(flat)
-
-        mock_search = self._make_mock_search(config_gen, cached_configs=[])
-        with (
-            patch.object(config_gen, "canonicalize_flat", side_effect=canonicalize),
-            patch.object(
-                config_gen,
-                "random_flat",
-                side_effect=(
-                    default_flat,
-                    invalid_flat,
-                    first_flat,
-                    first_flat,
-                    second_flat,
-                ),
-            ) as random_flat,
-        ):
-            population = (
-                PopulationBasedSearch._pad_initial_population_with_unique_random(
-                    mock_search, [default_flat], 3
-                )
-            )
-
-        configs = [config_gen.unflatten(flat) for flat in population]
-        self.assertEqual(len(configs), 3)
-        self.assertEqual(len(set(configs)), 3)
-        self.assertEqual(random_flat.call_count, 5)
-        mock_search.log.assert_called_once_with(
-            "Initial population after unique random padding: 3 total"
-        )
-
-    def test_unique_random_padding_stops_when_space_is_exhausted(self):
-        config_gen = self._make_config_gen()
-        default_flat = config_gen.default_flat()
-        mock_search = self._make_mock_search(config_gen, cached_configs=[])
-        with patch.object(
-            config_gen, "random_flat", return_value=default_flat
-        ) as random_flat:
-            population = (
-                PopulationBasedSearch._pad_initial_population_with_unique_random(
-                    mock_search, [default_flat], 3
-                )
-            )
-
-        self.assertEqual(population, [default_flat])
-        self.assertEqual(random_flat.call_count, 128)
-        self.assertEqual(
-            [call.args[0] for call in mock_search.log.call_args_list],
-            [
-                (
-                    "Generated only 1/3 unique valid initial population configs "
-                    "after 128 random attempts (0 invalid, 128 duplicate)."
-                ),
-                "Initial population after unique random padding: 1 total",
-            ],
-        )
-
-    def test_non_flash_best_available_padding_preserves_raw_random_behavior(self):
-        config_gen = self._make_config_gen()
-        default_flat = config_gen.default_flat()
-        search = PatternSearch.__new__(PatternSearch)
-        search.config_gen = config_gen
-        search.initial_population_strategy = (
-            InitialPopulationStrategy.FROM_BEST_AVAILABLE
-        )
-        search.best_available_pad_random = True
-        search.initial_population = 3
-        search._generate_best_available_population_flat = MagicMock(
-            return_value=[default_flat]
-        )
-
-        with patch.object(
-            config_gen, "random_flat", return_value=default_flat
-        ) as random_flat:
-            population = search._generate_initial_population_flat()
-
-        self.assertEqual(population, [default_flat, default_flat, default_flat])
-        self.assertEqual(random_flat.call_count, 2)
 
     def test_default_only_when_no_cached(self):
         """Population contains only default config when no cached configs found."""

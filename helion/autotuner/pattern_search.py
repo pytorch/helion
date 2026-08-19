@@ -123,13 +123,8 @@ class PatternSearch(PopulationBasedSearch):
         ):
             pop = self._generate_best_available_population_flat()
             if self.best_available_pad_random:
-                if self.config_gen.config_spec.cute_flash_search_enabled:
-                    pop = self._pad_initial_population_with_unique_random(
-                        pop, self.initial_population
-                    )
-                else:
-                    n_random = max(0, self.initial_population - len(pop))
-                    pop.extend(self.config_gen.random_flat() for _ in range(n_random))
+                n_random = max(0, self.initial_population - len(pop))
+                pop.extend(self.config_gen.random_flat() for _ in range(n_random))
             return pop
         return self.config_gen.random_population_flat(
             self.initial_population,

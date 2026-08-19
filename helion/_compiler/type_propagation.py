@@ -758,54 +758,8 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Subscript(self, node: ast.Subscript) -> TypeInfo:
         value_type = self.visit(node.value)
-        # ellipsis expansion not yet supported for StackTensorType.
-        if isinstance(value_type, TensorType):
-            self._expand_ellipsis_in_subscript(node, value_type.fake_value.ndim)
         slice_type = self.visit(node.slice)
         return value_type.propagate_getitem(slice_type, self.origin())
-
-    def _expand_ellipsis_in_subscript(self, node: ast.Subscript, ndim: int) -> None:
-        """Expand ellipsis to full-dim slices, idempotent."""
-        sl = node.slice
-        if isinstance(sl, ast.Constant) and sl.value is ...:
-            slices = [
-                create(ast.Slice, lower=None, upper=None, step=None)
-                for _ in range(ndim)
-            ]
-            node.slice = create(ast.Tuple, elts=slices, ctx=ast.Load())
-            return
-        if not isinstance(sl, ast.Tuple):
-            return
-        ellipsis_indices = [
-            i
-            for i, elt in enumerate(sl.elts)
-            if isinstance(elt, ast.Constant) and elt.value is ...
-        ]
-        if not ellipsis_indices:
-            return
-        if len(ellipsis_indices) > 1:
-            raise exc.TypeInferenceError(
-                "an index can only have a single ellipsis (...)"
-            )
-        idx = ellipsis_indices[0]
-        dims_consumed = sum(
-            1
-            for elt in sl.elts
-            if not (
-                isinstance(elt, ast.Constant)
-                and (elt.value is ... or elt.value is None)
-            )
-        )
-        n_expand = ndim - dims_consumed
-        if n_expand < 0:
-            raise exc.TypeInferenceError(
-                f"too many indices for tensor of dimension {ndim}"
-            )
-        slices = [
-            create(ast.Slice, lower=None, upper=None, step=None)
-            for _ in range(n_expand)
-        ]
-        sl.elts[idx : idx + 1] = slices
 
     def visit_Slice(self, node: ast.Slice) -> TypeInfo:
         lower = (

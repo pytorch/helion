@@ -93,11 +93,7 @@ def is_symm_mem_tensor(t: Tensor, process_group_name: str | None = None) -> bool
         return False
 
 
-def kernel_uses_symm_mem(
-    args: tuple[object, ...],
-    *,
-    dist_initialized: bool | None = None,
-) -> bool:
+def kernel_uses_symm_mem(args: tuple[object, ...]) -> bool:
     """Return True if this is a distributed kernel operating on symmetric memory.
 
     Helion's distributed-only compilation behavior (persistent-only PID types,
@@ -107,9 +103,7 @@ def kernel_uses_symm_mem(
     that merely run inside a process where torch.distributed happens to be
     initialized (e.g. vLLM). See GitHub issue #3024.
     """
-    if dist_initialized is None:
-        dist_initialized = dist.is_initialized()
-    if not dist_initialized:
+    if not dist.is_initialized():
         return False
     if not hasattr(symm_mem, "is_symm_mem_tensor"):
         # Older PyTorch cannot cheaply detect symmetric-memory tensors without a

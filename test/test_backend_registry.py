@@ -1,27 +1,13 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import cast
 import unittest
-from unittest import mock
 
-import torch
-
-from helion import exc
-from helion._compiler import backend_registry
-from helion._compiler.aten_lowering import AtenLowering
 from helion._compiler.backend import Backend
 from helion._compiler.backend_registry import _REGISTRY
 from helion._compiler.backend_registry import all_reserved_launch_param_names
 from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.backend_registry import list_backends
 from helion._compiler.backend_registry import register_compiler_backend
-from helion._compiler.backend_registry import repair_backend_codegen
-from helion._compiler.compile_environment import CompileEnvironment
-import helion.language as hl
-from helion.language._decorators import APIFunc
-from helion.language._decorators import api
-from helion.language._decorators import codegen
 
 
 class TestBackendRegistry(unittest.TestCase):
@@ -40,23 +26,6 @@ class TestBackendRegistry(unittest.TestCase):
     def test_get_backend_class_raises_for_unknown(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown backend: 'nonexistent'"):
             get_backend_class("nonexistent")
-
-    def test_default_fake_subscript_shape(self) -> None:
-        backend = get_backend_class("triton")()
-        tensor = torch.empty(4, 8)
-
-        self.assertEqual(
-            backend.fake_subscript_shape(tensor, [slice(None), None, slice(None)]),
-            [4, 1, 8],
-        )
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "narrowing kernel-tensor subscripts"
-        ):
-            backend.fake_subscript_shape(tensor, [0, slice(None)])
-        with self.assertRaises(exc.InvalidIndexingType):
-            backend.fake_subscript_shape(tensor, [object(), slice(None)])
-        with self.assertRaises(exc.InvalidIndexingType):
-            backend.fake_subscript_shape(tensor, [slice(0, 4, 0), slice(None)])
 
     def test_register_custom_backend(self) -> None:
         class _TestBackend(Backend):
@@ -78,11 +47,9 @@ class TestBackendRegistry(unittest.TestCase):
             def constexpr_type(self) -> str:
                 return ""
 
-            @property
             def function_decorator(self) -> str:
                 return ""
 
-            @property
             def library_imports(self) -> dict[str, str]:
                 return {}
 
@@ -104,175 +71,6 @@ class TestBackendRegistry(unittest.TestCase):
         # must be the union of all backends
         for cls in _REGISTRY.values():
             self.assertTrue(cls.reserved_launch_param_names().issubset(result))
-
-
-class TestBackendCodegenRepair(unittest.TestCase):
-    def setUp(self) -> None:
-        patcher = mock.patch.object(
-            backend_registry, "_REPAIRED_CODEGEN_NAMES", frozenset()
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_repair_runs_once_per_codegen_backend(self) -> None:
-        with mock.patch.object(
-            backend_registry, "_reload_backend_codegen"
-        ) as reload_mock:
-            repair_backend_codegen("triton")
-            repair_backend_codegen("triton")
-
-        reload_mock.assert_called_once_with("triton")
-
-    def test_failed_repair_can_be_retried(self) -> None:
-        with mock.patch.object(
-            backend_registry,
-            "_reload_backend_codegen",
-            side_effect=[RuntimeError("broken import"), None],
-        ) as reload_mock:
-            with self.assertRaisesRegex(RuntimeError, "broken import"):
-                repair_backend_codegen("triton")
-            repair_backend_codegen("triton")
-            repair_backend_codegen("triton")
-
-        self.assertEqual(reload_mock.call_count, 2)
-
-    def test_controlled_repair_allows_reregistration(self) -> None:
-        @api()
-        def op() -> None:
-            return None
-
-        def original(state: object) -> str:
-            return "original"
-
-        def replacement(state: object) -> str:
-            return "replacement"
-
-        codegen(op, "triton")(original)
-
-        def reload_backend(codegen_name: str) -> None:
-            self.assertEqual(codegen_name, "triton")
-            codegen(op, "triton")(replacement)
-
-        with mock.patch.object(
-            backend_registry,
-            "_reload_backend_codegen",
-            side_effect=reload_backend,
-        ):
-            repair_backend_codegen("triton")
-
-        self.assertIs(
-            dict.__getitem__(cast("APIFunc", op)._codegen, "triton"), replacement
-        )
-
-    def test_repair_rejects_second_registration_for_same_slot(self) -> None:
-        @api()
-        def op() -> None:
-            return None
-
-        def first(state: object) -> str:
-            return "first"
-
-        def second(state: object) -> str:
-            return "second"
-
-        def reload_backend(codegen_name: str) -> None:
-            codegen(op, codegen_name)(first)
-            codegen(op, codegen_name)(second)
-
-        with (
-            mock.patch.object(
-                backend_registry,
-                "_reload_backend_codegen",
-                side_effect=reload_backend,
-            ),
-            self.assertRaisesRegex(
-                AssertionError, "codegen already registered for backend 'triton'"
-            ),
-        ):
-            repair_backend_codegen("triton")
-
-    def test_real_reload_restores_missing_handler(self) -> None:
-        codegen_impls = cast("APIFunc", hl.load)._codegen
-        original = dict.__getitem__(codegen_impls, "triton")
-        del codegen_impls["triton"]
-        self.addCleanup(codegen_impls.__setitem__, "triton", original)
-
-        restored = codegen_impls["triton"]
-
-        self.assertEqual(restored.__module__, "helion._compiler.triton.memory_ops")
-        self.assertIsNot(restored, original)
-
-    def test_resident_plan_metadata_survives_codegen_reload(self) -> None:
-        from helion._compiler.pallas import view_ops
-
-        plan = view_ops._ResidentPlan(False, (), None)
-        node = mock.Mock(meta={view_ops.RESIDENT_PLAN_META: plan})
-
-        class ReloadedResidentPlan:
-            pass
-
-        with mock.patch.object(view_ops, "_ResidentPlan", ReloadedResidentPlan):
-            self.assertIs(view_ops._resident_plan(node), plan)
-
-
-class TestAtenCodegenRepair(unittest.TestCase):
-    def test_exact_backend_passes_repair_barrier(self) -> None:
-        def triton(ctx: object, node: object) -> str:
-            return "triton"
-
-        lowering = AtenLowering(codegen_impls={"triton": triton})
-        env = SimpleNamespace(codegen_name="triton", backend_name="triton")
-
-        with (
-            mock.patch.object(CompileEnvironment, "current", return_value=env),
-            mock.patch(
-                "helion._compiler.backend_registry.repair_backend_codegen"
-            ) as repair_mock,
-        ):
-            result = lowering.codegen(mock.Mock(), mock.Mock())
-
-        self.assertEqual(result, "triton")
-        repair_mock.assert_called_once_with("triton")
-
-    def test_missing_backend_repairs_before_common_fallback(self) -> None:
-        def common(ctx: object, node: object) -> str:
-            return "common"
-
-        def triton(ctx: object, node: object) -> str:
-            return "triton"
-
-        lowering = AtenLowering(codegen_impls={"common": common})
-        env = SimpleNamespace(codegen_name="triton", backend_name="triton")
-
-        def repair(codegen_name: str) -> None:
-            lowering.codegen_impls[codegen_name] = triton
-
-        with (
-            mock.patch.object(CompileEnvironment, "current", return_value=env),
-            mock.patch(
-                "helion._compiler.backend_registry.repair_backend_codegen",
-                side_effect=repair,
-            ) as repair_mock,
-        ):
-            result = lowering.codegen(mock.Mock(), mock.Mock())
-
-        self.assertEqual(result, "triton")
-        repair_mock.assert_called_once_with("triton")
-
-    def test_rejects_duplicate_registration_outside_repair(self) -> None:
-        lowering = AtenLowering()
-
-        def first(ctx: object, node: object) -> None:
-            return None
-
-        def second(ctx: object, node: object) -> None:
-            return None
-
-        lowering.register_codegen("triton")(first)
-        with self.assertRaisesRegex(
-            AssertionError, "codegen already registered for backend 'triton'"
-        ):
-            lowering.register_codegen("triton")(second)
 
 
 if __name__ == "__main__":

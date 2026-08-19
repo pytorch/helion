@@ -1,9 +1,8 @@
 name: Benchmark Pretuned
 
-# Reusable workflow: runs every kernel under pretuned_kernels/ with its
-# checked-in heuristic and reference baselines on a single GPU runner,
-# then uploads aggregate JSON metrics as a pretuned-results-<alias> artifact.
-# The Pretuned tab of
+# Reusable workflow: runs every kernel under pretuned_kernels/ against its
+# checked-in heuristic on a single GPU runner and uploads the aggregate
+# SUMMARY metrics as a pretuned-results-<alias> artifact. The Pretuned tab of
 # the dashboard is built from these artifacts by
 # .github/dashboard/build_pretuned_dashboard_data.py.
 
@@ -99,7 +98,7 @@ jobs:
       - name: Install Helion
         run: |
           source .venv/bin/activate
-          uv pip install setuptools ninja wheel
+          uv pip install setuptools ninja
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
@@ -139,86 +138,6 @@ jobs:
           print("Helion CuTe backend requirements OK")
           PY
 
-      - name: Select grouped GEMM references
-        id: grouped-gemm-references
-        if: inputs.alias == 'b200'
-        env:
-          SELECTED_KERNELS: ${{ inputs.kernels }}
-        run: |
-          source .venv/bin/activate
-          python - <<'PY'
-          import os
-
-          from pretuned_kernels.run import grouped_reference_requirements
-
-          outputs = grouped_reference_requirements(os.environ["SELECTED_KERNELS"])
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              for name, enabled in outputs.items():
-                  print(f"{name}={str(enabled).lower()}", file=output)
-          PY
-
-      - name: Fetch pinned CUTLASS grouped GEMM reference
-        if: steps.grouped-gemm-references.outputs.cutlass == 'true'
-        # If GitHub is temporarily unavailable, run.py records grouped_gemm as
-        # an error while preserving results for every other B200 kernel.
-        continue-on-error: true
-        env:
-          CUTLASS_GROUPED_GEMM_COMMIT: db1c288993354c88e551c40c19a8fb93a774a241
-          CUTLASS_GROUPED_GEMM_SHA256: 05b74a05682c024557d83284e32f973ed5be4f0d1a1a12c72fe7824c29f7e94f
-        run: |
-          source .venv/bin/activate
-          python - <<'PY'
-          import hashlib
-          import os
-          import urllib.request
-          from pathlib import Path
-
-          commit = os.environ["CUTLASS_GROUPED_GEMM_COMMIT"]
-          expected = os.environ["CUTLASS_GROUPED_GEMM_SHA256"]
-          url = (
-              "https://raw.githubusercontent.com/NVIDIA/cutlass/"
-              f"{commit}/examples/python/CuTeDSL/cute/blackwell/kernel/"
-              "grouped_gemm/grouped_gemm.py"
-          )
-          with urllib.request.urlopen(url, timeout=60) as response:
-              source = response.read()
-          actual = hashlib.sha256(source).hexdigest()
-          if actual != expected:
-              raise RuntimeError(
-                  f"CUTLASS grouped_gemm.py SHA256 mismatch: {actual} != {expected}"
-              )
-          output = Path(os.environ["RUNNER_TEMP"]) / "cutlass-grouped-gemm.py"
-          output.write_bytes(source)
-          with Path(os.environ["GITHUB_ENV"]).open("a") as env_file:
-              print(
-                  f"HELION_CUTLASS_GROUPED_GEMM_SOURCE={output}",
-                  file=env_file,
-              )
-          print(f"Verified CUTLASS grouped GEMM reference: {output}")
-          PY
-
-      - name: Build pinned DeepGEMM grouped GEMM reference
-        if: steps.grouped-gemm-references.outputs.deepgemm == 'true'
-        # Keep the rest of the B200 dashboard useful if the external checkout
-        # or build is temporarily unavailable; run.py will record only the
-        # grouped_gemm_deepgemm row as failed.
-        continue-on-error: true
-        env:
-          DEEPGEMM_COMMIT: 559d79fb6994a58b8a15b4b93bf13ccc16edf247
-        run: |
-          source .venv/bin/activate
-          DEEPGEMM_CHECKOUT=$(mktemp -d "$RUNNER_TEMP/deepgemm.XXXXXX")
-          git -C "$DEEPGEMM_CHECKOUT" init
-          git -C "$DEEPGEMM_CHECKOUT" remote add origin \
-            https://github.com/deepseek-ai/DeepGEMM.git
-          git -C "$DEEPGEMM_CHECKOUT" fetch --depth=1 origin "$DEEPGEMM_COMMIT"
-          git -C "$DEEPGEMM_CHECKOUT" checkout --detach FETCH_HEAD
-          git -C "$DEEPGEMM_CHECKOUT" submodule update --init --recursive
-          "$DEEPGEMM_CHECKOUT/develop.sh"
-          echo "HELION_DEEPGEMM_ROOT=$DEEPGEMM_CHECKOUT" >> "$GITHUB_ENV"
-          PYTHONPATH="$DEEPGEMM_CHECKOUT" python -c \
-            "import deep_gemm; print('DeepGEMM reference build OK')"
-
       - name: CUDA Compute Check
         if: startsWith(inputs.image, 'nvidia')
         run: |
@@ -249,23 +168,16 @@ jobs:
           python -c "from tritonbench.components.do_bench.run import _do_bench_cudagraph_with_cache_clear; print('tritonbench cudagraph timer OK')"
 
       - name: Run pretuned kernel benchmarks
-        env:
-          SELECTED_KERNELS: ${{ inputs.kernels }}
         run: |
           source .venv/bin/activate
 
           TEST_REPORTS_DIR=$(pwd)/test/test-reports
           mkdir -p "$TEST_REPORTS_DIR"
 
-          KERNEL_ARGS=()
-          if [[ -n "$SELECTED_KERNELS" ]]; then
-            KERNEL_ARGS=(--kernels "$SELECTED_KERNELS")
-          fi
-
           ${{ inputs.env-vars }} python pretuned_kernels/run.py \
             --output "$TEST_REPORTS_DIR/pretuned-bench.json" \
             --hardware "${{ inputs.alias }}" \
-            "${KERNEL_ARGS[@]}"
+            ${{ inputs.kernels != '' && format('--kernels {0}', inputs.kernels) || '' }}
 
           echo "----- pretuned-bench.json -----"
           cat "$TEST_REPORTS_DIR/pretuned-bench.json"

@@ -10,6 +10,7 @@ import threading
 import types
 import typing
 from typing import TYPE_CHECKING
+from typing import Protocol
 import warnings
 
 import sympy
@@ -206,12 +207,11 @@ if TYPE_CHECKING:
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
 
+    class _TLS(Protocol):
+        env: CompileEnvironment | None
 
-class _TLS(threading.local):
-    env: CompileEnvironment | None = None
 
-
-tls = _TLS()
+tls: _TLS = typing.cast("_TLS", threading.local())
 
 
 class HelionKernelSource(EphemeralSource):
@@ -305,12 +305,6 @@ class CompileEnvironment:
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
-        self._debug_shape_rename_override: contextvars.ContextVar[
-            dict[sympy.Basic, sympy.Basic] | None
-        ] = contextvars.ContextVar(
-            f"helion_debug_shape_renames_{id(self)}",
-            default=None,
-        )
         try:
             from ..runtime import get_num_sm
 
@@ -322,7 +316,6 @@ class CompileEnvironment:
             target_device_capability=target_device_capability(device),
             device=device,
             num_sm=_num_sm,
-            log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
@@ -377,17 +370,15 @@ class CompileEnvironment:
         # signal-pad clamp is symm-mem-specific and left to
         # restrict_pid_types_for_persistent().
         if settings.autotune_force_persistent:
-            self._disallow_nonpersistent_pid_types(
-                reason="autotune_force_persistent is set"
-            )
+            self._disallow_nonpersistent_pid_types()
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
 
-    def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
+    def _disallow_nonpersistent_pid_types(self) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
         for pid_type in ("flat", "xyz"):
-            self.config_spec.disallow_pid_type(pid_type, reason=reason)
+            self.config_spec.disallow_pid_type(pid_type)
 
     def restrict_pid_types_for_persistent(self, args: Sequence[object]) -> None:
         """Restrict to persistent kernels when the kernel needs cross-rank sync.
@@ -420,10 +411,7 @@ class CompileEnvironment:
         if not uses_symm_mem and not self.has_barrier:
             return
 
-        self._disallow_nonpersistent_pid_types(
-            reason="a distributed process group is initialized (persistent "
-            "kernels required)"
-        )
+        self._disallow_nonpersistent_pid_types()
         if uses_symm_mem:
             self._clamp_max_num_sm_multiplier_for_symm_mem()
 
@@ -471,26 +459,6 @@ class CompileEnvironment:
             yield
         finally:
             self._runtime_arg_values_by_name.reset(token)
-
-    @property
-    def active_debug_shape_renames(self) -> dict[sympy.Basic, sympy.Basic]:
-        return self._debug_shape_rename_override.get() or self.debug_shape_renames
-
-    @property
-    def has_debug_shape_rename_override(self) -> bool:
-        return self._debug_shape_rename_override.get() is not None
-
-    @contextlib.contextmanager
-    def use_debug_shape_renames(
-        self, values: dict[sympy.Basic, sympy.Basic]
-    ) -> typing.Iterator[None]:
-        token = self._debug_shape_rename_override.set(
-            {**self.debug_shape_renames, **values}
-        )
-        try:
-            yield
-        finally:
-            self._debug_shape_rename_override.reset(token)
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -1324,10 +1292,10 @@ class CompileEnvironment:
         return self.index_type()
 
     def sympy_debug(self, expr: sympy.Basic) -> str:
-        return str(expr.xreplace(self.active_debug_shape_renames))
+        return str(expr.xreplace(self.debug_shape_renames))
 
     def __enter__(self) -> Self:
-        assert tls.env is None, "CompileEnvironment already active"
+        assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
         self.fake_mode.__enter__()
         tls.env = self
         return self
@@ -1343,13 +1311,20 @@ class CompileEnvironment:
 
     @staticmethod
     def current() -> CompileEnvironment:
-        if (env := tls.env) is not None:
-            return env
+        try:
+            if (env := tls.env) is not None:
+                return env
+        except AttributeError:
+            pass
         raise NoCurrentEnvironment from None
 
     @staticmethod
     def has_current() -> bool:
-        return tls.env is not None
+        try:
+            CompileEnvironment.current()
+            return True
+        except NoCurrentEnvironment:
+            return False
 
     def get_block_id(self, size: int | torch.SymInt | sympy.Basic) -> int | None:
         """

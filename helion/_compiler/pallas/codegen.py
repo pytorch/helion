@@ -8,9 +8,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
-from helion._compiler.pallas.dma import DmaTransfer
-from helion._compiler.pallas.dma import allocate_dma_resources
-from helion._compiler.pallas.dma import async_copy_statements
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
 
@@ -24,51 +21,35 @@ if TYPE_CHECKING:
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
 
-def _load_route(
-    state: CodegenState, tensor: torch.Tensor
-) -> tuple[str, str, list[object]]:
-    arg_name = state.device_function.tensor_arg(tensor).name
-    active_name = vmem_name(state, arg_name)
-    state.device_function.device_load_index += 1
-    state.device_function.device_memory_op_index += 1
-    assert state.fx_node is not None
-    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
-    return arg_name, active_name, patterns
-
-
 def load_expr(
     state: CodegenState,
     subscript: list[object],
     tensor: torch.Tensor,
 ) -> ast.AST:
-    """Emit a normal Pallas load or a selected TensorCore gather."""
+    """Emit a normal load or a selected TensorCore gather plan."""
     from helion._compiler.pallas.gather import emit_gather
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
-    arg_name, active_name, patterns = _load_route(state, tensor)
+    name = state.device_function.tensor_arg(tensor).name
+    name = vmem_name(state, name)
     device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+
     assert state.fx_node is not None
+    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
     if isinstance(plan, OneHotGatherPlan):
-        return emit_gather(state, plan.plan, active_name)
-
-    from helion._compiler.device_function import PallasMemorySpace
-
-    if (
-        active_name == arg_name
-        and device_fn.pallas_memory_space.get(id(tensor)) == PallasMemorySpace.HBM
-        and device_fn.is_pallas_remote_copy_operand(tensor)
-    ):
-        return _remote_hbm_load_expr(state, subscript, tensor, arg_name)
+        return emit_gather(state, plan.plan, name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
     if scalar_load is None:
-        result = expr_from_string(f"{active_name}[{', '.join(parts)}]")
+        result = expr_from_string(f"{name}[{', '.join(parts)}]")
         result = _padded_value_for_load(state, tensor, subscript, parts, result)
     else:
-        result = emit_vmem_scalar_load(tensor, active_name, parts, scalar_load)
+        result = emit_vmem_scalar_load(tensor, name, parts, scalar_load)
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(
@@ -79,105 +60,6 @@ def load_expr(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
-
-
-def _remote_hbm_load_expr(
-    state: CodegenState,
-    subscript: list[object],
-    tensor: torch.Tensor,
-    name: str,
-) -> ast.AST:
-    """Stage one directly accessed remote-DMA HBM region into VMEM.
-
-    Remote-copy destinations can intentionally remain in HBM so their address is
-    stable across program iterations. Mosaic cannot load an HBM Ref directly, so
-    materialize the selected region at the exact source-level load. Emitting the
-    DMA here preserves ordering with nearby remote-copy waits and avoids changing
-    the placement of unrelated tensor arguments.
-    """
-    assert state.fx_node is not None
-    value = state.fx_node.meta.get("val")
-    if not isinstance(value, torch.Tensor):
-        raise RuntimeError("Pallas HBM load has no tensor result metadata")
-
-    patterns = list(state.fx_node.meta.get("indexing_patterns") or ())
-    parts, none_dims = index_parts(
-        state,
-        subscript,
-        tensor,
-        indexing_patterns=patterns,
-        pipeline_scalar_indices_local=False,
-        raw_hbm_ref=True,
-    )
-    scratch_shape = list(value.shape)
-    for dim in reversed(none_dims):
-        scratch_shape.pop(dim)
-    if not scratch_shape:
-        raise NotImplementedError("Pallas cannot DMA a scalar HBM load into VMEM")
-
-    transfer = DmaTransfer(
-        tensor=tensor,
-        subscript=tuple(subscript),
-        direction="load",
-    )
-    resources = allocate_dma_resources(
-        state.device_function,
-        transfer,
-        vmem_shape=tuple(scratch_shape),
-        buffer_count=1,
-        scratch_hint=f"{name}_load",
-        semaphore_hint=f"{name}_load_sem",
-    )
-    source = f"{name}.at[{', '.join(parts)}]"
-    for statement in async_copy_statements(
-        state,
-        source,
-        resources.scratch,
-        resources.semaphore,
-        ("start", "wait"),
-        f"{name}_load_copy",
-    ):
-        state.codegen.add_statement(statement)
-
-    result = expr_from_string(f"{resources.scratch}[...]")
-    mask_expr = _load_mask_expr(state, subscript, tensor)
-    if mask_expr is not None:
-        result = expr_from_string(
-            "{result} * ({mask})", result=result, mask=expr_from_string(mask_expr)
-        )
-    for dim in none_dims:
-        result = expr_from_string(
-            f"jnp.expand_dims({{result}}, axis={dim})", result=result
-        )
-    return result
-
-
-def resident_ref_load_expr(
-    state: CodegenState,
-    subscript: list[object],
-    tensor: torch.Tensor,
-) -> ast.AST:
-    """Keep a proven direct VMEM load as a Pallas Ref."""
-    from helion import exc
-    from helion._compiler.device_function import PallasMemorySpace
-    from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
-    from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
-
-    arg_name, name, _patterns = _load_route(state, tensor)
-    device_fn = state.device_function
-
-    assert state.fx_node is not None
-    plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
-    if isinstance(plan, OneHotGatherPlan):
-        raise exc.InvalidConfig("resident Ref cannot follow an indirect gather")
-    parts, none_dims = index_parts(state, subscript, tensor)
-    if none_dims or len(parts) != tensor.ndim:
-        raise exc.InvalidConfig("resident Ref producer must preserve rank")
-    if name == arg_name and (
-        device_fn.pallas_memory_space.get(id(tensor)) is not PallasMemorySpace.VMEM
-    ):
-        raise exc.InvalidConfig("resident Ref producer did not resolve to VMEM")
-    return expr_from_string(f"{name}.at[{', '.join(parts)}]")
 
 
 def maybe_codegen_resident_prep_cache_read(
@@ -542,12 +424,6 @@ def index_parts(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
     tensor: torch.Tensor,
-    *,
-    indexing_patterns: list[object] | None = None,
-    ast_subscripts: list[ast.AST] | None = None,
-    pipeline_scalar_indices_local: bool = True,
-    tensor_indices_are_scalars: bool = False,
-    raw_hbm_ref: bool = False,
 ) -> tuple[list[str], list[int]]:
     """Build a JAX/Pallas index string from a Helion subscript list.
 
@@ -579,8 +455,7 @@ def index_parts(
         pipeline_block_ids.update(loop.block_ids)
 
     # Use pre-computed indexing patterns from plan_tiling analysis
-    if indexing_patterns is None:
-        indexing_patterns = _get_indexing_patterns(state, tensor)
+    indexing_patterns = _get_indexing_patterns(state, tensor)
 
     # Build parts using the pre-computed patterns
     parts: list[str] = []
@@ -596,18 +471,7 @@ def index_parts(
 
         # Generate code based on the pattern type
         index_code = _generated_index_code(
-            pattern,
-            idx,
-            state,
-            tensor,
-            i,
-            tensor_dim,
-            in_pipeline,
-            pipeline_block_ids,
-            ast_subscripts,
-            pipeline_scalar_indices_local,
-            tensor_indices_are_scalars,
-            raw_hbm_ref,
+            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, pipeline_block_ids
         )
         parts.append(index_code)
 
@@ -631,16 +495,14 @@ def _arbitrary_index_pattern_code(
     state: CodegenState,
     subscript_index: int,
     in_pipeline: bool,
-    ast_subscripts: list[ast.AST] | None,
-    pipeline_scalar_indices_local: bool,
 ) -> str:
     from helion._utils import is_scalar_index
 
-    if in_pipeline and pipeline_scalar_indices_local and is_scalar_index(idx):
+    if in_pipeline and is_scalar_index(idx):
         return "0"
     if isinstance(idx, int):
         return str(idx)
-    return _index_expr_from_ast(state, subscript_index, ast_subscripts)
+    return _index_expr_from_ast(state, subscript_index)
 
 
 def _generated_index_code(
@@ -652,10 +514,6 @@ def _generated_index_code(
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
-    ast_subscripts: list[ast.AST] | None,
-    pipeline_scalar_indices_local: bool,
-    tensor_indices_are_scalars: bool,
-    raw_hbm_ref: bool,
 ) -> str:
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -667,14 +525,7 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern,
-            idx,
-            state,
-            tensor,
-            tensor_dim,
-            in_pipeline,
-            pipeline_block_ids,
-            raw_hbm_ref,
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
@@ -684,14 +535,7 @@ def _generated_index_code(
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
-            pattern,
-            state,
-            subscript_index,
-            tensor_dim,
-            in_pipeline,
-            pipeline_block_ids,
-            ast_subscripts,
-            raw_hbm_ref,
+            pattern, state, subscript_index, tensor_dim, in_pipeline, pipeline_block_ids
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
@@ -699,18 +543,10 @@ def _generated_index_code(
 
     if isinstance(pattern, ArbitraryIndexPattern):
         return _arbitrary_index_pattern_code(
-            pattern,
-            idx,
-            state,
-            subscript_index,
-            in_pipeline,
-            ast_subscripts,
-            pipeline_scalar_indices_local,
+            pattern, idx, state, subscript_index, in_pipeline
         )
 
     if isinstance(pattern, TensorIndexPattern):
-        if tensor_indices_are_scalars:
-            return _index_expr_from_ast(state, subscript_index, ast_subscripts)
         from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
         from helion._compiler.pallas.tensorcore_plan import TensorCorePlan
 
@@ -739,7 +575,6 @@ def _tile_pattern_code(
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
-    raw_hbm_ref: bool,
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -749,11 +584,6 @@ def _tile_pattern_code(
     assert isinstance(pattern, TilePattern)
 
     block_id = pattern.block_id
-
-    # Raw HBM refs have no surrounding BlockSpec to apply the grid tile.
-    # Address the global HBM slice explicitly instead of using the local ':'.
-    if raw_hbm_ref:
-        return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
     # Pipeline-tiled dims are already sliced by emit_pipeline / fori_loop's
     # BlockSpec or DMA copy, so the body should use ``:`` regardless of
@@ -804,8 +634,6 @@ def _tile_begin_with_offset_pattern_code(
     tensor_dim: int,
     in_pipeline: bool,
     pipeline_block_ids: set[int],
-    ast_subscripts: list[ast.AST] | None,
-    raw_hbm_ref: bool,
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -815,19 +643,13 @@ def _tile_begin_with_offset_pattern_code(
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
 
-    if raw_hbm_ref:
-        offset = state.codegen.offset_var(block_id)
-        if pattern.offset != 0:
-            offset = f"{offset} + {offset_str}"
-        return offset
-
     if in_pipeline and block_id in pipeline_block_ids:
         return offset_str
 
     can_tile = _can_tile_dimension(state, tensor_dim)
 
     if not can_tile:
-        return _index_expr_from_ast(state, subscript_index, ast_subscripts)
+        return _index_expr_from_ast(state, subscript_index)
 
     assert isinstance(pattern.offset, int)
 
@@ -841,15 +663,9 @@ def _tile_begin_with_offset_pattern_code(
     return f"{pattern.offset}"
 
 
-def _index_expr_from_ast(
-    state: CodegenState,
-    subscript_index: int,
-    ast_subscripts: list[ast.AST] | None = None,
-) -> str:
-    if ast_subscripts is None:
-        ast_arg = state.ast_args[1]
-        assert isinstance(ast_arg, list)
-        ast_subscripts = ast_arg
+def _index_expr_from_ast(state: CodegenState, subscript_index: int) -> str:
+    ast_subscripts = state.ast_args[1]
+    assert isinstance(ast_subscripts, list)
     ast_idx = ast_subscripts[subscript_index]
     assert isinstance(ast_idx, ast.AST)
     name = state.codegen.lift(ast_idx, dce=True, prefix="index")

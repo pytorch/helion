@@ -397,25 +397,6 @@ class TestMetalBoundsMasking(unittest.TestCase):
             "OOB store detected in vector_add sentinel region",
         )
 
-    def test_tile_mask_bounds_threads_to_the_tile(self) -> None:
-        """The emitted mask must bound threads to their tile."""
-
-        @helion.kernel(
-            backend="metal",
-            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
-        )
-        def add2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            for tm, tn in hl.tile([x.size(0), x.size(1)]):
-                out[tm, tn] = x[tm, tn] + y[tm, tn]
-            return out
-
-        x = torch.randn(128, 128, device=DEVICE)
-        y = torch.randn(128, 128, device=DEVICE)
-        msl = _get_msl(add2d, (x, y))
-        self.assertIn("(tid[0] < _BLOCK_SIZE_0)", msl)
-        self.assertIn("(tid[1] < _BLOCK_SIZE_1)", msl)
-
 
 # ---------------------------------------------------------------------------
 # Tests – arithmetic
@@ -1183,41 +1164,6 @@ class TestMetalMatmul(unittest.TestCase):
         msl = _get_msl(matmul_dot_relu, (x, y))
         self.assertIn("matmul2d", msl, "MPP matmul2d not found in MSL (hl.dot)")
         self.assertIn("_coop.begin()", msl, "Epilogue loop not found in MSL (hl.dot)")
-
-    def test_matmul_bias_epilogue_is_correct(self) -> None:
-        """Surplus MPP threads must not race with the scalar bias epilogue."""
-
-        def matmul_bias(
-            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _k, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc + bias[None, tile_n]
-            return out
-
-        n = 256
-        x = torch.randn(n, n, device=DEVICE)
-        y = torch.randn(n, n, device=DEVICE)
-        bias = torch.randn(n, device=DEVICE)
-        expected = x @ y + bias
-
-        for block_m, warps in [(16, 4), (16, 1), (32, 4), (64, 8), (128, 8), (64, 2)]:
-            with self.subTest(block_m=block_m, num_warps=warps):
-                kernel = helion.kernel(
-                    matmul_bias,
-                    backend="metal",
-                    configs=[
-                        helion.Config(block_sizes=[block_m, 16, 16], num_warps=warps)
-                    ],
-                )
-                torch.testing.assert_close(
-                    kernel(x, y, bias), expected, rtol=2e-3, atol=2e-3
-                )
 
 
 if __name__ == "__main__":

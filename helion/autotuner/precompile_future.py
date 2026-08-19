@@ -11,7 +11,6 @@ from multiprocessing import connection
 import os
 from pathlib import Path
 import pickle
-import signal
 import sys
 import time
 import traceback
@@ -38,8 +37,6 @@ from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
-from .process_utils import signal_process_tree
-from .process_utils import start_isolated_process_group
 from .progress_bar import iter_with_progress
 
 if TYPE_CHECKING:
@@ -313,7 +310,6 @@ def _run_kernel_in_subprocess_spawn(
     result_path: str,
     decorator: str,
 ) -> None:
-    start_isolated_process_group()
     status = 0
     _cap: list[str] = [""]
     try:
@@ -406,7 +402,6 @@ def _run_kernel_in_subprocess_fork(
     result_path: str,
     decorator: str,
 ) -> None:
-    start_isolated_process_group()
     status = 0
     _cap: list[str] = [""]
     try:
@@ -698,8 +693,9 @@ class PrecompileFuture:
         process = self.process
         if process is None or not self.started:
             return
-        with contextlib.suppress(Exception):
-            signal_process_tree(process, signal.SIGKILL)
+        if process.is_alive():
+            with contextlib.suppress(Exception):
+                process.kill()
 
     def cancel(self) -> None:
         """Terminate the underlying process (if any) without waiting for success."""
@@ -708,7 +704,8 @@ class PrecompileFuture:
         if process is not None:
             if self.started:
                 with contextlib.suppress(Exception):
-                    signal_process_tree(process, signal.SIGKILL)
+                    if process.is_alive():
+                        process.kill()
                     process.join()
         if self.ok is None:
             self.ok = False
@@ -732,15 +729,13 @@ class PrecompileFuture:
             self.start()
         if not process.is_alive():
             self.ok = process.exitcode == 0
-            if not self.ok:
-                signal_process_tree(process, signal.SIGKILL)
             self._consume_result(raise_on_raise=False)
             if self.ok:
                 self.failure_reason = "ok"
             elif self.failure_reason is None:
                 self.failure_reason = "error"
             return self.ok
-        signal_process_tree(process, signal.SIGTERM)
+        process.terminate()
         process.join(10)
         msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
         if process.is_alive():
@@ -749,13 +744,11 @@ class PrecompileFuture:
                     msg,
                     "(SIGKILL required)",
                 )
+            process.kill()
+            process.join()
         else:
             if not self.ctx.settings.autotune_ignore_errors:
                 self.ctx.log.warning(msg)
-        # The worker can exit on SIGTERM before a compiler grandchild does.
-        # Always hard-kill the process group after the grace period.
-        signal_process_tree(process, signal.SIGKILL)
-        process.join()
 
         self.ok = False
         self.failure_reason = "timeout"

@@ -15,8 +15,6 @@ from typing import Callable
 from typing import TypeVar
 
 from .logger import _UNRECOVERABLE_RUNTIME_ERROR_RE
-from .process_utils import signal_process_tree
-from .process_utils import start_isolated_process_group
 
 if TYPE_CHECKING:
     from multiprocessing.connection import Connection
@@ -35,7 +33,6 @@ def _set_pdeathsig() -> None:
 
 
 def _worker_loop(connection: Connection, device: int | None) -> None:
-    start_isolated_process_group()
     _set_pdeathsig()
     if device is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
@@ -209,9 +206,9 @@ class BenchmarkWorker:
 
     def _kill(self) -> None:
         process, connection = self._process, self._parent_connection
-        if process is not None:
+        if process is not None and process.is_alive():
             with contextlib.suppress(Exception):
-                signal_process_tree(process, signal.SIGKILL)
+                process.kill()
                 process.join(timeout=5)
         if connection is not None:
             with contextlib.suppress(Exception):

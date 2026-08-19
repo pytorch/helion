@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import threading
 from typing import TYPE_CHECKING
 from typing import Generic
 from typing import Literal
@@ -37,62 +36,12 @@ if TYPE_CHECKING:
         def __call__(self, fn: Callable[..., _T]) -> object: ...
 
 
-_CodegenT = TypeVar("_CodegenT")
-_CODEGEN_REPAIR_STATE = threading.local()
-
-
-def _codegen_repair_in_progress() -> bool:
-    return getattr(_CODEGEN_REPAIR_STATE, "codegen_names", None) is not None
-
-
-def _begin_codegen_repair(codegen_names: frozenset[str]) -> None:
-    assert not _codegen_repair_in_progress()
-    _CODEGEN_REPAIR_STATE.codegen_names = codegen_names
-    _CODEGEN_REPAIR_STATE.registrations = set()
-
-
-def _end_codegen_repair() -> None:
-    del _CODEGEN_REPAIR_STATE.codegen_names
-    del _CODEGEN_REPAIR_STATE.registrations
-
-
-def _register_codegen_handler(
-    implementations: dict[str, _CodegenT], backend: str, handler: _CodegenT
-) -> None:
-    codegen_names: frozenset[str] | None = getattr(
-        _CODEGEN_REPAIR_STATE, "codegen_names", None
-    )
-    if codegen_names is None:
-        assert backend not in implementations, (
-            f"codegen already registered for backend {backend!r}"
-        )
-    else:
-        if backend not in codegen_names:
-            return
-        key = (id(implementations), backend)
-        registrations: set[tuple[int, str]] = _CODEGEN_REPAIR_STATE.registrations
-        assert key not in registrations, (
-            f"codegen already registered for backend {backend!r}"
-        )
-        registrations.add(key)
-    implementations[backend] = handler
-
-
 class CodegenDict(dict[str, "Callable[[CodegenState], object]"]):
     """A dict subclass that falls back to the 'common' key when a backend key is missing."""
 
-    def __getitem__(self, key: str) -> Callable[[CodegenState], object]:
-        if key != "common":
-            from .._compiler.backend_registry import repair_backend_codegen
-
-            # Exact hits also wait: a partial module may have registered a
-            # handler before defining helpers that it calls.
-            repair_backend_codegen(key)
-        return dict.__getitem__(self, key)
-
     def __missing__(self, key: str) -> Callable[[CodegenState], object]:
         if key != "common" and "common" in self:
-            return dict.__getitem__(self, "common")
+            return self["common"]
         raise KeyError(key)
 
     # pyrefly: ignore[bad-override]
@@ -333,7 +282,10 @@ def codegen(
         assert is_api_func(original_fn), (
             f"{type_propagation.__qualname__} can only be used on API functions"
         )
-        _register_codegen_handler(original_fn._codegen, backend, codegen_fn)
+        assert backend not in original_fn._codegen, (
+            f"codegen already registered for backend {backend!r}"
+        )
+        original_fn._codegen[backend] = codegen_fn
         return _no_call
 
     # pyrefly: ignore [bad-return]

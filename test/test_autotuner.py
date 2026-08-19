@@ -57,14 +57,11 @@ from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
-from helion.autotuner.config_fragment import BlockSizeFragment
 from helion.autotuner.config_fragment import BooleanFragment
-from helion.autotuner.config_fragment import ConfigSpecFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import NumThreadsFragment
-from helion.autotuner.config_fragment import NumWarpsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -228,8 +225,6 @@ class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
         self, settings: Settings, *, args: tuple[object, ...] = ()
     ) -> BaseSearch:
-        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
-        # its attributes, so new __init__ fields don't need to be added here.
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
@@ -252,7 +247,6 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
-        search._search_space_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,
@@ -985,95 +979,6 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Restricted search -> debug CSV written, but no dataset sidecar.
         self.assertTrue(base_path.with_suffix(".csv").exists())
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
-
-
-class TestConfigFragmentCardinality(TestCase):
-    """cardinality()/search_values() are pure, GPU-independent fragment
-    methods, so they run in both normal and ref-eager modes."""
-
-    def test_fragment_cardinality(self):
-        # Number of distinct search values per fragment type. Feeds the
-        # search-space size product and coverage denominators.
-        self.assertIsNone(ConfigSpecFragment().cardinality())  # unknown by default
-        self.assertEqual(PermutationFragment(1).cardinality(), 1)
-        self.assertEqual(PermutationFragment(4).cardinality(), 24)  # 4!
-        self.assertEqual(IntegerFragment(1, 8).cardinality(), 8)
-        self.assertEqual(PowerOfTwoFragment(1, 64).cardinality(), 7)  # 1..64
-        self.assertEqual(PowerOfTwoFragment(1, 1).cardinality(), 1)  # boundary
-        self.assertEqual(BlockSizeFragment(16, 256).cardinality(), 5)
-        self.assertEqual(NumWarpsFragment(1, 32).cardinality(), 6)
-        self.assertEqual(EnumFragment(("a", "b", "c")).cardinality(), 3)
-        # search_choices restrict the searched cardinality to the subset.
-        self.assertEqual(
-            EnumFragment(("a", "b", "c", "d"), search_choices=("a", "c")).cardinality(),
-            2,
-        )
-        self.assertEqual(BooleanFragment().cardinality(), 2)
-        # NumThreads: "0" (auto) plus powers of two up to high.
-        self.assertEqual(NumThreadsFragment(256).cardinality(), 10)
-        # ListOf is combinatorial (inner ** length), not linear.
-        self.assertEqual(
-            ListOf(EnumFragment(("a", "b", "c")), length=4).cardinality(), 81
-        )
-        # ListOf over an unknown-cardinality inner is itself unknown.
-        self.assertIsNone(ListOf(ConfigSpecFragment(), length=3).cardinality())
-
-    def test_fragment_search_values(self):
-        # Explicit enumerable values, and the limit guard that avoids
-        # materializing very large ranges.
-        self.assertIsNone(ConfigSpecFragment().search_values())
-        self.assertEqual(
-            IntegerFragment(1, 8).search_values(), [1, 2, 3, 4, 5, 6, 7, 8]
-        )
-        self.assertEqual(
-            PowerOfTwoFragment(1, 64).search_values(), [1, 2, 4, 8, 16, 32, 64]
-        )
-        self.assertEqual(
-            BlockSizeFragment(16, 256).search_values(), [16, 32, 64, 128, 256]
-        )
-        self.assertEqual(EnumFragment(("a", "b", "c")).search_values(), ["a", "b", "c"])
-        self.assertEqual(
-            EnumFragment(
-                ("a", "b", "c", "d"), search_choices=("a", "c")
-            ).search_values(),
-            ["a", "c"],
-        )
-        self.assertEqual(BooleanFragment().search_values(), [False, True])
-        self.assertEqual(
-            NumThreadsFragment(256).search_values(),
-            [0, 1, 2, 4, 8, 16, 32, 64, 128, 256],
-        )
-        # limit guard: None (not a materialized list) above the limit, full below.
-        self.assertIsNone(IntegerFragment(0, 200).search_values())
-        self.assertEqual(len(IntegerFragment(0, 200).search_values(limit=1000)), 201)
-        # ListOf combinations are not enumerated.
-        self.assertIsNone(
-            ListOf(EnumFragment(("a", "b", "c")), length=4).search_values()
-        )
-
-    def test_block_id_sequence_cardinality(self):
-        # Product of per-item fragment cardinalities; empty -> 1 (neutral);
-        # an unknown-cardinality item makes the whole sequence unknown.
-        from helion.autotuner.block_id_sequence import BlockIdSequence
-        from helion.autotuner.block_id_sequence import _BlockIdItem
-
-        class _Item(_BlockIdItem):
-            def __init__(self, ids, frag):
-                super().__init__(ids)
-                self._f = frag
-
-            def _fragment(self, base):
-                return self._f
-
-        seq = BlockIdSequence()
-        seq.append(_Item([0], EnumFragment(("a", "b", "c"))))
-        seq.append(_Item([1], EnumFragment(("x", "y"))))
-        self.assertEqual(seq.cardinality(None), 6)  # 3 * 2
-        self.assertEqual(BlockIdSequence().cardinality(None), 1)
-
-        unknown = BlockIdSequence()
-        unknown.append(_Item([0], ConfigSpecFragment()))
-        self.assertIsNone(unknown.cardinality(None))
 
 
 @onlyBackends(["triton"])
@@ -4197,7 +4102,7 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             set(flash_fragments[FLASH_STAT_TRANSPORT_KEY].choices),
-            {"ring2", "single", "single_final"},
+            {"ring2", "single"},
         )
         self.assertEqual(
             set(flash_fragments[FLASH_MMA_INTERLEAVE_KEY].choices), {False, True}
@@ -4206,12 +4111,7 @@ class TestCuteAutotuner(TestCase):
             flash_fragments[FLASH_MMA_INTERLEAVE_KEY].search_choices, (True,)
         )
         self.assertEqual(
-            flash_fragments[FLASH_STAT_TRANSPORT_KEY].search_choices,
-            ("single", "ring2", "single_final"),
-        )
-        self.assertIn(
-            "ring2",
-            flash_fragments[FLASH_STAT_TRANSPORT_KEY].pattern_neighbors("single"),
+            flash_fragments[FLASH_STAT_TRANSPORT_KEY].search_choices, ("single",)
         )
         self.assertEqual(
             set(flash_fragments[FLASH_EXP2_PACKET_KEY].search_choices or ()),
@@ -4740,7 +4640,6 @@ class TestCuteAutotuner(TestCase):
             ("stage",),
         )
         common_very_long_dense_search_choices = {
-            FLASH_PERSISTENT_KEY: (True, False),
             FLASH_PERSISTENT_CTAS_PER_SM_KEY: (1,),
             FLASH_CORR_TILE_SIZE_KEY: (8, 16),
             FLASH_SOFTMAX_DISC_KEY: (False,),
@@ -4921,8 +4820,7 @@ class TestCuteAutotuner(TestCase):
             long_dense_fragments[FLASH_SOFTMAX_DISC_KEY].search_choices, (True, False)
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_PERSISTENT_KEY].search_choices,
-            (True, False),
+            long_dense_fragments[FLASH_PERSISTENT_KEY].search_choices, (True,)
         )
         self.assertEqual(
             long_dense_fragments[FLASH_P_STORE_REP_KEY].search_choices, (16, 32)
@@ -5307,10 +5205,7 @@ class TestCuteAutotuner(TestCase):
                 random_long[FLASH_EXP2_PACKET_KEY],
                 {"1x1", "4x1", "4x2", "8x1", "8x2"},
             )
-            self.assertIn(
-                random_long[FLASH_STAT_TRANSPORT_KEY],
-                {"ring2", "single", "single_final"},
-            )
+            self.assertIn(random_long[FLASH_STAT_TRANSPORT_KEY], {"ring2", "single"})
             self.assertIn(random_long[FLASH_MMA_INTERLEAVE_KEY], {False, True})
             self.assertEqual(
                 random_long[FLASH_Q_TILE_COUNT_KEY],
@@ -5320,7 +5215,7 @@ class TestCuteAutotuner(TestCase):
             self.assertIn(random_long[FLASH_RESCALE_CHUNK_COLS_KEY], {16, 32})
             self.assertEqual(random_long[FLASH_S_STAGE_KEY], 2)
             self.assertIn(random_long[FLASH_KV_STAGE_KEY], {2, 3, 4, 6, 8})
-            self.assertIn(random_long[FLASH_PERSISTENT_KEY], {False, True})
+            self.assertTrue(random_long[FLASH_PERSISTENT_KEY])
             self.assertIn(random_long[FLASH_PERSISTENT_CTAS_PER_SM_KEY], {1, 2, 3, 4})
             self.assertIn(random_long[FLASH_P_STORE_REP_KEY], {16, 32})
             self.assertIn(random_long[FLASH_S_LOAD_REP_KEY], {16, 32})
@@ -5338,12 +5233,7 @@ class TestCuteAutotuner(TestCase):
             )
             self.assertTrue(random_long[FLASH_PACKED_REDUCE_KEY])
             effective_values = flash_effective_config_values(
-                flash_config_from_config(
-                    random_long,
-                    64,
-                    64,
-                    standard_dense_output=True,
-                )
+                flash_config_from_config(random_long, 64, 64)
             )
             for key, value in effective_values.items():
                 self.assertEqual(random_long[key], value, key)
@@ -6182,35 +6072,6 @@ class TestConfigFilter(TestCase):
         )
         return add, args
 
-    def test_finite_search_accepts_benchmark_provider_factory(self) -> None:
-        class CustomBenchmarkProvider(LocalBenchmarkProvider):
-            def __init__(
-                self, *args: object, context: object, **kwargs: object
-            ) -> None:
-                self.context = context
-                super().__init__(*args, **kwargs)  # pyrefly: ignore[bad-argument-type]
-
-        configs = [
-            helion.Config(block_sizes=[16], num_warps=4),
-            helion.Config(block_sizes=[32], num_warps=4),
-        ]
-        add, args = self._make_kernel_and_args()
-        context = object()
-        provider_factory = functools.partial(
-            CustomBenchmarkProvider,
-            context=context,
-        )
-        search = FiniteSearch(
-            add.bind(args),
-            args,
-            configs=configs,
-            benchmark_provider_cls=provider_factory,
-        )
-        search._prepare()
-
-        self.assertIsInstance(search.benchmark_provider, CustomBenchmarkProvider)
-        self.assertIs(search.benchmark_provider.context, context)
-
     def test_autotune_config_filter_skips_filtered_configs(self) -> None:
         """Filtered configs produce status='filtered' and perf=inf."""
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
@@ -6472,8 +6333,6 @@ class TestFiniteSearchWarmStart(TestCase):
 @onlyBackends(["triton", "cute"])
 class TestAutotuneBudget(TestCase):
     def _make_search(self, settings: Settings) -> BaseSearch:
-        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
-        # its attributes, so new __init__ fields don't need to be added here.
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
@@ -6490,7 +6349,6 @@ class TestAutotuneBudget(TestCase):
         )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
-        search._search_space_tracker = None
         search._prepared = False
         with patch.object(
             LocalBenchmarkProvider,

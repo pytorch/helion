@@ -105,7 +105,6 @@ _helion_aot_*.py
 !tutorials/*/_helion_aot_*.py
 # Pretuned kernels ship checked-in heuristic files alongside the kernel source.
 !pretuned_kernels/*/_helion_aot_*.py
-!examples/linear/_helion_aot_*.py
 pytorch
 .logs/
 quack

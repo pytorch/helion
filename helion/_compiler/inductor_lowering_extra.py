@@ -2,22 +2,16 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import threading
 from typing import Any
 from typing import Callable
 from typing import Generator
 
 import torch
 from torch._inductor.ir import TensorBox
+from torch._inductor.lowering import lowerings as original_lowerings
 from torch._inductor.lowering import to_dtype
 
 inductor_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
-
-_MISSING_LOWERING = object()
-_patch_lock = threading.Lock()
-_patch_users = 0
-_patch_table: dict[Any, Any] | None = None
-_patch_entries: dict[Any, tuple[object, object]] = {}
 
 
 def create_fp16_to_fp32_unary_fallback_lowering(
@@ -27,13 +21,6 @@ def create_fp16_to_fp32_unary_fallback_lowering(
 
     @functools.wraps(original_op)
     def fp32_fallback_lowering(x: object) -> object:
-        from .compile_environment import CompileEnvironment
-
-        if (
-            not CompileEnvironment.has_current()
-            or CompileEnvironment.current().backend_name == "pallas"
-        ):
-            return original_op(x)
         if isinstance(x, TensorBox) and (original_dtype := x.get_dtype()) in (
             torch.float16,
             torch.bfloat16,
@@ -45,42 +32,6 @@ def create_fp16_to_fp32_unary_fallback_lowering(
         return original_op(x)
 
     return fp32_fallback_lowering
-
-
-def _compile_environment_lowering(
-    op: Callable[..., Any] | str,
-    patched: Callable[..., Any],
-    previous: object,
-) -> Callable[..., Any]:
-    """Use a Helion override only in the thread compiling a Helion kernel."""
-
-    @functools.wraps(patched)
-    def scoped(*args: object, **kwargs: object) -> object:
-        from .compile_environment import CompileEnvironment
-
-        if CompileEnvironment.has_current():
-            return patched(*args, **kwargs)
-        if previous is _MISSING_LOWERING:
-            raise KeyError(f"no Inductor lowering registered for {op!r}")
-        return previous(*args, **kwargs)  # pyrefly: ignore [not-callable]
-
-    return scoped
-
-
-def _restore_inductor_lowerings() -> None:
-    """Restore Helion-owned entries without disturbing concurrent registrations."""
-    global _patch_table
-
-    assert _patch_table is not None
-    for op, (previous, installed) in _patch_entries.items():
-        if _patch_table.get(op, _MISSING_LOWERING) is not installed:
-            continue
-        if previous is _MISSING_LOWERING:
-            _patch_table.pop(op, None)
-        else:
-            _patch_table[op] = previous
-    _patch_entries.clear()
-    _patch_table = None
 
 
 # Operations that need fp32 fallbacks due to libdevice/tl_math limitations
@@ -96,49 +47,47 @@ FP32_FALLBACK_OPS_UNARY = [
     torch.ops.aten.exp.default,
 ]
 
+# Register fp32 fallback lowerings in a separate dict so that
+# `patch_inductor_lowerings` can skip them on backends (Pallas) where
+# Mosaic handles bf16 transcendentals natively and the round-trip would
+# only double per-element VMEM working-set.
+fp32_fallback_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
+for op in FP32_FALLBACK_OPS_UNARY:
+    fp32_fallback_dispatch[op] = create_fp16_to_fp32_unary_fallback_lowering(
+        original_lowerings[op]
+    )
+
 
 @contextlib.contextmanager
 def patch_inductor_lowerings() -> Generator[None, Any, Any]:
-    """Temporarily install lowering overrides needed by Helion compilation.
+    """Context manager to temporarily patch the inductor lowering table.
 
-    Inductor's lowering table is process-global, so the installed wrappers
-    apply Helion behavior only with an active compile environment and delegate
-    to the prior lowerings in all other threads.
+    This is useful for overwriting specific Inductor lowerings without
+    affecting the global state, especially in cases where Helion
+    is missing support for a specific lowering.
     """
-    global _patch_table, _patch_users
+    from .compile_environment import CompileEnvironment
 
-    with _patch_lock:
-        if _patch_users == 0:
-            # Mutate the existing table: register_lowering() captures this dict
-            # object, and replacing it disconnects later registrations.
-            # pyrefly: ignore [implicit-import]
-            _patch_table = torch._inductor.lowering.lowerings
-            try:
-                for op, patched in inductor_lowering_dispatch.items():
-                    previous = _patch_table.get(op, _MISSING_LOWERING)
-                    installed = _compile_environment_lowering(op, patched, previous)
-                    _patch_entries[op] = (previous, installed)
-                    _patch_table[op] = installed
-                for op in FP32_FALLBACK_OPS_UNARY:
-                    current = _patch_table.get(op, _MISSING_LOWERING)
-                    if current is _MISSING_LOWERING or not callable(current):
-                        raise KeyError(f"no Inductor lowering registered for {op!r}")
-                    existing = _patch_entries.get(op)
-                    previous = current if existing is None else existing[0]
-                    installed = create_fp16_to_fp32_unary_fallback_lowering(current)
-                    _patch_entries[op] = (previous, installed)
-                    _patch_table[op] = installed
-            except Exception:
-                _restore_inductor_lowerings()
-                raise
-        _patch_users += 1
+    # pyrefly: ignore [implicit-import]
+    original_lowerings = torch._inductor.lowering.lowerings.copy()
     try:
+        # pyrefly: ignore [implicit-import]
+        torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)
+        # The fp32 round-trip is a Triton/CUDA workaround for libdevice
+        # /tl_math bf16 limitations. Mosaic on TPU handles bf16
+        # transcendentals natively, so installing the fallback there
+        # would only double per-element VMEM working-set.
+        is_pallas = (
+            CompileEnvironment.has_current()
+            and CompileEnvironment.current().backend_name == "pallas"
+        )
+        if not is_pallas:
+            # pyrefly: ignore [implicit-import]
+            torch._inductor.lowering.lowerings.update(fp32_fallback_dispatch)
         yield
     finally:
-        with _patch_lock:
-            _patch_users -= 1
-            if _patch_users == 0:
-                _restore_inductor_lowerings()
+        # pyrefly: ignore [implicit-import]
+        torch._inductor.lowering.lowerings = original_lowerings
 
 
 # pyrefly: ignore [implicit-import]

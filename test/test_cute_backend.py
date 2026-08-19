@@ -26,7 +26,6 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import patch_cute_mma_support
 from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
 from helion.exc import InvalidConfig
@@ -41,7 +40,6 @@ from helion.runtime import default_cute_launcher
 if TYPE_CHECKING:
     from collections.abc import Hashable
     from collections.abc import Sequence
-    from typing_extensions import Self
 
     from helion.autotuner.config_spec import ConfigSpec
 
@@ -600,29 +598,6 @@ def cute_matmul_mma_fp8_rowwise_colwise_scale(
         for tile_k in hl.tile(k):
             acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         acc = acc * scale_m[tile_m, tile_n] * scale_n[tile_n]
-        out[tile_m, tile_n] = acc.to(torch.bfloat16)
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True)
-def cute_matmul_mma_fp8_three_broadcast_scales(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    scale_m: torch.Tensor,
-    scale_n0: torch.Tensor,
-    scale_n1: torch.Tensor,
-) -> torch.Tensor:
-    """FP8 matmul with three separately chained broadcast auxiliaries."""
-    m, k = x.size()
-    _, n = y.size()
-    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
-        acc = acc * scale_m[tile_m, tile_n]
-        acc = acc * scale_n0[tile_n]
-        acc = acc * scale_n1[tile_n]
         out[tile_m, tile_n] = acc.to(torch.bfloat16)
     return out
 
@@ -2500,14 +2475,8 @@ class TestCuteBackend(TestCase):
                 if "flash_grid_m_pairs_delta" in code:
                     self.assertIn("flash_grid_m_pairs_delta", code)
                     self.assertIn("flash_tmem_dealloc_ptr", code)
-                    self.assertIn(
-                        "_helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)",
-                        code,
-                    )
-                    self.assertIn(
-                        "_helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)",
-                        code,
-                    )
+                    self.assertIn("flash_tmem_user_bar.arrive_and_wait()", code)
+                    self.assertIn("flash_tmem_user_bar.arrive()", code)
                     self.assertNotIn("mbarrier_wait(flash_tmem_dealloc_ptr, 0)", code)
                     self.assertNotIn("mbarrier_arrive(flash_tmem_dealloc_ptr)", code)
                     self.assertNotIn("cute.arch.barrier()", code)
@@ -2645,99 +2614,12 @@ class TestCuteBackend(TestCase):
             cute_flash_stat_transport="single",
         )
         self.assertIn("while flash_tile_id < 192", code)
-        self.assertIn("flash_s_corr_prod_phase = cutlass.Int32(0)", code)
-        self.assertNotIn("flash_s_corr_prod_index", code)
-        for stage, barrier_id in ((0, 3), (1, 7)):
-            empty_arrive = (
-                f"cute.arch.mbarrier_arrive(flash_s{stage}_corr_empty_ptr + 0)"
-            )
-            self.assertIn(empty_arrive, code)
-            producer_wait_text = (
-                f"_helion_flash_rt.mbar_spin_wait("
-                f"flash_s{stage}_corr_empty_ptr + 0, flash_s_corr_prod_phase,"
-            )
-            producer_wait = code.index(producer_wait_text)
-            alpha_store = code.index(
-                f"flash_scale_t[{stage} * 128 + flash_local_tidx] = flash_alpha",
-                producer_wait,
-            )
-            producer_publish = code.index(
-                "_helion_flash_rt.named_barrier_arrive_unaligned(", alpha_store
-            )
-            producer_advance = code.index(
-                "flash_s_corr_prod_phase ^= 1", producer_publish
-            )
-            rowsum_wait = code.index(producer_wait_text, producer_advance)
-            rowsum_store = code.index(
-                f"flash_scale_t[{stage} * 128 + flash_local_tidx] = flash_row_sum",
-                rowsum_wait,
-            )
-            rowsum_publish = code.index(
-                "_helion_flash_rt.named_barrier_arrive_unaligned(", rowsum_store
-            )
-            rowsum_advance = code.index("flash_s_corr_prod_phase ^= 1", rowsum_publish)
-            consumer_wait = code.index(
-                f"_helion_flash_rt.named_barrier_wait_unaligned("
-                f"{barrier_id} + warp_idx % 4, 64)",
-                rowsum_advance,
-            )
-            alpha_load = code.index(
-                f"flash_a{stage} = flash_scale_t[{stage} * 128 + flash_local_tidx]",
-                consumer_wait,
-            )
-            consumer_release = code.index(empty_arrive, alpha_load)
-            final_wait = code.index(
-                f"_helion_flash_rt.named_barrier_wait_unaligned("
-                f"{barrier_id} + warp_idx % 4, 64)",
-                consumer_release,
-            )
-            rowsum_load = code.index(
-                f"flash_inv_sum{stage} = _helion_flash_rt.rcp_approx_ftz("
-                f"flash_scale_t[{stage} * 128 + flash_local_tidx])",
-                final_wait,
-            )
-            final_release = code.index(empty_arrive, rowsum_load)
-            self.assertLess(producer_wait, alpha_store)
-            self.assertLess(alpha_store, producer_publish)
-            self.assertLess(producer_publish, producer_advance)
-            self.assertLess(producer_advance, rowsum_wait)
-            self.assertLess(rowsum_wait, rowsum_store)
-            self.assertLess(rowsum_store, rowsum_publish)
-            self.assertLess(rowsum_publish, rowsum_advance)
-            self.assertLess(rowsum_advance, consumer_wait)
-            self.assertLess(consumer_wait, alpha_load)
-            self.assertLess(alpha_load, consumer_release)
-            self.assertLess(consumer_release, final_wait)
-            self.assertLess(final_wait, rowsum_load)
-            self.assertLess(rowsum_load, final_release)
+        self.assertNotIn("flash_s_corr_prod_phase", code)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=bias
         )
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
         self.assertTrue(torch.isfinite(lse).all())
-
-    def test_flash_attention_late_acquire_stat_handoff_persistent(self) -> None:
-        q, k, v = (
-            torch.randn(1, 64, 768, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
-        )
-        code, out = code_and_output(
-            cute_dense_attention,
-            (q, k, v),
-            block_sizes=[1, 128, 128],
-            cute_flash_pipeline_family="fa4",
-            cute_flash_persistent=True,
-            cute_flash_stat_transport="single",
-            cute_flash_exp2_packet="8x2",
-            cute_flash_softmax_disc=False,
-            cute_flash_rescale_threshold=8.0,
-        )
-
-        self.assertIn("while flash_tile_id < 192", code)
-        self.assertEqual(code.count("flash_s_corr_prod_phase = cutlass.Int32(1)"), 2)
-        self.assertNotIn("flash_s_corr_prod_phase = cutlass.Int32(0)", code)
-        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
     def test_flash_attention_fa4_deep_one_cta_causal_split_matches_sdpa(
         self,
@@ -2824,30 +2706,6 @@ class TestCuteBackend(TestCase):
         self.assertIn("is_two_cta=True", code)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
-
-    def test_flash_attention_ring2_stat_handoff_persistent_matches_sdpa(self) -> None:
-        q, k, v = (
-            torch.randn(1, 64, 768, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
-        )
-        code, out = code_and_output(
-            cute_dense_attention,
-            (q, k, v),
-            block_sizes=[1, 128, 128],
-            # 192 work items exceed B200's 148-CTA persistent grid, forcing
-            # phase and ring-index state to carry into a second work item.
-            cute_flash_pipeline_family="fa4",
-            cute_flash_stat_transport="ring2",
-            cute_flash_persistent=True,
-            cute_flash_persistent_ctas_per_sm=1,
-        )
-
-        self.assertIn("flash_s_corr_prod_index = cutlass.Int32(0)", code)
-        self.assertIn("flash_s_corr_cons_index = cutlass.Int32(0)", code)
-        self.assertIn("flash_s_corr_prod_index ^= 1", code)
-        self.assertIn("flash_s_corr_cons_index ^= 1", code)
-        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
     def test_flash_attention_fa4_causal_two_cta_modifier_matches_sdpa(self) -> None:
         q, k, v = (
@@ -3061,7 +2919,6 @@ class TestCuteBackend(TestCase):
                     cute_flash_persistent=True,
                     cute_flash_use_2cta=True,
                     cute_flash_epi_tma=True,
-                    cute_flash_stat_transport="single",
                 )
 
                 self.assertIn("cta_group=2", code)
@@ -3071,11 +2928,6 @@ class TestCuteBackend(TestCase):
                 self.assertIn("mbarrier_init(flash_pfor2_ptr + flash_st, 256)", code)
                 self.assertIn("fa4_correction_epilogue_to_smem_scoped_2cta", code)
                 self.assertIn("'use_2cta_instrs': True", code)
-                self.assertIn(
-                    "mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
-                    "flash_s_corr_prod_phase",
-                    code,
-                )
                 self.assertIn("gemm_ptx_precomputed_qk_static", code)
                 self.assertIn(
                     "early_split_publish=True, pair_batch=8, emu_batch=2", code
@@ -3310,8 +3162,7 @@ class TestCuteBackend(TestCase):
                         "flash_local_tidx] = flash_alpha"
                     )
                     alpha_publish = masked_stage0.index(
-                        "_helion_flash_rt.named_barrier_arrive_unaligned(",
-                        alpha_store,
+                        "cute.arch.barrier_arrive(", alpha_store
                     )
                     self.assertEqual(masked_stage0.count("flash_minus_max_scale ="), 1)
                     minus_scale = masked_stage0.index("flash_minus_max_scale =")
@@ -3432,7 +3283,7 @@ class TestCuteBackend(TestCase):
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
 
-    def test_flash_attention_dense_degree2_seed_requires_standard_output(self) -> None:
+    def test_flash_attention_dense_degree1_seed_requires_standard_output(self) -> None:
         target = torch.empty(1, 1, 262_144, 64, dtype=torch.float16, device=DEVICE)
         cases = (
             (cute_dense_attention, True),
@@ -3446,22 +3297,14 @@ class TestCuteBackend(TestCase):
                     bound.config_spec._cute_flash_standard_dense_output,
                     expected_standard,
                 )
-                self.assertFalse(
-                    any(
-                        seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
-                        in {"deg1_8x2_corr10", "deg1_16x8"}
-                        for seed in bound.config_spec.compiler_seed_configs
-                    )
-                )
-                has_degree2_seed = any(
-                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
+                has_degree1_seed = any(
+                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
+                    in {"deg1_8x2_corr10", "deg1_16x8"}
                     for seed in bound.config_spec.compiler_seed_configs
                 )
-                self.assertEqual(has_degree2_seed, expected_standard)
+                self.assertEqual(has_degree1_seed, expected_standard)
 
-    def test_flash_attention_auxiliary_outputs_have_no_causal_degree1_seed(
-        self,
-    ) -> None:
+    def test_flash_attention_hybrid_seed_excludes_auxiliary_outputs(self) -> None:
         target = torch.empty(1, 1, 65_536, 64, dtype=torch.float16, device=DEVICE)
         slopes = torch.empty(1, dtype=torch.float32, device=DEVICE)
         cases = (
@@ -4883,16 +4726,19 @@ class TestCuteBackend(TestCase):
             dense_midrange = resolve_flash_config(64, 1536, force_two_cta)
             dense_long = resolve_flash_config(64, 2052, force_two_cta)
             dense_long_unaligned = resolve_flash_config(64, 2050, force_two_cta)
+            dense_long_seed = next(
+                seed
+                for seed in _cute_flash.flash_attention_seed_configs(
+                    64,
+                    2052,
+                    standard_dense_output=True,
+                )
+                if seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY) == "deg1_16x8"
+            )
             dense_long_degree1 = resolve_flash_config(
                 64,
                 2052,
-                force_two_cta
-                | {
-                    _cute_flash.FLASH_EXP2_PACKET_KEY: "deg1_16x8",
-                    _cute_flash.FLASH_E2E_SCHEDULE_KEY: "16/8",
-                    _cute_flash.FLASH_E2E_OFFSET_KEY: 0,
-                    _cute_flash.FLASH_E2E_OFFSET0_KEY: 10,
-                },
+                dense_long_seed.config,
                 standard_dense_output=True,
             )
             dense_bf16 = resolve_flash_config(
@@ -6170,8 +6016,8 @@ class TestCuteBackend(TestCase):
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
-        self.assertIn("'lhs_tma_order': (1, 2, 0)", code)
-        self.assertIn("'rhs_tma_order': (2, 1, 0)", code)
+        self.assertIn("'lhs_leading_passthrough': True", code)
+        self.assertIn("'rhs_leading_passthrough': True", code)
         self.assertIn("'d_leading_passthrough': True", code)
         self.assertIn("cpasync.tma_partition", code)
         self.assertIn("tcgen05_tma_store_atom", code)
@@ -6203,8 +6049,8 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.gemm(", code)
         self.assertIn("CtaGroup.TWO", code)
         self.assertIn("mcast_mask", code)
-        self.assertIn("'lhs_tma_order': (1, 2, 0)", code)
-        self.assertIn("'rhs_tma_order': (2, 1, 0)", code)
+        self.assertIn("'lhs_leading_passthrough': True", code)
+        self.assertIn("'rhs_leading_passthrough': True", code)
 
     def test_leading_matmul_accepts_explicit_deep_direct_entry_config(self) -> None:
         support = get_cute_mma_support()
@@ -6593,7 +6439,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
                 ),
-                "'lhs_tma_order': (1, 2, 0)",
+                "'lhs_leading_passthrough': True",
             ),
             (
                 cute_rhs_batched_dot_tcgen05,
@@ -6601,7 +6447,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
                 ),
-                "'rhs_tma_order': (2, 1, 0)",
+                "'rhs_leading_passthrough': True",
             ),
             (
                 cute_mixed_rank_batched_dot_tcgen05,
@@ -6609,7 +6455,7 @@ class TestCuteBackend(TestCase):
                     torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE).T,
                 ),
-                "'lhs_tma_order': (1, 2, 0)",
+                "'lhs_leading_passthrough': True",
             ),
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
@@ -6973,50 +6819,6 @@ class TestCuteBackend(TestCase):
         self.assertFalse(out.float().isnan().any().item())
         self.assertIn("cute.nvgpu.tcgen05", code)
 
-    def test_matmul_mma_tcgen05_fuses_three_broadcast_edge_loads(self) -> None:
-        m, k, n = 64, 256, 8
-        x = torch.empty((m, k), device=DEVICE, dtype=torch.float8_e4m3fn)
-        y = torch.empty((k, n), device=DEVICE, dtype=torch.float8_e4m3fn)
-        scale_m = torch.empty((m, 1), device=DEVICE).expand(m, n)
-        scale_n0 = torch.empty(n, device=DEVICE)
-        scale_n1 = torch.empty(n, device=DEVICE)
-        args = (x, y, scale_m, scale_n0, scale_n1)
-        config = helion.Config(
-            block_sizes=[64, 16, 256],
-            indexing=["tensor_descriptor"] * len(args),
-            l2_groupings=[1],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=1,
-            tcgen05_cluster_n=1,
-            tcgen05_ab_stages=4,
-            tcgen05_acc_stages=1,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_l2_swizzle_size=1,
-            tcgen05_persistence_model="static_persistent",
-        )
-        with patch_cute_mma_support():
-            code = cute_matmul_mma_fp8_three_broadcast_scales.bind(args).to_triton_code(
-                config
-            )
-
-        self.assertIn(
-            "for _edge_i in range(cute.size(tcgen05_tTR_gAux_subtile_0.shape))",
-            code,
-        )
-        for aux_idx in (1, 2):
-            self.assertNotIn(
-                f"for _edge_i in range(cute.size("
-                f"tcgen05_tTR_gAux_subtile_{aux_idx}.shape))",
-                code,
-            )
-        for aux_idx in range(3):
-            self.assertIn(
-                f"tcgen05_aux_rmem_{aux_idx}[_edge_i] = "
-                f"tcgen05_tTR_gAux_subtile_{aux_idx}[_edge_i]",
-                code,
-            )
-
     def _run_colvec_scale_row_dependent(
         self,
         block_sizes: list[int],
@@ -7260,7 +7062,6 @@ class TestCuteBackend(TestCase):
             block_sizes=[128, 128, 128],
             tcgen05_cluster_m=2,
             pid_type="persistent_blocked",
-            tcgen05_aux_load_placement="pre_acc_wait",
         )
         ref = (x.float() @ y.float()) * scale_n.float()
         torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
@@ -7279,7 +7080,6 @@ class TestCuteBackend(TestCase):
                 block_sizes=[256, 128, 128],
                 tcgen05_cluster_m=2,
                 pid_type="persistent_blocked",
-                tcgen05_aux_load_placement="pre_acc_wait",
             )
         )
         self.assertNotIn("tcgen05_aux_rmem_full_", code256)
@@ -8362,58 +8162,6 @@ class TestCuteBackend(TestCase):
         self.assertEqual(second, ("launched", (context_b, "stream-B")))
         self.assertEqual(third, ("launched", (context_b, "stream-C")))
 
-    def test_grouped_static_metadata_match_filters_device_plans(self) -> None:
-        launcher = importlib.import_module("helion.runtime.cute.launcher")
-        host_plan = {"kind": "tcgen05_grouped_static_persistent"}
-        device_plan = {
-            "kind": "tcgen05_grouped_static_persistent",
-            "device_split_sizes": True,
-        }
-        unrelated_plan = {"kind": "unrelated"}
-        cute_kernel = type("DummyCuteKernel", (), {})()
-
-        class Entry:
-            has_m_tail = False
-            has_n_tail = False
-
-            def __init__(self, matches: bool = True) -> None:
-                self._matches = matches
-
-            def matches(self, *_args: object) -> bool:
-                return self._matches
-
-        def metadata_matches(entries: tuple[Entry, ...]) -> bool:
-            return launcher._cute_grouped_static_metadata_matches(
-                entries,
-                cute_kernel,
-                (),
-            )
-
-        with (
-            patch.object(
-                launcher,
-                "_tcgen05_grouped_static_layout_arg",
-                return_value=object(),
-            ),
-            patch.object(
-                launcher,
-                "_tcgen05_grouped_static_size_arg",
-                return_value=None,
-            ),
-        ):
-            for plans in ([], [unrelated_plan], [device_plan]):
-                cute_kernel._helion_cute_wrapper_plans = plans
-                self.assertTrue(metadata_matches(()))
-
-            for plans in (
-                [host_plan, device_plan],
-                [device_plan, unrelated_plan, host_plan],
-            ):
-                cute_kernel._helion_cute_wrapper_plans = plans
-                self.assertTrue(metadata_matches((Entry(),)))
-                self.assertFalse(metadata_matches(()))
-                self.assertFalse(metadata_matches((Entry(matches=False),)))
-
     def test_grouped_capture_retains_generated_tensors_beyond_launch_lru(
         self,
     ) -> None:
@@ -8621,101 +8369,6 @@ class TestCuteBackend(TestCase):
                     layout,
                 ),
             )
-
-    def test_grouped_device_split_cluster_bound_uses_source_profile(self) -> None:
-        launcher = importlib.import_module("helion.runtime.cute.launcher")
-        common_plan = {
-            "group_count": 8,
-            "m_size": 2048,
-            "n_size": 512,
-        }
-
-        self.assertEqual(
-            launcher._tcgen05_grouped_device_split_total_clusters(
-                {**common_plan, "source_m_tile": 224}
-            ),
-            160,
-        )
-        self.assertEqual(
-            launcher._tcgen05_grouped_device_split_total_clusters(
-                {**common_plan, "source_m_tile": 256}
-            ),
-            128,
-        )
-
-    def test_grouped_device_split_dimensions_must_fit_int32(self) -> None:
-        launcher = importlib.import_module("helion.runtime.cute.launcher")
-        plan = {
-            "group_count": 1,
-            "orientation": "nm",
-            "bk": 128,
-            "source_m_tile": 256,
-            "m_size": torch.iinfo(torch.int32).max + 1,
-            "n_size": 512,
-            "k_total_size": 128,
-            "dynamic_ab_tensormaps": True,
-            "dynamic_ab_tensormap_rank": 2,
-            "dynamic_d_tensormap": True,
-        }
-
-        with self.assertRaisesRegex(BackendUnsupported, "positive signed Int32"):
-            launcher._validate_tcgen05_grouped_device_split_sizes(
-                plan,
-                torch.empty(1, dtype=torch.int32),
-            )
-
-    def test_grouped_static_problem_shapes_runtime_guard(self) -> None:
-        if DEVICE.type != "cuda":
-            self.skipTest("grouped static problem-shape guard needs CUDA")
-        runtime_mod = importlib.import_module("helion.runtime")
-        base_plan = {
-            "kind": "tcgen05_grouped_static_persistent",
-            "layout_idx": 0,
-            "n_sizes_idx": 1,
-            "group_count": 2,
-            "bm": 128,
-            "bn": 64,
-            "bk": 128,
-            "n_size": 256,
-            "k_total_size": 128,
-            "problem_sizes_arg": "problem_sizes",
-            "starts_arg": "starts",
-            "total_clusters_arg": "total_clusters",
-        }
-        layout = torch.cat(
-            (
-                torch.zeros(128, dtype=torch.int32, device=DEVICE),
-                torch.ones(128, dtype=torch.int32, device=DEVICE),
-            )
-        )
-        n_sizes = torch.tensor((64, 256), dtype=torch.int32, device=DEVICE)
-        args = (layout, n_sizes)
-        actual_shapes = ((128, 64, 128), (128, 256, 128))
-
-        matching_plan = {**base_plan, "static_problem_shapes": actual_shapes}
-        matching_kernel = type("MatchingDummyCuteKernel", (), {})()
-        matching_kernel._helion_cute_wrapper_plans = [matching_plan]
-        runtime_mod._build_tcgen05_grouped_static_metadata(
-            matching_kernel, matching_plan, args
-        )
-
-        mismatches = (
-            ((64, 64, 128), (128, 256, 128)),
-            ((128, 64, 128), (128, 192, 128)),
-            ((128, 64, 64), (128, 256, 128)),
-        )
-        for expected_shapes in mismatches:
-            with self.subTest(expected_shapes=expected_shapes):
-                plan = {**base_plan, "static_problem_shapes": expected_shapes}
-                cute_kernel = type("MismatchedDummyCuteKernel", (), {})()
-                cute_kernel._helion_cute_wrapper_plans = [plan]
-                with self.assertRaisesRegex(
-                    BackendUnsupported,
-                    "static problem-shape specialization",
-                ):
-                    runtime_mod._build_tcgen05_grouped_static_metadata(
-                        cute_kernel, plan, args
-                    )
 
     def test_grouped_inference_metadata_tracks_value_mutation(self) -> None:
         if DEVICE.type != "cuda":
@@ -9350,115 +9003,6 @@ class TestCuteBackend(TestCase):
 
         self.assertNotEqual(key0, key1)
         self.assertIsNot(identity.bind(args), bound)
-
-    def test_isolated_bound_does_not_publish_cute_specializations(self) -> None:
-        identity = _runtime_identity_kernel()
-        args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
-        bound = identity._bind_isolated(args)
-        kernel_mod = importlib.import_module("helion.runtime.kernel")
-
-        with (
-            patch.object(
-                kernel_mod,
-                "_cute_grouped_static_tail_extra_descriptors",
-                return_value=(("cute_grouped_static_tail", 1, 1, 128, None, None),),
-            ),
-            patch.object(
-                identity,
-                "_extend_bound_kernel_specializations",
-                side_effect=AssertionError("isolated bind published specialization"),
-            ),
-        ):
-            bound._register_cute_grouped_static_tail_specializations()
-
-        self.assertFalse(identity._cute_grouped_static_tail_extra_descriptors)
-
-    def test_concurrent_cute_specialization_registration_deduplicates(self) -> None:
-        identity = _runtime_identity_kernel()
-        args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
-        bound = identity.bind(args)
-        descriptor = ("cute_grouped_static_tail", 1, 1, 128, None, None)
-        extractor_entered = threading.Event()
-        release_extractor = threading.Event()
-
-        class TrackedRLock:
-            def __init__(self) -> None:
-                self._lock = threading.RLock()
-                self._state_lock = threading.Lock()
-                self._owner: int | None = None
-                self._depth = 0
-                self.contended = threading.Event()
-
-            def __enter__(self) -> Self:
-                thread_id = threading.get_ident()
-                with self._state_lock:
-                    if self._owner is not None and self._owner != thread_id:
-                        self.contended.set()
-                self._lock.acquire()
-                with self._state_lock:
-                    if self._owner == thread_id:
-                        self._depth += 1
-                    else:
-                        self._owner = thread_id
-                        self._depth = 1
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                with self._state_lock:
-                    self._depth -= 1
-                    if self._depth == 0:
-                        self._owner = None
-                self._lock.release()
-
-        tracked_lock = TrackedRLock()
-        extractor_calls = 0
-        extractor_calls_lock = threading.Lock()
-
-        def blocking_extractor(_args: object) -> Hashable:
-            nonlocal extractor_calls
-            with extractor_calls_lock:
-                extractor_calls += 1
-                first_call = extractor_calls == 1
-            if first_call:
-                extractor_entered.set()
-                self.assertTrue(release_extractor.wait(5))
-            return (1,)
-
-        kernel_mod = importlib.import_module("helion.runtime.kernel")
-        with (
-            patch.object(identity, "_bind_lock", tracked_lock),
-            patch.object(
-                kernel_mod,
-                "_cute_grouped_static_tail_extra_descriptors",
-                return_value=(descriptor,),
-            ),
-            patch.object(
-                kernel_mod,
-                "_make_cute_grouped_static_tail_extractor",
-                return_value=blocking_extractor,
-            ),
-            ThreadPoolExecutor(max_workers=2) as pool,
-        ):
-            first = pool.submit(
-                bound._register_cute_grouped_static_tail_specializations
-            )
-            self.assertTrue(extractor_entered.wait(5))
-            second = pool.submit(
-                bound._register_cute_grouped_static_tail_specializations
-            )
-            try:
-                self.assertTrue(tracked_lock.contended.wait(5))
-            finally:
-                release_extractor.set()
-            first.result(timeout=5)
-            second.result(timeout=5)
-
-        signature = bound._base_spec_key
-        self.assertEqual(len(identity._specialize_extra[signature]), 1)
-        self.assertEqual(
-            identity._cute_grouped_static_tail_extra_descriptors[signature],
-            {descriptor},
-        )
 
     def test_kernel_growing_late_specialization_evicts_all_stale_keys(self) -> None:
         identity = _runtime_identity_kernel()
@@ -10665,12 +10209,7 @@ class TestCuteBackendRequirements(TestCase):
         from helion._compiler.cute import cutedsl_compat
 
         self.addCleanup(cutedsl_compat.cute_math_min_max_available.cache_clear)
-        for version, expected in (
-            ("4.5.1", False),
-            ("4.6.0", True),
-            ("4.6.1", True),
-            ("4.7.0", True),
-        ):
+        for version, expected in (("4.5.1", False), ("4.6.0", True), ("4.6.1", True)):
             with self.subTest(version=version):
                 cutedsl_compat.cute_math_min_max_available.cache_clear()
                 with patch.object(

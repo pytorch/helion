@@ -26,9 +26,6 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
-from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
-from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
 from .._compiler.cute.tcgen05_constants import (
@@ -73,9 +70,8 @@ from .stack_tensor import StackTensor
 if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
-    from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
+    from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
-    from .._compiler.cute.fragment_epilogue import Tcgen05PairEpiloguePlan
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
 
@@ -99,7 +95,6 @@ class _AuxStepRecord:
     the per-output-tile setup and per-subtile load helpers.
     """
 
-    expr: _AuxiliaryTensorLoadExpr
     aux_tensor_name: str
     broadcast_axis: int | None
     has_leading_passthrough: bool
@@ -1529,7 +1524,6 @@ def _codegen_cute_store_tcgen05_tile(
     value_name: str,
     epilogue_chain: Tcgen05UnaryEpilogueChain | None = None,
     grouped_tail_epilogue: Tcgen05GroupedTailEpilogueMatch | None = None,
-    pair_epilogue: Tcgen05PairEpiloguePlan | None = None,
 ) -> list[ast.AST] | ast.AST | None:
     df = state.device_function
     candidate_names = df.variable_aliases(value_name)
@@ -1584,30 +1578,20 @@ def _codegen_cute_store_tcgen05_tile(
             "tcgen05 matmul store requires the exact zero-offset output tile axes",
         )
     if tcgen05_value.pure_matmul_role_lifecycle:
-        if (
-            epilogue_chain is not None
-            or grouped_tail_epilogue is not None
-            or pair_epilogue is not None
-        ):
+        if epilogue_chain is not None or grouped_tail_epilogue is not None:
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 pure role-lifecycle supports only identity pure-matmul stores",
             )
     if tcgen05_value.orientation is Tcgen05Orientation.NM and (
-        epilogue_chain is not None
-        or grouped_tail_epilogue is not None
-        or pair_epilogue is not None
+        epilogue_chain is not None or grouped_tail_epilogue is not None
     ):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 N,M-oriented worklist path supports only an identity BF16 store",
         )
     assert (
-        sum(
-            value is not None
-            for value in (epilogue_chain, grouped_tail_epilogue, pair_epilogue)
-        )
-        <= 1
+        sum(value is not None for value in (epilogue_chain, grouped_tail_epilogue)) <= 1
     )
     # When one matmul accumulator fans out to multiple output stores (e.g.
     # aux = pre-activation and out = gelu(pre)), the per-matmul TMA-store
@@ -1874,7 +1858,7 @@ def _codegen_cute_store_tcgen05_tile(
         epi_warp_ids += ","
 
     # Per-aux-step plumbing: per-thread auxiliary tensor reads at
-    # the splice site. For each ``_AuxiliaryTensorLoadExpr`` in the
+    # the splice site. For each ``_AuxiliaryTensorStep`` in the
     # chain we register the auxiliary tensor as a kernel arg,
     # allocate fresh AST var names for the partitioning chain, and
     # later (inside each per-thread splice site) emit per-subtile
@@ -1883,27 +1867,9 @@ def _codegen_cute_store_tcgen05_tile(
     # ``ttr_aux_subtile.load()`` form. SIMT-store edge tiles use a
     # predicated GMEM-to-register copy first, so the aux read observes
     # the same runtime predicate as the output store.
-    aux_steps_in_chain: tuple[_AuxiliaryTensorLoadExpr, ...] = (
-        epilogue_chain.auxiliary_tensor_loads if epilogue_chain is not None else ()
+    aux_steps_in_chain: tuple[_AuxiliaryTensorStep, ...] = (
+        epilogue_chain.auxiliary_tensor_steps if epilogue_chain is not None else ()
     )
-    tcgen05_aux_load_placement = df.config.get(
-        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
-        TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
-    )
-    if tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT:
-        if not aux_steps_in_chain:
-            raise exc.InvalidConfig(
-                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
-                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the epilogue has "
-                "no per-subtile auxiliary loads to place"
-            )
-        if tcgen05_value.partial_output_tma_store:
-            raise exc.InvalidConfig(
-                f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
-                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: per-subtile "
-                "auxiliary loads cannot precede the accumulator wait for a "
-                "partial-output TMA-store epilogue"
-            )
 
     aux_step_records: list[_AuxStepRecord] = []
     for aux_idx, aux_step in enumerate(aux_steps_in_chain):
@@ -1930,7 +1896,6 @@ def _codegen_cute_store_tcgen05_tile(
         )
         aux_step_records.append(
             _AuxStepRecord(
-                expr=aux_step,
                 aux_tensor_name=aux_tensor_name,
                 broadcast_axis=aux_step.broadcast_axis,
                 has_leading_passthrough=aux_torch_tensor.ndim == 3,
@@ -1970,13 +1935,12 @@ def _codegen_cute_store_tcgen05_tile(
                     df.new_var(f"tcgen05_aux_rmem_full_{aux_idx}")
                     if (
                         aux_step.broadcast_axis in (0, 1)
-                        and tcgen05_aux_load_placement
-                        == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
                         and tcgen05_is_two_cta_m128(
                             is_two_cta=tcgen05_lifecycle.is_two_cta,
                             bm=tcgen05_value.bm,
                         )
                         and tcgen05_value.use_tma_store_epilogue
+                        and not tcgen05_value.partial_output_tma_store
                     )
                     else None
                 ),
@@ -2465,7 +2429,7 @@ def _codegen_cute_store_tcgen05_tile(
 
         For the broadcast form the helper first builds a 2-D view
         of the underlying rank-1 tensor with stride 0 on the
-        orthogonal axis (see :class:`_AuxiliaryTensorLoadExpr` for the
+        orthogonal axis (see :class:`_AuxiliaryTensorStep` for the
         canonical contract).
 
         When ``define_thr_copy_t2r`` is True the helper emits the
@@ -2829,56 +2793,6 @@ def _codegen_cute_store_tcgen05_tile(
                     + "\n",
                 ]
             )
-        # Broadcast auxiliaries are partitioned against the same accumulator
-        # carrier, so their fragments share an index domain, coordinates, and
-        # validity predicate. Load all of them in one scalar edge loop instead
-        # of traversing that coordinate fragment once per auxiliary tensor.
-        if (
-            force_simt_edge_aux
-            and len(aux_step_records) >= 2
-            and all(rec.broadcast_axis is not None for rec in aux_step_records)
-        ):
-            for rec in aux_step_records:
-                lines.extend(
-                    [
-                        (
-                            f"{prelude_indent}{rec.ttr_aux_subtile} = "
-                            f"{rec.ttr_aux_grouped}[(None, None, None, "
-                            "cutlass.Int32(_tcgen05_subtile))]\n"
-                        ),
-                        (
-                            f"{prelude_indent}{rec.aux_rmem} = "
-                            f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
-                            f"{rec.aux_dtype})\n"
-                        ),
-                        f"{prelude_indent}{rec.aux_rmem}.fill(0)\n",
-                    ]
-                )
-            first_rec = aux_step_records[0]
-            lines.extend(
-                [
-                    _simt_edge_coord_subtile_source(prelude_indent),
-                    (
-                        f"{prelude_indent}for _edge_i in range(cute.size("
-                        f"{first_rec.ttr_aux_subtile}.shape)):\n"
-                    ),
-                    f"{prelude_indent}    _coord = {ttr_cc_subtile}[_edge_i]\n",
-                    (
-                        f"{prelude_indent}    if cute.elem_less("
-                        f"_coord, ({m_size}, {n_size})):\n"
-                    ),
-                ]
-            )
-            for rec in aux_step_records:
-                lines.append(
-                    f"{prelude_indent}        {rec.aux_rmem}[_edge_i] = "
-                    f"{rec.ttr_aux_subtile}[_edge_i]\n"
-                )
-            for rec in aux_step_records:
-                lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
-                )
-            return "".join(lines)
         for aux_idx, rec in enumerate(aux_step_records):
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
             if (
@@ -3078,21 +2992,6 @@ def _codegen_cute_store_tcgen05_tile(
         chain.
         """
         load_expr = f"{carrier_name}.load()"
-        if pair_epilogue is not None:
-            coordinate_setup, coordinate_name = _coord_subtile_source(
-                prelude_indent, coord_layout, include_setup=True
-            )
-            from .._compiler.cute.fragment_epilogue import render_tcgen05_pair_epilogue
-
-            pair_prelude, pair_expression = render_tcgen05_pair_epilogue(
-                state,
-                pair_epilogue,
-                carrier_name=carrier_name,
-                coordinate_name=coordinate_name,
-                target_dtype=target_dtype,
-                indent=prelude_indent,
-            )
-            return "", coordinate_setup + pair_prelude, pair_expression
         if epilogue_chain is None or not epilogue_chain.steps:
             rhs = load_expr
             late_prelude = ""
@@ -3120,35 +3019,12 @@ def _codegen_cute_store_tcgen05_tile(
             force_simt_edge_aux=force_simt_edge_aux,
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
         )
-        aux_locals_by_expr = {rec.expr: rec.aux_loaded for rec in aux_step_records}
-        assert len(aux_locals_by_expr) == len(aux_step_records)
-        if (
-            len(epilogue_chain.steps) == 1
-            and epilogue_chain.steps[0].hoistable_aux_expr is not None
-        ):
-            # The auxiliary expression does not depend on the accumulator.
-            # Form it with the auxiliary-load prelude so pre-wait placement can
-            # overlap its loads and elementwise operations with the MMA tail.
-            expr_step = epilogue_chain.steps[0]
-            aux_expr_prelude, aux_expr = (
-                expr_step.render_hoistable_aux_prelude_and_expr(
-                    aux_locals_by_expr,
-                    df.new_var,
-                    prelude_indent,
-                )
-            )
-            final_expr = df.new_var("tcgen05_chain_step")
-            rendered_step = expr_step.render_with_hoisted_aux(loaded, aux_expr)
-            return (
-                early_aux_prelude + aux_expr_prelude,
-                prelude_load + f"{prelude_indent}{final_expr} = {rendered_step}\n",
-                f"({final_expr}).to({target_dtype})",
-            )
+        aux_locals: tuple[str, ...] = tuple(rec.aux_loaded for rec in aux_step_records)
         chain_prelude, final_expr = epilogue_chain.render_prelude_and_expr(
             loaded,
             df.new_var,
             prelude_indent,
-            aux_locals_by_expr=aux_locals_by_expr or None,
+            aux_locals_by_step=aux_locals or None,
         )
         return (
             early_aux_prelude,
@@ -3242,8 +3118,6 @@ def _codegen_cute_store_tcgen05_tile(
         }
         if leading_passthrough_output:
             d_tma_plan["d_leading_passthrough"] = True
-        if tcgen05_value.output_column_major:
-            d_tma_plan["d_column_major"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
         if d_tma_uses_tail_rank3_mnl_tensor:
             tail_d_tma_plan = {
@@ -3526,19 +3400,9 @@ def _codegen_cute_store_tcgen05_tile(
             )
         return static_setup, tile_setup
 
-    # A hybrid TMA/SIMT epilogue reaches SIMT only for edge tiles. A static
-    # output smaller than its selected tile also cannot produce a full tile,
-    # independent of whether its storage is row-major or column-major.
     simt_edge_only = (
         tcgen05_value.tma_store_full_tiles_only
         and not grouped_dynamic_d_tensormap_edge_only
-    )
-    static_m_size = tensor.shape[-2]
-    static_n_size = tensor.shape[-1]
-    simt_edge_only = simt_edge_only or (
-        isinstance(static_m_size, int)
-        and isinstance(static_n_size, int)
-        and (static_m_size < tcgen05_value.bm or static_n_size < tcgen05_value.bn)
     )
     simt_edge_aux_atoms: dict[int, str] = {}
     simt_edge_aux_atom_setup: list[str] = []
@@ -3564,26 +3428,6 @@ def _codegen_cute_store_tcgen05_tile(
         force_simt_edge_aux=simt_edge_only,
     )
     simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
-    # SIMT auxiliary loads are independent of the accumulator. Edge-only
-    # stores always issue them early; full-tile SIMT stores do so when the
-    # placement config explicitly requests it. In either case their GMEM
-    # latency overlaps the MMA tail, and TMEM is copied only after the wait.
-    prefetch_simt_aux = (
-        (
-            simt_edge_only
-            or (
-                tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
-                and not tcgen05_value.use_tma_store_epilogue
-            )
-        )
-        and bool(aux_steps_in_chain)
-        and not is_secondary_store
-    )
-    simt_acc_wait = (
-        "        if _tcgen05_subtile == 0:\n"
-        f"            {tcgen05_lifecycle.acc_pipeline}.consumer_wait("
-        f"{tcgen05_lifecycle.acc_consumer_state})\n"
-    )
     if tcgen05_value.use_tma_store_epilogue:
         tma_static_store_setup, tma_tile_store_setup = store_common_setup(
             tcgen05_value.tma_store_tensor,
@@ -3796,14 +3640,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
         *(
-            [
+            []
+            if is_secondary_store
+            else [
                 (
                     f"if {tcgen05_lifecycle.epi_active}:\n"
                     f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
                 )
             ]
-            if not (is_secondary_store or prefetch_simt_aux)
-            else []
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
@@ -3858,14 +3702,9 @@ def _codegen_cute_store_tcgen05_tile(
             f"    if {tcgen05_lifecycle.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-            + (f"{simt_early_aux}{simt_acc_wait}" if prefetch_simt_aux else "")
-            + f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            + (
-                f"{simt_late_prelude}"
-                if prefetch_simt_aux
-                else f"{simt_acc_vec_prelude}"
-            )
-            + f"        {acc_vec} = {simt_acc_vec_rhs}\n"
+            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            f"{simt_acc_vec_prelude}"
+            f"        {acc_vec} = {simt_acc_vec_rhs}\n"
             f"        {ttr_rd}.store({acc_vec})\n"
             # The secondary fan-out store reuses the still-live accumulator and
             # must not release it; the primary store owns the release + advance.
@@ -4282,10 +4121,13 @@ def _codegen_cute_store_tcgen05_tile(
     ) -> str:
         """Return the t2r/math/store-source region.
 
-        The default path renders the aux prelude after the TMEM→register
-        copy to keep large residual fragments out of the store prefix. The
-        compact M64 and two-CTA M128 scaled-FP8 paths prefetch their small
-        scale fragments before the accumulator wait to hide the LDG latency.
+        The aux prelude is rendered inside ``body`` immediately after
+        the TMEM→register copy and before ``acc.load()`` / fused math.
+        Keeping residual and bias fragments out of the acquire/T2R
+        prefix shortens their live ranges through the R2S store path;
+        the long-scoreboard overlap from the older hoist was less
+        valuable on the packed Target8 epilogue than eliminating the
+        resulting local-memory spills.
         """
         assert allow_aux_chain or not aux_steps_in_chain, (
             "split/helper epilogue layouts reject aux-tensor chains at validate "
@@ -4314,15 +4156,11 @@ def _codegen_cute_store_tcgen05_tile(
                 f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
             )
         )
-        pre_wait_aux = (
-            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
-        )
         return (
-            f"{early_aux_prelude if pre_wait_aux else ''}"
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"{'' if pre_wait_aux else early_aux_prelude}"
+            f"{early_aux_prelude}"
             f"{late_prelude}"
             f"        {acc_vec} = {rhs}\n"
             f"{acc_release}"
@@ -4917,11 +4755,6 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{kernel_desc}, {tcgen05_aux_epi_tidx}, {tacc}, "
                 f"{tcgc_planned}, {epi_tile}, {tcgen05_lifecycle.is_two_cta!s})"
             ),
-            *(
-                [f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"]
-                if pair_epilogue is not None
-                else []
-            ),
             f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
             (
                 f"{tiled_copy_r2s}, {trs_rd}, {trs_sd} = "
@@ -5473,6 +5306,409 @@ def _codegen_cute_store_permute_lane_loops(
     )
 
 
+def _flydsl_reduction_col_block(
+    env: object, state: CodegenState, tensor: torch.Tensor, subscript: object
+) -> int | None:
+    """Block id of an active looped-reduction column a ``:`` slice reduces over.
+
+    Whole-row kernels (``x[tile_m, :]`` + ``mean(dim=-1)``) roll the ``:`` axis
+    into a reduction loop. This maps such a ``:`` to the reduction loop's block
+    id so the load/store indexes the column by that loop's element index
+    (``roffset + lane``, one element per thread) — correct for any N — instead
+    of a bare ``thread_idx.x`` that only ever covers the first 64 lanes.
+    """
+    red_blocks = [
+        bs.block_id
+        for bs in env.block_sizes
+        if bs.reduction and state.codegen.active_device_loops.get(bs.block_id)
+    ]
+    if not red_blocks:
+        return None
+
+    for ax, idx in enumerate(subscript):
+        if isinstance(idx, slice) and idx == slice(None):
+            try:
+                ax_hint = env.size_hint(tensor.size(ax))
+            except Exception:
+                continue
+            for bid in red_blocks:
+                if env.block_sizes[bid].size_hint() == ax_hint:
+                    return bid
+    return None
+
+
+_FLYDSL_COPY_CLS = {
+    8: "BufferCopy8b",
+    16: "BufferCopy16b",
+    32: "BufferCopy32b",
+    64: "BufferCopy64b",
+    128: "BufferCopy128b",
+}
+
+
+def _flydsl_copy_cls(bits: int) -> str:
+    """BufferCopy class for a ``bits``-wide transaction, else BackendUnsupported.
+
+    A single BufferCopy tops out at 128 bits, so e.g. fp32 V=8 (256-bit) is not
+    representable -- reject it cleanly instead of raising a raw KeyError. The
+    autotuner only enumerates V that keep ``V * element_bits <= 128``.
+    """
+    cls = _FLYDSL_COPY_CLS.get(bits)
+    if cls is None:
+        raise exc.BackendUnsupported(
+            "flydsl", f"vector copy width {bits} bits (max 128; reduce vec width V)"
+        )
+    return cls
+
+
+def _flydsl_col_tail_pred(
+    state: CodegenState, offset_var: str, vec: int, n_expr: str, lane_mod: int = 64
+) -> str:
+    """Per-element column predicate that masks the reduction-loop tail.
+
+    Lane ``l`` at loop offset ``offset_var`` owns columns
+    ``offset_var + l*vec + j`` for ``j in range(vec)``. Returns a length-``vec``
+    bool vector ``col < N`` so out-of-range columns (present when N is not a
+    multiple of the chunk ``lane_mod*vec``) can be dropped from
+    loads/reductions/stores. ``lane_mod`` is the reduction thread_count (= 64*W);
+    lanes span 0..lane_mod-1 across the W wavefronts.
+    """
+
+    _elems = ", ".join(str(j) for j in range(vec))
+    iota = f"fx.Vector.from_elements([{_elems}], fx.Int32)"
+    col_base = f"({offset_var} + (fx.thread_idx.x % {lane_mod}) * {vec})"
+    return f"(({col_base}) + {iota}) < ({n_expr})"
+
+
+@_decorators.codegen(store, "flydsl")
+def _(state: CodegenState) -> ast.AST | None:
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    value = state.ast_arg(2)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
+
+    env = CompileEnvironment.current()
+    backend = env.backend
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    use_buffer = getattr(backend, "_tensor_use_buffer", {}).get(id(tensor), False)
+
+    if use_buffer and tensor.ndim == 1:
+        # Rank-1 scalar store (e.g. inv_rms[tile_m] = per-row reduced scalar):
+        # one element per row, not a vectorized column store. Slicing a rank-1
+        # memref with a 2-tuple fails the flydsl profile check, so store the
+        # scalar directly at element ``idx_expr`` of the buffer. All 64 lanes
+        # hold the same reduced value and index, so the write is idempotent.
+        row_block_id = 0
+        for idx in subscript:
+            if isinstance(idx, torch.SymInt):
+                bid = env.get_block_id(idx)
+                if bid is not None:
+                    row_block_id = bid
+                    break
+        idx_expr = state.codegen.index_var(row_block_id)
+        buf = state.codegen.lift(
+            expr_from_string(f"fx.rocdl.make_buffer_tensor({tensor_name})"),
+            prefix="flydsl_buf",
+            dce=True,
+        )
+        state.add_statement(
+            statement_from_string(
+                f"fx.memref_store({{value}}, {buf.id}, {idx_expr})", value=value
+            )
+        )
+        return None
+
+    if use_buffer:
+        row_block_id = 0
+        col_block_id = None
+        seen_row = False
+        if tensor.ndim == 1:
+            # A 1-D tensor loaded alongside 2-D tiles (e.g. weight[tile_n]) is
+            # indexed along its column/vector dimension and broadcasts across
+            # rows, so its sole block id is the column, not the row. This routes
+            # it through the vectorized path with the same 128-bit vec width and
+            # column chunk index as the 2-D operands it multiplies against.
+            for idx in subscript:
+                if isinstance(idx, torch.SymInt):
+                    bid = env.get_block_id(idx)
+                    if bid is not None:
+                        col_block_id = bid
+                        break
+        else:
+            for idx in subscript:
+                if isinstance(idx, torch.SymInt):
+                    bid = env.get_block_id(idx)
+                    if bid is not None:
+                        if not seen_row:
+                            row_block_id = bid
+                            seen_row = True
+                        else:
+                            col_block_id = bid
+                            break
+
+        # Reduction-column ``:`` (whole-row rolled reduction): index the column
+        # by the reduction loop's element index (roffset + lane), one element
+        # per thread (vec_width 1), so any N is covered by looping over the axis.
+        # Only when no explicit tile-n block id was found in the subscript.
+
+        is_redcol = False
+        if col_block_id is None:
+            _rc = _flydsl_reduction_col_block(env, state, tensor, subscript)
+            if _rc is not None:
+                col_block_id = _rc
+                is_redcol = True
+        # Per-thread vec width for a looped reduction column = chunk / threads
+        # (V contiguous elems/thread). Read it from the reduction strategy so the
+        # load tiles V elements per thread and loops over N. redcol_offset is the
+        # loop's element offset; the chunk index is ``offset // V + lane``.
+        redcol_vec = 1
+        redcol_offset: str | None = None
+        if is_redcol:
+            _rs = state.device_function.tile_strategy.block_id_to_strategy.get(
+                (col_block_id,)
+            )
+            _tc = getattr(_rs, "_thread_count", 0) or 0
+            _lb = getattr(_rs, "_loop_block_size", 0) or 0
+
+            if _rs is not None and _tc > 0 and _lb >= _tc:
+                redcol_vec = max(1, _lb // _tc)
+                redcol_offset = _rs.offset_var(col_block_id)
+        # Column tail: when N is not a multiple of the chunk (64*V), the last
+        # loop pass reads/writes past column N. Build a per-element predicate to
+        # drop those out-of-range columns from loads, reductions and stores.
+        redcol_pred: str | None = None
+        if is_redcol and redcol_offset is not None:
+            _numel = env.block_sizes[col_block_id].numel
+            if not env.known_multiple(_numel, _lb):
+                redcol_pred = _flydsl_col_tail_pred(
+                    state,
+                    redcol_offset,
+                    redcol_vec,
+                    state.sympy_expr(_numel),
+                    lane_mod=_tc if _tc > 0 else 64,
+                )
+        # Scalar path (col_block_id is None): x[tile_m,:] -- thread t loads column t, M must equal 64.
+        # Vectorized path (col_block_id is not None): x[tile_m,tile_n] -- 4 elems/thread, 256/tile.
+        # Keep separate div/atom per (tensor, mode) so both paths can coexist for the same tensor.
+        is_vec = col_block_id is not None
+        if getattr(backend, "_flydsl_warps_per_row", 1) > 1:
+            assert col_block_id is not None, (
+                "flydsl W>1 regime requires the vectorized (2D-tile) path"
+            )
+
+        device_fn = state.device_function
+        if not hasattr(device_fn, "_flydsl_setup"):
+            device_fn._flydsl_setup = {}
+
+        setup_key = (tensor_name, is_vec, is_redcol)
+        setup = device_fn._flydsl_setup.get(setup_key)
+        if setup is None:
+            _hoist = None
+            if (
+                col_block_id is not None
+                and state.codegen.active_device_loops[col_block_id]
+            ):
+                _hoist = state.codegen.active_device_loops[col_block_id][
+                    -1
+                ].outer_prefix
+            # Loop-invariant setup (buffer/row/logical_divide/copy_atom). Under a
+            # runtime scf.for reduction the reduce-loop body is lifted into its
+            # own function, so setup emitted inside it is invisible to the sibling
+            # normalize-loop body (NameError). set_statements redirects these
+            # lifts to the reduction loop's outer_prefix (enclosing scope) so both
+            # loop-body functions can close over them; a no-op (None) otherwise.
+            with state.codegen.set_statements(_hoist):
+                bid_expr = state.codegen.index_var(
+                    row_block_id
+                )  # pid*bm + warp_id (warp-per-row)
+                buf = state.codegen.lift(
+                    expr_from_string(
+                        f"fx.rocdl.make_buffer_tensor({tensor_name})",
+                    ),
+                    prefix="flydsl_buf",
+                    dce=True,
+                )
+                if tensor.ndim == 1:
+                    # 1-D load (e.g. weight[:] broadcast or weight[tile_n]): the
+                    # whole rank-1 buffer is the vector; there is no separate row
+                    # dimension to slice. Slicing a rank-1 memref with a 2-tuple
+                    # fails the flydsl profile check.
+                    row = buf
+                else:
+                    row = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.slice({buf.id}, ({bid_expr}, None))",
+                        ),
+                        prefix="flydsl_row",
+                        dce=True,
+                    )
+                if is_vec:
+                    # The vectorized path tiles 256 columns/warp across 64 threads =
+                    # 4 elements/thread (design invariant, dtype-independent). The
+                    # copy transaction width follows from the dtype so the register
+                    # (vec_width * element bits) matches the copy. Previously this
+                    # used vec_width = 128 // bits (= 8 for fp16) with a hardcoded
+                    # 128-bit copy, which both over-provisioned the 64-thread tiling
+                    # (32 chunks vs 64 threads -> wrong fp16 results) and mismatched
+                    # the 64-bit fp16 register (invalid bitcast).
+
+                    vec_width = redcol_vec if is_redcol else 4
+                    _elem_bits = tensor.element_size() * 8
+                    _bits = vec_width * _elem_bits
+
+                    _copy_cls = _flydsl_copy_cls(_bits)
+                    div = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.logical_divide({row.id}, fx.make_layout({vec_width}, 1))",
+                        ),
+                        prefix="flydsl_div",
+                        dce=True,
+                    )
+                    atom = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.make_copy_atom(fx.rocdl.{_copy_cls}(), {_bits})"
+                        ),
+                        prefix="flydsl_atom",
+                        dce=True,
+                    )
+                else:
+                    # Derive vec_width from column size: col // 64 threads, supported widths 1/2/4.
+                    # M=64 -> 1x32b, M=128 -> 2x64b, M>=256 -> 4x128b.
+                    _col = tensor.shape[-1]
+                    vec_width = max(1, min(4, _col // 64))
+                    if vec_width == 3:
+                        vec_width = 2
+                    # Copy width must match the register size = vec_width * element
+                    # bits, NOT vec_width * 32 (which assumed 32-bit elements and
+                    # paired a 128-bit copy with a 64-bit fp16 register, producing an
+                    # invalid ``bitcast i128 -> vector<4xf16>`` at LLVM translation).
+                    _elem_bits = tensor.element_size() * 8
+                    _bits = vec_width * _elem_bits
+
+                    _copy_cls = _flydsl_copy_cls(_bits)
+                    div = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.logical_divide({row.id}, fx.make_layout({vec_width}, 1))",
+                        ),
+                        prefix="flydsl_div",
+                        dce=True,
+                    )
+                    atom = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.make_copy_atom(fx.rocdl.{_copy_cls}(), {_bits})"
+                        ),
+                        prefix="flydsl_atom",
+                        dce=True,
+                    )
+
+            setup = {"div": div.id, "atom": atom.id, "vec": vec_width, "row": row.id}
+            device_fn._flydsl_setup[setup_key] = setup
+
+        dtype_str = backend.dtype_str(tensor.dtype)
+        vec_width = setup["vec"]
+        r_var = f"_r_{tensor_name}_s"
+        state.add_statement(
+            statement_from_string(
+                f"{r_var} = fx.make_rmem_tensor({vec_width}, {dtype_str})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"fx.memref_store_vec({{value}}, {r_var})", value=value
+            )
+        )
+
+        if is_redcol and redcol_offset is not None:
+            # V contiguous elems/thread at chunk index ``offset // V + lane``.
+            # Lane spans the reduction's thread_count (= 64*W waves/row), not 64.
+            _lane_mod = _tc if _tc > 0 else 64
+            chunk_idx_s = (
+                f"({redcol_offset}) // {vec_width} + fx.thread_idx.x % {_lane_mod}"
+            )
+        elif is_vec:
+            chunk_idx_s = state.codegen.index_var(col_block_id)
+        else:
+            chunk_idx_s = "fx.thread_idx.x"
+
+        _atom_name = setup["atom"]
+        _div_name = setup["div"]
+        # Explicit hl.tile(n) column tail: N not a multiple of the per-iteration
+        # span (4 * 64 * W) -> the last chunk's high lanes address past column N.
+        _expl_tail = (
+            is_vec
+            and not is_redcol
+            and not env.known_multiple(
+                env.block_sizes[col_block_id].numel,
+                4 * 64 * (getattr(backend, "_flydsl_warps_per_row", 1) or 1),
+            )
+        )
+        if redcol_pred is not None:
+            # Column tail: the vectorized BufferCopy is a single transaction and
+            # cannot be predicated per element, so (like CuTe's scalar edge
+            # fallback) emit one guarded scalar store per element. Element j of
+            # this thread is column ``offset + lane*V + j``; store it only when
+            # in range so tail columns are never written into the next row.
+            _n_expr = state.sympy_expr(env.block_sizes[col_block_id].numel)
+            _row = setup["row"]
+            _lane_mod = _tc if _tc > 0 else 64
+            for _j in range(vec_width):
+                _colj = (
+                    f"{redcol_offset} + (fx.thread_idx.x % {_lane_mod}) "
+                    f"* {vec_width} + {_j}"
+                )
+                state.add_statement(
+                    statement_from_string(
+                        f"if ({_colj}) < ({_n_expr}):\n"
+                        f"    fx.memref_store(fx.memref_load({r_var}, {_j}), {_row}, {_colj})"
+                    )
+                )
+        elif _expl_tail:
+            # Explicit-tile column tail: guarded scalar stores (the vectorized
+            # BufferCopy can't be per-element predicated). Element j of this thread
+            # is column ``chunk_idx * 4 + j``; store only when in range so tail
+            # columns are never written into the next row.
+            _n_expr = state.sympy_expr(env.block_sizes[col_block_id].numel)
+            _row = setup["row"]
+            for _j in range(vec_width):
+                _colj = f"(({chunk_idx_s}) * {vec_width}) + {_j}"
+                state.add_statement(
+                    statement_from_string(
+                        f"if ({_colj}) < ({_n_expr}):\n"
+                        f"    fx.memref_store(fx.memref_load({r_var}, {_j}), {_row}, {_colj})"
+                    )
+                )
+        else:
+            state.add_statement(
+                statement_from_string(
+                    f"fx.copy_atom_call({_atom_name}, {r_var}, fx.slice({_div_name}, (None, {chunk_idx_s})))"
+                )
+            )
+        return None
+    # simple element-wise store
+    parts = []
+    for idx in subscript:
+        if idx is None:
+            continue
+        if isinstance(idx, slice) and idx == slice(None):
+            parts.append("fx.thread_idx.x")
+        elif isinstance(idx, torch.SymInt):
+            bid = env.get_block_id(idx)
+            if bid is not None:
+                parts.append(state.codegen.index_var(bid))
+            else:
+                parts.append(state.sympy_expr(idx))
+        elif isinstance(idx, int):
+            parts.append(str(idx))
+    idx_str = ", ".join(parts)
+    state.add_statement(
+        statement_from_string(f"{tensor_name}[{idx_str}] = {{value}}", value=value)
+    )
+    return None
+
+
 # TODO(joydddd): Add support for stack tensor in ref mode.
 @_decorators.ref(store)
 def _(
@@ -5660,6 +5896,407 @@ def _maybe_materialize_tile_index_load(
         else:
             raise AssertionError(f"Unexpected index type in tile_index load: {idx}")
     return expr_from_string(f"{base_var}[{', '.join(parts)}]")
+
+
+@_decorators.codegen(load, "flydsl")
+def _(state: CodegenState) -> ast.AST | None:
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
+
+    env = CompileEnvironment.current()
+    backend = env.backend
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    use_buffer = getattr(backend, "_tensor_use_buffer", {}).get(id(tensor), False)
+
+    if use_buffer:
+        # buffer tensor path for both x[tile_n,:] and x[tile_m,tile_n].
+        # Find row block_id (first SymInt) and col block_id (second SymInt, if any).
+        row_block_id = 0
+        col_block_id = None
+        seen_row = False
+        if tensor.ndim == 1:
+            # A 1-D tensor loaded alongside 2-D tiles (e.g. weight[tile_n]) is
+            # indexed along its column/vector dimension and broadcasts across
+            # rows, so its sole block id is the column, not the row. This routes
+            # it through the vectorized path with the same 128-bit vec width and
+            # column chunk index as the 2-D operands it multiplies against.
+            for idx in subscript:
+                if isinstance(idx, torch.SymInt):
+                    bid = env.get_block_id(idx)
+                    if bid is not None:
+                        col_block_id = bid
+                        break
+        else:
+            for idx in subscript:
+                if isinstance(idx, torch.SymInt):
+                    bid = env.get_block_id(idx)
+                    if bid is not None:
+                        if not seen_row:
+                            row_block_id = bid
+                            seen_row = True
+                        else:
+                            col_block_id = bid
+                            break
+
+        # Reduction-column ``:`` (whole-row rolled reduction): index the column
+        # by the reduction loop's element index (roffset + lane), one element
+        # per thread (vec_width 1), so any N is covered by looping over the axis.
+        # Only when no explicit tile-n block id was found in the subscript.
+
+        is_redcol = False
+        if col_block_id is None:
+            _rc = _flydsl_reduction_col_block(env, state, tensor, subscript)
+            if _rc is not None:
+                col_block_id = _rc
+                is_redcol = True
+        # Per-thread vec width for a looped reduction column = chunk / threads
+        # (V contiguous elems/thread). Read it from the reduction strategy so the
+        # load tiles V elements per thread and loops over N. redcol_offset is the
+        # loop's element offset; the chunk index is ``offset // V + lane``.
+        redcol_vec = 1
+        redcol_offset: str | None = None
+        if is_redcol:
+            _rs = state.device_function.tile_strategy.block_id_to_strategy.get(
+                (col_block_id,)
+            )
+            _tc = getattr(_rs, "_thread_count", 0) or 0
+            _lb = getattr(_rs, "_loop_block_size", 0) or 0
+
+            if _rs is not None and _tc > 0 and _lb >= _tc:
+                redcol_vec = max(1, _lb // _tc)
+                redcol_offset = _rs.offset_var(col_block_id)
+        # Column tail: when N is not a multiple of the chunk (64*V), the last
+        # loop pass reads/writes past column N. Build a per-element predicate to
+        # drop those out-of-range columns from loads, reductions and stores.
+        redcol_pred: str | None = None
+        if is_redcol and redcol_offset is not None:
+            _numel = env.block_sizes[col_block_id].numel
+            if not env.known_multiple(_numel, _lb):
+                redcol_pred = _flydsl_col_tail_pred(
+                    state,
+                    redcol_offset,
+                    redcol_vec,
+                    state.sympy_expr(_numel),
+                    lane_mod=_tc if _tc > 0 else 64,
+                )
+        # Scalar path (col_block_id is None): x[tile_m,:] -- thread t loads column t, M must equal 64.
+        # Vectorized path (col_block_id is not None): x[tile_m,tile_n] -- 4 elems/thread, 256/tile.
+        # Keep separate div/atom per (tensor, mode) so both paths can coexist for the same tensor.
+        is_vec = col_block_id is not None
+        if getattr(backend, "_flydsl_warps_per_row", 1) > 1:
+            assert col_block_id is not None, (
+                "flydsl W>1 regime requires the vectorized (2D-tile) path"
+            )
+
+        device_fn = state.device_function
+        if not hasattr(device_fn, "_flydsl_setup"):
+            device_fn._flydsl_setup = {}
+
+        setup_key = (tensor_name, is_vec, is_redcol)
+        setup = device_fn._flydsl_setup.get(setup_key)
+        if setup is None:
+            _hoist = None
+            if (
+                col_block_id is not None
+                and state.codegen.active_device_loops[col_block_id]
+            ):
+                _hoist = state.codegen.active_device_loops[col_block_id][
+                    -1
+                ].outer_prefix
+            # Loop-invariant setup (buffer/row/logical_divide/copy_atom). Under a
+            # runtime scf.for reduction the reduce-loop body is lifted into its
+            # own function, so setup emitted inside it is invisible to the sibling
+            # normalize-loop body (NameError). set_statements redirects these
+            # lifts to the reduction loop's outer_prefix (enclosing scope) so both
+            # loop-body functions can close over them; a no-op (None) otherwise.
+            with state.codegen.set_statements(_hoist):
+                bid_expr = state.codegen.index_var(
+                    row_block_id
+                )  # pid*bm + warp_id (warp-per-row)
+                buf = state.codegen.lift(
+                    expr_from_string(
+                        f"fx.rocdl.make_buffer_tensor({tensor_name})",
+                    ),
+                    prefix="flydsl_buf",
+                    dce=True,
+                )
+                if tensor.ndim == 1:
+                    # 1-D load (e.g. weight[:] broadcast or weight[tile_n]): the
+                    # whole rank-1 buffer is the vector; there is no separate row
+                    # dimension to slice. Slicing a rank-1 memref with a 2-tuple
+                    # fails the flydsl profile check.
+                    row = buf
+                else:
+                    row = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.slice({buf.id}, ({bid_expr}, None))",
+                        ),
+                        prefix="flydsl_row",
+                        dce=True,
+                    )
+                if is_vec:
+                    # The vectorized path tiles 256 columns/warp across 64 threads =
+                    # 4 elements/thread (design invariant, dtype-independent). The
+                    # copy transaction width follows from the dtype so the register
+                    # (vec_width * element bits) matches the copy. Previously this
+                    # used vec_width = 128 // bits (= 8 for fp16) with a hardcoded
+                    # 128-bit copy, which both over-provisioned the 64-thread tiling
+                    # (32 chunks vs 64 threads -> wrong fp16 results) and mismatched
+                    # the 64-bit fp16 register (invalid bitcast).
+
+                    vec_width = redcol_vec if is_redcol else 4
+                    _elem_bits = tensor.element_size() * 8
+                    _bits = vec_width * _elem_bits
+
+                    _copy_cls = _flydsl_copy_cls(_bits)
+                    div = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.logical_divide({row.id}, fx.make_layout({vec_width}, 1))",
+                        ),
+                        prefix="flydsl_div",
+                        dce=True,
+                    )
+                    atom = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.make_copy_atom(fx.rocdl.{_copy_cls}(), {_bits})"
+                        ),
+                        prefix="flydsl_atom",
+                        dce=True,
+                    )
+                else:
+                    # Derive vec_width from column size: col // 64 threads, supported widths 1/2/4.
+                    # M=64 -> 1x32b, M=128 -> 2x64b, M>=256 -> 4x128b.
+                    _col = tensor.shape[-1]
+                    vec_width = max(1, min(4, _col // 64))
+                    if vec_width == 3:
+                        vec_width = 2
+                    # Copy width must match the register size = vec_width * element
+                    # bits, NOT vec_width * 32 (which assumed 32-bit elements and
+                    # paired a 128-bit copy with a 64-bit fp16 register, producing an
+                    # invalid ``bitcast i128 -> vector<4xf16>`` at LLVM translation).
+                    _elem_bits = tensor.element_size() * 8
+                    _bits = vec_width * _elem_bits
+
+                    _copy_cls = _flydsl_copy_cls(_bits)
+                    div = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.logical_divide({row.id}, fx.make_layout({vec_width}, 1))",
+                        ),
+                        prefix="flydsl_div",
+                        dce=True,
+                    )
+                    atom = state.codegen.lift(
+                        expr_from_string(
+                            f"fx.make_copy_atom(fx.rocdl.{_copy_cls}(), {_bits})"
+                        ),
+                        prefix="flydsl_atom",
+                        dce=True,
+                    )
+
+            setup = {"div": div.id, "atom": atom.id, "vec": vec_width, "row": row.id}
+            device_fn._flydsl_setup[setup_key] = setup
+
+        dtype_str = backend.dtype_str(tensor.dtype)
+        vec_width = setup["vec"]
+        r_var = f"_r_{tensor_name}"
+
+        if is_redcol and redcol_offset is not None:
+            # V contiguous elems/thread at chunk index ``offset // V + lane``.
+            # Lane spans the reduction's thread_count (= 64*W waves/row), not 64.
+            _lane_mod = _tc if _tc > 0 else 64
+            chunk_idx = (
+                f"({redcol_offset}) // {vec_width} + fx.thread_idx.x % {_lane_mod}"
+            )
+        elif is_vec:
+            chunk_idx = state.codegen.index_var(col_block_id)
+        else:
+            chunk_idx = "fx.thread_idx.x"
+
+        # Explicit hl.tile(n) column tail: N not a multiple of the per-iteration
+        # span (4 * 64 * W) -> the last chunk's high lanes would read past column N
+        # via the vectorized BufferCopy. The AMD buffer descriptor has max_size set
+        # to 0xFFFFFFFF which should return 0 for OOB reads, but in practice the
+        # hardware still fires a GPU page fault when the byte address exceeds the
+        # tensor's actual allocation (e.g. N=640, last tile reads cols 640-767 which
+        # falls one page past the end). Use guarded scalar loads instead so no
+        # memory access ever goes past the last valid column.
+        _expl_tail = (
+            is_vec
+            and not is_redcol
+            and not env.known_multiple(
+                env.block_sizes[col_block_id].numel,
+                4 * 64 * (getattr(backend, "_flydsl_warps_per_row", 1) or 1),
+            )
+        )
+
+        state.add_statement(
+            statement_from_string(
+                f"{r_var} = fx.make_rmem_tensor({vec_width}, {dtype_str})"
+            )
+        )
+        _atom_name = setup["atom"]
+        _div_name = setup["div"]
+        _row = setup["row"]
+
+        if _expl_tail:
+            # Explicit-tile column tail: use guarded scalar loads to avoid reading
+            # past the tensor allocation. Element j of this thread is column
+            # ``chunk_idx * vec_width + j``; load from the row buffer only when
+            # in range, otherwise write the zero identity into r_var.
+            _n_expr = state.sympy_expr(env.block_sizes[col_block_id].numel)
+            _zero = f"{dtype_str}(0)"
+            for _j in range(vec_width):
+                _colj = f"(({chunk_idx}) * {vec_width}) + {_j}"
+                state.add_statement(
+                    statement_from_string(
+                        f"if ({_colj}) < ({_n_expr}):\n"
+                        f"    fx.memref_store(fx.memref_load({_row}, {_colj}), {r_var}, {_j})\n"
+                        f"else:\n"
+                        f"    fx.memref_store({_zero}, {r_var}, {_j})"
+                    )
+                )
+            return expr_from_string(f"fx.memref_load_vec({r_var})")
+
+        # Whole-row looped reduction tail with large OOB: when the last loop pass
+        # has threads whose chunk_idx exceeds the logical_divide layout by more than
+        # AMD's buffer-descriptor padding (~256 fp16 elements = 512 bytes), the
+        # unconditional copy_atom_call fires a GPU page fault even though the
+        # per-element predicate would zero the result afterward.  Fall back to
+        # guarded scalar loads (element-wise if-in-range) for these cases.
+        # OOB distance = chunk_idx_max − (numel // vec_width)
+        #              = chunk // V + thread_count − 1 − numel // V
+        # When _tc > 0 and _lb is set, compute and compare to the safe threshold.
+        _redcol_large_oob = False
+        if (
+            is_redcol
+            and redcol_pred is not None
+            and _tc > 0
+            and _lb > 0
+            and vec_width > 0
+        ):
+            import contextlib as _cl
+
+            _numel_int: int | None = None
+            _numel_sym = env.block_sizes[col_block_id].numel
+            with _cl.suppress(TypeError, ValueError):
+                _numel_int = int(_numel_sym)
+            if _numel_int is not None:
+                _chunk_idx_max = _lb // vec_width + _tc - 1
+                _div_layout_size = (_numel_int + vec_width - 1) // vec_width
+                _oob_elems = _chunk_idx_max - _div_layout_size
+                # Convert OOB elements to bytes and compare against the
+                # conservative lower-bound for PyTorch's ROCm allocator rounding
+                # (512 bytes).  AMD's buffer descriptor hardware returns 0 for OOB
+                # reads within allocated physical pages but page-faults once the
+                # byte address crosses into an unmapped page.  Using bytes (not
+                # elements) makes the threshold dtype-agnostic: fp16 allows
+                # 512/2=256 OOB elements, fp32 allows 512/4=128, int64 512/8=64.
+                _elem_bytes = tensor.element_size()
+                _SAFE_OOB_BYTES = 512
+                if _oob_elems * _elem_bytes > _SAFE_OOB_BYTES:
+                    _redcol_large_oob = True
+
+        if _redcol_large_oob:
+            # Use per-element guarded scalar loads: column of element j is
+            # redcol_offset + lane * vec_width + j (same as _colj in the store).
+            _n_expr_rl = state.sympy_expr(env.block_sizes[col_block_id].numel)
+            _lane_mod_rl = _tc if _tc > 0 else 64
+            _zero_rl = f"{dtype_str}(0)"
+            for _j in range(vec_width):
+                _colj_rl = (
+                    f"({redcol_offset}) + (fx.thread_idx.x % {_lane_mod_rl}) "
+                    f"* {vec_width} + {_j}"
+                )
+                state.add_statement(
+                    statement_from_string(
+                        f"if ({_colj_rl}) < ({_n_expr_rl}):\n"
+                        f"    fx.memref_store(fx.memref_load({_row}, {_colj_rl}), {r_var}, {_j})\n"
+                        f"else:\n"
+                        f"    fx.memref_store({_zero_rl}, {r_var}, {_j})"
+                    )
+                )
+            return expr_from_string(f"fx.memref_load_vec({r_var})")
+
+        state.add_statement(
+            statement_from_string(
+                f"fx.copy_atom_call({_atom_name}, fx.slice({_div_name}, (None, {chunk_idx})), {r_var})"
+            )
+        )
+
+        if redcol_pred is not None:
+            # Zero out-of-range tail columns so masked-out lanes contribute the
+            # sum/mean identity (0) instead of neighbouring-row data. Use a
+            # shape-only zero (``filled_like(_lv, 0)``) NOT ``_lv - _lv``: a tail
+            # read past the tensor can return nan/inf garbage, and nan-nan is nan,
+            # which ``.select`` would then keep.
+            _lv = f"_lv_{r_var}"
+            state.add_statement(
+                statement_from_string(f"{_lv} = fx.memref_load_vec({r_var})")
+            )
+            return expr_from_string(
+                f"({redcol_pred}).select({_lv}, fx.Vector.filled_like({_lv}, 0))"
+            )
+        return expr_from_string(f"fx.memref_load_vec({r_var})")
+
+    # simple element-wise path: x[tile_m, tile_n]
+    parts = []
+    for idx in subscript:
+        if idx is None:
+            continue
+        if isinstance(idx, slice) and idx == slice(None):
+            parts.append("fx.thread_idx.x")
+        elif isinstance(idx, torch.SymInt):
+            bid = env.get_block_id(idx)
+            if bid is not None:
+                parts.append(state.codegen.index_var(bid))
+            else:
+                parts.append(state.sympy_expr(idx))
+        elif isinstance(idx, int):
+            parts.append(str(idx))
+    return expr_from_string(f"{tensor_name}[{', '.join(parts)}]")
+
+
+def _cute_load_feeds_sort_or_scan(load_node: object) -> bool:
+    """Return True if ``load_node`` feeds a sort/topk/_associative_scan.
+
+    Direct users (sort/topk and the scalar ``_associative_scan`` path) are
+    matched immediately.  For a tuple ``_associative_scan`` the index stream is
+    typically a ``load`` that flows through a chain of dtype-cast / shape ops
+    (e.g. ``indices[tile].float().unsqueeze(1).expand_as(vals)``) before
+    reaching the scan.  To recover a scalar load for that stream we follow the
+    forward chain through those pass-through ops.
+    """
+    from torch.fx.node import Node
+
+    from .._compiler.cute.indexing import is_cute_shape_chain_target
+
+    if not isinstance(load_node, Node):
+        return False
+
+    passthrough_targets = (torch.ops.prims.convert_element_type.default,)
+    seen: set[Node] = set()
+    stack: list[Node] = [load_node]
+    while stack:
+        node = stack.pop()
+        for user in node.users:
+            if not isinstance(user, Node):
+                continue
+            target = user.target
+            if (
+                target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+                or getattr(target, "__name__", None) == "_associative_scan"
+            ):
+                return True
+            if (
+                is_cute_shape_chain_target(target) or target in passthrough_targets
+            ) and user not in seen:
+                seen.add(user)
+                stack.append(user)
+    return False
 
 
 @_decorators.get_masked_value(load)

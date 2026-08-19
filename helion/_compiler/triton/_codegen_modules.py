@@ -17,7 +17,6 @@ from . import atomic_ops  # noqa: F401
 from . import barrier  # noqa: F401
 from . import debug_ops  # noqa: F401
 from . import device_print  # noqa: F401
-from . import distributed_ops  # noqa: F401
 from . import gelu_tanh_approx  # noqa: F401
 from . import inline_asm_ops  # noqa: F401
 from . import inline_triton_ops  # noqa: F401

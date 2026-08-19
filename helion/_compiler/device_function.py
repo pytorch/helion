@@ -214,15 +214,14 @@ _sort_order: dict[type[Argument], int] = {
 class ScratchArg:
     """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU).
 
-    scratch_type can be "vmem" (default) or "dma_semaphore" for Pallas
-    scratch.
+    scratch_type can be "vmem" (default) for VMEM buffers or "dma_semaphore"
+    for DMA semaphores used with pltpu.make_async_copy.
     """
 
     name: str
     shape: tuple[int | torch.SymInt, ...]
     dtype: torch.dtype | None  # None for semaphores
-    scratch_type: str = "vmem"
-    shape_sources: tuple[tuple[torch.Tensor, int] | None, ...] | None = None
+    scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
 
 
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
@@ -332,34 +331,9 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
-        self.requires_nvshmem = False
-        self.requires_collective_id = False
-        self.requires_remote_copy = False
-        # Descriptor lifecycle operations may live in nested control-flow
-        # graphs. Backends resolve them through this compiler-owned table.
-        self.remote_copy_descriptors: dict[int, object] = {}
-        # Triton/NVSHMEM receive completion is hidden from the frontend. The
-        # lowering appends one compiler-managed signal-pad pointer to the kernel
-        # signature and assigns one slot per receive-wait descriptor.
-        self.triton_remote_copy_signal_arg: str | None = None
-        self.triton_remote_copy_signal_dst: str | None = None
-        self.triton_remote_copy_signal_slots = 0
-        # Triton peer barriers use a separate compiler-owned symmetric signal
-        # pad because they do not necessarily have a remote-copy destination.
-        self.triton_remote_barrier_signal_arg: str | None = None
-        self.triton_remote_barrier_signal_slots = 0
-        # NVSHMEM takes pointer sources. Computed Triton tiles are materialized
-        # into compiler-owned global scratch before the transfer starts.
-        self.triton_remote_copy_scratch_args: list[str] = []
-        self.triton_remote_copy_scratch_specs: list[tuple[str, str]] = []
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
-        # Track Pallas remote-copy operands by tensor and storage identity. The
-        # storage key keeps views of the same allocation consistent across
-        # nested control-flow graphs.
-        self.pallas_remote_copy_tensor_ids: set[int] = set()
-        self.pallas_remote_copy_storage_ids: set[int] = set()
         # Pallas: id(fake_tensor) → memory space, determined during
         # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
         # NOTE: Currently each tensor can only have one memory space.
@@ -380,16 +354,6 @@ class DeviceFunction:
         # One scratch per output buffer (a tile may feed several stores),
         # allocated at the store.
         self.carry_scratch: dict[CarryScratchKey, str] = {}
-
-    def mark_pallas_remote_copy_operand(self, tensor: torch.Tensor) -> None:
-        self.pallas_remote_copy_tensor_ids.add(id(tensor))
-        self.pallas_remote_copy_storage_ids.add(id(tensor.untyped_storage()))
-
-    def is_pallas_remote_copy_operand(self, tensor: torch.Tensor) -> bool:
-        return (
-            id(tensor) in self.pallas_remote_copy_tensor_ids
-            or id(tensor.untyped_storage()) in self.pallas_remote_copy_storage_ids
-        )
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -904,24 +868,7 @@ class DeviceFunction:
         # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
         for scratch_arg in self._scratch_args:
             args.append(create_arg(scratch_arg.name))
-        # Remote-copy arguments are supplied by the Triton launcher rather than
-        # the generated host wrapper. Keep their signature order aligned with
-        # the launcher's canonical signal-then-scratch append order, independent
-        # of which descriptor kind the kernel encounters first.
-        remote_copy_params = set(self.triton_remote_copy_scratch_args)
-        if self.triton_remote_copy_signal_arg is not None:
-            remote_copy_params.add(self.triton_remote_copy_signal_arg)
-        if self.triton_remote_barrier_signal_arg is not None:
-            remote_copy_params.add(self.triton_remote_barrier_signal_arg)
-        wrapper_only_params = [
-            name for name in self.wrapper_only_params if name not in remote_copy_params
-        ]
-        if self.triton_remote_copy_signal_arg is not None:
-            wrapper_only_params.append(self.triton_remote_copy_signal_arg)
-        if self.triton_remote_barrier_signal_arg is not None:
-            wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
-        wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
-        args.extend(create_arg(name) for name in wrapper_only_params)
+        args.extend(create_arg(name) for name in self.wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -940,11 +887,6 @@ class DeviceFunction:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
         function_decorator = backend.function_decorator_for_args(param_args)
-        decorators = (
-            [expr_from_string("requires_nvshmem")] if self.requires_nvshmem else []
-        )
-        if function_decorator:
-            decorators.append(expr_from_string(function_decorator))
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
@@ -1065,7 +1007,9 @@ class DeviceFunction:
                     name=self.name,
                     args=create_arguments(args),
                     body=kernel_body,
-                    decorator_list=decorators,
+                    decorator_list=[expr_from_string(function_decorator)]
+                    if function_decorator
+                    else [],
                     type_params=[],
                 ),
                 {k: v[0] for k, v in self._variable_renames.items()},
@@ -1200,7 +1144,6 @@ class DeviceFunction:
         dtype: torch.dtype | None,
         name_hint: str = "scratch",
         scratch_type: str = "vmem",
-        shape_sources: tuple[tuple[torch.Tensor, int] | None, ...] | None = None,
     ) -> str:
         """Register a scratch memory buffer and return its variable name."""
         if CompileEnvironment.current().backend_name != "pallas":
@@ -1208,11 +1151,7 @@ class DeviceFunction:
                 "register_scratch is only supported by the Pallas backend"
             )
         name = self.new_var(name_hint)
-        if shape_sources is not None and len(shape_sources) != len(shape):
-            raise ValueError("scratch shape sources must match the scratch rank")
-        self._scratch_args.append(
-            ScratchArg(name, shape, dtype, scratch_type, shape_sources)
-        )
+        self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
         return name
 
     def scratch_read_slice(self, name: str) -> str | None:
@@ -1232,7 +1171,6 @@ class DeviceFunction:
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
-        from helion.language import distributed_ops
         from helion.language import memory_ops
         from helion.language import tile_index
         from helion.language.atomic_ops import ATOMIC_OPS
@@ -1258,13 +1196,7 @@ class DeviceFunction:
                         return None
                     tensor_val = tensor_arg.meta.get("val")
                     assert isinstance(tensor_val, torch.Tensor)
-                    try:
-                        return self.tensor_arg(tensor_val).name
-                    except KeyError:
-                        # Device-created tensors are compiler-managed scratch,
-                        # not host arguments that need BlockSpec read/write
-                        # classification.
-                        return None
+                    return self.tensor_arg(tensor_val).name
 
                 if node.target is memory_ops.load:
                     name = _get_tensor_name(node)
@@ -1279,23 +1211,6 @@ class DeviceFunction:
                     if name is not None:
                         read_names.add(name)
                         write_names.add(name)
-                elif node.target is distributed_ops.make_async_remote_copy:
-                    if len(node.args) != 5:
-                        raise exc.InternalError(
-                            RuntimeError(
-                                "remote copy was not normalized to "
-                                "its five-argument form"
-                            )
-                        )
-                    src_name = _get_tensor_name(node)
-                    if src_name is not None:
-                        read_names.add(src_name)
-                    dst_arg = node.args[3]
-                    if isinstance(dst_arg, torch.fx.Node):
-                        dst_value = dst_arg.meta.get("val")
-                        if isinstance(dst_value, torch.Tensor):
-                            with contextlib.suppress(KeyError):
-                                write_names.add(self.tensor_arg(dst_value).name)
         return read_names, write_names
 
     def __enter__(self) -> None:

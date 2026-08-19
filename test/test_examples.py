@@ -28,6 +28,7 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
@@ -35,7 +36,6 @@ from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
-from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
@@ -105,7 +105,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "add", args, sum(args), block_sizes=[256, 128], loop_orders=[[1, 0]]
         )
 
-    @skipIfSharedMemoryLessThan(
+    @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_matmul(self):
@@ -2244,7 +2244,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @skipIfSharedMemoryLessThan(
+    @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
@@ -2563,7 +2563,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @skipIfSharedMemoryLessThan(
+    @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     def test_broadcast_matmul(self):
@@ -2894,14 +2894,14 @@ class TestExamples(RefEagerTestBase, TestCase):
                 )
                 kernel.settings.autotune_effort = "none"
 
-    def _run_linear_example(self, name: str, method: str = "test") -> None:
+    def _run_linear_example(self, name: str) -> None:
         import importlib
 
         self._skip_linear_engine_autotune()
         mod = importlib.import_module(f"examples.linear.{name}")
         harness = getattr(mod, "HARNESS", None)
         if harness is not None:
-            getattr(harness, method)()
+            harness.test()
         else:
             mod.test()
 
@@ -2960,20 +2960,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
-
-    @pytest.mark.timeout(600)
-    @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
-    def test_linear_kda_fused_preamble(self):
-        self._run_linear_example("example_kda", method="test_fused_preamble")
-
-    @pytest.mark.timeout(600)
-    @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
-    @skipIfCute("linear-attention examples not supported on cute backend")
-    def test_linear_kda_varlen(self):
-        self._run_linear_example("example_kda", method="test_varlen")
 
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 

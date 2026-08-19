@@ -187,7 +187,6 @@ else:
         scale: float = 1.0,
         initial_state: torch.Tensor | None = None,
         return_final_state: bool = False,
-        **preamble: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert g is not None
         assert beta is not None
@@ -200,7 +199,6 @@ else:
             scale=scale,
             initial_state=initial_state,
             output_final_state=return_final_state,
-            **preamble,  # pyrefly: ignore[bad-argument-type]
         )
 
     _FLA_FWD = {

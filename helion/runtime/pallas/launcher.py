@@ -28,7 +28,6 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
-    from collections.abc import Mapping
 
     import jax
 
@@ -671,7 +670,7 @@ class _DirectCallKernel:
 
     call_custom_kernel: object
     kernel_name: str
-    mlir_fingerprint: str
+    kernel_key: str
     output_shapes: object
     donate_argnums: object
     out_tree: object
@@ -684,7 +683,7 @@ class _DirectCallKernel:
 def _build_direct_call_invoke(
     call_custom_kernel: object,
     kernel_name: str,
-    mlir_fingerprint: str,
+    kernel_key: str,
     output_shapes: object,
     donate_argnums: object,
     out_tree: object,
@@ -697,7 +696,7 @@ def _build_direct_call_invoke(
         def invoke_no_alias(input_tensors: list[object]) -> object:
             results = call_custom_kernel(  # type: ignore[operator]
                 kernel_name,
-                mlir_fingerprint,
+                kernel_key,
                 inputs=input_tensors,
                 output_shapes=output_shapes,
                 donate_argnums=donate_argnums,
@@ -709,7 +708,7 @@ def _build_direct_call_invoke(
     def invoke_with_alias(input_tensors: list[object]) -> object:
         results = call_custom_kernel(  # type: ignore[operator]
             kernel_name,
-            mlir_fingerprint,
+            kernel_key,
             inputs=input_tensors,
             output_shapes=output_shapes,
             donate_argnums=donate_argnums,
@@ -774,7 +773,6 @@ def _make_helion_static_jax_callable_class() -> type:
             if cached_entry is None:
                 return result
             output_shapes, out_tree = cached_entry
-            mlir_fingerprint = self.kernel_key_to_mlir_fingerprint[kernel_key]
             sig_tuple = tuple(
                 (a.shape, a.dtype)  # type: ignore[attr-defined]
                 for a in args
@@ -786,7 +784,7 @@ def _make_helion_static_jax_callable_class() -> type:
             invoke = _build_direct_call_invoke(
                 tpu_torch_pallas.call_custom_kernel,
                 self.name,
-                mlir_fingerprint,
+                kernel_key,
                 output_shapes,
                 self.donate_argnums,
                 out_tree,
@@ -795,7 +793,7 @@ def _make_helion_static_jax_callable_class() -> type:
             self._helion_direct_call = _DirectCallKernel(
                 call_custom_kernel=tpu_torch_pallas.call_custom_kernel,
                 kernel_name=self.name,
-                mlir_fingerprint=mlir_fingerprint,
+                kernel_key=kernel_key,
                 output_shapes=output_shapes,
                 donate_argnums=self.donate_argnums,
                 out_tree=out_tree,
@@ -1338,12 +1336,12 @@ def _ensure_cpu_tpu_info() -> None:
     """
     try:
         from jax._src.pallas.mosaic.tpu_info import ChipVersion
-        from jax._src.pallas.mosaic.tpu_info import get_tpu_info_for_chip
+        from jax._src.pallas.mosaic.tpu_info import _get_tpu_info_impl
         from jax._src.pallas.mosaic.tpu_info import registry
     except ImportError:
         return
     if "cpu" not in registry:
-        registry["cpu"] = lambda: get_tpu_info_for_chip(ChipVersion.TPU_7X, 1)
+        registry["cpu"] = lambda: _get_tpu_info_impl(ChipVersion.TPU_7X, 1)
 
 
 def _pallas_apply_ds_padding(
@@ -1512,9 +1510,7 @@ def _pallas_pl_kernel_jit_fn(
     n_outputs: int,
     hbm_in_positions: set[int],
     hbm_out_positions: set[int],
-    input_output_aliases: dict[int, int],
     interpret: bool,
-    collective_id: int | None,
 ) -> object:
     """Build the ``pl.kernel`` jit_fn that drives the Helion device kernel.
 
@@ -1533,23 +1529,6 @@ def _pallas_pl_kernel_jit_fn(
     out_specs_seq = (
         list(out_specs) if isinstance(out_specs, (list, tuple)) else [out_specs]
     )
-    out_shape_seq = (
-        list(out_shape_arg)
-        if n_outputs > 1 and isinstance(out_shape_arg, (list, tuple))
-        else [out_shape_arg]
-    )
-    hbm_alias_input_by_output = {
-        out_pos: in_pos
-        for in_pos, out_pos in input_output_aliases.items()
-        if in_pos in hbm_in_positions and out_pos in hbm_out_positions
-    }
-    hbm_alias_input_positions = set(hbm_alias_input_by_output.values())
-    kernel_input_positions = [
-        pos for pos in range(n_inputs) if pos not in hbm_alias_input_positions
-    ]
-    kernel_output_positions = [
-        pos for pos in range(n_outputs) if pos not in hbm_alias_input_by_output
-    ]
     pipeline_grid = grid or (1,)
     n_io = n_inputs + n_outputs
     # Positions (within [inputs..., outputs...]) that go through the
@@ -1562,135 +1541,36 @@ def _pallas_pl_kernel_jit_fn(
     pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
     pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
 
-    mesh = pltpu.create_tensorcore_mesh("_helion_core", num_cores=1)  # type: ignore[union-attr]
+    def kernel_body(*refs: object) -> None:
+        io_any = refs[:n_io]
+        # Mixed spaces: VMEM/SMEM buffers and DMA semaphores.
+        scratch_refs = refs[n_io:]
+        pipe_any = [io_any[p] for p in pipe_positions]
+
+        # block_refs are the per-step windowed buffers (VMEM, or SMEM for
+        # SMEM-spec'd args), one per pipe_positions entry.
+        def pipeline_body(*block_refs: object) -> None:
+            merged = list(io_any)
+            for p, block in zip(pipe_positions, block_refs, strict=True):
+                merged[p] = block
+            reordered_kernel(*merged, *scratch_refs)  # type: ignore[operator]
+
+        pltpu.emit_pipeline(  # type: ignore[union-attr]
+            pipeline_body,
+            grid=pipeline_grid,
+            in_specs=pipe_in_specs,
+            out_specs=pipe_out_specs,
+        )(*pipe_any)
+
+    mesh = pltpu.create_tensorcore_mesh("core", num_cores=1)  # type: ignore[union-attr]
     scratch_kw = _pallas_kernel_scratch_kwarg(pl)
-
-    # ``jax.new_ref`` models physical HBM aliases for real TPU execution, but
-    # interpret-mode refs do not expose the same memory-space behavior. Remote
-    # DMA itself is unsupported in interpret mode, so retain the direct IO path
-    # used before HBM aliasing was added.
-    if interpret:
-
-        def interpret_kernel_body(*refs: object) -> None:
-            io_any = refs[:n_io]
-            scratch_refs = refs[n_io:]
-            pipe_any = [io_any[p] for p in pipe_positions]
-
-            def pipeline_body(*block_refs: object) -> None:
-                merged = list(io_any)
-                for p, block in zip(pipe_positions, block_refs, strict=True):
-                    merged[p] = block
-                reordered_kernel(*merged, *scratch_refs)  # type: ignore[operator]
-
-            pltpu.emit_pipeline(  # type: ignore[union-attr]
-                pipeline_body,
-                grid=pipeline_grid,
-                in_specs=pipe_in_specs,
-                out_specs=pipe_out_specs,
-            )(*pipe_any)
-
-        return pl.kernel(  # type: ignore[union-attr]
-            interpret_kernel_body,
-            out_shape_arg,
-            mesh=mesh,
-            interpret=True,
-            **{scratch_kw: scratch_shapes},
-        )
-
-    kernel_out_shapes = [out_shape_seq[pos] for pos in kernel_output_positions]
-    kernel_out_shape: object
-    if not kernel_out_shapes:
-        kernel_out_shape = ()
-    elif len(kernel_out_shapes) == 1:
-        kernel_out_shape = kernel_out_shapes[0]
-    else:
-        kernel_out_shape = tuple(kernel_out_shapes)
-
-    def make_kernel(alias_refs: Mapping[int, object]) -> object:
-        def kernel_body(*refs: object) -> None:
-            input_refs = iter(refs[: len(kernel_input_positions)])
-            output_start = len(kernel_input_positions)
-            output_end = output_start + len(kernel_output_positions)
-            output_refs = iter(refs[output_start:output_end])
-            scratch_refs = refs[output_end:]
-
-            io_any: list[object] = []
-            for position in range(n_inputs):
-                io_any.append(
-                    alias_refs[position]
-                    if position in hbm_alias_input_positions
-                    else next(input_refs)
-                )
-            for position in range(n_outputs):
-                alias_input = hbm_alias_input_by_output.get(position)
-                io_any.append(
-                    alias_refs[alias_input]
-                    if alias_input is not None
-                    else next(output_refs)
-                )
-            assert len(io_any) == n_io
-            pipe_any = [io_any[p] for p in pipe_positions]
-
-            # block_refs are the per-step windowed buffers (VMEM, or SMEM for
-            # SMEM-spec'd args), one per pipe_positions entry.
-            def pipeline_body(*block_refs: object) -> None:
-                merged = list(io_any)
-                for p, block in zip(pipe_positions, block_refs, strict=True):
-                    merged[p] = block
-                reordered_kernel(*merged, *scratch_refs)  # type: ignore[operator]
-
-            pltpu.emit_pipeline(  # type: ignore[union-attr]
-                pipeline_body,
-                grid=pipeline_grid,
-                in_specs=pipe_in_specs,
-                out_specs=pipe_out_specs,
-            )(*pipe_any)
-
-        kernel_kwargs: dict[str, object] = {scratch_kw: scratch_shapes}
-        if collective_id is not None:
-            kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr]
-                collective_id=collective_id
-            )
-        return pl.kernel(  # type: ignore[union-attr]
-            kernel_body,
-            kernel_out_shape,
-            mesh=mesh,
-            interpret=interpret,
-            **kernel_kwargs,
-        )
-
-    if not hbm_alias_input_positions:
-        return make_kernel({})
-
-    import jax
-
-    def ref_jit_fn(*inputs: object) -> object:
-        alias_refs = {
-            position: jax.new_ref(inputs[position])
-            for position in hbm_alias_input_positions
-        }
-        kernel_inputs = [inputs[position] for position in kernel_input_positions]
-        kernel = cast("Callable[..., object]", make_kernel(alias_refs))
-        kernel_results = kernel(*kernel_inputs)
-        if not kernel_output_positions:
-            kernel_results_seq: list[object] = []
-        elif len(kernel_output_positions) == 1:
-            kernel_results_seq = [kernel_results]
-        else:
-            kernel_results_seq = list(cast("Iterable[object]", kernel_results))
-
-        result_iter = iter(kernel_results_seq)
-        results = []
-        for position in range(n_outputs):
-            alias_input = hbm_alias_input_by_output.get(position)
-            results.append(
-                alias_refs[alias_input][...]
-                if alias_input is not None
-                else next(result_iter)
-            )
-        return results[0] if len(results) == 1 else tuple(results)
-
-    return ref_jit_fn
+    return pl.kernel(  # type: ignore[union-attr]
+        kernel_body,
+        out_shape_arg,
+        mesh=mesh,
+        interpret=interpret,
+        **{scratch_kw: scratch_shapes},
+    )
 
 
 @dataclass(slots=True)
@@ -1725,7 +1605,6 @@ def _pallas_compile_jit_fn(
     _scratch_shapes: list[object] | None,
     _hbm_arg_indices: list[int] | None,
     _matmul_dot_general: dict[str, object] | None,
-    _collective_id: int | None,
     interpret: bool,
     placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
@@ -1912,9 +1791,7 @@ def _pallas_compile_jit_fn(
             hbm_out_positions={
                 i for i, idx in enumerate(_output_indices) if idx in hbm_set
             },
-            input_output_aliases=pallas_aliases,
             interpret=interpret,
-            collective_id=_collective_id,
         )
 
     return _PallasCompileResult(
@@ -1928,7 +1805,6 @@ def _pallas_compile_jit_fn(
 
 
 _PALLAS_CACHE_ATTR = "_pallas_cache"
-_PALLAS_SCRATCH_KEY_ATTR = "_pallas_scratch_key"
 
 
 def _pallas_jax_call(
@@ -1942,12 +1818,10 @@ def _pallas_jax_call(
     scratch_shapes: list[object] | None,
     hbm_arg_indices: list[int] | None,
     smem_arg_indices: list[int] | None,
-    collective_id: int | None,
     interpret: bool,
     compact: dict[str, object] | None = None,
     orig_shapes: dict[int, tuple[int, ...]] | None = None,
     ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
-    return_all_outputs: bool = False,
 ) -> list[object]:
     """Drive the shared compile core (``pl.kernel``) + jit_fn on raw ``jax.Array``s
     and return the output JAX array(s).
@@ -1958,10 +1832,6 @@ def _pallas_jax_call(
     carries the compact-worklist kwargs when the kernel uses that lowering.
     """
     if compact is not None:
-        if collective_id is not None:
-            raise RuntimeError(
-                "Pallas remote_barrier is not supported by compact_worklist kernels"
-            )
         result = _pallas_compile_compact_jit_fn(
             pallas_kernel,
             jax_args,
@@ -1986,7 +1856,6 @@ def _pallas_jax_call(
             _scratch_shapes=scratch_shapes,
             _hbm_arg_indices=hbm_arg_indices,
             _matmul_dot_general=None,
-            _collective_id=collective_id,
             interpret=interpret,
         )
 
@@ -1998,12 +1867,10 @@ def _pallas_jax_call(
     # In-place positions alias back into the caller's buffer on the torch path,
     # but JAX has no in-place mutation -- when every output is in-place, surface
     # them as fresh values (mirrors the torch fast-path descriptor list).
-    descriptors = ()
-    if not return_all_outputs:
-        descriptors = _pallas_output_only_descriptors(
-            output_indices, result.arg_to_tensor_pos
-        )
-    if return_all_outputs or not descriptors:
+    descriptors = _pallas_output_only_descriptors(
+        output_indices, result.arg_to_tensor_pos
+    )
+    if not descriptors:
         descriptors = tuple(enumerate(output_indices))
 
     output_results: list[object] = [jax_results[out_idx] for out_idx, _ in descriptors]
@@ -2041,7 +1908,6 @@ def _pallas_install_launcher_cache(
     _hbm_arg_indices: list[int] | None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
-    _collective_id: int | None,
     _matmul_dot_general: dict[str, object] | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
@@ -2082,7 +1948,6 @@ def _pallas_install_launcher_cache(
         _scratch_shapes=_scratch_shapes,
         _hbm_arg_indices=_hbm_arg_indices,
         _matmul_dot_general=_matmul_dot_general,
-        _collective_id=_collective_id,
         interpret=interpret,
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret
@@ -2174,8 +2039,6 @@ def default_pallas_launcher(
     _hbm_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
-    _collective_id: int | None = None,
-    _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
     _compact_build_worklist: Callable[..., object] | None = None,
     _compact_offset_arg_indices: list[int] | None = None,
@@ -2216,10 +2079,6 @@ def default_pallas_launcher(
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
     """
-    if _compact_build_worklist is not None and _collective_id is not None:
-        raise RuntimeError(
-            "Pallas remote_barrier is not supported by compact_worklist kernels"
-        )
     if _compact_build_worklist is not None:
         # Resident-cache correctness backstop: runs EVERY call (the offset arrays are
         # runtime data even when the compiled kernel is cached for this grid), raising
@@ -2233,15 +2092,8 @@ def default_pallas_launcher(
             _compact_active_mask_arg_index,
             _compact_ordered_window,
         )
-    scratch_key = tuple(
-        (tuple(shape), dtype, kind) for shape, dtype, kind in (_scratch_shapes or [])
-    )
     cache = getattr(pallas_kernel, _PALLAS_CACHE_ATTR, None)
-    if (
-        cache is None
-        or cache[0] != grid
-        or getattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, None) != scratch_key
-    ):
+    if cache is None or cache[0] != grid:
         if _compact_build_worklist is not None:
             cache = _pallas_install_compact_launcher_cache(
                 pallas_kernel,
@@ -2280,10 +2132,8 @@ def default_pallas_launcher(
                 _hbm_arg_indices=_hbm_arg_indices,
                 _ds_pad_dims=_ds_pad_dims,
                 _pallas_interpret=_pallas_interpret,
-                _collective_id=_collective_id,
                 _matmul_dot_general=_matmul_dot_general,
             )
-        setattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, scratch_key)
 
     return _pallas_invoke_cached_launcher(
         pallas_kernel,
@@ -2623,7 +2473,7 @@ def _pallas_compile_compact_jit_fn(
                 out_specs=pipe_out_specs,
             )(*pipe_any)
 
-        mesh = pltpu.create_tensorcore_mesh("_helion_core", num_cores=1)  # type: ignore[union-attr]
+        mesh = pltpu.create_tensorcore_mesh("core", num_cores=1)  # type: ignore[union-attr]
         call = pl.kernel(  # type: ignore[union-attr]
             kernel_body,
             out_shape_arg,

@@ -390,7 +390,14 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                if (
+                    fake_val.ndim < ndim
+                    and fake_val.ndim > 0
+                    and CompileEnvironment.current().backend.name != "flydsl"
+                ):
+                    # FlyDSL per-thread vectors carry the tile/row axis
+                    # implicitly, so a Triton-style [None, :] broadcast-expand
+                    # is both unsupported and unnecessary -- skip it.
                     expand = tile_strategy.broadcast_expand_dims(
                         tuple(fake_val.shape), output_shape
                     )
@@ -486,35 +493,19 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
-        return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
-
-    def codegen_from_input_asts(
-        self,
-        ctx: LoweringContext,
-        node: torch.fx.Node,
-        input_asts: list[ast.AST],
-    ) -> object:
-        """Lower this pointwise node with explicitly supplied tensor values."""
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
-        assert len(input_asts) == len(self.input_names)
-        with install_inductor_kernel_handlers(
-            ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
-        ):
+        with self.install_kernel_handlers(ctx, node):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             result = expr_from_string(output_name)
 
-        return self._reshape_for_size1_reduction(ctx, node, result, input_asts)
+        return self._reshape_for_size1_reduction(ctx, node, result)
 
     def _reshape_for_size1_reduction(
-        self,
-        ctx: LoweringContext,
-        node: torch.fx.Node,
-        result: ast.AST,
-        input_asts: list[ast.AST] | None = None,
+        self, ctx: LoweringContext, node: torch.fx.Node, result: ast.AST
     ) -> ast.AST:
         # When Inductor converts a size-1 reduction to a Pointwise op, the
         # buffer has fewer ranges than the inputs.  This happens when the
@@ -532,9 +523,7 @@ class PointwiseLowering(InductorLowering):
             # Cute lowers one element per thread, so synthetic size-1 view dims
             # (from unsqueeze/keepdim paths rewritten to pointwise) must collapse
             # back to the underlying scalar expression.
-            inputs = (
-                input_asts if input_asts is not None else self.input_asts(ctx, node)
-            )
+            inputs = self.input_asts(ctx, node)
             if len(inputs) == 1:
                 return inputs[0]
 
@@ -1095,6 +1084,17 @@ class GenerateASTFromInductor(DefaultHandler):
         backend = CompileEnvironment.current().backend
         return backend.cast_ast(x, target_dtype)
 
+    def _cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        # Cast a raw scalar (possibly a bare Python literal lifted from an index
+        # expr) to ``target_dtype``. Backends whose value-cast syntax assumes a
+        # wrapped runtime object (flydsl's ``x.to(dtype)``) provide a scalar-safe
+        # ``cast_scalar_ast``; others just use ``cast_ast``.
+        backend = CompileEnvironment.current().backend
+        cast_scalar = getattr(backend, "cast_scalar_ast", None)
+        if cast_scalar is not None:
+            return cast_scalar(x, target_dtype)
+        return backend.cast_ast(x, target_dtype)
+
     def _to_ast(self, x: object) -> ast.AST:
         if isinstance(x, ast.AST):
             return x
@@ -1316,7 +1316,7 @@ class GenerateASTFromInductor(DefaultHandler):
         if name in self.cg.device_function._constexpr_args:
             return name
 
-        return self._lift(self._create_cast_expr(expr_from_string(name), dtype))
+        return self._lift(self._cast_scalar_ast(expr_from_string(name), dtype))
 
 
 def _unpack_opsvalue(value: object) -> str:
@@ -1496,25 +1496,6 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
-                    cute_state = self.cg.device_function.cute_state
-                    if cute_state.has_tcgen05_pair_epilogue_plan:
-                        if cute_state.is_deferred_tcgen05_pair_epilogue_node(n):
-                            n.meta["codegen"] = _DEFERRED_TCGEN05_PAIR_EPILOGUE
-                            return _DEFERRED_TCGEN05_PAIR_EPILOGUE
-                        if (
-                            any(
-                                self.env.get(input_node)
-                                is _DEFERRED_TCGEN05_PAIR_EPILOGUE
-                                for input_node in n.all_input_nodes
-                            )
-                            and cute_state.tcgen05_pair_epilogue_plan_for_store(n)
-                            is None
-                        ):
-                            raise exc.BackendUnsupported(
-                                "cute",
-                                "deferred tcgen05 pair epilogue escaped its "
-                                "committed store",
-                            )
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
                     n.meta["codegen"] = result
@@ -1569,13 +1550,6 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
         return super().run_node(n)
-
-
-_DEFERRED_TCGEN05_PAIR_EPILOGUE = object()
-
-
-def is_deferred_tcgen05_pair_epilogue(value: object) -> bool:
-    return value is _DEFERRED_TCGEN05_PAIR_EPILOGUE
 
 
 def codegen_call_with_graph(

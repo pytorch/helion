@@ -184,13 +184,6 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     return module.body
 
 
-def dependency_free_runtime_source(info: LauncherInfo) -> str:
-    """Render the canonical dependency-free runtime shim as module source."""
-    module = ast.Module(body=_runtime_shim_statements(info), type_ignores=[])
-    ast.fix_missing_locations(module)
-    return ast.unparse(module)
-
-
 def _is_future_import(node: ast.stmt) -> bool:
     """True for a ``from __future__ import ...`` statement."""
     return isinstance(node, ast.ImportFrom) and node.module == "__future__"

@@ -341,6 +341,7 @@ class TestXCDRemapCodegen(TestCase):
     @skipUnlessMultiXCD("Requires a multi-XCD AMD CDNA GPU")
     def test_aot_standalone_inlines_get_num_xcd(self) -> None:
         # AOT standalone output must inline get_num_xcd (no Helion runtime dep).
+        import ast
         from pathlib import Path
         import tempfile
 
@@ -353,10 +354,9 @@ class TestXCDRemapCodegen(TestCase):
         self.assertIn("helion.runtime.get_num_xcd(", code)
         out = generate_standalone_file("add", [code], "", Path(tempfile.mkdtemp()))
         txt = out.read_text()
-        self.assertIn("get_num_xcd=get_num_xcd", txt)
-        self.assertIn("helion.runtime.get_num_xcd(", txt)
-        self.assertNotIn("import helion", txt)
-        self.assertNotIn("from helion", txt)
+        self.assertIn("def _get_num_xcd", txt)
+        self.assertNotIn("helion.runtime.get_num_xcd(", txt)
+        ast.parse(txt)
 
     @skipUnlessMultiXCD("Requires a multi-XCD AMD CDNA GPU")
     def test_direct_configspec_derives_num_sm(self) -> None:

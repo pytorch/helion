@@ -10,16 +10,12 @@ import pytest
 import torch
 
 import helion
-from helion import exc
 from helion._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
-from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY,
-)
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
 )
@@ -29,9 +25,7 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
-import helion.runtime as helion_runtime
 from helion.runtime import _append_cute_wrapper_plan
-from helion.runtime.cute.launcher import _tcgen05_grouped_static_quotas
 
 pytestmark = skipUnlessBackends(["cute"])
 if matchesBackends(["cute"]):
@@ -380,7 +374,7 @@ def _make_documented_mixed_k_args(
 ]:
     k_values = (32, 1536, 16, 16)
     m_values = (128, 16, 128, 16)
-    n_values = (64, 128, 64, 80)
+    n_values = (64, 128, 64, 64)
     groups = len(k_values)
     padded_m = groups * 128
     max_n = max(n_values)
@@ -552,7 +546,6 @@ def test_rank3_rhs_grouped_nt_codegen_uses_nkg_tma_view() -> None:
     assert "tcgen05_rhs_safe_group" in code
     assert "tcgen05_rhs_group = (" in code
     assert ".layout.stride[0])).load()" in code
-    assert "while tcgen05_work_tile_valid:" in code
     assert "cute.slice_(tma_tensor_b" not in code
     assert "tma_tensor_b[tcgen05_rhs_safe_group" not in code
     assert any(
@@ -648,7 +641,7 @@ def test_rank3_rhs_grouped_static_dynamic_bk64_mixed_tail_direct_codegen() -> No
         "m_tail_preserve": True,
         "n_tail_preserve": True,
         "grouped_static_has_m_tail": True,
-        "grouped_static_has_n_tail": True,
+        "grouped_static_has_n_tail": False,
         "dynamic_ab_tensormaps": True,
         "dynamic_d_tensormap": True,
         "direct_pointer_metadata": True,
@@ -662,221 +655,14 @@ def test_rank3_rhs_grouped_static_dynamic_bk64_mixed_tail_direct_codegen() -> No
         "tma_desc_ptr=tcgen05_grouped_d_tensormap_desc_ptr",
         "tcgen05_grouped_direct_pointers",
         "tcgen05_grouped_direct_strides",
+        "tile_offset_2 < tcgen05_grouped_problem_k",
     ):
         assert marker in code
     assert code.count("cute.nvgpu.cpasync.prefetch_descriptor(") == 3
-    update_pos = code.index(".update_tensormap(")
-    partition_pos = code.index("cute.nvgpu.cpasync.tma_partition", update_pos)
-    try_acquire_pos = code.index(".producer_try_acquire(", partition_pos)
-    fence_pos = code.index(".fence_tensormap_update(", try_acquire_pos)
-    copy_pos = code.index("cute.copy(tma_atom_a", fence_pos)
-    assert update_pos < partition_pos < try_acquire_pos < fence_pos < copy_pos
-
     assert "tcgen05_tiled_copy_r2g" not in code
     assert "tcgen05_store_mask" not in code
     assert _wrapper_plan(code, "tcgen05_ab_tma")["dynamic_ab_tensormaps"] is True
     assert _wrapper_plan(code, "tcgen05_d_tma")["rank3_mnl_tensor"] is True
-
-
-def test_rank3_rhs_grouped_static_problem_signature_codegen() -> None:
-    _require_cuda("rank3 RHS B TMA codegen test needs CUDA fake inputs")
-    signature = [4, 128, 64, 32, 16, 128, 1536, 128, 64, 16, 16, 80, 16]
-    config = _dynamic_bk64_config(direct=True)
-    config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = signature
-    code = _code_for(
-        _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes,
-        _make_documented_mixed_k_args(),
-        config,
-    )
-
-    # The exact-shape fast path is used when every group can own at least one
-    # CTA. A uniform generic fallback handles more groups than active CTAs.
-    assert "cute.arch.grid_dim()[2] >= cutlass.Int32(4)" in code
-    assert "StaticPersistentGroupTileScheduler.create" in code
-    assert "create_initial_search_state" in code
-    assert ".group_search_result" in code
-    grouped_plan = _wrapper_plan(code, "tcgen05_grouped_static_persistent")
-    assert grouped_plan["static_problem_shapes"] == (
-        (128, 64, 32),
-        (16, 128, 1536),
-        (128, 64, 16),
-        (16, 80, 16),
-    )
-    quota_args = grouped_plan["static_group_quota_args"]
-    assert isinstance(quota_args, tuple)
-    assert len(quota_args) == 4
-
-
-def test_rank3_rhs_grouped_static_problem_signature_group_count_mismatch() -> None:
-    _require_cuda("rank3 RHS B TMA codegen test needs CUDA fake inputs")
-    config = _dynamic_bk64_config(direct=True)
-    config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = [
-        3,
-        128,
-        64,
-        32,
-        16,
-        128,
-        1536,
-        128,
-        64,
-        16,
-    ]
-    with pytest.raises(exc.BackendUnsupported, match="describes 3 groups"):
-        _code_for(
-            _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes,
-            _make_documented_mixed_k_args(),
-            config,
-        )
-
-
-@pytest.mark.parametrize(
-    ("config_key", "value", "message"),
-    (
-        ("l2_groupings", [2], "l2_groupings"),
-        ("tcgen05_l2_swizzle_size", 2, "tcgen05_l2_swizzle_size=1"),
-    ),
-)
-def test_rank3_rhs_grouped_static_problem_signature_rejects_l2_swizzle(
-    config_key: str,
-    value: object,
-    message: str,
-) -> None:
-    _require_cuda("rank3 RHS B TMA codegen test needs CUDA fake inputs")
-    config = _dynamic_bk64_config(direct=True)
-    config.config[config_key] = value
-    config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = [
-        4,
-        128,
-        64,
-        32,
-        16,
-        128,
-        1536,
-        128,
-        64,
-        16,
-        16,
-        80,
-        16,
-    ]
-    with pytest.raises(exc.BackendUnsupported, match=message):
-        _code_for(
-            _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes,
-            _make_documented_mixed_k_args(),
-            config,
-        )
-
-
-def test_grouped_problem_signature_many_groups_uses_generic_scheduler() -> None:
-    _require_cuda("rank3 RHS B TMA codegen test needs CUDA fake inputs")
-    group_count = 9
-    a, b_grouped, layout = _make_full_args(groups=group_count, n=64, k=64)
-    n_sizes = torch.full((group_count,), 64, device=DEVICE, dtype=torch.int32)
-    k_sizes = torch.full((group_count,), 64, device=DEVICE, dtype=torch.int32)
-    out = torch.empty_like(a)
-    config = _dynamic_bk64_config()
-    config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = [
-        group_count,
-        *([128, 64, 64] * group_count),
-    ]
-    code = _code_for(
-        _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes,
-        (a, b_grouped, layout, n_sizes, k_sizes, out),
-        config,
-    )
-
-    plan = _assert_group_scheduler(code)
-    assert len(plan["static_problem_shapes"]) == group_count
-    assert "_static_group_quota" not in code
-    assert "cute.arch.grid_dim()[2] >= cutlass.Int32(9)" not in code
-
-
-@pytest.mark.parametrize(
-    ("problem_shapes", "max_active_clusters", "expected"),
-    (
-        (
-            ((128, 128, 128), (512, 128, 128), (128, 256, 128)),
-            148,
-            (2, 8, 4),
-        ),
-        (
-            (
-                (8192, 1280, 32),
-                (128, 384, 1536),
-                (640, 1280, 16),
-                (640, 128, 16),
-            ),
-            148,
-            (131, 6, 10, 1),
-        ),
-        (
-            (
-                (9 * 128, 64, 4 * 64),
-                (5 * 128, 64, 32 * 64),
-                (23 * 128, 64, 4 * 64),
-                (28 * 128, 64, 16 * 64),
-                (24 * 128, 64, 2 * 64),
-                (19 * 128, 64, 8 * 64),
-            ),
-            8,
-            (1, 1, 1, 3, 1, 1),
-        ),
-        (((128, 64, 64), (128, 64, 64), (128, 64, 64)), 2, (1, 1, 1)),
-    ),
-)
-def test_grouped_static_quota_allocation(
-    problem_shapes: tuple[tuple[int, int, int], ...],
-    max_active_clusters: int,
-    expected: tuple[int, ...],
-) -> None:
-    assert (
-        _tcgen05_grouped_static_quotas(
-            problem_shapes,
-            bm=128,
-            bn=64,
-            bk=64,
-            max_active_clusters=max_active_clusters,
-        )
-        == expected
-    )
-
-
-def test_rank3_rhs_grouped_direct_deep_pipeline_checks_target_smem() -> None:
-    from helion.autotuner.config_spec import ConfigSpec
-
-    _require_cuda("rank3 RHS B TMA codegen test needs CUDA fake inputs")
-    args = _make_documented_mixed_k_args()
-    config = _dynamic_bk64_config(direct=True)
-    config.config["tcgen05_ab_stages"] = 8
-    config.config["tcgen05_c_stages"] = 4
-
-    with (
-        patch.object(
-            ConfigSpec,
-            "_tcgen05_grouped_dynamic_stages_fit_for_target",
-            autospec=True,
-            return_value=False,
-        ) as fit,
-        pytest.raises(
-            helion.exc.BackendUnsupported,
-            match="target-device SMEM headroom",
-        ),
-    ):
-        _code_for(_rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes, args, config)
-
-    assert fit.called
-    assert fit.call_args.kwargs == {
-        "dtype_bytes": 2,
-        "output_dtype_bytes": 2,
-        "device": args[0].device,
-        "bm": 128,
-        "bn": 64,
-        "bk": 64,
-        "cluster_m": 1,
-        "ab_stages": 8,
-        "c_stages": 4,
-    }
 
 
 @pytest.mark.parametrize(
@@ -1082,124 +868,6 @@ def test_rank3_rhs_grouped_static_native_runtime() -> None:
     _assert_grouped_result(out, args)
 
 
-def test_rank3_rhs_grouped_static_exact_signature_runtime() -> None:
-    """Ordinary static mode uses the exact scheduler and survives graph replay."""
-    _require_tcgen05_runtime_test()
-    args = _make_full_args(
-        groups=3,
-        m_per_group=256,
-        n=64,
-        k=64,
-        dtype=torch.float16,
-    )
-    config = _grouped_config(block_n=64, block_k=64)
-    config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = [
-        3,
-        *([256, 64, 64] * 3),
-    ]
-    code = _code_for(_rank3_rhs_grouped_nt, args, config)
-    assert "cute.arch.grid_dim()[2] >= cutlass.Int32(3)" in code
-    plan = _wrapper_plan(code, "tcgen05_grouped_static_persistent")
-    assert plan["static_problem_shapes"] == ((256, 64, 64),) * 3
-    assert "dynamic_ab_tensormaps" not in plan
-
-    with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-        bound = _rank3_rhs_grouped_nt.bind(args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
-        bound.set_config(config)
-        out = bound(*args)
-        torch.cuda.synchronize()
-        _assert_grouped_result(out, args)
-
-        with helion_runtime.cute_cuda_graph() as graph:
-            captured = bound(*args)
-        torch.cuda.synchronize()
-        captured.fill_(-77.0)
-        graph.replay()
-        torch.cuda.synchronize()
-        _assert_grouped_result(captured, args)
-
-
-def test_rank3_rhs_grouped_exact_signature_low_capacity_fallback_runtime() -> None:
-    """Fewer active CTAs than groups executes the generic scheduler fallback."""
-    _require_tcgen05_runtime_test()
-    num_sm = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-    if num_sm <= 2:
-        pytest.skip("low-capacity grouped fallback requires more than two SMs")
-
-    full_args = _make_documented_mixed_k_args()
-    args = (
-        full_args[0][:384],
-        full_args[1][:3],
-        full_args[2][:384],
-        full_args[3][:3],
-        full_args[4][:3],
-        full_args[5][:384],
-    )
-    config = _dynamic_bk64_config(direct=False)
-    config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = [
-        3,
-        128,
-        64,
-        32,
-        16,
-        128,
-        1536,
-        128,
-        64,
-        16,
-    ]
-    config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = num_sm - 2
-    code = _code_for(
-        _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes,
-        args,
-        config,
-    )
-    assert "cute.arch.grid_dim()[2] >= cutlass.Int32(3)" in code
-
-    with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-        bound = _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes.bind(args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
-        bound.set_config(config)
-        out = bound(*args)
-        torch.cuda.synchronize()
-        _assert_mixed_result(out, args)
-
-        with helion_runtime.cute_cuda_graph() as graph:
-            captured = bound(*args)
-        torch.cuda.synchronize()
-        captured.fill_(-77.0)
-        graph.replay()
-        torch.cuda.synchronize()
-        _assert_mixed_result(captured, args)
-
-
-def test_rank3_rhs_grouped_static_native_runtime_multiple_iterations() -> None:
-    """Every role crosses group-search windows over multiple persistent waves."""
-    _require_tcgen05_runtime_test()
-    groups = 40
-    m_per_group = 1024
-    args = _make_full_args(
-        groups=groups,
-        m_per_group=m_per_group,
-        n=64,
-        k=16,
-        dtype=torch.float16,
-    )
-    work_clusters = groups * (m_per_group // 128)
-    assert (
-        work_clusters > torch.cuda.get_device_properties(DEVICE).multi_processor_count
-    )
-
-    out = _run_configured(
-        _rank3_rhs_grouped_nt,
-        args,
-        _grouped_config(block_n=64, block_k=16),
-    )
-
-    _assert_grouped_result(out, args)
-
-
 def test_rank3_rhs_unsafe_store_fallback_runtime() -> None:
     _require_tcgen05_runtime_test()
     args = _make_mn_tail_args()
@@ -1223,55 +891,3 @@ def test_rank3_rhs_grouped_static_dynamic_bk64_runtime(direct: bool) -> None:
     )
     assert out is args[-1]
     _assert_mixed_result(out, args)
-
-
-@pytest.mark.parametrize(
-    ("dtype", "direct"),
-    ((torch.float16, True), (torch.bfloat16, False)),
-)
-def test_rank3_rhs_grouped_deep_pipeline_runtime(
-    dtype: torch.dtype,
-    direct: bool,
-) -> None:
-    """The CUTLASS-parity AB8/C4 pipeline survives repeated graph replay."""
-    _require_tcgen05_runtime_test()
-    args = _make_documented_mixed_k_args(dtype=dtype)
-    config = _dynamic_bk64_config(direct=direct)
-    config.config["tcgen05_ab_stages"] = 8
-    config.config["tcgen05_c_stages"] = 4
-    config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = [
-        4,
-        128,
-        64,
-        32,
-        16,
-        128,
-        1536,
-        128,
-        64,
-        16,
-        16,
-        80,
-        16,
-    ]
-
-    with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-        bound = _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes.bind(args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
-        bound.set_config(config)
-        out = bound(*args)
-        torch.cuda.synchronize()
-        _assert_mixed_result(out, args)
-
-        with helion_runtime.cute_cuda_graph() as graph:
-            captured = bound(*args)
-        torch.cuda.synchronize()
-
-        for _ in range(2):
-            captured.fill_(-77.0)
-            graph.replay()
-            torch.cuda.synchronize()
-            _assert_mixed_result(captured, args)
-
-    assert out is args[-1]
-    assert captured is args[-1]
