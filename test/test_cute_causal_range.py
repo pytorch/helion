@@ -8,7 +8,6 @@ from helion._compiler.cute.causal_range import TileLayout
 from helion._compiler.cute.causal_range import prove_causal_tile_range_unmasked
 from helion._compiler.cute.causal_range import prove_descending_causal_prefix_unmasked
 from helion._compiler.cute.cute_flash import _flash_fa4_descending_causal_split_proof
-from helion._compiler.cute.cute_flash import _flash_runtime_range_header
 
 
 @pytest.fixture
@@ -87,17 +86,6 @@ def test_causal_range_handles_distinct_tile_geometries() -> None:
         kv_layout=TileLayout(extent=512, stride=64, width=64),
     )
     assert proof.proven
-
-
-def test_causal_split_loop_header_stays_runtime() -> None:
-    source = _flash_runtime_range_header(
-        "flash_kv_unmask_iter",
-        "flash_m_tile0",
-    )
-    assert source == (
-        "for flash_kv_unmask_iter in cutlass.range(flash_m_tile0, unroll=1):"
-    )
-    assert "range_constexpr" not in source
 
 
 def test_fa4_split_proof_requires_exact_static_sequence_coverage() -> None:

@@ -3293,11 +3293,10 @@ def _fmax_reduce_packed_ssa(
 @cute.jit
 def _fadd_reduce_packed_ssa(
     values: cute.TensorSSA,
-    init_val: object = None,
 ) -> Float32:
     values_rmem = cute.make_rmem_tensor(values.shape, Float32)
     values_rmem.store(values)
-    return fadd_reduce_packed(values_rmem, init_val)
+    return fadd_reduce_packed(values_rmem)
 
 
 @cute.jit

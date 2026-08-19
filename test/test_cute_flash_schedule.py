@@ -529,8 +529,17 @@ def test_persistent_phase_continuity_at_work_boundary(
 
 
 @pytest.mark.parametrize("kv_iterations", (3, 4))
+@pytest.mark.parametrize(
+    ("causal", "mapping"),
+    (
+        (False, FlashStatReleaseMapping.CROSS_SLOT),
+        (True, FlashStatReleaseMapping.SAME_SLOT),
+    ),
+)
 def test_pipelined_stat_handoff_models_dummy_and_final_events(
     kv_iterations: int,
+    causal: bool,
+    mapping: FlashStatReleaseMapping,
 ) -> None:
     schedule = build_fa4_schedule(
         FlashScheduleSpec(
@@ -538,8 +547,10 @@ def test_pipelined_stat_handoff_models_dummy_and_final_events(
             2,
             persistent=True,
             kv_iterations=kv_iterations,
+            causal=causal,
             stat_depth=1,
             pipelined_stat_handoff=True,
+            stat_release_mapping=mapping,
         )
     )
 
@@ -618,17 +629,19 @@ def test_pipelined_stat_release_mappings(
 
     verify_flash_schedule(schedule)
 
-    if mapping is FlashStatReleaseMapping.CROSS_SLOT:
-        assert (
-            FlashScheduleSpec(64, 2).stat_release_mapping
-            is FlashStatReleaseMapping.CROSS_SLOT
-        )
     assert schedule.spec.stat_release_mapping is mapping
     assert {
         (edge.source, edge.target, edge.iteration_delta, edge.barrier)
         for edge in schedule.edges
         if edge.barrier is not None and edge.barrier.startswith("stat_empty_")
     } == expected_releases
+
+
+def test_default_stat_release_mapping_is_cross_slot() -> None:
+    assert (
+        FlashScheduleSpec(64, 2).stat_release_mapping
+        is FlashStatReleaseMapping.CROSS_SLOT
+    )
 
 
 @pytest.mark.parametrize(
