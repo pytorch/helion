@@ -2395,6 +2395,20 @@ class TestAutotunerHeuristic(TestCase):
                         self.assertEqual(promoted.config["tcgen05_cluster_m"], 2)
                         self.assertEqual(effective.config["tcgen05_cluster_m"], 2)
 
+            from pretuned_kernels.grouped_gemm_deepgemm.grouped_gemm_deepgemm import (
+                grouped_gemm_deepgemm,
+            )
+
+            reviewed_args = make_args(224, "n")
+            reviewed_bound = grouped_gemm_deepgemm.bind(
+                (*reviewed_args[:3], None, reviewed_args[3])
+            )
+            self.assertIsNotNone(reviewed_bound.config_spec.compiler_default_config)
+            self.assertEqual(
+                grouped_seeds(reviewed_bound.config_spec, 224),
+                grouped_seeds(bounds[3].config_spec, 224),
+            )
+
             b200_256_bound = bounds[-1]
             self.assertIsNotNone(b200_256_bound.config_spec.compiler_default_config)
 

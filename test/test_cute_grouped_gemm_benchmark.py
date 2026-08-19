@@ -5,14 +5,27 @@ import builtins
 from contextlib import AbstractContextManager
 import hashlib
 import importlib.util
-from itertools import starmap
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from typing import Any
 
+from benchmarks.cute import grouped_gemm_deepgemm_support as deepgemm_support
+from pretuned_kernels import _bench as pretuned_bench
+from pretuned_kernels import run as pretuned_runner
+from pretuned_kernels.grouped_gemm import (
+    _helion_aot_grouped_gemm_cuda_sm100 as grouped_heuristic,
+)
+from pretuned_kernels.grouped_gemm_deepgemm import (
+    _deepgemm_public_api as deepgemm_public_api,
+)
 import pytest
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
 
 BENCHMARK_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "cute"
 PRETUNED_DIR = Path(__file__).resolve().parents[1] / "pretuned_kernels"
@@ -34,6 +47,118 @@ def _load_path(path: Path, module_name: str) -> Any:
     return module
 
 
+def _assert_aot_training_does_not_load_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    main: Callable[[], object],
+    reference_path_name: str,
+    expected_training_args: tuple[object, ...],
+    modes: tuple[str, ...] = ("collect", "compile", "measure"),
+) -> None:
+    result = {
+        "helion_wins": 0,
+        "total": 0,
+        "geomean": 0.0,
+        "best_speedup": 0.0,
+        "baselines": {},
+    }
+
+    def fake_run_aot_training(*args: object) -> dict[str, object]:
+        assert args == expected_training_args
+        return result
+
+    monkeypatch.setattr(module, "_run_aot_training", fake_run_aot_training)
+    monkeypatch.setattr(
+        module,
+        reference_path_name,
+        lambda: pytest.fail("AOT training loaded an external reference"),
+    )
+    for mode in modes:
+        monkeypatch.setenv("HELION_AOT_MODE", mode)
+        assert main() is result
+
+
+def _assert_dashboard_uses_shared_timer(
+    monkeypatch: pytest.MonkeyPatch,
+    bench: Any,
+    main: Callable[[], object],
+    *,
+    repetitions: int,
+    invoke_make_calls: bool = False,
+) -> dict[str, Any]:
+    expected: dict[str, Any] = {"ok": True}
+
+    def fake_run_sweep(*args: object, **kwargs: object) -> dict[str, Any]:
+        assert kwargs["use_cudagraph"] is False
+        assert kwargs["pre_captured_cudagraph"] is True
+        assert kwargs["rep"] == repetitions
+        assert kwargs["thermal_warmup_ms"] == 10_000
+        if invoke_make_calls:
+            cases: Any = args[0]
+            make_calls: Any = args[1]
+            for case in cases:
+                make_calls(case)
+        return expected
+
+    monkeypatch.setattr(bench, "run_sweep", fake_run_sweep)
+    assert main() is expected
+    return expected
+
+
+@pytest.fixture(scope="module")
+def cutlass_benchmark() -> Iterator[Any]:
+    module_name = "helion_test_compare_grouped_gemm_backends"
+    yield _load_path(
+        BENCHMARK_DIR / "compare_grouped_gemm_backends.py",
+        module_name,
+    )
+    sys.modules.pop(module_name, None)
+
+
+@pytest.fixture(scope="module")
+def cublas_adapter() -> Iterator[Any]:
+    module_name = "helion_test_cublas_grouped_gemm"
+    yield _load_path(BENCHMARK_DIR / "cublas_grouped_gemm.py", module_name)
+    sys.modules.pop(module_name, None)
+
+
+def test_published_cutlass_cases_manifest_is_fixed(cutlass_benchmark: Any) -> None:
+    manifest = tuple(
+        (
+            case.name,
+            case.problems,
+            case.ab_stages,
+            case.acc_stages,
+            case.c_stages,
+        )
+        for case in cutlass_benchmark.CASES
+    )
+
+    assert hashlib.sha256(repr(manifest).encode()).hexdigest() == (
+        "a53f21c946fa3dba89bea7d28c4b3888da05e797bfa8bf4950b94ee3e5ffe5c5"
+    )
+
+
+@pytest.fixture(scope="module")
+def pretuned_grouped_gemm() -> Iterator[Any]:
+    module_name = "helion_test_pretuned_grouped_gemm"
+    yield _load_path(
+        PRETUNED_DIR / "grouped_gemm" / "grouped_gemm.py",
+        module_name,
+    )
+    sys.modules.pop(module_name, None)
+
+
+@pytest.fixture(scope="module")
+def pretuned_deepgemm() -> Iterator[Any]:
+    module_name = "helion_test_pretuned_grouped_gemm_deepgemm"
+    yield _load_path(
+        PRETUNED_DIR / "grouped_gemm_deepgemm" / "grouped_gemm_deepgemm.py",
+        module_name,
+    )
+    sys.modules.pop(module_name, None)
+
+
 def test_bench_module_import_does_not_require_triton(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -47,115 +172,22 @@ def test_bench_module_import_does_not_require_triton(
 
     monkeypatch.setattr(builtins, "__import__", import_without_triton)
     module_name = "helion_test_pretuned_bench_without_triton"
-    module = _load_path(PRETUNED_DIR / "_bench.py", module_name)
-    assert module.geomean((1.0, 4.0)) == 2.0
-    sys.modules.pop(module_name)
-
-
-@pytest.fixture(scope="module")
-def cutlass_benchmark() -> Any:
-    return _load_path(
-        BENCHMARK_DIR / "compare_grouped_gemm_backends.py",
-        "helion_test_compare_grouped_gemm_backends",
-    )
-
-
-@pytest.fixture(scope="module")
-def cublas_adapter() -> Any:
-    return _load_path(
-        BENCHMARK_DIR / "cublas_grouped_gemm.py",
-        "helion_test_cublas_grouped_gemm",
-    )
-
-
-@pytest.fixture(scope="module")
-def deepgemm_benchmark() -> Any:
-    return _load_path(
-        BENCHMARK_DIR / "deepgemm_selected_path.py",
-        "helion_test_deepgemm_selected_path",
-    )
-
-
-def test_published_manifests_are_fixed(
-    cutlass_benchmark: Any, deepgemm_benchmark: Any
-) -> None:
-    manifest = (
-        tuple(
-            (
-                case.name,
-                case.problems,
-                case.ab_stages,
-                case.acc_stages,
-                case.c_stages,
-            )
-            for case in cutlass_benchmark.CASES
-        ),
-        tuple(tuple(shape) for shape in deepgemm_benchmark.OFFICIAL_SHAPES),
-        (
-            deepgemm_benchmark.DEEPGEMM_SELECTED_TILE_M,
-            deepgemm_benchmark.DEEPGEMM_SELECTED_TILE_N,
-            deepgemm_benchmark.DEEPGEMM_SELECTED_TILE_K,
-            deepgemm_benchmark.M_ALIGNMENT,
-        ),
-        deepgemm_benchmark.selected_config().config,
-    )
-    assert hashlib.sha256(repr(manifest).encode()).hexdigest() == (
-        "5995339a3112d28f958a8a6bbe2f36fddae01e7c914feaeccd4ee3d394283efc"
-    )
-
-
-@pytest.fixture(scope="module")
-def pretuned_grouped_gemm() -> Any:
-    return _load_path(
-        PRETUNED_DIR / "grouped_gemm" / "grouped_gemm.py",
-        "helion_test_pretuned_grouped_gemm",
-    )
-
-
-@pytest.fixture(scope="module")
-def grouped_gemm_heuristic() -> Any:
-    return _load_path(
-        PRETUNED_DIR / "grouped_gemm" / "_helion_aot_grouped_gemm_cuda_sm100.py",
-        "helion_test_pretuned_grouped_gemm_heuristic",
-    )
-
-
-@pytest.fixture(scope="module")
-def pretuned_deepgemm() -> Any:
-    return _load_path(
-        PRETUNED_DIR / "grouped_gemm_deepgemm" / "grouped_gemm_deepgemm.py",
-        "helion_test_pretuned_grouped_gemm_deepgemm",
-    )
-
-
-@pytest.fixture(scope="module")
-def deepgemm_heuristic() -> Any:
-    return _load_path(
-        PRETUNED_DIR
-        / "grouped_gemm_deepgemm"
-        / "_helion_aot_grouped_gemm_deepgemm_cuda_sm100.py",
-        "helion_test_pretuned_grouped_gemm_deepgemm_heuristic",
-    )
-
-
-@pytest.fixture(scope="module")
-def pretuned_bench() -> Any:
-    return _load_path(PRETUNED_DIR / "_bench.py", "helion_test_pretuned_bench")
-
-
-@pytest.fixture(scope="module")
-def pretuned_runner() -> Any:
-    return _load_path(PRETUNED_DIR / "run.py", "helion_test_pretuned_runner")
+    try:
+        module = _load_path(PRETUNED_DIR / "_bench.py", module_name)
+        assert module.geomean((1.0, 4.0)) == 2.0
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_cutlass_timings_use_shared_timer(
-    cutlass_benchmark: Any, monkeypatch: pytest.MonkeyPatch
+    cutlass_benchmark: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
     thermal_warmups: list[int] = []
-    args = cutlass_benchmark._parser().parse_args([])
-    args.repetitions = 12
-    args.thermal_warmup_ms = 0
+    args = cutlass_benchmark._parser().parse_args(
+        ["--repetitions", "12", "--thermal-warmup-ms", "0"]
+    )
 
     def fake_bench(calls: list[Any], rep: int) -> list[float]:
         assert rep == 12
@@ -179,7 +211,9 @@ def test_cutlass_timings_use_shared_timer(
 
 
 def test_cutlass_loader_verifies_and_retains_bytes(
-    cutlass_benchmark: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    cutlass_benchmark: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     source = tmp_path / "grouped_gemm.py"
     source.write_text("raise AssertionError('must not execute')\n")
@@ -196,7 +230,9 @@ def test_cutlass_loader_verifies_and_retains_bytes(
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     monkeypatch.setattr(cutlass_benchmark, "CUTLASS_SHA256", digest)
     monkeypatch.setattr(
-        cutlass_benchmark.importlib.metadata, "version", lambda _name: "test"
+        cutlass_benchmark.importlib.metadata,
+        "version",
+        lambda _name: "test",
     )
 
     module, provenance = cutlass_benchmark.load_cutlass_source(source)
@@ -234,14 +270,20 @@ def test_cutlass_summary_reports_kernel_baseline(
     assert summary["geomean_helion_over_cutlass_kernel"] == 0.8
 
 
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16),
+    ids=("fp16", "bf16"),
+)
 def test_cublas_grouped_adapter_matches_torch(
-    cublas_adapter: Any, dtype: torch.dtype
+    cublas_adapter: Any,
+    dtype: torch.dtype,
 ) -> None:
     if torch.version.cuda is None or not torch.cuda.is_available():
         pytest.skip("cuBLAS grouped adapter requires an NVIDIA CUDA device")
     device = torch.device("cuda", torch.cuda.current_device())
     problems = ((3, 16, 8, 1), (5, 24, 16, 1))
+
     group_a = tuple(
         torch.randn((m, k), device=device, dtype=dtype) for m, _n, k, _batch in problems
     )
@@ -254,7 +296,10 @@ def test_cublas_grouped_adapter_matches_torch(
     expected = tuple(a @ b.T for a, b in zip(group_a, group_b, strict=True))
 
     launch, _provenance = cublas_adapter.prepare_cublas(
-        problems, group_a, group_b, outputs
+        problems,
+        group_a,
+        group_b,
+        outputs,
     )
     launch()
     torch.cuda.synchronize(device)
@@ -271,38 +316,130 @@ def test_cublas_grouped_adapter_matches_torch(
         torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-2)
 
 
-def test_pretuned_grouped_gemm_configs(
-    pretuned_grouped_gemm: Any,
-    grouped_gemm_heuristic: Any,
-) -> None:
-    candidates = pretuned_grouped_gemm._AOT_CONFIGS
-    assert [
+@pytest.mark.parametrize(
+    ("selected", "expected"),
+    (
+        ("", {"cutlass": True, "deepgemm": True}),
+        ("grouped_gemm", {"cutlass": True, "deepgemm": False}),
+        ("grouped_gemm_deepgemm", {"cutlass": False, "deepgemm": True}),
         (
-            config["tcgen05_ab_stages"],
-            config["tcgen05_acc_stages"],
-            config["tcgen05_c_stages"],
-        )
-        for config in candidates
-    ] == [(2, 1, 2), (8, 2, 4)]
+            "grouped_gemm, grouped_gemm_deepgemm",
+            {"cutlass": True, "deepgemm": True},
+        ),
+    ),
+)
+def test_grouped_reference_selection(
+    selected: str,
+    expected: dict[str, bool],
+) -> None:
+    assert pretuned_runner.grouped_reference_requirements(selected) == expected
 
-    signatures = tuple(
+
+def test_grouped_reference_workflow_pins_match_benchmarks(
+    cutlass_benchmark: Any,
+) -> None:
+    workflow = PRETUNED_WORKFLOW.read_text()
+    for pin in (
+        cutlass_benchmark.CUTLASS_COMMIT,
+        cutlass_benchmark.CUTLASS_SHA256,
+        deepgemm_support.DEEPGEMM_COMMIT,
+    ):
+        assert pin in workflow
+    assert 'KERNEL_ARGS=(--kernels "$SELECTED_KERNELS")' in workflow
+    assert '"${KERNEL_ARGS[@]}"' in workflow
+
+
+def test_generated_grouped_heuristic_selects_measured_and_fallback_pipelines(
+    pretuned_grouped_gemm: Any,
+) -> None:
+    static_signature_key = "tcgen05_grouped_static_problem_signature"
+    expected_measured_stages = [(2, 1, 2), *((8, 2, 4),) * 6]
+    measured_signatures = tuple(
         pretuned_grouped_gemm._problem_signature(case.problems)
         for case in pretuned_grouped_gemm.CASES
     )
-    assert len(set(signatures)) == len(signatures)
-    static_key = pretuned_grouped_gemm.STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
-    selected = tuple(starmap(grouped_gemm_heuristic.autotune_grouped_gemm, signatures))
-    assert [
-        (config["tcgen05_ab_stages"], config["tcgen05_acc_stages"])
-        for config in selected
-    ] == [(2, 1), *((8, 2),) * 6]
-    for signature, config in zip(signatures, selected, strict=True):
-        assert config[static_key] == list(signature[: 1 + 3 * signature[0]])
 
-    unseen = (1, 256, 64, 64)
-    fallback = grouped_gemm_heuristic.autotune_grouped_gemm(*unseen)
-    assert fallback[static_key] == list(unseen)
-    assert fallback["tcgen05_ab_stages"] == 2
+    assert len(set(measured_signatures)) == len(measured_signatures)
+    assert len(grouped_heuristic.CONFIGS) == len(measured_signatures)
+    for signature, published, expected_stages in zip(
+        measured_signatures,
+        grouped_heuristic.CONFIGS,
+        expected_measured_stages,
+        strict=True,
+    ):
+        selected = grouped_heuristic.autotune_grouped_gemm(*signature)
+        assert selected == published
+        assert (
+            selected["tcgen05_ab_stages"],
+            selected["tcgen05_acc_stages"],
+            selected["tcgen05_c_stages"],
+        ) == expected_stages
+        assert selected[static_signature_key] == list(signature[: 1 + 3 * signature[0]])
+
+    for signature, expected_stages in (
+        ((1, 256, 64, 64), (2, 1, 2)),
+        ((1, 8192, 8192, 64), (8, 2, 4)),
+    ):
+        selected = grouped_heuristic.autotune_grouped_gemm(*signature)
+        assert (
+            selected["tcgen05_ab_stages"],
+            selected["tcgen05_acc_stages"],
+            selected["tcgen05_c_stages"],
+        ) == expected_stages
+        assert selected[static_signature_key] == list(signature)
+
+
+def test_pretuned_grouped_kernels_register_for_b200_and_ship_only_sm100() -> None:
+    for name in ("grouped_gemm", "grouped_gemm_deepgemm"):
+        assert name in pretuned_runner.KERNELS
+        assert pretuned_runner._supported_hardware(name) == {"b200"}
+        heuristic_files = sorted(
+            path.name
+            for path in (pretuned_runner.PRETUNED_KERNELS_DIR / name).glob(
+                f"_helion_aot_{name}_cuda_sm*.py"
+            )
+        )
+        assert heuristic_files == [f"_helion_aot_{name}_cuda_sm100.py"]
+
+
+def test_pretuned_runner_preserves_benchmark_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {"provider": {"commit": "abc"}}
+    details = {"rows": [{"config": "reviewed"}]}
+    module = SimpleNamespace(
+        main=lambda verbose: {
+            "helion_wins": 1,
+            "total": 1,
+            "geomean": 1.1,
+            "best_speedup": 1.1,
+            "baselines": {},
+            "benchmark_metadata": metadata,
+            "benchmark_details": details,
+        },
+        use_cudagraph=lambda: True,
+    )
+    monkeypatch.setattr(pretuned_runner, "_supported_hardware", lambda _name: {"b200"})
+    monkeypatch.setattr(pretuned_runner, "_import_kernel_module", lambda _name: module)
+
+    record = pretuned_runner.run_kernel("grouped_gemm_deepgemm", "b200")
+
+    assert record["benchmark_metadata"] is metadata
+    assert record["benchmark_details"] is details
+
+
+def test_pretuned_deepgemm_reference_computes_valid_rows_and_zero_padding(
+    pretuned_deepgemm: Any,
+) -> None:
+    a = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    b = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+    worklist = torch.tensor(((0, 0, 1, 2), (1, 2, 1, 2)), dtype=torch.int32)
+
+    output = pretuned_deepgemm._reference(a, b, worklist)
+
+    torch.testing.assert_close(output[0], a[0] @ b[0].T)
+    torch.testing.assert_close(output[2], a[2] @ b[1].T)
+    torch.testing.assert_close(output[[1, 3]], torch.zeros_like(output[[1, 3]]))
 
 
 @pytest.mark.parametrize("replay_writes_output", (True, False))
@@ -367,164 +504,38 @@ def test_grouped_gemm_tuner_validates_pointer_targets(
     assert cleared == [candidate]
 
 
-def test_pretuned_deepgemm_contract(
-    deepgemm_benchmark: Any,
-    pretuned_deepgemm: Any,
-    deepgemm_heuristic: Any,
-) -> None:
-    assert [
-        config["tcgen05_ab_stages"] for config in pretuned_deepgemm._AOT_CONFIGS
-    ] == [4, 5, 6, 7]
-    assert deepgemm_heuristic.autotune_grouped_gemm_deepgemm(1, 2, 3) == (
-        deepgemm_benchmark.selected_config().config
-    )
-
-    a = torch.arange(12, dtype=torch.float32).reshape(4, 3)
-    b = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
-    worklist = torch.tensor(((0, 0, 1, 2), (1, 2, 1, 2)), dtype=torch.int32)
-    output = pretuned_deepgemm._reference(a, b, worklist)
-    torch.testing.assert_close(output[0], a[0] @ b[0].T)
-    torch.testing.assert_close(output[2], a[2] @ b[1].T)
-    torch.testing.assert_close(output[[1, 3]], torch.zeros_like(output[[1, 3]]))
-
-
-@pytest.mark.parametrize("replay_writes_output", (True, False))
-def test_deepgemm_tuner_validates_captured_replay(
-    pretuned_deepgemm: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    replay_writes_output: bool,
-) -> None:
-    output = torch.zeros(2)
-    expected = torch.tensor([1.0, 2.0])
-    failures: list[object] = []
-
-    def replay() -> None:
-        if replay_writes_output:
-            output.copy_(expected)
-
-    class FakeCapture(AbstractContextManager[SimpleNamespace]):
-        def __enter__(self) -> SimpleNamespace:
-            return SimpleNamespace(replay=replay)
-
-        def __exit__(self, *args: object) -> None:
-            return None
-
-    provider = pretuned_deepgemm._ColdCudagraphBenchmarkProvider.__new__(
-        pretuned_deepgemm._ColdCudagraphBenchmarkProvider
-    )
-    provider.args = ()
-    provider.settings = SimpleNamespace(autotune_accuracy_check=True)
-    provider._record_accuracy_failure = failures.append
-    provider._validate_against_baseline = lambda _config, actual, _args: torch.equal(
-        actual, expected
-    )
-
-    monkeypatch.setattr(
-        pretuned_deepgemm.helion_runtime, "cute_cuda_graph", FakeCapture
-    )
-    monkeypatch.setattr(pretuned_deepgemm.torch.cuda, "synchronize", lambda: None)
-
-    def candidate() -> torch.Tensor:
-        output.copy_(expected)
-        return output
-
-    config = object()
-    captured = provider._capture_validated_replay(config, candidate)
-    assert (captured is not None) is replay_writes_output
-    assert failures == ([] if replay_writes_output else [config])
-
-
-def test_pretuned_grouped_kernels_are_registered_for_b200(
-    pretuned_runner: Any,
-) -> None:
-    for name in ("grouped_gemm", "grouped_gemm_deepgemm"):
-        assert name in pretuned_runner.KERNELS
-        assert pretuned_runner._supported_hardware(name) == {"b200"}
-
-
-@pytest.mark.parametrize(
-    ("selected", "expected"),
-    (
-        ("", {"cutlass": True, "deepgemm": True}),
-        ("grouped_gemm", {"cutlass": True, "deepgemm": False}),
-        ("grouped_gemm_deepgemm", {"cutlass": False, "deepgemm": True}),
-        (
-            "grouped_gemm, grouped_gemm_deepgemm",
-            {"cutlass": True, "deepgemm": True},
-        ),
-    ),
-)
-def test_grouped_reference_selection(
-    pretuned_runner: Any,
-    selected: str,
-    expected: dict[str, bool],
-) -> None:
-    assert pretuned_runner.grouped_reference_requirements(selected) == expected
-
-
-def test_grouped_reference_workflow_pins_match_benchmarks(
-    cutlass_benchmark: Any,
-    deepgemm_benchmark: Any,
-) -> None:
-    workflow = PRETUNED_WORKFLOW.read_text()
-    for pin in (
-        cutlass_benchmark.CUTLASS_COMMIT,
-        cutlass_benchmark.CUTLASS_SHA256,
-        deepgemm_benchmark.DEEPGEMM_COMMIT,
-    ):
-        assert pin in workflow
-    assert 'KERNEL_ARGS=(--kernels "$SELECTED_KERNELS")' in workflow
-    assert '"${KERNEL_ARGS[@]}"' in workflow
-
-
 def test_grouped_gemm_aot_training_does_not_load_cutlass(
     pretuned_grouped_gemm: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = {
-        "helion_wins": 0,
-        "total": 0,
-        "geomean": 0.0,
-        "best_speedup": 0.0,
-        "baselines": {},
-    }
-    monkeypatch.setattr(
-        pretuned_grouped_gemm, "_run_aot_training", lambda _verbose: result
-    )
-    monkeypatch.setattr(
+    _assert_aot_training_does_not_load_reference(
+        monkeypatch,
         pretuned_grouped_gemm,
+        lambda: pretuned_grouped_gemm.main(verbose=False),
         "_cutlass_source_path",
-        lambda: pytest.fail("AOT training loaded an external reference"),
+        (False,),
     )
-    for mode in ("collect", "compile", "measure"):
-        monkeypatch.setenv("HELION_AOT_MODE", mode)
-        assert pretuned_grouped_gemm.main(verbose=False) is result
 
 
 def test_deepgemm_aot_training_does_not_load_reference(
     pretuned_deepgemm: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = {
-        "helion_wins": 0,
-        "total": 0,
-        "geomean": 0.0,
-        "best_speedup": 0.0,
-        "baselines": {},
-    }
-    monkeypatch.setattr(pretuned_deepgemm, "_run_aot_training", lambda _verbose: result)
-    monkeypatch.setattr(
-        pretuned_deepgemm,
+    _assert_aot_training_does_not_load_reference(
+        monkeypatch,
+        deepgemm_public_api,
+        lambda: deepgemm_public_api.main(
+            pretuned_deepgemm.create_grouped_gemm_deepgemm_kernel,
+            verbose=False,
+        ),
         "_deepgemm_root",
-        lambda: pytest.fail("AOT training loaded an external reference"),
+        (pretuned_deepgemm.create_grouped_gemm_deepgemm_kernel, False),
+        modes=("collect", "measure"),
     )
-    for mode in ("collect", "compile", "measure"):
-        monkeypatch.setenv("HELION_AOT_MODE", mode)
-        assert pretuned_deepgemm.main(verbose=False) is result
 
 
 def test_pre_captured_graph_sweep_uses_shared_timer(
-    pretuned_bench: Any, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[list[str], int]] = []
 
@@ -564,20 +575,12 @@ def test_grouped_gemm_dashboard_selects_shared_timer(
         lambda _path: (object(), {}),
     )
 
-    recorded: dict[str, object] = {}
-    expected = {"ok": True}
-
-    def fake_run_sweep(*args: object, **kwargs: object) -> dict[str, bool]:
-        recorded["args"] = args
-        recorded.update(kwargs)
-        return expected
-
-    monkeypatch.setattr(pretuned_grouped_gemm._BENCH, "run_sweep", fake_run_sweep)
-    assert pretuned_grouped_gemm.main(verbose=False) is expected
-    assert recorded["use_cudagraph"] is False
-    assert recorded["pre_captured_cudagraph"] is True
-    assert recorded["rep"] == 204
-    assert recorded["thermal_warmup_ms"] == 10_000
+    _assert_dashboard_uses_shared_timer(
+        monkeypatch,
+        pretuned_grouped_gemm._BENCH,
+        lambda: pretuned_grouped_gemm.main(verbose=False),
+        repetitions=204,
+    )
 
 
 def test_deepgemm_dashboard_selects_shared_timer(
@@ -586,31 +589,76 @@ def test_deepgemm_dashboard_selects_shared_timer(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
-    monkeypatch.setattr(pretuned_deepgemm, "_deepgemm_root", lambda: tmp_path)
+    monkeypatch.setattr(deepgemm_public_api, "_deepgemm_root", lambda: tmp_path)
     monkeypatch.setattr(
-        pretuned_deepgemm._HARNESS,
+        deepgemm_public_api._SUPPORT,
         "import_deepgemm",
         lambda _root, _alignment: (object(), {}),
     )
 
-    recorded: dict[str, object] = {}
-    expected = {"ok": True}
+    def fake_captured_calls(
+        case: tuple[Any, ...],
+        _deep_gemm: object,
+        _kernel_factory: object,
+        selected_configs: dict[int, dict[str, object]],
+    ) -> tuple[object, list[object], str]:
+        shape = case[0]
+        selected_configs[shape.row_index] = {"config_name": f"row-{shape.row_index}"}
+        return object(), [], "case"
 
-    def fake_run_sweep(*args: object, **kwargs: object) -> dict[str, bool]:
-        recorded["args"] = args
-        recorded.update(kwargs)
-        return expected
+    monkeypatch.setattr(deepgemm_public_api, "_captured_calls", fake_captured_calls)
+    expected = _assert_dashboard_uses_shared_timer(
+        monkeypatch,
+        deepgemm_public_api._BENCH,
+        lambda: deepgemm_public_api.main(
+            pretuned_deepgemm.create_grouped_gemm_deepgemm_kernel,
+            verbose=False,
+        ),
+        repetitions=102,
+        invoke_make_calls=True,
+    )
+    metadata = expected["benchmark_metadata"]
+    assert metadata["deepgemm_api"] == {
+        "function": "m_grouped_bf16_gemm_nt_contiguous",
+        "b_major": "k",
+        "compiled_dims": "nk",
+        "use_psum_layout": False,
+        "ensure_zero_padding": False,
+        "m_alignment": deepgemm_support.M_ALIGNMENT,
+    }
+    assert metadata["reviewed_profile_manifest_sha256"]
+    assert len(expected["benchmark_details"]["reviewed_helion_configs"]) == 8
 
-    monkeypatch.setattr(pretuned_deepgemm._BENCH, "run_sweep", fake_run_sweep)
-    assert pretuned_deepgemm.main(verbose=False) is expected
-    assert recorded["use_cudagraph"] is False
-    assert recorded["pre_captured_cudagraph"] is True
-    assert recorded["rep"] == 102
-    assert recorded["thermal_warmup_ms"] == 10_000
+
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    (
+        ({"HELION_AOT_MODE": "disabled"}, "requires HELION_AOT_MODE=evaluate"),
+        ({"HELION_AOT_MODE": "compile"}, "requires HELION_AOT_MODE=evaluate"),
+        (
+            {"HELION_AOT_MODE": "evaluate", "HELION_HEURISTIC_DIR": "/tmp/other"},
+            "does not permit HELION_HEURISTIC_DIR",
+        ),
+    ),
+)
+def test_deepgemm_dashboard_rejects_aot_overrides(
+    pretuned_deepgemm: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    message: str,
+) -> None:
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match=message):
+        deepgemm_public_api.main(
+            pretuned_deepgemm.create_grouped_gemm_deepgemm_kernel,
+            verbose=False,
+        )
 
 
 def test_pre_captured_graph_timer_balances_and_clears(
-    pretuned_bench: Any, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     operations: list[str] = []
     event_count = 36
@@ -662,98 +710,3 @@ def test_pre_captured_graph_timer_balances_and_clears(
     assert operations[19:-1] == measured
     assert operations[-1] == "sync"
     assert timings == [1.0, 2.0, 3.0]
-
-
-def test_deepgemm_rows_and_single_rng_stream(deepgemm_benchmark: Any) -> None:
-    actual = deepgemm_benchmark.official_actual_ms(seed=0)
-    expected = (
-        (9884, 9459, 7801, 7007),
-        (8247, 7724, 9586, 7225),
-        (8076, 8601, 10197, 8215),
-        (7119, 9449, 8773, 6965),
-        (5102, 5282, 4858, 5084, 3629, 4660, 5076, 4548),
-        (4027, 3114, 3934, 4368, 5111, 5242, 4039, 4993),
-        (3507, 4845, 4215, 2901, 4635, 3847, 4894, 4509),
-        (2870, 4080, 4999, 3466, 3666, 5006, 3336, 4261),
-    )
-    selected = deepgemm_benchmark.parse_rows("7,2-4,2")
-
-    assert actual == expected
-    assert selected == [2, 3, 4, 7]
-    assert tuple(actual[row] for row in selected) == tuple(
-        expected[row] for row in selected
-    )
-    assert deepgemm_benchmark.parse_rows("all") == list(range(8))
-    with pytest.raises(argparse.ArgumentTypeError, match="invalid row range"):
-        deepgemm_benchmark.parse_rows("4-2")
-    with pytest.raises(argparse.ArgumentTypeError, match="out of range"):
-        deepgemm_benchmark.parse_rows("8")
-
-
-def test_deepgemm_timings_are_paired_and_alternate_first_graph(
-    deepgemm_benchmark: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    replay_order: list[str] = []
-    synchronizations = 0
-
-    class FakeGraph:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def replay(self) -> None:
-            replay_order.append(self.name)
-
-    class FakeEvent:
-        def record(self) -> None:
-            pass
-
-        def elapsed_time(self, end: FakeEvent) -> float:
-            return 2.0
-
-    class FakeL2Flush:
-        zero_calls = 0
-
-        def zero_(self) -> None:
-            self.zero_calls += 1
-
-    def synchronize() -> None:
-        nonlocal synchronizations
-        synchronizations += 1
-
-    monkeypatch.setattr(
-        deepgemm_benchmark.torch.cuda, "Event", lambda **_kwargs: FakeEvent()
-    )
-    monkeypatch.setattr(deepgemm_benchmark.torch.cuda, "synchronize", synchronize)
-    l2_flush = FakeL2Flush()
-    monkeypatch.setattr(
-        deepgemm_benchmark.torch,
-        "empty",
-        lambda size, **_kwargs: l2_flush if size == 1 else None,
-    )
-    thermal_warmups: list[int] = []
-    monkeypatch.setattr(deepgemm_benchmark, "thermal_warmup", thermal_warmups.append)
-    args = argparse.Namespace(
-        samples=4,
-        iters=2,
-        warmups=2,
-        thermal_warmup_ms=0,
-        l2_flush_bytes=4,
-    )
-
-    first, second = deepgemm_benchmark.graph_timings(
-        (FakeGraph("H"), FakeGraph("D")), args, flops=4_000_000_000
-    )
-
-    assert replay_order == list("HDDHHHDDDDHHHHDDDDHH")
-    assert synchronizations == 1 + args.samples
-    assert thermal_warmups == [0]
-    assert l2_flush.zero_calls == 2 * args.samples * args.iters
-    assert first["samples_us"] == second["samples_us"] == [2000.0] * args.samples
-    defaults = deepgemm_benchmark.build_arg_parser().parse_args([])
-    assert (
-        defaults.samples,
-        defaults.iters,
-        defaults.warmups,
-        defaults.thermal_warmup_ms,
-        defaults.l2_flush_bytes,
-    ) == (10, 50, 5, 10000, 8_000_000_000)

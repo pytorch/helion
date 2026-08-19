@@ -773,9 +773,18 @@ AOT cache can find it at runtime.
 compute capability used for runtime lookup (e.g. `cuda_sm100`,
 `rocm_gfx950`).
 
-Only the heuristic file is meant to be checked in — it is the entire
-runtime artifact.  Everything under the data directory is disposable
-per-run state used to build the heuristic.
+For ordinary generated heuristics, the heuristic file is the entire runtime
+artifact and the only file meant to be checked in. Everything under the data
+directory is disposable per-run state used to build the heuristic.
+
+Hand-maintained heuristics may explicitly depend on a sibling, standard-library-only
+policy module. The reviewed grouped-GEMM artifact is one such exception: deploy
+`_helion_aot_grouped_gemm_deepgemm_cuda_sm100.py` together with its sibling
+`reviewed_profiles.py`. The artifact resolves that sibling relative to its own
+file, so the pair works without the repository root or `pretuned_kernels` on
+`sys.path`. A direct import without the sibling raises a clear `ImportError`;
+normal AOT evaluation warns that the artifact could not load and falls back to
+the compiler default config.
 
 ### Heuristic file format
 
