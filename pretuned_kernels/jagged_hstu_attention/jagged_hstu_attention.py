@@ -302,6 +302,14 @@ class ShapeCase:
     local_tokens: int
 
 
+@dataclass(frozen=True)
+class BenchmarkResult:
+    """Warm latency and checksum from one sharded kernel benchmark."""
+
+    warm_median_ms: float
+    checksum: float
+
+
 SHAPE_CASES = {
     case.name: case
     for case in (
@@ -406,7 +414,7 @@ def _run_case(
     distribution: str,
     kernel_names: tuple[str, ...],
     warm_repetitions: int,
-) -> None:
+) -> dict[str, BenchmarkResult]:
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh
@@ -548,6 +556,7 @@ def _run_case(
         f"max_seq={case.declared_max_seq_len} l_local={case.local_tokens} "
         f"actual_max={int(lengths.max())}"
     )
+    results: dict[str, BenchmarkResult] = {}
     for kernel_name in kernel_names:
         run, inputs = value_inputs[kernel_name]
         start = time.perf_counter()
@@ -563,10 +572,15 @@ def _run_case(
             for leaf in jax.tree_util.tree_leaves(output)
         )
         warm_ms = 0.0 if not warm_times else 1000.0 * float(np.median(warm_times))
+        results[kernel_name] = BenchmarkResult(
+            warm_median_ms=warm_ms,
+            checksum=checksum,
+        )
         print(
             f"  {kernel_name}: first={first_seconds:.3f}s "
             f"warm_median={warm_ms:.3f}ms checksum={checksum:.6e}"
         )
+    return results
 
 
 def main() -> None:

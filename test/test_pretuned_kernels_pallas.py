@@ -21,6 +21,17 @@ except Exception:  # pragma: no cover - JAX is optional or TPU is busy
 
 _PRETUNED_KERNELS_DIR = Path(__file__).resolve().parents[1] / "pretuned_kernels"
 
+# Median latencies measured on an otherwise-idle 8-device TPU v7x.  The gate
+# allows a deliberately generous 60% slowdown because it uses absolute device
+# latency rather than a simultaneously measured baseline.  It is intended to
+# catch substantial regressions, not ordinary run-to-run noise.
+_HSTU_EXPECTED_LATENCY_MS = {
+    "s4096_b65": {"fwd": 7.5, "bwd": 22.5},
+    "s3072_b5": {"fwd": 1.1, "bwd": 2.7},
+    "s16384_b3": {"fwd": 3.3, "bwd": 8.8},
+}
+_HSTU_MAX_SLOWDOWN = 1.60
+
 
 def _import_pretuned_module(name: str) -> object:
     module_name = f"_helion_pretuned_pallas_test_{name}"
@@ -168,6 +179,55 @@ class TestPretunedPallasNumerics(unittest.TestCase):
         self.assertLess(self._relative_l2(actual_fwd, expected_fwd), 1e-2)
         for actual, expected in zip(actual_bwd, expected_bwd, strict=True):
             self.assertLess(self._relative_l2(actual, expected), 1e-2)
+
+
+@unittest.skipUnless(HAS_TPU, "requires a real JAX TPU device")
+class TestPretunedPallasPerformance(unittest.TestCase):
+    """Performance regression checks for TPU-specific pretuned kernels."""
+
+    @pytest.mark.timeout(300)
+    def test_jagged_hstu_latency(self) -> None:
+        import jax
+
+        devices = jax.devices()
+        if len(devices) != 8 or any(
+            not device.device_kind.startswith("TPU v7") for device in devices
+        ):
+            self.skipTest("HSTU latency targets are calibrated for an 8-device TPU v7x")
+
+        module = _import_pretuned_module("jagged_hstu_attention")
+        for case_name, expected in _HSTU_EXPECTED_LATENCY_MS.items():
+            with self.subTest(case=case_name):
+                results = module._run_case(
+                    module.SHAPE_CASES[case_name],
+                    distribution="jagged",
+                    kernel_names=("fwd", "dq", "dk_dv"),
+                    warm_repetitions=11,
+                )
+                for kernel_name, result in results.items():
+                    self.assertTrue(
+                        bool(np.isfinite(result.checksum)),
+                        f"{case_name} {kernel_name} produced a non-finite checksum",
+                    )
+
+                actual = {
+                    "fwd": results["fwd"].warm_median_ms,
+                    # The public backward path launches these two kernels.
+                    "bwd": (
+                        results["dq"].warm_median_ms
+                        + results["dk_dv"].warm_median_ms
+                    ),
+                }
+                for pass_name, actual_ms in actual.items():
+                    ceiling_ms = expected[pass_name] * _HSTU_MAX_SLOWDOWN
+                    self.assertLessEqual(
+                        actual_ms,
+                        ceiling_ms,
+                        f"{case_name} {pass_name} latency {actual_ms:.3f} ms "
+                        f"exceeds {ceiling_ms:.3f} ms "
+                        f"(expected ~{expected[pass_name]:.3f} ms, "
+                        f"slowdown allowance {_HSTU_MAX_SLOWDOWN - 1:.0%})",
+                    )
 
 
 if __name__ == "__main__":
