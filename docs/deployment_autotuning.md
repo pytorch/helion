@@ -740,6 +740,10 @@ Each phase must run in a fresh process. Do not change `HELION_AOT_MODE` after
 an AOT kernel has been called in a process; Helion raises rather than reuse a
 warm bound-kernel/config cache under different phase semantics. The AOT runner
 enforces this contract by launching a new benchmark subprocess for each phase.
+When a run is resumed, that subprocess validates `hardware.json` against the
+device resolved from the kernel's actual arguments. This supports benchmarks
+that select a nondefault device such as `cuda:1` while still rejecting a phase
+that executes on different hardware or a different runtime.
 
 The AOT key dispatcher also pins its data directory on first active use. Set
 `HELION_AOT_DATA_DIR` before the first call and do not change it afterward. If
@@ -820,6 +824,15 @@ compute capability used for runtime lookup (e.g. `cuda_sm100`,
 For ordinary generated heuristics, the heuristic file is the entire runtime
 artifact and the only file meant to be checked in. Everything under the data
 directory is disposable per-run state used to build the heuristic.
+
+Hand-maintained heuristics may explicitly depend on a sibling, standard-library-only
+policy module. The reviewed grouped-GEMM artifact is one such exception: deploy
+`_helion_aot_grouped_gemm_deepgemm_cuda_sm100.py` together with its sibling
+`reviewed_profiles.py`. The artifact resolves that sibling relative to its own
+file, so the pair works without the repository root or `pretuned_kernels` on
+`sys.path`. A direct import without the sibling raises a clear `ImportError`;
+normal AOT evaluation warns that the artifact could not load and falls back to
+the compiler default config.
 
 ### Heuristic file format
 

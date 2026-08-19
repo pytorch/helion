@@ -7,7 +7,7 @@ checked-in Helion heuristic against one or more reference baselines and returns
 aggregate metrics::
 
     {"helion_wins": .., "total": .., "geomean": .., "best_speedup": ..,
-     "baselines": {"name": {..}}}
+     "baselines": {"name": {..}}, "benchmark_metadata": {..}}
 
 This script runs each ``main()`` and writes a JSON list of per-kernel records
 that ``.github/dashboard/build_pretuned_dashboard_data.py`` aggregates for the
@@ -147,6 +147,10 @@ def run_kernel(name: str, current_hardware: str) -> dict:
         # for the dashboard's per-kernel dropdown.
         if metrics.get("baselines"):
             record["baselines"] = metrics["baselines"]
+        if metrics.get("benchmark_metadata"):
+            record["benchmark_metadata"] = metrics["benchmark_metadata"]
+        if metrics.get("benchmark_details"):
+            record["benchmark_details"] = metrics["benchmark_details"]
     except (
         Exception
     ) as exc:  # Keep going: one kernel's failure shouldn't sink the report.

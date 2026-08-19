@@ -178,6 +178,10 @@ def parse_run(run_dir, active_platforms=None):
                         # Per-baseline breakdown for the dashboard dropdown (or
                         # None for single-baseline kernels).
                         "baselines": rec.get("baselines"),
+                        # Keep the bounded provenance/scope summary in dashboard
+                        # history. Full per-row configs stay in the raw benchmark
+                        # artifact to avoid multiplying them across retained runs.
+                        "benchmark_metadata": rec.get("benchmark_metadata"),
                     }
                 )
             kernels.append(kernel)
@@ -205,6 +209,7 @@ def build_history_entry(run, k):
                 "total": k["total"],
                 "best_speedup": round(k["best_speedup"], 4),
                 "baselines": k.get("baselines"),
+                "benchmark_metadata": k.get("benchmark_metadata"),
             }
         )
     return entry
@@ -338,6 +343,11 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
                 "total": latest.get("total", 0) if latest else 0,
                 "best_speedup": latest.get("best_speedup", 0) if latest else 0,
                 "baselines": latest.get("baselines") if latest and not failed else None,
+                "benchmark_metadata": (
+                    latest.get("benchmark_metadata")
+                    if latest and not failed
+                    else None
+                ),
                 "last_seen_date": latest["date"] if latest else None,
                 "history": entry["history"],
             }

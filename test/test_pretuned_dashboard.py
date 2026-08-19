@@ -89,6 +89,7 @@ def test_latest_kernel_failure_replaces_previous_speedup(tmp_path: Path) -> None
                 "helion_wins": 4,
                 "total": 4,
                 "best_speedup": 3.5,
+                "benchmark_metadata": {"provider": {"commit": "abc"}},
             },
             {
                 **common,
@@ -115,3 +116,8 @@ def test_latest_kernel_failure_replaces_previous_speedup(tmp_path: Path) -> None
     assert data["stats"]["failed_count"] == 1
     assert data["stats"]["unchanged_count"] == 0
     assert data["stats"]["geomean"] == 3.0
+    healthy = summary["healthy_kernel"]
+    assert healthy["benchmark_metadata"] == {"provider": {"commit": "abc"}}
+    assert healthy["history"][-1]["benchmark_metadata"] == {
+        "provider": {"commit": "abc"}
+    }
