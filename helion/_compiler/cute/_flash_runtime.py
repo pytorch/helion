@@ -306,6 +306,49 @@ def named_barrier_wait_unaligned(
     )
 
 
+@dsl_user_op
+def exp2_approx_f16x2_to_f32(
+    x: object,
+    y: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> tuple[Float32, Float32]:
+    """Evaluate two approximate exp2 values through one packed-f16x2 XU op."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(  # pyrefly: ignore[missing-attribute]
+            [Float32.mlir_type, Float32.mlir_type]
+        ),
+        [
+            Float32(x).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+            Float32(y).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+        ],
+        """
+        {
+          .reg .b16 lo, hi;
+          .reg .b32 packed;
+          cvt.rn.f16.f32 lo, $2;
+          cvt.rn.f16.f32 hi, $3;
+          mov.b32 packed, {lo, hi};
+          ex2.approx.f16x2 packed, packed;
+          mov.b32 {lo, hi}, packed;
+          cvt.f32.f16 $0, lo;
+          cvt.f32.f16 $1, hi;
+        }
+        """,
+        "=f,=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(Float32.mlir_type, result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(Float32.mlir_type, result, [1], loc=loc, ip=ip)),
+    )
+
+
 # ===========================================================================
 # FA4 ex2_emulation_2: degree-3 minimax poly software-exp2 on the FMA/ALU
 # pipe (packed-f32x2). Ported from flash_attn.cute.utils.py. STRING rounding
@@ -977,6 +1020,31 @@ def fa4_disc_rowmax_balanced(
     return row_max
 
 
+def disc_rowmax_ldred(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_max: Float32,
+    ld_chunks: int,
+) -> Float32:
+    """Chunked row-max using ``tcgen05.ld.red``.
+
+    ``LdRed32x32bOp`` returns the loaded score fragment plus one hardware
+    maximum for each 32-column TMEM tile.  Folding only those reduction
+    registers removes the software FMNMX tree while preserving the disc
+    path's one-chunk register footprint.
+    """
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    for ci in range(ld_chunks):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        red = cute.make_rmem_tensor(((1, 1), *frg.shape[1:]), cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ci, None, None], (frg, red))
+        for i in range(cute.size(red.shape)):
+            row_max = cute.arch.fmax(row_max, red[i])
+    cute.arch.fence_view_async_tmem_load()
+    return row_max
+
+
 def fa4_disc_rowmax_causal_balanced(
     tiled_ld: object,
     tLDtS: cute.Tensor,
@@ -1156,6 +1224,7 @@ def _disc_chunk_exp(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
 ) -> None:
     """In-place packed scale-subtract then exp2(pipe-split) over ONE 32-elem chunk.
 
@@ -1177,8 +1246,11 @@ def _disc_chunk_exp(
             )
             use_xu = ((i + e2e_offset) % e2e_freq) < (e2e_freq - e2e_res) or last_frag
             if use_xu:
-                frg[i] = cute.arch.exp2(r0)
-                frg[i + 1] = cute.arch.exp2(r1)
+                if f16x2_xu:
+                    frg[i], frg[i + 1] = exp2_approx_f16x2_to_f32(r0, r1)
+                else:
+                    frg[i] = cute.arch.exp2(r0)
+                    frg[i + 1] = cute.arch.exp2(r1)
             elif degree1:
                 frg[i], frg[i + 1] = ex2_emulation_deg1_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
             elif degree2:
@@ -1203,8 +1275,11 @@ def _disc_chunk_exp(
         pending_values = []
         for i, r0, r1, use_xu in scaled:
             if use_xu:
-                frg[i] = cute.arch.exp2(r0)
-                frg[i + 1] = cute.arch.exp2(r1)
+                if f16x2_xu:
+                    frg[i], frg[i + 1] = exp2_approx_f16x2_to_f32(r0, r1)
+                else:
+                    frg[i] = cute.arch.exp2(r0)
+                    frg[i + 1] = cute.arch.exp2(r1)
             elif emu_batch == 1:
                 if degree1:
                     frg[i], frg[i + 1] = ex2_emulation_deg1_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
@@ -2365,6 +2440,7 @@ def _fa4_sp_exp_convert_store_impl(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2391,6 +2467,7 @@ def _fa4_sp_exp_convert_store_impl(
                 emu_batch,
                 degree2,
                 degree1,
+                f16x2_xu,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_split):
@@ -2411,6 +2488,7 @@ def _fa4_sp_exp_convert_store_impl(
                 emu_batch,
                 degree2,
                 degree1,
+                f16x2_xu,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_split, p_store_chunks):
@@ -2432,6 +2510,7 @@ def _fa4_sp_exp_convert_store_impl(
                 emu_batch,
                 degree2,
                 degree1,
+                f16x2_xu,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_chunks):
@@ -2478,6 +2557,7 @@ def fa4_sp_exp_convert_store(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2506,6 +2586,7 @@ def fa4_sp_exp_convert_store(
         emu_batch,
         degree2,
         degree1,
+        f16x2_xu,
     )
 
 
@@ -2532,6 +2613,7 @@ def fa4_sp_exp_convert_store_whole_rowsum(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2560,6 +2642,7 @@ def fa4_sp_exp_convert_store_whole_rowsum(
         emu_batch,
         degree2,
         degree1,
+        f16x2_xu,
     )
 
 
@@ -2808,6 +2891,7 @@ def fa4_disc_exp_convert_store_pipe(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
 ) -> Float32:
     """SOFTWARE-PIPELINED chunked-t2r PASS 2 (the L1 lever). Same numerics + staged-P
     handshake + zero-spill peak (ONE chunk + a bounded pipeline window) as the serial
@@ -2872,6 +2956,7 @@ def fa4_disc_exp_convert_store_pipe(
             emu_batch,
             degree2,
             degree1,
+            f16x2_xu,
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)
@@ -2913,6 +2998,7 @@ def fa4_disc_exp_convert_store_pipe_causal(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store_pipe``."""
     p_sum = cutlass.Float32(0.0)
@@ -2953,6 +3039,7 @@ def fa4_disc_exp_convert_store_pipe_causal(
             emu_batch,
             degree2,
             degree1,
+            f16x2_xu,
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)

@@ -14,6 +14,7 @@ import torch
 import helion
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
 from helion._testing import DEVICE
@@ -160,6 +161,53 @@ def _hybrid_runtime_config() -> dict[str, object]:
     }
 
 
+def _emit_dense_resident_value_graph_source(
+    *,
+    capability: tuple[int, int] = (10, 3),
+    has_lse: bool = False,
+    score_plan: AttentionScorePlan | None = None,
+    num_kv: int = 256,
+    config_overrides: dict[str, object] | None = None,
+) -> str:
+    if score_plan is None:
+        score_plan = dense_score_plan(64)
+    with patch.dict(os.environ, {}, clear=True):
+        seed = cute_flash.flash_attention_seed_config(
+            64,
+            num_kv,
+            dtype=torch.float16,
+            is_causal=False,
+            standard_dense_output=True,
+            target_device_capability=(10, 3),
+        )
+        assert seed is not None
+        manual_overrides = dict(seed.config)
+        if config_overrides is not None:
+            manual_overrides.update(config_overrides)
+        config = cute_flash.resolve_flash_config(
+            64,
+            num_kv,
+            manual_overrides,
+            dtype=torch.float16,
+            is_causal=False,
+            standard_dense_output=True,
+        )
+    body = cute_flash.emit_flash_fa4_device_body(
+        cast("DeviceFunction", None),
+        head_dim=64,
+        num_kv=num_kv,
+        sequence_extent=num_kv * 128,
+        num_bh=64,
+        total_tiles=num_kv * 16,
+        cfg=config,
+        has_lse=has_lse,
+        io_dtype="cutlass.Float16",
+        score_plan=score_plan,
+        target_device_capability=capability,
+    )
+    return ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+
 def test_degree2_polynomial_relative_error_bound() -> None:
     x = torch.linspace(0.0, 1.0, 100_001, dtype=torch.float32)
     c0, c1, c2 = _flash_runtime._POLY_EX2_DEG2
@@ -298,6 +346,86 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
         )
 
 
+def test_sm103_packed_f16x2_rewrite_requires_exact_promoted_seed() -> None:
+    intermediate_source = _emit_dense_resident_value_graph_source(
+        num_kv=384,
+        config_overrides={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
+            cute_flash.FLASH_PERSISTENT_KEY: False,
+            cute_flash.FLASH_EXP2_PACKET_KEY: _DEG1_SHORT_PACKET,
+            cute_flash.FLASH_Q_TILE_COUNT_KEY: 2,
+        },
+    )
+    manual_source = _emit_dense_resident_value_graph_source(
+        num_kv=2048,
+        config_overrides={cute_flash.FLASH_E2E_OFFSET0_KEY: 9},
+    )
+    promoted_source = _emit_dense_resident_value_graph_source(num_kv=2048)
+
+    assert "f16x2_xu=True" not in intermediate_source
+    assert "f16x2_xu=True" not in manual_source
+    assert "f16x2_xu=True" in promoted_source
+
+
+def test_sm103_scaled_all_xu_codegen_covers_256k() -> None:
+    all_xu_source = _emit_dense_resident_value_graph_source(num_kv=2048)
+    overflow_source = _emit_dense_resident_value_graph_source(
+        num_kv=2048,
+        config_overrides={cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 9.0},
+    )
+    all_xu_module = ast.parse(all_xu_source)
+    overflow_module = ast.parse(overflow_source)
+
+    def _pass2_calls(module: ast.Module) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "fa4_sp_exp_convert_store_whole_rowsum"
+        ]
+
+    all_xu_calls = _pass2_calls(all_xu_module)
+    overflow_calls = _pass2_calls(overflow_module)
+    assert len(all_xu_calls) == len(overflow_calls) == 2
+    for call in all_xu_calls:
+        assert [ast.literal_eval(call.args[index]) for index in (6, 7, 8)] == [
+            16,
+            0,
+            0,
+        ]
+        assert any(
+            keyword.arg == "f16x2_xu" and ast.literal_eval(keyword.value)
+            for keyword in call.keywords
+        )
+    assert (
+        "cutlass.Float32(7.0) - flash_row_max_safe * _flash_scale_log2" in all_xu_source
+    )
+    for call in overflow_calls:
+        assert [ast.literal_eval(call.args[index]) for index in (6, 7)] == [16, 8]
+        assert not any(keyword.arg == "f16x2_xu" for keyword in call.keywords)
+    assert "cutlass.Float32(7.0)" not in overflow_source
+
+
+def test_dense_target_lowering_match_is_environment_independent() -> None:
+    dense_seed = cute_flash.flash_attention_seed_config(
+        64,
+        256,
+        standard_dense_output=True,
+        target_device_capability=(10, 3),
+    )
+    assert dense_seed is not None
+    dense_cfg = cute_flash.resolve_flash_config(
+        64,
+        256,
+        dense_seed.config,
+        standard_dense_output=True,
+    )
+
+    with patch.dict(os.environ, {"HELION_CUTE_FLASH_WAIT_HINT": "0"}):
+        assert cute_flash._flash_dense_resident_seed_matches(dense_cfg, 256, (10, 3))
+
+
 def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
     with patch.dict(os.environ, {}, clear=True):
         config = cute_flash.resolve_flash_config(
@@ -400,6 +528,7 @@ def test_polynomial_packet_uses_whole_row_dense_pass2(
         has_lse=False,
         io_dtype="cutlass.Float16",
         score_plan=dense_score_plan(64),
+        target_device_capability=(10, 0),
     )
     module = ast.Module(body=body, type_ignores=[])
     pass2_calls = [
@@ -458,6 +587,7 @@ def test_short_degree1_packet_reverses_steady_correction_order(
         has_lse=False,
         io_dtype="cutlass.Float16",
         score_plan=dense_score_plan(64),
+        target_device_capability=(10, 3),
     )
     correction_loop = next(
         node
@@ -520,6 +650,7 @@ def _emit_dense_single_stat_source(
             has_lse=False,
             io_dtype="cutlass.Float16",
             score_plan=dense_score_plan(64),
+            target_device_capability=(10, 3),
         )
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
@@ -927,6 +1058,7 @@ def test_dense_ring2_emits_two_slot_stat_protocol() -> None:
             has_lse=False,
             io_dtype="cutlass.Float16",
             score_plan=dense_score_plan(64),
+            target_device_capability=(10, 3),
         )
         return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
