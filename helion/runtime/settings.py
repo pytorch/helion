@@ -872,7 +872,7 @@ class Settings(_Settings):
         ),
         "retry_with_fallback": (
             "If True, retry a kernel once with the default config if it fails to launch (e.g. out of resources). "
-            "Useful for AOT kernels where resource usage scales with the input size (e.g. paged attention with batch size)," 
+            "Useful for AOT kernels where resource usage scales with the input size (e.g. paged attention with batch size),"
             "where the generated heuristic might return invalid configurations for larger unseen inputs. "
             "Ignored when autotune_effort=none; likely unnecessary for non-AOT dispatch."
             "Off by default; set HELION_RETRY_WITH_FALLBACK=1 to enable."

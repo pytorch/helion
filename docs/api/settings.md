@@ -339,6 +339,10 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 .. autoattribute:: Settings.ref_mode
 
    Select the reference execution strategy. ``RefMode.OFF`` runs compiled kernels (default); ``RefMode.EAGER`` runs the interpreter for debugging. Controlled by ``HELION_INTERPRET``.
+
+.. autoattribute:: Settings.retry_with_fallback
+
+   Retry a kernel that failed to launch due to resource limitations using the default configuration. Default is ``False``. Controlled by ``HELION_RETRY_WITH_FALLBACK``.
 ```
 
 ### Autotuner Hooks
