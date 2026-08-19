@@ -2417,6 +2417,75 @@ def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
 
 
+@dsl_user_op
+def resident_softmax_value_graph(
+    tLDrS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+    stats_empty_ptr_stage: object,
+    stats_empty_phase: object,
+    row_sum_init: object,
+    wait_hint: int = 10_000_000,
+    *,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """Resident softmax lowering with a full-row value graph.
+
+    Keep scale, exp2/conversion, split-P publication, statistics acquire, and
+    row-sum reduction in one lowering unit.  The exp2 results remain fp32 in
+    ``tLDrS`` for the reducer while a distinct register tensor holds fp16 P.
+    """
+    assert tLDrS.element_type is cutlass.Float32
+    assert cute.size(tLDrS) % 32 == 0
+    frag_count = cute.size(tLDrS) // 32
+    assert p_store_chunks == frag_count
+    assert cute.size(tSTtS, mode=[2]) == p_store_chunks
+    assert 0 < p_store_split < p_store_chunks
+
+    for i in range(0, cute.size(tLDrS), 2):
+        tLDrS[i], tLDrS[i + 1] = cute.arch.fma_packed_f32x2(
+            (tLDrS[i], tLDrS[i + 1]),
+            (scale, scale),
+            (minus_max_scale, minus_max_scale),
+        )
+
+    tSTrS = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
+    tSTrS_e = cute.make_tensor(
+        cute.recast_ptr(tSTrS.iterator, dtype=cutlass.Float16), tLDrS.layout
+    )
+    src = cute.logical_divide(tLDrS, cute.make_layout(32))
+    dst = cute.logical_divide(tSTrS_e, cute.make_layout(32))
+    for ci in range(frag_count):
+        for i in range(0, 32, 2):
+            exp0 = cute.math.exp2(src[i, ci], fastmath=True)
+            exp1 = cute.math.exp2(src[i + 1, ci], fastmath=True)
+            src[i, ci] = exp0
+            src[i + 1, ci] = exp1
+        cast("cute.Tensor", dst[None, ci]).store(
+            cast("cute.Tensor", src[None, ci]).load().to(cutlass.Float16)
+        )
+
+    for ci in range(p_store_chunks):
+        cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
+        if ci == p_store_split - 1:
+            cute.arch.fence_view_async_tmem_store()
+            mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    mbar_spin_wait(stats_empty_ptr_stage, stats_empty_phase, wait_hint)
+    return fadd_reduce_packed(tLDrS, row_sum_init)
+
+
 def _fa4_sp_exp_convert_store_impl(
     tLDrS: cute.Tensor,
     tiled_st: object,

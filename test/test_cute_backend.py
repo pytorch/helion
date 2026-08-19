@@ -23,6 +23,7 @@ import helion
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
+from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
@@ -2878,6 +2879,46 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("LdRed32x32bOp", modified_code)
 
     def test_flash_attention_sm103_f16x2_exp2_codegen_gates(self) -> None:
+        resident_q, resident_k, resident_v = (
+            torch.empty(1, 1, 32768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        resident_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta",
+            cute_flash_persistent=False,
+            cute_flash_exp2_packet="deg1_8x2_corr10",
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_e2e_offset=5,
+            cute_flash_e2e_offset0=1,
+            cute_flash_kv_stage=6,
+            cute_flash_stat_transport="single",
+        )
+        resident_bound = cute_dense_attention.bind((resident_q, resident_k, resident_v))
+        with patch.object(
+            resident_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            resident_code = resident_bound.to_triton_code(resident_config)
+        self.assertIn("resident_softmax_value_graph", resident_code)
+        self.assertNotIn("f16x2_xu=True", resident_code)
+        for fallback_target in ((10, 0), (10, 4)):
+            with patch.object(
+                resident_bound.env.config_spec,
+                "target_device_capability",
+                fallback_target,
+            ):
+                fallback_code = resident_bound.to_triton_code(resident_config)
+            self.assertNotIn("resident_softmax_value_graph", fallback_code)
+
+        nonpolicy_config = helion.Config(
+            **{**resident_config.config, "cute_flash_e2e_offset": 4}
+        )
+        with patch.object(
+            resident_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            nonpolicy_code = resident_bound.to_triton_code(nonpolicy_config)
+        self.assertNotIn("resident_softmax_value_graph", nonpolicy_code)
+
         q, k, v = (
             torch.empty(1, 1, 262144, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
@@ -2906,15 +2947,27 @@ class TestCuteBackend(TestCase):
             b200_code = dense_bound.to_triton_code(config)
         self.assertNotIn("f16x2_xu=True", b200_code)
 
-        lse_bound = cute_dense_attention_with_lse.bind((q, k, v))
+        lse_bound = cute_dense_attention_with_lse.bind(
+            (resident_q, resident_k, resident_v)
+        )
         lse_config = helion.Config(
-            **{**config.config, "cute_flash_stat_transport": "single"}
+            **{**resident_config.config, "cute_flash_stat_transport": "single"}
         )
         with patch.object(
             lse_bound.env.config_spec, "target_device_capability", (10, 3)
         ):
             lse_code = lse_bound.to_triton_code(lse_config)
         self.assertNotIn("f16x2_xu=True", lse_code)
+        self.assertNotIn("resident_softmax_value_graph", lse_code)
+
+        modified_bound = cute_softcap_attention.bind(
+            (resident_q, resident_k, resident_v)
+        )
+        with patch.object(
+            modified_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            modified_code = modified_bound.to_triton_code(resident_config)
+        self.assertNotIn("resident_softmax_value_graph", modified_code)
 
     def test_flash_attention_target_packed_exp2_preserves_256k_tail(self) -> None:
         capability = torch.cuda.get_device_capability()
@@ -2959,6 +3012,88 @@ class TestCuteBackend(TestCase):
         self.assertTrue(torch.equal(out, repeated))
         self.assertTrue(torch.isfinite(out).all())
         self.assertLess((out.float() - expected).abs().max().item(), 5e-5)
+
+    def _check_flash_attention_target_dense_resident(
+        self, num_kv: int, seed_value: int
+    ) -> None:
+        capability = torch.cuda.get_device_capability()
+        dense_policy = get_flash_target_policy(capability).tuning.dense_policy(num_kv)
+        if (
+            dense_policy is None
+            or dense_policy.softmax_lowering
+            is not FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+        ):
+            self.skipTest("target has no dense resident flash lowering")
+
+        torch.manual_seed(seed_value)
+        sequence_length = num_kv * 128
+        q, k, v = (
+            torch.randn(
+                1,
+                1,
+                sequence_length,
+                64,
+                dtype=torch.float16,
+                device=DEVICE,
+            )
+            for _ in range(3)
+        )
+        seed = _cute_flash.flash_attention_seed_config(
+            64,
+            num_kv,
+            dtype=torch.float16,
+            standard_dense_output=True,
+            target_device_capability=capability,
+        )
+        assert seed is not None
+        config = helion.Config(**seed.config)
+        bound = cute_dense_attention.bind((q, k, v))
+        code = bound.to_triton_code(config)
+        compiled = bound.compile_config(config)
+        self.assertIn("resident_softmax_value_graph", code)
+        self.assertNotIn("f16x2_xu=True", code)
+
+        out = compiled(q, k, v)
+        repeated = compiled(q, k, v)
+        torch.cuda.synchronize()
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        diff = (out.float() - expected.float()).abs()
+        normalized_rmse = torch.sqrt(
+            (diff * diff).mean(dtype=torch.float64)
+        ) / torch.sqrt((expected.float() * expected.float()).mean(dtype=torch.float64))
+        self.assertTrue(torch.equal(out, repeated))
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertLess(diff.max().item(), 0.015)
+        self.assertLess(normalized_rmse.item(), 0.004)
+        torch.testing.assert_close(out, expected, atol=0.01, rtol=0.02)
+
+        if num_kv == 1024:
+            tail_q = torch.zeros_like(q)
+            tail_k = torch.zeros_like(k)
+            tail_v = torch.full_like(v, -2.0)
+            tail_q[..., 0] = 1.0
+            tail_k[..., 0] = -26.0 * math.sqrt(64) / math.log2(math.e)
+            tail_k[..., 0, 0] = 0.0
+            tail_v[..., 0, :] = 2.0
+            tail_out = compiled(tail_q, tail_k, tail_v)
+            tail_repeated = compiled(tail_q, tail_k, tail_v)
+            effective_tail_log2 = (
+                tail_k[0, 0, 1, 0].float().item() / math.sqrt(64) * math.log2(math.e)
+            )
+            tail_mass = (sequence_length - 1) * 2.0**effective_tail_log2
+            tail_expected = (2.0 - 2.0 * tail_mass) / (1.0 + tail_mass)
+            self.assertTrue(torch.equal(tail_out, tail_repeated))
+            self.assertTrue(torch.isfinite(tail_out).all())
+            self.assertLess((tail_out.float() - tail_expected).abs().max().item(), 5e-5)
+
+    def test_flash_attention_target_dense32_resident_matches_sdpa(self) -> None:
+        self._check_flash_attention_target_dense_resident(256, 107)
+
+    def test_flash_attention_target_dense64_resident_matches_sdpa(self) -> None:
+        self._check_flash_attention_target_dense_resident(512, 111)
+
+    def test_flash_attention_target_dense128_resident_matches_sdpa(self) -> None:
+        self._check_flash_attention_target_dense_resident(1024, 113)
 
     def test_flash_attention_target_ldred_matches_sdpa(self) -> None:
         capability = torch.cuda.get_device_capability()

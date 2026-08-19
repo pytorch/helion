@@ -60,6 +60,7 @@ from .flash_schedule import FlashScheduleSpec
 from .flash_schedule import build_fa4_schedule
 from .flash_schedule import verify_flash_schedule
 from .flash_tuning import FlashPackedExp2Mode
+from .flash_tuning import FlashSoftmaxLowering
 
 _T = TypeVar("_T")
 
@@ -7399,6 +7400,36 @@ def emit_flash_fa4_device_body(
     probability_shift_safe = probability_log2_shift + cfg.rescale_threshold < math.log2(
         torch.finfo(torch.float16).max
     )
+    dense_resident_value_graph_candidate = False
+    if (
+        dense_tuning is not None
+        and _flash_dense_resident_seed_matches(cfg, num_kv, target_device_capability)
+        and not is_causal
+        and hd == 64
+        and io_dtype == "cutlass.Float16"
+        and not has_lse
+        and cfg.pipeline_family == "fa4_2cta"
+        and cfg.q_tile_count == 2
+        and cfg.use_2cta_instrs
+        and not cfg.separate_kv_rings
+        and not cfg.softmax_disc
+        and cfg.split_p_arrive
+        and cfg.p_store_repetition == 16
+        and cfg.s_load_repetition == 32
+        and cfg.rescale_threshold > 0.0
+        and probability_shift_safe
+        and score_plan.modifier_kinds == (DENSE_SCORE_KIND,)
+    ):
+        dense_softmax_family = dense_tuning.softmax_lowering
+        if dense_softmax_family is FlashSoftmaxLowering.STANDARD:
+            pass
+        elif dense_softmax_family is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH:
+            dense_resident_value_graph_candidate = True
+        else:
+            raise AssertionError(
+                "unsupported dense resident softmax lowering family: "
+                f"{dense_softmax_family!r}"
+            )
     use_whole_row_tmem_reduce = (
         use_tmem_row_reduce and not is_causal and not cfg.softmax_disc
     )
@@ -7440,7 +7471,9 @@ def emit_flash_fa4_device_body(
         and probability_shift_safe
     )
     effective_probability_log2_shift = (
-        probability_log2_shift if use_all_packed_f16x2_xu else 0
+        probability_log2_shift
+        if use_all_packed_f16x2_xu or dense_resident_value_graph_candidate
+        else 0
     )
     use_cga2_local_cta = cfg.use_cga2_local_cta
     use_clc_scheduler = cfg.use_clc_scheduler
@@ -7455,7 +7488,10 @@ def emit_flash_fa4_device_body(
         and cfg.exp2_impl == "split"
         and not cfg.softmax_disc
         and cfg.rescale_threshold > 0.0
-        and cfg.exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+        and (
+            cfg.exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+            or dense_resident_value_graph_candidate
+        )
     )
     # The MMA warp's PV -> next-QK order makes each alpha slot safe to reuse
     # without a per-iteration empty acknowledgement. Keep a single terminal
@@ -7464,6 +7500,11 @@ def emit_flash_fa4_device_body(
         fa4_stat_pipeline and cfg.stat_transport == "single_final"
     )
     acknowledged_stat_pipeline = fa4_stat_pipeline and not final_only_stat_pipeline
+    use_dense_resident_value_graph = (
+        dense_resident_value_graph_candidate and acknowledged_stat_pipeline
+    )
+    if dense_resident_value_graph_candidate:
+        assert use_dense_resident_value_graph
     verified_shared_memory_bytes: int | None = None
     if separate_kv_rings:
         assert not use_cga2_local_cta
@@ -9505,7 +9546,20 @@ if warp_idx == 15:
             cute.arch.fence_view_async_tmem_store()
             _helion_flash_rt.mbarrier_arrive(
                 flash_pfor_ptr + {stage}{pfor_peer_arg})"""
-        if cfg.exp2_impl == "split":
+        if use_dense_resident_value_graph:
+            assert split_p_arrive
+            assert not mixed_p_store
+            sp_exp_block = f"""            flash_row_sum = _helion_flash_rt.resident_softmax_value_graph(
+                tLDrS, {st}, {stt}, tSTcS, _flash_scale_log2,
+                flash_minus_max_scale, flash_pfor_ptr + {stage},
+                flash_pfor2_ptr + {stage}, flash_P_STORE_SPLIT,
+                flash_P_STORE_CHUNKS, {corr_empty_ptr} + 0,
+                flash_s_corr_prod_phase, flash_row_sum * flash_alpha,
+                {cfg.wait_hint}, pfor_peer_cta_rank=cutlass.Int32(0),
+                pfor_self_cta_rank={pfor_self_cta_rank})"""
+            sp_p_store_block = ""
+            sp_corr_publish_alpha = ""
+        elif cfg.exp2_impl == "split":
             sp_e2e_offset = (
                 "0"
                 if exp2_codegen.e2e_res == 0
@@ -9638,6 +9692,14 @@ if warp_idx == 15:
             else "            flash_row_max = "
             "_helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)"
         )
+        post_p_stat_acquire = (
+            "" if use_dense_resident_value_graph else fa4_post_p_stat_acquire.rstrip()
+        )
+        row_sum_update = (
+            "            flash_s_corr_prod_phase ^= 1"
+            if use_dense_resident_value_graph
+            else "            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum"
+        )
         return f"""{
             fa4_entry_stat_acquire
         }        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
@@ -9660,8 +9722,8 @@ if warp_idx == 15:
 {_softmax_release_p_ready(stage)}
 {_sp_alpha_post}
 {sp_alpha_publish_post}
-{fa4_post_p_stat_acquire.rstrip()}
-            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
+{post_p_stat_acquire}
+{row_sum_update}
 {sp_p_store_block}
 {final_corr_publish_rowsum}"""
 
@@ -10022,7 +10084,10 @@ if warp_idx == 15:
     corr_output_m_tile1 = output_m_tile1 if not epi_smem else "flash_m_tile1"
     corr_steady_stages = (
         f"{corr_stage1}\n{corr_stage0}"
-        if cfg.exp2_packet == _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+        if (
+            cfg.exp2_packet == _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+            and not use_dense_resident_value_graph
+        )
         else f"{corr_stage0}\n{corr_stage1}"
     )
     if cfg.skip_rescale_stats:
