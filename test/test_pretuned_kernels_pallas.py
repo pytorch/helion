@@ -214,8 +214,7 @@ class TestPretunedPallasPerformance(unittest.TestCase):
                     "fwd": results["fwd"].warm_median_ms,
                     # The public backward path launches these two kernels.
                     "bwd": (
-                        results["dq"].warm_median_ms
-                        + results["dk_dv"].warm_median_ms
+                        results["dq"].warm_median_ms + results["dk_dv"].warm_median_ms
                     ),
                 }
                 for pass_name, actual_ms in actual.items():
