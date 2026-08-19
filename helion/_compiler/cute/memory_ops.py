@@ -1460,24 +1460,24 @@ def _try_splice_tcgen05_unary_epilogue(
     return ast.Constant(value=None)
 
 
-def _try_codegen_tcgen05_pair_epilogue(
+def _try_codegen_tcgen05_fragment_epilogue(
     state: CodegenState,
     tensor: object,
     subscript: list[object] | tuple[object, ...],
     ast_subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
 ) -> ast.AST | None:
-    plan = state.device_function.cute_state.tcgen05_pair_epilogue_plan_for_store(
+    plan = state.device_function.cute_state.tcgen05_fragment_epilogue_plan_for_store(
         state.fx_node
     )
     if plan is None:
         return None
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", "planned tcgen05 store is not a tensor")
-    from ..inductor_lowering import is_deferred_tcgen05_pair_epilogue
+    from ..inductor_lowering import is_deferred_tcgen05_fragment_epilogue
 
     value_node = state.fx_node.args[2] if state.fx_node is not None else None
-    if value_node is not plan.value_node or not is_deferred_tcgen05_pair_epilogue(
+    if value_node is not plan.value_node or not is_deferred_tcgen05_fragment_epilogue(
         state.ast_args[2]
     ):
         raise exc.BackendUnsupported(
@@ -1498,7 +1498,7 @@ def _try_codegen_tcgen05_pair_epilogue(
         ast_subscript,
         extra_mask,
         result_var,
-        pair_epilogue=plan,
+        fragment_epilogue=plan,
     )
     if rewritten is None:
         raise exc.BackendUnsupported(
@@ -1560,7 +1560,7 @@ def _(state: CodegenState) -> ast.AST:
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
     if (
-        planned := _try_codegen_tcgen05_pair_epilogue(
+        planned := _try_codegen_tcgen05_fragment_epilogue(
             state, tensor, subscript, ast_subscript, extra_mask
         )
     ) is not None:

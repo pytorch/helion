@@ -119,7 +119,7 @@ class _DestinationSubtileProgram:
 
 
 @dataclasses.dataclass(frozen=True)
-class Tcgen05PairEpiloguePlan:
+class Tcgen05FragmentEpiloguePlan:
     anchor: Node
     store_node: Node
     value_node: Node
@@ -822,7 +822,7 @@ def _extract_region(
     return _Region(store, value, frozenset(owned), frozenset(boundaries))
 
 
-def analyze_tcgen05_pair_epilogue_candidate(
+def analyze_tcgen05_fragment_epilogue_candidate(
     graphs: Sequence[GraphInfo],
     anchor: Node,
     *,
@@ -1634,7 +1634,7 @@ def _collect_demands(
     return result
 
 
-def analyze_tcgen05_pair_epilogue_plan(
+def analyze_tcgen05_fragment_epilogue_plan(
     graphs: Sequence[GraphInfo],
     anchor: Node,
     *,
@@ -1645,7 +1645,7 @@ def analyze_tcgen05_pair_epilogue_plan(
     bk: int,
     input_dtype: torch.dtype,
     source_global_shape: tuple[int | torch.SymInt, ...],
-) -> Tcgen05PairEpiloguePlan | None:
+) -> Tcgen05FragmentEpiloguePlan | None:
     """Finalize exact thread-local fragment ownership for one configuration."""
     try:
         region = _extract_region(graphs, anchor, expected_output_block_ids)
@@ -1802,7 +1802,7 @@ def analyze_tcgen05_pair_epilogue_plan(
                 )
             programs.append(_DestinationSubtileProgram(tuple(groups)))
 
-        plan = Tcgen05PairEpiloguePlan(
+        plan = Tcgen05FragmentEpiloguePlan(
             anchor=anchor,
             store_node=region.store,
             value_node=region.value,
@@ -1866,7 +1866,7 @@ class _Evaluator:
     def __init__(
         self,
         state: CodegenState,
-        plan: Tcgen05PairEpiloguePlan,
+        plan: Tcgen05FragmentEpiloguePlan,
         *,
         carrier: str,
         destination_position: str,
@@ -2117,9 +2117,9 @@ class _Evaluator:
         return result
 
 
-def _render_tcgen05_pair_group(
+def _render_tcgen05_fragment_group(
     state: CodegenState,
-    plan: Tcgen05PairEpiloguePlan,
+    plan: Tcgen05FragmentEpiloguePlan,
     program: _SourceSubtileProgram,
     *,
     carrier_name: str,
@@ -2178,9 +2178,9 @@ def _render_tcgen05_pair_group(
     return prelude, output
 
 
-def render_tcgen05_pair_epilogue(
+def render_tcgen05_fragment_epilogue(
     state: CodegenState,
-    plan: Tcgen05PairEpiloguePlan,
+    plan: Tcgen05FragmentEpiloguePlan,
     *,
     carrier_name: str,
     coordinate_name: str,
@@ -2191,7 +2191,7 @@ def render_tcgen05_pair_epilogue(
     program = plan.streaming_program
     if program is None:
         raise RuntimeError("shape-changing fragment requires the scheduled renderer")
-    prelude, output = _render_tcgen05_pair_group(
+    prelude, output = _render_tcgen05_fragment_group(
         state,
         plan,
         program,
@@ -2203,9 +2203,9 @@ def render_tcgen05_pair_epilogue(
     return prelude, f"{output}.load()"
 
 
-def render_tcgen05_pair_epilogue_group(
+def render_tcgen05_fragment_epilogue_group(
     state: CodegenState,
-    plan: Tcgen05PairEpiloguePlan,
+    plan: Tcgen05FragmentEpiloguePlan,
     program: _SourceSubtileProgram,
     *,
     carrier_name: str,
@@ -2215,7 +2215,7 @@ def render_tcgen05_pair_epilogue_group(
     indent: str,
 ) -> str:
     """Fill one destination fragment from its resident source subtile."""
-    prelude, _ = _render_tcgen05_pair_group(
+    prelude, _ = _render_tcgen05_fragment_group(
         state,
         plan,
         program,

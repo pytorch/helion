@@ -15771,7 +15771,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(_split_minor_coord_meta(projected), coordinate)
         self.assertIsNone(_split_minor_coord_meta(opaque))
 
-    def test_tcgen05_pair_index_compiler_matches_sympy(self) -> None:
+    def test_tcgen05_fragment_index_compiler_matches_sympy(self) -> None:
         row = _Index.variable("row", 3)
         pair = _Index.variable("pair", 4)
         numerator = _add(_add(_mul(row, -3), _mul(pair, 5)), -1)
@@ -15842,7 +15842,7 @@ class TestCuteLowerings(unittest.TestCase):
                     ownership,
                 )
 
-    def test_tcgen05_pair_plan_rejection_is_memoized_per_tile_shape(
+    def test_tcgen05_fragment_plan_rejection_is_memoized_per_tile_shape(
         self,
     ) -> None:
         from helion._compiler.cute import cute_mma as cute_mma_module
@@ -15859,7 +15859,7 @@ class TestCuteLowerings(unittest.TestCase):
         candidate = cast(
             "Any",
             SimpleNamespace(
-                requires_pair_epilogue=True,
+                requires_fragment_epilogue=True,
                 operands=SimpleNamespace(
                     output_block_ids=(),
                     lhs=SimpleNamespace(
@@ -15881,7 +15881,7 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             patch.object(
                 cute_mma_module,
-                "_tcgen05_pair_epilogue_operands_supported",
+                "_tcgen05_fragment_epilogue_operands_supported",
                 return_value=True,
             ),
             patch.object(
@@ -15889,13 +15889,13 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             patch.object(
                 cute_mma_module,
-                "analyze_tcgen05_pair_epilogue_plan",
+                "analyze_tcgen05_fragment_epilogue_plan",
                 return_value=None,
             ) as analyze,
         ):
             for bn in (64, 64, 128):
                 self.assertFalse(
-                    cute_mma_module.ensure_tcgen05_pair_epilogue_plan(
+                    cute_mma_module.ensure_tcgen05_fragment_epilogue_plan(
                         fn,
                         anchor,
                         candidate,
@@ -15908,7 +15908,7 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertEqual(analyze.call_count, 2)
 
-    def test_tcgen05_pair_fragment_projection_rotary_codegen(self) -> None:
+    def test_tcgen05_fragment_projection_rotary_codegen(self) -> None:
         dtype = torch.bfloat16
         x = torch.empty([128, 128], device=DEVICE, dtype=dtype)
         for head_dim in (64, 128):
@@ -15990,7 +15990,7 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIsNone(spec.compiler_default_config)
 
-    def test_tcgen05_pair_fragment_projection_rotary_runtime(self) -> None:
+    def test_tcgen05_fragment_projection_rotary_runtime(self) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -16123,7 +16123,7 @@ class TestCuteLowerings(unittest.TestCase):
         ).view(heads, m, head_dim)
         torch.testing.assert_close(actual, expected.to(dtype), atol=0.1, rtol=1e-2)
 
-    def test_tcgen05_pair_fragment_is_generic_and_locality_checked(
+    def test_tcgen05_fragment_is_generic_and_locality_checked(
         self,
     ) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -16203,7 +16203,7 @@ class TestCuteLowerings(unittest.TestCase):
         ).view(1, 128, 64)
         torch.testing.assert_close(actual, expected.to(dtype), atol=0.1, rtol=2e-2)
 
-    def test_tcgen05_pair_fragment_mixed_mma_is_rejected_atomically(
+    def test_tcgen05_fragment_mixed_mma_is_rejected_atomically(
         self,
     ) -> None:
         dtype = torch.bfloat16
@@ -16232,7 +16232,7 @@ class TestCuteLowerings(unittest.TestCase):
                 ):
                     bound.to_triton_code(config)
 
-    def test_tcgen05_pair_fragment_rejects_unplanned_search_tiles(
+    def test_tcgen05_fragment_rejects_unplanned_search_tiles(
         self,
     ) -> None:
         args = (
@@ -16283,7 +16283,7 @@ class TestCuteLowerings(unittest.TestCase):
             ):
                 bound.to_triton_code(config)
 
-    def test_tcgen05_pair_fragment_rejects_explicit_epilogue_layout(
+    def test_tcgen05_fragment_rejects_explicit_epilogue_layout(
         self,
     ) -> None:
         dtype = torch.bfloat16

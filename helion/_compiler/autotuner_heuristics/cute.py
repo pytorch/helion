@@ -824,15 +824,15 @@ class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        from ..cute.cute_mma import tcgen05_pair_epilogue_has_unique_anchor
-        from ..cute.cute_mma import tcgen05_pair_epilogue_present
+        from ..cute.cute_mma import tcgen05_fragment_epilogue_has_unique_anchor
+        from ..cute.cute_mma import tcgen05_fragment_epilogue_present
 
         spec = env.config_spec
         return (
             spec.cute_tcgen05_search_enabled
             and TCGEN05_TWO_CTA_SEED_PID_TYPE in spec.allowed_pid_types
-            and tcgen05_pair_epilogue_present(device_ir.graphs)
-            and tcgen05_pair_epilogue_has_unique_anchor(
+            and tcgen05_fragment_epilogue_present(device_ir.graphs)
+            and tcgen05_fragment_epilogue_has_unique_anchor(
                 device_ir.graphs,
                 device_ir=device_ir,
             )

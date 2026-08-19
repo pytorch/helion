@@ -3028,7 +3028,7 @@ class TestCuteBackend(TestCase):
                     )
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
-    def test_flash_attention_fa4_two_cta_clamps_pair_epilogue(self) -> None:
+    def test_flash_attention_fa4_two_cta_clamps_fragment_epilogue(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             cfg = resolve_flash_config(
                 128,

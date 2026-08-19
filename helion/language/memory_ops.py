@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
-    from .._compiler.cute.fragment_epilogue import Tcgen05PairEpiloguePlan
+    from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
 
@@ -1529,7 +1529,7 @@ def _codegen_cute_store_tcgen05_tile(
     value_name: str,
     epilogue_chain: Tcgen05UnaryEpilogueChain | None = None,
     grouped_tail_epilogue: Tcgen05GroupedTailEpilogueMatch | None = None,
-    pair_epilogue: Tcgen05PairEpiloguePlan | None = None,
+    fragment_epilogue: Tcgen05FragmentEpiloguePlan | None = None,
 ) -> list[ast.AST] | ast.AST | None:
     df = state.device_function
     candidate_names = df.variable_aliases(value_name)
@@ -1579,9 +1579,9 @@ def _codegen_cute_store_tcgen05_tile(
     else:
         expected_block_ids = tcgen05_value.output_block_ids
     if (
-        pair_epilogue is not None
-        and pair_epilogue.store_node is store_node
-        and pair_epilogue.changes_shape
+        fragment_epilogue is not None
+        and fragment_epilogue.store_node is store_node
+        and fragment_epilogue.changes_shape
     ):
         # The committed planner exhaustively proved the derived indices are
         # the exact compact destination tile. ``exact_tile_block_ids`` cannot
@@ -1596,7 +1596,7 @@ def _codegen_cute_store_tcgen05_tile(
         if (
             epilogue_chain is not None
             or grouped_tail_epilogue is not None
-            or pair_epilogue is not None
+            or fragment_epilogue is not None
         ):
             raise exc.BackendUnsupported(
                 "cute",
@@ -1605,7 +1605,7 @@ def _codegen_cute_store_tcgen05_tile(
     if tcgen05_value.orientation is Tcgen05Orientation.NM and (
         epilogue_chain is not None
         or grouped_tail_epilogue is not None
-        or pair_epilogue is not None
+        or fragment_epilogue is not None
     ):
         raise exc.BackendUnsupported(
             "cute",
@@ -1614,7 +1614,7 @@ def _codegen_cute_store_tcgen05_tile(
     assert (
         sum(
             value is not None
-            for value in (epilogue_chain, grouped_tail_epilogue, pair_epilogue)
+            for value in (epilogue_chain, grouped_tail_epilogue, fragment_epilogue)
         )
         <= 1
     )
@@ -1745,13 +1745,14 @@ def _codegen_cute_store_tcgen05_tile(
                 "tcgen05 pure role-lifecycle store requires a rank-2 tile store",
             )
         return None
-    if pair_epilogue is not None and pair_epilogue.changes_shape:
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
         source_base_indices = [
             _cute_tile_begin_expr(state, size)
-            for size in pair_epilogue.store_tile_sizes
+            for size in fragment_epilogue.store_tile_sizes
         ]
         column_ratio = (
-            pair_epilogue.source_shape[-1] // pair_epilogue.destination_shape[-1]
+            fragment_epilogue.source_shape[-1]
+            // fragment_epilogue.destination_shape[-1]
         )
         base_indices = [
             *source_base_indices[:-1],
@@ -1782,8 +1783,8 @@ def _codegen_cute_store_tcgen05_tile(
         else f"({m_index}) // cutlass.Int32({tcgen05_source_bm})"
     )
     tcgen05_destination_bn = (
-        pair_epilogue.destination_shape[-1]
-        if pair_epilogue is not None and pair_epilogue.changes_shape
+        fragment_epilogue.destination_shape[-1]
+        if fragment_epilogue is not None and fragment_epilogue.changes_shape
         else tcgen05_source_bn
     )
     tile_coord_n = f"({n_index}) // cutlass.Int32({tcgen05_destination_bn})"
@@ -3113,15 +3114,17 @@ def _codegen_cute_store_tcgen05_tile(
         chain.
         """
         load_expr = f"{carrier_name}.load()"
-        if pair_epilogue is not None:
+        if fragment_epilogue is not None:
             coordinate_setup, coordinate_name = _coord_subtile_source(
                 prelude_indent, coord_layout, include_setup=True
             )
-            from .._compiler.cute.fragment_epilogue import render_tcgen05_pair_epilogue
+            from .._compiler.cute.fragment_epilogue import (
+                render_tcgen05_fragment_epilogue,
+            )
 
-            fragment_prelude, fragment_expression = render_tcgen05_pair_epilogue(
+            fragment_prelude, fragment_expression = render_tcgen05_fragment_epilogue(
                 state,
-                pair_epilogue,
+                fragment_epilogue,
                 carrier_name=carrier_name,
                 coordinate_name=coordinate_name,
                 target_dtype=target_dtype,
@@ -3593,7 +3596,7 @@ def _codegen_cute_store_tcgen05_tile(
     simt_static_store_setup, simt_tile_store_setup = store_common_setup(
         tensor_name, include_full_tile=not simt_edge_only
     )
-    if pair_epilogue is not None and pair_epilogue.changes_shape:
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
         simt_early_aux = simt_late_prelude = ""
         simt_acc_vec_rhs = ""
     else:
@@ -3940,17 +3943,17 @@ def _codegen_cute_store_tcgen05_tile(
             )
         ),
     ]
-    if pair_epilogue is not None and pair_epilogue.changes_shape:
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
         from .._compiler.cute.fragment_epilogue import (
-            render_tcgen05_pair_epilogue_group,
+            render_tcgen05_fragment_epilogue_group,
         )
 
-        destination_bm = pair_epilogue.destination_shape[-2]
-        destination_bn = pair_epilogue.destination_shape[-1]
+        destination_bm = fragment_epilogue.destination_shape[-2]
+        destination_bn = fragment_epilogue.destination_shape[-1]
         assert leading_index is not None
         scheduled_source = f"if {tcgen05_lifecycle.epi_active}:\n"
         for destination_subtile, destination_program in enumerate(
-            pair_epilogue.programs
+            fragment_epilogue.programs
         ):
             scheduled_source += (
                 f"    {compact_gd_subtile} = {compact_ttr_gd_grouped}["
@@ -3964,9 +3967,9 @@ def _codegen_cute_store_tcgen05_tile(
                     f"(None, None, None, cutlass.Int32({program.source_subtile}))]\n"
                     f"    cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
                 )
-                scheduled_source += render_tcgen05_pair_epilogue_group(
+                scheduled_source += render_tcgen05_fragment_epilogue_group(
                     state,
-                    pair_epilogue,
+                    fragment_epilogue,
                     program,
                     carrier_name=ttr_racc,
                     destination_name=ttr_rd,
@@ -3974,7 +3977,7 @@ def _codegen_cute_store_tcgen05_tile(
                     target_dtype=target_dtype,
                     indent="    ",
                 )
-            if destination_subtile == len(pair_epilogue.programs) - 1:
+            if destination_subtile == len(fragment_epilogue.programs) - 1:
                 scheduled_source += (
                     "    cute.arch.fence_view_async_tmem_load()\n"
                     "    with cute.arch.elect_one():\n"
@@ -4848,7 +4851,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{tma_store_default_subtile_body}"
         )
 
-    if pair_epilogue is not None and pair_epilogue.changes_shape:
+    if fragment_epilogue is not None and fragment_epilogue.changes_shape:
         # The compact SIMT schedule above owns T2R and never instantiates the
         # same-shape TMA renderer. Avoid eagerly formatting that unused body.
         tma_store_subtile_loop = ""
@@ -5090,7 +5093,7 @@ def _codegen_cute_store_tcgen05_tile(
             ),
             *(
                 [f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_aux_epi_tidx})"]
-                if pair_epilogue is not None
+                if fragment_epilogue is not None
                 else []
             ),
             f"{ttr_rd} = cute.make_rmem_tensor({ttr_racc}.shape, {target_dtype})",
