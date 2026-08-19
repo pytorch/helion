@@ -2429,7 +2429,6 @@ def resident_softmax_value_graph(
     pfor_ptr_stage: object,
     pfor2_ptr_stage: object,
     p_store_split: int,
-    p_store_chunks: int,
     stats_empty_ptr_stage: object,
     stats_empty_phase: object,
     row_sum_init: object,
@@ -2449,9 +2448,8 @@ def resident_softmax_value_graph(
     assert tLDrS.element_type is cutlass.Float32
     assert cute.size(tLDrS) % 32 == 0
     frag_count = cute.size(tLDrS) // 32
-    assert p_store_chunks == frag_count
-    assert cute.size(tSTtS, mode=[2]) == p_store_chunks
-    assert 0 < p_store_split < p_store_chunks
+    assert cute.size(tSTtS, mode=[2]) == frag_count
+    assert 0 < p_store_split < frag_count
 
     for i in range(0, cute.size(tLDrS), 2):
         tLDrS[i], tLDrS[i + 1] = cute.arch.fma_packed_f32x2(
@@ -2476,7 +2474,7 @@ def resident_softmax_value_graph(
             cast("cute.Tensor", src[None, ci]).load().to(cutlass.Float16)
         )
 
-    for ci in range(p_store_chunks):
+    for ci in range(frag_count):
         cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
         if ci == p_store_split - 1:
             cute.arch.fence_view_async_tmem_store()
@@ -3356,16 +3354,16 @@ class ResidentSoftmaxState:
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
     ) -> "ResidentSoftmaxState":
+        row_max = cute.make_rmem_tensor(1, Float32)
+        row_sum = cute.make_rmem_tensor(1, Float32)
+        row_max.fill(Float32(-Float32.inf))
+        row_sum.fill(Float32(0.0))
         return ResidentSoftmaxState(
             scale_log2,
-            cute.make_rmem_tensor(1, Float32),
-            cute.make_rmem_tensor(1, Float32),
+            row_max,
+            row_sum,
             rescale_threshold,
         )
-
-    def reset(self) -> None:
-        self.row_max.fill(Float32(-Float32.inf))
-        self.row_sum.fill(Float32(0.0))
 
     @cute.jit
     def _update_row_max_from_local(
@@ -3451,15 +3449,6 @@ class ResidentSoftmaxState:
             converted_fragments[None, fragment].store(
                 score_fragments[None, fragment].load().to(converted.element_type)
             )
-
-    @cute.jit
-    def acquire_stats(
-        self,
-        stats_empty_ptr_stage: object,
-        stats_empty_phase: object,
-        wait_hint: int,
-    ) -> None:
-        mbar_spin_wait(stats_empty_ptr_stage, stats_empty_phase, wait_hint)
 
     @cute.jit
     def update_row_sum(

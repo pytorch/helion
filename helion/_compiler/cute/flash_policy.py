@@ -8,6 +8,7 @@ from .flash_tuning import FlashCausalTuningPolicy
 from .flash_tuning import FlashDenseTuningPolicy
 from .flash_tuning import FlashPackedExp2Mode
 from .flash_tuning import FlashSoftmaxLowering
+from .flash_tuning import FlashTuningDType
 from .flash_tuning import FlashTuningPolicy
 
 
@@ -19,38 +20,94 @@ class FlashTargetPolicy:
         default_factory=FlashHardwareCapabilities
     )
     tuning: FlashTuningPolicy = dataclasses.field(default_factory=FlashTuningPolicy)
+    additional_tunings: tuple[FlashTuningPolicy, ...] = ()
 
     def __post_init__(self) -> None:
-        if (
-            self.tuning.tmem_row_reduce_min_kv is not None
-            and not self.hardware.supports_tmem_row_reduce
-        ):
-            raise ValueError("TMEM row-reduce tuning requires hardware support")
-        causal_resident_policies = tuple(
-            policy
-            for policy in self.tuning.causal_policies
-            if policy.softmax_lowering is not FlashSoftmaxLowering.STANDARD
+        workloads = [tuning.workload for tuning in self.tunings]
+        if len(set(workloads)) != len(workloads):
+            raise ValueError("flash target tuning workloads must be unique")
+        for tuning in self.tunings:
+            uses_specialized_lowering = any(
+                policy.softmax_lowering is not FlashSoftmaxLowering.STANDARD
+                or policy.packed_exp2_mode is not FlashPackedExp2Mode.DISABLED
+                for policy in tuning.dense_policies
+            ) or any(
+                policy.softmax_lowering is not FlashSoftmaxLowering.STANDARD
+                for policy in tuning.causal_policies
+            )
+            if uses_specialized_lowering and (
+                tuning.workload.head_dim != 64
+                or tuning.workload.dtype is not FlashTuningDType.FLOAT16
+            ):
+                raise ValueError(
+                    "specialized flash lowerings require the FP16 head-dim-64 workload"
+                )
+            if (
+                tuning.tmem_row_reduce_min_kv is not None
+                and not self.hardware.supports_tmem_row_reduce
+            ):
+                raise ValueError("TMEM row-reduce tuning requires hardware support")
+            causal_resident_policies = tuple(
+                policy
+                for policy in tuning.causal_policies
+                if policy.softmax_lowering is not FlashSoftmaxLowering.STANDARD
+            )
+            if causal_resident_policies and not self.hardware.supports_tmem_row_reduce:
+                raise ValueError(
+                    "causal resident softmax requires TMEM row-reduce support"
+                )
+            row_reduce_min_kv = tuning.tmem_row_reduce_min_kv
+            if causal_resident_policies and (
+                row_reduce_min_kv is None
+                or any(
+                    policy.num_kv < row_reduce_min_kv
+                    for policy in causal_resident_policies
+                )
+            ):
+                raise ValueError(
+                    "causal resident softmax requires an enabled TMEM row-reduce range"
+                )
+            if (
+                any(
+                    policy.packed_exp2_mode is not FlashPackedExp2Mode.DISABLED
+                    for policy in tuning.dense_policies
+                )
+                and not self.hardware.supports_packed_f16x2_exp2
+            ):
+                raise ValueError("packed exp2 tuning requires hardware support")
+
+    @property
+    def tunings(self) -> tuple[FlashTuningPolicy, ...]:
+        """Return every workload-specific tuning table for this target."""
+        return (self.tuning, *self.additional_tunings)
+
+    def tuning_for_torch(
+        self, head_dim: int, torch_dtype: str
+    ) -> FlashTuningPolicy | None:
+        """Resolve a tuning table from host-side workload types."""
+        return next(
+            (
+                tuning
+                for tuning in self.tunings
+                if tuning.workload.head_dim == head_dim
+                and tuning.workload.dtype.value == torch_dtype
+            ),
+            None,
         )
-        if causal_resident_policies and not self.hardware.supports_tmem_row_reduce:
-            raise ValueError("causal resident softmax requires TMEM row-reduce support")
-        row_reduce_min_kv = self.tuning.tmem_row_reduce_min_kv
-        if causal_resident_policies and (
-            row_reduce_min_kv is None
-            or any(
-                policy.num_kv < row_reduce_min_kv for policy in causal_resident_policies
-            )
-        ):
-            raise ValueError(
-                "causal resident softmax requires an enabled TMEM row-reduce range"
-            )
-        if (
-            any(
-                policy.packed_exp2_mode is not FlashPackedExp2Mode.DISABLED
-                for policy in self.tuning.dense_policies
-            )
-            and not self.hardware.supports_packed_f16x2_exp2
-        ):
-            raise ValueError("packed exp2 tuning requires hardware support")
+
+    def tuning_for_cute(
+        self, head_dim: int, cute_dtype: str
+    ) -> FlashTuningPolicy | None:
+        """Resolve a tuning table from generated CuTe workload types."""
+        return next(
+            (
+                tuning
+                for tuning in self.tunings
+                if tuning.workload.head_dim == head_dim
+                and tuning.workload.dtype.cute_name == cute_dtype
+            ),
+            None,
+        )
 
 
 _GENERIC_FLASH_TARGET_POLICY = FlashTargetPolicy()
@@ -72,6 +129,8 @@ _FLASH_TARGET_POLICIES = {
                     stat_transport="single",
                     probability_log2_shift=7,
                     softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+                    corr_regs=64,
+                    other_regs=40,
                 ),
                 FlashDenseTuningPolicy(
                     num_kv=512,
@@ -94,6 +153,8 @@ _FLASH_TARGET_POLICIES = {
                     stat_transport="single",
                     probability_log2_shift=7,
                     softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+                    corr_regs=72,
+                    other_regs=40,
                 ),
                 FlashDenseTuningPolicy(
                     num_kv=2048,
@@ -104,12 +165,18 @@ _FLASH_TARGET_POLICIES = {
                     stat_transport="single_final",
                     packed_exp2_mode=FlashPackedExp2Mode.ALL_XU,
                     probability_log2_shift=7,
+                    corr_regs=80,
+                    other_regs=32,
                 ),
             ),
             causal_policies=(
                 FlashCausalTuningPolicy(
                     num_kv=512,
                     kv_stage=8,
+                    e2e_offset=15,
+                    e2e_offset0=3,
+                    role_map="fa4",
+                    epi_tma=True,
                     softmax_lowering=FlashSoftmaxLowering.STATEFUL,
                     softmax_regs=200,
                     first_load_order=2,
@@ -117,17 +184,31 @@ _FLASH_TARGET_POLICIES = {
                 FlashCausalTuningPolicy(
                     num_kv=1024,
                     kv_stage=3,
+                    e2e_offset=1,
+                    e2e_offset0=14,
+                    role_map="fa4",
                     softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+                    softmax_regs=184,
+                    first_load_order=0,
                 ),
                 FlashCausalTuningPolicy(
                     num_kv=2048,
                     kv_stage=3,
+                    e2e_offset=14,
+                    e2e_offset0=12,
+                    role_map="fa4",
                     softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+                    softmax_regs=184,
+                    first_load_order=0,
                 ),
                 FlashCausalTuningPolicy(
                     num_kv=4096,
                     kv_stage=6,
+                    e2e_offset=14,
+                    e2e_offset0=12,
                     softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+                    softmax_regs=184,
+                    first_load_order=0,
                 ),
             ),
         ),
@@ -142,6 +223,13 @@ def get_flash_target_policy(
     if capability is None:
         return _GENERIC_FLASH_TARGET_POLICY
     return _FLASH_TARGET_POLICIES.get(capability, _GENERIC_FLASH_TARGET_POLICY)
+
+
+def registered_flash_target_policies() -> tuple[
+    tuple[tuple[int, int], FlashTargetPolicy], ...
+]:
+    """Return registered target policies in stable capability order."""
+    return tuple(sorted(_FLASH_TARGET_POLICIES.items()))
 
 
 def _cache_identity_value(value: object) -> object:
@@ -159,9 +247,35 @@ def _cache_identity_value(value: object) -> object:
 
 def flash_target_policy_cache_identity(
     capability: tuple[int, int] | None,
+    *,
+    head_dim: int | None = None,
+    torch_dtype: str | None = None,
+    num_kv: int | None = None,
+    is_causal: bool = False,
 ) -> object | None:
-    """Return a stable cache salt for non-generic target policy choices."""
+    """Return the stable cache salt for one target/workload policy."""
     policy = get_flash_target_policy(capability)
     if policy is _GENERIC_FLASH_TARGET_POLICY:
         return None
-    return _cache_identity_value(policy)
+    if head_dim is None or torch_dtype is None:
+        tuning = policy.tuning
+    else:
+        tuning = policy.tuning_for_torch(head_dim, torch_dtype)
+    if tuning is None:
+        return None
+    workload = tuning.workload
+    shape_policy = (
+        tuning.causal_policy(num_kv)
+        if is_causal and num_kv is not None
+        else tuning.dense_policy(num_kv)
+        if num_kv is not None
+        else None
+    )
+    return _cache_identity_value(
+        (
+            policy.hardware,
+            workload,
+            tuning.tmem_row_reduce_min_kv,
+            shape_policy,
+        )
+    )

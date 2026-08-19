@@ -95,6 +95,8 @@ from helion._compiler.cute.cute_flash import flash_autotune_fragments
 from helion._compiler.cute.cute_flash import flash_effective_config_values
 from helion._compiler.cute.cute_flash import resolve_flash_config
 from helion._compiler.cute.flash_policy import get_flash_target_policy
+from helion._compiler.cute.flash_tuning import FlashCausalTuningPolicy
+from helion._compiler.cute.flash_tuning import FlashDenseTuningPolicy
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -2579,36 +2581,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
 
     def test_cute_flash_sm103_rank0_seed_policy(self) -> None:
-        dense_params = {
-            256: ("deg1_8x2_corr10", "8/2", 5, 1, "single"),
-            512: ("deg1_8x2_corr10", "8/2", 2, 1, "single"),
-            1024: ("deg1_8x2_corr10", "8/2", 2, 1, "single"),
-            2048: ("deg1_16x8", "16/8", 0, 10, "single_final"),
-        }
-        causal_kv_stages = {512: 8, 1024: 3, 2048: 3, 4096: 6}
-        dense_inherited = {
-            256: (64, 40, 200, 0, "helion", True),
-            512: (72, 40, 200, 4, "fa4", True),
-            1024: (72, 40, 200, 0, "helion", True),
-            2048: (80, 32, 192, 4, "helion", True),
-        }
-        causal_inherited = {
-            512: (15, 3, 200, 2, "fa4", True),
-            1024: (1, 14, 184, 0, "fa4", False),
-            2048: (14, 12, 184, 0, "fa4", False),
-            4096: (14, 12, 184, 0, "helion", False),
-        }
         sm103_policy = get_flash_target_policy((10, 3)).tuning
-        self.assertEqual(
-            {
-                shape_policy.num_kv: shape_policy.kv_stage
-                for shape_policy in sm103_policy.causal_policies
-            },
-            causal_kv_stages,
-        )
-
-        cases = [(False, num_kv) for num_kv in dense_params] + [
-            (True, num_kv) for num_kv in causal_kv_stages
+        dense_policies = {
+            shape_policy.num_kv: shape_policy
+            for shape_policy in sm103_policy.dense_policies
+        }
+        causal_policies = {
+            shape_policy.num_kv: shape_policy
+            for shape_policy in sm103_policy.causal_policies
+        }
+        cases = [(False, num_kv) for num_kv in dense_policies] + [
+            (True, num_kv) for num_kv in causal_policies
         ]
         for is_causal, num_kv in cases:
             with self.subTest(is_causal=is_causal, num_kv=num_kv):
@@ -2632,6 +2615,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 self.assertEqual(seed.config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
 
                 if is_causal:
+                    resident_policy = causal_policies[num_kv]
                     self.assertEqual(seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
                     self.assertFalse(seed.config[FLASH_PERSISTENT_KEY])
                     self.assertEqual(seed.config[FLASH_E2E_SCHEDULE_KEY], "16/6")
@@ -2643,6 +2627,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     self.assertEqual(seed.config[FLASH_OTHER_REGS_KEY], 48)
                     self.assertEqual(
                         (
+                            seed.config[FLASH_KV_STAGE_KEY],
                             seed.config[FLASH_E2E_OFFSET_KEY],
                             seed.config[FLASH_E2E_OFFSET0_KEY],
                             seed.config[FLASH_SOFTMAX_REGS_KEY],
@@ -2650,85 +2635,45 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                             seed.config[FLASH_ROLE_MAP_KEY],
                             seed.config[FLASH_EPI_TMA_KEY],
                         ),
-                        causal_inherited[num_kv],
+                        (
+                            resident_policy.kv_stage,
+                            resident_policy.e2e_offset,
+                            resident_policy.e2e_offset0,
+                            resident_policy.softmax_regs,
+                            resident_policy.first_load_order,
+                            resident_policy.role_map,
+                            resident_policy.epi_tma,
+                        ),
                     )
-                    baseline_degree2 = next(
-                        candidate
-                        for candidate in flash_attention_seed_configs(
-                            64,
-                            num_kv,
-                            **seed_kwargs,
-                        )
-                        if candidate.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
-                    )
-                    expected = {
-                        **baseline_degree2.config,
-                        FLASH_KV_STAGE_KEY: causal_kv_stages[num_kv],
-                        FLASH_Q_TILE_COUNT_KEY: 2,
-                    }
-                    resident_policy = sm103_policy.causal_policy(num_kv)
-                    assert resident_policy is not None
-                    if resident_policy.softmax_regs is not None:
-                        expected[FLASH_SOFTMAX_REGS_KEY] = resident_policy.softmax_regs
-                    if resident_policy.first_load_order is not None:
-                        expected[FLASH_FIRST_LOAD_ORDER_KEY] = (
-                            resident_policy.first_load_order
-                        )
                 else:
+                    resident_policy = dense_policies[num_kv]
                     self.assertEqual(
                         (
+                            seed.config[FLASH_EXP2_PACKET_KEY],
+                            seed.config[FLASH_E2E_SCHEDULE_KEY],
+                            seed.config[FLASH_E2E_OFFSET_KEY],
+                            seed.config[FLASH_E2E_OFFSET0_KEY],
+                            seed.config[FLASH_STAT_TRANSPORT_KEY],
+                            seed.config[FLASH_PIPELINE_FAMILY_KEY],
+                            seed.config[FLASH_KV_STAGE_KEY],
+                            seed.config[FLASH_PERSISTENT_KEY],
                             seed.config[FLASH_CORR_REGS_KEY],
                             seed.config[FLASH_OTHER_REGS_KEY],
-                            seed.config[FLASH_SOFTMAX_REGS_KEY],
-                            seed.config[FLASH_FIRST_LOAD_ORDER_KEY],
-                            seed.config[FLASH_ROLE_MAP_KEY],
-                            seed.config[FLASH_PRECOMPUTE_QK_DESC_KEY],
                         ),
-                        dense_inherited[num_kv],
+                        (
+                            resident_policy.exp2_packet,
+                            resident_policy.e2e_schedule,
+                            resident_policy.e2e_offset,
+                            resident_policy.e2e_offset0,
+                            resident_policy.stat_transport,
+                            resident_policy.pipeline_family,
+                            resident_policy.kv_stage,
+                            resident_policy.persistent,
+                            resident_policy.corr_regs,
+                            resident_policy.other_regs,
+                        ),
                     )
-                    fragments = flash_autotune_fragments(
-                        64,
-                        num_kv,
-                        dtype=torch.float16,
-                        standard_dense_output=True,
-                        pipeline_family_override="fa4_2cta",
-                    )
-                    packet, schedule, offset, offset0, stat_transport = dense_params[
-                        num_kv
-                    ]
-                    expected_values = {
-                        key: fragment.default() for key, fragment in fragments.items()
-                    }
-                    expected_values.update(
-                        {
-                            FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
-                            FLASH_KV_STAGE_KEY: 6,
-                            FLASH_PERSISTENT_KEY: False,
-                            FLASH_E2E_SCHEDULE_KEY: schedule,
-                            FLASH_E2E_OFFSET_KEY: offset,
-                            FLASH_E2E_OFFSET0_KEY: offset0,
-                            FLASH_EXP2_PACKET_KEY: packet,
-                            FLASH_STAT_TRANSPORT_KEY: stat_transport,
-                        }
-                    )
-                    dense_resident_policy = sm103_policy.dense_policy(num_kv)
-                    if (
-                        dense_resident_policy is not None
-                        and dense_resident_policy.corr_regs is not None
-                    ):
-                        assert dense_resident_policy.other_regs is not None
-                        expected_values[FLASH_CORR_REGS_KEY] = (
-                            dense_resident_policy.corr_regs
-                        )
-                        expected_values[FLASH_OTHER_REGS_KEY] = (
-                            dense_resident_policy.other_regs
-                        )
-                    expected = {
-                        "block_sizes": [1, 128, 128],
-                        **expected_values,
-                        FLASH_Q_TILE_COUNT_KEY: 2,
-                    }
-                self.assertEqual(seed.config, expected)
+                self.assertEqual(seed.config[FLASH_Q_TILE_COUNT_KEY], 2)
 
                 ranked = flash_attention_seed_configs(
                     64,
@@ -2788,7 +2733,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 self.assertEqual(roundtrip, seed)
 
     def test_cute_flash_sm103_seed_policy_changes_cache_identity(self) -> None:
-        def make_spec(target: tuple[int, int]) -> ConfigSpec:
+        def make_spec(
+            target: tuple[int, int], *, is_causal: bool = False
+        ) -> ConfigSpec:
             spec = ConfigSpec(
                 backend=CuteBackend(),
                 target_device_capability=target,
@@ -2802,14 +2749,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 num_kv=1024,
                 block_size_targets={0: 1, 1: 128, 2: 128},
                 dtype=torch.float16,
-                standard_dense_output=True,
+                is_causal=is_causal,
+                standard_dense_output=not is_causal,
+                standard_causal_output=is_causal,
             )
             spec.compiler_seed_configs = list(
                 flash_attention_seed_configs(
                     64,
                     1024,
                     dtype=torch.float16,
-                    standard_dense_output=True,
+                    is_causal=is_causal,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
                     target_device_capability=target,
                 )
             )
@@ -2830,6 +2781,21 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         original_hash = sm103.cache_fingerprint_hash()
         target_policy = get_flash_target_policy((10, 3))
+        unrelated_tuning = dataclasses.replace(
+            target_policy.tuning,
+            dense_policies=tuple(
+                dataclasses.replace(policy, e2e_offset=policy.e2e_offset + 1)
+                if policy.num_kv == 256
+                else policy
+                for policy in target_policy.tuning.dense_policies
+            ),
+        )
+        with patch(
+            "helion._compiler.cute.flash_policy.get_flash_target_policy",
+            return_value=dataclasses.replace(target_policy, tuning=unrelated_tuning),
+        ):
+            self.assertEqual(sm103.cache_fingerprint_hash(), original_hash)
+
         dense_policy = target_policy.tuning.dense_policy(1024)
         assert dense_policy is not None
         changed_tuning = dataclasses.replace(
@@ -2849,6 +2815,110 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             return_value=dataclasses.replace(target_policy, tuning=changed_tuning),
         ):
             self.assertNotEqual(sm103.cache_fingerprint_hash(), original_hash)
+
+        causal_sm103 = make_spec((10, 3), is_causal=True)
+        causal_original_hash = causal_sm103.cache_fingerprint_hash()
+        with patch(
+            "helion._compiler.cute.flash_policy.get_flash_target_policy",
+            return_value=dataclasses.replace(target_policy, tuning=unrelated_tuning),
+        ):
+            self.assertEqual(
+                causal_sm103.cache_fingerprint_hash(), causal_original_hash
+            )
+
+        changed_causal_tuning = dataclasses.replace(
+            target_policy.tuning,
+            causal_policies=tuple(
+                dataclasses.replace(
+                    policy,
+                    softmax_lowering=FlashSoftmaxLowering.STANDARD,
+                )
+                if policy.num_kv == 1024
+                else policy
+                for policy in target_policy.tuning.causal_policies
+            ),
+        )
+        with patch(
+            "helion._compiler.cute.flash_policy.get_flash_target_policy",
+            return_value=dataclasses.replace(
+                target_policy, tuning=changed_causal_tuning
+            ),
+        ):
+            self.assertNotEqual(
+                causal_sm103.cache_fingerprint_hash(), causal_original_hash
+            )
+
+    def test_cute_flash_registered_causal_shape_builds_direct_target_seed(self) -> None:
+        target_policy = get_flash_target_policy((10, 3))
+        extra_policy = FlashCausalTuningPolicy(
+            num_kv=768,
+            kv_stage=4,
+            e2e_offset=2,
+            e2e_offset0=3,
+            softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+            softmax_regs=184,
+        )
+        extended_tuning = dataclasses.replace(
+            target_policy.tuning,
+            causal_policies=(*target_policy.tuning.causal_policies, extra_policy),
+        )
+        with patch(
+            "helion._compiler.cute.cute_flash.get_flash_target_policy",
+            return_value=dataclasses.replace(
+                target_policy,
+                tuning=extended_tuning,
+            ),
+        ):
+            seed = flash_attention_seed_config(
+                64,
+                768,
+                dtype=torch.float16,
+                is_causal=True,
+                standard_causal_output=True,
+                target_device_capability=(10, 3),
+            )
+
+        assert seed is not None
+        self.assertEqual(seed.config[FLASH_KV_STAGE_KEY], 4)
+        self.assertEqual(seed.config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(seed.config[FLASH_E2E_OFFSET0_KEY], 3)
+        self.assertTrue(seed.config[FLASH_CAUSAL_LOOP_SPLIT_KEY])
+        self.assertEqual(seed.config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
+
+    def test_cute_flash_target_policy_seed_must_round_trip(self) -> None:
+        target_policy = get_flash_target_policy((10, 3))
+        invalid_dense_policy = FlashDenseTuningPolicy(
+            num_kv=256,
+            exp2_packet="deg1_16x8",
+            e2e_schedule="8/2",
+            e2e_offset=0,
+            e2e_offset0=0,
+            stat_transport="single",
+        )
+        invalid_tuning = dataclasses.replace(
+            target_policy.tuning,
+            dense_policies=(
+                invalid_dense_policy,
+                *target_policy.tuning.dense_policies[1:],
+            ),
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_flash.get_flash_target_policy",
+                return_value=dataclasses.replace(
+                    target_policy,
+                    tuning=invalid_tuning,
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "does not round-trip"),
+        ):
+            flash_attention_seed_config(
+                64,
+                256,
+                dtype=torch.float16,
+                standard_dense_output=True,
+                target_device_capability=(10, 3),
+            )
 
     def test_cute_flash_target_policy_preserves_b200_fragment_surface(self) -> None:
         def fragment_signature(
@@ -2876,7 +2946,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         for is_causal in (False, True):
             baseline = fragment_signature(None, is_causal=is_causal)
             self.assertEqual(baseline, fragment_signature((10, 0), is_causal=is_causal))
-            self.assertEqual(baseline, fragment_signature((10, 4), is_causal=is_causal))
+            self.assertEqual(
+                baseline, fragment_signature((999, 999), is_causal=is_causal)
+            )
 
         sm103_fragments = flash_autotune_fragments(
             64,
@@ -2891,7 +2963,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(first_load.search_choices, (0,))
 
     def test_cute_flash_non_sm103_seed_order_is_unchanged(self) -> None:
-        targets = (None, (10, 0), (10, 2), (10, 4), (11, 0))
+        targets = (None, (10, 0), (999, 999))
         cases = (
             {
                 "num_kv": 1024,

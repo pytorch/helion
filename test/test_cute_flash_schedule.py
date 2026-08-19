@@ -528,17 +528,9 @@ def test_persistent_phase_continuity_at_work_boundary(
     assert cycles["pfor_q0"].phases == (0, middle_phase, 0)
 
 
-@pytest.mark.parametrize(
-    "stat_release_mapping",
-    (
-        FlashStatReleaseMapping.CROSS_SLOT,
-        FlashStatReleaseMapping.SAME_SLOT,
-    ),
-)
 @pytest.mark.parametrize("kv_iterations", (3, 4))
 def test_pipelined_stat_handoff_models_dummy_and_final_events(
     kv_iterations: int,
-    stat_release_mapping: FlashStatReleaseMapping,
 ) -> None:
     schedule = build_fa4_schedule(
         FlashScheduleSpec(
@@ -548,7 +540,6 @@ def test_pipelined_stat_handoff_models_dummy_and_final_events(
             kv_iterations=kv_iterations,
             stat_depth=1,
             pipelined_stat_handoff=True,
-            stat_release_mapping=stat_release_mapping,
         )
     )
 
@@ -588,51 +579,56 @@ def test_pipelined_stat_handoff_models_dummy_and_final_events(
     )
 
 
-def test_pipelined_stat_handoff_defaults_to_cross_slot_releases() -> None:
+@pytest.mark.parametrize(
+    ("causal", "mapping", "expected_releases"),
+    (
+        (
+            False,
+            FlashStatReleaseMapping.CROSS_SLOT,
+            {
+                ("correction_r0_q0", "stat_r0_q1", 0, "stat_empty_r0_q1"),
+                ("correction_r0_q1", "stat_r0_q0", 1, "stat_empty_r0_q0"),
+            },
+        ),
+        (
+            True,
+            FlashStatReleaseMapping.SAME_SLOT,
+            {
+                ("correction_r0_q0", "stat_r0_q0", 1, "stat_empty_r0_q0"),
+                ("correction_r0_q1", "stat_r0_q1", 1, "stat_empty_r0_q1"),
+            },
+        ),
+    ),
+)
+def test_pipelined_stat_release_mappings(
+    causal: bool,
+    mapping: FlashStatReleaseMapping,
+    expected_releases: set[tuple[str, str, int, str]],
+) -> None:
     schedule = build_fa4_schedule(
         FlashScheduleSpec(
             64,
             2,
+            causal=causal,
             stat_depth=1,
             pipelined_stat_handoff=True,
+            stat_release_mapping=mapping,
         )
     )
 
     verify_flash_schedule(schedule)
 
-    assert schedule.spec.stat_release_mapping is FlashStatReleaseMapping.CROSS_SLOT
-    assert {
-        (edge.source, edge.target, edge.iteration_delta, edge.barrier)
-        for edge in schedule.edges
-        if edge.barrier is not None and edge.barrier.startswith("stat_empty_")
-    } == {
-        ("correction_r0_q0", "stat_r0_q1", 0, "stat_empty_r0_q1"),
-        ("correction_r0_q1", "stat_r0_q0", 1, "stat_empty_r0_q0"),
-    }
-
-
-def test_causal_pipelined_stat_handoff_uses_same_slot_releases() -> None:
-    schedule = build_fa4_schedule(
-        FlashScheduleSpec(
-            64,
-            2,
-            causal=True,
-            stat_depth=1,
-            pipelined_stat_handoff=True,
-            stat_release_mapping=FlashStatReleaseMapping.SAME_SLOT,
+    if mapping is FlashStatReleaseMapping.CROSS_SLOT:
+        assert (
+            FlashScheduleSpec(64, 2).stat_release_mapping
+            is FlashStatReleaseMapping.CROSS_SLOT
         )
-    )
-
-    verify_flash_schedule(schedule)
-
+    assert schedule.spec.stat_release_mapping is mapping
     assert {
         (edge.source, edge.target, edge.iteration_delta, edge.barrier)
         for edge in schedule.edges
         if edge.barrier is not None and edge.barrier.startswith("stat_empty_")
-    } == {
-        ("correction_r0_q0", "stat_r0_q0", 1, "stat_empty_r0_q0"),
-        ("correction_r0_q1", "stat_r0_q1", 1, "stat_empty_r0_q1"),
-    }
+    } == expected_releases
 
 
 @pytest.mark.parametrize(
@@ -699,18 +695,14 @@ def test_pipelined_stat_release_mapping_corruption_is_rejected(
         verify_flash_schedule(schedule)
 
 
-@pytest.mark.parametrize(
-    "spec",
-    (FlashScheduleSpec(64, 2, stat_depth=2, pipelined_stat_handoff=True),),
-)
-def test_pipelined_stat_handoff_rejects_unsupported_schedules(
-    spec: FlashScheduleSpec,
-) -> None:
+def test_pipelined_stat_handoff_rejects_unsupported_schedules() -> None:
     with pytest.raises(
         FlashScheduleError,
         match="pipelined stat handoff requires depth one",
     ):
-        build_fa4_schedule(spec)
+        build_fa4_schedule(
+            FlashScheduleSpec(64, 2, stat_depth=2, pipelined_stat_handoff=True)
+        )
 
 
 def test_causal_cross_slot_stat_releases_are_rejected() -> None:
