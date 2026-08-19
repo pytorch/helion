@@ -1148,6 +1148,10 @@ class CuteBackend(Backend):
                 "from helion._compiler.cute.epilogue_helpers import "
                 "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2"
             ),
+            "_cute_sigmoid_approx_ftz_f32": (
+                "from helion._compiler.cute.epilogue_helpers import "
+                "sigmoid_approx_ftz_f32 as _cute_sigmoid_approx_ftz_f32"
+            ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",

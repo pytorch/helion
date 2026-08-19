@@ -16,7 +16,7 @@ import helion
 import helion.language as hl
 
 
-@helion.aot_kernel(backend="cute", static_shapes=True)
+@helion.aot_kernel(backend="cute", static_shapes=True, fast_math=True)
 def interleaved_swiglu(
     x: torch.Tensor,
     weight: torch.Tensor,

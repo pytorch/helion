@@ -2630,6 +2630,7 @@ def ensure_tcgen05_fragment_epilogue_plan(
             Tcgen05LayoutStrategy.DEFAULT.value,
         )
         == Tcgen05LayoutStrategy.DEFAULT.value
+        and warp_spec_from_config(config).store_warps == 0
         and not is_pure_matmul_role_lifecycle_config(config)
     ):
         return reject()
@@ -6685,16 +6686,10 @@ def _emit_mma_pipeline(
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
-    committed_fragment_plan = (
-        df.cute_state.tcgen05_fragment_epilogue_plan_for_anchor(fx_node)
-        if fx_node is not None
-        else None
-    )
-    if committed_fragment_plan is not None and committed_fragment_plan.changes_shape:
-        # A compact destination has its own store partition. Keep the ordinary
-        # same-shape TMA/SMEM epilogue byte-identical and use the direct SIMT
-        # schedule whose ownership was proven for the compact fragment.
-        tcgen05_use_tma_store_epilogue = False
+    # A proven compact fragment destination can use the same SMEM-staged TMA
+    # store pipeline as a same-shape epilogue.  The store renderer builds the
+    # destination-sized TMA descriptor and keeps the source T2R ownership
+    # separate from the compact destination partition.
 
     def tcgen05_tma_store_full_tiles_only_for(
         partial_output_tma_store: bool,

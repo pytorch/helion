@@ -1663,7 +1663,8 @@ def analyze_tcgen05_fragment_epilogue_plan(
         if (
             source_shape != (1, bm, bn)
             or destination_shape[-2] != bm
-            or destination_shape[-1] not in (bn, bn // 2)
+            or destination_shape[-1] <= 0
+            or bn % destination_shape[-1]
             or not _store_indices_are_tile_identity(
                 region,
                 source_shape,
@@ -2042,6 +2043,24 @@ class _Evaluator:
             )
             for input_node in inputs
         ]
+        output = node.meta.get("val")
+        # Fragment FP32 values can use the native reciprocal instruction for
+        # sigmoid. Keep the ordinary CuTe epilogue lowering unchanged.
+        if (
+            node.target is torch.ops.aten.sigmoid.default
+            and isinstance(output, torch.Tensor)
+            and output.dtype is torch.float32
+            and CompileEnvironment.current().settings.fast_math
+        ):
+            if len(input_values) != 1:
+                raise RuntimeError("invalid fragment sigmoid input count")
+            return self._bind(
+                "tcgen05_epi_value",
+                expr_from_string(
+                    "_cute_sigmoid_approx_ftz_f32({x})",
+                    x=input_values[0],
+                ),
+            )
         ctx = LoweringContext.__new__(LoweringContext)
         ctx.cg = self.state.codegen
         ctx.env = self.state.env

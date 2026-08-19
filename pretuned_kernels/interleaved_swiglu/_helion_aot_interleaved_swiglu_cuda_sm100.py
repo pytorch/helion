@@ -11,7 +11,7 @@ _CONFIG = {
     "pid_type": "persistent_interleaved",
     "tcgen05_cluster_m": 1,
     "tcgen05_cluster_n": 1,
-    "tcgen05_ab_stages": 2,
+    "tcgen05_ab_stages": 3,
     "tcgen05_acc_stages": 2,
     "tcgen05_c_stages": 2,
     "tcgen05_num_epi_warps": 4,

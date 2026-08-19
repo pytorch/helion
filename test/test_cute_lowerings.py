@@ -489,7 +489,7 @@ def cute_projection_rotary_bf16(
     return out
 
 
-@helion.kernel(backend="cute")
+@helion.kernel(backend="cute", fast_math=True)
 def cute_projection_interleaved_swiglu_bf16(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -610,6 +610,64 @@ def cute_group4_fragment_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
         mixed_right = hl.join(total + x2, total + x3)
         out[tile_h, tile_m, tile_d] = (
             hl.join(mixed_left, mixed_right)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_compact_group4_fragment_bf16(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Compact four adjacent projection columns into one weighted output."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d // 4], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        groups = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 4,
+            2,
+            2,
+        )
+        left, right = hl.split(groups)
+        x0, x2 = hl.split(left)
+        x1, x3 = hl.split(right)
+        index_groups = tile_d.index.view(tile_d.block_size // 4, 2, 2)
+        index_left, index_right = hl.split(index_groups)
+        output_d, output_d_other = hl.split(index_left)
+        out[
+            tile_h.index[:, None, None],
+            tile_m.index[None, :, None],
+            (output_d // 4)[None, None, :],
+        ] = (x0 + 2.0 * x1 - 3.0 * x2 + 4.0 * x3).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_fragment_sigmoid_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Exercise strict sigmoid through the generic fragment renderer."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        left, right = hl.split(pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(torch.sigmoid(left), right)
             .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
             .to(x.dtype)
         )
@@ -9219,6 +9277,8 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cute.math.exp2", code)
         self.assertIn("1.4426950408889634", code)
         self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("1.0 /", code)
+        self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
         out = bound(x, y)
         expected = torch.sigmoid((x @ y).float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
@@ -16082,8 +16142,12 @@ class TestCuteLowerings(unittest.TestCase):
                     )
                     code = bound.to_triton_code(config)
                     self.assertIn("for tcgen05_epi_position", code)
-                    self.assertIn("tcgen05_compact_gD2d", code)
-                    self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
+                    self.assertIn("tcgen05_compact_gD_epi", code)
+                    self.assertIn("_cute_sigmoid_approx_ftz_f32(", code)
+                    self.assertIn(
+                        f"'kind': 'tcgen05_d_tma', 'bm': 128, 'bn': {source_bn // 2}",
+                        code,
+                    )
                     bound.set_config(config)
                     actual = bound(x, weight)
                     torch.testing.assert_close(actual, expected, atol=0.1, rtol=2e-2)
@@ -16091,6 +16155,57 @@ class TestCuteLowerings(unittest.TestCase):
                     self.assertFalse(
                         torch.allclose(actual, swapped, atol=0.1, rtol=2e-2)
                     )
+
+    def test_tcgen05_fragment_sigmoid_respects_strict_math(self) -> None:
+        torch.manual_seed(13)
+        dtype = torch.bfloat16
+        args = (
+            torch.randn([128, 64], device=DEVICE, dtype=dtype),
+            torch.randn([1, 64, 64], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 64, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
+        with patch_cute_mma_support():
+            bound = cute_fragment_sigmoid_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            code = bound.to_triton_code(config)
+            bound.set_config(config)
+            actual = bound(*args)
+        self.assertIn("for tcgen05_epi_position", code)
+        self.assertIn("1.0 /", code)
+        self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
+        acc = torch.einsum("mk,hkd->hmd", args[0].float(), args[1].float())
+        pairs = acc.view(1, 128, 32, 2)
+        expected = torch.stack(
+            (torch.sigmoid(pairs[..., 0]), pairs[..., 1]), dim=-1
+        ).view(1, 128, 64)
+        torch.testing.assert_close(actual, expected.to(dtype), atol=0.1, rtol=2e-2)
+
+    def test_tcgen05_fragment_rejects_dedicated_store_warp(self) -> None:
+        dtype = torch.bfloat16
+        args = (
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 128, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_store_warps=1,
+        )
+        with patch_cute_mma_support():
+            bound = cute_projection_interleaved_swiglu_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "thread-local epilogue ownership proof rejected",
+            ):
+                bound.to_triton_code(config)
 
     def test_projection_rotary_scalar_fallback_runtime(self) -> None:
         torch.manual_seed(1)
@@ -16202,6 +16317,37 @@ class TestCuteLowerings(unittest.TestCase):
             dim=-1,
         ).view(1, 128, 64)
         torch.testing.assert_close(actual, expected.to(dtype), atol=0.1, rtol=2e-2)
+
+    def test_tcgen05_compact_fragment_reads_four_registers_runtime(self) -> None:
+        torch.manual_seed(17)
+        dtype = torch.bfloat16
+        args = (
+            torch.randn([128, 64], device=DEVICE, dtype=dtype),
+            torch.randn([1, 64, 128], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 128, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
+        with patch_cute_mma_support():
+            bound = cute_compact_group4_fragment_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            code = bound.to_triton_code(config)
+            bound.set_config(config)
+            actual = bound(*args)
+        self.assertIn("for tcgen05_epi_position", code)
+        self.assertIn("'kind': 'tcgen05_d_tma', 'bm': 128, 'bn': 32", code)
+        self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
+        acc = torch.einsum("mk,hkd->hmd", args[0].float(), args[1].float())
+        groups = acc.view(1, 128, 32, 4)
+        expected = (
+            groups[..., 0]
+            + 2.0 * groups[..., 1]
+            - 3.0 * groups[..., 2]
+            + 4.0 * groups[..., 3]
+        )
+        torch.testing.assert_close(actual, expected.to(dtype), atol=0.2, rtol=2e-2)
 
     def test_tcgen05_fragment_mixed_mma_is_rejected_atomically(
         self,
