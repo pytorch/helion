@@ -419,6 +419,9 @@ Note: You can still run the underlying tools directly via `./lint.sh [fix|check|
 
 Questions or feedback? Join us on the [GPU MODE Discord](https://discord.gg/gpumode) in the `#helion` channel.
 
+- [Project governance and maintainers](GOVERNANCE.md)
+- [Technical charter](TECHNICAL_CHARTER.md)
+
 ## License
 
 Helion is BSD-style licensed, as found in the LICENSE file.
