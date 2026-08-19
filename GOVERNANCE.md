@@ -1,3 +1,6 @@
+Helion's technical governance is defined by the
+[Technical Charter](TECHNICAL_CHARTER.md).
+
 ### Core Maintainers:
 - Jason Ansel, https://github.com/jansel
 - Oguz Ulgen, https://github.com/oulgen

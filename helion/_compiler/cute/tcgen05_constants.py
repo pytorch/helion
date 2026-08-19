@@ -226,9 +226,17 @@ TCGEN05_ACC_WAIT_PLACEMENTS = (
     TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
-# Placement of per-subtile auxiliary-tensor loads relative to the accumulator
-# consumer wait. Post-wait is the conservative default; pre-wait is available
-# for full output tiles and is selected by the measured scale_mm configs.
+# Placement of independent per-subtile auxiliary-tensor loads (for example,
+# scales, bias, or residuals) relative to the accumulator pipeline's consumer
+# wait. Both TMA-store and full-tile SIMT epilogues honor this setting. The
+# pre-wait form issues the auxiliary loads while tcgen05 MMA may still be
+# producing the accumulator, hiding their latency; the TMEM-to-register copy
+# and all accumulator-dependent epilogue arithmetic remain after the wait.
+# Keeping auxiliary fragments live across the wait can increase register
+# pressure, so post-wait is the conservative default in most cases.
+# SIMT edge-only fallback loads are scheduled early
+# independently of this setting because that path has been validated as a
+# family.
 TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY = "tcgen05_aux_load_placement"
 TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT = "pre_acc_wait"
 TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT = "post_acc_wait"
