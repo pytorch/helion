@@ -7629,8 +7629,8 @@ class TestCuteBackend(TestCase):
         per-tile setup (before the accumulator ``consumer_wait``) so the
         rowvec GMEM latency hides under the MMA wait; the per-subtile loop
         slices the register tensor instead of issuing per-subtile LDGs.
-        bm=256 must keep the per-subtile GMEM load (the whole-tile hoist
-        historically caused register spills there).
+        The cluster-N=1 bm=256 family must keep the per-subtile GMEM load (the
+        whole-tile register hoist historically caused spills there).
         """
         support = get_cute_mma_support()
         if not support.tcgen05_f8:
@@ -7658,8 +7658,10 @@ class TestCuteBackend(TestCase):
         self.assertLess(hoist_pos, acc_wait_pos)
         # The subtile loop reads the register tensor, not per-subtile GMEM.
         self.assertNotIn("tcgen05_tTR_gAux_subtile_", code)
+        self.assertNotIn("tcgen05_aux_rowvec_smem_layout_", code)
 
-        # bm=256 keeps the per-subtile GMEM load (no whole-fragment hoist).
+        # bm=256 cannot use the whole-fragment register hoist, so it stages the
+        # rowvec once per warp in SMEM instead.
         code256 = cute_matmul_mma_fp8_rowvec_scale.bind((x, y, scale_n)).to_triton_code(
             helion.Config(
                 block_sizes=[256, 128, 128],
@@ -7669,6 +7671,132 @@ class TestCuteBackend(TestCase):
             )
         )
         self.assertNotIn("tcgen05_aux_rmem_full_", code256)
+        self.assertIn("tcgen05_aux_rowvec_smem_layout_", code256)
+
+    def test_matmul_mma_tcgen05_fp8_rowvec_warp_staging_configs(self) -> None:
+        """Warp-private rowvec staging follows the measured profitability rule."""
+        x = torch.empty((256, 512), device=DEVICE, dtype=torch.float8_e4m3fn)
+        y = torch.empty((512, 256), device=DEVICE, dtype=torch.float8_e4m3fn)
+        scale_n = torch.empty(256, device=DEVICE)
+        cases = (
+            ("single_cta", [128, 128, 128], {}, "stage"),
+            (
+                "two_cta_cluster_n1",
+                [256, 128, 128],
+                {"tcgen05_cluster_m": 2},
+                "stage",
+            ),
+            (
+                "four_cta_cluster_n2",
+                [256, 128, 128],
+                {"tcgen05_cluster_m": 2, "tcgen05_cluster_n": 2},
+                "stage",
+            ),
+            ("bn64", [128, 64, 128], {}, "stage"),
+            (
+                "two_cta_m128_register_hoist",
+                [128, 128, 128],
+                {"tcgen05_cluster_m": 2},
+                "register",
+            ),
+            ("bk64", [128, 128, 64], {}, "stage"),
+            ("bn256", [128, 256, 128], {}, "stage"),
+            ("bn64_bk64", [128, 64, 64], {}, "stage"),
+            ("bn32_break_even", [128, 32, 128], {}, "gmem"),
+            (
+                "unmeasured_single_cta_bm256",
+                [256, 128, 128],
+                {},
+                "gmem",
+            ),
+            (
+                "two_cta_bn64",
+                [256, 64, 128],
+                {"tcgen05_cluster_m": 2},
+                "stage",
+            ),
+            (
+                "two_cta_bn64_cluster_n2",
+                [256, 64, 128],
+                {"tcgen05_cluster_m": 2, "tcgen05_cluster_n": 2},
+                "stage",
+            ),
+            (
+                "explicit_epi_m64",
+                [128, 64, 128],
+                {
+                    "tcgen05_layout_strategy": "explicit_epi_tile",
+                    "tcgen05_layout_overrides_epi_tile_m": 64,
+                    "tcgen05_layout_overrides_epi_tile_n": 64,
+                    "tcgen05_layout_overrides_d_store_box_n": 64,
+                },
+                "gmem",
+            ),
+        )
+        with patch_cute_mma_support():
+            for name, block_sizes, extra_config, expected_path in cases:
+                with self.subTest(name=name):
+                    config_kwargs: dict[str, object] = {
+                        "pid_type": "persistent_blocked",
+                        "tcgen05_aux_load_placement": "pre_acc_wait",
+                    }
+                    config_kwargs.update(extra_config)
+                    code = cute_matmul_mma_fp8_rowvec_scale.bind(
+                        (x, y, scale_n)
+                    ).to_triton_code(
+                        helion.Config(
+                            block_sizes=block_sizes,
+                            **config_kwargs,
+                        )
+                    )
+                    if expected_path == "stage":
+                        self.assertIn("tcgen05_aux_rowvec_smem_layout_", code)
+                    else:
+                        self.assertNotIn("tcgen05_aux_rowvec_smem_layout_", code)
+                    if expected_path == "register":
+                        self.assertIn("tcgen05_aux_rmem_full_", code)
+                    else:
+                        self.assertNotIn("tcgen05_aux_rmem_full_", code)
+
+            bf16_scale_n = torch.empty(256, device=DEVICE, dtype=torch.bfloat16)
+            code = cute_matmul_mma_fp8_rowvec_scale.bind(
+                (x, y, bf16_scale_n)
+            ).to_triton_code(
+                helion.Config(
+                    block_sizes=[128, 128, 128],
+                    pid_type="persistent_blocked",
+                    tcgen05_aux_load_placement="pre_acc_wait",
+                )
+            )
+            self.assertNotIn("tcgen05_aux_rowvec_smem_layout_", code)
+
+    def test_matmul_mma_tcgen05_fp8_four_cta_rowvec_scale_staging(self) -> None:
+        """The bm256 cluster-N=2 rowvec staging path is numerically correct."""
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        m, k, n = 512, 512, 256
+        x = (torch.randn(m, k, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        scale_n = torch.linspace(0.5, 1.5, n, device=DEVICE)
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[256, 128, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_aux_load_placement="pre_acc_wait",
+        )
+        ref = (x.float() @ y.float()) * scale_n.reshape(1, -1)
+        torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
+        self.assertFalse(out.float().isnan().any().item())
+        self.assertIn("tcgen05_aux_rowvec_smem_layout_", code)
 
     def test_matmul_mma_tcgen05_f16_m128_cluster_m2_keeps_cta_group_one(
         self,
