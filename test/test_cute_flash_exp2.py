@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib
 import math
 import os
@@ -14,9 +15,13 @@ import torch
 import helion
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.attention_plan import SOFTCAP_KIND
+from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.flash_policy import get_flash_target_policy
+from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
@@ -424,6 +429,181 @@ def test_dense_target_lowering_match_is_environment_independent() -> None:
 
     with patch.dict(os.environ, {"HELION_CUTE_FLASH_WAIT_HINT": "0"}):
         assert cute_flash._flash_dense_resident_seed_matches(dense_cfg, 256, (10, 3))
+
+
+@pytest.mark.parametrize("num_kv", (256, 512, 1024))
+def test_dense_resident_value_graph_codegen_and_barrier_protocol(num_kv: int) -> None:
+    source = _emit_dense_resident_value_graph_source(num_kv=num_kv)
+    module = ast.parse(source)
+    value_graph_calls = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "resident_softmax_value_graph"
+    ]
+
+    assert len(value_graph_calls) == 2
+    for call in value_graph_calls:
+        assert ast.unparse(call.args[10]).endswith("_corr_empty_ptr + 0")
+        assert ast.unparse(call.args[11]) == "flash_s_corr_prod_phase"
+        assert ast.unparse(call.args[12]) == "flash_row_sum * flash_alpha"
+        assert {
+            keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords
+        } == {
+            "pfor_peer_cta_rank": "cutlass.Int32(0)",
+            "pfor_self_cta_rank": "None",
+        }
+
+    assert "fa4_sp_exp_convert_store_whole_rowsum" not in source
+    assert "f16x2_xu=True" not in source
+    assert "cutlass.Float32(7.0) - flash_row_max_safe * _flash_scale_log2" in source
+    assert source.count("flash_s_corr_prod_phase = cutlass.Int32(1)") == 2
+
+    stage0_start = source.index("flash_s_corr_prod_phase = cutlass.Int32(1)")
+    stage1_start = source.index(
+        "flash_s_corr_prod_phase = cutlass.Int32(1)", stage0_start + 1
+    )
+    softmax0 = source[stage0_start:stage1_start]
+    empty_wait = (
+        "_helion_flash_rt.mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
+        "flash_s_corr_prod_phase, 10000000)"
+    )
+    assert softmax0.count(empty_wait) == 2
+    assert softmax0.count("flash_s_corr_prod_phase ^= 1") == 2
+    entry_wait = softmax0.index(empty_wait)
+    alpha_store = softmax0.index(
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_alpha"
+    )
+    value_graph = softmax0.index("resident_softmax_value_graph", alpha_store)
+    phase_advance = softmax0.index("flash_s_corr_prod_phase ^= 1", value_graph)
+    rowsum_store = softmax0.index(
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_row_sum",
+        phase_advance,
+    )
+    tail_wait = softmax0.index(empty_wait, rowsum_store)
+    assert (
+        entry_wait
+        < alpha_store
+        < value_graph
+        < phase_advance
+        < rowsum_store
+        < tail_wait
+    )
+    assert "flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum" not in softmax0
+
+    correction = source[source.index("(warp_idx >= 8) & (warp_idx < 12):") :]
+    steady_loop = correction.index("for flash_kv")
+    alpha0 = correction.index("flash_a0 =", steady_loop)
+    pfor0 = correction.index("flash_pfor_ptr + 0", alpha0)
+    release1 = correction.index(
+        "cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)", pfor0
+    )
+    alpha1 = correction.index("flash_a1 =", release1)
+    pfor1 = correction.index("flash_pfor_ptr + 1", alpha1)
+    release0 = correction.index(
+        "cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)", pfor1
+    )
+    assert alpha0 < pfor0 < release1 < alpha1 < pfor1 < release0
+
+
+def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
+    base_plan = dense_score_plan(64)
+    modified_plan = dataclasses.replace(
+        base_plan,
+        modifiers=(AttentionScoreModifier(SOFTCAP_KIND, value_log2=2.0),),
+    )
+    fallback_sources = (
+        _emit_dense_resident_value_graph_source(capability=(10, 0)),
+        _emit_dense_resident_value_graph_source(capability=(10, 4)),
+        _emit_dense_resident_value_graph_source(num_kv=2048),
+        _emit_dense_resident_value_graph_source(has_lse=True),
+        _emit_dense_resident_value_graph_source(score_plan=modified_plan),
+        _emit_dense_resident_value_graph_source(
+            config_overrides={cute_flash.FLASH_E2E_OFFSET_KEY: 4}
+        ),
+    )
+    for fallback_source in fallback_sources:
+        assert "resident_softmax_value_graph" not in fallback_source
+        assert "fa4_sp_exp_convert_store_whole_rowsum" in fallback_source
+
+
+def test_sm103_dense64_register_policy_is_target_specific() -> None:
+    sm103_seed = cute_flash.flash_attention_seed_config(
+        64,
+        512,
+        dtype=torch.float16,
+        is_causal=False,
+        standard_dense_output=True,
+        target_device_capability=(10, 3),
+    )
+    sm100_seed = cute_flash.flash_attention_seed_config(
+        64,
+        512,
+        dtype=torch.float16,
+        is_causal=False,
+        standard_dense_output=True,
+        target_device_capability=(10, 0),
+    )
+
+    assert sm103_seed is not None
+    assert sm100_seed is not None
+    assert sm103_seed.config[cute_flash.FLASH_CORR_REGS_KEY] == 72
+    assert sm103_seed.config[cute_flash.FLASH_OTHER_REGS_KEY] == 40
+    assert sm100_seed.config[cute_flash.FLASH_CORR_REGS_KEY] == 80
+    assert sm100_seed.config[cute_flash.FLASH_OTHER_REGS_KEY] == 32
+
+
+def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
+    policy = get_flash_target_policy((10, 3)).tuning
+    shape_policy = policy.dense_policy(256)
+    assert shape_policy is not None
+
+    standard_policy = dataclasses.replace(
+        policy,
+        dense_policies=(
+            dataclasses.replace(
+                shape_policy,
+                softmax_lowering=FlashSoftmaxLowering.STANDARD,
+            ),
+            *policy.dense_policies[1:],
+        ),
+    )
+    with patch.object(
+        cute_flash,
+        "get_flash_target_policy",
+        return_value=dataclasses.replace(
+            get_flash_target_policy((10, 3)), tuning=standard_policy
+        ),
+    ):
+        standard_source = _emit_dense_resident_value_graph_source()
+    assert "resident_softmax_value_graph" not in standard_source
+    assert "fa4_sp_exp_convert_store_whole_rowsum" in standard_source
+
+
+def test_dense_probability_shift_fails_closed_before_fp16_overflow() -> None:
+    target_policy = get_flash_target_policy((10, 3))
+    dense_policy = target_policy.tuning.dense_policy(256)
+    assert dense_policy is not None
+    unsafe_tuning = dataclasses.replace(
+        target_policy.tuning,
+        dense_policies=tuple(
+            dataclasses.replace(policy, probability_log2_shift=16)
+            if policy.num_kv == 256
+            else policy
+            for policy in target_policy.tuning.dense_policies
+        ),
+    )
+    with patch.object(
+        cute_flash,
+        "get_flash_target_policy",
+        return_value=dataclasses.replace(target_policy, tuning=unsafe_tuning),
+    ):
+        source = _emit_dense_resident_value_graph_source()
+
+    assert "resident_softmax_value_graph" not in source
+    assert "f16x2_xu=True" not in source
+    assert "cutlass.Float32(16.0)" not in source
 
 
 def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
