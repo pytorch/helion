@@ -891,7 +891,7 @@ def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> st
 
 def _cute_register_tile_unroll_vec_hoist(
     state: CodegenState,
-    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
+    strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
     block_id: int,
     tensor: torch.Tensor,
     tensor_name: str,
@@ -899,7 +899,7 @@ def _cute_register_tile_unroll_vec_hoist(
     vec_width: int,
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
-    ``CuteNDTileStrategy`` lane loops.
+    ``PerThreadNDTileStrategy`` lane loops.
 
     Splices a single ``cute.arch.load(base_ptr, <elem>x V)`` into the
     outer-lane body (above the constexpr V-loop) and returns the
@@ -974,7 +974,7 @@ def _cute_register_tile_unroll_vec_hoist(
 
 def _cute_register_tile_unroll_vec_hoist_split2(
     state: CodegenState,
-    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
+    strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
     block_id: int,
     tensor: torch.Tensor,
     tensor_name: str,

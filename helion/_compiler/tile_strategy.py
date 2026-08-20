@@ -3113,7 +3113,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         """Hook: does ``block_id`` claim a CUDA thread axis under this strategy?
 
         Defaults to ``_uses_thread_axis(block_size)``. Subclasses that
-        track per-block-id state (e.g. ``CuteNDTileStrategy``'s
+        track per-block-id state (e.g. ``PerThreadNDTileStrategy``'s
         ``inactive_block_ids``) override this to return False for
         block_ids that don't claim an axis so the grid / device-loop
         codegen does not emit ``thread_idx[axis]`` for them.
@@ -3614,8 +3614,13 @@ class NDTileStrategy(_BaseNDTileStrategy):
         return super().select_pid_strategy()
 
 
-class CuteNDTileStrategy(NDTileStrategy):
-    """CuTe N-D tile strategy using the standard tile pipeline."""
+class PerThreadNDTileStrategy(NDTileStrategy):
+    """N-D tiling for backends that give each thread one element of the tile.
+
+    Adds, on top of :class:`NDTileStrategy`, the per-axis ``num_threads`` split
+    and the lane loop it implies: an axis served by fewer threads than its
+    block size has each thread walk ``block_size // num_threads`` elements.
+    """
 
     def __init__(
         self,
@@ -3754,20 +3759,22 @@ class CuteNDTileStrategy(NDTileStrategy):
         nt = self.num_threads[idx]
         if nt == 0:
             return block_size
+        backend_name = CompileEnvironment.current().backend.name
         resolved_block_size = block_size
         if not isinstance(resolved_block_size, int):
             static_block_size = self._configured_block_size_int(resolved_block_size)
             if static_block_size is None:
                 raise exc.BackendUnsupported(
-                    "cute",
-                    "num_threads requires static ND block sizes for cute",
+                    backend_name,
+                    f"num_threads requires static ND block sizes for {backend_name}",
                 )
             resolved_block_size = static_block_size
         if resolved_block_size % nt != 0:
             raise exc.BackendUnsupported(
-                "cute",
+                backend_name,
                 (
-                    "block size must be divisible by num_threads for cute axis "
+                    f"block size must be divisible by num_threads for "
+                    f"{backend_name} axis "
                     f"{block_id}: {resolved_block_size} is not divisible by {nt}"
                 ),
             )
@@ -4233,8 +4240,13 @@ class CuteNDTileStrategy(NDTileStrategy):
         return False
 
 
-class CuteFlattenedTileStrategy(FlattenedTileStrategy):
-    """Flattened CuTe strategy: scalar index per thread over a flattened tile."""
+class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
+    """Flattened tiling with one scalar index per thread.
+
+    The flattened counterpart of :class:`PerThreadNDTileStrategy`: a single
+    ``num_threads`` splits the flattened tile, and a lane loop covers the rest
+    when it is narrower than the block size.
+    """
 
     def __init__(
         self,
@@ -4261,16 +4273,18 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
     def _thread_extent(self) -> SymIntLike:
         if self._num_threads == 0:
             return self.block_size
+        backend_name = CompileEnvironment.current().backend.name
         if not isinstance(self.block_size, int):
             raise exc.BackendUnsupported(
-                "cute",
-                "num_threads requires static flattened block sizes for cute",
+                backend_name,
+                f"num_threads requires static flattened block sizes for {backend_name}",
             )
         if self.block_size % self._num_threads != 0:
             raise exc.BackendUnsupported(
-                "cute",
+                backend_name,
                 (
-                    "block size must be divisible by num_threads for cute: "
+                    f"block size must be divisible by num_threads for "
+                    f"{backend_name}: "
                     f"{self.block_size} is not divisible by {self._num_threads}"
                 ),
             )
