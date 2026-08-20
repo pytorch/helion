@@ -38,7 +38,7 @@ def _(state: CodegenState) -> None:
     device_fn = state.device_function
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
-    parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
+    parts, none_dims = pallas_codegen.index_parts(state, subscript, tensor)
     value = pallas_codegen.sliced_value_for_store(
         state, tensor, subscript, parts, value
     )
@@ -46,11 +46,27 @@ def _(state: CodegenState) -> None:
     from .gather import emit_scatter_store
     from .tensorcore_plan import TENSORCORE_PLAN_META
     from .tensorcore_plan import OneHotScatterPlan
+    from .vmem_scalar_load import VMEM_SCALAR_STORE_PLAN
+    from .vmem_scalar_load import VmemScalarStorePlan
+    from .vmem_scalar_load import emit_vmem_scalar_store
+    from .vmem_scalar_load import materialize_vmem_scalar_store
 
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
     is_scatter = isinstance(plan, OneHotScatterPlan)
     if is_scatter:
         value = emit_scatter_store(state, plan.plan, name, idx_str, value)
+    elif not none_dims and state.fx_node is not None:
+        scalar_store_plan = state.fx_node.meta.get(VMEM_SCALAR_STORE_PLAN)
+        if isinstance(scalar_store_plan, VmemScalarStorePlan):
+            scalar_store = materialize_vmem_scalar_store(
+                state, tensor, parts, scalar_store_plan
+            )
+            value_var = device_fn.new_var("store_value", dce=True)
+            for stmt in emit_vmem_scalar_store(
+                tensor, name, parts, value, value_var, scalar_store
+            ):
+                state.codegen.add_statement(stmt)
+            return
     from .ordered_carry import emit_carry_store
 
     if not is_scatter and state.device_function.carry_tiles:

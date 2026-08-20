@@ -99,6 +99,35 @@ def plan_tiling(
             graph_info, graph_lookup, parent_ids
         )
         _analyze_indexing_expressions(graph_info, config, local_access_keys)
+    _plan_vmem_scalar_stores(graphs)
+
+
+def _plan_vmem_scalar_stores(graphs: list[GraphInfo]) -> None:
+    """Attach scalar-store plans after tensor memory spaces are final."""
+    from ...language import memory_ops
+    from ..device_function import DeviceFunction
+    from .vmem_scalar_load import VMEM_SCALAR_STORE_PLAN
+    from .vmem_scalar_load import plan_vmem_scalar_store
+
+    device_fn = DeviceFunction.current()
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            node.meta.pop(VMEM_SCALAR_STORE_PLAN, None)
+            if node.op != "call_function" or node.target is not memory_ops.store:
+                continue
+            tensor_arg = node.args[0]
+            if not isinstance(tensor_arg, torch.fx.Node):
+                continue
+            tensor = tensor_arg.meta.get("val")
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            plan = plan_vmem_scalar_store(
+                tensor,
+                list(node.meta.get("indexing_patterns") or ()),
+                device_fn.pallas_memory_space.get(id(tensor)),
+            )
+            if plan is not None:
+                node.meta[VMEM_SCALAR_STORE_PLAN] = plan
 
 
 def _tensor_origin_key(tensor: torch.Tensor) -> str | int:
