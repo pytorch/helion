@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 
 _FLASH_POLICY_EXP2_PACKETS = frozenset(
     {
@@ -37,7 +38,20 @@ _FLASH_POLICY_PIPELINE_FAMILIES = frozenset(
         "fa4_clc_local_tma_4d",
     }
 )
+_FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES = frozenset(
+    {
+        "fa4_tma_4d",
+        "fa4_local_tma_4d",
+        "fa4_cga2_local_tma_4d",
+        "fa4_2cta_tma_4d",
+        "fa4_clc_tma_4d",
+        "fa4_clc_local_tma_4d",
+    }
+)
 _FLASH_POLICY_ROLE_MAPS = frozenset({"helion", "fa4"})
+_FLASH_POLICY_BASE_EXP2_PACKETS = frozenset({"1x1", "4x1", "4x2", "8x1", "8x2"})
+_FLASH_POLICY_DEGREE1_EXP2_PACKETS = frozenset({"deg1_16x8", "deg1_8x2_corr10"})
+_FLASH_FLOAT16_MAX_LOG2 = math.log2(65504.0)
 
 
 def _validate_policy_choice(name: str, value: str, choices: frozenset[str]) -> None:
@@ -106,6 +120,7 @@ class FlashDenseTuningPolicy:
     pipeline_family: str = "fa4_2cta"
     kv_stage: int = 6
     persistent: bool = False
+    rescale_threshold: float = 8.0
     packed_exp2_mode: FlashPackedExp2Mode = FlashPackedExp2Mode.DISABLED
     probability_log2_shift: int = 0
     softmax_lowering: FlashSoftmaxLowering = FlashSoftmaxLowering.STANDARD
@@ -137,11 +152,31 @@ class FlashDenseTuningPolicy:
         )
         if self.kv_stage <= 0:
             raise ValueError("dense KV stage must be positive")
-        if self.probability_log2_shift < 0:
-            raise ValueError("probability log2 shift must be nonnegative")
-        if self.softmax_lowering is FlashSoftmaxLowering.STATEFUL:
+        if not math.isfinite(self.rescale_threshold):
+            raise ValueError("dense rescale threshold must be finite")
+        if self.rescale_threshold < 0:
+            raise ValueError("dense rescale threshold must be nonnegative")
+        if (
+            type(self.probability_log2_shift) is not int
+            or self.probability_log2_shift < 0
+        ):
+            raise ValueError("probability log2 shift must be a nonnegative integer")
+        if type(self.softmax_lowering) is not FlashSoftmaxLowering or (
+            self.softmax_lowering
+            not in (
+                FlashSoftmaxLowering.STANDARD,
+                FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+            )
+        ):
             raise ValueError(
-                "stateful softmax lowering is unsupported for dense policy"
+                f"unsupported dense softmax lowering: {self.softmax_lowering!r}"
+            )
+        if type(self.packed_exp2_mode) is not FlashPackedExp2Mode or (
+            self.packed_exp2_mode
+            not in (FlashPackedExp2Mode.DISABLED, FlashPackedExp2Mode.ALL_XU)
+        ):
+            raise ValueError(
+                f"unsupported dense packed exp2 mode: {self.packed_exp2_mode!r}"
             )
         if (
             self.softmax_lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
@@ -150,6 +185,43 @@ class FlashDenseTuningPolicy:
             raise ValueError(
                 "dense resident value-graph lowering requires single statistics transport"
             )
+        uses_resident_softmax = (
+            self.softmax_lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+        )
+        uses_packed_exp2 = self.packed_exp2_mode is FlashPackedExp2Mode.ALL_XU
+        if uses_resident_softmax and uses_packed_exp2:
+            raise ValueError(
+                "dense resident softmax and packed exp2 lowerings are mutually exclusive"
+            )
+        if uses_resident_softmax or uses_packed_exp2:
+            if self.rescale_threshold <= 0:
+                raise ValueError(
+                    "specialized dense lowerings require a positive rescale threshold"
+                )
+            if self.pipeline_family != "fa4_2cta" or self.persistent:
+                raise ValueError(
+                    "specialized dense lowerings require the nonpersistent fa4_2cta pipeline"
+                )
+            if self.e2e_schedule == "xu":
+                raise ValueError(
+                    "specialized dense lowerings require a split end-to-end schedule"
+                )
+            if (
+                self.probability_log2_shift + self.rescale_threshold
+                >= _FLASH_FLOAT16_MAX_LOG2
+            ):
+                raise ValueError(
+                    "dense probability shift and rescale threshold exceed fp16 range"
+                )
+        elif self.probability_log2_shift:
+            raise ValueError(
+                "dense probability shift requires a resident or packed exp2 lowering"
+            )
+        if (
+            uses_packed_exp2
+            and self.exp2_packet not in _FLASH_POLICY_DEGREE1_EXP2_PACKETS
+        ):
+            raise ValueError("packed exp2 lowering requires a degree-1 exp2 packet")
         if (self.corr_regs is None) != (self.other_regs is None):
             raise ValueError(
                 "dense correction and other register counts must be set together"
@@ -164,6 +236,16 @@ class FlashDenseTuningPolicy:
             raise ValueError(
                 "dense other register count must be at least 24 and a multiple of 8"
             )
+
+    @property
+    def requires_fp16_hd64(self) -> bool:
+        """Whether this policy selects an implementation limited to FP16/hd64."""
+        return (
+            self.pipeline_family in _FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES
+            or self.exp2_packet not in _FLASH_POLICY_BASE_EXP2_PACKETS
+            or self.softmax_lowering is not FlashSoftmaxLowering.STANDARD
+            or self.packed_exp2_mode is not FlashPackedExp2Mode.DISABLED
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -190,6 +272,23 @@ class FlashCausalTuningPolicy:
             raise ValueError("causal KV stage must be positive")
         if self.e2e_offset < 0 or self.e2e_offset0 < 0:
             raise ValueError("causal end-to-end offsets must be nonnegative")
+        if type(self.seed_template) is not FlashCausalSeedTemplate or (
+            self.seed_template is not FlashCausalSeedTemplate.DEGREE2_V1
+        ):
+            raise ValueError(
+                f"unsupported causal seed template: {self.seed_template!r}"
+            )
+        if type(self.softmax_lowering) is not FlashSoftmaxLowering or (
+            self.softmax_lowering
+            not in (
+                FlashSoftmaxLowering.STANDARD,
+                FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+                FlashSoftmaxLowering.STATEFUL,
+            )
+        ):
+            raise ValueError(
+                f"unsupported causal softmax lowering: {self.softmax_lowering!r}"
+            )
         _validate_policy_choice(
             "causal role map", self.role_map, _FLASH_POLICY_ROLE_MAPS
         )
@@ -207,6 +306,13 @@ class FlashCausalTuningPolicy:
             not self.causal_loop_split or self.causal_kv_order != "descending"
         ):
             raise ValueError("causal resident softmax requires a descending split loop")
+
+    @property
+    def requires_fp16_hd64(self) -> bool:
+        """Whether this policy's seed template is limited to FP16/hd64."""
+        # DEGREE2_V1 is currently the only implemented causal seed template and
+        # its emitter is specialized to the FP16/head-dim-64 workload.
+        return self.seed_template is FlashCausalSeedTemplate.DEGREE2_V1
 
 
 @dataclasses.dataclass(frozen=True)

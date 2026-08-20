@@ -2947,16 +2947,59 @@ class TestCuteBackend(TestCase):
             b200_code = dense_bound.to_triton_code(config)
         self.assertNotIn("f16x2_xu=True", b200_code)
 
+        packed_lse_bound = cute_dense_attention_with_lse.bind((q, k, v))
+        target_policy = get_flash_target_policy((10, 3))
+        lse_tuning = dataclasses.replace(
+            target_policy.tuning,
+            dense_policies=tuple(
+                dataclasses.replace(policy, stat_transport="single")
+                if policy.num_kv == 2048
+                else policy
+                for policy in target_policy.tuning.dense_policies
+            ),
+        )
+        lse_config = helion.Config(
+            **{**config.config, "cute_flash_stat_transport": "single"}
+        )
+        with (
+            patch.object(
+                dense_bound.env.config_spec,
+                "target_device_capability",
+                (10, 3),
+            ),
+            patch.object(
+                _cute_flash,
+                "get_flash_target_policy",
+                return_value=dataclasses.replace(target_policy, tuning=lse_tuning),
+            ),
+        ):
+            packed_control_code = dense_bound.to_triton_code(lse_config)
+        self.assertIn("f16x2_xu=True", packed_control_code)
+        with (
+            patch.object(
+                packed_lse_bound.env.config_spec,
+                "target_device_capability",
+                (10, 3),
+            ),
+            patch.object(
+                _cute_flash,
+                "get_flash_target_policy",
+                return_value=dataclasses.replace(target_policy, tuning=lse_tuning),
+            ),
+        ):
+            packed_lse_code = packed_lse_bound.to_triton_code(lse_config)
+        self.assertNotIn("f16x2_xu=True", packed_lse_code)
+
         lse_bound = cute_dense_attention_with_lse.bind(
             (resident_q, resident_k, resident_v)
         )
-        lse_config = helion.Config(
+        resident_lse_config = helion.Config(
             **{**resident_config.config, "cute_flash_stat_transport": "single"}
         )
         with patch.object(
             lse_bound.env.config_spec, "target_device_capability", (10, 3)
         ):
-            lse_code = lse_bound.to_triton_code(lse_config)
+            lse_code = lse_bound.to_triton_code(resident_lse_config)
         self.assertNotIn("f16x2_xu=True", lse_code)
         self.assertNotIn("resident_softmax_value_graph", lse_code)
 
@@ -2969,7 +3012,9 @@ class TestCuteBackend(TestCase):
             modified_code = modified_bound.to_triton_code(resident_config)
         self.assertNotIn("resident_softmax_value_graph", modified_code)
 
-    def test_flash_attention_target_packed_exp2_preserves_256k_tail(self) -> None:
+    def test_flash_attention_target_packed_exp2_matches_sdpa_and_preserves_tail(
+        self,
+    ) -> None:
         capability = torch.cuda.get_device_capability()
         target_policy = get_flash_target_policy(capability)
         dense_policy = target_policy.tuning.dense_policy(2048)
@@ -2981,9 +3026,11 @@ class TestCuteBackend(TestCase):
             self.skipTest("target has no packed f16x2 exp2 lowering")
 
         sequence_length = 262_144
-        q = torch.zeros((1, 1, sequence_length, 64), dtype=torch.float16, device=DEVICE)
-        k = torch.zeros_like(q)
-        v = torch.full_like(q, -2.0)
+        kv_shape = (1, 1, sequence_length, 64)
+        q_shape = kv_shape
+        q = torch.zeros(q_shape, dtype=torch.float16, device=DEVICE)
+        k = torch.zeros(kv_shape, dtype=torch.float16, device=DEVICE)
+        v = torch.full(kv_shape, -2.0, dtype=torch.float16, device=DEVICE)
         q[..., 0] = 1.0
         k[..., 0] = -26.0 * math.sqrt(64) / math.log2(math.e)
         k[..., 0, 0] = 0.0
@@ -3012,6 +3059,16 @@ class TestCuteBackend(TestCase):
         self.assertTrue(torch.equal(out, repeated))
         self.assertTrue(torch.isfinite(out).all())
         self.assertLess((out.float() - expected).abs().max().item(), 5e-5)
+
+        torch.manual_seed(2048)
+        random_q = torch.randn(q_shape, dtype=torch.float16, device=DEVICE)
+        random_k = torch.randn(kv_shape, dtype=torch.float16, device=DEVICE)
+        random_v = torch.randn(kv_shape, dtype=torch.float16, device=DEVICE)
+        random_out = compiled(random_q, random_k, random_v)
+        random_expected = torch.nn.functional.scaled_dot_product_attention(
+            random_q, random_k, random_v
+        )
+        torch.testing.assert_close(random_out, random_expected, atol=0.002, rtol=0.02)
 
     def _check_flash_attention_target_dense_resident(
         self, num_kv: int, seed_value: int

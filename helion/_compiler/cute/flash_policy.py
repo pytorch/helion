@@ -27,20 +27,15 @@ class FlashTargetPolicy:
         if len(set(workloads)) != len(workloads):
             raise ValueError("flash target tuning workloads must be unique")
         for tuning in self.tunings:
-            uses_specialized_lowering = any(
-                policy.softmax_lowering is not FlashSoftmaxLowering.STANDARD
-                or policy.packed_exp2_mode is not FlashPackedExp2Mode.DISABLED
-                for policy in tuning.dense_policies
-            ) or any(
-                policy.softmax_lowering is not FlashSoftmaxLowering.STANDARD
-                for policy in tuning.causal_policies
-            )
-            if uses_specialized_lowering and (
+            requires_fp16_hd64 = any(
+                policy.requires_fp16_hd64 for policy in tuning.dense_policies
+            ) or any(policy.requires_fp16_hd64 for policy in tuning.causal_policies)
+            if requires_fp16_hd64 and (
                 tuning.workload.head_dim != 64
                 or tuning.workload.dtype is not FlashTuningDType.FLOAT16
             ):
                 raise ValueError(
-                    "specialized flash lowerings require the FP16 head-dim-64 workload"
+                    "flash target tuning currently requires the FP16 head-dim-64 workload"
                 )
             if (
                 tuning.tmem_row_reduce_min_kv is not None

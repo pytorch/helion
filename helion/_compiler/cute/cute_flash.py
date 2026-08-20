@@ -3958,6 +3958,7 @@ def _flash_dense_tuning_overrides(
         FLASH_E2E_OFFSET0_KEY: policy.e2e_offset0,
         FLASH_EXP2_PACKET_KEY: policy.exp2_packet,
         FLASH_STAT_TRANSPORT_KEY: policy.stat_transport,
+        FLASH_RESCALE_THRESHOLD_KEY: policy.rescale_threshold,
     }
     if policy.corr_regs is not None:
         values[FLASH_CORR_REGS_KEY] = policy.corr_regs
@@ -3999,20 +4000,20 @@ def _flash_config_matches_tuning_values(
     return all(actual.get(key) == value for key, value in expected.items())
 
 
-def _flash_dense_resident_seed_matches(
+def _flash_dense_target_seed_matches(
     cfg: FlashAttentionConfig,
     policy: FlashDenseTuningPolicy | None,
 ) -> bool:
     """Return whether ``cfg`` is the validated target-promoted dense seed."""
-    expected = (
+    if policy is None:
+        return False
+    return _flash_config_matches_tuning_values(
+        cfg,
         {
             **_flash_dense_tuning_overrides(policy),
             FLASH_Q_TILE_COUNT_KEY: 2,
-        }
-        if policy is not None
-        else {}
+        },
     )
-    return policy is not None and _flash_config_matches_tuning_values(cfg, expected)
 
 
 def _flash_resident_softmax_config(
@@ -5523,7 +5524,10 @@ def flash_autotune_fragments(
         if value not in fragment.choices:
             search_choices = fragment.search_choices
             if search_choices is None:
-                search_choices = (fragment.default(),)
+                # ``None`` means every existing choice is searched.  The target
+                # value is accepted as a fixed seed without narrowing that
+                # pre-existing search surface.
+                search_choices = fragment.choices
             fragments[key] = EnumFragment((*fragment.choices, value), search_choices)
     return fragments
 
@@ -6074,16 +6078,110 @@ def _flash_fa4_causal_split_equal_iteration_proof(
         return CausalRangeProof(False, split_range_proof.reason)
     if query_slots_per_cta != 2:
         return CausalRangeProof(False, "FA4 resident path requires two query slots")
-    # For each query tile, the descending split executes ``num_kv - m_tile``
-    # masked iterations followed by ``m_tile`` unmasked iterations.  The range
-    # proof guarantees both bounds describe the same complete KV interval, so
-    # their sum is exactly ``num_kv`` for both resident query slots.
-    return CausalRangeProof(True, "masked and unmasked loop bounds sum to num_kv")
+    # Each resident query slot shares ``flash_num_active_kv``.  Its descending
+    # split executes ``flash_num_active_kv - m_tile`` masked iterations followed
+    # by ``m_tile`` unmasked iterations, so both slots execute the same active
+    # KV count while traversing different mask-free suffix lengths.
+    return CausalRangeProof(
+        True, "resident query slots share the same active KV iteration count"
+    )
 
 
-def _flash_runtime_range_header(loop_var: str, loop_bound: str) -> str:
-    """Emit a runtime CuTe loop header; causal splitting must not unroll it."""
-    return f"for {loop_var} in cutlass.range({loop_bound}, unroll=1):"
+@dataclasses.dataclass(frozen=True)
+class _FlashSoftmaxLoopSegment:
+    """Runtime loop domain and phase facts for one online-softmax segment."""
+
+    loop_var: str
+    loop_bound: str
+    kv_expr: str | None = None
+    continues_previous_segment: bool = False
+
+    @property
+    def not_first_condition(self) -> str:
+        """Return the loop-local expression proving this is not the first KV tile."""
+        if self.continues_previous_segment:
+            return f"{self.loop_var} >= cutlass.Int32(0)"
+        return f"{self.loop_var} != 0"
+
+
+_FLASH_ONLINE_STATISTICS_UPDATE = (
+    "            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _FlashOnlineSoftmaxIteration:
+    """Ordered source blocks for one statically specialized softmax iteration.
+
+    The final row-sum publication is deliberately not part of this plan because
+    it occurs after the complete loop (or masked/unmasked loop pair).
+    """
+
+    load_and_reduce: str
+    alpha_pre_probability: str
+    alpha_publish_pre_probability: str
+    probability_update: str
+    alpha_post_probability: str = ""
+    alpha_publish_post_probability: str = ""
+    statistics_acquire: str = ""
+    statistics_update: str = _FLASH_ONLINE_STATISTICS_UPDATE
+    post_statistics: str = ""
+
+
+def _flash_causal_split_softmax_segments(
+    kv_loop_bound: str,
+    stage: str,
+    *,
+    split_range_proof: CausalRangeProof,
+) -> tuple[_FlashSoftmaxLoopSegment, _FlashSoftmaxLoopSegment]:
+    """Return the proof-backed masked prefix and unmasked causal suffix."""
+    if not split_range_proof.proven:
+        raise AssertionError(
+            "causal softmax split requires a proven complete masked/unmasked range"
+        )
+    return (
+        _FlashSoftmaxLoopSegment(
+            loop_var="flash_kv_mask_iter",
+            loop_bound=f"{kv_loop_bound} - flash_m_tile{stage}",
+            kv_expr=(f"{kv_loop_bound} - cutlass.Int32(1) - flash_kv_mask_iter"),
+        ),
+        _FlashSoftmaxLoopSegment(
+            loop_var="flash_kv_unmask_iter",
+            loop_bound=f"flash_m_tile{stage}",
+            kv_expr=(f"flash_m_tile{stage} - cutlass.Int32(1) - flash_kv_unmask_iter"),
+            continues_previous_segment=True,
+        ),
+    )
+
+
+def _format_fa4_online_softmax_loop(
+    segment: _FlashSoftmaxLoopSegment,
+    iteration: _FlashOnlineSoftmaxIteration,
+    *,
+    stage: str,
+    wait_hint: int,
+) -> str:
+    """Render the common FA4 wait/max/alpha/P/row-sum iteration order."""
+    kv_assignment = (
+        f"\n            flash_kv = {segment.kv_expr}" if segment.kv_expr else ""
+    )
+    return f"""        for {segment.loop_var} in cutlass.range({segment.loop_bound}, unroll=1):{kv_assignment}
+            _helion_flash_rt.mbar_spin_wait(
+                flash_s_full_ptr + {stage}, flash_s_full_phase, {wait_hint})
+            flash_s_full_phase ^= 1
+            flash_old_row_max = flash_row_max
+{iteration.load_and_reduce}
+            flash_row_max_safe = flash_row_max
+            if flash_row_max == -cutlass.Float32.inf:
+                flash_row_max_safe = cutlass.Float32(0.0)
+{iteration.alpha_pre_probability}
+{iteration.alpha_publish_pre_probability}
+{iteration.probability_update}
+{iteration.alpha_post_probability}
+{iteration.alpha_publish_post_probability}
+{iteration.statistics_acquire}
+{iteration.statistics_update}
+{iteration.post_statistics}"""
 
 
 def _flash_kv_iteration(
@@ -7515,12 +7613,18 @@ def emit_flash_fa4_device_body(
     probability_log2_shift = (
         dense_tuning.probability_log2_shift if dense_tuning is not None else 0
     )
-    probability_shift_safe = probability_log2_shift + cfg.rescale_threshold < math.log2(
-        torch.finfo(torch.float16).max
+    dense_seed_matches = _flash_dense_target_seed_matches(cfg, dense_tuning)
+    dense_softmax_lowering = (
+        dense_tuning.softmax_lowering
+        if dense_tuning is not None
+        else FlashSoftmaxLowering.STANDARD
     )
-    dense_seed_matches = _flash_dense_resident_seed_matches(cfg, dense_tuning)
-    dense_resident_value_graph_candidate = False
-    if (
+    dense_packed_exp2_mode = (
+        dense_tuning.packed_exp2_mode
+        if dense_tuning is not None
+        else FlashPackedExp2Mode.DISABLED
+    )
+    dense_target_lowering_applies = (
         dense_tuning is not None
         and dense_seed_matches
         and not is_causal
@@ -7528,23 +7632,16 @@ def emit_flash_fa4_device_body(
         and cfg.use_2cta_instrs
         and not cfg.separate_kv_rings
         and not cfg.softmax_disc
-        and cfg.split_p_arrive
         and cfg.p_store_repetition == 16
         and cfg.s_load_repetition == 32
-        and cfg.rescale_threshold > 0.0
-        and probability_shift_safe
         and score_plan.modifier_kinds == (DENSE_SCORE_KIND,)
-    ):
-        dense_softmax_family = dense_tuning.softmax_lowering
-        if dense_softmax_family is FlashSoftmaxLowering.STANDARD:
-            pass
-        elif dense_softmax_family is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH:
-            dense_resident_value_graph_candidate = True
-        else:
-            raise AssertionError(
-                "unsupported dense resident softmax lowering family: "
-                f"{dense_softmax_family!r}"
-            )
+    )
+    dense_resident_value_graph_candidate = (
+        dense_target_lowering_applies
+        and cfg.split_p_arrive
+        and cfg.rescale_threshold > 0.0
+        and dense_softmax_lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+    )
     causal_tuning = (
         tuning_policy.causal_policy(num_kv) if tuning_policy is not None else None
     )
@@ -7585,8 +7682,8 @@ def emit_flash_fa4_device_body(
             )
     if use_causal_resident_native:
         # Use the architecture-selected resident softmax lowering only for the
-        # validated rank-0 schedule. Other manual/autotuned configs retain their
-        # explicit exp2, disc, and statistics choices.
+        # validated rank-0 schedule. Other manual/autotuned configs remain on
+        # their resolved standard lowering.
         cfg = _flash_resident_softmax_config(cfg)
     stat_release_mapping = (
         FlashStatReleaseMapping.SAME_SLOT
@@ -7606,24 +7703,11 @@ def emit_flash_fa4_device_body(
     if not use_tensor_4d_tma:
         tensor_4d_heads = 0
     use_2cta_instrs = cfg.use_2cta_instrs
-    dense_packed_exp2_mode = (
-        dense_tuning.packed_exp2_mode
-        if dense_tuning is not None
-        else FlashPackedExp2Mode.DISABLED
-    )
     use_packed_f16x2_xu = (
         dense_packed_exp2_mode is FlashPackedExp2Mode.ALL_XU
         and hardware_capabilities.supports_packed_f16x2_exp2
-        and probability_shift_safe
-        and not has_lse
+        and dense_target_lowering_applies
         and cfg.exp2_impl == "split"
-        and cfg.p_store_repetition == 16
-        and cfg.s_load_repetition == 32
-        and not is_causal
-        and dense_seed_matches
-        and score_plan.modifier_kinds == (DENSE_SCORE_KIND,)
-        and use_2cta_instrs
-        and not cfg.softmax_disc
         and cfg.exp2_packet in _FLASH_DEG1_EXP2_PACKETS
     )
     effective_probability_log2_shift = (
@@ -7659,11 +7743,8 @@ def emit_flash_fa4_device_body(
         fa4_stat_pipeline and cfg.stat_transport == "single_final"
     )
     acknowledged_stat_pipeline = fa4_stat_pipeline and not final_only_stat_pipeline
-    use_dense_resident_value_graph = (
-        dense_resident_value_graph_candidate and acknowledged_stat_pipeline
-    )
     if dense_resident_value_graph_candidate:
-        assert use_dense_resident_value_graph
+        assert acknowledged_stat_pipeline
     if use_causal_stateful_softmax:
         assert acknowledged_stat_pipeline
     verified_shared_memory_bytes: int | None = None
@@ -7723,7 +7804,7 @@ def emit_flash_fa4_device_body(
         verified_shared_memory_bytes = verified_schedule.schedule.shared_memory_bytes
     elif use_causal_resident_native:
         assert causal_split_equal_iteration_proof.proven
-        verify_flash_schedule(
+        verified_schedule = verify_flash_schedule(
             build_fa4_schedule(
                 FlashScheduleSpec(
                     head_dim=head_dim,
@@ -7742,6 +7823,7 @@ def emit_flash_fa4_device_body(
                 )
             )
         )
+        verified_shared_memory_bytes = verified_schedule.schedule.shared_memory_bytes
     use_local_tma_partition = (
         cfg.local_tma_partition
         and persistent
@@ -8355,9 +8437,8 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
         and not has_lse
         and not score_plan.modifiers
     )
-    policy_stage_local_softmax_setup = use_causal_stateful_softmax
     stage_local_softmax_setup = (
-        policy_stage_local_softmax_setup
+        use_causal_stateful_softmax
         or _flash_bool_env(
             "HELION_CUTE_FLASH_STAGE_LOCAL_SOFTMAX_SETUP",
             default_stage_local_softmax_setup,
@@ -9227,13 +9308,14 @@ if warp_idx == 15:
     else:
         _disc_pass2_name = "fa4_disc_exp_convert_store"
         _disc_pass2_causal_name = "fa4_disc_exp_convert_store_causal"
-    softmax_loop_var = "flash_kv_iter" if desc_kv else "flash_kv"
-    softmax_actual_kv = (
-        f"\n            flash_kv = {kv_loop_bound} - cutlass.Int32(1) - flash_kv_iter"
-        if desc_kv
-        else ""
+    softmax_segment = _FlashSoftmaxLoopSegment(
+        loop_var="flash_kv_iter" if desc_kv else "flash_kv",
+        loop_bound=kv_loop_bound,
+        kv_expr=(
+            f"{kv_loop_bound} - cutlass.Int32(1) - flash_kv_iter" if desc_kv else None
+        ),
     )
-    softmax_not_first = "flash_kv_iter != 0" if desc_kv else "flash_kv != 0"
+    softmax_not_first = softmax_segment.not_first_condition
     defer_causal_minus_scale = (
         is_causal and _flash_fa4_runtime_disc_score_plan_supported(score_plan)
     )
@@ -9328,9 +9410,6 @@ if warp_idx == 15:
             f"flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})"
         )
 
-    def _softmax_release_p_ready(stage: str) -> str:
-        return ""
-
     def _softmax_inner(
         stage: str,
         ld: str,
@@ -9422,8 +9501,6 @@ if warp_idx == 15:
                 args.append("degree1=True")
             elif disc_exp2_codegen.degree2:
                 args.append("degree2=True")
-            if use_packed_f16x2_xu:
-                args.append("f16x2_xu=True")
             return f"_helion_flash_rt.{name}(" + ", ".join(args) + ")"
 
         pass2_call = _format_disc_pass2(_disc_pass2_name, causal=False)
@@ -9517,7 +9594,6 @@ if warp_idx == 15:
         {corr_rowsum_advance}"""
         # The correction warp consumes per-KV alpha handoffs during the loop and
         # one final row-sum handoff after the loop.
-        final_corr_publish_rowsum = corr_publish_rowsum
         if cfg.softmax_disc:
             if not _flash_fa4_runtime_disc_score_plan_supported(score_plan):
                 score_transform = _flash_score_transform_block(
@@ -9546,22 +9622,23 @@ if warp_idx == 15:
                     else f"""            if {softmax_not_first}:
 {corr_publish_alpha}"""
                 )
+                iteration = _FlashOnlineSoftmaxIteration(
+                    load_and_reduce=rowmax_block,
+                    alpha_pre_probability=_disc_alpha_block,
+                    alpha_publish_pre_probability=alpha_publish,
+                    probability_update=f"""{_disc_minus_scale_block}
+{pass2_block}""",
+                )
+                loop = _format_fa4_online_softmax_loop(
+                    softmax_segment,
+                    iteration,
+                    stage=stage,
+                    wait_hint=cfg.wait_hint,
+                )
                 return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-        for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{softmax_actual_kv}
-            _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-{rowmax_block}
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{_disc_alpha_block}
-{alpha_publish}
-{_disc_minus_scale_block}
-{pass2_block}
-            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
-{final_corr_publish_rowsum}"""
+{loop}
+{corr_publish_rowsum}"""
             rowmax_dense_call = (
                 f"_helion_flash_rt.disc_rowmax_ldred("
                 f"flash_tiled_ldred{stage}, tLDRedtS{stage}, tLDcS, "
@@ -9574,51 +9651,44 @@ if warp_idx == 15:
             direct_dense_pass2 = f"            flash_p_sum = {pass2_call}"
 
             def _format_disc_loop(
-                loop_var: str,
-                loop_bound: str,
-                actual_kv: str,
-                not_first: str,
+                segment: _FlashSoftmaxLoopSegment,
                 loop_rowmax_block: str,
                 loop_pass2_block: str,
                 *,
-                publish_rowsum: bool = True,
                 zero_first_tile: bool = False,
-                known_not_first: bool = False,
             ) -> str:
-                rowsum_publish = final_corr_publish_rowsum if publish_rowsum else ""
                 if cfg.skip_rescale_stats:
                     alpha_publish = ""
-                elif known_not_first:
+                elif segment.continues_previous_segment:
                     alpha_publish = _corr_publish_alpha("            ")
                 else:
-                    alpha_publish = f"""            if {not_first}:
+                    alpha_publish = f"""            if {segment.not_first_condition}:
 {corr_publish_alpha}"""
                 if zero_first_tile:
-                    loop_rowmax_block = f"""            if {not_first}:
+                    loop_rowmax_block = f"""            if {segment.not_first_condition}:
 {textwrap.indent(loop_rowmax_block, "    ")}"""
-                    loop_pass2_block = f"""            if {not_first}:
+                    loop_pass2_block = f"""            if {segment.not_first_condition}:
 {textwrap.indent(loop_pass2_block, "    ")}
             else:
                 flash_p_sum = {zero_pass2_call}"""
                 alpha_block, minus_scale_block = _disc_alpha_blocks_for(
-                    not_first, known_not_first=known_not_first
+                    segment.not_first_condition,
+                    known_not_first=segment.continues_previous_segment,
                 )
-                loop_header = _flash_runtime_range_header(loop_var, loop_bound)
-                return f"""        {loop_header}{actual_kv}
-            _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-{loop_rowmax_block}
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{alpha_block}
-{alpha_publish}
-{minus_scale_block}
+                iteration = _FlashOnlineSoftmaxIteration(
+                    load_and_reduce=loop_rowmax_block,
+                    alpha_pre_probability=alpha_block,
+                    alpha_publish_pre_probability=alpha_publish,
+                    probability_update=f"""{minus_scale_block}
             flash_p_sum = cutlass.Float32(0.0)
-{loop_pass2_block}
-            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
-{rowsum_publish}"""
+{loop_pass2_block}""",
+                )
+                return _format_fa4_online_softmax_loop(
+                    segment,
+                    iteration,
+                    stage=stage,
+                    wait_hint=cfg.wait_hint,
+                )
 
             if is_causal:
                 mask_m_tile = score_m_tile_expr
@@ -9636,37 +9706,31 @@ if warp_idx == 15:
                     and cfg.causal_loop_split
                     and causal_split_proof.proven
                 ):
+                    masked_segment, unmasked_segment = (
+                        _flash_causal_split_softmax_segments(
+                            kv_loop_bound,
+                            stage,
+                            split_range_proof=causal_split_proof,
+                        )
+                    )
                     masked_loop = _format_disc_loop(
-                        "flash_kv_mask_iter",
-                        f"{kv_loop_bound} - flash_m_tile{stage}",
-                        (
-                            f"\n            flash_kv = {kv_loop_bound} - "
-                            "cutlass.Int32(1) - flash_kv_mask_iter"
-                        ),
-                        "flash_kv_mask_iter != 0",
+                        masked_segment,
                         direct_causal_rowmax,
                         direct_causal_pass2,
-                        publish_rowsum=False,
                         zero_first_tile=stage == "0",
                     )
                     # The proven split always executes a nonempty masked prefix
                     # before entering its unmasked suffix.
                     unmasked_loop = _format_disc_loop(
-                        "flash_kv_unmask_iter",
-                        f"flash_m_tile{stage}",
-                        (
-                            f"\n            flash_kv = flash_m_tile{stage} - "
-                            "cutlass.Int32(1) - flash_kv_unmask_iter"
-                        ),
-                        "flash_kv_unmask_iter >= cutlass.Int32(0)",
+                        unmasked_segment,
                         direct_dense_rowmax,
                         direct_dense_pass2,
-                        known_not_first=True,
                     )
                     return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
 {masked_loop}
-{unmasked_loop}"""
+{unmasked_loop}
+{corr_publish_rowsum}"""
                 rowmax_block = f"""            if flash_kv >= flash_m_tile{stage}:
                 flash_row_max = {rowmax_causal_call}
             else:
@@ -9686,29 +9750,22 @@ if warp_idx == 15:
             # fold + the staged-P pfor/pfor2 arrives, freeing each chunk before the
             # next. Peak live = ONE 32-elem fragment -> fits the 200-grant zero-spill.
             loop = _format_disc_loop(
-                softmax_loop_var,
-                kv_loop_bound,
-                softmax_actual_kv,
-                softmax_not_first,
+                softmax_segment,
                 rowmax_block,
                 pass2_block,
                 zero_first_tile=is_causal and causal_desc_kv and stage == "0",
             )
             return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-{loop}"""
-        score_transform_m_tile = (
-            f"flash_q_mma_tile{stage} * cutlass.Int32(2)"
-            if use_2cta_instrs
-            else f"flash_m_tile{stage}"
-        )
+{loop}
+{corr_publish_rowsum}"""
         score_transform = _flash_score_transform_block(
             score_plan,
             indent="            ",
             score_tensor="tLDrS",
             coord_tensor="tLDcS",
             bh_expr="flash_bh",
-            m_tile_expr=score_transform_m_tile,
+            m_tile_expr=score_m_tile_expr,
             kv_tile_expr="flash_kv",
         )
         if split_p_arrive:
@@ -9735,8 +9792,9 @@ if warp_idx == 15:
             _helion_flash_rt.mbarrier_arrive(
                 flash_pfor_ptr + {stage}{pfor_peer_arg})"""
         use_resident_value_graph = (
-            use_causal_resident_value_graph or use_dense_resident_value_graph
+            use_causal_resident_value_graph or dense_resident_value_graph_candidate
         )
+        sp_corr_publish_alpha = ""
         if use_resident_value_graph:
             assert split_p_arrive
             assert not mixed_p_store
@@ -9744,7 +9802,7 @@ if warp_idx == 15:
                 f""",
                 pfor_peer_cta_rank=cutlass.Int32(0),
                 pfor_self_cta_rank={pfor_self_cta_rank}"""
-                if use_dense_resident_value_graph
+                if dense_resident_value_graph_candidate
                 else ""
             )
             sp_exp_block = f"""            flash_row_sum = _helion_flash_rt.resident_softmax_value_graph(
@@ -9755,7 +9813,6 @@ if warp_idx == 15:
                 flash_s_corr_prod_phase, flash_row_sum * flash_alpha,
                 {cfg.wait_hint}{resident_pfor_args})"""
             sp_p_store_block = ""
-            sp_corr_publish_alpha = ""
         elif cfg.exp2_impl == "split" or use_causal_resident_native:
             sp_e2e_offset = (
                 "0"
@@ -9823,18 +9880,18 @@ if warp_idx == 15:
             elif exp2_codegen.degree2:
                 sp_pass2_args.append("degree2=True")
             if use_packed_f16x2_xu:
+                assert not mixed_p_store
                 sp_pass2_args.append("f16x2_xu=True")
-            sp_pass2_call = (
-                f"_helion_flash_rt.{sp_pass2_name}(" + ", ".join(sp_pass2_args) + ")"
+            sp_exp_block = (
+                f"            flash_p_sum = _helion_flash_rt.{sp_pass2_name}("
+                + ", ".join(sp_pass2_args)
+                + ")"
             )
-            sp_exp_block = f"            flash_p_sum = {sp_pass2_call}"
             sp_p_store_block = ""
-            sp_corr_publish_alpha = ""
         else:
             sp_exp_block = softmax_exp_block
             sp_p_store_block = p_store_block
-            sp_corr_publish_alpha = ""
-        if not sp_corr_publish_alpha and not cfg.skip_rescale_stats:
+        if not cfg.skip_rescale_stats:
             if acknowledged_stat_pipeline:
                 sp_corr_publish_alpha = f"""            if {softmax_not_first}:
 {corr_publish_alpha}
@@ -9868,6 +9925,8 @@ if warp_idx == 15:
             if acknowledged_stat_pipeline
             else ""
         )
+        if use_whole_row_tmem_reduce:
+            assert not score_transform
         sp_score_load = (
             f"""            tLDrS_red = cute.make_rmem_tensor(
                 ((1, 1), *tLDrS.shape[1:]), cutlass.Float32)
@@ -9893,20 +9952,15 @@ if warp_idx == 15:
             assert cfg.exp2_impl == "xu"
 
             def _format_resident_causal_loop(
-                loop_var: str,
-                loop_bound: str,
-                actual_kv: str,
-                not_first: str,
+                segment: _FlashSoftmaxLoopSegment,
                 score_load: str,
                 rowmax_update: str,
-                *,
-                publish_rowsum: bool,
-                known_not_first: bool = False,
             ) -> str:
                 pin_condition = (
                     f"flash_acc_log >= -{cfg.rescale_threshold}"
-                    if known_not_first
-                    else f"({not_first}) & (flash_acc_log >= -{cfg.rescale_threshold})"
+                    if segment.continues_previous_segment
+                    else f"({segment.not_first_condition}) & "
+                    f"(flash_acc_log >= -{cfg.rescale_threshold})"
                 )
                 alpha_pre = f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
             flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
@@ -9917,43 +9971,40 @@ if warp_idx == 15:
             flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2"""
                 if cfg.skip_rescale_stats:
                     alpha_publish = ""
-                elif known_not_first:
+                elif segment.continues_previous_segment:
                     alpha_publish = _corr_publish_alpha("            ")
                 else:
-                    alpha_publish = f"""            if {not_first}:
+                    alpha_publish = f"""            if {segment.not_first_condition}:
 {_corr_publish_alpha("                ")}
             else:
                 _helion_flash_rt.named_barrier_arrive_unaligned(
                     {3 + int(stage) * 4} + warp_idx % 4, 64)"""
-                rowsum_publish = final_corr_publish_rowsum if publish_rowsum else ""
-                loop_header = _flash_runtime_range_header(loop_var, loop_bound)
                 post_p_stat_acquire = (
                     ""
                     if use_causal_resident_value_graph
                     else fa4_post_p_stat_acquire.rstrip()
                 )
-                row_sum_update = (
+                statistics_update = (
                     "            flash_s_corr_prod_phase ^= 1"
                     if use_causal_resident_value_graph
-                    else "            flash_row_sum = "
-                    "flash_row_sum * flash_alpha + flash_p_sum"
+                    else _FLASH_ONLINE_STATISTICS_UPDATE
                 )
-                return f"""        {loop_header}{actual_kv}
-            {_softmax_wait_s_ready(stage)}
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+                iteration = _FlashOnlineSoftmaxIteration(
+                    load_and_reduce=f"""            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
 {score_load}
-{rowmax_update}
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{alpha_pre}
-{alpha_publish}
-{sp_exp_block}
-{post_p_stat_acquire}
-{row_sum_update}
-{rowsum_publish}"""
+{rowmax_update}""",
+                    alpha_pre_probability=alpha_pre,
+                    alpha_publish_pre_probability=alpha_publish,
+                    probability_update=sp_exp_block,
+                    statistics_acquire=post_p_stat_acquire,
+                    statistics_update=statistics_update,
+                )
+                return _format_fa4_online_softmax_loop(
+                    segment,
+                    iteration,
+                    stage=stage,
+                    wait_hint=cfg.wait_hint,
+                )
 
             masked_score_load = f"""            cute.copy({ld}, {ldt}, tLDrS)
             cute.arch.fence_view_async_tmem_load(){score_transform}"""
@@ -10003,7 +10054,7 @@ if warp_idx == 15:
 {indent}flash_softmax.scale_subtract_rowmax(tLDrS, flash_row_max_safe)
 {indent}flash_tSrP_f32 = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
 {indent}flash_tSrP = cute.make_tensor(
-{indent}    cute.recast_ptr(flash_tSrP_f32.iterator, dtype=cutlass.Float16),
+{indent}    cute.recast_ptr(flash_tSrP_f32.iterator, dtype={io_dtype}),
 {indent}    tLDrS.layout)
 {indent}flash_softmax.apply_exp2_convert(tLDrS, flash_tSrP)
 {indent}for flash_ci in cutlass.range_constexpr(flash_P_STORE_SPLIT):
@@ -10052,70 +10103,62 @@ if warp_idx == 15:
         for flash_kv_unmask_iter in cutlass.range(flash_m_tile{stage}, unroll=1):
             flash_kv = flash_m_tile{stage} - cutlass.Int32(1) - flash_kv_unmask_iter
 {unmasked_step}
-{final_corr_publish_rowsum}"""
+{corr_publish_rowsum}"""
+            masked_segment, unmasked_segment = _flash_causal_split_softmax_segments(
+                kv_loop_bound,
+                stage,
+                split_range_proof=causal_split_proof,
+            )
             masked_loop = _format_resident_causal_loop(
-                "flash_kv_mask_iter",
-                f"{kv_loop_bound} - flash_m_tile{stage}",
-                (
-                    f"\n            flash_kv = {kv_loop_bound} - "
-                    "cutlass.Int32(1) - flash_kv_mask_iter"
-                ),
-                "flash_kv_mask_iter != 0",
+                masked_segment,
                 masked_score_load,
                 masked_rowmax,
-                publish_rowsum=False,
             )
             unmasked_loop = _format_resident_causal_loop(
-                "flash_kv_unmask_iter",
-                f"flash_m_tile{stage}",
-                (
-                    f"\n            flash_kv = flash_m_tile{stage} - "
-                    "cutlass.Int32(1) - flash_kv_unmask_iter"
-                ),
-                "flash_kv_unmask_iter >= cutlass.Int32(0)",
+                unmasked_segment,
                 unmasked_score_load,
                 unmasked_rowmax,
-                publish_rowsum=True,
-                known_not_first=True,
             )
             return f"""{fa4_entry_stat_acquire}        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
 {masked_loop}
-{unmasked_loop}"""
+{unmasked_loop}
+{corr_publish_rowsum}"""
         post_p_stat_acquire = (
-            "" if use_dense_resident_value_graph else fa4_post_p_stat_acquire.rstrip()
+            ""
+            if dense_resident_value_graph_candidate
+            else fa4_post_p_stat_acquire.rstrip()
         )
-        row_sum_update = (
+        statistics_update = (
             "            flash_s_corr_prod_phase ^= 1"
-            if use_dense_resident_value_graph
-            else "            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum"
+            if dense_resident_value_graph_candidate
+            else _FLASH_ONLINE_STATISTICS_UPDATE
+        )
+        iteration = _FlashOnlineSoftmaxIteration(
+            load_and_reduce=f"""            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+{sp_score_load}
+{sp_rowmax}""",
+            alpha_pre_probability=_sp_alpha_pre,
+            alpha_publish_pre_probability=sp_alpha_publish_pre,
+            probability_update=sp_exp_block,
+            alpha_post_probability=_sp_alpha_post,
+            alpha_publish_post_probability=sp_alpha_publish_post,
+            statistics_acquire=post_p_stat_acquire,
+            statistics_update=statistics_update,
+            post_statistics=sp_p_store_block,
+        )
+        loop = _format_fa4_online_softmax_loop(
+            softmax_segment,
+            iteration,
+            stage=stage,
+            wait_hint=cfg.wait_hint,
         )
         return f"""{
             fa4_entry_stat_acquire
         }        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-        for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{
-            softmax_actual_kv
-        }
-            {_softmax_wait_s_ready(stage)}
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
-{sp_score_load}
-{sp_rowmax}
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{_sp_alpha_pre}
-{sp_alpha_publish_pre}
-{sp_exp_block}
-{_softmax_release_p_ready(stage)}
-{_sp_alpha_post}
-{sp_alpha_publish_post}
-{post_p_stat_acquire}
-{row_sum_update}
-{sp_p_store_block}
-{final_corr_publish_rowsum}"""
+{loop}
+{corr_publish_rowsum}"""
 
     softmax0_setup = (
         _tmem_softmax_setup_stage("0")
@@ -10486,7 +10529,7 @@ if warp_idx == 15:
         f"{corr_stage1}\n{corr_stage0}"
         if (
             cfg.exp2_packet == _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
-            and not use_dense_resident_value_graph
+            and not acknowledged_stat_pipeline
         )
         else f"{corr_stage0}\n{corr_stage1}"
     )

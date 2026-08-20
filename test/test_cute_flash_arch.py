@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import ast
+import dataclasses
+from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 import pytest
+import torch
 
+from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_tuning
+from helion._compiler.cute.attention_plan import dense_score_plan
 from helion._compiler.cute.flash_arch import FlashHardwareCapabilities
 from helion._compiler.cute.flash_policy import FlashTargetPolicy
 from helion._compiler.cute.flash_policy import flash_target_policy_cache_identity
@@ -17,6 +25,9 @@ from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._compiler.cute.flash_tuning import FlashTuningDType
 from helion._compiler.cute.flash_tuning import FlashTuningPolicy
 from helion._compiler.cute.flash_tuning import FlashTuningWorkload
+
+if TYPE_CHECKING:
+    from helion._compiler.device_function import DeviceFunction
 
 
 def test_sm103_flash_target_policy() -> None:
@@ -47,12 +58,24 @@ def test_sm103_flash_target_policy() -> None:
         )
         is None
     )
+    bfloat_dense_policy = FlashDenseTuningPolicy(
+        512,
+        "1x1",
+        "8/2",
+        0,
+        0,
+        "ring2",
+        pipeline_family="fa4_2cta",
+        kv_stage=3,
+        rescale_threshold=0,
+    )
     bfloat_tuning = FlashTuningPolicy(
         workload=FlashTuningWorkload(
             head_dim=128,
             dtype=FlashTuningDType.BFLOAT16,
         ),
         tmem_row_reduce_min_kv=512,
+        dense_policies=(bfloat_dense_policy,),
     )
     multi_workload_policy = FlashTargetPolicy(
         hardware=capabilities,
@@ -63,6 +86,43 @@ def test_sm103_flash_target_policy() -> None:
     assert (
         multi_workload_policy.tuning_for_cute(128, "cutlass.BFloat16") is bfloat_tuning
     )
+    with patch.object(
+        cute_flash, "get_flash_target_policy", return_value=multi_workload_policy
+    ):
+        bfloat_seed = cute_flash.flash_attention_seed_config(
+            128,
+            512,
+            dtype=torch.bfloat16,
+            standard_dense_output=True,
+            target_device_capability=(10, 3),
+        )
+    assert bfloat_seed is not None
+    bfloat_config = cute_flash.resolve_flash_config(
+        128,
+        512,
+        bfloat_seed.config,
+        dtype=torch.bfloat16,
+        is_causal=False,
+        standard_dense_output=True,
+    )
+    with patch.object(
+        cute_flash, "get_flash_target_policy", return_value=multi_workload_policy
+    ):
+        bfloat_body = cute_flash.emit_flash_fa4_device_body(
+            cast("DeviceFunction", None),
+            head_dim=128,
+            num_kv=512,
+            sequence_extent=65_536,
+            num_bh=64,
+            total_tiles=8192,
+            cfg=bfloat_config,
+            has_lse=False,
+            io_dtype="cutlass.BFloat16",
+            score_plan=dense_score_plan(128),
+            target_device_capability=(10, 3),
+        )
+    bfloat_source = ast.unparse(ast.Module(body=bfloat_body, type_ignores=[]))
+    assert "LdRed32x32bOp" in bfloat_source
     with patch(
         "helion._compiler.cute.flash_policy.get_flash_target_policy",
         return_value=multi_workload_policy,
@@ -70,19 +130,15 @@ def test_sm103_flash_target_policy() -> None:
         bfloat_identity = flash_target_policy_cache_identity(
             (10, 3), head_dim=128, torch_dtype="bfloat16", num_kv=512
         )
-    changed_bfloat_policy = FlashTargetPolicy(
-        hardware=capabilities,
-        tuning=policy,
-        additional_tunings=(
-            FlashTuningPolicy(
-                workload=bfloat_tuning.workload,
-                tmem_row_reduce_min_kv=1024,
-            ),
-        ),
+    changed_bfloat_tuning = dataclasses.replace(
+        bfloat_tuning,
+        tmem_row_reduce_min_kv=1024,
     )
     with patch(
         "helion._compiler.cute.flash_policy.get_flash_target_policy",
-        return_value=changed_bfloat_policy,
+        return_value=dataclasses.replace(
+            multi_workload_policy, additional_tunings=(changed_bfloat_tuning,)
+        ),
     ):
         changed_bfloat_identity = flash_target_policy_cache_identity(
             (10, 3), head_dim=128, torch_dtype="bfloat16", num_kv=512
@@ -99,6 +155,7 @@ def test_sm103_flash_target_policy() -> None:
             "fa4_2cta",
             6,
             False,
+            8.0,
             FlashPackedExp2Mode.DISABLED,
             7,
             FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
@@ -114,6 +171,7 @@ def test_sm103_flash_target_policy() -> None:
             "fa4_2cta",
             6,
             False,
+            8.0,
             FlashPackedExp2Mode.DISABLED,
             7,
             FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
@@ -129,6 +187,7 @@ def test_sm103_flash_target_policy() -> None:
             "fa4_2cta",
             6,
             False,
+            8.0,
             FlashPackedExp2Mode.DISABLED,
             7,
             FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
@@ -144,6 +203,7 @@ def test_sm103_flash_target_policy() -> None:
             "fa4_2cta",
             6,
             False,
+            8.0,
             FlashPackedExp2Mode.ALL_XU,
             7,
             FlashSoftmaxLowering.STANDARD,
@@ -164,6 +224,7 @@ def test_sm103_flash_target_policy() -> None:
             shape.pipeline_family,
             shape.kv_stage,
             shape.persistent,
+            shape.rescale_threshold,
             shape.packed_exp2_mode,
             shape.probability_log2_shift,
             shape.softmax_lowering,
@@ -280,10 +341,28 @@ def test_flash_policy_rejects_invalid_field_combinations() -> None:
         FlashTargetPolicy(additional_tunings=(FlashTuningPolicy(),))
     with pytest.raises(ValueError, match="TMEM row-reduce minimum KV size"):
         FlashTuningPolicy(tmem_row_reduce_min_kv=0)
-    with pytest.raises(ValueError, match="probability log2 shift"):
-        FlashDenseTuningPolicy(
-            256, "1x1", "8/2", 0, 0, "single", probability_log2_shift=-1
-        )
+    for shift in (-1, 1.5, float("nan"), True):
+        with pytest.raises(ValueError, match="probability log2 shift"):
+            FlashDenseTuningPolicy(
+                256,
+                "1x1",
+                "8/2",
+                0,
+                0,
+                "single",
+                probability_log2_shift=cast("int", shift),
+            )
+    for threshold in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="rescale threshold must be finite"):
+            FlashDenseTuningPolicy(
+                256,
+                "1x1",
+                "8/2",
+                0,
+                0,
+                "single",
+                rescale_threshold=threshold,
+            )
     with pytest.raises(ValueError, match="register counts must be set together"):
         FlashDenseTuningPolicy(
             512,
@@ -314,7 +393,13 @@ def test_flash_policy_rejects_invalid_field_combinations() -> None:
         )
     with pytest.raises(ValueError, match="role map"):
         FlashCausalTuningPolicy(512, 8, role_map="unknown")
-    with pytest.raises(ValueError, match="unsupported for dense"):
+    with pytest.raises(ValueError, match="unsupported causal softmax lowering"):
+        FlashCausalTuningPolicy(
+            512,
+            8,
+            softmax_lowering=cast("FlashSoftmaxLowering", "standard"),
+        )
+    with pytest.raises(ValueError, match="unsupported dense softmax lowering"):
         FlashDenseTuningPolicy(
             256,
             "1x1",
@@ -323,6 +408,26 @@ def test_flash_policy_rejects_invalid_field_combinations() -> None:
             0,
             "single",
             softmax_lowering=FlashSoftmaxLowering.STATEFUL,
+        )
+    with pytest.raises(ValueError, match="unsupported dense softmax lowering"):
+        FlashDenseTuningPolicy(
+            256,
+            "1x1",
+            "8/2",
+            0,
+            0,
+            "single",
+            softmax_lowering=cast("FlashSoftmaxLowering", "standard"),
+        )
+    with pytest.raises(ValueError, match="unsupported dense packed exp2 mode"):
+        FlashDenseTuningPolicy(
+            256,
+            "1x1",
+            "8/2",
+            0,
+            0,
+            "single",
+            packed_exp2_mode=cast("FlashPackedExp2Mode", "disabled"),
         )
     with pytest.raises(ValueError, match="single statistics transport"):
         FlashDenseTuningPolicy(
@@ -333,6 +438,38 @@ def test_flash_policy_rejects_invalid_field_combinations() -> None:
             0,
             "ring2",
             softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+        )
+    with pytest.raises(ValueError, match="nonpersistent fa4_2cta"):
+        FlashDenseTuningPolicy(
+            256,
+            "deg1_8x2_corr10",
+            "8/2",
+            0,
+            0,
+            "single",
+            pipeline_family="fa4",
+            softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+        )
+    with pytest.raises(ValueError, match="degree-1 exp2 packet"):
+        FlashDenseTuningPolicy(
+            2048,
+            "8x2",
+            "8/2",
+            0,
+            0,
+            "single_final",
+            packed_exp2_mode=FlashPackedExp2Mode.ALL_XU,
+        )
+    with pytest.raises(ValueError, match="exceed fp16 range"):
+        FlashDenseTuningPolicy(
+            2048,
+            "deg1_16x8",
+            "16/8",
+            0,
+            0,
+            "single_final",
+            probability_log2_shift=8,
+            packed_exp2_mode=FlashPackedExp2Mode.ALL_XU,
         )
     with pytest.raises(ValueError, match="descending split loop"):
         FlashCausalTuningPolicy(
@@ -359,8 +496,8 @@ def test_target_policy_rejects_tuning_without_hardware_support() -> None:
                 dense_policies=(
                     FlashDenseTuningPolicy(
                         256,
-                        "1x1",
-                        "8/2",
+                        "deg1_16x8",
+                        "16/8",
                         0,
                         0,
                         "single",
@@ -413,6 +550,47 @@ def test_target_policy_rejects_tuning_without_hardware_support() -> None:
                 ),
             ),
         )
+    FlashTargetPolicy(
+        hardware=FlashHardwareCapabilities(supports_tmem_row_reduce=True),
+        tuning=FlashTuningPolicy(
+            workload=FlashTuningWorkload(
+                head_dim=128,
+                dtype=FlashTuningDType.BFLOAT16,
+            ),
+            tmem_row_reduce_min_kv=256,
+        ),
+    )
+    with pytest.raises(ValueError, match="FP16 head-dim-64"):
+        FlashTargetPolicy(
+            tuning=FlashTuningPolicy(
+                workload=FlashTuningWorkload(
+                    head_dim=128,
+                    dtype=FlashTuningDType.BFLOAT16,
+                ),
+                causal_policies=(FlashCausalTuningPolicy(512, 8),),
+            )
+        )
+    with pytest.raises(ValueError, match="FP16 head-dim-64"):
+        FlashTargetPolicy(
+            tuning=FlashTuningPolicy(
+                workload=FlashTuningWorkload(
+                    head_dim=128,
+                    dtype=FlashTuningDType.BFLOAT16,
+                ),
+                dense_policies=(
+                    FlashDenseTuningPolicy(
+                        512,
+                        "1x1",
+                        "8/2",
+                        0,
+                        0,
+                        "ring2",
+                        pipeline_family="fa4_tma_4d",
+                        rescale_threshold=0,
+                    ),
+                ),
+            )
+        )
 
     FlashTargetPolicy(
         hardware=FlashHardwareCapabilities(
@@ -424,8 +602,8 @@ def test_target_policy_rejects_tuning_without_hardware_support() -> None:
             dense_policies=(
                 FlashDenseTuningPolicy(
                     256,
-                    "1x1",
-                    "8/2",
+                    "deg1_16x8",
+                    "16/8",
                     0,
                     0,
                     "single",
@@ -440,4 +618,36 @@ def test_target_policy_rejects_tuning_without_hardware_support() -> None:
                 ),
             ),
         ),
+    )
+
+
+def test_flash_policy_choice_tables_match_codegen_schema() -> None:
+    assert (
+        frozenset(cute_flash.FLASH_PIPELINE_FAMILY_FLAGS)
+        == flash_tuning._FLASH_POLICY_PIPELINE_FAMILIES
+    )
+    assert (
+        frozenset(
+            (
+                *cute_flash._FLASH_EXP2_PACKET_PARAMS,
+                *cute_flash._FLASH_MANUAL_EXP2_PACKET_PARAMS,
+            )
+        )
+        == flash_tuning._FLASH_POLICY_EXP2_PACKETS
+    )
+    assert (
+        frozenset(cute_flash._FLASH_EXP2_PACKET_PARAMS)
+        == flash_tuning._FLASH_POLICY_BASE_EXP2_PACKETS
+    )
+    assert (
+        cute_flash._FLASH_DEG1_EXP2_PACKETS
+        == flash_tuning._FLASH_POLICY_DEGREE1_EXP2_PACKETS
+    )
+    assert (
+        frozenset(
+            family
+            for family, flags in cute_flash.FLASH_PIPELINE_FAMILY_FLAGS.items()
+            if flags.tensor_4d_tma
+        )
+        == flash_tuning._FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES
     )

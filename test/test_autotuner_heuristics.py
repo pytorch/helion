@@ -2804,6 +2804,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 dataclasses.replace(
                     policy,
                     softmax_lowering=FlashSoftmaxLowering.STANDARD,
+                    probability_log2_shift=0,
                 )
                 if policy.num_kv == 1024
                 else policy
