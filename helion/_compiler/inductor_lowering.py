@@ -395,7 +395,14 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                if (
+                    fake_val.ndim < ndim
+                    and fake_val.ndim > 0
+                    and CompileEnvironment.current().backend.name != "flydsl"
+                ):
+                    # FlyDSL per-thread vectors carry the tile/row axis
+                    # implicitly, so a Triton-style [None, :] broadcast-expand
+                    # is both unsupported and unnecessary -- skip it.
                     expand = tile_strategy.broadcast_expand_dims(
                         tuple(fake_val.shape), output_shape
                     )
@@ -1100,6 +1107,17 @@ class GenerateASTFromInductor(DefaultHandler):
         backend = CompileEnvironment.current().backend
         return backend.cast_ast(x, target_dtype)
 
+    def _cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        # Cast a raw scalar (possibly a bare Python literal lifted from an index
+        # expr) to ``target_dtype``. Backends whose value-cast syntax assumes a
+        # wrapped runtime object (flydsl's ``x.to(dtype)``) provide a scalar-safe
+        # ``cast_scalar_ast``; others just use ``cast_ast``.
+        backend = CompileEnvironment.current().backend
+        cast_scalar = getattr(backend, "cast_scalar_ast", None)
+        if cast_scalar is not None:
+            return cast_scalar(x, target_dtype)
+        return backend.cast_ast(x, target_dtype)
+
     def _to_ast(self, x: object) -> ast.AST:
         if isinstance(x, ast.AST):
             return x
@@ -1321,7 +1339,7 @@ class GenerateASTFromInductor(DefaultHandler):
         if name in self.cg.device_function._constexpr_args:
             return name
 
-        return self._lift(self._create_cast_expr(expr_from_string(name), dtype))
+        return self._lift(self._cast_scalar_ast(expr_from_string(name), dtype))
 
 
 def _unpack_opsvalue(value: object) -> str:
