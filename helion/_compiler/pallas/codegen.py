@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 
     from helion._compiler.aten_lowering import LoweringContext
     from helion._compiler.inductor_lowering import CodegenState
+    from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
+    from helion._compiler.tile_strategy import ForiLoopState
 
 
 def _load_route(
@@ -42,14 +44,25 @@ def load_expr(
     tensor: torch.Tensor,
 ) -> ast.AST:
     """Emit a normal Pallas load or a selected TensorCore gather."""
+    from helion import exc
+    from helion._compiler.pallas.dma import emit_grid_indirect_transfer
     from helion._compiler.pallas.gather import emit_gather
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import DmaGatherPlan
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
     arg_name, active_name, patterns = _load_route(state, tensor)
     device_fn = state.device_function
     assert state.fx_node is not None
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, DmaGatherPlan):
+        dma_ref = memory_op_dma_scratch(state)
+        if dma_ref is None:
+            raise exc.InvalidConfig(
+                "indirect DMA load was not admitted by the active scheduler"
+            )
+        emit_grid_indirect_transfer(state, plan, arg_name)
+        return expr_from_string(f"{dma_ref}[...]")
     if isinstance(plan, OneHotGatherPlan):
         return emit_gather(state, plan.plan, active_name)
 
@@ -160,7 +173,9 @@ def resident_ref_load_expr(
     """Keep a proven direct VMEM load as a Pallas Ref."""
     from helion import exc
     from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.pallas.dma import emit_grid_indirect_transfer
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import DmaGatherPlan
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
     arg_name, name, _patterns = _load_route(state, tensor)
@@ -168,8 +183,18 @@ def resident_ref_load_expr(
 
     assert state.fx_node is not None
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, DmaGatherPlan):
+        dma_ref = memory_op_dma_scratch(state)
+        if dma_ref is None:
+            raise exc.InvalidConfig(
+                "resident Ref indirect gather was not admitted by a DMA scheduler"
+            )
+        emit_grid_indirect_transfer(state, plan, arg_name)
+        return expr_from_string(dma_ref)
     if isinstance(plan, OneHotGatherPlan):
-        raise exc.InvalidConfig("resident Ref cannot follow an indirect gather")
+        raise exc.InvalidConfig(
+            "resident Ref indirect gather requires the indirect DMA access mode"
+        )
     parts, none_dims = index_parts(state, subscript, tensor)
     if none_dims or len(parts) != tensor.ndim:
         raise exc.InvalidConfig("resident Ref producer must preserve rank")
@@ -1081,3 +1106,46 @@ def vmem_name(state: CodegenState, name: str) -> str:
     if isinstance(loop, ForiLoopState) and name in loop._prefetched_load_tensors:
         return f"{ref}.at[{loop.loop_var_name} % 2]"
     return ref
+
+
+def _memory_op_fori_binding(
+    state: CodegenState,
+) -> tuple[ForiLoopState, DmaResources] | None:
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    node = state.fx_node
+    if node is None:
+        return None
+    seen: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in reversed(loops):
+            if id(loop) in seen or not isinstance(loop, ForiLoopState):
+                continue
+            seen.add(id(loop))
+            binding = loop._memory_op_to_dma_scratch.get(node)
+            if binding is not None:
+                return loop, binding
+    return None
+
+
+def memory_op_dma_scratch(state: CodegenState) -> str | None:
+    """Return this memory operation's scheduler-owned VMEM stage, if any."""
+    found = _memory_op_fori_binding(state)
+    if found is not None:
+        loop, resources = found
+        stage = (
+            None
+            if resources.buffer_count == 1
+            else f"{loop.loop_var_name} % {resources.buffer_count}"
+        )
+        return resources.scratch_ref(stage)
+    resources = grid_memory_op_dma_binding(state)
+    return resources.scratch if resources is not None else None
+
+
+def grid_memory_op_dma_binding(state: CodegenState) -> DmaResources | None:
+    """Return this root-grid memory operation's DMA resources."""
+    node = state.fx_node
+    if node is None:
+        return None
+    return state.device_function.pallas_grid_dma_bindings.get(node)

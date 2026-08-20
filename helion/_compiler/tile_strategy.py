@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from .inductor_lowering import CodegenState
+    from .pallas.dma import DmaResources
 
     _T = TypeVar("_T")
     SymIntLike = torch.SymInt | int
@@ -1883,6 +1884,9 @@ class ForiLoopState(DeviceLoopOrGridState):
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
     _prefetched_load_tensors: set[str] = dataclasses.field(default_factory=set)
+    _memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass

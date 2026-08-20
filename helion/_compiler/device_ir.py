@@ -86,6 +86,7 @@ from .type_info import _eval_unary
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..autotuner.config_spec import AccumulatorFact
@@ -362,6 +363,51 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         finally:
             # pyrefly: ignore [missing-attribute]
             state.codegen._cute_active_graph_info = None
+
+
+def control_flow_parent_entries(
+    graphs: Sequence[GraphInfo],
+) -> dict[int, tuple[torch.fx.Node, int]]:
+    """Map child graph IDs to their parent call and captured-argument slot."""
+    result: dict[int, tuple[torch.fx.Node, int]] = {}
+    for info in graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or not node.args:
+                continue
+            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
+                node.args[0], int
+            ):
+                result[node.args[0]] = (node, 3)
+            elif node.target is _tracing_ops._if and len(node.args) >= 5:
+                if isinstance(node.args[1], int):
+                    result[node.args[1]] = (node, 3)
+                if isinstance(node.args[2], int):
+                    result[node.args[2]] = (node, 4)
+    return result
+
+
+def device_loop_bounds(
+    info: GraphInfo,
+    parents: Mapping[int, torch.fx.Node],
+    block_id: int,
+) -> tuple[object, object] | None:
+    """Return one device loop's traced begin/end values for ``block_id``."""
+    parent = parents.get(info.graph_id)
+    if (
+        not isinstance(info, ForLoopGraphInfo)
+        or parent is None
+        or block_id not in info.block_ids
+    ):
+        return None
+    begins, ends = parent.args[1:3]
+    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
+        return None
+    position = info.block_ids.index(block_id)
+
+    def value(item: object) -> object:
+        return item.meta.get("val") if isinstance(item, torch.fx.Node) else item
+
+    return value(begins[position]), value(ends[position])
 
 
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
@@ -3918,6 +3964,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
             )
+        if config_spec.supports_config_key("pallas_indirect_access_mode"):
+            from .pallas.tensorcore_plan import indirect_access_modes
+
+            config_spec.pallas_indirect_access_modes = indirect_access_modes(device_ir)
         load_count = sum(f.kind == "load" for f in memory_op_facts)
         _register_load_store_tunables(
             load_count,

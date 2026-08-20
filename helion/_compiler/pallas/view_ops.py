@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
+    from .tensorcore_plan import DmaGatherPlan
 
 
 RESIDENT_PLAN_META = "pallas_resident_ref_plan"
@@ -181,23 +182,12 @@ def _capture_edges(
     dict[torch.fx.Node, torch.fx.Node],
 ]:
     """Build parent and capture links on the current per-config graph copies."""
+    from ..device_ir import control_flow_parent_entries
+
     # TODO(jansel): Reuse NodeArgsGraphInfo.node_args for capture edges once kwargs()
     # remaps those nodes into per-config graph copies (see the TODO in device_ir.py).
     # Until then, reconstruct the links from the copied parent calls below.
-    parent_args: dict[int, tuple[torch.fx.Node, int]] = {}
-    for info in graphs:
-        for node in info.graph.nodes:
-            if node.op != "call_function" or not node.args:
-                continue
-            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
-                node.args[0], int
-            ):
-                parent_args[node.args[0]] = (node, 3)
-            elif node.target is _tracing_ops._if and len(node.args) >= 5:
-                if isinstance(node.args[1], int):
-                    parent_args[node.args[1]] = (node, 3)
-                if isinstance(node.args[2], int):
-                    parent_args[node.args[2]] = (node, 4)
+    parent_args = control_flow_parent_entries(graphs)
 
     captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]] = {}
     for info in graphs:
@@ -252,37 +242,17 @@ def _mutated_storage_ids(graphs: list[GraphInfo]) -> set[int]:
     return mutated_storages
 
 
-def _loop_bounds(
-    info: GraphInfo,
-    parents: dict[int, torch.fx.Node],
-    block_id: int,
-) -> tuple[object, object] | None:
-    from ..device_ir import ForLoopGraphInfo
-
-    entry = parents.get(info.graph_id)
-    if (
-        not isinstance(info, ForLoopGraphInfo)
-        or entry is None
-        or block_id not in info.block_ids
-    ):
-        return None
-    parent = entry
-    position = info.block_ids.index(block_id)
-    begins, ends = parent.args[1:3]
-    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
-        return None
-    return _node_value(begins[position]), _node_value(ends[position])
-
-
 def _enclosing_loop_bounds(
     info: GraphInfo,
     parents: dict[int, torch.fx.Node],
     graph_infos: dict[torch.fx.Graph, GraphInfo],
     block_id: int,
 ) -> tuple[object, object] | None:
+    from ..device_ir import device_loop_bounds
+
     seen: set[torch.fx.Graph] = set()
     while True:
-        if (bounds := _loop_bounds(info, parents, block_id)) is not None:
+        if (bounds := device_loop_bounds(info, parents, block_id)) is not None:
             return bounds
         assert info.graph not in seen, "cycle while resolving an enclosing tile loop"
         seen.add(info.graph)
@@ -330,6 +300,15 @@ def _physical_shape(
     return cast("tuple[int, ...]", shape) if None not in shape else None
 
 
+def _indirect_dma_plan(producer: torch.fx.Node) -> DmaGatherPlan | None:
+    """Return the selected indirect DMA plan, if present."""
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+    from .tensorcore_plan import DmaGatherPlan
+
+    plan = producer.meta.get(TENSORCORE_PLAN_META)
+    return plan if isinstance(plan, DmaGatherPlan) else None
+
+
 def _root_variants(
     producer: torch.fx.Node,
     graph_info: GraphInfo,
@@ -361,6 +340,18 @@ def _root_variants(
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} has unsupported indices"
         )
+
+    dma_plan = _indirect_dma_plan(producer)
+    if dma_plan is not None:
+        shape = _physical_shape(value, context.config, 1)
+        expected = dma_plan.transfer_shape
+        if shape is None or shape != expected:
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the indirect DMA source load at {location} has physical shape "
+                f"{shape}, expected {expected}",
+            )
+        return (_ResidentVariant(1, shape, (), None),)
     if isinstance(producer.meta.get(TENSORCORE_PLAN_META), OneHotGatherPlan):
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} uses an indirect gather"
@@ -386,7 +377,9 @@ def _root_variants(
     # the loaded Ref remains guarded until a selector proves it uses the exact live
     # extent of this source block.
     full_loop = False
-    bounds = _loop_bounds(graph_info, context.parents, outer_block_id)
+    from ..device_ir import device_loop_bounds
+
+    bounds = device_loop_bounds(graph_info, context.parents, outer_block_id)
     if bounds is not None:
         start, end = bounds
         env = CompileEnvironment.current()
@@ -837,7 +830,6 @@ def _registered_transform(
             output = _reshape_variants(node, context.config, variants)
             return _ResidentTransform(output, None)
         return _selector(node, graph_info, variants, context)
-
     if node.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
         output = _reshape_variants(node, context.config, variants)
         return _ResidentTransform(output, None)
@@ -885,6 +877,39 @@ def _effective_users(
         for placeholder, _parent in edges:
             stack.append((placeholder, (*transports, placeholder)))
     return results
+
+
+def indirect_loads_requiring_resident_refs(
+    graphs: list[GraphInfo],
+) -> set[torch.fx.Node]:
+    """Find indirect loads whose resident view chains narrow their result."""
+    captures, _parents, _placeholder_to_outer = _capture_edges(graphs)
+    required: set[torch.fx.Node] = set()
+    for info in graphs:
+        for producer in info.graph.find_nodes(op="call_function", target=load):
+            indices = producer.args[1] if len(producer.args) > 1 else None
+            if not isinstance(indices, (list, tuple)) or not any(
+                isinstance(index, torch.fx.Node)
+                and isinstance(index.meta.get("val"), torch.Tensor)
+                for index in indices
+            ):
+                continue
+            seen: set[torch.fx.Node] = set()
+            stack = [producer]
+            while stack and producer not in required:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                for user, _transports in _effective_users(current, captures):
+                    if user.target is subscript:
+                        if _narrowed_dims(user.args[1]):
+                            required.add(producer)
+                            break
+                        stack.append(user)
+                    elif user.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
+                        stack.append(user)
+    return required
 
 
 def _record_descendant_failure(
@@ -1050,11 +1075,13 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
     for info in graphs:
         for producer in info.graph.find_nodes(op="call_function", target=load):
             tensor = _node_value(producer.args[0])
+            dma_plan = _indirect_dma_plan(producer)
             # Keeping a Ref defers the physical read until its consumer. A device
             # write through an alias could therefore change program semantics.
             if (
                 isinstance(tensor, torch.Tensor)
                 and id(tensor.untyped_storage()) in mutated_storages
+                and dma_plan is None
             ):
                 _record_descendant_failure(
                     producer,
