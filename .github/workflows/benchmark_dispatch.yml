@@ -181,10 +181,10 @@ jobs:
       id-token: write
       contents: read
     with:
-      runner: linux.rocm.gpu.ecosystem.gfx950.1
+      runner: linux.rocm.gpu.ecosystem.mi350.1
       python-version: "3.12"
-      image: rocm/dev-ubuntu-24.04:7.1.1-complete
-      runtime-version: rocm7.1
+      image: rocm/dev-ubuntu-24.04:7.14.0-full
+      runtime-version: rocm7.14
       # TorchInductor 2.11 keeps benchmark-only ROCm modules loaded; Welford
       # 8192 exhausts the container's 1024-file limit with 1002 open HSACO files.
       container-options: --device=/dev/kfd --device=/dev/dri --ulimit nofile=65536:65536

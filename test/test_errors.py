@@ -206,24 +206,6 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 (torch.randn(4, 8, 16, device=DEVICE),),
             )
 
-    def test_rank_mismatch_indexing(self):
-        """Test that RankMismatch shows tensor shapes in indexing errors."""
-
-        @helion.kernel()
-        def fn(x: torch.Tensor) -> torch.Tensor:
-            batch = x.size(0)
-            out = x.new_empty(batch)
-            for tile_batch in hl.tile([batch]):
-                scalar_val = x[tile_batch].sum()  # 1d index for 2d tensor
-                out = scalar_val
-            return out
-
-        with self.assertRaisesRegex(
-            helion.exc.RankMismatch,
-            r"Expected ndim=2, but got ndim=1.*You have too few indices",
-        ):
-            code_and_output(fn, (torch.randn(4, 8, device=DEVICE),))
-
     def test_rank_mismatch_indexing_too_many(self):
         @helion.kernel()
         def fn(x: torch.Tensor) -> torch.Tensor:

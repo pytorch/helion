@@ -1497,22 +1497,22 @@ class GraphInterpreter(LoweringContext, Interpreter):
             ):
                 try:
                     cute_state = self.cg.device_function.cute_state
-                    if cute_state.has_tcgen05_pair_epilogue_plan:
-                        if cute_state.is_deferred_tcgen05_pair_epilogue_node(n):
-                            n.meta["codegen"] = _DEFERRED_TCGEN05_PAIR_EPILOGUE
-                            return _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                    if cute_state.has_tcgen05_fragment_epilogue_plan:
+                        if cute_state.is_deferred_tcgen05_fragment_epilogue_node(n):
+                            n.meta["codegen"] = _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+                            return _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
                         if (
                             any(
                                 self.env.get(input_node)
-                                is _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                                is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
                                 for input_node in n.all_input_nodes
                             )
-                            and cute_state.tcgen05_pair_epilogue_plan_for_store(n)
+                            and cute_state.tcgen05_fragment_epilogue_plan_for_store(n)
                             is None
                         ):
                             raise exc.BackendUnsupported(
                                 "cute",
-                                "deferred tcgen05 pair epilogue escaped its "
+                                "deferred tcgen05 fragment epilogue escaped its "
                                 "committed store",
                             )
                     lowering: Lowering = n.meta["lowering"]
@@ -1571,11 +1571,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
         return super().run_node(n)
 
 
-_DEFERRED_TCGEN05_PAIR_EPILOGUE = object()
+_DEFERRED_TCGEN05_FRAGMENT_EPILOGUE = object()
 
 
-def is_deferred_tcgen05_pair_epilogue(value: object) -> bool:
-    return value is _DEFERRED_TCGEN05_PAIR_EPILOGUE
+def is_deferred_tcgen05_fragment_epilogue(value: object) -> bool:
+    return value is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
 
 
 def codegen_call_with_graph(

@@ -48,6 +48,9 @@ KERNELS = [
     "scale_mm_cute",
     "nvfp4_gemv",
     "nvfp4_gemv_cute",
+    # B200 tcgen05 register-fragment epilogues.
+    "projection_rotary",
+    "interleaved_swiglu",
     "cross_entropy",
     # Ported from vLLM (vllm/kernels/helion/ops); torch-native baselines.
     "silu_mul_fp8",

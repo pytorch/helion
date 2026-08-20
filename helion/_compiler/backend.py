@@ -3030,7 +3030,7 @@ def _analyzed_specialized_mma_plan(
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import _mma_tiles_are_static_full
     from .cute.cute_mma import analyze_cute_mma_node
-    from .cute.cute_mma import ensure_tcgen05_pair_epilogue_plan
+    from .cute.cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
     candidate = analyze_cute_mma_node(node)
     if (
@@ -3061,7 +3061,7 @@ def _analyzed_specialized_mma_plan(
     )
     if mma_impl == "universal":
         return None
-    if mma_impl == "tcgen05" and not ensure_tcgen05_pair_epilogue_plan(
+    if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
         fn,
         node,
         candidate,

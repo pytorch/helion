@@ -263,7 +263,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import analyze_cute_mma_node
-    from .cute_mma import ensure_tcgen05_pair_epilogue_plan
+    from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
     if _detect_grouped_rank3_specialized_mma_loop(
         fn,
@@ -341,7 +341,7 @@ def _detect_specialized_mma_loop(
             root_m_threads=root_m_threads,
             root_n_threads=root_n_threads,
         ):
-            if mma_impl == "tcgen05" and not ensure_tcgen05_pair_epilogue_plan(
+            if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
                 fn,
                 node,
                 candidate,
@@ -1147,6 +1147,10 @@ class CuteBackend(Backend):
             "_cute_gelu_erf_exact_f32x2": (
                 "from helion._compiler.cute.epilogue_helpers import "
                 "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2"
+            ),
+            "_cute_sigmoid_approx_ftz_f32": (
+                "from helion._compiler.cute.epilogue_helpers import "
+                "sigmoid_approx_ftz_f32 as _cute_sigmoid_approx_ftz_f32"
             ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",

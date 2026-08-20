@@ -35,6 +35,8 @@ pretuned_kernels/
 ├── grouped_gemm_deepgemm/            # B200 grouped BF16 vs DeepGEMM + cuBLAS
 ├── nvfp4_gemv/                       # B200 Triton NVFP4 (W4A4 / W4A16) decode GEMV
 ├── nvfp4_gemv_cute/                  # B200 Helion CuTe NVFP4 decode GEMV
+├── projection_rotary/                # B200 CuTe projection + rotary fragment epilogue
+├── interleaved_swiglu/               # B200 CuTe projection + compact SwiGLU epilogue
 ├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
 ├── dynamic_per_token_scaled_fp8_quant/
 ├── per_token_group_fp8_quant/
@@ -61,6 +63,8 @@ At runtime Helion picks the file matching the current GPU.
 | `grouped_gemm_deepgemm` | Eight official DeepGEMM BF16 grouped-NT shapes with deterministic heterogeneous per-group M (B200 CuTe only) | pinned DeepGEMM `m_grouped_bf16_gemm_nt_contiguous` + CUDA's `cublasGemmGroupedBatchedEx` |
 | `nvfp4_gemv` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes (Llama-3 / Qwen projections), W4A4 + W4A16 (B200 Triton backend) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
 | `nvfp4_gemv_cute` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes, W4A4 + W4A16, using Helion kernels compiled with the CuTe backend on B200 | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
+| `projection_rotary` | BF16 `(M=1024, K=4096, heads=32, D=128)` projection with fused bias and adjacent-pair rotary mixing (B200 CuTe only) | eager BF16 projection + rotary composition |
+| `interleaved_swiglu` | BF16 `(M=1024, K=4096, heads=1, packed D=11008)` projection with interleaved gate/value columns (B200 CuTe only) | eager BF16 projection + SwiGLU composition |
 | `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |
 | `dynamic_per_token_scaled_fp8_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native per-token fp8 quant |
 | `per_token_group_fp8_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native per-group fp8 quant |

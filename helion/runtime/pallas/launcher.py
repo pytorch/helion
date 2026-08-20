@@ -1338,12 +1338,12 @@ def _ensure_cpu_tpu_info() -> None:
     """
     try:
         from jax._src.pallas.mosaic.tpu_info import ChipVersion
-        from jax._src.pallas.mosaic.tpu_info import _get_tpu_info_impl
+        from jax._src.pallas.mosaic.tpu_info import get_tpu_info_for_chip
         from jax._src.pallas.mosaic.tpu_info import registry
     except ImportError:
         return
     if "cpu" not in registry:
-        registry["cpu"] = lambda: _get_tpu_info_impl(ChipVersion.TPU_7X, 1)
+        registry["cpu"] = lambda: get_tpu_info_for_chip(ChipVersion.TPU_7X, 1)
 
 
 def _pallas_apply_ds_padding(
@@ -2632,19 +2632,14 @@ def _pallas_compile_compact_jit_fn(
             # scratch_types); pass whichever this pallas exposes.
             **{_pallas_kernel_scratch_kwarg(pl): all_scratch},  # pyrefly: ignore[bad-argument-type]
             compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                # Resident caching sizes its physical window from
-                # _get_vmem_limit_bytes during backend setup.  This 128MiB
-                # floor is ONLY a Mosaic compile ceiling so TPU7x accepts that
-                # already-sized allocation; do not use it to choose C.  A
-                # streamed compact_worklist kernel keeps the platform default.
-                vmem_limit_bytes=(
-                    max(
-                        _get_vmem_limit_bytes(pltpu, _pallas_interpret_enabled()),
-                        128 * 1024 * 1024,
-                    )
-                    if ordered_aligned_arg_indices
-                    else _get_vmem_limit_bytes(pltpu, _pallas_interpret_enabled())
-                ),
+                # The device capacity is also the largest scoped-Vmem XLA will
+                # accept, so never request more: a bare kernel call is clamped
+                # down with a warning, but the same request inside a shard_map
+                # is rejected outright (INVALID_ARGUMENT; see
+                # https://openxla.org/xla/errors/error_0200).
+                # Resident caching sizes its physical window conservatively
+                # from this capacity during backend setup.
+                vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
             ),
             interpret=interpret,
         )

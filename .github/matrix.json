@@ -106,11 +106,11 @@
       "triton-pin": "5fcc14d918045eb2c866336b55229d1253d6d60c"
     },
     {
-      "runner": "linux.rocm.gpu.ecosystem.gfx950.1",
+      "runner": "linux.rocm.gpu.ecosystem.mi350.1",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "rocm/dev-ubuntu-24.04:7.0-complete",
-      "runtime-version": "rocm7.0",
+      "image": "rocm/dev-ubuntu-24.04:7.14.0-full",
+      "runtime-version": "rocm7.14",
       "container-options": "--device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0 -e ROCR_VISIBLE_DEVICES=0",
       "pytorch-version": "pytorch-nightly",
       "alias": "mi350x",

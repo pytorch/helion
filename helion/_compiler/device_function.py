@@ -268,9 +268,7 @@ class DeviceFunction:
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
         self.wrapper_only_params: list[str] = []
-        self._tensor_properties: dict[
-            tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
-        ] = {}
+        self._tensor_properties: dict[tuple[object, ...], TensorPropertyArg] = {}
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
@@ -829,8 +827,14 @@ class DeviceFunction:
         dim: int,
         prefix: str,
     ) -> _P:
-        # TODO(jansel): dedupe based on sympy expressions
-        key = (prop_cls, fake_value, dim)
+        key: tuple[object, ...] = (prop_cls, fake_value, dim)
+        if prop_cls is TensorSizeArg:
+            size = fake_value.size(dim)
+            assert isinstance(size, torch.SymInt)
+            key = (
+                prop_cls,
+                CompileEnvironment.current().shape_env.replace(size._sympy_()),
+            )
         if key not in self._tensor_properties:
             arg = self.tensor_arg(fake_value)
             prop = prop_cls(f"{arg.name}_{prefix}_{dim}", arg, dim)

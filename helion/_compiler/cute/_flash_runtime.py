@@ -24,6 +24,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blackwell_helpers as sm100_utils_flash
 
 from ._mlir_compat import ir
+from .epilogue_helpers import rcp_approx_ftz as rcp_approx_ftz
 
 
 @functools.cache
@@ -302,22 +303,6 @@ def named_barrier_wait_unaligned(
         aligned=False,
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def rcp_approx_ftz(x: object, *, loc: object = None, ip: object = None) -> Float32:
-    """FA4-style approximate reciprocal that lowers to ``rcp.approx.ftz.f32``."""
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(x).ir_value(loc=loc, ip=ip)],  # pyrefly: ignore[bad-argument-type]
-            "rcp.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
     )
 
 
