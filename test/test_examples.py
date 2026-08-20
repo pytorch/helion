@@ -2731,10 +2731,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
-    @xfailIfPallasTpu("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
-            2,
+            3,
             8,
             1,
             256,

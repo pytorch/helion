@@ -130,6 +130,109 @@ def _plan_vmem_scalar_stores(graphs: list[GraphInfo]) -> None:
                 node.meta[VMEM_SCALAR_STORE_PLAN] = plan
 
 
+def order_grid_for_shared_scalar_stores(
+    graphs: list[GraphInfo], config: Config, tile_strategy: TileStrategyDispatch
+) -> None:
+    """Keep programs updating one resident output window consecutive.
+
+    An aligned scalar RMW updates a full VMEM window. Grid dimensions omitted
+    by that tensor's BlockSpec must therefore be faster than every dimension
+    selecting the window, so each window is completed before it is flushed.
+    """
+    from ..compile_environment import CompileEnvironment
+    from ..device_function import DeviceFunction
+    from ..host_function import HostFunction
+    from .vmem_scalar_load import VMEM_SCALAR_STORE_PLAN
+    from .vmem_scalar_load import VmemScalarStorePlan
+
+    device_fn = DeviceFunction.current()
+    env = CompileEnvironment.current()
+    stores: list[tuple[torch.Tensor, VmemScalarStorePlan]] = []
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            plan = node.meta.get(VMEM_SCALAR_STORE_PLAN)
+            if not isinstance(plan, VmemScalarStorePlan):
+                continue
+            tensor_arg = node.args[0]
+            if not isinstance(tensor_arg, torch.fx.Node):
+                continue
+            tensor = tensor_arg.meta.get("val")
+            if isinstance(tensor, torch.Tensor):
+                stores.append((tensor, plan))
+
+    for grid_block_ids in HostFunction.current().device_ir.grid_block_ids:
+        if len(grid_block_ids) <= 1:
+            continue
+        strategy = tile_strategy.block_id_to_strategy.get(tuple(grid_block_ids))
+        order = getattr(strategy, "loop_order", None)
+        if not isinstance(order, list) or len(order) != len(grid_block_ids):
+            continue
+
+        grid_ids = frozenset(grid_block_ids)
+        edges: set[tuple[int, int]] = set()
+        for tensor, plan in stores:
+            tilings = device_fn.pallas_tensor_dim_tilings.get(id(tensor))
+            if tilings is None:
+                continue
+            key_ids: set[int] = set()
+            for dim, tiling in enumerate(tilings):
+                # Composite-index dimensions cannot be BlockSpec-tiled and
+                # therefore remain part of the fully resident window.
+                if not tiling.can_tile or len(tiling.block_ids) != 1:
+                    continue
+                block_id = tiling.block_ids[0]
+                if block_id not in grid_ids:
+                    continue
+                block_size = env.block_sizes[block_id].from_config(config)
+                dim_size = tensor.shape[dim]
+                if isinstance(block_size, int) and (
+                    not isinstance(dim_size, int) or dim_size > block_size
+                ):
+                    key_ids.add(block_id)
+
+            shared_ids = grid_ids - key_ids
+            if not (plan.scalar_block_ids & shared_ids):
+                continue
+            edges.update(
+                (key_id, shared_id) for key_id in key_ids for shared_id in shared_ids
+            )
+
+        if edges:
+            ordered_ids = [grid_block_ids[position] for position in order]
+            new_order = [
+                grid_block_ids.index(block_id)
+                for block_id in _stable_topological_order(ordered_ids, edges)
+            ]
+            # The original list belongs to Config; install an effective copy.
+            strategy.loop_order = new_order  # type: ignore[attr-defined]
+
+
+def _stable_topological_order(
+    order: list[int], edges: set[tuple[int, int]]
+) -> list[int]:
+    """Satisfy ordering constraints while preserving unrelated order."""
+    remaining = list(order)
+    result: list[int] = []
+    while remaining:
+        ready = next(
+            (
+                block_id
+                for block_id in remaining
+                if not any(
+                    before in remaining for before, after in edges if after == block_id
+                )
+            ),
+            None,
+        )
+        if ready is None:
+            raise exc.InvalidConfig(
+                "Pallas resident scalar stores require incompatible grid orders"
+            )
+        result.append(ready)
+        remaining.remove(ready)
+    return result
+
+
 def _tensor_origin_key(tensor: torch.Tensor) -> str | int:
     from ..host_function import HostFunction
 
