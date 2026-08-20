@@ -2745,7 +2745,11 @@ class ConfigSpec:
             from .._compiler.cute.flash_policy import flash_target_policy_cache_identity
 
             target_policy_identity = flash_target_policy_cache_identity(
-                self.target_device_capability
+                self.target_device_capability,
+                head_dim=self._cute_flash_head_dim,
+                torch_dtype=str(self._cute_flash_dtype).removeprefix("torch."),
+                num_kv=self._cute_flash_num_kv,
+                is_causal=self._cute_flash_is_causal,
             )
         if (
             self.compiler_default_config is None
