@@ -793,6 +793,7 @@ class TypePropagation(ast.NodeVisitor):
         # ellipsis expansion not yet supported for StackTensorType.
         if isinstance(value_type, TensorType):
             self._expand_ellipsis_in_subscript(node, value_type.fake_value.ndim)
+            self._pad_trailing_dims(node, value_type.fake_value.ndim)
         slice_type = self.visit(node.slice)
         return value_type.propagate_getitem(slice_type, self.origin())
 
@@ -820,14 +821,7 @@ class TypePropagation(ast.NodeVisitor):
                 "an index can only have a single ellipsis (...)"
             )
         idx = ellipsis_indices[0]
-        dims_consumed = sum(
-            1
-            for elt in sl.elts
-            if not (
-                isinstance(elt, ast.Constant)
-                and (elt.value is ... or elt.value is None)
-            )
-        )
+        dims_consumed = _count_dims_in_subscript(sl.elts)
         n_expand = ndim - dims_consumed
         if n_expand < 0:
             raise exc.TypeInferenceError(
@@ -838,6 +832,36 @@ class TypePropagation(ast.NodeVisitor):
             for _ in range(n_expand)
         ]
         sl.elts[idx : idx + 1] = slices
+
+    def _pad_trailing_dims(self, node: ast.Subscript, ndim: int) -> None:
+        sl = node.slice
+        if isinstance(sl, ast.Tuple):
+            consumed = _count_dims_in_subscript(sl.elts)
+            missing = ndim - consumed
+            if missing > 0:
+                sl.elts.extend(
+                    create(ast.Slice, lower=None, upper=None, step=None)
+                    for _ in range(missing)
+                )
+        elif not isinstance(sl, ast.Slice):
+            slice_type = self.visit(sl)
+            if isinstance(slice_type, SequenceType):
+                consumed = sum(
+                    1
+                    for t in slice_type.element_types
+                    if not (isinstance(t, LiteralType) and t.value is None)
+                )
+            elif isinstance(slice_type, LiteralType) and slice_type.value is None:
+                consumed = 0
+            else:
+                consumed = 1
+            missing = ndim - consumed
+            if missing > 0:
+                elts = [sl] + [
+                    create(ast.Slice, lower=None, upper=None, step=None)
+                    for _ in range(missing)
+                ]
+                node.slice = create(ast.Tuple, elts=elts, ctx=ast.Load())
 
     def visit_Slice(self, node: ast.Slice) -> TypeInfo:
         lower = (
@@ -1226,6 +1250,16 @@ class TypePropagation(ast.NodeVisitor):
     visit_MatchAs: _VisitMethod = _not_supported
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchOr: _VisitMethod = _not_supported
+
+
+def _count_dims_in_subscript(elts: list[ast.expr]) -> int:
+    return sum(
+        1
+        for elt in elts
+        if not (
+            isinstance(elt, ast.Constant) and (elt.value is ... or elt.value is None)
+        )
+    )
 
 
 def _is_barrier_stmt(statement: ast.stmt) -> bool:

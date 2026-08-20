@@ -2031,9 +2031,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "RankMismatch: Expected ndim=2, but got ndim=1 - tensor value assignment shape mismatch"
-    )
     def test_tensor_value(self):
         """Test both setter from tensor value and getter for [i]"""
 
@@ -2059,6 +2056,24 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_dst = val.expand(N, -1)
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+    def test_tensor_value_3d(self):
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(dst: torch.Tensor, val: torch.Tensor) -> torch.Tensor:
+            N = dst.shape[0]
+            for i in hl.grid(N):
+                dst[i] = val
+            return dst
+
+        N = 8
+        dst = torch.zeros([N, 3, 4], device=DEVICE)
+        val = torch.ones([3, 4], device=DEVICE)
+
+        result = kernel(dst, val)
+
+        expected = val.expand(N, -1, -1)
+        torch.testing.assert_close(result, expected)
 
     def test_slice_to_slice(self):
         """buf[:] = zeros[:] - Full slice to slice assignment"""
