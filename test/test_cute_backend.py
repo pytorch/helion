@@ -21,6 +21,8 @@ import torch
 
 import helion
 from helion._compiler.cute.attention_plan import causal_score_plan
+from helion._compiler.cute.flash_policy import get_flash_target_policy
+from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
@@ -2825,6 +2827,192 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
+    def test_flash_attention_sm103_ldred_codegen(self) -> None:
+        q, k, v = (
+            torch.empty(1, 1, 32768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        dense_bound = cute_dense_attention.bind((q, k, v))
+        dense_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_softmax_disc=False,
+            cute_flash_s_load_rep=32,
+        )
+        with patch.object(
+            dense_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            dense_code = dense_bound.to_triton_code(dense_config)
+        self.assertIn("LdRed32x32bOp", dense_code)
+        self.assertIn("flash_hw_row_max", dense_code)
+        self.assertNotIn("fmax_reduce_packed(tLDrS, flash_row_max)", dense_code)
+
+        with patch.object(
+            dense_bound.env.config_spec, "target_device_capability", (10, 0)
+        ):
+            b200_code = dense_bound.to_triton_code(dense_config)
+        self.assertNotIn("LdRed32x32bOp", b200_code)
+        self.assertIn("fmax_reduce_packed(tLDrS, flash_row_max)", b200_code)
+
+        causal_bound = cute_causal_attention.bind((q, k, v))
+        causal_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_causal_kv_order="descending",
+            cute_flash_causal_loop_split=True,
+            cute_flash_s_load_rep=32,
+        )
+        with patch.object(
+            causal_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            causal_code = causal_bound.to_triton_code(causal_config)
+        self.assertIn("LdRed32x32bOp", causal_code)
+        self.assertIn("disc_rowmax_ldred", causal_code)
+        self.assertIn("fa4_disc_rowmax_causal_balanced", causal_code)
+
+        modified_bound = cute_softcap_attention.bind((q, k, v))
+        with patch.object(
+            modified_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            modified_code = modified_bound.to_triton_code(dense_config)
+        self.assertNotIn("LdRed32x32bOp", modified_code)
+
+    def test_flash_attention_sm103_f16x2_exp2_codegen_gates(self) -> None:
+        q, k, v = (
+            torch.empty(1, 1, 262144, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_2cta",
+            cute_flash_persistent=False,
+            cute_flash_exp2_packet="deg1_16x8",
+            cute_flash_e2e_schedule="16/8",
+            cute_flash_e2e_offset=0,
+            cute_flash_e2e_offset0=10,
+            cute_flash_kv_stage=6,
+            cute_flash_stat_transport="single_final",
+        )
+        dense_bound = cute_dense_attention.bind((q, k, v))
+        with patch.object(
+            dense_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            sm103_code = dense_bound.to_triton_code(config)
+        self.assertIn("f16x2_xu=True", sm103_code)
+
+        with patch.object(
+            dense_bound.env.config_spec, "target_device_capability", (10, 0)
+        ):
+            b200_code = dense_bound.to_triton_code(config)
+        self.assertNotIn("f16x2_xu=True", b200_code)
+
+        lse_bound = cute_dense_attention_with_lse.bind((q, k, v))
+        lse_config = helion.Config(
+            **{**config.config, "cute_flash_stat_transport": "single"}
+        )
+        with patch.object(
+            lse_bound.env.config_spec, "target_device_capability", (10, 3)
+        ):
+            lse_code = lse_bound.to_triton_code(lse_config)
+        self.assertNotIn("f16x2_xu=True", lse_code)
+
+    def test_flash_attention_target_packed_exp2_preserves_256k_tail(self) -> None:
+        capability = torch.cuda.get_device_capability()
+        target_policy = get_flash_target_policy(capability)
+        dense_policy = target_policy.tuning.dense_policy(2048)
+        if (
+            not target_policy.hardware.supports_packed_f16x2_exp2
+            or dense_policy is None
+            or dense_policy.packed_exp2_mode is not FlashPackedExp2Mode.ALL_XU
+        ):
+            self.skipTest("target has no packed f16x2 exp2 lowering")
+
+        sequence_length = 262_144
+        q = torch.zeros((1, 1, sequence_length, 64), dtype=torch.float16, device=DEVICE)
+        k = torch.zeros_like(q)
+        v = torch.full_like(q, -2.0)
+        q[..., 0] = 1.0
+        k[..., 0] = -26.0 * math.sqrt(64) / math.log2(math.e)
+        k[..., 0, 0] = 0.0
+        v[..., 0, :] = 2.0
+        seed = _cute_flash.flash_attention_seed_config(
+            64,
+            2048,
+            standard_dense_output=True,
+            target_device_capability=capability,
+        )
+        assert seed is not None
+        config = helion.Config(**seed.config)
+        bound = cute_dense_attention.bind((q, k, v))
+        code = bound.to_triton_code(config)
+        compiled = bound.compile_config(config)
+        self.assertIn("f16x2_xu=True", code)
+
+        out = compiled(q, k, v)
+        repeated = compiled(q, k, v)
+        effective_tail_log2 = (
+            k[0, 0, 1, 0].float().item() / math.sqrt(64) * math.log2(math.e)
+        )
+        tail_mass = (sequence_length - 1) * 2.0**effective_tail_log2
+        expected = (2.0 - 2.0 * tail_mass) / (1.0 + tail_mass)
+
+        self.assertTrue(torch.equal(out, repeated))
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertLess((out.float() - expected).abs().max().item(), 5e-5)
+
+    def test_flash_attention_target_ldred_matches_sdpa(self) -> None:
+        capability = torch.cuda.get_device_capability()
+        target_policy = get_flash_target_policy(capability)
+        if (
+            not target_policy.hardware.supports_tmem_row_reduce
+            or target_policy.tuning.tmem_row_reduce_min_kv is None
+        ):
+            self.skipTest("target has no tcgen05.ld.red flash lowering")
+        q, k, v = (
+            torch.randn(1, 1, 32768, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        dense_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_softmax_disc=False,
+            cute_flash_s_load_rep=32,
+        )
+        dense_bound = cute_dense_attention.bind((q, k, v))
+        with patch.object(
+            dense_bound.env.config_spec, "target_device_capability", capability
+        ):
+            dense_code = dense_bound.to_triton_code(dense_config)
+            dense_out = dense_bound.compile_config(dense_config)(q, k, v)
+        self.assertIn("LdRed32x32bOp", dense_code)
+        torch.testing.assert_close(
+            dense_out,
+            torch.nn.functional.scaled_dot_product_attention(q, k, v),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+        causal_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4",
+            cute_flash_causal_kv_order="descending",
+            cute_flash_causal_loop_split=True,
+            cute_flash_s_load_rep=32,
+        )
+        causal_bound = cute_causal_attention.bind((q, k, v))
+        with patch.object(
+            causal_bound.env.config_spec, "target_device_capability", capability
+        ):
+            causal_code = causal_bound.to_triton_code(causal_config)
+            causal_out, _lse = causal_bound.compile_config(causal_config)(q, k, v)
+        self.assertIn("disc_rowmax_ldred", causal_code)
+        torch.testing.assert_close(
+            causal_out,
+            torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
     def test_flash_attention_ring2_stat_handoff_persistent_matches_sdpa(self) -> None:
         q, k, v = (
             torch.randn(1, 64, 768, 64, dtype=torch.float16, device=DEVICE)
@@ -3446,12 +3634,18 @@ class TestCuteBackend(TestCase):
                     bound.config_spec._cute_flash_standard_dense_output,
                     expected_standard,
                 )
-                self.assertFalse(
-                    any(
-                        seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
-                        in {"deg1_8x2_corr10", "deg1_16x8"}
-                        for seed in bound.config_spec.compiler_seed_configs
-                    )
+                has_degree1_seed = any(
+                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
+                    in {"deg1_8x2_corr10", "deg1_16x8"}
+                    for seed in bound.config_spec.compiler_seed_configs
+                )
+                target_policy = get_flash_target_policy(
+                    bound.config_spec.target_device_capability
+                )
+                self.assertEqual(
+                    has_degree1_seed,
+                    expected_standard
+                    and target_policy.tuning.dense_policy(2048) is not None,
                 )
                 has_degree2_seed = any(
                     seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
