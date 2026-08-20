@@ -5,6 +5,7 @@ from typing import cast
 
 from cutlass import Float32
 from cutlass import const_expr
+from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import T
@@ -19,6 +20,59 @@ if TYPE_CHECKING:
 # well below this, while larger pointwise tiles should avoid thousands
 # of Python-unrolled MLIR ops.
 _GELU_ERF_PACKED_MAX_UNROLLED_ELEMENTS = 512
+_LOG2_E = 1.4426950408889634
+
+
+def _rcp_approx_ftz_impl(
+    x: object,
+    *,
+    loc: ir.Location | None,
+    ip: ir.InsertionPoint | None,
+) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(x).ir_value(  # pyrefly: ignore[bad-argument-type]
+                    loc=loc, ip=ip
+                )
+            ],
+            "rcp.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def rcp_approx_ftz(
+    x: object,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> Float32:
+    """Approximate f32 reciprocal using the native CUDA instruction."""
+    return _rcp_approx_ftz_impl(x, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sigmoid_approx_ftz_f32(
+    x: object,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> Float32:
+    """FP32 sigmoid with the native approximate reciprocal instruction."""
+    value = Float32(x)  # pyrefly: ignore[bad-argument-type]
+    return _rcp_approx_ftz_impl(
+        1.0 + cute.math.exp2(-value * _LOG2_E),
+        loc=loc,
+        ip=ip,
+    )
 
 
 def _gelu_erf_exact_expr(x: Float32 | cute.TensorSSA) -> Float32 | cute.TensorSSA:

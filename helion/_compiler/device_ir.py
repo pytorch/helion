@@ -3790,9 +3790,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 from ..language.matmul_ops import enable_cute_tcgen05_search
                 from ..language.matmul_ops import plan_cute_tcgen05_search
                 from .cute.cute_mma import analyze_cute_mma_node
-                from .cute.cute_mma import tcgen05_pair_epilogue_can_shape_search
-                from .cute.cute_mma import tcgen05_pair_epilogue_has_unique_anchor
-                from .cute.cute_mma import tcgen05_pair_epilogue_present
 
                 # The same structural analyzer gates tcgen05 search and codegen
                 # for every matrix rank. This prevents transformed loads from
@@ -3828,7 +3825,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     for candidate, _lhs, _rhs, _node in mma_candidates
                 )
                 search_candidates = []
-                for candidate, lhs, rhs, node in mma_candidates:
+                for candidate, lhs, rhs, _node in mma_candidates:
                     search_plan = plan_cute_tcgen05_search(
                         lhs,
                         rhs,
@@ -3842,25 +3839,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             supports_small_n_scalar_fallback
                         ),
                     )
-                    if search_plan is None or not (
-                        tcgen05_pair_epilogue_can_shape_search(
-                            device_ir.graphs,
-                            node,
-                            candidate,
-                            min_search_m=search_plan.min_search_m,
-                            max_search_m=search_plan.max_search_m,
-                            max_search_n=search_plan.max_search_n,
-                        )
-                    ):
+                    if search_plan is None:
                         continue
                     search_candidates.append((candidate, lhs, search_plan))
-                if tcgen05_pair_epilogue_present(
-                    device_ir.graphs
-                ) and not tcgen05_pair_epilogue_has_unique_anchor(
-                    device_ir.graphs,
-                    device_ir=device_ir,
-                ):
-                    search_candidates.clear()
                 analysis_keys = {
                     (
                         candidate.operands.output_block_ids,
