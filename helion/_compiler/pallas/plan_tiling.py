@@ -101,6 +101,64 @@ def plan_tiling(
         _analyze_indexing_expressions(graph_info, config, local_access_keys)
 
 
+def order_grid_for_shared_outputs(
+    graphs: list[GraphInfo], tile_strategy: TileStrategyDispatch
+) -> None:
+    """Make grid dims a stored tensor's block does not index innermost.
+
+    The pipeline writes an output block back when its block index changes
+    and never reloads it, so programs sharing one block must run
+    consecutively. Shared dims move to the end of the strategy's
+    ``loop_order`` (last grid axis iterates fastest), relative order kept.
+    """
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ..device_function import DeviceFunction
+    from ..host_function import HostFunction
+
+    device_fn = DeviceFunction.current()
+    store_targets = ATOMIC_OPS | {memory_ops.store}
+    stored: dict[int, torch.Tensor] = {}
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in store_targets:
+                continue
+            tensor_arg = node.args[0]
+            if not isinstance(tensor_arg, torch.fx.Node):
+                continue
+            tensor_val = tensor_arg.meta.get("val")
+            if isinstance(tensor_val, torch.Tensor):
+                stored[id(tensor_val)] = tensor_val
+    if not stored:
+        return
+
+    for grid_block_ids in HostFunction.current().device_ir.grid_block_ids:
+        if len(grid_block_ids) <= 1:
+            continue
+        strategy = tile_strategy.block_id_to_strategy.get(tuple(grid_block_ids))
+        order = getattr(strategy, "loop_order", None)
+        if not isinstance(order, list) or len(order) != len(grid_block_ids):
+            continue
+        shared: set[int] = set()
+        for tid in stored:
+            tilings = device_fn.pallas_tensor_dim_tilings.get(tid)
+            if tilings is None:
+                continue
+            used = {
+                t.block_ids[0] for t in tilings if t.can_tile and len(t.block_ids) == 1
+            }
+            unused = [bid for bid in grid_block_ids if bid not in used]
+            if unused and len(unused) < len(grid_block_ids):
+                shared.update(unused)
+        if not shared:
+            continue
+        shared_pos = {i for i, bid in enumerate(grid_block_ids) if bid in shared}
+        new_order = [i for i in order if i not in shared_pos] + [
+            i for i in order if i in shared_pos
+        ]
+        order[:] = new_order
+
+
 def _tensor_origin_key(tensor: torch.Tensor) -> str | int:
     from ..host_function import HostFunction
 

@@ -4248,16 +4248,28 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, x * 2.0)
 
-    @xfailIfPallasTpu(
-        "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
-    )
-    def test_mixed_scalar_write_and_slice_access(self) -> None:
-        """Tensor with both scalar write and slice access is unsupported.
+    def test_packed_scalar_row_store(self) -> None:
+        """Packed VMEM stores merge a row into the resident output window."""
 
-        SMEM only supports scalar access; VMEM doesn't support scalar writes.
-        A tensor that needs both would require duplication into SMEM (for the
-        scalar write) and VMEM (for the slice access), which is not yet
-        implemented.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_row_store(x: torch.Tensor) -> torch.Tensor:
+            b, n = x.shape
+            out = torch.empty_like(x)
+            for tile_b, tile_n in hl.tile([b, n], block_size=[1, None]):
+                out[tile_b.begin, tile_n] = x[tile_b.begin, tile_n]
+            return out
+
+        x = torch.randn(4, 256, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(scalar_row_store, (x,), block_sizes=[128])
+        self.assertIn("lax.broadcasted_iota", code)
+        torch.testing.assert_close(result, x)
+
+    @xfailIfPallasTpu("32-bit runtime sublane stores need an aligned VMEM lowering")
+    def test_mixed_scalar_write_and_slice_access(self) -> None:
+        """A 32-bit runtime sublane store mixed with slice access is unsupported.
+
+        Packed scalar stores use an aligned one-hot merge. The 32-bit sublane
+        form currently takes the direct-store path, which Mosaic rejects.
         """
 
         @helion.kernel(
