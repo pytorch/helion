@@ -4265,6 +4265,30 @@ class TestPallas(TestCase):
         self.assertIn("lax.broadcasted_iota", code)
         torch.testing.assert_close(result, x)
 
+    def test_shared_output_scalar_store_grid_order(self) -> None:
+        """Programs updating one resident output window stay consecutive."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_row_store(x: torch.Tensor) -> torch.Tensor:
+            b, n = x.shape
+            out = torch.empty_like(x)
+            for tile_b, tile_n in hl.tile([b, n], block_size=[1, None]):
+                out[tile_b.begin, tile_n] = x[tile_b.begin, tile_n]
+            return out
+
+        # Three column windows exceed the two output buffers. Without the grid
+        # constraint, revisiting the first window loses its earlier row stores.
+        x = torch.randn(4, 384, device=DEVICE, dtype=torch.bfloat16)
+        loop_orders = [[0, 1]]
+        _, result = code_and_output(
+            scalar_row_store,
+            (x,),
+            block_sizes=[128],
+            loop_orders=loop_orders,
+        )
+        self.assertEqual(loop_orders, [[0, 1]])
+        torch.testing.assert_close(result, x)
+
     @xfailIfPallasTpu("32-bit runtime sublane stores need an aligned VMEM lowering")
     def test_mixed_scalar_write_and_slice_access(self) -> None:
         """A 32-bit runtime sublane store mixed with slice access is unsupported.
