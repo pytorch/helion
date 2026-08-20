@@ -6,6 +6,7 @@
 # generated Helion module DOES carry ``from __future__ import annotations`` at
 # its top, so the struct + the inline-traced rescale helper must live here, in a
 # real module compiled without that flag, and be imported by the generated code.
+from dataclasses import dataclass
 import functools
 from functools import partial
 from itertools import starmap
@@ -3279,6 +3280,200 @@ def fmax_reduce_packed(frg: cute.Tensor, init_val: object = None) -> Float32:
         local_max[3] = _fmax3(local_max[3], frg[i + 6], frg[i + 7])
     local_max[0] = _fmax3(local_max[0], local_max[1])
     return _fmax3(local_max[0], local_max[2], local_max[3])
+
+
+@cute.jit
+def _fmax_reduce_packed_ssa(
+    values: cute.TensorSSA,
+    init_val: object = None,
+) -> Float32:
+    values_rmem = cute.make_rmem_tensor(values.shape, Float32)
+    values_rmem.store(values)
+    return fmax_reduce_packed(values_rmem, init_val)
+
+
+@cute.jit
+def _fadd_reduce_packed_ssa(
+    values: cute.TensorSSA,
+    init_val: object = None,
+) -> Float32:
+    values_rmem = cute.make_rmem_tensor(values.shape, Float32)
+    values_rmem.store(values)
+    return fadd_reduce_packed(values_rmem, init_val)
+
+
+@cute.jit
+def _fadd_reduce_packed_ssa_scaled(
+    values: cute.TensorSSA,
+    row_sum: Float32,
+    acc_scale: Float32,
+) -> Float32:
+    values_rmem = cute.make_rmem_tensor(values.shape, Float32)
+    values_rmem.store(values)
+    n = cute.size(values_rmem)
+    assert n % 8 == 0
+    local_sum = [
+        cute.arch.fma_packed_f32x2(
+            (row_sum, 0.0),
+            (acc_scale, 0.0),
+            (values_rmem[0], values_rmem[1]),
+        ),
+        (values_rmem[2], values_rmem[3]),
+        (values_rmem[4], values_rmem[5]),
+        (values_rmem[6], values_rmem[7]),
+    ]
+    for i in cutlass.range_constexpr(8, n, 8):
+        local_sum[0] = _add_packed_f32x2(
+            local_sum[0], (values_rmem[i], values_rmem[i + 1])
+        )
+        local_sum[1] = _add_packed_f32x2(
+            local_sum[1], (values_rmem[i + 2], values_rmem[i + 3])
+        )
+        local_sum[2] = _add_packed_f32x2(
+            local_sum[2], (values_rmem[i + 4], values_rmem[i + 5])
+        )
+        local_sum[3] = _add_packed_f32x2(
+            local_sum[3], (values_rmem[i + 6], values_rmem[i + 7])
+        )
+    local_sum[0] = _add_packed_f32x2(local_sum[0], local_sum[1])
+    local_sum[2] = _add_packed_f32x2(local_sum[2], local_sum[3])
+    local_sum[0] = _add_packed_f32x2(local_sum[0], local_sum[2])
+    sum_lo, sum_hi = local_sum[0]
+    return Float32(sum_lo) + Float32(sum_hi)
+
+
+@dataclass
+class ResidentSoftmaxState:
+    """Register-backed online-softmax state for a causal resident lowering."""
+
+    scale_log2: Float32
+    row_max: cute.Tensor
+    row_sum: cute.Tensor
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
+
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+    ) -> "ResidentSoftmaxState":
+        return ResidentSoftmaxState(
+            scale_log2,
+            cute.make_rmem_tensor(1, Float32),
+            cute.make_rmem_tensor(1, Float32),
+            rescale_threshold,
+        )
+
+    def reset(self) -> None:
+        self.row_max.fill(Float32(-Float32.inf))
+        self.row_sum.fill(Float32(0.0))
+
+    @cute.jit
+    def _update_row_max_from_local(
+        self,
+        row_max_new: Float32,
+        is_first: cutlass.Constexpr[bool],
+    ) -> tuple[Float32, Float32]:
+        acc_scale: Float32
+        if cutlass.const_expr(is_first):
+            row_max_safe = row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            acc_scale = Float32(0.0)
+        else:
+            row_max_old = self.row_max[0]
+            assert isinstance(row_max_old, Float32)
+            row_max_safe = row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            acc_scale_log2 = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_log2, fastmath=True)
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                if acc_scale_log2 >= -self.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = Float32(1.0)
+        self.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
+
+    @cute.jit
+    def update_row_max_precomputed(
+        self,
+        hw_row_max: Float32,
+        is_first: cutlass.Constexpr[bool],
+    ) -> tuple[Float32, Float32]:
+        row_max_new = (
+            hw_row_max
+            if cutlass.const_expr(is_first)
+            else cute.arch.fmax(hw_row_max, self.row_max[0])
+        )
+        return self._update_row_max_from_local(row_max_new, is_first)
+
+    @cute.jit
+    def update_row_max_masked(
+        self,
+        scores: cute.TensorSSA,
+        is_first: cutlass.Constexpr[bool],
+    ) -> tuple[Float32, Float32]:
+        row_max_new = _fmax_reduce_packed_ssa(
+            scores,
+            None if cutlass.const_expr(is_first) else self.row_max[0],
+        )
+        return self._update_row_max_from_local(row_max_new, is_first)
+
+    @cute.jit
+    def scale_subtract_rowmax(
+        self,
+        scores: cute.Tensor,
+        row_max: Float32,
+    ) -> None:
+        assert cute.size(scores) % 2 == 0
+        bias = Float32(0.0) - row_max * self.scale_log2
+        for i in cutlass.range(0, cute.size(scores), 2, unroll_full=True):
+            scores[i], scores[i + 1] = cute.arch.fma_packed_f32x2(
+                (scores[i], scores[i + 1]),
+                (self.scale_log2, self.scale_log2),
+                (bias, bias),
+            )
+
+    @cute.jit
+    def apply_exp2_convert(
+        self,
+        scores: cute.Tensor,
+        converted: cute.Tensor,
+    ) -> None:
+        assert cute.size(scores) % 32 == 0
+        score_fragments = cute.logical_divide(scores, cute.make_layout(32))
+        converted_fragments = cute.logical_divide(converted, cute.make_layout(32))
+        for fragment in cutlass.range_constexpr(cute.size(score_fragments, mode=[1])):
+            for i in cutlass.range_constexpr(0, 32, 2):
+                score_fragments[i, fragment] = cute.math.exp2(
+                    score_fragments[i, fragment], fastmath=True
+                )
+                score_fragments[i + 1, fragment] = cute.math.exp2(
+                    score_fragments[i + 1, fragment], fastmath=True
+                )
+            converted_fragments[None, fragment].store(
+                score_fragments[None, fragment].load().to(converted.element_type)
+            )
+
+    @cute.jit
+    def acquire_stats(
+        self,
+        stats_empty_ptr_stage: object,
+        stats_empty_phase: object,
+        wait_hint: int,
+    ) -> None:
+        mbar_spin_wait(stats_empty_ptr_stage, stats_empty_phase, wait_hint)
+
+    @cute.jit
+    def update_row_sum(
+        self,
+        scores_exp: cute.TensorSSA,
+        acc_scale: Float32,
+        is_first: cutlass.Constexpr[bool] = False,
+    ) -> None:
+        if cutlass.const_expr(is_first):
+            self.row_sum[0] = _fadd_reduce_packed_ssa(scores_exp)
+        else:
+            self.row_sum[0] = _fadd_reduce_packed_ssa_scaled(
+                scores_exp, self.row_sum[0], acc_scale
+            )
 
 
 # ===========================================================================
