@@ -73,6 +73,7 @@ from .type_info import GridIndexType
 from .type_info import IterType
 from .type_info import JaggedTileIndexType
 from .type_info import LiteralType
+from .type_info import NestedFunctionType
 from .type_info import NumericType
 from .type_info import SequenceType
 from .type_info import StackTensorType
@@ -3003,22 +3004,41 @@ class WalkDeviceAST(NodeVisitor):
             else:
                 kwargs[kwarg.arg] = self.visit(kwarg.value)
 
-        if isinstance(
-            (
-                # pyrefly: ignore [missing-attribute]
-                func_type_info := node.func._type_info
-            ),
-            CallableType,
-        ) and (replacement := get_device_func_replacement(func_type_info.value)):
+        # pyrefly: ignore [missing-attribute]
+        func_type_info = node.func._type_info
+        if isinstance(func_type_info, NestedFunctionType):
+            return self._call_nested_function(func_type_info, args)
+        if isinstance(func_type_info, CallableType) and (
+            replacement := get_device_func_replacement(func_type_info.value)
+        ):
             func = replacement
         else:
             func = self.visit(node.func)
-
         # pyrefly: ignore [bad-argument-type]
         return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.scope[node.name] = None
+
+    def _call_nested_function(
+        self, func: NestedFunctionType, args: list[object]
+    ) -> object:
+        func_node = func.func_node
+        params = func_node.args
+        old_scope = self.scope.copy()
+        for param, arg_val in zip(params.args, args, strict=True):
+            self.scope[param.arg] = arg_val
+        try:
+            for stmt in func_node.body:
+                if isinstance(stmt, ast.Return):
+                    return self.visit(stmt.value) if stmt.value is not None else None
+                self.visit(stmt)
+        finally:
+            self.scope = old_scope
+        return None
 
     def visit_Expr(self, node: ast.Expr) -> object:
         return self.visit(node.value)
