@@ -126,7 +126,7 @@ def _resolve_dim_block_id(
 def _strategy_aliases_index_and_offset(strategy: object, block_id: int) -> bool:
     """Return True when ``strategy`` produces an index var aliased to its offset.
 
-    ``CuteFlattenedTileStrategy`` (and ``FlattenedTileStrategy``) emit
+    ``PerThreadFlattenedTileStrategy`` (and ``FlattenedTileStrategy``) emit
     ``indices_X = offsets_X`` when collapsing a single block id, so the
     difference ``indices_X - offsets_X`` is always zero. We must derive the
     per-thread coordinate from ``thread_idx`` instead.

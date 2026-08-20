@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib
+import inspect
 import math
 import os
 from typing import TYPE_CHECKING
@@ -22,6 +23,8 @@ from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
 from helion._compiler.cute.causal_range import CausalRangeProof
 from helion._compiler.cute.flash_policy import get_flash_target_policy
+from helion._compiler.cute.flash_policy import registered_flash_target_policies
+from helion._compiler.cute.flash_tuning import FlashCausalTuningPolicy
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._testing import DEVICE
 from helion._testing import code_and_output
@@ -170,6 +173,7 @@ def _hybrid_runtime_config() -> dict[str, object]:
 def _emit_causal_resident_native_source(
     *,
     capability: tuple[int, int] = (10, 3),
+    seed_capability: tuple[int, int] | None = None,
     has_lse: bool = False,
     score_plan: AttentionScorePlan | None = None,
     num_kv: int = 512,
@@ -177,6 +181,8 @@ def _emit_causal_resident_native_source(
 ) -> str:
     if score_plan is None:
         score_plan = causal_score_plan(64)
+    if seed_capability is None:
+        seed_capability = capability
     with patch.dict(os.environ, {}, clear=True):
         seed = cute_flash.flash_attention_seed_config(
             64,
@@ -184,7 +190,7 @@ def _emit_causal_resident_native_source(
             dtype=torch.float16,
             is_causal=True,
             standard_causal_output=True,
-            target_device_capability=(10, 3),
+            target_device_capability=seed_capability,
         )
         assert seed is not None
         manual_overrides = dict(seed.config)
@@ -216,6 +222,7 @@ def _emit_causal_resident_native_source(
 def _emit_dense_resident_value_graph_source(
     *,
     capability: tuple[int, int] = (10, 3),
+    seed_capability: tuple[int, int] | None = None,
     has_lse: bool = False,
     score_plan: AttentionScorePlan | None = None,
     num_kv: int = 256,
@@ -223,6 +230,8 @@ def _emit_dense_resident_value_graph_source(
 ) -> str:
     if score_plan is None:
         score_plan = dense_score_plan(64)
+    if seed_capability is None:
+        seed_capability = capability
     with patch.dict(os.environ, {}, clear=True):
         seed = cute_flash.flash_attention_seed_config(
             64,
@@ -230,7 +239,7 @@ def _emit_dense_resident_value_graph_source(
             dtype=torch.float16,
             is_causal=False,
             standard_dense_output=True,
-            target_device_capability=(10, 3),
+            target_device_capability=seed_capability,
         )
         assert seed is not None
         manual_overrides = dict(seed.config)
@@ -260,6 +269,75 @@ def _emit_dense_resident_value_graph_source(
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
 
+def _assert_source_markers_in_order(source: str, markers: tuple[str, ...]) -> None:
+    offsets = [source.index(marker) for marker in markers]
+    assert offsets == sorted(offsets)
+
+
+def test_causal_split_softmax_segments_require_proof() -> None:
+    with pytest.raises(AssertionError, match="requires a proven"):
+        cute_flash._flash_causal_split_softmax_segments(
+            "flash_bound",
+            "1",
+            split_range_proof=CausalRangeProof(False, "not proven"),
+        )
+    masked, unmasked = cute_flash._flash_causal_split_softmax_segments(
+        "flash_bound",
+        "1",
+        split_range_proof=CausalRangeProof(True, "proven"),
+    )
+    assert masked.loop_bound == "flash_bound - flash_m_tile1"
+    assert masked.kv_expr == ("flash_bound - cutlass.Int32(1) - flash_kv_mask_iter")
+    assert masked.not_first_condition == "flash_kv_mask_iter != 0"
+    assert not masked.continues_previous_segment
+    assert unmasked.loop_bound == "flash_m_tile1"
+    assert unmasked.kv_expr == (
+        "flash_m_tile1 - cutlass.Int32(1) - flash_kv_unmask_iter"
+    )
+    assert unmasked.not_first_condition == ("flash_kv_unmask_iter >= cutlass.Int32(0)")
+    assert unmasked.continues_previous_segment
+
+
+def test_online_softmax_codegen_preserves_target_alpha_schedules() -> None:
+    b200_source = _emit_causal_resident_native_source(
+        capability=(10, 0),
+        num_kv=512,
+    )
+    b200_masked_start = b200_source.index("for flash_kv_mask_iter")
+    b200_unmasked_start = b200_source.index(
+        "for flash_kv_unmask_iter", b200_masked_start
+    )
+    b200_masked = b200_source[b200_masked_start:b200_unmasked_start]
+    b200_markers = (
+        "mbar_spin_wait(flash_s_full_ptr + 0",
+        "flash_s_full_phase ^= 1",
+        "flash_scale_t[flash_s_corr_prod_index, 0, flash_local_tidx] = flash_alpha",
+        "flash_minus_max_scale =",
+        "fa4_disc_exp_convert_store_pipe_causal",
+        "flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum",
+    )
+    _assert_source_markers_in_order(b200_masked, b200_markers)
+
+    gb300_source = _emit_causal_resident_native_source(
+        capability=(10, 3),
+        num_kv=1024,
+    )
+    gb300_masked_start = gb300_source.index("for flash_kv_mask_iter")
+    gb300_unmasked_start = gb300_source.index(
+        "for flash_kv_unmask_iter", gb300_masked_start
+    )
+    gb300_masked = gb300_source[gb300_masked_start:gb300_unmasked_start]
+    gb300_markers = (
+        "mbar_spin_wait(flash_s_full_ptr + 0",
+        "flash_s_full_phase ^= 1",
+        "flash_minus_max_scale =",
+        "flash_scale_t[0 * 128 + flash_local_tidx] = flash_alpha",
+        "resident_softmax_value_graph",
+        "flash_s_corr_prod_phase ^= 1",
+    )
+    _assert_source_markers_in_order(gb300_masked, gb300_markers)
+
+
 def test_causal_split_equal_iteration_proof_is_explicit() -> None:
     failed = cute_flash._flash_fa4_causal_split_equal_iteration_proof(
         split_range_proof=CausalRangeProof(False, "range failed"),
@@ -279,6 +357,51 @@ def test_causal_split_equal_iteration_proof_is_explicit() -> None:
         False, "FA4 resident path requires two query slots"
     )
     assert proven.proven
+
+
+def test_registered_causal_shape_selects_requested_resident_lowering() -> None:
+    target_policy = get_flash_target_policy((10, 3))
+    extra_policy = FlashCausalTuningPolicy(
+        num_kv=768,
+        kv_stage=4,
+        e2e_offset=2,
+        e2e_offset0=3,
+        softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+        softmax_regs=184,
+    )
+    extended_tuning = dataclasses.replace(
+        target_policy.tuning,
+        causal_policies=(*target_policy.tuning.causal_policies, extra_policy),
+    )
+    base_fragments = cute_flash.flash_autotune_fragments(
+        64,
+        768,
+        dtype=torch.float16,
+        is_causal=True,
+        standard_causal_output=True,
+    )
+    with patch(
+        "helion._compiler.cute.cute_flash.get_flash_target_policy",
+        return_value=dataclasses.replace(target_policy, tuning=extended_tuning),
+    ):
+        target_fragments = cute_flash.flash_autotune_fragments(
+            64,
+            768,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+            target_device_capability=(10, 3),
+        )
+        source = _emit_causal_resident_native_source(num_kv=768)
+
+    base_kv_stage = cast("EnumFragment", base_fragments[cute_flash.FLASH_KV_STAGE_KEY])
+    target_kv_stage = cast(
+        "EnumFragment", target_fragments[cute_flash.FLASH_KV_STAGE_KEY]
+    )
+    assert extra_policy.kv_stage not in base_kv_stage.choices
+    assert extra_policy.kv_stage in target_kv_stage.choices
+    assert target_kv_stage.search_choices == base_kv_stage.choices
+    assert "resident_softmax_value_graph" in source
 
 
 def test_degree2_polynomial_relative_error_bound() -> None:
@@ -401,6 +524,11 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
     ]
     assert len(unmasked_loops) == 2
     for loop in unmasked_loops:
+        assert isinstance(loop.iter, ast.Call)
+        assert ast.unparse(loop.iter.func) == "cutlass.range"
+        assert len(loop.iter.keywords) == 1
+        assert loop.iter.keywords[0].arg == "unroll"
+        assert ast.literal_eval(loop.iter.keywords[0].value) == 1
         assert not any(
             "flash_kv_unmask_iter" in ast.unparse(node.test)
             for node in ast.walk(loop)
@@ -440,7 +568,7 @@ def test_sm103_packed_f16x2_rewrite_requires_exact_promoted_seed() -> None:
     assert "f16x2_xu=True" in promoted_source
 
 
-def test_sm103_scaled_all_xu_codegen_covers_256k() -> None:
+def test_sm103_scaled_all_xu_codegen_requires_exact_rescale_threshold() -> None:
     all_xu_source = _emit_dense_resident_value_graph_source(num_kv=2048)
     overflow_source = _emit_dense_resident_value_graph_source(
         num_kv=2048,
@@ -480,28 +608,29 @@ def test_sm103_scaled_all_xu_codegen_covers_256k() -> None:
     assert "cutlass.Float32(7.0)" not in overflow_source
 
 
-def test_dense_target_lowering_match_is_environment_independent() -> None:
-    dense_seed = cute_flash.flash_attention_seed_config(
-        64,
-        256,
-        standard_dense_output=True,
-        target_device_capability=(10, 3),
-    )
+def test_dense_target_seed_match_ignores_conflicting_environment() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        dense_seed = cute_flash.flash_attention_seed_config(
+            64,
+            256,
+            standard_dense_output=True,
+            target_device_capability=(10, 3),
+        )
     assert dense_seed is not None
-    dense_cfg = cute_flash.resolve_flash_config(
-        64,
-        256,
-        dense_seed.config,
-        standard_dense_output=True,
-    )
+    with patch.dict(os.environ, {"HELION_CUTE_FLASH_WAIT_HINT": "0"}, clear=True):
+        dense_cfg = cute_flash.resolve_flash_config(
+            64,
+            256,
+            dense_seed.config,
+            standard_dense_output=True,
+        )
+        policy = get_flash_target_policy((10, 3)).tuning.dense_policy(256)
+        assert dense_cfg.wait_hint == 10000000
+        assert cute_flash._flash_dense_target_seed_matches(dense_cfg, policy)
 
-    with patch.dict(os.environ, {"HELION_CUTE_FLASH_WAIT_HINT": "0"}):
-        assert cute_flash._flash_dense_resident_seed_matches(dense_cfg, 256, (10, 3))
 
-
-@pytest.mark.parametrize("num_kv", (256, 512, 1024))
-def test_dense_resident_value_graph_codegen_and_barrier_protocol(num_kv: int) -> None:
-    source = _emit_dense_resident_value_graph_source(num_kv=num_kv)
+def test_dense_resident_value_graph_codegen_and_barrier_protocol() -> None:
+    source = _emit_dense_resident_value_graph_source()
     module = ast.parse(source)
     value_graph_calls = [
         node
@@ -512,10 +641,16 @@ def test_dense_resident_value_graph_codegen_and_barrier_protocol(num_kv: int) ->
     ]
 
     assert len(value_graph_calls) == 2
+    parameter_names = tuple(
+        inspect.signature(_flash_runtime.resident_softmax_value_graph).parameters
+    )
     for call in value_graph_calls:
-        assert ast.unparse(call.args[10]).endswith("_corr_empty_ptr + 0")
-        assert ast.unparse(call.args[11]) == "flash_s_corr_prod_phase"
-        assert ast.unparse(call.args[12]) == "flash_row_sum * flash_alpha"
+        arguments = dict(zip(parameter_names, call.args, strict=False))
+        assert ast.unparse(arguments["stats_empty_ptr_stage"]).endswith(
+            "_corr_empty_ptr + 0"
+        )
+        assert ast.unparse(arguments["stats_empty_phase"]) == "flash_s_corr_prod_phase"
+        assert ast.unparse(arguments["row_sum_init"]) == "flash_row_sum * flash_alpha"
         assert {
             keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords
         } == {
@@ -575,6 +710,28 @@ def test_dense_resident_value_graph_codegen_and_barrier_protocol(num_kv: int) ->
     assert alpha0 < pfor0 < release1 < alpha1 < pfor1 < release0
 
 
+@pytest.mark.parametrize(
+    ("capability", "num_kv"),
+    tuple(
+        (capability, shape_policy.num_kv)
+        for capability, target_policy in registered_flash_target_policies()
+        for tuning in target_policy.tunings
+        if tuning.workload.head_dim == 64 and tuning.workload.dtype.value == "float16"
+        for shape_policy in tuning.dense_policies
+        if shape_policy.softmax_lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+    ),
+)
+def test_dense_resident_value_graph_selects_registered_shapes(
+    capability: tuple[int, int], num_kv: int
+) -> None:
+    source = _emit_dense_resident_value_graph_source(
+        capability=capability,
+        num_kv=num_kv,
+    )
+
+    assert "resident_softmax_value_graph" in source
+
+
 def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
     base_plan = dense_score_plan(64)
     modified_plan = dataclasses.replace(
@@ -582,8 +739,12 @@ def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
         modifiers=(AttentionScoreModifier(SOFTCAP_KIND, value_log2=2.0),),
     )
     fallback_sources = (
-        _emit_dense_resident_value_graph_source(capability=(10, 0)),
-        _emit_dense_resident_value_graph_source(capability=(10, 4)),
+        _emit_dense_resident_value_graph_source(
+            capability=(10, 0), seed_capability=(10, 3)
+        ),
+        _emit_dense_resident_value_graph_source(
+            capability=(999, 999), seed_capability=(10, 3)
+        ),
         _emit_dense_resident_value_graph_source(num_kv=2048),
         _emit_dense_resident_value_graph_source(has_lse=True),
         _emit_dense_resident_value_graph_source(score_plan=modified_plan),
@@ -594,32 +755,6 @@ def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
     for fallback_source in fallback_sources:
         assert "resident_softmax_value_graph" not in fallback_source
         assert "fa4_sp_exp_convert_store_whole_rowsum" in fallback_source
-
-
-def test_sm103_dense64_register_policy_is_target_specific() -> None:
-    sm103_seed = cute_flash.flash_attention_seed_config(
-        64,
-        512,
-        dtype=torch.float16,
-        is_causal=False,
-        standard_dense_output=True,
-        target_device_capability=(10, 3),
-    )
-    sm100_seed = cute_flash.flash_attention_seed_config(
-        64,
-        512,
-        dtype=torch.float16,
-        is_causal=False,
-        standard_dense_output=True,
-        target_device_capability=(10, 0),
-    )
-
-    assert sm103_seed is not None
-    assert sm100_seed is not None
-    assert sm103_seed.config[cute_flash.FLASH_CORR_REGS_KEY] == 72
-    assert sm103_seed.config[cute_flash.FLASH_OTHER_REGS_KEY] == 40
-    assert sm100_seed.config[cute_flash.FLASH_CORR_REGS_KEY] == 80
-    assert sm100_seed.config[cute_flash.FLASH_OTHER_REGS_KEY] == 32
 
 
 def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
@@ -633,6 +768,7 @@ def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
             dataclasses.replace(
                 shape_policy,
                 softmax_lowering=FlashSoftmaxLowering.STANDARD,
+                probability_log2_shift=0,
             ),
             *policy.dense_policies[1:],
         ),
@@ -649,29 +785,12 @@ def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
     assert "fa4_sp_exp_convert_store_whole_rowsum" in standard_source
 
 
-def test_dense_probability_shift_fails_closed_before_fp16_overflow() -> None:
+def test_dense_probability_shift_is_rejected_before_fp16_overflow() -> None:
     target_policy = get_flash_target_policy((10, 3))
     dense_policy = target_policy.tuning.dense_policy(256)
     assert dense_policy is not None
-    unsafe_tuning = dataclasses.replace(
-        target_policy.tuning,
-        dense_policies=tuple(
-            dataclasses.replace(policy, probability_log2_shift=16)
-            if policy.num_kv == 256
-            else policy
-            for policy in target_policy.tuning.dense_policies
-        ),
-    )
-    with patch.object(
-        cute_flash,
-        "get_flash_target_policy",
-        return_value=dataclasses.replace(target_policy, tuning=unsafe_tuning),
-    ):
-        source = _emit_dense_resident_value_graph_source()
-
-    assert "resident_softmax_value_graph" not in source
-    assert "f16x2_xu=True" not in source
-    assert "cutlass.Float32(16.0)" not in source
+    with pytest.raises(ValueError, match="exceed fp16 range"):
+        dataclasses.replace(dense_policy, probability_log2_shift=16)
 
 
 def test_causal_resident_native_codegen_and_single_stat_protocol() -> None:
@@ -694,7 +813,7 @@ def test_causal_resident_native_codegen_and_single_stat_protocol() -> None:
     assert "flash_s_corr_cons_index" not in source
     assert source.count("flash_s_corr_prod_phase = cutlass.Int32(1)") == 2
     assert source.count("ResidentSoftmaxState.create") == 2
-    assert source.count("flash_softmax.reset()") == 2
+    assert "flash_softmax.reset()" not in source
     assert source.count("update_row_max_masked(tLDrS.load(), True)") == 2
     assert source.count("update_row_max_masked(tLDrS.load(), False)") == 2
     assert source.count("update_row_max_precomputed(flash_hw_row_max, False)") == 2
@@ -702,7 +821,6 @@ def test_causal_resident_native_codegen_and_single_stat_protocol() -> None:
     assert source.count("flash_softmax.apply_exp2_convert") == 6
     assert source.count("flash_tSrP_f32 = cute.make_rmem_tensor") == 6
     assert source.count("dtype=cutlass.Float16), tLDrS.layout") == 6
-    assert source.count("flash_softmax.acquire_stats") == 6
     assert source.count("flash_softmax.update_row_sum") == 6
     assert source.count("tLDrS.load(), flash_alpha, True") == 2
     assert source.count("tLDrS.load(), flash_alpha)") == 4
@@ -739,7 +857,11 @@ def test_causal_resident_native_codegen_and_single_stat_protocol() -> None:
     scale_subtract = masked.index("flash_softmax.scale_subtract_rowmax", alpha_ready)
     fresh_p = masked.index("flash_tSrP_f32 = cute.make_rmem_tensor", scale_subtract)
     early_pack = masked.index("flash_softmax.apply_exp2_convert", fresh_p)
-    stats_acquire = masked.index("flash_softmax.acquire_stats", early_pack)
+    stats_wait = (
+        "_helion_flash_rt.mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
+        "flash_s_corr_prod_phase, 0)"
+    )
+    stats_acquire = masked.index(stats_wait, early_pack)
     row_sum = masked.index("flash_softmax.update_row_sum", stats_acquire)
     phase_advance = masked.index("flash_s_corr_prod_phase ^= 1", row_sum)
     assert (
@@ -897,8 +1019,12 @@ def test_causal_resident_native_gate_preserves_fallbacks() -> None:
         ),
     )
     fallback_sources = (
-        _emit_causal_resident_native_source(capability=(10, 0)),
-        _emit_causal_resident_native_source(capability=(10, 4)),
+        _emit_causal_resident_native_source(
+            capability=(10, 0), seed_capability=(10, 3)
+        ),
+        _emit_causal_resident_native_source(
+            capability=(999, 999), seed_capability=(10, 3)
+        ),
         _emit_causal_resident_native_source(has_lse=True),
         _emit_causal_resident_native_source(score_plan=modified_plan),
         _emit_causal_resident_native_source(num_kv=256),
@@ -969,6 +1095,7 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     ("num_kv", "repeat_count"),
     (
         (1024, 31),
+        (2048, 3),
         (4096, 3),
     ),
 )
@@ -979,9 +1106,12 @@ def test_causal_resident_cross_stage_matches_sdpa_without_deadlock(
     capability = torch.cuda.get_device_capability()
     policy = get_flash_target_policy(capability).tuning
     shape_policy = policy.causal_policy(num_kv)
-    if shape_policy is None:
+    if (
+        shape_policy is None
+        or shape_policy.softmax_lowering
+        is not FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+    ):
         pytest.skip("causal resident native softmax is unsupported on this target")
-    assert shape_policy.softmax_lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
 
     torch.manual_seed(109 + num_kv)
     sequence_length = num_kv * 128
@@ -1019,26 +1149,28 @@ def test_causal_resident_cross_stage_matches_sdpa_without_deadlock(
     torch.testing.assert_close(out, expected, atol=0.01, rtol=0.02)
 
 
-def test_causal_target_lowering_match_is_environment_independent() -> None:
-    causal_seed = cute_flash.flash_attention_seed_config(
-        64,
-        512,
-        is_causal=True,
-        standard_causal_output=True,
-        target_device_capability=(10, 3),
-    )
-    assert causal_seed is not None
-    causal_cfg = cute_flash.resolve_flash_config(
-        64,
-        512,
-        causal_seed.config,
-        is_causal=True,
-    )
-
-    with patch.dict(os.environ, {"HELION_CUTE_FLASH_WAIT_HINT": "0"}):
-        assert cute_flash._flash_causal_resident_native_seed_matches(
-            causal_cfg, 512, (10, 3)
+def test_causal_target_seed_match_ignores_conflicting_environment() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        causal_seed = cute_flash.flash_attention_seed_config(
+            64,
+            512,
+            is_causal=True,
+            standard_causal_output=True,
+            target_device_capability=(10, 3),
         )
+    assert causal_seed is not None
+    with patch.dict(
+        os.environ, {"HELION_CUTE_FLASH_WAIT_HINT": "10000000"}, clear=True
+    ):
+        causal_cfg = cute_flash.resolve_flash_config(
+            64,
+            512,
+            causal_seed.config,
+            is_causal=True,
+        )
+        policy = get_flash_target_policy((10, 3)).tuning.causal_policy(512)
+        assert causal_cfg.wait_hint == 0
+        assert cute_flash._flash_causal_resident_native_seed_matches(causal_cfg, policy)
 
     effective = cute_flash._flash_resident_softmax_config(causal_cfg)
     assert causal_cfg.exp2_packet == _DEG2_PACKET
@@ -1068,7 +1200,6 @@ def test_hybrid_packet_uses_degree1_only_for_unmasked_pass2() -> None:
         has_lse=False,
         io_dtype="cutlass.Float16",
         score_plan=causal_score_plan(64),
-        target_device_capability=(10, 3),
     )
     module = ast.Module(body=body, type_ignores=[])
     pass2_calls = [
@@ -1151,7 +1282,6 @@ def test_polynomial_packet_uses_whole_row_dense_pass2(
         has_lse=False,
         io_dtype="cutlass.Float16",
         score_plan=dense_score_plan(64),
-        target_device_capability=(10, 0),
     )
     module = ast.Module(body=body, type_ignores=[])
     pass2_calls = [
@@ -1210,7 +1340,6 @@ def test_short_degree1_packet_reverses_steady_correction_order(
         has_lse=False,
         io_dtype="cutlass.Float16",
         score_plan=dense_score_plan(64),
-        target_device_capability=(10, 3),
     )
     correction_loop = next(
         node
@@ -1273,7 +1402,6 @@ def _emit_dense_single_stat_source(
             has_lse=False,
             io_dtype="cutlass.Float16",
             score_plan=dense_score_plan(64),
-            target_device_capability=(10, 3),
         )
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
@@ -1681,7 +1809,6 @@ def test_dense_ring2_emits_two_slot_stat_protocol() -> None:
             has_lse=False,
             io_dtype="cutlass.Float16",
             score_plan=dense_score_plan(64),
-            target_device_capability=(10, 3),
         )
         return ast.unparse(ast.Module(body=body, type_ignores=[]))
 

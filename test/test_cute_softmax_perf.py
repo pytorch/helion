@@ -3,7 +3,7 @@
 These tests exercise the codegen paths that lifted Helion CuTe softmax
 performance from ~0.45x ATen to ~0.66x ATen on (4096, *) shapes:
 
-- P1: tile-loop vec hoist (CuteNDTileStrategy emits ``cute.arch.load``
+- P1: tile-loop vec hoist (PerThreadNDTileStrategy emits ``cute.arch.load``
   with ``ir.VectorType`` so masked reductions can vectorize).
 - P2/P5: ``fuse_two_pass_loads`` extended alias map to canonicalize
   per-sweep ``mask_<N>``, ``lane_base_<N>``, ``vec_lane_<N>``, and
@@ -1112,7 +1112,7 @@ class TestCuteMultiRowInvestigation(TestCase):
     ``thread_idx[0]`` = lane in row, ``thread_idx[1]`` = row index)
     would require structurally swapping the thread-axis assignment
     between the M-grid loop and the inner N-tile loop in
-    ``CuteNDTileStrategy``.  Even if implemented, the wall-clock gain
+    ``PerThreadNDTileStrategy``.  Even if implemented, the wall-clock gain
     is bounded by the launcher overhead.
 
     Future work to close the (4096, 256) gap should target either:

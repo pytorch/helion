@@ -2069,7 +2069,7 @@ def _cute_vector_load_ctx(
             return vec_width, inner_block_id, "unroll"
         return None
     # CuTe N-D tile strategy with lane loops: vec is set up per-block in
-    # ``CuteNDTileStrategy.__init__`` when the autotuner picks
+    # ``PerThreadNDTileStrategy.__init__`` when the autotuner picks
     # ``cute_vector_widths[block_id]`` > 1 and EPT is divisible by V.  Mode
     # is forced to ``"unroll"`` (per-element bitcast) for fp16/bf16 since
     # subscripting a bf16/fp16 vector in the CuTe DSL is unsafe; fp32
@@ -2293,7 +2293,7 @@ def _(state: CodegenState) -> object:
             )
         elif vec_mode == "tile_unroll":
             # Same hoist protocol as ``LoopedReductionStrategy``'s
-            # ``unroll`` mode but for ``CuteNDTileStrategy`` lane loops.
+            # ``unroll`` mode but for ``PerThreadNDTileStrategy`` lane loops.
             from ..tile_strategy import BlockSizeTileStrategy
 
             assert isinstance(strategy, BlockSizeTileStrategy)

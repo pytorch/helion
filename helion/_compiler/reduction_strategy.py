@@ -282,7 +282,7 @@ class ReductionStrategy(TileStrategy):
 
     def _reduction_block_in_device_lane_loop(self) -> bool:
         """Return True when a ``DeviceLoopState`` distributes this reduction
-        block across a per-thread lane loop (CuteNDTileStrategy lanes).
+        block across a per-thread lane loop (PerThreadNDTileStrategy lanes).
 
         Unlike :meth:`_reduction_block_has_lane_loops`, this does NOT feed
         :meth:`_needs_loop_carried_accumulator` — it is a dedicated signal for
