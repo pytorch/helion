@@ -195,7 +195,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
-        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash(
+        config_spec_hash = self.kernel.config_spec.cache_fingerprint_hash(
             advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
         )
         return LooseAutotuneCacheKey(

@@ -484,7 +484,7 @@ class TestCacheMatching(unittest.TestCase):
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
             mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+            mock_search.config_spec.cache_fingerprint_hash = MagicMock(
                 return_value=fp_hash
             )
 
@@ -499,6 +499,59 @@ class TestCacheMatching(unittest.TestCase):
             self.assertEqual(len(entries), 2)
             self.assertEqual(entries[0].config.config["block_sizes"], [32, 64])
             self.assertEqual(entries[1].config.config["block_sizes"], [64, 128])
+
+    def test_find_similar_rejects_old_compiler_seed_policy(self):
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        historical_hash = config_spec.structural_fingerprint_hash()
+        config_spec.compiler_seed_configs = [Config(block_sizes=[64], num_warps=4)]
+        current_hash = config_spec.cache_fingerprint_hash()
+        self.assertNotEqual(current_hash, historical_hash)
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self._write_best_config(
+                cache_dir,
+                "old-policy.best_config",
+                hardware="NVIDIA GeForce RTX 4090",
+                spec_key="('tensor_spec',)",
+                source_hash="old",
+                config_dict={"block_sizes": [32], "num_warps": 8},
+                config_spec_hash=historical_hash,
+                flat_config=[32, 8],
+            )
+            self._write_best_config(
+                cache_dir,
+                "current-policy.best_config",
+                hardware="NVIDIA GeForce RTX 4090",
+                spec_key="('tensor_spec',)",
+                source_hash="current",
+                config_dict={"block_sizes": [64], "num_warps": 4},
+                config_spec_hash=current_hash,
+                flat_config=[64, 4],
+            )
+
+            mock_search = MagicMock()
+            mock_search._skip_cache = False
+            mock_search.settings = MagicMock()
+            mock_search.settings.autotune_best_available_max_cache_scan = 500
+            mock_search.settings.autotune_search_acf = None
+            mock_search._get_current_hardware_and_specialization = MagicMock(
+                return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
+            )
+            mock_search.config_spec = config_spec
+
+            with patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ):
+                entries = PopulationBasedSearch._find_similar_cached_configs(
+                    mock_search, max_configs=10
+                )
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].config.config["block_sizes"], [64])
 
     def test_find_similar_cached_configs_respects_max_configs(self):
         """Test that _find_similar_cached_configs respects max_configs limit."""
@@ -527,7 +580,7 @@ class TestCacheMatching(unittest.TestCase):
                 return_value=("NVIDIA GeForce RTX 4090", "('tensor_spec',)")
             )
             mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+            mock_search.config_spec.cache_fingerprint_hash = MagicMock(
                 return_value=fp_hash
             )
 
@@ -616,7 +669,7 @@ class TestCacheMatching(unittest.TestCase):
                 return_value=("NVIDIA GeForce RTX 5090", current_normalized)
             )
             mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+            mock_search.config_spec.cache_fingerprint_hash = MagicMock(
                 return_value=fp_hash
             )
 
@@ -666,7 +719,7 @@ class TestCacheMatching(unittest.TestCase):
             mock_search.settings.autotune_best_available_max_cache_scan = 500
             mock_search.args = [torch.tensor([1.0], device=DEVICE)]
             mock_search.config_spec = MagicMock()
-            mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+            mock_search.config_spec.cache_fingerprint_hash = MagicMock(
                 return_value=fp_hash
             )
 
@@ -737,9 +790,7 @@ class TestRemoteCacheMerging(unittest.TestCase):
             return_value=(hardware, spec_key)
         )
         mock_search.config_spec = MagicMock()
-        mock_search.config_spec.structural_fingerprint_hash = MagicMock(
-            return_value=fp_hash
-        )
+        mock_search.config_spec.cache_fingerprint_hash = MagicMock(return_value=fp_hash)
         return mock_search
 
     def test_remote_entries_returned_when_local_empty(self):
@@ -1163,7 +1214,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
                 hardware="test_hw",
                 runtime_name="1.0",
                 backend="triton",
-                config_spec_hash=config_spec.structural_fingerprint_hash(
+                config_spec_hash=config_spec.cache_fingerprint_hash(
                     advanced_controls_files=acf_files
                 ),
             )
@@ -1232,6 +1283,101 @@ class TestStructuralFingerprint(unittest.TestCase):
         self.assertEqual(
             spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
         )
+
+    def test_cache_fingerprint_tracks_ordered_compiler_configs(self):
+        def make_spec() -> ConfigSpec:
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+            return spec
+
+        seed_a = Config(block_sizes=[64], num_warps=4)
+        seed_b = Config(block_sizes=[128], num_warps=8)
+
+        baseline = make_spec()
+        baseline.compiler_seed_configs = [seed_a, seed_b]
+
+        changed_value = make_spec()
+        changed_value.compiler_seed_configs = [
+            Config(block_sizes=[64], num_warps=2),
+            seed_b,
+        ]
+
+        changed_order = make_spec()
+        changed_order.compiler_seed_configs = [seed_b, seed_a]
+
+        changed_default = make_spec()
+        changed_default.compiler_seed_configs = [seed_a, seed_b]
+        changed_default.compiler_default_config = seed_a
+
+        changed_default_value = make_spec()
+        changed_default_value.compiler_seed_configs = [seed_a, seed_b]
+        changed_default_value.compiler_default_config = seed_b
+
+        equivalent_key_order = make_spec()
+        equivalent_key_order.compiler_seed_configs = [
+            Config.from_dict({"num_warps": 4, "block_sizes": [64]}),
+            seed_b,
+        ]
+
+        specs = (
+            changed_value,
+            changed_order,
+            changed_default,
+            changed_default_value,
+            equivalent_key_order,
+        )
+        for spec in specs:
+            self.assertEqual(
+                baseline.structural_fingerprint(), spec.structural_fingerprint()
+            )
+
+        baseline_hash = baseline.cache_fingerprint_hash()
+        self.assertNotEqual(baseline_hash, changed_value.cache_fingerprint_hash())
+        self.assertNotEqual(baseline_hash, changed_order.cache_fingerprint_hash())
+        self.assertNotEqual(baseline_hash, changed_default.cache_fingerprint_hash())
+        self.assertNotEqual(
+            changed_default.cache_fingerprint_hash(),
+            changed_default_value.cache_fingerprint_hash(),
+        )
+        self.assertEqual(baseline_hash, equivalent_key_order.cache_fingerprint_hash())
+
+        default_only_a = make_spec()
+        default_only_a.compiler_default_config = seed_a
+        default_only_b = make_spec()
+        default_only_b.compiler_default_config = seed_b
+        self.assertNotEqual(
+            default_only_a.cache_fingerprint_hash(),
+            default_only_b.cache_fingerprint_hash(),
+        )
+
+    def test_cache_fingerprint_without_compiler_configs_is_byte_compatible(self):
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=64))
+        historical_hash = hashlib.sha256(
+            repr(spec.structural_fingerprint()).encode("utf-8")
+        ).hexdigest()
+
+        self.assertEqual(spec.structural_fingerprint_hash(), historical_hash)
+        self.assertEqual(spec.cache_fingerprint_hash(), historical_hash)
+
+        key_kwargs = {
+            "specialization_key": ("tensor_spec",),
+            "extra_results": (),
+            "kernel_source_hash": "source",
+            "hardware": "hardware",
+            "runtime_name": "runtime",
+            "backend": "triton",
+        }
+        historical_key = LooseAutotuneCacheKey(
+            **key_kwargs,
+            config_spec_hash=historical_hash,
+        )
+        current_key = LooseAutotuneCacheKey(
+            **key_kwargs,
+            config_spec_hash=spec.cache_fingerprint_hash(),
+        )
+        self.assertEqual(repr(current_key), repr(historical_key))
+        self.assertEqual(current_key.stable_hash(), historical_key.stable_hash())
 
     def test_enum_choices_change_fingerprint(self):
         """Enum search-space changes should invalidate exact-cache entries."""

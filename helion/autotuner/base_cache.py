@@ -135,7 +135,9 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     hardware: Hardware of the input device
     runtime_name: Version of the cuda/rocm arch
     backend: Kernel backend (e.g. triton, pallas)
-    config_spec_hash: Hash of the config spec (available knobs and their ranges)
+    config_spec_hash: Hash of the config spec's persistent-cache identity
+        (available knobs and their ranges, plus any compiler-owned default and
+        ordered seed configs)
     extra_cache_key: Optional extra cache key from the kernel (e.g. fusion context hash)
     best_of_k: Number of autotune trials run with different random seeds; the
         winning config across trials is the one cached. Default ``1`` (the
