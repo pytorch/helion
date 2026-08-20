@@ -1489,6 +1489,7 @@ class PallasBackend(Backend):
     ) -> None:
         from ...autotuner.config_spec import VALID_PALLAS_WORKLIST_GROUPINGS
         from ..compile_environment import CompileEnvironment
+        from .plan_tiling import order_grid_for_shared_outputs
         from .plan_tiling import plan_tiling
         from .tensorcore_plan import build_tensorcore_plans
 
@@ -1504,6 +1505,7 @@ class PallasBackend(Backend):
         env = CompileEnvironment.current()
 
         plan_tiling(graphs, config, tile_strategy)
+        order_grid_for_shared_outputs(graphs, tile_strategy)
         build_tensorcore_plans(graphs, config)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
