@@ -1,4 +1,4 @@
-"""Lower scalar-indexed loads from TPU VMEM-resident tensor references.
+"""Lower scalar-indexed accesses to TPU VMEM-resident tensor references.
 
 TPU VMEM is physically tiled in the two minor dimensions, and Mosaic cannot
 project a runtime scalar index out of either one directly. For 32-bit dtypes
@@ -7,9 +7,10 @@ itself (``ref[i, :]``); the lane dimension is then selected with a static
 index after the load. Packed dtypes and dynamic lane indices instead load
 the window, pad it to the physical tile, rotate the requested element to
 index zero, widen to a 32-bit register type, and extract statically.
+Stores use an aligned full-window read-modify-write with a one-hot mask.
 
-``classify_vmem_scalar_load`` decides whether a load needs this lowering;
-``emit_vmem_scalar_load`` generates it.
+``classify_vmem_scalar_load`` classifies both loads and stores; the emitters
+generate the operation-specific lowering.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.ast_extension import statement_from_string
 
 if TYPE_CHECKING:
     import ast
@@ -69,7 +71,7 @@ def _resident_extent(state: CodegenState, tensor: torch.Tensor, dim: int) -> int
     dim_size = tensor.shape[dim]
     if not isinstance(dim_size, int):
         raise NotImplementedError(
-            "Pallas VMEM scalar load requires a static resident extent"
+            "Pallas VMEM scalar access requires a static resident extent"
         )
 
     tiling = state.device_function.pallas_tensor_dim_tilings[id(tensor)][dim]
@@ -81,7 +83,7 @@ def _resident_extent(state: CodegenState, tensor: torch.Tensor, dim: int) -> int
         )
         if not isinstance(block_size, int):
             raise NotImplementedError(
-                "Pallas VMEM scalar load requires a static block size"
+                "Pallas VMEM scalar access requires a static block size"
             )
         return min(dim_size, block_size)
     return dim_size
@@ -101,9 +103,9 @@ def classify_vmem_scalar_load(
     index_parts: list[str],
     indexing_patterns: list[object],
 ) -> VmemScalarLoad | None:
-    """Decide whether a load needs the VMEM scalar-load lowering.
+    """Decide whether an access needs the VMEM scalar-index lowering.
 
-    ``None`` means an ordinary load: no runtime scalar index on the two minor
+    ``None`` means an ordinary access: no runtime scalar index on the two minor
     dims, or a form Mosaic already lowers (static 32-bit extracts).
     """
     from helion._compiler.device_function import PallasMemorySpace
@@ -249,3 +251,64 @@ def emit_vmem_scalar_load(
     if _sublane_load_applies(tensor, load):
         return _sublane_load_expr(tensor, ref_name, index_parts, load)
     return _roll_load_expr(tensor, ref_name, index_parts, load)
+
+
+def needs_vmem_scalar_store(tensor: torch.Tensor, access: VmemScalarLoad) -> bool:
+    """Whether a store needs the select-merge lowering.
+
+    32-bit dtypes can put a runtime sublane index in the ref subscript
+    directly; packed dtypes and runtime lane indices cannot.
+    """
+    return not _sublane_load_applies(tensor, access)
+
+
+def emit_vmem_scalar_store(
+    tensor: torch.Tensor,
+    ref_name: str,
+    index_parts: list[str],
+    value: ast.AST,
+    value_var: str,
+    access: VmemScalarLoad,
+) -> list[ast.stmt]:
+    """Store through a runtime scalar index on a tiled minor dim.
+
+    Reads the full minor-dim window, selects the target slice with a one-hot
+    mask, and writes the window back. The window stays aligned, so Mosaic
+    accepts it; correctness relies on the window being resident in VMEM.
+    """
+    window_parts = [*index_parts]
+    for dim in access.scalar_dims:
+        window_parts[dim] = ":"
+    window = f"{ref_name}[{', '.join(window_parts)}]"
+
+    window_dims = [
+        d
+        for d in range(tensor.ndim)
+        if d in access.scalar_dims or not _is_scalar_index_pattern(access.patterns[d])
+    ]
+    rank = len(window_dims)
+    value_expr = "{value}"
+    masks: list[str] = []
+    for dim in access.scalar_dims:
+        axis = window_dims.index(dim)
+        value_expr = f"jnp.expand_dims({value_expr}, axis={axis})"
+        extent = access.extents[dim]
+        if extent == 1:
+            continue
+        static = access.static_indices[dim]
+        index = str(static) if static is not None else f"({index_parts[dim]})"
+        shape = ", ".join(
+            str(extent) if i == axis else f"{value_var}.shape[{i}]" for i in range(rank)
+        )
+        masks.append(
+            f"(lax.broadcasted_iota(jnp.int32, ({shape},), {axis}) == {index})"
+        )
+    statements = [statement_from_string(f"{value_var} = {value_expr}", value=value)]
+    if not masks:
+        statements.append(statement_from_string(f"{window} = {value_var}"))
+        return statements
+    mask = " & ".join(masks)
+    statements.append(
+        statement_from_string(f"{window} = jnp.where({mask}, {value_var}, {window})")
+    )
+    return statements
