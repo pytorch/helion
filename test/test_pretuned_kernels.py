@@ -27,6 +27,7 @@ from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfSharedMemoryLessThan
 
 
 def _under_xdist() -> bool:
@@ -392,6 +393,10 @@ class TestPretunedKernelsCorrectness(TestCase):
     def test_rope_bwd(self):
         self._run_correctness("rope_bwd")
 
+    @skipIfSharedMemoryLessThan(
+        147456,
+        reason="pretuned sm90 scaled_mm config exceeds device shared memory limit",
+    )
     def test_scaled_mm(self):
         if not is_cuda():
             self.skipTest("Pretuned kernels require CUDA / ROCm.")
