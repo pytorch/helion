@@ -33,6 +33,7 @@ from .type_info import CallableType
 from .type_info import CollectionType
 from .type_info import DictType
 from .type_info import LiteralType
+from .type_info import NestedFunctionType
 from .type_info import NoType
 from .type_info import NumericType
 from .type_info import SequenceType
@@ -761,8 +762,35 @@ class TypePropagation(ast.NodeVisitor):
                 "Failed to unpack */** args to function, got: "
                 + ", ".join(map(str, unhandled))
             )
+        if isinstance(func, NestedFunctionType):
+            return self._call_nested_function(func, args)
+
         # pyrefly: ignore [bad-argument-type, bad-return]
         return func.propagate_call(tuple(args), kwargs, self.origin())
+
+    def _call_nested_function(
+        self, func: NestedFunctionType, args: list[TypeInfo]
+    ) -> TypeInfo:
+        func_node = func.func_node
+        params = func_node.args
+        if len(args) != len(params.args):
+            raise exc.TypeInferenceError(
+                f"Function '{func_node.name}' expects "
+                f"{len(params.args)} arguments, got {len(args)}"
+            )
+        self.push_scope()
+        for param, arg_type in zip(params.args, args, strict=True):
+            self.scope.set(param.arg, arg_type)
+        try:
+            result: TypeInfo = NoType(origin=self.origin())
+            for stmt in func_node.body:
+                if isinstance(stmt, ast.Return) and stmt.value is not None:
+                    result = self.visit(stmt.value)
+                    break
+                result = self.visit(stmt)
+        finally:
+            self.pop_scope()
+        return result
 
     def visit_IfExp(self, node: ast.IfExp) -> TypeInfo:
         test = self.visit(node.test)
@@ -1214,9 +1242,24 @@ class TypePropagation(ast.NodeVisitor):
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_SetComp: _VisitMethod = _not_supported
 
-    # TODO(jansel): support closure functions defined on host
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
-    visit_FunctionDef: _VisitMethod = _not_supported
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> TypeInfo:
+        args = node.args
+        if args.vararg:
+            raise exc.StatementNotSupported(
+                f"*args not supported in nested function '{node.name}'"
+            )
+        if args.kwarg:
+            raise exc.StatementNotSupported(
+                f"**kwargs not supported in nested function '{node.name}'"
+            )
+        if args.defaults or args.kw_defaults:
+            raise exc.StatementNotSupported(
+                f"Default arguments not supported in nested function '{node.name}'"
+            )
+        func_type = NestedFunctionType(origin=self.origin(), func_node=node)
+        self.scope.set(node.name, func_type)
+        return func_type
 
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_ClassDef: _VisitMethod = _not_supported

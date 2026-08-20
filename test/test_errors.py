@@ -491,8 +491,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 result[i] = x[i] * 2
             return result
 
-        with self.assertRaises(helion.exc.StatementNotSupported):
-            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+        code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
 
     def test_direct_scalar_tensor_in_device_context(self):
         """Test that direct scalar tensor usage gives clear error in device code."""
@@ -626,6 +625,48 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             r"Device loop is empty after dead-code elimination",
         ):
             code_and_output(empty_kernel, (torch.randn(4, 4, device=DEVICE),))
+
+    def test_nested_function_varargs(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def foo(*args):
+                return args[0]
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = foo(x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_function_kwargs(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def foo(**kwargs):
+                return kwargs["a"]
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = foo(a=x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_function_defaults(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def foo(a, b=1.0):
+                return a + b
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = foo(x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
 
 
 def _make_fake_kernel():

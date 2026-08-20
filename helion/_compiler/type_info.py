@@ -716,6 +716,21 @@ class StringType(TypeInfo):
         return "str"
 
 
+class NestedFunctionType(TypeInfo):
+    func_node: ast.FunctionDef
+
+    def __init__(
+        self,
+        origin: Origin,
+        func_node: ast.FunctionDef,
+    ) -> None:
+        super().__init__(origin)
+        self.func_node = func_node
+
+    def __str__(self) -> str:
+        return f"NestedFunctionType({self.func_node.name})"
+
+
 class ConfigFragmentType(LiteralType):
     """TypeInfo for config fragments are treated as constant literals during compilation."""
 
