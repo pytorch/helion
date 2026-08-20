@@ -46,6 +46,7 @@ KERNELS = [
     "softmax",
     "scaled_mm",
     "scale_mm_cute",
+    "residual",
     "nvfp4_gemv",
     "nvfp4_gemv_cute",
     "cross_entropy",

@@ -514,11 +514,13 @@ def _is_mma_candidate_loop(
     if not any(bid not in grid_ids for bid in block_ids):
         return False
     resolved_threads: list[int] = [
-        num_threads
-        if num_threads > 0
-        else int(block_size)
-        if isinstance(block_size, int)
-        else 0
+        (
+            num_threads
+            if num_threads > 0
+            else int(block_size)
+            if isinstance(block_size, int)
+            else 0
+        )
         for block_size, num_threads in zip(block_sizes, num_threads_config, strict=True)
     ]
     return _detect_mma_loop(
@@ -1150,7 +1152,10 @@ class CuteBackend(Backend):
             ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
+            "_cute_grouped_reduce_shared_two_stage_sum3": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage_sum3",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_bf16x2_accumulate3": "from helion._compiler.cute.reduce_helpers import _cute_bf16x2_accumulate3",
+            "_cute_bf16x2_sum_to_f32": "from helion._compiler.cute.reduce_helpers import _cute_bf16x2_sum_to_f32",
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
@@ -1842,9 +1847,11 @@ class CuteBackend(Backend):
             referenced_dims != (1, 1, 1) or has_nested_device_loops
         ):
             dims = tuple(
-                max(size, root_static_dims[axis], recorded_dims[axis])
-                if axis in final_thread_axes
-                else size
+                (
+                    max(size, root_static_dims[axis], recorded_dims[axis])
+                    if axis in final_thread_axes
+                    else size
+                )
                 for axis, size in enumerate(dims)
             )
             dims = tuple(
@@ -2068,9 +2075,11 @@ class CuteBackend(Backend):
                     int_positions.append(i)
                     int_block_sizes[i] = block_size
             resolved_threads = [
-                num_threads_config[i]
-                if num_threads_config[i] > 0
-                else int_block_sizes[i]
+                (
+                    num_threads_config[i]
+                    if num_threads_config[i] > 0
+                    else int_block_sizes[i]
+                )
                 for i in int_positions
             ]
             auto_positions = {
@@ -2342,11 +2351,15 @@ class CuteBackend(Backend):
                     static_threads = functools.reduce(
                         operator.mul,
                         (
-                            threads
-                            if threads > 0
-                            else int(block_size)
-                            if isinstance(block_size, int)
-                            else 0
+                            (
+                                threads
+                                if threads > 0
+                                else (
+                                    int(block_size)
+                                    if isinstance(block_size, int)
+                                    else 0
+                                )
+                            )
                             for block_size, threads in zip(
                                 nd_block_size,
                                 num_threads_config,

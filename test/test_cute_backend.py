@@ -210,6 +210,46 @@ def cute_row_sum(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_row_sum_fp32_cast(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        out[tile_n] = x[tile_n, :].to(torch.float32).sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_three_row_sums(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n, 3], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        values = x[tile_n, :].to(torch.float32)
+        sum_0 = values.sum(-1)
+        sum_1 = (values * values).sum(-1)
+        sum_2 = (values + 1.0).sum(-1)
+        out[tile_n, 0] = sum_0
+        out[tile_n, 1] = sum_1
+        out[tile_n, 2] = sum_2
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_packed_pair_stats(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty([n, 3], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        x_values = x[tile_n, :].to(torch.float32)
+        y_values = y[tile_n, :].to(torch.float32)
+        x2 = (x_values * x_values).sum(-1)
+        y2 = (y_values * y_values).sum(-1)
+        xy = (x_values * y_values).sum(-1)
+        out[tile_n, 0] = x2
+        out[tile_n, 1] = y2
+        out[tile_n, 2] = xy
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_normalize_by_sum(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty_like(x)
@@ -5874,6 +5914,99 @@ class TestCuteBackend(TestCase):
         self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
         self.assertIn("group_span=1024", code)
         self.assertIn("block=(1024, 1, 1)", code)
+
+    def test_vectorized_looped_reduction_uses_fewer_threads(self) -> None:
+        args = (torch.randn(16, 4096, device=DEVICE, dtype=torch.bfloat16),)
+        code, out = code_and_output(
+            cute_row_sum_fp32_cast,
+            args,
+            block_sizes=[8],
+            reduction_loop=512,
+            cute_vector_widths=[4],
+        )
+        (x,) = args
+        torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint16.mlir_type)", code)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+        self.assertIn("block=(32, 8, 1)", code)
+
+    def test_three_shared_sum_reductions_share_barriers(self) -> None:
+        args = (torch.randn(16, 4096, device=DEVICE, dtype=torch.bfloat16),)
+        code, out = code_and_output(
+            cute_three_row_sums,
+            args,
+            block_sizes=[4],
+            reduction_loop=1024,
+            cute_vector_widths=[4],
+        )
+        (x,) = args
+        values = x.float()
+        ref = torch.stack(
+            [values.sum(-1), (values * values).sum(-1), (values + 1.0).sum(-1)],
+            dim=1,
+        )
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage_sum3(", code)
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage(", code)
+
+    def test_packed_bf16x2_grouped_accumulation(self) -> None:
+        args = (
+            (torch.randn(16, 4096, device=DEVICE) + 2.0).to(torch.bfloat16),
+            (torch.randn(16, 4096, device=DEVICE) + 2.0).to(torch.bfloat16),
+        )
+        with patch.dict(
+            os.environ,
+            {"HELION_CUTE_PACKED_BF16X2_REDUCTION": "1"},
+        ):
+            code, out = code_and_output(
+                cute_packed_pair_stats,
+                args,
+                block_sizes=[4],
+                reduction_loop=1024,
+                cute_vector_widths=[4],
+            )
+        x, y = (arg.float() for arg in args)
+        ref = torch.stack(
+            [(x * x).sum(-1), (y * y).sum(-1), (x * y).sum(-1)],
+            dim=1,
+        )
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        self.assertIn("_cute_bf16x2_accumulate3(", code)
+        self.assertIn("ir.VectorType.get([2], cutlass.Uint32.mlir_type)", code)
+        self.assertIn("for reduction_lane_1 in cutlass.range_constexpr(8)", code)
+        self.assertIn("block=(32, 4, 1)", code)
+
+    def test_packed_bf16x2_multiwarp_warp0_epilogue(self) -> None:
+        args = (
+            (torch.randn(16, 4096, device=DEVICE) + 2.0).to(torch.bfloat16),
+            (torch.randn(16, 4096, device=DEVICE) + 2.0).to(torch.bfloat16),
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_PACKED_BF16X2_REDUCTION": "1",
+                "HELION_CUTE_PACKED_BF16X2_THREADS_PER_ROW": "128",
+                "HELION_CUTE_PACKED_BF16X2_WARP0_EPILOGUE": "1",
+            },
+        ):
+            code, out = code_and_output(
+                cute_packed_pair_stats,
+                args,
+                block_sizes=[1],
+                reduction_loop=2048,
+                cute_vector_widths=[4],
+            )
+        x, y = (arg.float() for arg in args)
+        ref = torch.stack(
+            [(x * x).sum(-1), (y * y).sum(-1), (x * y).sum(-1)],
+            dim=1,
+        )
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage_sum3(", code)
+        self.assertIn("if looped_reduce_lane_in_group < 32:", code)
+        self.assertIn("for reduction_lane_1 in cutlass.range_constexpr(4)", code)
+        self.assertIn("block=(128, 1, 1)", code)
 
     def test_cute_vector_widths_partitions_lane_extent(self) -> None:
         """cute_vector_widths=[V] partitions the lane extent into

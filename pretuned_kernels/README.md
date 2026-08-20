@@ -31,6 +31,7 @@ pretuned_kernels/
 ├── rope/
 ├── scaled_mm/
 ├── scale_mm_cute/                    # B200 CuTe (tcgen05) rowwise FP8 GEMM
+├── residual/                         # B200 CuTe BF16 residual statistics
 ├── grouped_gemm/                     # B200 grouped FP16 GEMM vs CuTeDSL
 ├── grouped_gemm_deepgemm/            # B200 grouped BF16 vs DeepGEMM + cuBLAS
 ├── nvfp4_gemv/                       # B200 Triton NVFP4 (W4A4 / W4A16) decode GEMV
@@ -57,6 +58,7 @@ At runtime Helion picks the file matching the current GPU.
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
 | `scale_mm_cute` | Skinny-M FP8 decode + decoder-layer FP8 W8A8 serving `(M, K, N)` shapes (B200 CuTe backend only) | `torch._scaled_mm` (rowwise) + vLLM CUTLASS |
+| `residual` | Fixed-shape `(tokens=16384, dim=8192)` BF16 residual statistics (B200 CuTe backend only) | eager PyTorch reference |
 | `grouped_gemm` | Seven CUTLASS-example-derived heterogeneous FP16 grouped-NT cases (3--4 GEMMs, including M/N tails; B200 CuTe only) | pinned NVIDIA CUTLASS CuTeDSL kernel |
 | `grouped_gemm_deepgemm` | Eight official DeepGEMM BF16 grouped-NT shapes with deterministic heterogeneous per-group M (B200 CuTe only) | pinned DeepGEMM `m_grouped_bf16_gemm_nt_contiguous` + CUDA's `cublasGemmGroupedBatchedEx` |
 | `nvfp4_gemv` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes (Llama-3 / Qwen projections), W4A4 + W4A16 (B200 Triton backend) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |

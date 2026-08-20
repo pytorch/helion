@@ -4,7 +4,73 @@ from __future__ import annotations
 import operator
 
 import cutlass
+from cutlass._mlir.dialects import llvm
 import cutlass.cute as cute
+from cutlass.cutlass_dsl import T
+
+
+@cute.jit
+def _cute_bf16x2_fma(
+    lhs: cutlass.Uint32,
+    rhs: cutlass.Uint32,
+    acc: cutlass.Uint32,
+) -> cutlass.Uint32:
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [lhs.ir_value(), rhs.ir_value(), acc.ir_value()],
+            "fma.rn.bf16x2 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _cute_bf16x2_accumulate3(
+    branch_pair: cutlass.Uint32,
+    stream_pair: cutlass.Uint32,
+    branch_acc: cutlass.Uint32,
+    stream_acc: cutlass.Uint32,
+    cross_acc: cutlass.Uint32,
+) -> tuple[cutlass.Uint32, cutlass.Uint32, cutlass.Uint32]:
+    """Accumulate three packed BF16x2 products with one rounding each."""
+
+    return (
+        _cute_bf16x2_fma(branch_pair, branch_pair, branch_acc),
+        _cute_bf16x2_fma(stream_pair, stream_pair, stream_acc),
+        _cute_bf16x2_fma(stream_pair, branch_pair, cross_acc),
+    )
+
+
+@cute.jit
+def _cute_bf16x2_sum_to_f32(value: cutlass.Uint32) -> cutlass.Float32:
+    """Widen both halves of a BF16x2 word and return their FP32 sum."""
+    lo = cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [value.ir_value()],
+            "{ .reg .b32 t; shl.b32 t, $1, 16; mov.b32 $0, t; }",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    hi = cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [value.ir_value()],
+            "{ .reg .b32 t; and.b32 t, $1, 0xffff0000; mov.b32 $0, t; }",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    return lo + hi
 
 
 @cute.jit
@@ -199,6 +265,78 @@ def _cute_grouped_reduce_shared_two_stage_sum(
         cute.arch.sync_threads()
 
     return smem[results_base + lane_mod_pre_var]
+
+
+@cute.jit
+def _cute_grouped_reduce_shared_two_stage_sum3(
+    input_value_0: cute.Numeric,
+    input_value_1: cute.Numeric,
+    input_value_2: cute.Numeric,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    lane_mod_pre_var: cutlass.Int32,
+    *,
+    pre: cutlass.Constexpr[int],
+    group_span: cutlass.Constexpr[int],
+    group_count: cutlass.Constexpr[int],
+) -> tuple[cute.Numeric, cute.Numeric, cute.Numeric]:
+    """Reduce three independent sums while sharing the CTA barriers."""
+    dtype = type(identity)
+    warps_per_group = group_span // 32
+    partials_size = group_count * pre * warps_per_group
+    results_size = group_count * pre
+    value_stride = partials_size + results_size
+    smem_ptr = cute.arch.alloc_smem(dtype, 3 * value_stride)
+    smem = cute.make_tensor(smem_ptr, (3 * value_stride,))
+    group_id = lane_var // group_span
+    lane_in_warp = lane_var % 32
+    warp_in_group = lane_in_group_var // 32
+    partials_base = group_id * (pre * warps_per_group)
+    results_base = partials_size + group_id * pre
+
+    for p in cutlass.range_constexpr(pre):
+        masked_0 = input_value_0 if lane_mod_pre_var == p else identity
+        masked_1 = input_value_1 if lane_mod_pre_var == p else identity
+        masked_2 = input_value_2 if lane_mod_pre_var == p else identity
+        warp_partial_0 = _warp_reduce_sum(masked_0, threads_in_group=32)
+        warp_partial_1 = _warp_reduce_sum(masked_1, threads_in_group=32)
+        warp_partial_2 = _warp_reduce_sum(masked_2, threads_in_group=32)
+        partial_idx = partials_base + p * warps_per_group + warp_in_group
+        if lane_in_warp == 0:
+            smem[partial_idx] = warp_partial_0
+            smem[value_stride + partial_idx] = warp_partial_1
+            smem[2 * value_stride + partial_idx] = warp_partial_2
+        cute.arch.sync_threads()
+
+        if warp_in_group == 0:
+            stage2_idx = partials_base + p * warps_per_group + lane_in_warp
+            stage2_0 = smem[stage2_idx] if lane_in_warp < warps_per_group else identity
+            stage2_1 = (
+                smem[value_stride + stage2_idx]
+                if lane_in_warp < warps_per_group
+                else identity
+            )
+            stage2_2 = (
+                smem[2 * value_stride + stage2_idx]
+                if lane_in_warp < warps_per_group
+                else identity
+            )
+            group_result_0 = _warp_reduce_sum(stage2_0, threads_in_group=32)
+            group_result_1 = _warp_reduce_sum(stage2_1, threads_in_group=32)
+            group_result_2 = _warp_reduce_sum(stage2_2, threads_in_group=32)
+            if lane_in_warp == 0:
+                smem[results_base + p] = group_result_0
+                smem[value_stride + results_base + p] = group_result_1
+                smem[2 * value_stride + results_base + p] = group_result_2
+        cute.arch.sync_threads()
+
+    result_idx = results_base + lane_mod_pre_var
+    return (
+        smem[result_idx],
+        smem[value_stride + result_idx],
+        smem[2 * value_stride + result_idx],
+    )
 
 
 @cute.jit

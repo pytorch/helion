@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import logging
 import operator
+import os
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -1096,6 +1097,76 @@ class LoopedReductionStrategy(ReductionStrategy):
             thread_count = env.backend.adjust_reduction_thread_count(
                 thread_count, tile_dispatch.strategies
             )
+        cute_vector_widths = cast(
+            "list[int]",
+            fn.config.config.get("cute_vector_widths", []) or [],
+        )
+        vec_width = env.config_spec.cute_vector_widths.config_get(
+            cute_vector_widths,
+            block_index,
+            1,
+        )
+        vec_mode = _cute_vec_kernel_mode() if env.backend.name == "cute" else "none"
+        if env.backend.name == "cute":
+            from .cute.pack_bf16x2_reductions import PACKED_BF16X2_CONFIG_KEY
+            from .cute.pack_bf16x2_reductions import PACKED_BF16X2_THREADS_CONFIG_KEY
+
+            packed_config = fn.config.config.get(PACKED_BF16X2_CONFIG_KEY)
+            packed_threads_config = fn.config.config.get(
+                PACKED_BF16X2_THREADS_CONFIG_KEY
+            )
+        else:
+            packed_config = None
+            packed_threads_config = None
+        packed_bf16x2 = bool(
+            env.backend.name == "cute"
+            and (packed_config or os.environ.get("HELION_CUTE_PACKED_BF16X2_REDUCTION"))
+        )
+        # A CuTe vector load gives each reduction thread V adjacent values.
+        # Keep the logical reduction chunk unchanged, but spend those V values
+        # on fewer threads instead of merely shortening the per-thread lane
+        # loop.  This both cuts the launch footprint and lets <=32-thread
+        # groups use warp shuffles rather than the shared-memory two-stage
+        # reduction.  Retain at least one warp so wide memory reductions still
+        # have enough independent lanes to hide latency.
+        if (
+            env.backend.name == "cute"
+            and isinstance(vec_width, int)
+            and 1 < vec_width <= 4
+            and vec_mode in ("vec", "unroll")
+            and thread_count > _CUTE_WARP_REDUCTION_THREADS
+        ):
+            candidate_threads = max(
+                _CUTE_WARP_REDUCTION_THREADS,
+                thread_count // (vec_width * (2 if packed_bf16x2 else 1)),
+            )
+            if (
+                block_size % candidate_threads == 0
+                and (block_size // candidate_threads) % vec_width == 0
+            ):
+                thread_count = candidate_threads
+        packed_threads = packed_threads_config or os.environ.get(
+            "HELION_CUTE_PACKED_BF16X2_THREADS_PER_ROW"
+        )
+        if packed_bf16x2 and packed_threads:
+            if not isinstance(packed_threads, (int, str)):
+                raise exc.InvalidConfig(
+                    "cute_packed_bf16x2_threads_per_row must be an integer"
+                )
+            requested_threads = int(packed_threads)
+            if (
+                max_threads is None
+                or requested_threads < _CUTE_WARP_REDUCTION_THREADS
+                or requested_threads > max_threads
+                or requested_threads & (requested_threads - 1)
+                or block_size % requested_threads != 0
+            ):
+                raise exc.InvalidConfig(
+                    "cute_packed_bf16x2_threads_per_row must be a "
+                    f"power of two in [32, {max_threads}] dividing "
+                    f"reduction block size {block_size}, got {requested_threads}"
+                )
+            thread_count = requested_threads
         self._thread_count = thread_count
         self.block_size = block_size
         self._loop_block_size = block_size
@@ -1128,21 +1199,12 @@ class LoopedReductionStrategy(ReductionStrategy):
             # Read autotuner-selected vector width and partition lane extent
             # into outer × inner = lane_extent/V × V.  When V==1 (default)
             # this preserves the original scalar codegen.
-            cute_vector_widths = cast(
-                "list[int]",
-                fn.config.config.get("cute_vector_widths", []) or [],
-            )
-            vec_width = env.config_spec.cute_vector_widths.config_get(
-                cute_vector_widths,
-                block_index,
-                1,
-            )
             if (
                 isinstance(vec_width, int)
                 and vec_width > 1
                 and self._cute_reduction_lane_extent % vec_width == 0
             ):
-                mode = _cute_vec_kernel_mode()
+                mode = vec_mode
                 if mode in ("vec", "unroll"):
                     self._cute_reduction_vec_width = vec_width
                     self._cute_reduction_vec_mode = mode

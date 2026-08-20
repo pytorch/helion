@@ -1057,6 +1057,26 @@ class DeviceFunction:
             kernel_body = pipeline_inner_loads(
                 kernel_body, constexpr_values, rename_groups=rename_groups
             )
+            from .cute.pack_bf16x2_reductions import PACKED_BF16X2_CONFIG_KEY
+            from .cute.pack_bf16x2_reductions import PACKED_BF16X2_WARP0_CONFIG_KEY
+            from .cute.pack_bf16x2_reductions import pack_bf16x2_reductions
+
+            kernel_body = pack_bf16x2_reductions(
+                kernel_body,
+                enabled=bool(self.config.config.get(PACKED_BF16X2_CONFIG_KEY)),
+            )
+            # Consecutive looped reductions over the same 64+-thread group
+            # otherwise invoke the two-stage shared-memory helper separately,
+            # paying two CTA barriers for every value.  Fuse triples of sums
+            # so they share the same pair of barriers.
+            from .cute.fuse_shared_sum_reductions import fuse_shared_sum_reductions
+
+            kernel_body = fuse_shared_sum_reductions(
+                kernel_body,
+                warp0_epilogue=bool(
+                    self.config.config.get(PACKED_BF16X2_WARP0_CONFIG_KEY)
+                ),
+            )
         return [
             *prefix,
             ast_rename(

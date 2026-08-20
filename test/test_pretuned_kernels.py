@@ -451,6 +451,31 @@ class TestPretunedKernelsCorrectness(TestCase):
 @onlyBackends(["cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedCuteCodegen(TestCase):
+    def test_residual_pretuned_kernel(self) -> None:
+        if torch.cuda.get_device_capability() < (10, 0):
+            self.skipTest("residual is pretuned for B200 (SM100).")
+
+        module = _import_pretuned_kernel_module("residual")
+        args = module._make_inputs(8, module.DIM)
+        bound = module.residual.bind(args)
+        actual = module.residual(*args)
+        expected = module._residual_torch(*args)
+        config = bound._config
+        assert config is not None
+        code = bound.to_triton_code(config)
+
+        self.assertEqual(config["block_sizes"], [1])
+        self.assertEqual(config["cute_vector_widths"], [4])
+        self.assertEqual(config["reduction_loops"], [2048])
+        self.assertEqual(config["cute_packed_bf16x2_threads_per_row"], 128)
+        self.assertTrue(config["cute_packed_bf16x2_reduction"])
+        self.assertTrue(config["cute_packed_bf16x2_warp0_epilogue"])
+        self.assertIn("_cute_bf16x2_accumulate3(", code)
+        self.assertIn("_cute_grouped_reduce_shared_two_stage_sum3(", code)
+        self.assertIn("if looped_reduce_lane_in_group < 32:", code)
+        self.assertIn("block=(128, 1, 1)", code)
+        torch.testing.assert_close(actual, expected, atol=4.0e-2, rtol=1.0e-2)
+
     def test_scale_mm_pretuned_explicit_epilogue_configs(self) -> None:
         path = (
             PRETUNED_KERNELS_DIR
