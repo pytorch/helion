@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import datetime
 import functools
+from itertools import combinations
 from itertools import count
 from itertools import starmap
 import math
@@ -92,10 +93,14 @@ class _MultiShapeAutotuneArgs:
     relative_to: MultiShapeReference
     cache_tag: str | None
     workload_key: tuple[object, ...]
+    num_config_limit: int = 1
     reference_latencies: tuple[float, ...] | None = None
     measurements: dict[str, tuple[tuple[float, ...], float, tuple[str, ...]]] = (
         dataclasses.field(default_factory=dict)
     )
+    measured_configs: dict[str, Config] = dataclasses.field(default_factory=dict)
+    selected_configs: tuple[Config, ...] = ()
+    selected_config_indices: tuple[int, ...] = ()
     defer_selected_log: bool = False
     search_started: bool = False
     found_valid_config: bool = False
@@ -105,6 +110,13 @@ class _MultiShapeAutotuneArgs:
 
     def __getitem__(self, index: int | slice) -> object:
         return self.cases[0][1][index]
+
+
+@dataclasses.dataclass(frozen=True)
+class _MultiShapeConfigSelection:
+    configs: tuple[Config, ...]
+    case_config_indices: tuple[int, ...]
+    objective: float
 
 
 def _aggregate_values(
@@ -136,6 +148,158 @@ def _aggregate_multi_shape_timings(
         for timing, reference in zip(timings, references, strict=True)
     ]
     return _aggregate_values(ratios, aggregation)
+
+
+def _evaluate_multi_shape_config_selection(
+    args: _MultiShapeAutotuneArgs,
+    config_keys: Sequence[str],
+) -> tuple[float, tuple[int, ...]]:
+    """Evaluate a portfolio, respecting cases that share one specialization."""
+    if not config_keys:
+        return inf, ()
+
+    groups: list[list[int]] = []
+    group_by_kernel_id: dict[int, int] = {}
+    for case_index, (bound_kernel, _) in enumerate(args.cases):
+        kernel_id = id(bound_kernel)
+        group_index = group_by_kernel_id.get(kernel_id)
+        if group_index is None:
+            group_index = len(groups)
+            group_by_kernel_id[kernel_id] = group_index
+            groups.append([])
+        groups[group_index].append(case_index)
+
+    selected_timings = [inf] * len(args.cases)
+    case_config_indices = [0] * len(args.cases)
+    for case_indices in groups:
+        references = (
+            [args.reference_latencies[index] for index in case_indices]
+            if args.reference_latencies is not None
+            else None
+        )
+
+        group_objectives = [
+            _aggregate_multi_shape_timings(
+                [
+                    args.measurements[config_key][0][case_index]
+                    for case_index in case_indices
+                ],
+                aggregation=args.aggregation,
+                references=references,
+            )
+            for config_key in config_keys
+        ]
+        best_config_index = min(
+            range(len(config_keys)),
+            key=group_objectives.__getitem__,
+        )
+        timings = args.measurements[config_keys[best_config_index]][0]
+        for case_index in case_indices:
+            selected_timings[case_index] = timings[case_index]
+            case_config_indices[case_index] = best_config_index
+
+    objective = _aggregate_multi_shape_timings(
+        selected_timings,
+        aggregation=args.aggregation,
+        references=args.reference_latencies,
+    )
+    return objective, tuple(case_config_indices)
+
+
+def _select_multi_shape_configs(
+    args: _MultiShapeAutotuneArgs,
+) -> _MultiShapeConfigSelection:
+    """Select a bounded portfolio from all valid measured configs."""
+    candidate_keys = [
+        key
+        for key, (_, objective, _) in args.measurements.items()
+        if math.isfinite(objective) and key in args.measured_configs
+    ]
+    if not candidate_keys:
+        return _MultiShapeConfigSelection((), (), inf)
+
+    target_size = min(args.num_config_limit, len(candidate_keys))
+    if math.comb(len(candidate_keys), target_size) <= 50_000:
+        selected_keys = []
+        selected_objective = inf
+        selected_indices: tuple[int, ...] = ()
+        for key_tuple in combinations(candidate_keys, target_size):
+            objective, indices = _evaluate_multi_shape_config_selection(args, key_tuple)
+            if objective < selected_objective:
+                selected_keys = list(key_tuple)
+                selected_objective = objective
+                selected_indices = indices
+    else:
+        # Large searches use forward selection followed by swap-based local
+        # improvement. Exact subset search grows combinatorially with the number
+        # of benchmarked candidates.
+        selected_keys = []
+        selected_objective = inf
+        selected_indices = ()
+        while len(selected_keys) < target_size:
+            best_key: str | None = None
+            best_objective = selected_objective
+            best_indices = selected_indices
+            for key in candidate_keys:
+                if key in selected_keys:
+                    continue
+                objective, indices = _evaluate_multi_shape_config_selection(
+                    args, [*selected_keys, key]
+                )
+                if best_key is None or objective < best_objective:
+                    best_key = key
+                    best_objective = objective
+                    best_indices = indices
+            if best_key is None or (
+                selected_keys and not best_objective < selected_objective
+            ):
+                break
+            selected_keys.append(best_key)
+            selected_objective = best_objective
+            selected_indices = best_indices
+
+        while selected_keys:
+            best_replacement: tuple[int, str] | None = None
+            best_objective = selected_objective
+            best_indices = selected_indices
+            for selected_index in range(len(selected_keys)):
+                for key in candidate_keys:
+                    if key in selected_keys:
+                        continue
+                    replaced = list(selected_keys)
+                    replaced[selected_index] = key
+                    objective, indices = _evaluate_multi_shape_config_selection(
+                        args, replaced
+                    )
+                    if objective < best_objective:
+                        best_replacement = selected_index, key
+                        best_objective = objective
+                        best_indices = indices
+            if best_replacement is None:
+                break
+            selected_keys[best_replacement[0]] = best_replacement[1]
+            selected_objective = best_objective
+            selected_indices = best_indices
+
+    # Do not retain configs that make no contribution to the selected objective.
+    removed_redundant = True
+    while removed_redundant and len(selected_keys) > 1:
+        removed_redundant = False
+        for index in range(len(selected_keys)):
+            reduced = selected_keys[:index] + selected_keys[index + 1 :]
+            objective, indices = _evaluate_multi_shape_config_selection(args, reduced)
+            if objective <= selected_objective:
+                selected_keys = reduced
+                selected_objective = objective
+                selected_indices = indices
+                removed_redundant = True
+                break
+
+    return _MultiShapeConfigSelection(
+        tuple(copy.deepcopy(args.measured_configs[key]) for key in selected_keys),
+        selected_indices,
+        selected_objective,
+    )
 
 
 def _format_multi_shape_measurement(
@@ -209,6 +373,61 @@ def _format_selected_multi_shape_measurement(
         aggregate,
         selected=True,
         statuses=statuses,
+    )
+
+
+def _format_selected_multi_shape_configs(
+    args: _MultiShapeAutotuneArgs,
+    selection: _MultiShapeConfigSelection,
+) -> str:
+    """Format a selected portfolio and the config assigned to each case."""
+    config_rows = [
+        f"[{index}] {config}" for index, config in enumerate(selection.configs)
+    ]
+    case_rows = []
+    for case_index, config_index in enumerate(selection.case_config_indices):
+        config = selection.configs[config_index]
+        timings, _, statuses = args.measurements[repr(config)]
+        timing = timings[case_index]
+        status = statuses[case_index]
+        row = (
+            f"arg_sets[{case_index}]: config=[{config_index}], "
+            f"latency={timing:.6f} ms, status={status}"
+        )
+        if args.reference_latencies is not None:
+            reference = args.reference_latencies[case_index]
+            row += (
+                f", {args.relative_to} reference={reference:.6f} ms, "
+                f"ratio={timing / reference:.6f}x"
+            )
+        case_rows.append(row)
+
+    if args.reference_latencies is None:
+        objective = (
+            f"{args.aggregation}(selected latencies)={selection.objective:.6f} ms"
+        )
+    else:
+        objective = (
+            f"{args.aggregation}(selected latency ratios vs {args.relative_to})="
+            f"{selection.objective:.6f}x"
+        )
+    best_single = min(
+        measurement[1]
+        for measurement in args.measurements.values()
+        if math.isfinite(measurement[1])
+    )
+    speedup = best_single / selection.objective
+    details = "\n  ".join(
+        [
+            *config_rows,
+            *case_rows,
+            f"objective: {objective}",
+            f"speedup vs best single-config objective: {speedup:.6f}x",
+        ]
+    )
+    return (
+        f"Selected multi-shape config portfolio "
+        f"({len(selection.configs)} configs):\n  {details}"
     )
 
 
@@ -1933,6 +2152,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 and math.isfinite(result.perf)
                 and result.perf > 0
                 for result in row
+            )
+            self.args.measured_configs[materialized_keys[child_config_index]] = (
+                copy.deepcopy(executed_configs[child_config_index])
             )
             perf = (
                 _aggregate_multi_shape_timings(
