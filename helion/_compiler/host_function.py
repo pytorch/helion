@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     import types
 
     from .device_ir import DeviceIR
+    from .loop_dependency_checker import TileDependencyAnalysis
     from .source_location import SourceLocation
     from .type_info import TypeInfo
 
@@ -103,6 +104,7 @@ class CompilerState:
     )
     global_imports: dict[str, GlobalImport] = dataclasses.field(default_factory=dict)
     rng_seed_slot_count: int = 0
+    tile_dependency_analysis: TileDependencyAnalysis | None = None
 
 
 class HostFunction:

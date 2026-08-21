@@ -53,8 +53,9 @@ class KernelCompiler:
       2. Static loop unrolling
       3. Backend-specific AST customizations
       4. Type propagation
-      5. Config spec finalization
-      6. Device IR lowering
+      5. Top-level tile-dependency analysis
+      6. Config spec finalization
+      7. Device IR lowering
 
     The HostFunction is the mutable compilation state that each step
     operates on.
@@ -76,6 +77,7 @@ class KernelCompiler:
             self.unroll(hf)
             self.customize_ast(hf)
             self.propagate_types(hf)
+            self.analyze_tile_dependencies(hf)
             self.finalize_config()
             self.lower(hf)
         return hf
@@ -145,6 +147,15 @@ class KernelCompiler:
         # HostFunction.current() internally. pass hf explicitly?
         with measure("HostFunction.finalize_config_spec"):
             self.env.finalize_config_spec()
+
+    def analyze_tile_dependencies(self, hf: HostFunction) -> None:
+        """Record cross-root dependencies for later scheduling/lowering passes."""
+        from .loop_dependency_checker import analyze_top_level_tile_dependencies
+
+        with measure("HostFunction.analyze_tile_dependencies"):
+            hf.compiler_state.tile_dependency_analysis = (
+                analyze_top_level_tile_dependencies(hf.body)
+            )
 
     def lower(self, hf: HostFunction) -> None:
         from .device_ir import lower_to_device_ir

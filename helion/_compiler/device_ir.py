@@ -61,6 +61,7 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .loop_dependency_checker import LoopDependencyChecker
+from .loop_dependency_checker import TileDependency
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import defer_pallas_load_masks
@@ -793,6 +794,7 @@ class DeviceIR:
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
+        self.tile_dependencies: tuple[TileDependency, ...] = ()
         self.grid_block_ids: list[list[int]] = []
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
@@ -3704,6 +3706,9 @@ def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
+    tile_dependency_analysis = func.compiler_state.tile_dependency_analysis
+    if tile_dependency_analysis is not None:
+        device_ir.tile_dependencies = tile_dependency_analysis.tile_dependencies
     with func, device_ir, compile_lock:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
