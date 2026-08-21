@@ -339,6 +339,10 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 .. autoattribute:: Settings.ref_mode
 
    Select the reference execution strategy. ``RefMode.OFF`` runs compiled kernels (default); ``RefMode.EAGER`` runs the interpreter for debugging. Controlled by ``HELION_INTERPRET``.
+
+.. autoattribute:: Settings.retry_with_fallback
+
+   Retry a kernel that failed to launch due to resource limitations using the default configuration. Default is ``False``. Controlled by ``HELION_RETRY_WITH_FALLBACK``.
 ```
 
 ### Autotuner Hooks
@@ -408,6 +412,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
 | ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |
 | ``HELION_INTERPRET`` | ``ref_mode`` | Run kernels through the reference interpreter when set to ``1`` (maps to ``RefMode.EAGER``). |
+| ``HELION_RETRY_WITH_FALLBACK`` | ``retry_with_fallback`` | Retries a failed kernel launch with the default config if set to ``1``. |
 | ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate. Default is ``"LFBOTreeSearch"``. Other options: ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``, ``"LLMGuidedSearch"``, ``"LLMSeededSearch"``, ``"LLMSeededLFBOTreeSearch"``. See :doc:`autotuner` for LLM configuration. |
 | ``HELION_BACKEND`` | ``backend`` | Code generation backend (``"triton"`` (default), ``"pallas"``, ``"cute"``, ``"tileir"``). ``"cute"`` requires PyTorch built against CUDA 13 or later. |
 

@@ -68,6 +68,7 @@ from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
+from ..autotuner.logger import match_launch_resource_error
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -2226,11 +2227,36 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config: The configuration to set.
         """
         config = self._normalize_config(config)
-        self._run = self.compile_config(config)
+        run = self.compile_config(config)
+        if self.settings.retry_with_fallback and config != (
+            default_config := self.env.config_spec.default_config()
+        ):
+            run = self._run_with_fallback(run, default_config)
+        self._run = run
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
+
+    def _run_with_fallback(
+        self, run: CompiledConfig, fallback_config: Config
+    ) -> CompiledConfig:
+        """Wrap ``run`` to retry once with the ``fallback_config`` if it raises a
+        launch resource error (shared memory, registers, grid size)."""
+
+        def run_with_fallback(*args: object) -> _R:
+            try:
+                return run(*args)
+            except Exception as e:
+                if not match_launch_resource_error(e):
+                    raise
+                log.warning(
+                    f"Kernel {self.kernel.name} failed to launch; retrying with the fallback config"
+                )
+                fallback = self.compile_config(fallback_config)
+                return fallback(*args)
+
+        return run_with_fallback
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
