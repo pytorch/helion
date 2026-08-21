@@ -61,6 +61,12 @@ if TYPE_CHECKING:
 # be reinstated.
 _RELAYOUT_TARGETS = frozenset({torch.ops.aten.permute.default})
 
+# Per-load map from deferred block id to the downstream ``_mask_to`` node names
+# that discharge its mask. Pallas emit-pipeline lowering uses this proof to add
+# a physical tensor-extent mask at the same cheap, post-relayout location when a
+# shortened DMA can leave its VMEM tail stale.
+PALLAS_DEFERRED_MASK_CONSUMERS_META = "pallas_deferred_mask_consumers"
+
 
 def mask_node_inputs(
     node: torch.fx.Node,
@@ -334,6 +340,23 @@ def defer_pallas_load_masks(graph: torch.fx.Graph) -> None:
         memo[node] = result
         return result
 
+    def collect_remask_consumers(
+        node: torch.fx.Node,
+        block_id: int,
+        seen: set[torch.fx.Node],
+    ) -> set[torch.fx.Node]:
+        """Collect terminal zero-fill masks after ``all_uses_remask`` succeeds."""
+        if node in seen:
+            return set()
+        seen.add(node)
+        result: set[torch.fx.Node] = set()
+        for user in node.users:
+            if is_remask(user, node, block_id):
+                result.add(user)
+            elif is_relayout(user):
+                result.update(collect_remask_consumers(user, block_id, seen))
+        return result
+
     changed = False
     for node in graph.find_nodes(op="call_function", target=load_op):
         val = node.meta.get("val")
@@ -345,6 +368,7 @@ def defer_pallas_load_masks(graph: torch.fx.Graph) -> None:
             if (block_id := env.resolve_block_id(size)) is not None
         }
         deferred: set[int] = set()
+        deferred_consumers: dict[int, tuple[str, ...]] = {}
         for block_id in candidates:
             # Profitability gate: defer only when the masked axis is a major/outer
             # dim at the load and a relayout carries it into the last-two
@@ -363,8 +387,15 @@ def defer_pallas_load_masks(graph: torch.fx.Graph) -> None:
                 continue
             if all_uses_remask(node, block_id, {}):
                 deferred.add(block_id)
+                deferred_consumers[block_id] = tuple(
+                    sorted(
+                        consumer.name
+                        for consumer in collect_remask_consumers(node, block_id, set())
+                    )
+                )
         if deferred:
             node.meta["pallas_deferred_mask_block_ids"] = frozenset(deferred)
+            node.meta[PALLAS_DEFERRED_MASK_CONSUMERS_META] = deferred_consumers
             node.meta["masked_value"] = None
             changed = True
 

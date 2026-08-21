@@ -1804,6 +1804,8 @@ class LoopDimInfo:
     begin_expr: sympy.Expr | None = None
     end_var_name: str | None = None
     end_expr: sympy.Expr | None = None
+    # True when the generated extent mask checks both the logical begin and end.
+    mask_has_lower_bound: bool = False
 
     def is_end_matching(self, size: int | torch.SymInt) -> bool:
         expected = _to_sympy(size)
@@ -1861,6 +1863,13 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Per downstream _mask_to node and block id, physical tensor bounds needed
+    # to zero lanes left stale by a shortened input DMA.
+    _deferred_physical_mask_bounds: dict[torch.fx.Node, dict[int, tuple[str, ...]]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    # Clean-region branches prove these physical bounds all-true for this tile.
+    _proven_physical_mask_block_ids: set[int] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
