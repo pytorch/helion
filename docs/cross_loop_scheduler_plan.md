@@ -633,6 +633,31 @@ affine accesses across simple views/reshapes, and let singleton roots wait on
 multiple proven root-completion events. None requires a Gemma-specific
 continuation or a new public tuning knob.
 
+The later exact-codegen probe recovered a performant lowering without changing
+that architecture. With the actual Helion-generated root bodies, the retained
+576-worker schedule measures approximately 72.2 microseconds versus
+79.8--80.0 microseconds for separate Helion. The winning changes are ordinary
+root configuration choices made for the fused envelope: QKV N=8/K=256 at four
+stages, output projection N=16/K=512 at three stages, gate/up N=32/K=256,
+activation width 256, streamed down K=512 at three stages, and PLE-gate K=256.
+The standalone gate-weight `evict_first` annotation must also be retained:
+omitting it measured 84.4 microseconds versus 72.25 microseconds with it in a
+matched post-copy run. This is an existing load-codegen choice, not a new
+scheduling strategy.
+
+Attention retiling did not expose a missing scheduler primitive. Q blocks 1
+and 2 were slower than the existing Q=4 shape, a smaller context tile was
+approximately neutral, and more attention splits were slower. Attention and
+output-projection continuations also regressed. Relaxed polling and alternate
+worker placement did not help.
+
+The final concurrency ablation is an important policy boundary: a 592-worker
+shape exactly filled the driver-reported resident capacity but regressed to
+111.2 microseconds. The scheduler must validate full residency for legality,
+but the cost model should preserve margin and must not assume that more
+resident work is faster. This remains a small deterministic policy over task
+counts and compiled resources, not a new dependency case.
+
 ## Validation matrix
 
 ### Dependency and legality tests
@@ -683,7 +708,7 @@ representation or traversal over adding a model-specific fast path.
 
 ## Known evidence and current baseline
 
-As of 2026-08-20:
+As of 2026-08-21:
 
 - The current full Qwen3 granular schedule runs at approximately 75
   microseconds versus approximately 81 microseconds for separate kernels on the
@@ -699,6 +724,12 @@ As of 2026-08-20:
   epoch-relative exact arrival target does not require power-of-two fan-in.
 - Explicit `static_shapes=False` scheduling now selects the existing safe
   cooperative phase-barrier fallback when task counts are unavailable.
+- The exact-codegen Gemma4 E4B probe now reaches approximately 72.2
+  microseconds versus 79.8--80.0 microseconds for separate Helion, with no
+  compiler changes and unchanged graph-derived legality.
+- Gemma attention retiling and additional legal continuations did not improve
+  the result. Joint fused-envelope tuning of existing root tile and range
+  settings supplied the gain.
 
 These observations motivate the edge-based design and define regressions that
 the migration must prevent.
@@ -872,3 +903,17 @@ Open, to be answered with implementation evidence:
   `tile_dependency_stages` and `continuation_split` public parameters.
 - The final focused validation covers 62 passing tests, 5 expected skips, and 9
   subtests; Ruff, focused Pyrefly checks, and `git diff --check` pass.
+- Retiled the exact generated Gemma4 roots while keeping scheduling primitives
+  unchanged. The best retained B200 result is approximately 72.2 microseconds
+  versus 79.8--80.0 microseconds for separate Helion.
+- Verified from lowered Triton and NCU that QKV N=8/K=256 and output projection
+  N=16/K=512 improve the combined resource envelope. Attention Q retiling,
+  attention/output continuations, relaxed polling, and worker spreading were
+  negative.
+- Reproduced the retained Gemma configuration from the integration worktree at
+  72.25 microseconds versus 80.04 microseconds for separate Helion. The
+  gate-weight `evict_first` annotation is required; omitting it regressed to
+  84.4 microseconds without changing the schedule.
+- Rejected a 592-worker boundary schedule after it measured 111.2
+  microseconds versus 80.2 microseconds. Full residency remains a legality
+  invariant, not a reason to fill every available CTA slot.
