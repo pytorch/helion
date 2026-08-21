@@ -306,11 +306,33 @@ def _target_names(target: ast.expr) -> tuple[str, ...]:
     return ()
 
 
+def _definitely_assigned_names(statement: ast.stmt) -> set[str]:
+    """Names assigned whenever normal execution continues past ``statement``."""
+    if isinstance(statement, ast.Assign):
+        return {name for target in statement.targets for name in _target_names(target)}
+    if isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        return set(_target_names(statement.target))
+    if isinstance(statement, ast.AugAssign):
+        return set(_target_names(statement.target))
+    if isinstance(statement, ast.If) and statement.orelse:
+        return _definitely_assigned_in_block(
+            statement.body
+        ) & _definitely_assigned_in_block(statement.orelse)
+    return set()
+
+
+def _definitely_assigned_in_block(body: list[ast.stmt]) -> set[str]:
+    result: set[str] = set()
+    for statement in body:
+        result.update(_definitely_assigned_names(statement))
+    return result
+
+
 def _live_in_read_names(body: list[ast.stmt]) -> set[str]:
     """Return names read before a definite root-local assignment.
 
-    This deliberately recognizes only straight-line assignments in the root
-    body. Definitions nested in control flow remain conservative live-ins.
+    Branch-local definitions count only when every branch assigns the name.
+    Loops remain conservative because they may execute zero times.
     """
     defined: set[str] = set()
     live_in: set[str] = set()
@@ -328,11 +350,7 @@ def _live_in_read_names(body: list[ast.stmt]) -> set[str]:
             if count > rw.inplace_writes.get(name, 0)
         } - loop_targets
         live_in.update(reads - defined)
-        if isinstance(statement, ast.Assign):
-            for target in statement.targets:
-                defined.update(_target_names(target))
-        elif isinstance(statement, ast.AnnAssign):
-            defined.update(_target_names(statement.target))
+        defined.update(_definitely_assigned_names(statement))
     return live_in
 
 

@@ -613,8 +613,6 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--epoch-replicas", type=int)
-    parser.add_argument("--tile-dependency-stages", type=int)
-    parser.add_argument("--continuation-split", type=int)
     parser.add_argument("--producer-order", choices=("physical", "consumer_major"))
     parser.add_argument("--strict-validation", action="store_true")
     parser.add_argument("--no-waits", action="store_true")
@@ -661,8 +659,6 @@ def main() -> None:
     probe.GENERATED_SOURCE = source
     _ACTIVE_TILE_DEPENDENCY_SCHEDULE = helion.TileDependencySchedule(
         epoch_replicas=args.epoch_replicas,
-        tile_dependency_stages=args.tile_dependency_stages,
-        continuation_split=args.continuation_split,
         producer_order=args.producer_order,
     )
     probe.qwen3_layer_tile_dependency = helion.kernel(

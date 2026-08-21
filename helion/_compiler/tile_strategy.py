@@ -1975,6 +1975,14 @@ class TileStrategy:
     def offset_var(self, block_idx: int) -> str:
         return self.offset_vars[block_idx]
 
+    def task_id_expr(self, block_idx: int) -> str | None:
+        """Return this axis's zero-based logical tile coordinate."""
+        block_size = self.block_size_var(block_idx)
+        offset = self.offset_var(block_idx)
+        if block_size in (None, "1"):
+            return offset
+        return f"({offset}) // ({block_size})"
+
     def index_var(self, block_idx: int) -> str:
         return self.index_vars[block_idx]
 
@@ -2545,6 +2553,10 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
     def offset_var(self, block_idx: int) -> str:
         raise NotImplementedError("offset_var not used in FlattenedTileStrategy")
+
+    def task_id_expr(self, block_idx: int) -> str | None:
+        # The flattened offset does not retain a coordinate for each logical axis.
+        return None
 
     def mask_var(self, block_idx: int) -> str | None:
         return self._mask_var

@@ -33,14 +33,16 @@ def _disable_plans(self, *args: object, **kwargs: object):
     return {}
 
 
+def _disable_sequence_plans(self, *args: object, **kwargs: object):
+    return ()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--disable-ordered-input", action="store_true")
     parser.add_argument("--disable-partitioned", action="store_true")
     parser.add_argument("--disable-continuation", action="store_true")
     parser.add_argument("--epoch-replicas", type=int)
-    parser.add_argument("--tile-dependency-stages", type=int)
-    parser.add_argument("--continuation-split", type=int)
     parser.add_argument("--producer-order", choices=("physical", "consumer_major"))
     parser.add_argument("--strict-validation", action="store_true")
     args, remaining = parser.parse_known_args()
@@ -50,7 +52,7 @@ def main() -> None:
     if args.disable_partitioned:
         ForEachProgramID._match_partitioned_dependency_pipeline = _disable_plans
     if args.disable_continuation:
-        ForEachProgramID._match_grouped_continuation = _disable_plans
+        ForEachProgramID._task_continuation_plans = _disable_sequence_plans
 
     import helion_qwen3_tile_dependency as probe
 
@@ -61,8 +63,6 @@ def main() -> None:
         autotune_effort="none",
         tile_dependency_schedule=helion.TileDependencySchedule(
             epoch_replicas=args.epoch_replicas,
-            tile_dependency_stages=args.tile_dependency_stages,
-            continuation_split=args.continuation_split,
             producer_order=args.producer_order,
         ),
     )(probe.qwen3_layer_tile_dependency.fn)

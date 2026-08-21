@@ -95,8 +95,6 @@ def main() -> None:
     parser.add_argument("--worker-multiplier", type=int, default=8)
     parser.add_argument("--kernel-stages", type=int, default=2)
     parser.add_argument("--epoch-replicas", type=int)
-    parser.add_argument("--tile-dependency-stages", type=int)
-    parser.add_argument("--continuation-split", type=int)
     parser.add_argument("--producer-order", choices=("physical", "consumer_major"))
     args = parser.parse_args()
 
@@ -115,8 +113,6 @@ def main() -> None:
     kernel, _source = probe._build_composite_kernel()
     schedule = helion.TileDependencySchedule(
         epoch_replicas=args.epoch_replicas,
-        tile_dependency_stages=args.tile_dependency_stages,
-        continuation_split=args.continuation_split,
         producer_order=args.producer_order,
     )
     scheduled = helion.kernel(

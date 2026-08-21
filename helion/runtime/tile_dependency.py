@@ -17,19 +17,13 @@ class TileDependencySchedule:
     """
 
     epoch_replicas: int | None = None
-    tile_dependency_stages: int | None = None
-    continuation_split: int | None = None
     producer_order: Literal["physical", "consumer_major"] | None = None
 
     def __post_init__(self) -> None:
-        for name in (
-            "epoch_replicas",
-            "tile_dependency_stages",
-            "continuation_split",
-        ):
-            value = getattr(self, name)
-            if value is not None and value <= 0:
-                raise ValueError(f"{name} must be positive or None, got {value!r}")
+        if self.epoch_replicas is not None and self.epoch_replicas <= 0:
+            raise ValueError(
+                f"epoch_replicas must be positive or None, got {self.epoch_replicas!r}"
+            )
         if self.producer_order not in (None, "physical", "consumer_major"):
             raise ValueError(
                 "producer_order must be 'physical', 'consumer_major', or None, "
@@ -39,8 +33,6 @@ class TileDependencySchedule:
     def __repr__(self) -> str:
         values = (
             ("epoch_replicas", self.epoch_replicas),
-            ("tile_dependency_stages", self.tile_dependency_stages),
-            ("continuation_split", self.continuation_split),
             ("producer_order", self.producer_order),
         )
         arguments = ", ".join(

@@ -27,7 +27,6 @@ from helion._compiler.program_id import ForEachProgramID
 from helion._compiler.program_id import _ast_fingerprint
 from helion._compiler.program_id import _clone_opaque_loop_segment
 from helion._compiler.program_id import _clone_opaque_statements
-from helion._compiler.program_id import _consumer_affinity_completion_prefixes
 from helion._compiler.program_id import _partitioned_materialization_geometry
 from helion._compiler.program_id import _prepend_schedule_to_opaque_loop
 from helion._compiler.tile_dependency_schedule import build_tile_dependency_stage_graph
@@ -73,6 +72,13 @@ def implicit_tile_dependency_chain(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         out[tile] = tmp[tile] * 2
     return out
+
+
+dynamic_implicit_tile_dependency_chain = helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    tile_dependency_schedule=helion.TileDependencySchedule(),
+)(implicit_tile_dependency_chain.fn)
 
 
 @helion.kernel(
@@ -252,28 +258,6 @@ class TestTileDependencyAnalysis(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "producer_order"):
             helion.TileDependencySchedule(producer_order="grouped")  # type: ignore[arg-type]
 
-    def test_consumer_major_order_is_derived_from_completion_prefix(self) -> None:
-        self.assertEqual(
-            _consumer_affinity_completion_prefixes(
-                group_count=10,
-                resident_workers=16,
-                tasks_per_group=4,
-                tiles_per_cohort=2,
-                cohort_stride=20,
-            ),
-            (4, 0),
-        )
-        self.assertEqual(
-            _consumer_affinity_completion_prefixes(
-                group_count=10,
-                resident_workers=40,
-                tasks_per_group=4,
-                tiles_per_cohort=2,
-                cohort_stride=20,
-            ),
-            (10, 10),
-        )
-
     def test_normalizes_host_views_and_aliases_to_base_storage(self) -> None:
         analysis = _analyze_source(
             """
@@ -315,6 +299,29 @@ class TestTileDependencyAnalysis(unittest.TestCase):
                 for j in range(n):
                     acc = 0
                     acc = acc + tmp[j]
+                    out[j] = acc
+            """
+        )
+        self.assertEqual(
+            [dependency.name for dependency in analysis.tile_dependencies],
+            ["tmp"],
+        )
+
+    def test_branch_defined_root_local_name_is_not_a_dependency(self) -> None:
+        analysis = _analyze_source(
+            """
+            def kernel(x, tmp, out, n, pred):
+                for i in range(n):
+                    if pred:
+                        acc = x[i] + 1
+                    else:
+                        acc = x[i] - 1
+                    tmp[i] = acc
+                for j in range(n):
+                    if pred:
+                        acc = tmp[j] * 2
+                    else:
+                        acc = tmp[j] * 3
                     out[j] = acc
             """
         )
@@ -503,6 +510,8 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         schedule = host_function.device_ir.tile_dependency_schedule
         assert analysis is not None
         assert schedule is not None
+        self.assertEqual(host_function.device_ir.cross_loop_accesses, ())
+        self.assertIsNone(host_function.device_ir.cross_loop_dependency_plan)
         self.assertEqual(analysis.source_phase_starts, frozenset({1}))
         self.assertEqual(schedule.stage_by_root, (0, 1))
         self.assertEqual(schedule.implicit_stage_starts, frozenset())
@@ -523,8 +532,8 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             )
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
-    def test_one_completion_counter_synchronizes_multiple_consumers(self) -> None:
-        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+    def test_one_task_event_synchronizes_multiple_consumers(self) -> None:
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
         code, outputs = code_and_output(
             implicit_tile_dependency_fanout,
             (x,),
@@ -535,6 +544,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out0, (x + 1) * 2)
         torch.testing.assert_close(out1, (x + 1) * 3)
         self.assertEqual(code.count("sem='release'"), 1)
+        self.assertIn("tile_dependency_task_epochs", code)
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
@@ -550,7 +560,23 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
         self.assertEqual(code.count("sem='release'"), 2)
+        self.assertIn("tile_dependency_task_epochs", code)
+        self.assertNotIn("tile_dependency_whole_value", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+
+    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
+    def test_dynamic_shape_schedule_uses_safe_phase_fallback(self) -> None:
+        x = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            dynamic_implicit_tile_dependency_chain,
+            (x,),
+            block_sizes=[16, 32],
+            pid_type="persistent_blocked",
+            num_warps=1,
+        )
+        torch.testing.assert_close(output, (x + 1) * 2)
+        self.assertIn("triton_helpers.x_grid_barrier(", code)
+        self.assertIn("launch_cooperative_grid=True", code)
 
     @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:

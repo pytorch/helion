@@ -31,6 +31,57 @@ _EVICTION_POLICY_MAP = {
 }
 
 
+def _mark_cross_loop_access_wait(state: CodegenState) -> None:
+    """Record an exact access-local scheduling point before a consumer load."""
+    from ..cross_loop_dependencies import CROSS_LOOP_ACCESS_ID_META
+    from ..cross_loop_dependencies import cross_loop_access_marker
+
+    fx_node = state.fx_node
+    if fx_node is None:
+        return
+    access_id = fx_node.meta.get(CROSS_LOOP_ACCESS_ID_META)
+    if not isinstance(access_id, int):
+        return
+    plan = state.codegen.host_function.device_ir.cross_loop_dependency_plan
+    if plan is None:
+        return
+    waits = tuple(
+        wait
+        for wait in plan.waits
+        if wait.consumer_access_id == access_id and wait.placement == "access"
+    )
+    if not waits:
+        return
+
+    required_block_ids = {
+        axis.consumer_block_id
+        for wait in waits
+        if wait.predecessor_map is not None
+        for axis in wait.predecessor_map.axes
+    }
+    coordinates: dict[int, str] = {}
+    for block_id in sorted(required_block_ids):
+        active_loops = state.codegen.active_device_loops.get(block_id)
+        if not active_loops:
+            state.device_function.cross_loop_access_coordinates[access_id] = None
+            return
+        coordinate = active_loops[-1].strategy.task_id_expr(block_id)
+        if coordinate is None:
+            state.device_function.cross_loop_access_coordinates[access_id] = None
+            return
+        coordinates[block_id] = coordinate
+
+    if access_id in state.device_function.cross_loop_access_coordinates:
+        prior = state.device_function.cross_loop_access_coordinates[access_id]
+        if prior is None or prior != coordinates:
+            state.device_function.cross_loop_access_coordinates[access_id] = None
+            return
+    state.device_function.cross_loop_access_coordinates[access_id] = coordinates
+    state.add_statement(
+        statement_from_string(repr(cross_loop_access_marker(access_id)))
+    )
+
+
 @_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -105,6 +156,8 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
+    _mark_cross_loop_access_wait(state)
+
     # A store to this tensor earlier in the same loop body followed by this load
     # is a cross-thread read-after-write on global memory; emit a barrier so the
     # store is visible before the read (see mark_intra_loop_raw_barriers).

@@ -27,8 +27,6 @@ sys.modules.setdefault("triton_qwen3_sm_overlap_probe", _compat_probe)
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--epoch-replicas", type=int)
-    parser.add_argument("--tile-dependency-stages", type=int)
-    parser.add_argument("--continuation-split", type=int)
     parser.add_argument("--producer-order", choices=("physical", "consumer_major"))
     parser.add_argument("--strict-validation", action="store_true")
     args, remaining = parser.parse_known_args()
@@ -40,8 +38,6 @@ def main() -> None:
         autotune_effort="none",
         tile_dependency_schedule=helion.TileDependencySchedule(
             epoch_replicas=args.epoch_replicas,
-            tile_dependency_stages=args.tile_dependency_stages,
-            continuation_split=args.continuation_split,
             producer_order=args.producer_order,
         ),
     )(probe.qwen3_ffn_tile_dependency.fn)

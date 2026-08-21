@@ -93,6 +93,8 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
+    from .cross_loop_dependencies import CrossLoopAccess
+    from .cross_loop_dependencies import CrossLoopDependencyPlan
     from .cute.layout import CuTeGridExecutionPlan
     from .tile_dependency_schedule import ResolvedTileDependencySchedule
 
@@ -799,7 +801,10 @@ class DeviceIR:
         self.tile_dependencies: tuple[TileDependency, ...] = ()
         self.tile_accesses: tuple[tuple[TileAccess, ...], ...] = ()
         self.tile_dependency_schedule: ResolvedTileDependencySchedule | None = None
+        self.cross_loop_accesses: tuple[CrossLoopAccess, ...] = ()
+        self.cross_loop_dependency_plan: CrossLoopDependencyPlan | None = None
         self.grid_block_ids: list[list[int]] = []
+        self.noncanonical_task_origin_block_ids: set[int] = set()
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
 
@@ -2422,6 +2427,19 @@ class WalkDeviceAST(NodeVisitor):
             for var in iter_vars:
                 assert isinstance(var, (TileIndexType, GridIndexType))
                 block_ids.append(var.block_id)
+            begin_values = begin if isinstance(begin, (list, tuple)) else [begin]
+            step_values = (
+                step if isinstance(step, (list, tuple)) else [step] * len(block_ids)
+            )
+            for block_id, begin_value, step_value in zip(
+                block_ids, begin_values, step_values, strict=True
+            ):
+                if (
+                    not isinstance(begin_value, int)
+                    or begin_value != 0
+                    or step_value not in (None, 1)
+                ):
+                    self.device_ir.noncanonical_task_origin_block_ids.add(block_id)
 
             host_reads, host_writes = rw.read_and_write_name_frozensets()
             graph_idx, outputs = self._trace_graph(
@@ -3074,6 +3092,54 @@ class LiftTensorArgs:
         return result
 
 
+def _literal_sequence_is(
+    expr: ast.expr,
+    *,
+    rank: int,
+    value: int,
+) -> bool:
+    if isinstance(expr, ast.Constant) and expr.value == value:
+        return True
+    if not isinstance(expr, (ast.List, ast.Tuple)) or len(expr.elts) != rank:
+        return False
+    return all(
+        isinstance(item, ast.Constant) and item.value == value for item in expr.elts
+    )
+
+
+def _root_loop_has_canonical_task_origin(
+    iter_expr: ast.expr,
+    rank: int,
+    *,
+    supports_step: bool,
+) -> bool:
+    """Return whether local PIDs map to zero-based, unit-stride coordinates."""
+    if not isinstance(iter_expr, ast.Call) or not iter_expr.args:
+        return False
+    if len(iter_expr.args) == 1 or (
+        len(iter_expr.args) >= 2
+        and isinstance(iter_expr.args[1], ast.Constant)
+        and iter_expr.args[1].value is None
+    ):
+        zero_start = True
+    else:
+        zero_start = _literal_sequence_is(iter_expr.args[0], rank=rank, value=0)
+    if not zero_start:
+        return False
+    if not supports_step:
+        return True
+
+    step = (
+        iter_expr.args[2]
+        if len(iter_expr.args) >= 3
+        else next(
+            (keyword.value for keyword in iter_expr.keywords if keyword.arg == "step"),
+            None,
+        )
+    )
+    return step is None or _literal_sequence_is(step, rank=rank, value=1)
+
+
 class WalkHostAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
@@ -3117,6 +3183,17 @@ class WalkHostAST(NodeVisitor):
                 # pyrefly: ignore [missing-attribute]
                 block_ids = [inner.block_id]
             self.device_ir.grid_block_ids.append(block_ids)
+            supports_step = (
+                all(isinstance(value, GridIndexType) for value in inner.unpack())
+                if isinstance(inner, SequenceType)
+                else isinstance(inner, GridIndexType)
+            )
+            if not _root_loop_has_canonical_task_origin(
+                node.iter,
+                len(block_ids),
+                supports_step=supports_step,
+            ):
+                self.device_ir.noncanonical_task_origin_block_ids.update(block_ids)
             # store root index (position) not graph id
             self.root_nodes.append(node)
             self.current_phase_roots.append(len(self.device_ir.root_ids) - 1)
@@ -3209,6 +3286,25 @@ def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
     """Return the block axis indexed by a tile-provenance subscript."""
     info = subscript_tile_info(env, sub)
     return info.block_id if info is not None else None
+
+
+def _subscript_is_scalar_tile_index(subscript: object) -> bool:
+    """Return whether an affine subscript is derived from ``tile.id``."""
+    if not isinstance(subscript, torch.fx.Node) or isinstance(
+        subscript.meta.get("val"), torch.Tensor
+    ):
+        return False
+    node = subscript
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        if node.target is hl.tile_id:
+            return True
+        node_args = [arg for arg in node.args if isinstance(arg, torch.fx.Node)]
+        if len(node_args) != 1:
+            return False
+        node = node_args[0]
+    return False
 
 
 def _tile_rank(dims: tuple[int | None, ...]) -> int:
@@ -3340,7 +3436,7 @@ def _graph_peak_live_tiles(
 
 def _collect_memory_op_facts(
     device_ir: DeviceIR,
-) -> tuple[list[MemoryOpFact], dict[int, int]]:
+) -> tuple[list[MemoryOpFact], dict[int, int], tuple[CrossLoopAccess, ...]]:
     """Walk every device graph once and record per-load/store metadata.
 
     Produces one ``MemoryOpFact`` per load/store in the order used to size
@@ -3353,12 +3449,16 @@ def _collect_memory_op_facts(
     reduction-fact builders need no bespoke walk. ``reductions_fed`` runs
     ``_classify_load_dataflow`` once over ALL reduction axes, grouped by axis.
 
-    Returns ``(memory_op_facts, liveness_by_axis)`` -- the second is the per-axis
-    peak simultaneously-live rdim-shaped tile count (max over graphs), computed in
-    this SAME pass so the kernel-fact builder can read a per-axis slice.
+    Returns ``(memory_op_facts, liveness_by_axis, cross_loop_accesses)``. The
+    second result is the per-axis peak simultaneously-live rdim-shaped tile count
+    (max over graphs). The third is the narrow access view used only by cross-root
+    dependency planning.
     """
     from ..autotuner.config_spec import MemoryOpFact
     from ..language import memory_ops
+    from .cross_loop_dependencies import CROSS_LOOP_ACCESS_ID_META
+    from .cross_loop_dependencies import CrossLoopAccess
+    from .cross_loop_dependencies import owner_root_by_graph_id
     from .inductor_lowering import ReductionLowering
 
     load_op = memory_ops.load
@@ -3371,9 +3471,16 @@ def _collect_memory_op_facts(
     # complete by the time we apply it to the (operand-less) facts below.
     operands: dict[torch.fx.Node, str] = {}
     records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
+    cross_loop_accesses: list[CrossLoopAccess] = []
     memory_op_index = 0
     eviction_index = 0
     liveness_by_axis: dict[int, int] = {}
+    schedule = device_ir.tile_dependency_schedule
+    collect_cross_loop_accesses = schedule is not None and schedule.policy is not None
+    graph_owners = (
+        owner_root_by_graph_id(device_ir) if collect_cross_loop_accesses else ()
+    )
+    allocation_ids: dict[int, int] = {}
 
     for graph_info in device_ir.graphs:
         graph = graph_info.graph
@@ -3441,9 +3548,27 @@ def _collect_memory_op_facts(
             subscript_index_scales: tuple[int, ...] = ()
             subscript_affine_block_ids: tuple[int | None, ...] = ()
             subscript_extents: tuple[int, ...] = ()
+            subscript_dims: tuple[int, ...] = ()
+            subscript_offsets: tuple[int | None, ...] = ()
+            subscript_is_scalar: tuple[bool, ...] = ()
             inner_extent: int | None = None
             accessed_numel = 0
+            allocation_id = -1
+            tensor_shape: tuple[int, ...] = ()
+            tensor_strides: tuple[int, ...] = ()
+            storage_offset = 0
             if fake is not None:
+                if collect_cross_loop_accesses:
+                    storage = fake.untyped_storage()
+                    storage_key = int(getattr(storage, "_cdata", id(storage)))
+                    allocation_id = allocation_ids.setdefault(
+                        storage_key, len(allocation_ids)
+                    )
+                    tensor_shape = tuple(env.size_hint(dim) for dim in fake.shape)
+                    tensor_strides = tuple(
+                        env.size_hint(stride) for stride in fake.stride()
+                    )
+                    storage_offset = env.size_hint(fake.storage_offset())
                 # Distinct HBM elements the op touches = product of size-hinted shape dims over
                 # NON-broadcast dims (stride != 0). A stride-0 dim (an .expand()/broadcast — full
                 # SIZE but one underlying element, e.g. bias[N].expand_as(x) or a broadcast_tensors
@@ -3464,6 +3589,7 @@ def _collect_memory_op_facts(
                         for pos, sub in enumerate(index_list)
                         if not isinstance(sub, int) and pos < fake.ndim
                     ]
+                    subscript_dims = tuple(positions)
                     indexed_block_ids = tuple(
                         env.resolve_block_id(fake.shape[pos]) for pos in positions
                     )
@@ -3487,6 +3613,20 @@ def _collect_memory_op_facts(
                     ]
                     subscript_affine_block_ids = tuple(bid for bid, _ in affine)
                     subscript_index_scales = tuple(scale for _, scale in affine)
+                    subscript_offsets = tuple(
+                        (
+                            int(info.offset)
+                            if (info := subscript_tile_info(env, index_list[pos]))
+                            is not None
+                            and isinstance(info.offset, int)
+                            else None
+                        )
+                        for pos in positions
+                    )
+                    subscript_is_scalar = tuple(
+                        _subscript_is_scalar_tile_index(index_list[pos])
+                        for pos in positions
+                    )
                     # Extent per subscript position; size_hint, not int(), so a SymInt dim
                     # is not specialized.
                     subscript_extents = tuple(
@@ -3498,6 +3638,39 @@ def _collect_memory_op_facts(
                     # heuristic signal, so a hint is sufficient and must not specialize.
                     inner_extent = env.size_hint(fake.shape[-1])
 
+            tensor_name = origin.root_rw_name() if origin else None
+            if collect_cross_loop_accesses:
+                owner_root = (
+                    graph_owners[graph_info.graph_id]
+                    if graph_info.graph_id < len(graph_owners)
+                    else -1
+                )
+                has_explicit_mask = (
+                    len(node.args) > (2 if is_load else 3)
+                    and node.args[2 if is_load else 3] is not None
+                )
+                node.meta[CROSS_LOOP_ACCESS_ID_META] = memory_op_index
+                cross_loop_accesses.append(
+                    CrossLoopAccess(
+                        access_id=memory_op_index,
+                        memory_op_index=memory_op_index,
+                        graph_id=graph_info.graph_id,
+                        root=owner_root,
+                        allocation_id=allocation_id,
+                        kind="load" if is_load else "store",
+                        tensor_name=tensor_name,
+                        tensor_shape=tensor_shape,
+                        tensor_strides=tensor_strides,
+                        storage_offset=storage_offset,
+                        subscript_dims=subscript_dims,
+                        subscript_affine_block_ids=subscript_affine_block_ids,
+                        subscript_index_scales=subscript_index_scales,
+                        subscript_offsets=subscript_offsets,
+                        subscript_is_scalar=subscript_is_scalar,
+                        has_explicit_mask=has_explicit_mask,
+                    )
+                )
+
             records.append(
                 (
                     node,
@@ -3505,7 +3678,7 @@ def _collect_memory_op_facts(
                         indexing_index=memory_op_index,
                         kind="load" if is_load else "store",
                         eviction_index=this_eviction_index,
-                        tensor_name=origin.root_rw_name() if origin else None,
+                        tensor_name=tensor_name,
                         dtype=fake.dtype if fake is not None else None,
                         ndim=fake.ndim if fake is not None else 0,
                         num_reuses=len(node.users) if is_load else 0,
@@ -3527,7 +3700,7 @@ def _collect_memory_op_facts(
             memory_op_index += 1
 
     facts = [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
-    return facts, liveness_by_axis
+    return facts, liveness_by_axis, tuple(cross_loop_accesses)
 
 
 def _indexing_uses_tensor_descriptor(
@@ -3939,8 +4112,23 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         # Collect per-load/store metadata once so heuristics can map each Config.indexing slot to its
         # graph op; the same pass returns the reduction-body liveness (per-axis peak live tiles).
-        memory_op_facts, liveness_by_axis = _collect_memory_op_facts(device_ir)
+        (
+            memory_op_facts,
+            liveness_by_axis,
+            cross_loop_accesses,
+        ) = _collect_memory_op_facts(device_ir)
         config_spec.memory_op_facts = memory_op_facts
+        device_ir.cross_loop_accesses = cross_loop_accesses
+        if cross_loop_accesses:
+            from .cross_loop_dependencies import build_cross_loop_dependency_plan
+
+            device_ir.cross_loop_dependency_plan = build_cross_loop_dependency_plan(
+                cross_loop_accesses,
+                device_ir.grid_block_ids,
+                noncanonical_task_origin_block_ids=frozenset(
+                    device_ir.noncanonical_task_origin_block_ids
+                ),
+            )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
