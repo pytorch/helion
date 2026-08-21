@@ -15,6 +15,7 @@ _FLASH_POLICY_EXP2_PACKETS = frozenset(
         "hybrid_deg1_16x8",
         "deg1_16x8",
         "deg1_8x2_corr10",
+        "causal_hd128_resident3_013_prefetch2_deg2_early_acquire",
     }
 )
 _FLASH_POLICY_E2E_SCHEDULES = frozenset({"xu", "8/2", "16/2", "16/4", "16/6", "16/8"})
@@ -126,6 +127,18 @@ class FlashDenseTuningPolicy:
     softmax_lowering: FlashSoftmaxLowering = FlashSoftmaxLowering.STANDARD
     corr_regs: int | None = None
     other_regs: int | None = None
+    epi_tma: bool | None = None
+    kv_order: str | None = None
+    precompute_qk_desc: bool | None = None
+    rescale_chunk_cols: int | None = None
+    first_load_order: int | None = None
+    corr_tile_size: int | None = None
+    role_map: str | None = None
+    softmax_regs: int | None = None
+    split_p_arrive: bool | None = None
+    softmax_disc: bool | None = None
+    disc_pipe_depth: int | None = None
+    sp_row_sum: str | None = None
 
     def __post_init__(self) -> None:
         if self.num_kv <= 0:
@@ -236,6 +249,45 @@ class FlashDenseTuningPolicy:
             raise ValueError(
                 "dense other register count must be at least 24 and a multiple of 8"
             )
+        if self.kv_order is not None:
+            _validate_policy_choice(
+                "dense KV order",
+                self.kv_order,
+                frozenset({"ascending", "descending"}),
+            )
+        if self.rescale_chunk_cols is not None and self.rescale_chunk_cols not in (
+            8,
+            16,
+            32,
+            64,
+        ):
+            raise ValueError("dense rescale chunk columns must be 8, 16, 32, or 64")
+        if self.first_load_order is not None and self.first_load_order not in range(5):
+            raise ValueError("dense first-load order must be between 0 and 4")
+        if self.corr_tile_size is not None and self.corr_tile_size not in (8, 16, 32):
+            raise ValueError("dense correction tile size must be 8, 16, or 32")
+        if self.role_map is not None:
+            _validate_policy_choice(
+                "dense role map", self.role_map, _FLASH_POLICY_ROLE_MAPS
+            )
+        if self.softmax_regs is not None and self.softmax_regs not in (
+            176,
+            184,
+            192,
+            200,
+        ):
+            raise ValueError(
+                "dense softmax register count must be 176, 184, 192, or 200"
+            )
+        if self.disc_pipe_depth is not None and self.disc_pipe_depth not in (
+            1,
+            2,
+            3,
+            4,
+        ):
+            raise ValueError("dense discrete softmax pipeline depth must be 1 to 4")
+        if self.sp_row_sum not in (None, "fragment", "whole"):
+            raise ValueError("dense SP row-sum mode must be fragment or whole")
 
     @property
     def requires_fp16_hd64(self) -> bool:

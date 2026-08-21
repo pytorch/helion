@@ -25,6 +25,23 @@ class PatternSearchConfig:
 
 
 @dataclass(frozen=True)
+class FlashStructuralSearchConfig:
+    qualification_rounds: int
+    pipeline_candidates_per_leaf_per_round: int
+    conditional_candidates_per_pipeline_lane: int
+    qualification_failure_retries: int
+    family_probe_generations: int
+    family_probe_candidates_per_path: int
+    retained_candidates_per_leaf: int
+    # None continues every successful live parent family. Finite caps rank
+    # families after the measured probe, then apply the slowdown filter and cap.
+    retained_families: int | None
+    retained_family_slowdown_limit: float
+    exhaust_unrestricted_path: bool
+    starting_paths: int = 14
+
+
+@dataclass(frozen=True)
 class DifferentialEvolutionConfig:
     population_size: int
     max_generations: int
@@ -55,6 +72,20 @@ PATTERN_SEARCH_DEFAULTS = PatternSearchConfig(
     max_generations=20,
 )
 
+FLASH_STRUCTURAL_SEARCH_DEFAULTS = FlashStructuralSearchConfig(
+    qualification_rounds=2,
+    pipeline_candidates_per_leaf_per_round=4,
+    conditional_candidates_per_pipeline_lane=1,
+    qualification_failure_retries=1,
+    family_probe_generations=1,
+    family_probe_candidates_per_path=20,
+    retained_candidates_per_leaf=2,
+    retained_families=4,
+    retained_family_slowdown_limit=2.0,
+    exhaust_unrestricted_path=True,
+    starting_paths=14,
+)
+
 DIFFERENTIAL_EVOLUTION_DEFAULTS = DifferentialEvolutionConfig(
     population_size=40,
     max_generations=40,
@@ -82,6 +113,7 @@ class AutotuneEffortProfile:
     llm_search: LLMSearchConfig | None = None
     finishing_rounds: int = 0
     rebenchmark_threshold: float = 1.5
+    flash_structural_search: FlashStructuralSearchConfig | None = None
 
 
 _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
@@ -125,6 +157,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         differential_evolution=DIFFERENTIAL_EVOLUTION_DEFAULTS,
         random_search=RANDOM_SEARCH_DEFAULTS,
         llm_search=LLM_SEARCH_DEFAULTS,
+        flash_structural_search=FLASH_STRUCTURAL_SEARCH_DEFAULTS,
     ),
 }
 

@@ -122,6 +122,9 @@ class _AuxStepRecord:
     # accumulator ``consumer_wait`` so the rowvec GMEM latency hides under
     # the MMA wait. ``None`` keeps the per-subtile GMEM load.
     aux_rmem_full: str | None = None
+    # Full-tile bm=256 four-CTA path: the per-row value is invariant across
+    # every N subtile, so retain it in a scalar register for the whole tile.
+    colvec_scalar_full: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2008,6 +2011,18 @@ def _codegen_cute_store_tcgen05_tile(
         # winning stage used 4 KiB without changing occupancy.
         return tcgen05_value.bn >= 64 and stage_bytes <= 4 * 1024
 
+    use_full_tile_bm256_broadcast_aux = (
+        tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        and aux_matmul_plan is not None
+        and aux_matmul_plan.cluster_n == 2
+        and tcgen05_lifecycle.is_two_cta
+        and tcgen05_value.bm == 256
+        and tcgen05_value.bn == 128
+        and tcgen05_value.use_tma_store_epilogue
+        and not tcgen05_value.partial_output_tma_store
+        and not tcgen05_value.output_column_major
+    )
+
     aux_step_records: list[_AuxStepRecord] = []
     for aux_idx, aux_step in enumerate(aux_steps_in_chain):
         aux_tensor_node = aux_step.load_node.args[0]
@@ -2080,6 +2095,14 @@ def _codegen_cute_store_tcgen05_tile(
                             bm=tcgen05_value.bm,
                         )
                         and tcgen05_value.use_tma_store_epilogue
+                    )
+                    else None
+                ),
+                colvec_scalar_full=(
+                    df.new_var(f"tcgen05_colvec_scalar_full_{aux_idx}")
+                    if (
+                        use_full_tile_bm256_broadcast_aux
+                        and aux_step.broadcast_axis == 2
                     )
                     else None
                 ),
@@ -2804,6 +2827,16 @@ def _codegen_cute_store_tcgen05_tile(
                         if rec.aux_rmem_full is not None and not force_gmem_aux
                         else []
                     ),
+                    *(
+                        [
+                            (
+                                f"{rec.colvec_scalar_full} = "
+                                f"{rec.ttr_aux_grouped}[(0, 0, 0, 0)]"
+                            )
+                        ]
+                        if rec.colvec_scalar_full is not None and not force_gmem_aux
+                        else []
+                    ),
                 ]
             )
         return lines
@@ -3112,11 +3145,17 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 if tcgen05_colvec_fragment_single_m_row:
-                    lines.append(
-                        f"{prelude_indent}{rec.aux_loaded} = "
-                        f"{rec.ttr_aux_grouped}"
-                        "[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
-                    )
+                    if rec.colvec_scalar_full is not None:
+                        lines.append(
+                            f"{prelude_indent}{rec.aux_loaded} = "
+                            f"{rec.colvec_scalar_full}\n"
+                        )
+                    else:
+                        lines.append(
+                            f"{prelude_indent}{rec.aux_loaded} = "
+                            f"{rec.ttr_aux_grouped}"
+                            "[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                        )
                 else:
                     lines.append(
                         _materialize_broadcast_aux_source(

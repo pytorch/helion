@@ -51,7 +51,9 @@ _AGGREGATED_METRIC_FIELDS = (
     "num_configs_tested",
     "num_compile_failures",
     "num_worker_failures",
+    "num_isolated_rebenchmark_timeouts",
     "num_accuracy_failures",
+    "num_successful_candidate_measurements",
     "num_unique_sources",
     "num_source_deduplications",
     "num_generations",
@@ -151,6 +153,14 @@ class LLMSeededSearch(BaseSearch):
         self.llm_fast_mode = llm_fast_mode
 
         self.hybrid_stage_breakdown = None
+
+    def _algorithm_cache_policy(self) -> dict[str, object] | None:
+        # A sound policy must include the effective policy of both possible
+        # child searches. Constructing those children here performs real search
+        # setup (RandomSearch even samples its population) and can fail before
+        # autotuning starts. Fail closed until child policies have a pure,
+        # constructor-free representation.
+        return None
 
     @classmethod
     def _get_default_second_stage_algorithm(cls) -> str:
@@ -323,7 +333,7 @@ class LLMSeededSearch(BaseSearch):
             )
         second_stage_start = time.perf_counter()
         try:
-            best_config = second_stage_search.autotune()
+            best_config = second_stage_search.autotune(skip_cache=self._skip_cache)
         except exc.NoConfigFound:
             if not isinstance(self.args, _MultiShapeAutotuneArgs):
                 raise

@@ -6,10 +6,14 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import hashlib
+import inspect
 import logging
+import marshal
 import math
 from math import inf
 import os
+from pathlib import Path
 import random
 import re
 import sys
@@ -31,8 +35,11 @@ from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.settings import _env_get_int
+from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
+from .benchmark_provider import IsolatedBenchmarkFailure
+from .benchmark_provider import IsolatedBenchmarkTiming
 from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import MultiShapeBenchmarkProvider
 from .benchmark_provider import _clone_args
@@ -97,6 +104,7 @@ _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV = (
 _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT = 0.0
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
+_CUTE_FLASH_CONFIG_GENERATION_POLICY_VERSION = 4
 
 
 class _HasDeviceAndProcessGroupName(Protocol):
@@ -209,6 +217,96 @@ def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
     )
 
 
+def _file_sha256(filename: str | None) -> str | None:
+    if filename is None:
+        return None
+    try:
+        return hashlib.sha256(Path(filename).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+class _UncacheablePythonFunctionPolicy(TypeError):
+    pass
+
+
+def _python_global_cache_policy(value: object, seen: set[int]) -> object:
+    if inspect.isfunction(value):
+        policy = _python_function_cache_policy_impl(value, seen)
+        if policy is None:
+            raise _UncacheablePythonFunctionPolicy(
+                f"cannot fingerprint Python helper {value.__qualname__}"
+            )
+        return policy
+    if inspect.ismodule(value):
+        return {
+            "kind": "module",
+            "name": value.__name__,
+            "version": getattr(value, "__version__", None),
+            "file_sha256": _file_sha256(getattr(value, "__file__", None)),
+        }
+    if inspect.isbuiltin(value):
+        return {
+            "kind": "builtin",
+            "module": value.__module__,
+            "qualname": value.__qualname__,
+        }
+    return value
+
+
+def _python_function_cache_policy_impl(
+    callback: object, seen: set[int]
+) -> dict[str, object] | None:
+    if not inspect.isfunction(callback):
+        return None
+    identity = {
+        "module": callback.__module__,
+        "qualname": callback.__qualname__,
+    }
+    if id(callback) in seen:
+        return {**identity, "recursive_reference": True}
+    source_file = inspect.getsourcefile(callback)
+    if source_file is None:
+        return None
+    seen.add(id(callback))
+    try:
+        module_sha256 = _file_sha256(source_file)
+        code_sha256 = hashlib.sha256(marshal.dumps(callback.__code__)).hexdigest()
+        closure = tuple(cell.cell_contents for cell in (callback.__closure__ or ()))
+        closure_vars = inspect.getclosurevars(callback)
+    except (OSError, TypeError, ValueError):
+        return None
+    return {
+        **identity,
+        "module_sha256": module_sha256,
+        "code_sha256": code_sha256,
+        "defaults": callback.__defaults__,
+        "kwdefaults": callback.__kwdefaults__,
+        "closure": closure,
+        "globals": {
+            name: _python_global_cache_policy(value, seen)
+            for name, value in sorted(closure_vars.globals.items())
+        },
+        "builtins": {
+            name: _python_global_cache_policy(value, seen)
+            for name, value in sorted(closure_vars.builtins.items())
+        },
+        "unbound": tuple(sorted(closure_vars.unbound)),
+    }
+
+
+def _python_function_cache_policy(callback: object) -> dict[str, object] | None:
+    """Fingerprint a Python function and the runtime globals it reads."""
+    try:
+        return _python_function_cache_policy_impl(callback, set())
+    except _UncacheablePythonFunctionPolicy:
+        return None
+
+
+def _autotune_search_acf_cache_policy(paths: Sequence[str]) -> tuple[object, ...]:
+    return tuple({"path": path, "sha256": _file_sha256(path)} for path in paths)
+
+
 def _normalize_spec_key(key: object) -> object:
     """Replace types.CodeType with a stable sentinel in a spec key tree."""
     return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
@@ -277,6 +375,114 @@ class BaseSearch(BaseAutotuner):
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
         self._search_space_tracker: SearchSpaceTracker | None = None
+        self._uncacheable_search_policy_nonce: str | None = None
+        self._search_policy_cacheable = True
+
+    def _algorithm_cache_policy(self) -> dict[str, object] | None:
+        """Return explicit behavior-affecting state for a built-in search."""
+        return None
+
+    def _final_rebenchmark_cache_policy(self) -> dict[str, object]:
+        return {"enabled": False}
+
+    def cache_policy(self) -> dict[str, object] | None:
+        """Return the effective search policy used by CuTe-flash cache keys.
+
+        Unknown search subclasses and arbitrary callbacks fail closed: callers
+        give them a one-shot cache key instead of risking reuse across different
+        candidate sets or benchmark objectives.
+        """
+        from . import search_algorithms
+
+        if type(self) not in search_algorithms.values():
+            return None
+        algorithm = self._algorithm_cache_policy()
+        settings = self.settings
+        baseline_fn_policy = (
+            None
+            if settings.autotune_baseline_fn is None
+            else _python_function_cache_policy(settings.autotune_baseline_fn)
+        )
+        if (
+            algorithm is None
+            or any(
+                callback is not None
+                for callback in (
+                    settings.autotune_config_filter,
+                    settings.autotune_benchmark_fn,
+                    settings.autotune_baseline_accuracy_check_fn,
+                )
+            )
+            or (
+                settings.autotune_baseline_fn is not None and baseline_fn_policy is None
+            )
+        ):
+            return None
+
+        if self.config_spec.cute_flash_search_enabled:
+            algorithm = {
+                **algorithm,
+                "cute_flash_config_generation_policy_version": (
+                    _CUTE_FLASH_CONFIG_GENERATION_POLICY_VERSION
+                ),
+            }
+
+        return {
+            "schema": "cute_flash_search_policy_v3",
+            "search_class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "algorithm": algorithm,
+            "settings": {
+                "autotune_effort": settings.autotune_effort,
+                "autotune_budget_seconds": settings.autotune_budget_seconds,
+                "autotune_config_overrides": settings.autotune_config_overrides,
+                "autotune_seed_configs": normalize_autotune_seed_configs(settings),
+                "compiler_seed_configs": tuple(self.config_spec.compiler_seed_configs),
+                "compiler_seed_timeout_retry_repetitions": (
+                    self.config_spec.compiler_seed_timeout_retry_repetitions
+                ),
+                "compiler_seed_timeout_retry_limit_per_source": (
+                    _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
+                ),
+                "config_value_priors_version": getattr(
+                    self.config_spec.backend, "config_value_priors_version", None
+                ),
+                "autotune_force_persistent": settings.autotune_force_persistent,
+                "disable_autotuner_heuristics": settings.disable_autotuner_heuristics,
+                "autotune_accuracy_check": settings.autotune_accuracy_check,
+                "autotune_baseline_fn": baseline_fn_policy,
+                "autotune_baseline_atol": settings.autotune_baseline_atol,
+                "autotune_baseline_rtol": settings.autotune_baseline_rtol,
+                "autotune_adaptive_timeout": settings.autotune_adaptive_timeout,
+                "autotune_compile_timeout": settings.autotune_compile_timeout,
+                "autotune_benchmark_subprocess": (
+                    settings.autotune_benchmark_subprocess
+                ),
+                "autotune_benchmark_timeout": settings.autotune_benchmark_timeout,
+                "autotune_precompile": settings.autotune_precompile,
+                "autotune_precompile_jobs": settings.autotune_precompile_jobs,
+                "autotune_ignore_errors": settings.autotune_ignore_errors,
+                "autotune_best_of_k": settings.autotune_best_of_k,
+                "autotune_with_torch_compile_fusion": (
+                    settings.autotune_with_torch_compile_fusion
+                ),
+                "autotune_rebenchmark_threshold": (
+                    settings.get_rebenchmark_threshold()
+                ),
+                "autotune_suspicious_rebenchmark_ratio": (
+                    settings.get_suspicious_rebenchmark_ratio()
+                ),
+                "autotune_best_available_max_configs": (
+                    settings.autotune_best_available_max_configs
+                ),
+                "autotune_best_available_max_cache_scan": (
+                    settings.autotune_best_available_max_cache_scan
+                ),
+                "autotune_search_acf": _autotune_search_acf_cache_policy(
+                    settings.autotune_search_acf
+                ),
+            },
+            "final_rebenchmark": self._final_rebenchmark_cache_policy(),
+        }
 
     @property
     def performance_unit(self) -> Literal["ms", "ratio"]:
@@ -376,13 +582,19 @@ class BaseSearch(BaseAutotuner):
                 )
                 self._search_space_tracker = None
         host_function = getattr(self.kernel, "host_function", None)
+        from .base_cache import should_skip_cache
+
+        metadata_settings = self.settings.to_dict()
+        metadata_settings["effective_cache_read_bypass"] = bool(
+            self._skip_cache or should_skip_cache()
+        )
         self._kernel_metadata: KernelMetadata = KernelMetadata(
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
             dtypes=dtypes,
             hardware=hardware,
-            settings=self.settings.to_dict(),
+            settings=metadata_settings,
             _device_ir=getattr(host_function, "_device_ir", None),
         )
         provider_cls = (
@@ -439,9 +651,23 @@ class BaseSearch(BaseAutotuner):
     def _budgeted_range(self, *args: int) -> Iterator[int]:
         """Yield ``range(*args)`` until the autotune budget is exhausted."""
         for value in range(*args):
-            if self._autotune_budget_exceeded():
+            if self._autotune_budget_exceeded_across_ranks():
                 return
             yield value
+
+    def _autotune_budget_exceeded_across_ranks(self) -> bool:
+        """Synchronize CuTe-flash budget exhaustion before the next round."""
+        exceeded = self._autotune_budget_exceeded()
+        if not getattr(
+            getattr(self, "config_spec", None), "cute_flash_search_enabled", False
+        ):
+            return exceeded
+        return any(
+            all_gather_object(
+                exceeded,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+        )
 
     @classmethod
     def get_kwargs_from_profile(
@@ -770,15 +996,22 @@ class BaseSearch(BaseAutotuner):
         return hardware, specialization_key
 
     def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
-        """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped.
+        """Return cached configs matching hardware and specialization.
 
         Scans the local cache first; if more configs are needed and a remote
         backend is configured, queries it via ``RemoteCacheBackend.list()``
-        and merges the results, deduplicating against local entries.
+        and merges the results, deduplicating against local entries. Explicit
+        cache disabling always suppresses these seeds. Forced autotuning
+        suppresses them only for CuTe flash, whose structural search must stay
+        independent of previous winners; other backends keep their warm-start
+        seeds under forced autotuning, which forces a fresh search rather than
+        discarding prior measurements.
         """
         from .base_cache import should_skip_cache
 
-        if self._skip_cache or should_skip_cache():
+        if (
+            self._skip_cache and self.config_spec.cute_flash_search_enabled
+        ) or should_skip_cache():
             return []
 
         from .local_cache import get_helion_cache_dir
@@ -872,6 +1105,44 @@ class BaseSearch(BaseAutotuner):
         self._autotune_metrics.num_generations = generation
 
     def _finalize_autotune_metrics(self, best_config: Config | None = None) -> None:
+        """Finalize run metrics and link population winners to measured source.
+
+        Population searches retain compiled callables for benchmarked members,
+        which lets us record the selected generated-source hash without
+        recompiling. Final verification can re-pick a member while older noisy
+        timings still make ``self.best`` point at a different config, so inspect
+        all retained members for the returned config. Search implementations that
+        do not retain a match leave the source fields unset rather than claiming
+        an unverifiable linkage.
+        """
+        if best_config is not None:
+            self._autotune_metrics.selected_config = copy.deepcopy(best_config.config)
+            if isinstance(
+                self, PopulationBasedSearch
+            ) and self.config_spec.backend.should_deduplicate_generated_sources(
+                self.config_spec
+            ):
+                selected_member = getattr(self, "_selected_member", None)
+                retained_members = [
+                    *(() if selected_member is None else (selected_member,)),
+                    *getattr(self, "population", ()),
+                    *getattr(self, "_benchmarked_members", {}).values(),
+                    *getattr(self, "_pinned_finalist_members", {}).values(),
+                ]
+                for member in retained_members:
+                    if member.config != best_config:
+                        continue
+                    source_hash = self.config_spec.backend.generated_source_hash(
+                        member.fn
+                    )
+                    if source_hash is None:
+                        continue
+                    if self._autotune_metrics.selected_source_hash is None:
+                        self._autotune_metrics.selected_source_hash = source_hash
+                    if self.benchmark_provider.has_measured_source_hash(source_hash):
+                        self._autotune_metrics.selected_source_hash = source_hash
+                        self._autotune_metrics.selected_source_was_measured = True
+                        break
         best_perf = self.best_perf_so_far
         if self.performance_unit == "ratio":
             best_perf = (
@@ -928,6 +1199,8 @@ class PopulationMember:
         "peer_compilation_fail",
         "filtered",
         "deduplicated",
+        "accuracy_error",
+        "source_rejected",
         "unknown",
     ] = "unknown"
     compile_time: float | None = None
@@ -984,6 +1257,7 @@ class PopulationBasedSearch(BaseSearch):
         # ``self.population``.
         self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
+        self._selected_member: PopulationMember | None = None
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
@@ -992,6 +1266,16 @@ class PopulationBasedSearch(BaseSearch):
 
     def _generation_invalid_config_count(self) -> int:
         return self.config_gen.invalid_config_count
+
+    def _final_rebenchmark_cache_policy(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "top_k": self._final_rebenchmark_top_k(),
+            "target_ms": self._final_rebenchmark_target_ms(),
+            "isolated": self._final_rebenchmark_use_isolated(),
+            "pinned_tolerance": self._final_rebenchmark_pinned_tolerance(),
+            "repeat_cap": os.getenv("HELION_CAP_REBENCHMARK_REPEAT"),
+        }
 
     @classmethod
     def get_kwargs_from_profile(
@@ -1301,7 +1585,43 @@ class PopulationBasedSearch(BaseSearch):
             member.status = result.status
             member.compile_time = result.compile_time
             self._record_benchmarked_member(member)
+        repairs = self.benchmark_provider.take_effective_source_repairs()
+        if repairs:
+            self._apply_effective_source_repairs(repairs, members)
         return members
+
+    def _apply_effective_source_repairs(
+        self,
+        repairs: dict[Config, BenchmarkResult],
+        current_members: Sequence[PopulationMember],
+    ) -> None:
+        """Repair failed members after a later config proves the same source."""
+        candidates = [
+            *current_members,
+            *self.population,
+            *self._compiler_seed_members,
+            *self._benchmarked_members.values(),
+            *self._pinned_finalist_members.values(),
+        ]
+        seen: set[int] = set()
+        for member in candidates:
+            if id(member) in seen:
+                continue
+            seen.add(id(member))
+            repair = repairs.get(member.config)
+            if repair is None or (member.perfs and math.isfinite(member.perf)):
+                continue
+            if member.perfs:
+                member.perfs = [
+                    repair.perf if not math.isfinite(perf) else perf
+                    for perf in member.perfs
+                ]
+            else:
+                member.perfs.append(repair.perf)
+            member.fn = repair.fn
+            member.status = repair.status
+            member.compile_time = None
+            self._record_benchmarked_member(member)
 
     def _record_benchmarked_member(self, member: PopulationMember) -> None:
         """Keep successful benchmarked members available for final verification."""
@@ -1324,29 +1644,135 @@ class PopulationBasedSearch(BaseSearch):
         target: dict[Config, PopulationMember],
         config: Config,
         member: PopulationMember,
+        *,
+        replace: bool = False,
+        replace_ties: bool = False,
     ) -> None:
         existing = target.get(config)
-        if existing is None or self._member_low_water_perf(
-            member
-        ) < self._member_low_water_perf(existing):
+        member_perf = self._finalist_history_perf(member)
+        existing_perf = (
+            inf if existing is None else self._finalist_history_perf(existing)
+        )
+        if (
+            replace
+            or existing is None
+            or member_perf < existing_perf
+            or (replace_ties and member_perf == existing_perf)
+        ):
             # Config is mutable and hashes on its contents, and the autotuner
             # mutates configs in place (normalize / neighbor generation). Store
             # a private snapshot so a later mutation of the original config
             # cannot change this key's hash (-> KeyError on prune / orphaned
-            # entries) or the config recompiled during final verification.
+            # entries) or the config recompiled during final verification. The
+            # performance list is mutable too, so do not let later rebenchmarks
+            # silently alter a supposedly historical snapshot.
             snapshot = copy.deepcopy(config)
             target[snapshot] = dataclasses.replace(
                 member,
+                perfs=copy.deepcopy(member.perfs),
                 flat_values=copy.deepcopy(member.flat_values),
                 config=snapshot,
             )
+
+    def _uses_verified_finalist_history(self) -> bool:
+        """Whether finalist retention should follow the latest verified timing."""
+        config_spec = getattr(self, "config_spec", None)
+        return bool(
+            config_spec is not None
+            and getattr(config_spec, "cute_flash_search_enabled", False)
+        )
+
+    def _finalist_history_perf(self, member: PopulationMember) -> float:
+        if self._uses_verified_finalist_history():
+            if member.perfs and math.isfinite(member.perf):
+                return member.perf
+            return inf
+        return self._member_low_water_perf(member)
+
+    def _refresh_benchmarked_members_after_rebenchmark(
+        self, members: Sequence[PopulationMember]
+    ) -> None:
+        """Refresh finalist history after its source members are rebenchmarked.
+
+        Long CuTe kernels can have optimistic first-call timings. Candidates are
+        initially recorded before the normal higher-effort rebenchmark, so the
+        first sample must not permanently decide which configs survive in the
+        bounded final-verification history. Other backends preserve their prior
+        low-water ranking and do not reinsert configs that were already pruned;
+        they still need an explicit refresh now that snapshots own their perf lists.
+        A failed duplicate retains the last successful snapshot for final checking,
+        unless source quarantine has invalidated that snapshot too.
+        """
+        benchmarked_members = getattr(self, "_benchmarked_members", None)
+        pinned_configs = getattr(self, "_pinned_finalist_configs", None)
+        pinned_members = getattr(self, "_pinned_finalist_members", None)
+        if (
+            benchmarked_members is None
+            or pinned_configs is None
+            or pinned_members is None
+        ):
+            return
+
+        use_verified_history = self._uses_verified_finalist_history()
+        top_k = self._final_rebenchmark_top_k()
+        refreshed_configs: dict[Config, None] = {}
+        finite_members: dict[Config, PopulationMember] = {}
+        for member in members:
+            if not member.perfs:
+                continue
+            refreshed_configs.setdefault(member.config, None)
+            history_perf = self._finalist_history_perf(member)
+            if not math.isfinite(history_perf):
+                continue
+            existing = finite_members.get(member.config)
+            if existing is None or history_perf < self._finalist_history_perf(existing):
+                finite_members[member.config] = member
+
+        for config in refreshed_configs:
+            member = finite_members.get(config)
+            if config in pinned_configs and member is not None:
+                self._record_best_member_for_config(
+                    pinned_members,
+                    config,
+                    member,
+                    replace=use_verified_history,
+                    replace_ties=not use_verified_history,
+                )
+            elif config in pinned_configs and use_verified_history:
+                existing = pinned_members.get(config)
+                if existing is not None and not math.isfinite(
+                    self._finalist_history_perf(existing)
+                ):
+                    pinned_members.pop(config, None)
+            if top_k <= 1 or (
+                not use_verified_history and config not in benchmarked_members
+            ):
+                continue
+            if member is not None:
+                # CuTe flash reinserts configs pruned by their initial sample.
+                # Other backends only refresh existing snapshots above.
+                self._record_best_member_for_config(
+                    benchmarked_members,
+                    config,
+                    member,
+                    replace=use_verified_history,
+                    replace_ties=not use_verified_history,
+                )
+            elif use_verified_history:
+                existing = benchmarked_members.get(config)
+                if existing is not None and not math.isfinite(
+                    self._finalist_history_perf(existing)
+                ):
+                    benchmarked_members.pop(config, None)
+        if use_verified_history and top_k > 1:
+            self._prune_benchmarked_members(top_k)
 
     def _prune_benchmarked_members(self, top_k: int) -> None:
         if len(self._benchmarked_members) <= top_k:
             return
         for config, _member in sorted(
             self._benchmarked_members.items(),
-            key=lambda item: self._member_low_water_perf(item[1]),
+            key=lambda item: self._finalist_history_perf(item[1]),
         )[top_k:]:
             del self._benchmarked_members[config]
 
@@ -1485,12 +1911,6 @@ class PopulationBasedSearch(BaseSearch):
         member and perform one apples-to-apples final verification over the best
         unique configs observed during the run.
         """
-        if self._autotune_budget_exceeded():
-            return best
-        top_k = self._final_rebenchmark_top_k()
-        if top_k <= 1:
-            return best
-
         by_config: dict[Config, PopulationMember] = {}
         candidates = [
             *self._pinned_finalist_members.values(),
@@ -1500,14 +1920,30 @@ class PopulationBasedSearch(BaseSearch):
         ]
         for member in candidates:
             if not member.perfs or not math.isfinite(
-                self._member_low_water_perf(member)
+                self._finalist_history_perf(member)
             ):
                 continue
             existing = by_config.get(member.config)
-            if existing is None or self._member_low_water_perf(
+            if existing is None or self._finalist_history_perf(
                 member
-            ) < self._member_low_water_perf(existing):
+            ) < self._finalist_history_perf(existing):
                 by_config[member.config] = member
+
+        live_candidates = [
+            member for member in candidates if math.isfinite(member.perf)
+        ]
+        if math.isfinite(best.perf):
+            fallback = best
+        elif live_candidates:
+            fallback = min(live_candidates, key=performance)
+        else:
+            raise exc.NoConfigFound
+
+        if self._autotune_budget_exceeded_across_ranks():
+            return fallback
+        top_k = self._final_rebenchmark_top_k()
+        if top_k <= 1:
+            return fallback
 
         pinned = [
             member
@@ -1522,10 +1958,13 @@ class PopulationBasedSearch(BaseSearch):
         ]
         finalists = [
             *pinned,
-            *sorted(remaining, key=self._member_low_water_perf)[:top_k],
+            *sorted(remaining, key=self._finalist_history_perf)[:top_k],
         ]
         if len(finalists) < 2:
-            return best
+            live_finalists = [
+                member for member in finalists if math.isfinite(member.perf)
+            ]
+            return min(live_finalists, key=performance, default=fallback)
 
         before = min(finalists, key=performance)
         # Finalists have already survived the normal benchmark path. Measure the
@@ -1542,9 +1981,13 @@ class PopulationBasedSearch(BaseSearch):
             confirm_suspicious=use_isolated,
             use_interleaved=False,
         )
-        after = min(finalists, key=performance)
-        if pinned:
-            pinned_after = min(pinned, key=performance)
+        live_finalists = [member for member in finalists if math.isfinite(member.perf)]
+        if not live_finalists:
+            raise exc.NoConfigFound
+        after = min(live_finalists, key=performance)
+        live_pinned = [member for member in pinned if math.isfinite(member.perf)]
+        if live_pinned:
+            pinned_after = min(live_pinned, key=performance)
             tolerance = self._final_rebenchmark_pinned_tolerance()
             if pinned_after.perf <= after.perf * (1.0 + tolerance):
                 after = pinned_after
@@ -1611,10 +2054,7 @@ class PopulationBasedSearch(BaseSearch):
                 [member.perf for member in members],
                 desc=desc,
             )
-            for member, timing in zip(members, provider_timings, strict=True):
-                member.perfs.append(timing)
-                if timing < self.best_perf_so_far:
-                    self.best_perf_so_far = timing
+            self._apply_rebenchmark_timings(members, provider_timings)
             return
 
         # Size the in-process repeat from the candidates being rechecked. A
@@ -1627,7 +2067,7 @@ class PopulationBasedSearch(BaseSearch):
         repeat = max(1, repeat)
 
         if use_isolated and self.settings.autotune_benchmark_fn is None:
-            isolated_timings = self.benchmark_provider.benchmark_isolated(
+            isolated_results = self.benchmark_provider.benchmark_isolated(
                 [m.fn for m in members],
                 warmup=1,
                 rep=PopulationBasedSearch._isolated_rep_ms(
@@ -1635,18 +2075,21 @@ class PopulationBasedSearch(BaseSearch):
                 ),
                 desc=desc,
             )
-            if isolated_timings is not None:
-                new_timings = [
-                    m.perf if timing is None else timing
-                    for m, timing in zip(members, isolated_timings, strict=True)
-                ]
-                new_timings = sync_object(
-                    new_timings, process_group_name=self.kernel.env.process_group_name
+            if isolated_results is not None:
+                new_timings, failure_statuses = (
+                    self._resolve_isolated_rebenchmark_results(
+                        members, isolated_results
+                    )
                 )
-                for member, timing in zip(members, new_timings, strict=True):
-                    member.perfs.append(timing)
-                    if timing < self.best_perf_so_far:
-                        self.best_perf_so_far = timing
+                new_timings, failure_statuses = sync_object(
+                    (new_timings, failure_statuses),
+                    process_group_name=self.kernel.env.process_group_name,
+                )
+                self._apply_rebenchmark_timings(
+                    members,
+                    new_timings,
+                    failure_statuses=failure_statuses,
+                )
                 return
 
         if len(self.benchmark_provider.mutated_arg_indices) > 0:
@@ -1724,13 +2167,169 @@ class PopulationBasedSearch(BaseSearch):
                 new_timings,
                 desc=desc,
             )
-        new_timings = sync_object(
-            new_timings, process_group_name=self.kernel.env.process_group_name
+        resolved_timings, failure_statuses = self._resolve_isolated_rebenchmark_results(
+            members, new_timings
         )
-        for m, t in zip(members, new_timings, strict=True):
-            m.perfs.append(t)
-            if t < self.best_perf_so_far:
-                self.best_perf_so_far = t
+        resolved_timings, failure_statuses = sync_object(
+            (resolved_timings, failure_statuses),
+            process_group_name=self.kernel.env.process_group_name,
+        )
+        self._apply_rebenchmark_timings(
+            members,
+            resolved_timings,
+            failure_statuses=failure_statuses,
+        )
+
+    def _resolve_isolated_rebenchmark_results(
+        self,
+        members: Sequence[PopulationMember],
+        results: Sequence[IsolatedBenchmarkTiming],
+    ) -> tuple[list[float], list[Literal["error", "timeout"] | None]]:
+        invalidate_failures = bool(
+            getattr(
+                getattr(self, "config_spec", None),
+                "cute_flash_search_enabled",
+                False,
+            )
+        )
+        timings: list[float] = []
+        failure_statuses: list[Literal["error", "timeout"] | None] = []
+        for member, result in zip(members, results, strict=True):
+            if isinstance(result, IsolatedBenchmarkFailure):
+                if invalidate_failures:
+                    timings.append(inf)
+                    failure_statuses.append(result.status)
+                elif result.status == "error":
+                    # Preserve the pre-existing behavior for a sticky runtime
+                    # error outside CuTe flash: remove it from the current
+                    # ranking without changing its benchmark status.
+                    timings.append(inf)
+                    failure_statuses.append(None)
+                else:
+                    timings.append(member.perf)
+                    failure_statuses.append(None)
+            else:
+                timings.append(member.perf if result is None else result)
+                failure_statuses.append(None)
+        return timings, failure_statuses
+
+    def _apply_rebenchmark_timings(
+        self,
+        members: Sequence[PopulationMember],
+        timings: Sequence[float],
+        *,
+        failure_statuses: Sequence[Literal["error", "timeout"] | None] | None = None,
+    ) -> None:
+        if failure_statuses is None:
+            failure_statuses = [None] * len(members)
+        for member, timing, failure_status in zip(
+            members, timings, failure_statuses, strict=True
+        ):
+            if failure_status is not None:
+                continue
+            member.perfs.append(timing)
+            if timing < self.best_perf_so_far:
+                self.best_perf_so_far = timing
+        invalidated = self._invalidate_cute_flash_rebenchmark_failures(
+            members, failure_statuses
+        )
+        refreshed = list(members)
+        refreshed.extend(invalidated)
+        self._refresh_benchmarked_members_after_rebenchmark(refreshed)
+        if invalidated:
+            self._recompute_cute_flash_best_perf(refreshed)
+
+    def _invalidate_cute_flash_rebenchmark_failures(
+        self,
+        members: Sequence[PopulationMember],
+        failure_statuses: Sequence[Literal["error", "timeout"] | None],
+    ) -> list[PopulationMember]:
+        failed_member_statuses = {
+            id(member): status
+            for member, status in zip(members, failure_statuses, strict=True)
+            if status is not None
+        }
+        if not failed_member_statuses:
+            return []
+
+        backend = self.config_spec.backend
+        failed_config_statuses = {
+            member.config: status
+            for member, status in zip(members, failure_statuses, strict=True)
+            if status is not None
+        }
+        failed_source_statuses: dict[str, Literal["error", "timeout"]] = {}
+        for member, status in zip(members, failure_statuses, strict=True):
+            if status is None:
+                continue
+            source_hash = backend.generated_source_hash(member.fn)
+            if source_hash is not None:
+                existing = failed_source_statuses.get(source_hash)
+                if existing != "timeout":
+                    failed_source_statuses[source_hash] = status
+
+        for source_hash in failed_source_statuses:
+            self.benchmark_provider.invalidate_effective_source_hash(source_hash)
+
+        candidates = [
+            *members,
+            *getattr(self, "population", ()),
+            *getattr(self, "_compiler_seed_members", ()),
+            *getattr(self, "_benchmarked_members", {}).values(),
+            *getattr(self, "_pinned_finalist_members", {}).values(),
+        ]
+        invalidated: list[PopulationMember] = []
+        invalidated_configs = set(failed_config_statuses)
+        seen: set[int] = set()
+        for member in candidates:
+            if id(member) in seen:
+                continue
+            seen.add(id(member))
+            status = failed_member_statuses.get(id(member))
+            if status is None:
+                status = failed_config_statuses.get(member.config)
+            if status is None and failed_source_statuses:
+                source_hash = backend.generated_source_hash(member.fn)
+                if source_hash is not None:
+                    status = failed_source_statuses.get(source_hash)
+            if status is None:
+                continue
+            member.perfs[:] = [inf]
+            member.status = status
+            invalidated.append(member)
+            invalidated_configs.add(member.config)
+        self._invalidate_rebenchmark_training_targets(
+            invalidated_configs,
+            set(failed_source_statuses),
+        )
+        return invalidated
+
+    def _invalidate_rebenchmark_training_targets(
+        self,
+        failed_configs: set[Config],
+        failed_source_hashes: set[str],
+    ) -> None:
+        """Let surrogate searches discard targets for quarantined CuTe sources."""
+        return None
+
+    def _recompute_cute_flash_best_perf(
+        self, members: Sequence[PopulationMember]
+    ) -> None:
+        candidates = [
+            *members,
+            *getattr(self, "population", ()),
+            *getattr(self, "_compiler_seed_members", ()),
+            *getattr(self, "_benchmarked_members", {}).values(),
+            *getattr(self, "_pinned_finalist_members", {}).values(),
+        ]
+        self.best_perf_so_far = min(
+            (
+                member.perf
+                for member in candidates
+                if member.perfs and math.isfinite(member.perf)
+            ),
+            default=inf,
+        )
 
     def _confirm_suspicious_rebenchmark_timings(
         self,
@@ -1738,10 +2337,11 @@ class PopulationBasedSearch(BaseSearch):
         timings: list[float],
         *,
         desc: str,
-    ) -> list[float]:
+    ) -> list[IsolatedBenchmarkTiming]:
+        updated: list[IsolatedBenchmarkTiming] = list(timings)
         ratio = self.settings.get_suspicious_rebenchmark_ratio()
         if ratio is None or ratio <= 0:
-            return timings
+            return updated
 
         suspicious = [
             i
@@ -1751,7 +2351,7 @@ class PopulationBasedSearch(BaseSearch):
             and timing < ratio * member.perf
         ]
         if not suspicious:
-            return timings
+            return updated
 
         confirmed = self.benchmark_provider.benchmark_isolated(
             [members[i].fn for i in suspicious],
@@ -1760,9 +2360,8 @@ class PopulationBasedSearch(BaseSearch):
             desc=f"{desc}: confirming suspicious timings",
         )
         if confirmed is None:
-            return timings
+            return updated
 
-        updated = list(timings)
         for i, timing in zip(suspicious, confirmed, strict=True):
             if timing is not None:
                 updated[i] = timing
@@ -1813,6 +2412,7 @@ class PopulationBasedSearch(BaseSearch):
             The minimized configuration (may be the same as input if no simplifications helped).
         """
         if rounds <= 0:
+            self._selected_member = best
             return best
 
         self.log(f"Starting finishing phase with {rounds} rounds")
@@ -1920,6 +2520,7 @@ class PopulationBasedSearch(BaseSearch):
             status=current.status,
             compile_time=current.compile_time,
         )
+        self._selected_member = current
         self.log(f"Finishing phase complete: final config={current.config}")
         return current
 

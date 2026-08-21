@@ -450,15 +450,17 @@ class TestCuteEpilogue(unittest.TestCase):
             "cutlass.Int32(32), None].iterator",
             code,
         )
-        scalar_read = (
-            "tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_grouped_0"
-            "[0, 0, 0, cutlass.Int32(_tcgen05_subtile)]"
+        scalar_hoist = (
+            "tcgen05_colvec_scalar_full_0 = tcgen05_tTR_gAux_grouped_0[0, 0, 0, 0]"
         )
+        self.assertIn(scalar_hoist, code)
+        scalar_read = "tcgen05_aux_loaded_0 = tcgen05_colvec_scalar_full_0"
         self.assertIn(scalar_read, code)
         self.assertNotIn(
             "tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_grouped_0.load()", code
         )
         loop_pos = code.index("for _tcgen05_subtile in cutlass.range")
+        self.assertLess(code.index(scalar_hoist), loop_pos)
         scalar_use_pos = code.index(scalar_read, loop_pos)
         product_pos = code.index("tcgen05_aux_product", scalar_use_pos)
         wait_pos = code.index("tcgen05_acc_pipeline.consumer_wait", loop_pos)

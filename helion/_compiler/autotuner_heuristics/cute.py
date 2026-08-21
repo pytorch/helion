@@ -710,11 +710,11 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
 
 
 class CuteFlashAttentionHeuristic(AutotunerHeuristic):
-    """Seed ``block_sizes=[1, 128, 128]`` for detected fp16 flash-attention.
+    """Seed ``block_sizes=[1, 128, 128]`` for detected flash attention.
 
     When ``HELION_CUTE_FLASH`` is on (the default), a dense online-softmax
-    attention kernel at [tile_b=1, tile_m=128, tile_n=128], fp16, head_dim in
-    {64, 128} lowers to the fused tcgen05 flash path
+    attention kernel at [tile_b=1, tile_m=128, tile_n=128], FP16/BF16, head_dim
+    in {64, 128} lowers to the fused tcgen05 flash path
     (``cute_flash.codegen_attention_flash``) -- orders of magnitude faster than
     the scalar fallback. The flash detector fires at EXACTLY 128x128 tiles, so
     unless that config is in the autotuner population the fast path is never
@@ -731,86 +731,50 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
         return env.config_spec.cute_flash_search_enabled
 
     @classmethod
-    def get_seed_config(
+    def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> Config | None:
+    ) -> list[Config] | None:
         spec = env.config_spec
         if not spec.cute_flash_search_enabled:
             return None
-        from ..cute.cute_flash import flash_attention_seed_config
+        from ..cute.cute_flash import flash_attention_seed_configs
 
         assert spec._cute_flash_head_dim is not None
-        seed = flash_attention_seed_config(
-            spec._cute_flash_head_dim,
-            spec._cute_flash_num_kv,
-            dtype=spec._cute_flash_dtype,
-            is_causal=spec._cute_flash_is_causal,
-            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
-            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
-            small_biased_candidate=spec._cute_flash_small_biased_candidate,
-            standard_dense_output=spec._cute_flash_standard_dense_output,
-            standard_causal_output=spec._cute_flash_standard_causal_output,
-            target_device_capability=spec.target_device_capability,
-            block_size_targets=spec._cute_flash_block_size_target_list(),
-        )
-        if seed is not None:
-            # A fresh worker retry uses one setup launch plus three timed
-            # launches. The median is robust while using half the launches of
-            # the normal path that timed out.
-            spec.compiler_seed_timeout_retry_repetitions = 3
-        return seed
-
-
-class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
-    """Seed best-known causal hd64 LPT swizzle points for large-token rows."""
-
-    name = "cute_flash_attention_causal_lpt"
-    backend = "cute"
-
-    @classmethod
-    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        from ..cute.cute_flash import flash_attention_seed_config
-
-        spec = env.config_spec
-        if not spec.cute_flash_search_enabled or spec._cute_flash_head_dim is None:
-            return False
-        return (
-            flash_attention_seed_config(
+        assert spec._cute_flash_num_kv is not None
+        common = {
+            "num_bh": spec._cute_flash_num_bh,
+            "tensor_4d_heads": spec._cute_flash_tensor_4d_heads,
+            "dtype": spec._cute_flash_dtype,
+            "is_causal": spec._cute_flash_is_causal,
+            "has_kv_tile_pruning": spec._cute_flash_has_kv_tile_pruning,
+            "requires_ws_overlap": spec._cute_flash_requires_ws_overlap,
+            "small_biased_candidate": spec._cute_flash_small_biased_candidate,
+            "supports_tensor_4d_tma": spec._cute_flash_supports_tensor_4d_tma,
+            "target_device_capability": spec.target_device_capability,
+            "block_size_targets": spec._cute_flash_block_size_target_list(),
+        }
+        seeds = spec._legalize_cute_flash_compiler_seeds(
+            flash_attention_seed_configs(
                 spec._cute_flash_head_dim,
                 spec._cute_flash_num_kv,
-                dtype=spec._cute_flash_dtype,
-                is_causal=spec._cute_flash_is_causal,
-                has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
-                small_biased_candidate=spec._cute_flash_small_biased_candidate,
-                block_size_targets=spec._cute_flash_block_size_target_list(),
-                seed_kind="causal_lpt",
+                standard_dense_output=spec._cute_flash_standard_dense_output,
+                standard_causal_output=spec._cute_flash_standard_causal_output,
+                **common,
             )
-            is not None
         )
+        if seeds:
+            # Slow but valid flash seeds can exceed the normal subprocess
+            # timing window. Retry once with three measured launches so a
+            # transient timeout does not remove a structural family.
+            spec.compiler_seed_timeout_retry_repetitions = 3
+        return seeds
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
-        if not cls.is_eligible(env, device_ir):
-            return None
-
-        from ..cute.cute_flash import flash_attention_seed_config
-
-        spec = env.config_spec
-        assert spec._cute_flash_head_dim is not None
-        return flash_attention_seed_config(
-            spec._cute_flash_head_dim,
-            spec._cute_flash_num_kv,
-            dtype=spec._cute_flash_dtype,
-            is_causal=spec._cute_flash_is_causal,
-            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
-            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
-            small_biased_candidate=spec._cute_flash_small_biased_candidate,
-            block_size_targets=spec._cute_flash_block_size_target_list(),
-            seed_kind="causal_lpt",
-        )
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
 
 
 class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):

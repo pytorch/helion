@@ -478,6 +478,10 @@ def _detect_attention_mma_loop(
     """
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return False
+    from ..compile_environment import CompileEnvironment
+
+    if CompileEnvironment.current().config_spec.cute_attention_generic_fallback_enabled:
+        return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
         return False
@@ -780,6 +784,9 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    # Bump when config_value_priors() changes its candidate distribution.
+    config_value_priors_version = 1
+
     @property
     def name(self) -> str:
         return "cute"
@@ -849,28 +856,7 @@ class CuteBackend(Backend):
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
         }
-        if config_spec is not None and config_spec.cute_flash_search_enabled:
-            priors.update(self._cute_flash_config_value_priors(config_spec))
         return priors
-
-    @staticmethod
-    def _cute_flash_config_value_priors(
-        config_spec: ConfigSpec,
-    ) -> dict[str, ValuePrior]:
-        from ...autotuner.config_priors import weighted_choice
-        from .cute_flash import flash_attention_value_prior_weights
-
-        return {
-            key: weighted_choice(weights)
-            for key, weights in flash_attention_value_prior_weights(
-                config_spec._cute_flash_head_dim or 0,
-                config_spec._cute_flash_num_kv,
-                dtype=config_spec._cute_flash_dtype,
-                is_causal=config_spec._cute_flash_is_causal,
-                has_kv_tile_pruning=config_spec._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=config_spec._cute_flash_requires_ws_overlap,
-            ).items()
-        }
 
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into

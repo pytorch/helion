@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING
 
 from .common import dedupe_configs
-from .cute import CuteFlashAttentionCausalLptHeuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteReductionTileHeuristic
@@ -42,7 +41,6 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
         CuteFp8GemmSkinnyMHeuristic,
         CuteFlashAttentionHeuristic,
-        CuteFlashAttentionCausalLptHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteTcgen05GroupedStaticCommonKHeuristic,
