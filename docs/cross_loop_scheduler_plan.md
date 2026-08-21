@@ -174,6 +174,95 @@ a semantic requirement. Prefer an epoch-relative exact target comparison so
 any statically proved positive fan-in is representable. Retain a power-of-two
 restriction only if generated-code measurements demonstrate a material need.
 
+### 3c. Separate readiness proofs from execution strategies
+
+“Continuation” is not a third kind of dependency legality. Dependency analysis
+proves one of two readiness levels:
+
+```text
+Dependency proof                 Possible execution strategy
+────────────────────────────────────────────────────────────
+Root-ready              →        root-completion counter
+Task-ready P(c)         →        exact task events
+Task-ready P(c)         →        proven event coarsening
+Task-ready P(c)         →        last-arrival continuation
+```
+
+For each consumer task `c`, the dependency graph defines:
+
+```text
+P(c) = producer tasks whose writes are required by c
+```
+
+Root completion conservatively replaces `P(c)` with the entire producer root.
+It is valid even when a finer mapping cannot be represented and usually has low
+synchronization overhead, but exposes no producer/consumer overlap.
+
+Exact task events implement `P(c)` directly. Each producer task publishes its
+completion, and each consumer waits only for the predecessors it needs. This is
+the faithful fine-grained lowering, but event storage, publication, polling,
+and poorly placed waits can make it slower than root completion.
+
+A continuation is an optimization of an already-proven task-ready relation.
+When the predecessor sets are disjoint, cover the producer domain, have a
+constant fan-in, and admit a compact mapping, each producer contributes one
+arrival to its consumer key and the final arrival executes the unchanged
+consumer task directly. Continuation does not discover new dependencies or
+make an otherwise illegal edge legal.
+
+For the Gemma gate-up to GeGLU edge, there are 640 producer tasks and 40
+consumer tasks, with 16 exact predecessors per consumer. The partition proof is
+valid, but the continuation was slower because it removed the tuned L2 order,
+added 640 atomic arrivals, increased whole-kernel register pressure, and did
+not create enough useful overlap with the downstream projection. The ordinary
+continuation measured about 153 us, while forcing the larger three-stage
+pipeline measured about 263 us. Therefore:
+
+```text
+legal continuation != profitable continuation
+```
+
+The dependency graph remains the single source of truth for legality. A policy
+layer may choose among root completion, exact events, coarsened events, and
+continuation only when the required proof exists. It should use a small,
+deterministic cost model based on fan-in, task counts, worker balance,
+synchronization volume, resource use, and resident-worker capacity. It should
+not automatically select the finest-grained legal schedule.
+
+### 3d. Make logical task geometry authoritative
+
+Logical task coordinates must be first-class DeviceIR metadata. Preserve each
+root's axis extents, block sizes, coordinate order, and logical-to-physical PID
+mapping before lowering. Do not reconstruct task counts or identities from
+generated PID expressions.
+
+This directly addresses two Gemma findings:
+
+- A specialized `q_heads // kv_heads` expression remained a string in the
+  lowered PID representation, causing static task-count recovery to fail and
+  silently selecting the cooperative-grid fallback.
+- Nontrivial L2 grouping currently disables task events because the readiness
+  implementation knows only ordinary flattened logical PIDs, not the root's
+  configured remap.
+
+The dependency proof should operate entirely in canonical logical coordinates.
+The execution layer should then apply the root's existing PID mapping when it
+dispatches that task. This keeps readiness identity stable across loop-order
+and L2-remapping choices without making either transformation a special case.
+
+### 3e. Normalize views before dependency proof
+
+Ordinary aliases, slices, and reshapes should be normalized into coordinates of
+their underlying allocation before overlap is analyzed. A projection written
+as `[token, flat_feature]` and consumed as `[token, head, head_dim]` describes
+the same allocation regions and should not fall back merely because the source
+ranks differ.
+
+The normalized form should retain allocation identity, storage offset, strides,
+extents, and affine expressions. Fine-grained readiness remains unavailable for
+indirect or ambiguous mappings, but simple view algebra should not hide an
+otherwise exact predecessor relation.
+
 ### 4. Represent scheduling with generic events and waits
 
 The plan should contain only generic scheduling concepts:
@@ -216,6 +305,19 @@ Do not copy the older experimental global atomic work cursor as the default
 admission mechanism. It adds dispatch overhead and previously exposed Triton
 dynamic-dispatch limitations. A cursor can be reconsidered only if a workload
 demonstrates that static traversal cannot express a necessary schedule.
+
+Outlined roots must remain opaque functions with a complete generated ABI.
+Their live-ins include both source values and compiler-created values such as
+tensor descriptors, dynamic strides, and scheduling state. Root extraction
+must compute and thread this ABI mechanically. A scheduling transformation
+must never leave a helper referring to a descriptor or other generated value
+that exists only in the parent kernel.
+
+Root completion should also support generic multi-predecessor joins. A
+singleton consumer with several incoming root-ready edges simply waits for all
+of their completion events and then executes its unchanged body. It should not
+require output-tiling the consumer, duplicating a reduction, or recognizing a
+residual-specific topology.
 
 ### 6. Place readiness at the narrowest proven program point
 
@@ -415,7 +517,7 @@ Status values: **pending**, **in progress**, **complete**, or **blocked**.
 | 5 | complete | Add two narrow optimizations over exact readiness: nested-loop cohorts and uniform-partition last-arrival continuations. | Qwen's FFN chain is represented without a topology matcher; failures fall back to exact events or root completion. |
 | 6 | in progress | Remove specialized matcher/emitter families and internalize or remove specialized public knobs. | Planner and codegen contain only root/task/access/event abstractions. |
 | 7 | pending | Audit and separate unrelated codegen changes; handle dynamic task counts without assertions. | Schedule-off codegen is unchanged, and dynamic-shape scheduling selects a valid symbolic path or safe fallback. |
-| 8 | pending | Final correctness, performance, lint, and design review. | Test matrix passes; Qwen meets the agreed performance range; remaining limitations are explicit and structural. |
+| 8 | in progress | Final correctness, performance, lint, and design review, including a second-model Gemma4 probe. | Test matrix passes; Qwen meets the agreed performance range; remaining limitations are explicit and structural. |
 
 ### Current migration boundary
 
@@ -467,6 +569,69 @@ for additional matcher families.
 These results validate the narrow generic continuation primitive. They do not
 justify reproducing every specialized ordering or staging detail from the
 probe.
+
+### Gemma4 generalization probe
+
+The first full-layer probe outside Qwen stacks the existing Gemma4 E4B Helion
+roots without changing the compiler. Lowered-code inspection is part of the
+evaluation, not just end-to-end timing. The current B200 results are:
+
+| Variant | Megakernel | Separate Helion | Delta |
+| --- | ---: | ---: | ---: |
+| sliding, non-shared | 105.42 us | 79.73 us | +25.69 us |
+| full, non-shared | 155.58 us | 131.57 us | +24.00 us |
+| sliding, shared | 100.19 us | 78.07 us | +22.12 us |
+| full, shared | 144.46 us | 129.22 us | +15.25 us |
+
+The measurements are interleaved CUDA Graph medians from the same process.
+They should be compared separately from the older Gemma README numbers, whose
+full-attention separate-kernel results were materially faster on the earlier
+software state.
+
+The probe exposed the following general boundaries:
+
+- Most Gemma roots currently lower through whole-value completion. The lowered
+  Triton code has global waits between input norm, projections, Q/K/V
+  normalization, attention split/merge, output projection, and the FFN prefix.
+  Only the PLE tail obtains useful task-level events in the retained
+  configuration.
+- Passing `q_heads // kv_heads` through the composed source left the shared
+  attention task extent symbolic during scheduler construction. Although
+  Triton later folded the value to 4, `_static_case_task_counts` returned
+  `None`, selecting the cooperative-grid fallback and producing a 210.7 us
+  kernel. Passing the already-known `q_per_kv` scalar directly restored the
+  ordinary persistent event schedule and reduced the result to about 100 us.
+  Static task geometry should eventually consume specialized scalar
+  expressions directly so equivalent source forms select the same schedule.
+- Copying a standalone tensor-descriptor choice into an outlined root emits a
+  descriptor load such as `down_weight_desc.load(...)` without threading that
+  descriptor through the generated root helper. This is a compiler correctness
+  bug in the interaction between root outlining and descriptor setup. The
+  benchmark therefore retains pointer indexing rather than changing compiler
+  code in this experiment.
+- Nontrivial L2 PID remaps deliberately force root completion because event
+  IDs are defined in ordinary logical PID order. Removing the remaps exposes
+  the generic gate/up continuation, but the resulting schedule is much slower
+  for Gemma (about 153 us); forcing the full three-stage pipeline was slower
+  still (about 263 us). This confirms that legality and policy must remain
+  separate: a proved continuation is not automatically the best schedule.
+- The full-attention root demonstrates the resource cost of a single kernel
+  configuration. A 512-by-128 attention tile exceeds B200 shared memory even
+  at two stages. A 32-token context tile with four warps and three stages is
+  legal and fastest among the tested simple choices, but the complete kernel
+  still reaches 254--255 registers. This is a configuration/resource issue,
+  not evidence for a model-specific scheduler case.
+- The two residual RMSNorm joins are singleton consumers with two producer
+  roots. The current structural singleton path accepts only one whole-value
+  predecessor, so the probe output-tiles these roots at width 1024. A generic
+  multi-input root-ready join would remove this source workaround.
+
+The next general improvements suggested by Gemma are therefore small and
+orthogonal: preserve specialized task extents through scalar expressions,
+thread generated descriptor arguments through outlined root helpers, normalize
+affine accesses across simple views/reshapes, and let singleton roots wait on
+multiple proven root-completion events. None requires a Gemma-specific
+continuation or a new public tuning knob.
 
 ## Validation matrix
 
@@ -568,6 +733,28 @@ Open, to be answered with implementation evidence:
   without introducing a broad symbolic-set solver.
 
 ## Progress log
+
+### 2026-08-21
+
+- Built a 14-root Gemma4 E4B layer megakernel from the existing Helion kernels
+  without changing compiler source.
+- Audited the emitted Triton for all four representative layer variants rather
+  than relying only on timing and resource summaries.
+- Found and worked around a specialized-expression leak in the benchmark:
+  passing `q_per_kv` directly lets the shared-cache variants use the generic
+  persistent scheduler instead of the cooperative-grid fallback.
+- Confirmed that root outlining currently fails to thread tensor-descriptor
+  handles used by a root body; retained pointer indexing and recorded this as a
+  compiler issue.
+- Confirmed that making the Gemma FFN continuation legal by removing L2 remaps
+  is not sufficient for performance: the ordinary continuation regressed to
+  roughly 153 us, and the fully admitted three-stage pipeline regressed to
+  roughly 263 us. No Gemma-specific scheduler path was added.
+- Reduced full-attention shared-memory pressure with a 32-token inner attention
+  tile and selected simple head-width-based launch defaults.
+- Validated correctness and interleaved performance for layers 0, 5, 24, and
+  29. The weighted 42-layer total is approximately 4.667 ms for the current
+  megakernel versus 3.680 ms for current separate Helion kernels.
 
 ### 2026-08-20
 
