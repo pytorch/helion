@@ -69,7 +69,7 @@ class FlyDSLBackend(Backend):
 
     def validate_environment(self) -> None:
         try:
-            import flydsl  # noqa: F401
+            import flydsl  # noqa: F401  # pyrefly: ignore[missing-import]
         except ImportError as e:
             raise exc.BackendUnsupported(
                 self.name,
@@ -459,8 +459,8 @@ class FlyDSLBackend(Backend):
                 return f"fmath.atan({x})"
 
             @staticmethod
-            def atan2(a: str, b: str) -> str:
-                return f"fmath.atan2({a}, {b})"
+            def atan2(x: str, y: str) -> str:
+                return f"fmath.atan2({x}, {y})"
 
             @staticmethod
             def sinh(x: str) -> str:
@@ -516,8 +516,8 @@ class FlyDSLBackend(Backend):
                 return f"fmath.round({x})"
 
             @staticmethod
-            def copysign(a: str, b: str) -> str:
-                return f"fmath.copysign({a}, {b})"
+            def copysign(x: str, y: str) -> str:
+                return f"fmath.copysign({x}, {y})"
 
             @staticmethod
             def isnan(x: str) -> str:

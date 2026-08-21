@@ -243,7 +243,7 @@ def _make(kernel):
     # Persistent null stream (fx.Stream(None) -> stream 0), reused across launches.
     global _flydsl_stream
     if _flydsl_stream is None:
-        import flydsl.expr as _fx
+        import flydsl.expr as _fx  # pyrefly: ignore[missing-import]
 
         _flydsl_stream = _fx.Stream(None)
 
@@ -254,7 +254,7 @@ def _make(kernel):
     # resolution in JitFunction.__call__ (the dominant per-launch CPU cost).
     compiled = _flydsl_compiled_cache.get(cache_key)
     if compiled is None:
-        import flydsl.compiler as _flyc
+        import flydsl.compiler as _flyc  # pyrefly: ignore[missing-import]
 
         compiled = _flyc.compile(_flydsl_jit_cache[cache_key], *args, _flydsl_stream)
         _flydsl_compiled_cache[cache_key] = compiled

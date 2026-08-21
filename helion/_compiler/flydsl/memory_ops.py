@@ -22,11 +22,15 @@ from ..ast_extension import statement_from_string
 if TYPE_CHECKING:
     import ast
 
+    from ..compile_environment import CompileEnvironment
     from ..inductor_lowering import CodegenState
 
 
 def _flydsl_rolled_col_block(
-    env: object, state: CodegenState, tensor: torch.Tensor, subscript: object
+    env: CompileEnvironment,
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
 ) -> int | None:
     """Block id of the rolled column loop a ``:`` slice iterates over.
 
@@ -102,11 +106,11 @@ def _flydsl_col_tail_pred(
 
 
 def _flydsl_buffer_setup(
-    env: object,
+    env: CompileEnvironment,
     state: CodegenState,
     tensor: torch.Tensor,
     tensor_name: str,
-    subscript: object,
+    subscript: list[object] | tuple[object, ...],
 ) -> dict:
     """Resolve indexing and build the (cached) buffer/div/copy-atom setup shared
     by the flydsl buffer load and store codegen.
@@ -168,6 +172,7 @@ def _flydsl_buffer_setup(
     _tc = 0
     _lb = 0
     if is_rolled_col:
+        assert col_block_id is not None
         _rs = state.device_function.tile_strategy.block_id_to_strategy.get(
             (col_block_id,)
         )
@@ -182,6 +187,7 @@ def _flydsl_buffer_setup(
     # drop those out-of-range columns from loads and stores.
     rolled_col_pred: str | None = None
     if is_rolled_col and rolled_col_offset is not None:
+        assert col_block_id is not None
         _numel = env.block_sizes[col_block_id].numel
         if not env.known_multiple(_numel, _lb):
             rolled_col_pred = _flydsl_col_tail_pred(
@@ -202,14 +208,15 @@ def _flydsl_buffer_setup(
 
     device_fn = state.device_function
     if not hasattr(device_fn, "_flydsl_setup"):
-        device_fn._flydsl_setup = {}
+        device_fn._flydsl_setup = {}  # pyrefly: ignore[missing-attribute]
 
     setup_key = (tensor_name, is_vec, is_rolled_col)
-    setup = device_fn._flydsl_setup.get(setup_key)
+    setup = device_fn._flydsl_setup.get(setup_key)  # pyrefly: ignore[missing-attribute]
     if setup is None:
         _hoist = None
         if col_block_id is not None and state.codegen.active_device_loops[col_block_id]:
-            _hoist = state.codegen.active_device_loops[col_block_id][-1].outer_prefix
+            _loop = state.codegen.active_device_loops[col_block_id][-1]
+            _hoist = _loop.outer_prefix  # pyrefly: ignore[missing-attribute]
         # Loop-invariant setup (buffer/row/logical_divide/copy_atom). Under a
         # runtime scf.for column loop the loop body is lifted into its own
         # function, so setup emitted inside it is invisible to a sibling
@@ -281,7 +288,7 @@ def _flydsl_buffer_setup(
             )
 
         setup = {"div": div.id, "atom": atom.id, "vec": vec_width, "row": row.id}
-        device_fn._flydsl_setup[setup_key] = setup
+        device_fn._flydsl_setup[setup_key] = setup  # pyrefly: ignore[missing-attribute]
 
     return {
         "setup": setup,
@@ -297,8 +304,9 @@ def _flydsl_buffer_setup(
 
 
 @_decorators.codegen(store, "flydsl")
-def _(state: CodegenState) -> ast.AST:
+def _(state: CodegenState) -> None:
     from ..compile_environment import CompileEnvironment
+    from ..compile_environment import _symint_sympy_expr
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -431,7 +439,7 @@ def _(state: CodegenState) -> ast.AST:
             if bid is not None:
                 parts.append(state.codegen.index_var(bid))
             else:
-                parts.append(state.sympy_expr(idx))
+                parts.append(state.sympy_expr(_symint_sympy_expr(idx)))
         elif isinstance(idx, int):
             parts.append(str(idx))
     idx_str = ", ".join(parts)
@@ -444,6 +452,7 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(load, "flydsl")
 def _(state: CodegenState) -> ast.AST:
     from ..compile_environment import CompileEnvironment
+    from ..compile_environment import _symint_sympy_expr
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -627,7 +636,7 @@ def _(state: CodegenState) -> ast.AST:
             if bid is not None:
                 parts.append(state.codegen.index_var(bid))
             else:
-                parts.append(state.sympy_expr(idx))
+                parts.append(state.sympy_expr(_symint_sympy_expr(idx)))
         elif isinstance(idx, int):
             parts.append(str(idx))
     return expr_from_string(f"{tensor_name}[{', '.join(parts)}]")
