@@ -644,6 +644,7 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
         "jnp.int8": jnp.int8,
         "jnp.uint8": jnp.uint8,
         "jnp.bool_": jnp.bool_,
+        "jnp.float8_e4m3fn": jnp.float8_e4m3fn,
     }
 
 
