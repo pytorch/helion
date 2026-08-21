@@ -233,6 +233,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
+            env=SimpleNamespace(device=torch.device("cpu"), process_group_name=None),
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
             maybe_log_repro=lambda log_func, args, config=None: None,
@@ -261,6 +262,12 @@ class TestAutotuneIgnoreErrors(TestCase):
         ):
             search._prepare()
         return search
+
+    def test_prepare_uses_compile_environment_device(self) -> None:
+        search = self._make_search(
+            Settings(autotune_log_level=logging.CRITICAL), args=()
+        )
+        self.assertIs(search._kernel_metadata._device, search.kernel.env.device)
 
     def test_settings_flag_from_env(self):
         with patch.dict(
@@ -6477,6 +6484,7 @@ class TestAutotuneBudget(TestCase):
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
+            env=SimpleNamespace(device=torch.device("cpu"), process_group_name=None),
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
             maybe_log_repro=lambda log_func, args, config=None: None,
@@ -6766,7 +6774,9 @@ class TestAutotuneBudget(TestCase):
         settings = Settings(autotune_log_level=logging.CRITICAL)
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
-        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.kernel = SimpleNamespace(
+            env=SimpleNamespace(device=torch.device("cpu"), process_group_name=None)
+        )
         config_gen = Mock()
         config_gen.seed_flat_config_pairs.return_value = [([64], normalized)]
         search.config_spec = SimpleNamespace(

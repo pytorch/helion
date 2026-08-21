@@ -156,8 +156,8 @@ class AutotuningLogger:
             sink.start_run()
             try:
                 yield sink
-            finally:
                 sink.end_run()
+            finally:
                 self._detach_sink()
 
     def record_autotune_entry(self, entry: AutotuneLogEntry) -> None:
