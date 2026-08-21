@@ -37,6 +37,7 @@ from .cute_epilogue import _AuxiliaryTensorLoadExpr
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
+from .tcgen05_constants import Tcgen05AuxStagingScope
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -107,6 +108,9 @@ class Tcgen05AuxTensorDescriptor:
       productive-body codegen can use this to pair the aux SMEM
       ring with the right store-splice consumer if a future kernel
       shape produces fan-out.
+    - ``staging_scope``: whether one pipeline stage carries an ordinary
+      epilogue subtile or the complete output tile. The latter is selected only
+      when the fragment proof shows every staged access stays within that tile.
 
     The descriptor is intentionally minimal — just the fields the
     productive body needs. Per-aux-step splice locals (var names,
@@ -124,6 +128,7 @@ class Tcgen05AuxTensorDescriptor:
     host_tensor_val: torch.Tensor
     broadcast_axis: int | None
     store_value_node: torch.fx.Node
+    staging_scope: Tcgen05AuxStagingScope = Tcgen05AuxStagingScope.EPILOGUE_SUBTILE
 
 
 def _output_global_shape_from_store(
