@@ -2599,7 +2599,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallasTpu("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         batch = 2
@@ -2613,22 +2612,41 @@ class TestExamples(RefEagerTestBase, TestCase):
             batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE
         )
         k = torch.nn.functional.rms_norm(k, (dhead,))
-        w = torch.randn(
-            batch,
-            seqlen // chunk_size,
-            chunk_size,
-            nheads,
-            dhead,
-            dtype=torch.float32,
-            device=DEVICE,
-        )
-        wu, ws, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
-        w = torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
-        w = (
-            w.permute(0, 1, 3, 2, 4)
-            .reshape(batch, seqlen, nheads, dhead)
-            .to(torch.bfloat16)
-        )
+        if DEVICE.type == "tpu":
+            # TODO(tcombes): Use the randomized SVD path once torch.linalg.svd supports TPU.
+            positions = torch.arange(chunk_size, dtype=torch.float32) + 0.5
+            frequencies = torch.arange(dhead, dtype=torch.float32)
+            frame = torch.cos(math.pi / chunk_size * positions[:, None] * frequencies)
+            frame[:, 0] /= math.sqrt(chunk_size)
+            frame[:, 1:] *= math.sqrt(2 / chunk_size)
+            signs = torch.randint(
+                0,
+                2,
+                (batch, seqlen // chunk_size, 1, nheads, dhead),
+                dtype=torch.int32,
+            )
+            w = (
+                (frame[None, None, :, None, :] * (signs * 2 - 1))
+                .reshape(batch, seqlen, nheads, dhead)
+                .to(device=DEVICE, dtype=torch.bfloat16)
+            )
+        else:
+            w = torch.randn(
+                batch,
+                seqlen // chunk_size,
+                chunk_size,
+                nheads,
+                dhead,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            wu, _, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
+            w = (
+                torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
+                .permute(0, 1, 3, 2, 4)
+                .reshape(batch, seqlen, nheads, dhead)
+                .to(torch.bfloat16)
+            )
         u = torch.randn(
             batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE
         )
