@@ -619,6 +619,19 @@ def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_cat_columns(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    rows = x.size(0)
+    out = torch.empty(
+        [rows, x.size(1) + y.size(1)],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for tile_rows in hl.tile(rows):
+        out[tile_rows, :] = torch.cat((x[tile_rows, :], y[tile_rows, :]), dim=1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
     """Kernel that uses hl.rand to generate random values and add them to x."""
     out = torch.empty_like(x)
@@ -716,6 +729,17 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_cat_columns(self) -> None:
+        x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_cat_columns,
+            (x, y),
+            block_sizes=[128],
+        )
+        self.assertIn("jnp.concatenate((", code)
+        torch.testing.assert_close(result.cpu(), torch.cat((x, y), dim=1).cpu())
+
     def test_rsqrt_uses_native_lax_op(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def rsqrt_kernel(x: torch.Tensor) -> torch.Tensor:

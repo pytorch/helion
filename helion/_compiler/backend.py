@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.settings import DotPrecision
+    from .aten_lowering import Lowering
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _CuteMmaNode
     from .device_function import Argument
@@ -897,6 +898,15 @@ class Backend(abc.ABC):
         Called after static loop unrolling but before type propagation
         and tracing.  Backends can override this to rewrite the user's
         AST for algorithmic transformations that change loop structure.
+        """
+        return None
+
+    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        """Return a backend-owned lowering that must bypass Inductor IR.
+
+        Most ATen operations use Helion's shared Inductor lowering. Backends may
+        override this for operations whose Inductor representation cannot be
+        consumed by that shared path.
         """
         return None
 

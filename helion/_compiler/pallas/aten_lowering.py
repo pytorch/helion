@@ -21,6 +21,7 @@ from torch.fx.node import map_arg
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..aten_lowering import AtenLowering
 from ..aten_lowering import _env_arg
 from ..aten_lowering import _node_dtype_kwarg
 from ..aten_lowering import _pallas_argreduce
@@ -48,6 +49,35 @@ from ..matmul_utils import _needs_f32_accumulator
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
+
+
+cat_lowering_pallas = AtenLowering(target=torch.ops.aten.cat.default)
+
+
+@cat_lowering_pallas.register_codegen("pallas")
+def codegen_cat_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
+    tensors = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensors, (list, tuple)) and tensors
+    assert all(isinstance(tensor, ast.AST) for tensor in tensors)
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+    assert isinstance(dim, int)
+    output = node.meta["val"]
+    assert isinstance(output, torch.Tensor)
+    if dim < 0:
+        dim += output.ndim
+    assert 0 <= dim < output.ndim
+
+    placeholders: dict[str, ast.AST] = {
+        f"tensor_{index}": cast("ast.AST", tensor)
+        for index, tensor in enumerate(tensors)
+    }
+    values = ", ".join(f"{{tensor_{index}}}" for index in range(len(tensors)))
+    if len(tensors) == 1:
+        values += ","
+    return expr_from_string(
+        f"jnp.concatenate(({values}), axis={dim})",
+        **placeholders,
+    )
 
 
 @argmax_lowering.register_codegen("pallas")
