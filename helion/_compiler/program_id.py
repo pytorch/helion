@@ -260,11 +260,25 @@ class ProgramIDs(abc.ABC):
         """Generate grid launch expression for kernel execution."""
         raise NotImplementedError
 
+    def codegen_grid_for_total(self, total_pids_expr: str) -> ast.AST:
+        """Generate a grid for an explicit aggregate logical PID count."""
+        return self.codegen_grid()
+
+    def codegen_uncapped_grid(self) -> ast.AST:
+        """Generate a grid when the aggregate logical PID count is unknown."""
+        return self.codegen_grid()
+
     def total_pids_expr(self, *, is_device: bool) -> str:
         """Get total PIDs expression for device or host."""
         return " * ".join(
             f"({pid.num_pids_expr(is_device=is_device)})" for pid in self.pid_info
         )
+
+    def host_total_pids_expr(self) -> str | None:
+        """Return the host-computable PID count, or None for device bounds."""
+        if any(isinstance(pid.numel, str) for pid in self.pid_info):
+            return None
+        return self.total_pids_expr(is_device=False)
 
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
@@ -413,6 +427,12 @@ class ForEachProgramID(ProgramIDs):
         cdivs = [pid.total_pids_expr(is_device=is_device) for pid in self.cases]
         return " + ".join(cdivs)
 
+    def host_total_pids_expr(self) -> str | None:
+        totals = [case.host_total_pids_expr() for case in self.cases]
+        if any(total is None for total in totals):
+            return None
+        return " + ".join(total for total in totals if total is not None)
+
     def codegen(self, state: CodegenState) -> None:
         blocks = self._get_cdiv_blocks(state, exclude_last=True)
         if blocks:
@@ -428,8 +448,10 @@ class ForEachProgramID(ProgramIDs):
     def codegen_grid(self) -> ast.AST:
         # Check if any of the pids is a persistent strategy
         if self.cases[0]._is_persistent():
-            # Use SM count grid for persistent kernels
-            return self.cases[0].codegen_grid()
+            total_pids_expr = self.host_total_pids_expr()
+            if total_pids_expr is not None:
+                return self.cases[0].codegen_grid_for_total(total_pids_expr)
+            return self.cases[0].codegen_uncapped_grid()
 
         # When persistent kernels are not active, use the full grid size
         host_cdivs = [pid.total_pids_expr(is_device=False) for pid in self.cases]
@@ -858,6 +880,14 @@ class L2GroupingProgramIDs(ProgramIDs):
         assert self.parent_strategy is not None
         return self.parent_strategy.codegen_grid()
 
+    def codegen_grid_for_total(self, total_pids_expr: str) -> ast.AST:
+        assert self.parent_strategy is not None
+        return self.parent_strategy.codegen_grid_for_total(total_pids_expr)
+
+    def codegen_uncapped_grid(self) -> ast.AST:
+        assert self.parent_strategy is not None
+        return self.parent_strategy.codegen_uncapped_grid()
+
     def setup_persistent_kernel(
         self, device_function: DeviceFunction, total_pids_expr: str | None = None
     ) -> list[ast.stmt] | None:
@@ -876,6 +906,10 @@ class L2GroupingProgramIDs(ProgramIDs):
         """Forward to parent strategy."""
         assert self.parent_strategy is not None
         return self.parent_strategy.total_pids_expr(is_device=is_device)
+
+    def host_total_pids_expr(self) -> str | None:
+        assert self.parent_strategy is not None
+        return self.parent_strategy.host_total_pids_expr()
 
 
 class PersistentProgramIDs(ProgramIDs):
@@ -931,7 +965,18 @@ class PersistentProgramIDs(ProgramIDs):
         return f"torch.{device!r}"
 
     def codegen_grid(self) -> ast.AST:
-        # Use num_sms * multiplier for persistent kernels (multi-occupancy)
+        total_pids_expr = self.host_total_pids_expr()
+        if total_pids_expr is None:
+            return expr_from_string(f"({self.grid_size_expr},)")
+        return self.codegen_grid_for_total(total_pids_expr)
+
+    def codegen_grid_for_total(self, total_pids_expr: str) -> ast.AST:
+        # Avoid launching workers that cannot own a logical PID. Keep the
+        # persistent stride unchanged so overprovisioned configurations still
+        # map virtual PIDs exactly as before when total work exceeds the grid.
+        return expr_from_string(f"(min(({total_pids_expr}), ({self.grid_size_expr})),)")
+
+    def codegen_uncapped_grid(self) -> ast.AST:
         return expr_from_string(f"({self.grid_size_expr},)")
 
     def _persistent_setup_statements(self, total_pids_expr: str) -> list[ast.stmt]:
@@ -1396,6 +1441,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             return expr_from_string(f"({cluster_m}, {cluster_n}, {total_clusters})")
         grid_work_clusters = self._tcgen05_grid_work_clusters_expr(total_clusters)
         return expr_from_string(f"({cluster_m}, {cluster_n}, {grid_work_clusters})")
+
+    def codegen_grid_for_total(self, total_pids_expr: str) -> ast.AST:
+        # tcgen05 uses its own cluster-aware scheduler and already caps its
+        # persistent work-cluster grid where required.
+        return self.codegen_grid()
+
+    def codegen_uncapped_grid(self) -> ast.AST:
+        return self.codegen_grid()
 
     def _tcgen05_logical_m_coord_expr(self, coord: str) -> str:
         if self._tcgen05_is_two_cta():
