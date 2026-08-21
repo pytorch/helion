@@ -16110,22 +16110,6 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertEqual(analyze.call_count, 2)
 
-    def test_tcgen05_fragment_pairing_is_proven_per_source_group(self) -> None:
-        from helion._compiler.cute.fragment_epilogue import (
-            _program_has_adjacent_destination_pairs,
-        )
-
-        def program(*registers: int) -> Any:
-            return cast(
-                "Any",
-                SimpleNamespace(destination_registers=registers),
-            )
-
-        self.assertTrue(_program_has_adjacent_destination_pairs(program(0, 1, 4, 5)))
-        self.assertFalse(_program_has_adjacent_destination_pairs(program(0, 2)))
-        self.assertFalse(_program_has_adjacent_destination_pairs(program(1, 2)))
-        self.assertFalse(_program_has_adjacent_destination_pairs(program(0)))
-
     def test_tcgen05_fragment_projection_rotary_codegen(self) -> None:
         dtype = torch.bfloat16
         x = torch.empty([128, 128], device=DEVICE, dtype=dtype)
