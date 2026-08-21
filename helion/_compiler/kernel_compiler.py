@@ -19,6 +19,7 @@ from .tensor_utils import patch_tensor_factories
 if TYPE_CHECKING:
     import types
 
+    from ..runtime.tile_dependency import TileDependencySchedule
     from .compile_environment import CompileEnvironment
 
 
@@ -54,16 +55,23 @@ class KernelCompiler:
       3. Backend-specific AST customizations
       4. Type propagation
       5. Top-level tile-dependency analysis
-      6. Config spec finalization
-      7. Device IR lowering
+      6. Tile-dependency schedule construction
+      7. Config spec finalization
+      8. Device IR lowering
 
     The HostFunction is the mutable compilation state that each step
     operates on.
     """
 
-    def __init__(self, env: CompileEnvironment) -> None:
+    def __init__(
+        self,
+        env: CompileEnvironment,
+        *,
+        tile_dependency_schedule: TileDependencySchedule | None = None,
+    ) -> None:
         self.env = env
         self.backend = env.backend
+        self.tile_dependency_schedule = tile_dependency_schedule
 
     def compile(
         self,
@@ -78,6 +86,7 @@ class KernelCompiler:
             self.customize_ast(hf)
             self.propagate_types(hf)
             self.analyze_tile_dependencies(hf)
+            self.schedule_tile_dependencies(hf)
             self.finalize_config()
             self.lower(hf)
         return hf
@@ -156,6 +165,40 @@ class KernelCompiler:
             hf.compiler_state.tile_dependency_analysis = (
                 analyze_top_level_tile_dependencies(hf.body)
             )
+
+    def schedule_tile_dependencies(self, hf: HostFunction) -> None:
+        """Validate and build an explicitly requested tile-dependency schedule."""
+        from .tile_dependency_schedule import build_tile_dependency_stage_graph
+
+        with measure("HostFunction.schedule_tile_dependencies"):
+            analysis = hf.compiler_state.tile_dependency_analysis
+            assert analysis is not None
+            unsynchronized = analysis.unsynchronized_tile_dependencies
+            if unsynchronized and self.tile_dependency_schedule is None:
+                raise exc.LoopDependencyError(unsynchronized[0].name)
+            if unsynchronized and analysis.source_phase_starts:
+                raise exc.TileDependencyScheduleError(
+                    "mixing explicit hl.barrier() phases with implicit "
+                    "tile-dependency stages is not supported yet"
+                )
+            schedule = build_tile_dependency_stage_graph(
+                analysis, self.tile_dependency_schedule
+            )
+            hf.compiler_state.tile_dependency_schedule = schedule
+            if not schedule.implicit_stage_starts:
+                return
+            if self.env.backend_name != "triton" or torch.version.hip is not None:
+                dependency = next(
+                    dependency
+                    for dependency in analysis.unsynchronized_tile_dependencies
+                    if dependency.consumer_root in schedule.implicit_stage_starts
+                )
+                raise exc.LoopDependencyError(dependency.name)
+            reason = (
+                "tile dependencies require a persistent blocked kernel for "
+                "tile-dependency scheduling"
+            )
+            self.env.require_persistent_blocked_without_cooperative_barrier(reason)
 
     def lower(self, hf: HostFunction) -> None:
         from .device_ir import lower_to_device_ir

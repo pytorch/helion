@@ -13,6 +13,7 @@ from .autotuner import from_cache
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import OutputCodeOptions
+from .runtime import TileDependencySchedule
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
 from .runtime.settings import RefMode
@@ -24,6 +25,7 @@ __all__ = [
     "OutputCodeOptions",
     "RefMode",
     "Settings",
+    "TileDependencySchedule",
     "aot_kernel",
     "cdiv",
     "exc",

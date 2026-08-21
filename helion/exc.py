@@ -103,6 +103,10 @@ class LoopDependencyError(BaseError):
     )
 
 
+class TileDependencyScheduleError(BaseError):
+    message = "TileDependencySchedule cannot safely lower dependency {0}."
+
+
 class TopLevelStatementBetweenLoops(BaseError):
     message = "Statements cannot appear between top level loops."
 

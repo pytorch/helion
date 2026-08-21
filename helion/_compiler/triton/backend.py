@@ -563,6 +563,19 @@ class TritonBackend(Backend):
                 for tensor, numel in device_fn.triton_remote_copy_scratch_specs
             )
             out.append(f"_remote_copy_scratch_specs=({specs},)")
+        if device_fn.triton_persistent_state_specs:
+            specs = ", ".join(
+                f"({tensor}, {numel}, {dtype}, {zero_init!r})"
+                for tensor, numel, dtype, zero_init in (
+                    device_fn.triton_persistent_state_specs
+                )
+            )
+            out.append(f"_persistent_state_specs=({specs},)")
+        if device_fn.triton_minimum_resident_programs is not None:
+            out.append(
+                "_minimum_resident_programs="
+                f"{device_fn.triton_minimum_resident_programs}"
+            )
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 

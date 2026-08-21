@@ -61,6 +61,7 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .loop_dependency_checker import LoopDependencyChecker
+from .loop_dependency_checker import TileAccess
 from .loop_dependency_checker import TileDependency
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
@@ -93,6 +94,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from .cute.layout import CuTeGridExecutionPlan
+    from .tile_dependency_schedule import ResolvedTileDependencySchedule
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -795,6 +797,8 @@ class DeviceIR:
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
         self.tile_dependencies: tuple[TileDependency, ...] = ()
+        self.tile_accesses: tuple[tuple[TileAccess, ...], ...] = ()
+        self.tile_dependency_schedule: ResolvedTileDependencySchedule | None = None
         self.grid_block_ids: list[list[int]] = []
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
@@ -3078,10 +3082,27 @@ class WalkHostAST(NodeVisitor):
         self.current_phase_roots: list[int] = []
         self.phases: list[KernelPhase] = []
         self.root_nodes: list[ast.For] = []
+        assert device_ir.host_function is not None
+        schedule = device_ir.host_function.compiler_state.tile_dependency_schedule
+        self.tile_dependency_stage_starts = (
+            schedule.implicit_stage_starts if schedule is not None else frozenset()
+        )
+
+    def _flush_current_phase(self) -> None:
+        assert self.current_phase_roots
+        self.phases.append(
+            KernelPhase(
+                roots=self.current_phase_roots,
+                root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
+            )
+        )
+        self.current_phase_roots = []
 
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         if node._loop_type == LoopType.GRID:
+            if self.root_index in self.tile_dependency_stage_starts:
+                self._flush_current_phase()
             self.device_ir.add_root_graph(
                 _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
             )
@@ -3114,25 +3135,13 @@ class WalkHostAST(NodeVisitor):
         if is_barrier:
             if self.root_index == 0 or not self.current_phase_roots:
                 raise exc.BarrierOnlyAllowedAtTopLevel
-            self.phases.append(
-                KernelPhase(
-                    roots=self.current_phase_roots,
-                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
-                )
-            )
-            self.current_phase_roots = []
+            self._flush_current_phase()
             return
         self.generic_visit(node)
 
     def flush_phases(self) -> None:
         if self.current_phase_roots:
-            self.phases.append(
-                KernelPhase(
-                    roots=self.current_phase_roots,
-                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
-                )
-            )
-            self.current_phase_roots = []
+            self._flush_current_phase()
 
 
 # Matmul/dot FX targets mapped to (lhs_arg_index, rhs_arg_index). Used to tag
@@ -3709,6 +3718,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     tile_dependency_analysis = func.compiler_state.tile_dependency_analysis
     if tile_dependency_analysis is not None:
         device_ir.tile_dependencies = tile_dependency_analysis.tile_dependencies
+        device_ir.tile_accesses = tile_dependency_analysis.accesses_by_root
+    device_ir.tile_dependency_schedule = func.compiler_state.tile_dependency_schedule
     with func, device_ir, compile_lock:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:

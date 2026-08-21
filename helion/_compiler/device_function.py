@@ -31,6 +31,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import dead_lane_loop_elimination
 from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
@@ -106,6 +107,22 @@ def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
     """Check if expression contains only block size symbols (no other variables)."""
     _, non_block = find_block_size_symbols(expr)
     return len(non_block) == 0
+
+
+def _clone_extended_ast(value: object) -> object:
+    """Clone Python/ExtendedAST nodes without dropping Helion source metadata."""
+    if isinstance(value, list):
+        return [_clone_extended_ast(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_extended_ast(item) for item in value)
+    if isinstance(value, ast.AST):
+        fields = {
+            field: _clone_extended_ast(getattr(value, field)) for field in value._fields
+        }
+        if isinstance(value, ExtendedAST):
+            return value.copy(**fields)
+        return ast.copy_location(type(value)(**fields), value)
+    return value
 
 
 @dataclasses.dataclass
@@ -352,6 +369,22 @@ class DeviceFunction:
         # into compiler-owned global scratch before the transfer starts.
         self.triton_remote_copy_scratch_args: list[str] = []
         self.triton_remote_copy_scratch_specs: list[tuple[str, str]] = []
+        # Compiler-owned state that must persist across launches (for example,
+        # epoch-scaled tile-dependency counters). The Triton launcher allocates it
+        # once per kernel/device/stream and appends it to the kernel arguments.
+        self.triton_persistent_state_args: list[str] = []
+        self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
+        # Cross-grid polling is deadlock-free only when the schedule's required
+        # worker cohort can be resident together.  The launcher validates this
+        # after Triton has produced exact register/shared-memory metadata.
+        self.triton_minimum_resident_programs: str | None = None
+        # Opaque tile bodies can be outlined behind Triton helper boundaries.
+        # Triton inlines these helpers, so the boundary carries no device-call
+        # ABI and leaves each body's computation unchanged.
+        self.triton_noinline_helpers: list[
+            tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
+        ] = []
+        self.triton_noinline_helper_constexprs: dict[str, int] = {}
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
@@ -909,6 +942,7 @@ class DeviceFunction:
         # the launcher's canonical signal-then-scratch append order, independent
         # of which descriptor kind the kernel encounters first.
         remote_copy_params = set(self.triton_remote_copy_scratch_args)
+        remote_copy_params.update(self.triton_persistent_state_args)
         if self.triton_remote_copy_signal_arg is not None:
             remote_copy_params.add(self.triton_remote_copy_signal_arg)
         if self.triton_remote_barrier_signal_arg is not None:
@@ -921,6 +955,7 @@ class DeviceFunction:
         if self.triton_remote_barrier_signal_arg is not None:
             wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
+        wrapper_only_params.extend(self.triton_persistent_state_args)
         args.extend(create_arg(name) for name in wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
@@ -1179,9 +1214,126 @@ class DeviceFunction:
         name = self.namespace.create_name(helper_graph_info.name, None)
         self.helper_manager.register_helper_function(helper_graph_info, name)
 
+    def register_triton_noinline_helper(
+        self,
+        name_hint: str,
+        body: list[ast.stmt],
+        *,
+        extra_argument_names: tuple[str, ...] = (),
+        noinline: bool = False,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Outline an opaque body without changing its computation AST."""
+        if CompileEnvironment.current().backend_name != "triton":
+            raise AssertionError("Triton noinline helpers require the Triton backend")
+        cloned_body = cast("list[ast.stmt]", _clone_extended_ast(body))
+        if tuple(
+            ast.dump(statement, include_attributes=False) for statement in cloned_body
+        ) != tuple(ast.dump(statement, include_attributes=False) for statement in body):
+            raise AssertionError("outlining changed an opaque tile body")
+        # Case extraction can carry common, compiler-generated index definitions
+        # into more than one branch. Standalone kernels eliminate those too; do
+        # the same before choosing helper parameters so dead definitions cannot
+        # accidentally turn a module constexpr into a host-wrapper local.
+        dead_assignment_elimination(cast("list[ast.AST]", cloned_body), self.dce_vars)
+        dead_expression_elimination(cast("list[ast.AST]", cloned_body))
+        reads = set(ReadWrites.from_list(cloned_body).reads)
+        local_names = {
+            node.id
+            for statement in cloned_body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        helper_names = {name for name, _, _, _ in self.triton_noinline_helpers}
+        environment = CompileEnvironment.current()
+        for name in reads:
+            if not name.startswith("_BLOCK_SIZE_"):
+                continue
+            suffix = name.removeprefix("_BLOCK_SIZE_")
+            if not suffix.isdigit():
+                continue
+            block_id = int(suffix)
+            self.triton_noinline_helper_constexprs[name] = int(
+                environment.block_sizes[block_id].from_config_assert(self.config)
+            )
+        argument_names = [
+            argument.name
+            for argument in self.arguments
+            if argument.name in reads
+            and not (
+                isinstance(argument, ConstExprArg) and _is_literal_constexpr(argument)
+            )
+        ]
+        argument_names.extend(
+            name
+            for name in self.wrapper_only_params
+            if name in reads and name not in argument_names
+        )
+        argument_names.extend(
+            name
+            for name in extra_argument_names
+            if name in reads and name not in argument_names
+        )
+        argument_names.extend(
+            name
+            for name in sorted(reads)
+            if name.startswith("tile_dependency_")
+            and name not in local_names
+            and name not in helper_names
+            and name not in argument_names
+        )
+        helper_name = self.namespace.create_name(name_hint, None)
+        self.triton_noinline_helpers.append(
+            (helper_name, tuple(argument_names), tuple(cloned_body), noinline)
+        )
+        return helper_name, tuple(argument_names)
+
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""
-        return self.helper_manager.codegen_helper_functions()
+        existing_module_assignments = {
+            target.id
+            for statement in self.codegen.module_statements
+            if isinstance(statement, ast.Assign)
+            for target in statement.targets
+            if isinstance(target, ast.Name)
+        }
+        helpers = [
+            statement_from_string(f"{name} = tl.constexpr({value})")
+            for name, value in self.triton_noinline_helper_constexprs.items()
+            if name not in existing_module_assignments
+        ]
+        helpers.extend(self.helper_manager.codegen_helper_functions())
+        renames = {name: values[0] for name, values in self._variable_renames.items()}
+        argument_by_name = {argument.name: argument for argument in self.arguments}
+        for name, argument_names, body, noinline in self.triton_noinline_helpers:
+            arguments: list[ast.arg] = []
+            for argument_name in argument_names:
+                argument = argument_by_name.get(argument_name)
+                if argument is None:
+                    argument_node = create_arg(argument_name)
+                else:
+                    argument_node = argument.arg_def_node()
+                argument_node.arg = renames.get(argument_node.arg, argument_node.arg)
+                arguments.append(argument_node)
+            helper_module = ast.Module(
+                body=cast("list[ast.stmt]", _clone_extended_ast(list(body))),
+                type_ignores=[],
+            )
+            ast_rename(helper_module, renames)
+            helpers.append(
+                create(
+                    ast.FunctionDef,
+                    name=name,
+                    args=create_arguments(arguments),
+                    body=helper_module.body,
+                    decorator_list=[
+                        expr_from_string(
+                            "triton.jit(noinline=True)" if noinline else "triton.jit"
+                        )
+                    ],
+                    type_params=[],
+                )
+            )
+        return helpers
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""
