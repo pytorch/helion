@@ -58,8 +58,8 @@ from .tcgen05_constants import TCGEN05_AB_PRODUCER_ACQUIRE_MODES
 from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_PRODUCER_ADVANCE_MODES
-from .tcgen05_constants import TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN
-from .tcgen05_constants import TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+from .tcgen05_constants import TCGEN05_AB_STAGES_MIN_DEVICE_SMEM_OPTIN
+from .tcgen05_constants import TCGEN05_AB_STAGES_RESERVED_SMEM_BYTES
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODES
@@ -170,7 +170,7 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
     allow_fp8_small_grid: bool = False
 
 
-class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
+class Tcgen05AbStagesSearchConstraints(NamedTuple):
     """Search-only envelope where ``tcgen05_ab_stages=3`` is admitted.
 
     The 3-stage AB pipeline is only safe to search when its larger SMEM
@@ -284,9 +284,9 @@ class CuteTcgen05Config:
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
         )
-        self.ab_stages_three_search_constraints: (
-            Tcgen05AbStagesThreeSearchConstraints | None
-        ) = None
+        self.ab_stages_search_constraints: Tcgen05AbStagesSearchConstraints | None = (
+            None
+        )
         self.deep_direct_entry_validation_enabled: bool = False
         self.num_epi_warps_search_choices: tuple[int, ...] | None = None
         self.num_epi_warps_validation_choices: tuple[int, ...] | None = None
@@ -530,7 +530,7 @@ class CuteTcgen05Config:
             bk=bk, ab_stage_count=3, c_stage_count=2
         ):
             return False
-        return self.ab_stages_three_fits(
+        return self.ab_stages_fits(
             bm=TCGEN05_TWO_CTA_BLOCK_M,
             bn=TCGEN05_TWO_CTA_BLOCK_N,
             bk=bk,
@@ -1031,7 +1031,7 @@ class CuteTcgen05Config:
         if not self._uses_grouped_static_reserved_sms(config):
             config.pop(reserved_sms_key, None)
 
-    def allow_ab_stages_three_search(
+    def allow_ab_stages_search(
         self,
         *,
         dtype_bytes: int,
@@ -1039,13 +1039,13 @@ class CuteTcgen05Config:
     ) -> None:
         assert dtype_bytes > 0, "dtype_bytes must be positive"
         if self._matmul_block_indices() is None:
-            self.ab_stages_three_search_constraints = None
+            self.ab_stages_search_constraints = None
             return
         budget_bytes = self.per_cta_ab_smem_budget_bytes(device)
         if budget_bytes <= 0:
-            self.ab_stages_three_search_constraints = None
+            self.ab_stages_search_constraints = None
             return
-        self.ab_stages_three_search_constraints = Tcgen05AbStagesThreeSearchConstraints(
+        self.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
             dtype_bytes=dtype_bytes,
             per_cta_smem_budget_bytes=budget_bytes,
         )
@@ -1067,18 +1067,18 @@ class CuteTcgen05Config:
     @classmethod
     def per_cta_smem_budget_bytes(cls, device: torch.device) -> int:
         device_cap = cls.per_cta_smem_capacity_bytes(device)
-        return max(0, device_cap - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES)
+        return max(0, device_cap - TCGEN05_AB_STAGES_RESERVED_SMEM_BYTES)
 
     @classmethod
     def per_cta_ab_smem_budget_bytes(cls, device: torch.device) -> int:
         device_cap = cls.per_cta_smem_capacity_bytes(device)
-        if device_cap < TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN:
+        if device_cap < TCGEN05_AB_STAGES_MIN_DEVICE_SMEM_OPTIN:
             return 0
         # Keep a fixed headroom reservation: CuTe's raw opt-in limit does not
         # include every barrier/runtime byte the 3-stage AB pipeline needs.
-        return device_cap - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        return device_cap - TCGEN05_AB_STAGES_RESERVED_SMEM_BYTES
 
-    def ab_stages_three_fits(
+    def ab_stages_fits(
         self,
         *,
         bm: int,
@@ -1088,7 +1088,7 @@ class CuteTcgen05Config:
         ab_stages: int = 3,
     ) -> bool:
         return self._ab_stages_fit_constraints(
-            constraints=self.ab_stages_three_search_constraints,
+            constraints=self.ab_stages_search_constraints,
             bm=bm,
             bn=bn,
             bk=bk,
@@ -1099,7 +1099,7 @@ class CuteTcgen05Config:
     @staticmethod
     def _ab_stages_fit_constraints(
         *,
-        constraints: Tcgen05AbStagesThreeSearchConstraints | None,
+        constraints: Tcgen05AbStagesSearchConstraints | None,
         bm: int,
         bn: int,
         bk: int,
@@ -1146,7 +1146,7 @@ class CuteTcgen05Config:
         # source-C (residual family) but ``(128, 32)`` WITHOUT one (plain
         # matmul) -- ``compute_epilogue_tile_size`` shrinks N when no C tile
         # competes for SMEM. ``has_source_c`` threads that distinction through.
-        constraints = self.ab_stages_three_search_constraints
+        constraints = self.ab_stages_search_constraints
         if constraints is None:
             return False
         if cluster_m not in (1, 2):
@@ -1236,11 +1236,11 @@ class CuteTcgen05Config:
             and block_sizes[:3] == [TCGEN05_TWO_CTA_BLOCK_M, 128, 64]
         ):
             return False
-        if self.ab_stages_three_search_constraints is None:
+        if self.ab_stages_search_constraints is None:
             # Fixed configs can be normalized before their input device is known.
             # CuTe MMA selection applies the real target's SMEM limit at codegen.
             return True
-        return self.ab_stages_three_fits(
+        return self.ab_stages_fits(
             bm=block_sizes[0],
             bn=block_sizes[1],
             bk=block_sizes[2],
@@ -1428,7 +1428,7 @@ class CuteTcgen05Config:
             >>> config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=2)
             4  # BF16 fits only 4 stages
         """
-        constraints = self.ab_stages_three_search_constraints
+        constraints = self.ab_stages_search_constraints
         if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
             return 0
         if cluster_m not in (1, 2):
@@ -1462,7 +1462,7 @@ class CuteTcgen05Config:
         return max(1, min(max_from_budget, hard_cap))
 
     def _fix_ab_stages_three_search_config(self, config: dict[str, object]) -> None:
-        if self.ab_stages_three_search_constraints is None:
+        if self.ab_stages_search_constraints is None:
             return
         if not self.search_enabled:
             return
@@ -1474,7 +1474,7 @@ class CuteTcgen05Config:
             return
         block_sizes, m_index, n_index, k_index = config_view
         cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
-        if not self.ab_stages_three_fits(
+        if not self.ab_stages_fits(
             bm=cast("int", block_sizes[m_index]),
             bn=cast("int", block_sizes[n_index]),
             bk=cast("int", block_sizes[k_index]),
@@ -1533,9 +1533,9 @@ class CuteTcgen05Config:
         else:
             # Plain / rowvec-bias store (no source-C ring): the bare-AB gate is the
             # calibrated admission — the small no-source-C epilogue D ring rides the
-            # non-AB reservation. ``ab_stages_three_fits`` returns False with no
+            # non-AB reservation. ``ab_stages_fits`` returns False with no
             # budget recorded, so this also fails CLOSED.
-            fits = self.ab_stages_three_fits(
+            fits = self.ab_stages_fits(
                 bm=cast("int", block_sizes[m_index]),
                 bn=cast("int", block_sizes[n_index]),
                 bk=cast("int", block_sizes[k_index]),
@@ -1762,7 +1762,7 @@ class CuteTcgen05Config:
         # cap of 3; admit ab_stages > 3 for fp8 as long as the AB SMEM fits the
         # per-CTA budget. This lets Helion emit the same deeply-pipelined
         # CtaGroup.TWO kernel CUTLASS uses for fp8 compute-bound GEMMs.
-        constraints = self.ab_stages_three_search_constraints
+        constraints = self.ab_stages_search_constraints
         if constraints is not None and constraints.dtype_bytes == 1:  # FP8
             config_view = self._matmul_config_view(config)
             cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
@@ -2165,8 +2165,8 @@ class CuteTcgen05Config:
         cluster_m2_static_k: int | None = None,
         allow_cluster_m2_edge_k_tail_family: bool = False,
         allow_cluster_m2_fp8_small_grid: bool = False,
-        ab_stages_three_dtype_bytes: int | None = None,
-        ab_stages_three_device: torch.device | None = None,
+        ab_stages_dtype_bytes: int | None = None,
+        ab_stages_device: torch.device | None = None,
     ) -> None:
         # Keep the default tcgen05 surface to combinations with runtime
         # coverage. Some unvalidated combinations fail loudly at CuTe
@@ -2219,16 +2219,16 @@ class CuteTcgen05Config:
             self.restrict_cluster_m_search((1,))
         self.restrict_num_epi_warps_search((4,))
         self.restrict_num_epi_warps_validation((4,))
-        if ab_stages_three_dtype_bytes is not None:
-            assert ab_stages_three_device is not None, (
-                "ab_stages_three_dtype_bytes requires ab_stages_three_device "
+        if ab_stages_dtype_bytes is not None:
+            assert ab_stages_device is not None, (
+                "ab_stages_dtype_bytes requires ab_stages_device "
                 "so the SMEM-budget gate consults the operand's device, not "
                 "the host's current CUDA device"
             )
-            self.allow_deep_direct_entry_validation(device=ab_stages_three_device)
-            self.allow_ab_stages_three_search(
-                dtype_bytes=ab_stages_three_dtype_bytes,
-                device=ab_stages_three_device,
+            self.allow_deep_direct_entry_validation(device=ab_stages_device)
+            self.allow_ab_stages_search(
+                dtype_bytes=ab_stages_dtype_bytes,
+                device=ab_stages_device,
             )
 
     def optional_fragments(
@@ -2261,15 +2261,15 @@ class CuteTcgen05Config:
             # cap; admit a frozen deep-staged fp8 config on the validation
             # surface too (``_validate_direct_entry_ab_stage_envelope`` clamps it to
             # the actual per-CTA SMEM budget for the chosen block sizes).
-            constraints = self.ab_stages_three_search_constraints
+            constraints = self.ab_stages_search_constraints
             if constraints is not None and constraints.dtype_bytes == 1:  # FP8
                 ab_stages_max = self._get_dtype_ab_stages_hard_cap(
                     constraints.dtype_bytes
                 )
-        elif self.ab_stages_three_search_constraints is not None:
+        elif self.ab_stages_search_constraints is not None:
             # Cycle 97: make ab=3 BUDGET-AWARE-SEARCHABLE. Where the device/dtype
             # admits ab=3 at all (the SMEM-budget constraints were recorded by
-            # ``allow_ab_stages_three_search`` at bind time — B200-class optin cap,
+            # ``allow_ab_stages_search`` at bind time — B200-class optin cap,
             # bf16/fp16), lift the ``for_search`` cap to 3 so the autotuner can
             # SAMPLE ab=3 directly instead of reaching it only through the per-shape
             # FFI / gelu seeds. ``_fix_ab_stages_search_config`` then demotes any
@@ -2281,7 +2281,7 @@ class CuteTcgen05Config:
             # validation range so an explicit deep-staged fp8 config is
             # accepted (``_validate_direct_entry_ab_stage_envelope`` clamps it to
             # the actual per-CTA SMEM budget for the chosen block sizes).
-            constraints = self.ab_stages_three_search_constraints
+            constraints = self.ab_stages_search_constraints
             if constraints is not None and constraints.dtype_bytes == 1:  # FP8
                 ab_stages_max = self._get_dtype_ab_stages_hard_cap(
                     constraints.dtype_bytes

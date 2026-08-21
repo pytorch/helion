@@ -42,7 +42,7 @@ class TestMaxABStagesThatFit(TestCase):
         from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
-            Tcgen05AbStagesThreeSearchConstraints,
+            Tcgen05AbStagesSearchConstraints,
         )
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -51,21 +51,17 @@ class TestMaxABStagesThatFit(TestCase):
 
         # FP8 config (1 byte per element)
         fp8_config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        fp8_config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=1,
-                per_cta_smem_budget_bytes=smem_budget,
-            )
+        fp8_config.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
+            dtype_bytes=1,
+            per_cta_smem_budget_bytes=smem_budget,
         )
         fp8_config.search_enabled = True
 
         # BF16 config (2 bytes per element)
         bf16_config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        bf16_config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=2,
-                per_cta_smem_budget_bytes=smem_budget,
-            )
+        bf16_config.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
+            dtype_bytes=2,
+            per_cta_smem_budget_bytes=smem_budget,
         )
         bf16_config.search_enabled = True
 
@@ -95,16 +91,14 @@ class TestMaxABStagesThatFit(TestCase):
         from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
-            Tcgen05AbStagesThreeSearchConstraints,
+            Tcgen05AbStagesSearchConstraints,
         )
         from helion.autotuner.config_spec import ConfigSpec
 
         config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=1,
-                per_cta_smem_budget_bytes=100000,
-            )
+        config.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
+            dtype_bytes=1,
+            per_cta_smem_budget_bytes=100000,
         )
         config.search_enabled = True
 
@@ -128,16 +122,14 @@ class TestMaxABStagesThatFit(TestCase):
         from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
-            Tcgen05AbStagesThreeSearchConstraints,
+            Tcgen05AbStagesSearchConstraints,
         )
         from helion.autotuner.config_spec import ConfigSpec
 
         config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=1,
-                per_cta_smem_budget_bytes=100000,
-            )
+        config.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
+            dtype_bytes=1,
+            per_cta_smem_budget_bytes=100000,
         )
         config.search_enabled = True
 
@@ -163,7 +155,7 @@ class TestMaxABStagesThatFit(TestCase):
         from helion.autotuner.config_spec import ConfigSpec
 
         config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        config.ab_stages_three_search_constraints = None
+        config.ab_stages_search_constraints = None
         config.search_enabled = True
 
         result = config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=1)
@@ -174,16 +166,14 @@ class TestMaxABStagesThatFit(TestCase):
         from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
-            Tcgen05AbStagesThreeSearchConstraints,
+            Tcgen05AbStagesSearchConstraints,
         )
         from helion.autotuner.config_spec import ConfigSpec
 
         config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=1,
-                per_cta_smem_budget_bytes=150000,
-            )
+        config.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
+            dtype_bytes=1,
+            per_cta_smem_budget_bytes=150000,
         )
         config.search_enabled = True
 
@@ -210,17 +200,15 @@ class TestMaxABStagesThatFit(TestCase):
         from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
-            Tcgen05AbStagesThreeSearchConstraints,
+            Tcgen05AbStagesSearchConstraints,
         )
         from helion.autotuner.config_spec import ConfigSpec
 
         # Config with huge budget (should hit hard cap, not budget)
         config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=1,
-                per_cta_smem_budget_bytes=10000000,  # 10MB (unrealistic)
-            )
+        config.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
+            dtype_bytes=1,
+            per_cta_smem_budget_bytes=10000000,  # 10MB (unrealistic)
         )
         config.search_enabled = True
 
@@ -239,17 +227,15 @@ class TestMaxABStagesThatFit(TestCase):
         from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
         from helion._compiler.cute.tcgen05_config import (
-            Tcgen05AbStagesThreeSearchConstraints,
+            Tcgen05AbStagesSearchConstraints,
         )
         from helion.autotuner.config_spec import ConfigSpec
 
         # Small budget that only fits ab_stages=1 or 2
         config = CuteTcgen05Config(ConfigSpec(backend=CuteBackend()))
-        config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=2,  # BF16
-                per_cta_smem_budget_bytes=50000,  # Tight budget
-            )
+        config.ab_stages_search_constraints = Tcgen05AbStagesSearchConstraints(
+            dtype_bytes=2,  # BF16
+            per_cta_smem_budget_bytes=50000,  # Tight budget
         )
         config.search_enabled = True
 
