@@ -221,15 +221,18 @@ def tcgen05_c_smem_bytes_per_cta(
 
 def tcgen05_aux_smem_bytes_per_cta(
     *,
-    tile_m: int,
-    tile_n: int,
-    dtype_bytes: tuple[int, ...],
+    tiles: tuple[tuple[int, int, int], ...],
     stages: int,
 ) -> int:
     """Return the data-ring SMEM bytes for staged auxiliary tensors."""
-    assert tile_m > 0 and tile_n > 0 and stages > 0
-    assert dtype_bytes and all(size > 0 for size in dtype_bytes)
-    return stages * tile_m * tile_n * sum(dtype_bytes)
+    assert stages > 0
+    assert tiles and all(
+        tile_m > 0 and tile_n > 0 and dtype_bytes > 0
+        for tile_m, tile_n, dtype_bytes in tiles
+    )
+    return stages * sum(
+        tile_m * tile_n * dtype_bytes for tile_m, tile_n, dtype_bytes in tiles
+    )
 
 
 def tcgen05_staged_smem_bytes_per_cta(
@@ -243,8 +246,7 @@ def tcgen05_staged_smem_bytes_per_cta(
     output_epilogue_tile: tuple[int, int] | None = None,
     output_dtype_bytes: int = 0,
     c_stages: int = 0,
-    aux_tile: tuple[int, int] | None = None,
-    aux_dtype_bytes: tuple[int, ...] = (),
+    aux_tiles: tuple[tuple[int, int, int], ...] = (),
     aux_stages: int = 0,
 ) -> int:
     """Return the combined AB, output-store, and auxiliary ring footprint.
@@ -271,15 +273,13 @@ def tcgen05_staged_smem_bytes_per_cta(
         )
     else:
         assert output_dtype_bytes == 0 and c_stages == 0
-    if aux_tile is not None:
+    if aux_tiles:
         total += tcgen05_aux_smem_bytes_per_cta(
-            tile_m=aux_tile[0],
-            tile_n=aux_tile[1],
-            dtype_bytes=aux_dtype_bytes,
+            tiles=aux_tiles,
             stages=aux_stages,
         )
     else:
-        assert not aux_dtype_bytes and aux_stages == 0
+        assert aux_stages == 0
     return total + TCGEN05_STAGED_PIPELINE_RESERVED_SMEM_BYTES
 
 

@@ -649,7 +649,7 @@ class _Tcgen05AuxPipelinePlan:
     stage_count: int
     staging_scope: Tcgen05AuxStagingScope
     # ``epi_tile_var`` is selected for ``EPILOGUE_SUBTILE`` staging;
-    # ``OUTPUT_TILE`` staging instead uses the matmul plan's ``(bm, bn)``.
+    # ``OUTPUT_TILE`` staging instead uses descriptor-specific tile shapes.
     epi_tile_var: str
 
 
@@ -8795,6 +8795,7 @@ def _emit_mma_pipeline(
     tcgen05_tmem_barrier_thread_count_value = 0
     tcgen05_acc_consumer_arrive_count_value = 0
     tcgen05_aux_tma_requested = False
+    fragment_aux_loads_present = False
     # Layout-override values are read by separate later
     # ``if mma_impl == "tcgen05":`` blocks (the function has multiple
     # gated emission sites). Initialize to ``None`` outside the
@@ -9015,6 +9016,9 @@ def _emit_mma_pipeline(
             df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
         )
         fragment_plan = df.cute_state.tcgen05_fragment_epilogue_plan_for_anchor(fx_node)
+        fragment_aux_loads_present = (
+            fragment_plan is not None and fragment_plan.has_host_loads
+        )
         if fragment_plan is not None and tcgen05_aux_tma_requested:
             aux_tensor_descriptors_value += tuple(
                 Tcgen05AuxTensorDescriptor(
@@ -9024,6 +9028,7 @@ def _emit_mma_pipeline(
                     broadcast_axis=None,
                     store_value_node=fragment_plan.value_node,
                     staging_scope=Tcgen05AuxStagingScope.OUTPUT_TILE,
+                    staging_tile_shape=host.staging_tile_shape,
                 )
                 for host in fragment_plan.tma_host_tensors
             )
@@ -9827,7 +9832,7 @@ def _emit_mma_pipeline(
             # ``PipelineAsync`` (``cute_plan.md`` §7.5.3.2 cycle 2
             # of the producer-body split). Fires only when the
             # productive-body gate is open: ``c_input_warp_count > 0``
-            # AND a non-empty exact-shape ``c_input_aux_tensor_descriptors``
+            # AND a non-empty stageable ``c_input_aux_tensor_descriptors``
             # tuple. Broadcast row-vector aux loads intentionally stay on the
             # direct per-thread path; staging them as 2-D rings burns a full
             # epilogue tile of SMEM for a one-dimensional input. The
@@ -9893,7 +9898,7 @@ def _emit_mma_pipeline(
             )
             if (
                 tcgen05_aux_tma_requested
-                and all_aux_tensor_descriptors
+                and (all_aux_tensor_descriptors or fragment_aux_loads_present)
                 and not aux_productive_body_gate_open
             ):
                 if not has_aux_producer_warp:
@@ -9904,9 +9909,9 @@ def _emit_mma_pipeline(
                     )
                 elif not c_input_aux_tensor_descriptors:
                     reason = (
-                        "requires at least one exact-shape rank-2 auxiliary "
-                        "tensor; broadcast-only auxiliary tensors are not "
-                        "staged by the aux TMA path"
+                        "requires at least one stageable rank-2 auxiliary tensor; "
+                        "broadcast-only or non-local fragment auxiliary tensors "
+                        "are not staged by the aux TMA path"
                     )
                 else:
                     reason = (
@@ -9954,19 +9959,46 @@ def _emit_mma_pipeline(
                         "by output-edge stores",
                     )
                 if tcgen05_aux_tma_requested and any(
-                    dtype_str != epi_elem_dtype_str
-                    for dtype_str in aux_descriptor_dtype_strs
+                    desc.staging_scope is Tcgen05AuxStagingScope.EPILOGUE_SUBTILE
+                    and dtype_str != epi_elem_dtype_str
+                    for desc, dtype_str in zip(
+                        c_input_aux_tensor_descriptors,
+                        aux_descriptor_dtype_strs,
+                        strict=True,
+                    )
                 ):
                     raise exc.BackendUnsupported(
                         "cute",
                         f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
-                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} requires auxiliary "
-                        "tensor dtype to match the epilogue/output dtype",
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} requires epilogue-subtile "
+                        "auxiliary tensor dtype to match the epilogue/output dtype",
                     )
                 tcgen05_aux_use_tma_load = tcgen05_aux_tma_requested
                 tcgen05_aux_stage_count = _tcgen05_aux_pipeline_stage_count_from_config(
                     df.config
                 )
+                if tcgen05_aux_staging_scope is Tcgen05AuxStagingScope.OUTPUT_TILE:
+                    if any(
+                        desc.staging_tile_shape is None
+                        for desc in c_input_aux_tensor_descriptors
+                    ):
+                        raise RuntimeError(
+                            "output-tile auxiliary descriptor is missing its staging "
+                            "tile shape"
+                        )
+                    aux_staging_tile_shapes = tuple(
+                        cast("tuple[int, int]", desc.staging_tile_shape)
+                        for desc in c_input_aux_tensor_descriptors
+                    )
+                    aux_tile_shape_exprs = tuple(
+                        f"({tile_m}, {tile_n})"
+                        for tile_m, tile_n in aux_staging_tile_shapes
+                    )
+                else:
+                    aux_staging_tile_shapes = ()
+                    aux_tile_shape_exprs = tuple(
+                        tcgen05_plan.epi_tile for _ in c_input_aux_tensor_descriptors
+                    )
                 if tcgen05_aux_staging_scope is Tcgen05AuxStagingScope.OUTPUT_TILE:
                     output_dtype = epi_elem_dtype or input_dtype
                     epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
@@ -9997,10 +10029,17 @@ def _emit_mma_pipeline(
                             if tcgen05_use_tma_store_epilogue
                             else 0
                         ),
-                        aux_tile=(tcgen05_mma_bm, tcgen05_mma_bn),
-                        aux_dtype_bytes=tuple(
-                            desc.host_tensor_val.dtype.itemsize
-                            for desc in c_input_aux_tensor_descriptors
+                        aux_tiles=tuple(
+                            (
+                                tile_m,
+                                tile_n,
+                                desc.host_tensor_val.dtype.itemsize,
+                            )
+                            for desc, (tile_m, tile_n) in zip(
+                                c_input_aux_tensor_descriptors,
+                                aux_staging_tile_shapes,
+                                strict=True,
+                            )
                         ),
                         aux_stages=tcgen05_aux_stage_count,
                     )
@@ -10027,24 +10066,29 @@ def _emit_mma_pipeline(
                     stage_count=tcgen05_aux_stage_count,
                 )
                 if tcgen05_aux_use_tma_load:
-                    for desc, ring, aux_dtype_str in zip(
+                    for desc, ring, aux_dtype_str, tile_shape in zip(
                         c_input_aux_tensor_descriptors,
                         tcgen05_aux_plan.rings,
                         aux_descriptor_dtype_strs,
+                        aux_staging_tile_shapes
+                        if tcgen05_aux_staging_scope
+                        is Tcgen05AuxStagingScope.OUTPUT_TILE
+                        else ((bm, bn),) * len(c_input_aux_tensor_descriptors),
                         strict=True,
                     ):
                         tma_atom = ring.tma_atom
                         tma_tensor = ring.tma_tensor
                         assert tma_atom is not None
                         assert tma_tensor is not None
+                        tile_m, tile_n = tile_shape
                         aux_tensor_name = df.tensor_arg(desc.host_tensor_val).name
                         df.placeholder_args.add(aux_tensor_name)
                         df.wrapper_only_params.extend([tma_atom, tma_tensor])
                         aux_wrapper_plan: dict[str, object] = {
                             "kind": "tcgen05_aux_tma",
                             "c_name": aux_tensor_name,
-                            "bm": bm,
-                            "bn": bn,
+                            "bm": tile_m,
+                            "bn": tile_n,
                             "stage_count": tcgen05_aux_stage_count,
                             "input_dtype": aux_dtype_str,
                             "kernel_args": [tma_atom, tma_tensor],
@@ -10053,7 +10097,9 @@ def _emit_mma_pipeline(
                             tcgen05_aux_staging_scope
                             is Tcgen05AuxStagingScope.OUTPUT_TILE
                         ):
-                            aux_wrapper_plan["epi_tile_raw_expr"] = f"({bm}, {bn})"
+                            aux_wrapper_plan["epi_tile_raw_expr"] = (
+                                f"({tile_m}, {tile_n})"
+                            )
                         cg.cute_wrapper_plans.append(aux_wrapper_plan)
                 df.cute_state.register_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
                 prefix.extend(
@@ -10079,12 +10125,7 @@ def _emit_mma_pipeline(
                         # 232 KB B200 cap at ``cluster_m=2 +
                         # tcgen05_ab_stages=3`` (cycle 48 measured
                         # 263 KB used at bk=128; bk=64 fits).
-                        tile_shape_expr=(
-                            f"({bm}, {bn})"
-                            if tcgen05_aux_staging_scope
-                            is Tcgen05AuxStagingScope.OUTPUT_TILE
-                            else tcgen05_plan.epi_tile
-                        ),
+                        tile_shape_exprs=aux_tile_shape_exprs,
                         # SIMT producer thread count. A single C-input warp = 32
                         # lanes (validator pins ``c_input_warp_count`` to
                         # ``{0, 1}`` under WITH_SCHEDULER); all 32 lanes do the
@@ -13164,8 +13205,8 @@ def _new_tcgen05_aux_pipeline_plan(
     ``epi_tile_var`` is the matmul-plan ``epi_tile`` variable name;
     the producer body uses it to subdivide the per-output-tile aux
     GMEM region into epi-tile-sized chunks for ``EPILOGUE_SUBTILE`` staging.
-    ``OUTPUT_TILE`` staging uses the ``(bm, bn)`` block shape read directly
-    from the matmul plan.
+    ``OUTPUT_TILE`` staging uses descriptor-specific source tile shapes passed
+    to :func:`_emit_tcgen05_aux_pipeline_setup`.
 
     ``stage_count`` controls the depth of the SMEM ring. Cycle 10
     makes this config-driven so the T8 wide-N CLC + aux-TMA seed
@@ -13214,7 +13255,7 @@ def _emit_tcgen05_aux_pipeline_setup(
     plan: _Tcgen05AuxPipelinePlan,
     *,
     descriptor_dtype_strs: tuple[str, ...],
-    tile_shape_expr: str,
+    tile_shape_exprs: tuple[str, ...],
     c_input_warp_thread_count: int,
     epi_warp_count: int,
     defer_sync: bool,
@@ -13224,23 +13265,21 @@ def _emit_tcgen05_aux_pipeline_setup(
     producer-body split (``cute_plan.md`` §7.5.3.2).
 
     Per descriptor, allocates a SMEM ring sized by
-    ``make_smem_layout_epi(<aux_dtype>, ROW_MAJOR, epi_tile,
-    plan.stage_count)`` — each ring stage holds ONE subtile
-    (``epi_tile``-shaped slice) of the per-output-tile aux region,
-    not the full ``(bm, bn)`` tile. Per-subtile staging keeps the
-    SMEM ring footprint at one ``epi_tile`` chunk per stage rather
-    than one ``(bm, bn)`` chunk, which is essential to fit
-    cluster_m=2 + ``tcgen05_ab_stages=3`` in the 228 KB B200 SMEM
-    cap. The producer issues one cooperative
-    ``cute.copy(GMEM_aux_subtile, SMEM_aux_ring[stage])`` *per
-    subtile* (looping over the per-output-tile subtile axis),
+    ``make_smem_layout_epi(<aux_dtype>, ROW_MAJOR, tile_shape,
+    plan.stage_count)``. Ordinary epilogue descriptors hold one ``epi_tile``
+    subtile per stage, keeping the ring small enough for the cluster_m=2 +
+    ``tcgen05_ab_stages=3`` family. Fragment descriptors hold their proven
+    output-tile-lifetime source region, which may be proportionally smaller than
+    ``(bm, bn)``. The producer issues one cooperative
+    ``cute.copy(GMEM_aux_subtile, SMEM_aux_ring[stage])`` per staged region,
     framed by ``producer_acquire`` / ``producer_commit`` / state
     advance; the consumer issues one ``consumer_wait`` / Quack-
     style ``tiled_copy_s2r`` ``cute.copy(SMEM_ring[stage], rmem)``
     / lane-0 ``consumer_release`` / state advance per subtile.
-    ``tile_shape_expr`` is the ``epi_tile`` variable name so the
-    SMEM ring sizing matches the producer-side subtile copy
-    extent. ``plan.stage_count`` controls the depth — cycle 10
+    ``tile_shape_exprs`` gives the producer-side copy extent for each
+    descriptor. Ordinary aux chains repeat the shared ``epi_tile`` expression;
+    output-tile fragment staging may use a distinct proportional tile per host
+    tensor. ``plan.stage_count`` controls the depth — cycle 10
     makes it config-driven so the T8 wide-N CLC + aux-TMA seed
     family can sample ``{2, 3}``.
 
@@ -13269,7 +13308,12 @@ def _emit_tcgen05_aux_pipeline_setup(
     extra_args = ", defer_sync=True" if defer_sync else ""
     stage_count = plan.stage_count
     lines: list[ast.AST] = []
-    for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True):
+    for ring, dtype_str, tile_shape_expr in zip(
+        plan.rings,
+        descriptor_dtype_strs,
+        tile_shape_exprs,
+        strict=True,
+    ):
         lines.extend(
             [
                 statement_from_string(

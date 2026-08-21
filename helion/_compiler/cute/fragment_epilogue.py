@@ -146,10 +146,11 @@ class Tcgen05FragmentTmaHostLoad:
 
 @dataclasses.dataclass(frozen=True)
 class Tcgen05FragmentTmaHostTensor:
-    """One rank-2 host tensor proven to stay within the current matrix tile."""
+    """One rank-2 host tensor proven to stay within its current source tile."""
 
     host_tensor_fx_node: Node
     host_tensor_val: torch.Tensor
+    staging_tile_shape: tuple[int, int]
     loads: tuple[Tcgen05FragmentTmaHostLoad, ...]
 
     @property
@@ -736,6 +737,9 @@ def _validate_host_load(node: Node, output_node: Node) -> None:
                 raise _UnsupportedFragment
             (block_id,) = block_ids
             canonical = env.canonical_block_id(block_id)
+            index_uses_arithmetic = isinstance(
+                index, Node
+            ) and _tile_index_uses_arithmetic(index)
             expected = (
                 None
                 if tensor_indices
@@ -747,7 +751,12 @@ def _validate_host_load(node: Node, output_node: Node) -> None:
                     expected is not None
                     and canonical != env.canonical_block_id(expected)
                 )
-                or not _extent_matches_block(source_value.shape[tensor_dim], block_id)
+                or (
+                    not index_uses_arithmetic
+                    and not _extent_matches_block(
+                        source_value.shape[tensor_dim], block_id
+                    )
+                )
             ):
                 raise _UnsupportedFragment
             used.add(canonical)
@@ -1891,17 +1900,19 @@ def _fragment_tma_host_tensors(
     destination_shape: tuple[int, ...],
     source_global_shape: tuple[int | torch.SymInt, ...],
     expected_output_block_ids: tuple[int, ...],
-    output_dtype: torch.dtype,
     config: Config,
 ) -> tuple[Tcgen05FragmentTmaHostTensor, ...]:
-    """Find host tensors whose accesses stay inside the current matrix tile.
+    """Find host tensors whose accesses stay inside one source tensor tile.
 
     Fragment loads may cross normal epilogue-subtile boundaries (rotary output
     columns 0 and 1 read coefficient columns 0 and 64).  The staged lifetime is
-    therefore one complete matrix tile. Shape equality alone is insufficient:
-    every accessed coordinate must still be proven inside that tile. This exact
-    enumeration is bounded by the admitted 128x{64,128} fragment envelope and
-    is independent of the number of runtime tiles.
+    therefore one complete output-tile iteration. A staged tensor need not have
+    the output's exact shape: each matrix dimension is divided across the same
+    number of runtime tiles, allowing proportional layouts such as separate
+    ``[M, D / 2]`` coefficient tables. Every accessed coordinate must still be
+    proven inside the corresponding source tile. This exact enumeration is
+    bounded by the admitted 128x{64,128} fragment envelope and is independent
+    of the number of runtime tiles.
     """
     if (
         source_shape != destination_shape
@@ -1913,7 +1924,8 @@ def _fragment_tma_host_tensors(
 
     env = CompileEnvironment.current()
     tile_origins: dict[int, _Index] = {}
-    output_origins: list[_Index] = []
+    tile_indices: list[_Index] = []
+    output_tile_counts: list[int] = []
     for dim, (global_extent, tile_extent, block_id) in enumerate(
         zip(
             source_global_shape,
@@ -1925,10 +1937,12 @@ def _fragment_tma_host_tensors(
         extent = env.size_hint(global_extent)
         if extent <= 0 or tile_extent <= 0 or extent % tile_extent:
             return ()
-        tile = _Index.variable(f"fragment_tma_tile_{dim}", extent // tile_extent - 1)
+        tile_count = extent // tile_extent
+        tile = _Index.variable(f"fragment_tma_tile_{dim}", tile_count - 1)
         origin = _mul(tile, tile_extent)
         tile_origins[env.canonical_block_id(block_id)] = origin
-        output_origins.append(origin)
+        tile_indices.append(tile)
+        output_tile_counts.append(tile_count)
 
     destination_bm, destination_bn = destination_shape[-2:]
     loads_by_tensor: dict[Node, list[tuple[Node, _Index]]] = {}
@@ -1940,13 +1954,25 @@ def _fragment_tma_host_tensors(
     descriptors: list[Tcgen05FragmentTmaHostTensor] = []
     for source, loads in sorted(loads_by_tensor.items(), key=lambda item: item[0].name):
         tensor = source.meta.get("val")
-        if not (
-            isinstance(tensor, torch.Tensor)
-            and tensor.ndim == 2
-            and tensor.dtype == output_dtype
-            and env.known_equal(tensor.shape[0], source_global_shape[-2])
-            and env.known_equal(tensor.shape[1], source_global_shape[-1])
-        ):
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
+            continue
+        tensor_extents = tuple(env.size_hint(extent) for extent in tensor.shape)
+        if any(extent <= 0 for extent in tensor_extents):
+            continue
+
+        staging_tile_shape: list[int] = []
+        staging_origins: list[_Index] = []
+        for tensor_dim, tensor_extent in enumerate(tensor_extents):
+            output_dim = tensor_dim + 1
+            tile_count = output_tile_counts[output_dim]
+            if tensor_extent % tile_count:
+                break
+            staging_extent = tensor_extent // tile_count
+            if staging_extent <= 0:
+                break
+            staging_tile_shape.append(staging_extent)
+            staging_origins.append(_mul(tile_indices[output_dim], staging_extent))
+        if len(staging_tile_shape) != 2:
             continue
 
         evaluators: list[tuple[_IndexEvaluator, _IndexEvaluator]] = []
@@ -1968,18 +1994,32 @@ def _fragment_tma_host_tensors(
                 ):
                     supported = False
                     break
-                index_flat = _broadcast_flat(
-                    flat,
-                    output_shape,
-                    _shape(index, config),
-                )
-                logical = _logical_index_value(
-                    index,
-                    index_flat,
-                    config=config,
-                    tile_origins=tile_origins,
-                )
-                local = _add(logical, _mul(output_origins[tensor_dim + 1], -1))
+                try:
+                    index_block_ids = {
+                        env.canonical_block_id(block_id)
+                        for block_id in _tile_index_block_ids(index)
+                    }
+                    expected_block_id = env.canonical_block_id(
+                        expected_output_block_ids[tensor_dim + 1]
+                    )
+                    if index_block_ids != {expected_block_id}:
+                        supported = False
+                        break
+                    index_flat = _broadcast_flat(
+                        flat,
+                        output_shape,
+                        _shape(index, config),
+                    )
+                    logical = _logical_index_value(
+                        index,
+                        index_flat,
+                        config=config,
+                        tile_origins=tile_origins,
+                    )
+                except (_UnsupportedFragment, IndexError, StopIteration, ValueError):
+                    supported = False
+                    break
+                local = _add(logical, _mul(staging_origins[tensor_dim], -1))
                 fixed_bounds = {
                     symbol: lower
                     for symbol, lower, upper in local.bounds
@@ -2039,6 +2079,7 @@ def _fragment_tma_host_tensors(
         if not supported:
             continue
 
+        staging_bm, staging_bn = staging_tile_shape
         variables = {"row": 0, "column": 0}
         for m in range(destination_bm):
             variables["row"] = m
@@ -2046,8 +2087,8 @@ def _fragment_tma_host_tensors(
                 variables["column"] = n
                 if any(
                     not (
-                        0 <= evaluate_m(variables) < destination_bm
-                        and 0 <= evaluate_n(variables) < destination_bn
+                        0 <= evaluate_m(variables) < staging_bm
+                        and 0 <= evaluate_n(variables) < staging_bn
                     )
                     for evaluate_m, evaluate_n in evaluators
                 ):
@@ -2060,6 +2101,7 @@ def _fragment_tma_host_tensors(
                 Tcgen05FragmentTmaHostTensor(
                     host_tensor_fx_node=source,
                     host_tensor_val=tensor,
+                    staging_tile_shape=(staging_bm, staging_bn),
                     loads=tuple(proven_loads),
                 )
             )
@@ -2177,7 +2219,6 @@ def analyze_tcgen05_fragment_epilogue_plan(
             destination_shape=destination_shape,
             source_global_shape=source_global_shape,
             expected_output_block_ids=expected_output_block_ids,
-            output_dtype=output_value.dtype,
             config=config,
         )
         demands = tuple(
