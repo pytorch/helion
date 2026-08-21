@@ -32,6 +32,8 @@ from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _not
 from ...language._tracing_ops import _phi
 from ...language._tracing_ops import _pre_broadcast_tile
+from ...language._tracing_ops import _while_loop
+from ...language._tracing_ops import is_for_loop_target
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -985,6 +987,245 @@ def _compact_block_variant(state: CodegenState, factor: int) -> Iterator[None]:
         fn.expr_to_var_info = original_expr_cache
 
 
+def _clean_region_predicate(
+    state: CodegenState,
+    graph: torch.fx.Graph,
+    block_ids: list[int],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    end_exprs: list[str],
+    slice_size_exprs: list[str],
+    aligned_dim: dict[int, int],
+    physical_mask_bounds: dict[int, set[str]] | None = None,
+) -> tuple[str, list[int]] | None:
+    """Condition under which the ordered and compact bounds masks are all-true.
+
+    Two parts, both read straight off the loop bounds -- no analysis of what the
+    kernel does with the tile:
+
+    * the inner tile lies wholly inside the ordered range, so its own extent
+      mask is all-true;
+    * every shortened input DMA covers the whole tile, so its per-load physical
+      extent mask is also all-true;
+    * the enclosing compact tile is uniformly full, so the compact extent mask
+      is all-true too.  Without this, expressions that combine masks from the
+      inner and enclosing axes still need the compact-axis factor.
+
+    Returns the predicate and the block ids whose masks it licenses dropping.
+    """
+    from .compact_worklist import compact_ref_names
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    if plan is None or len(block_ids) != 1 or not _is_compact_ordered_inner_loop(state):
+        return None
+    bid = block_ids[0]
+    cbid = plan.compact_axis.block_id
+    if env.is_jagged_tile(bid) or env.is_jagged_tile(cbid):
+        return None
+    if not _clean_region_body_is_replay_safe(state, graph):
+        return None
+    if not _graph_uses_tile_mask(graph, {bid, cbid}):
+        return None
+
+    # ``extent == full`` proves the compact mask all-true only for the current
+    # one-sided compact-loop mask.  Pin that invariant explicitly so a future
+    # aligned/two-sided compact lowering cannot silently invalidate the proof.
+    compact_loops = state.codegen.active_device_loops.get(cbid)
+    if not compact_loops:
+        return None
+    compact_info = compact_loops[-1].block_id_to_info.get(cbid)
+    if compact_info is None or compact_info.mask_has_lower_bound:
+        return None
+
+    tile_start = (
+        f"({begin_exprs[0]}) + (_helion_compat_pipeline_indices[0]) "
+        f"* ({iter_step_exprs[0]})"
+    )
+    tile_end = f"({tile_start}) + ({slice_size_exprs[0]})"
+    inner_clean = f"({tile_end}) <= ({end_exprs[0]})"
+    for physical_bound in sorted((physical_mask_bounds or {}).get(bid, ())):
+        inner_clean = (
+            f"jnp.logical_and({inner_clean}, ({tile_end}) <= ({physical_bound}))"
+        )
+    if bid in aligned_dim:
+        original_begin, _ = _get_loop_begin_and_end(state, 0)
+        lower_clean = f"({tile_start}) >= ({original_begin})"
+        inner_clean = f"jnp.logical_and({lower_clean}, {inner_clean})"
+    extent_ref = f"{compact_ref_names(plan)[1]}_ref"
+    full = env.block_sizes[cbid].from_config(state.config)
+    return (
+        f"jnp.logical_and({inner_clean}, {extent_ref}[_wid] == {full})",
+        [bid, cbid],
+    )
+
+
+def _graph_has_nested_device_control_flow(graph: torch.fx.Graph) -> bool:
+    """Whether codegen of ``graph`` recursively enters another device graph."""
+    return any(
+        node.op == "call_function"
+        and (
+            is_for_loop_target(node.target)
+            or node.target is _if
+            or node.target is _while_loop
+        )
+        for node in graph.nodes
+    )
+
+
+def _is_distributed_op_target(target: object) -> bool:
+    """Whether ``target`` belongs to Helion's distributed device API."""
+    from ...language import distributed_ops
+
+    return getattr(target, "__module__", None) == distributed_ops.__name__
+
+
+def _graph_uses_tile_mask(graph: torch.fx.Graph, block_ids: set[int]) -> bool:
+    """Whether suppressing these tile masks can change generated body code."""
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import MemoryAccess
+
+    env = CompileEnvironment.current()
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target is _mask_to:
+            value = node.meta.get("val")
+            if isinstance(value, torch.Tensor) and any(
+                env.resolve_block_id(size) in block_ids for size in value.shape
+            ):
+                return True
+        access = node.meta.get(MEMORY_ACCESS_META)
+        if isinstance(access, MemoryAccess) and any(
+            # This is intentionally broad: offset/index variants still show
+            # that suppressing this axis's generated mask can change the body.
+            getattr(pattern, "block_id", None) in block_ids
+            for pattern in access.patterns
+        ):
+            return True
+    return False
+
+
+def _clean_region_body_is_replay_safe(
+    state: CodegenState, graph: torch.fx.Graph
+) -> bool:
+    """Reject bodies whose codegen can allocate resources or recurse."""
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import MemoryAccess
+
+    if _graph_has_nested_device_control_flow(graph):
+        return False
+    for node in graph.nodes:
+        if node.op == "call_function" and _is_distributed_op_target(node.target):
+            return False
+        access = node.meta.get(MEMORY_ACCESS_META)
+        if isinstance(
+            access, MemoryAccess
+        ) and state.device_function.is_pallas_remote_copy_operand(access.tensor):
+            return False
+    return True
+
+
+_CODEGEN_VARIANT_COUNTERS = (
+    "atomic_op_index",
+    "device_load_index",
+    "device_load_cache_modifier_index",
+    "device_store_index",
+    "device_store_cache_modifier_index",
+    "device_memory_op_index",
+)
+
+
+@contextlib.contextmanager
+def _suppressed_tile_masks(state: CodegenState, block_ids: list[int]) -> Iterator[None]:
+    """Render with the bounds masks of ``block_ids`` proven away.
+
+    ``codegen.mask_var`` reads the live strategy for each axis, so nulling the
+    entry there is enough for both ``_mask_to`` and load codegen to skip that
+    dim -- the same per-axis granularity Pallas load codegen already has via
+    ``pallas_deferred_mask_block_ids``.
+    """
+    saved: list[tuple[object, int, str | None]] = []
+    saved_physical_proofs: list[tuple[object, set[int]]] = []
+    for bid in block_ids:
+        loops = state.codegen.active_device_loops[bid]
+        if not loops:
+            continue
+        loop = loops[-1]
+        strategy = loop.strategy
+        saved.append((strategy, bid, strategy.mask_var(bid)))
+        strategy.mask_vars[bid] = None  # pyrefly: ignore[missing-attribute]
+        proven = getattr(loop, "_proven_physical_mask_block_ids", None)
+        if isinstance(proven, set):
+            saved_physical_proofs.append((loop, set(proven)))
+            proven.add(bid)
+    try:
+        yield
+    finally:
+        for strategy, bid, mask in saved:
+            strategy.mask_vars[bid] = mask  # pyrefly: ignore[missing-attribute]
+        for loop, previous in saved_physical_proofs:
+            loop._proven_physical_mask_block_ids.clear()  # pyrefly: ignore[missing-attribute]
+            loop._proven_physical_mask_block_ids.update(previous)  # pyrefly: ignore[missing-attribute]
+
+
+def _emit_pipeline_clean_region(
+    state: CodegenState,
+    graph_info: object,
+    body_stmts: list[ast.AST],
+    clean_expr: str,
+    mask_block_ids: list[int],
+    body_args: list[ast.AST],
+    scratch_names: list[str],
+    carried: set[int],
+    has_loop_state: bool,
+) -> None:
+    """Emit masked and provably mask-free pipeline body variants."""
+    from ..inductor_lowering import codegen_call_with_graph
+
+    fn = state.device_function
+    clean_var = fn.new_var("_region_clean", dce=True)
+    body_stmts.append(statement_from_string(f"{clean_var} = {clean_expr}"))
+
+    saved = {name: getattr(fn, name) for name in _CODEGEN_VARIANT_COUNTERS}
+    expected_after: dict[str, int] | None = None
+    for suppress_masks in (True, False):
+        for name, value in saved.items():
+            setattr(fn, name, value)
+        branch: list[ast.AST] = []
+        with state.codegen.set_statements(branch):
+            mask_context = (
+                _suppressed_tile_masks(state, mask_block_ids)
+                if suppress_masks
+                else contextlib.nullcontext()
+            )
+            with mask_context:
+                results = codegen_call_with_graph(
+                    state.codegen,
+                    graph_info.graph,  # pyrefly: ignore[missing-attribute]
+                    body_args,
+                )
+                if has_loop_state:
+                    _write_back_loop_carried(state, scratch_names, carried, results)
+        branch_after = {name: getattr(fn, name) for name in _CODEGEN_VARIANT_COUNTERS}
+        if expected_after is None:
+            expected_after = branch_after
+        elif branch_after != expected_after:
+            # These are the same graph with only generated bounds masks changed,
+            # so unlike the grouped factor variants they must allocate identical
+            # codegen slots and may safely share the surrounding pipeline state.
+            raise AssertionError(
+                "pipeline clean-region variants consumed different codegen slots: "
+                f"{branch_after} != {expected_after}"
+            )
+        predicate = clean_var if suppress_masks else f"jnp.logical_not({clean_var})"
+        label = "_region_clean" if suppress_masks else "_region_masked"
+        body_stmts.append(
+            _pl_when(state, predicate, label, cast("list[ast.stmt]", branch))
+        )
+    assert expected_after is not None
+    for name, value in expected_after.items():
+        setattr(fn, name, value)
+
+
 def _compact_output_initializers(state: CodegenState) -> list[ast.stmt]:
     """Zero the full max-sized output window before the one-tile body."""
     from ..device_function import TensorArg
@@ -1024,16 +1265,8 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
     branch_defs: list[ast.FunctionDef] = []
     extent_ref = f"{compact_ref_names(plan)[1]}_ref"
 
-    counter_names = (
-        "atomic_op_index",
-        "device_load_index",
-        "device_load_cache_modifier_index",
-        "device_store_index",
-        "device_store_cache_modifier_index",
-        "device_memory_op_index",
-    )
     initial_counters = {
-        name: getattr(state.device_function, name) for name in counter_names
+        name: getattr(state.device_function, name) for name in _CODEGEN_VARIANT_COUNTERS
     }
     final_counters: dict[str, int] | None = None
     previous_common = codegen.grouped_compact_common_statements
@@ -1056,7 +1289,8 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
             if factor == 1:
                 branch_body[:0] = _compact_output_initializers(state)
                 final_counters = {
-                    name: getattr(state.device_function, name) for name in counter_names
+                    name: getattr(state.device_function, name)
+                    for name in _CODEGEN_VARIANT_COUNTERS
                 }
 
             fn_name = state.device_function.new_var(f"_compact_group_{factor}")
@@ -1160,6 +1394,7 @@ def _loop_dim_infos(
     state: CodegenState,
     block_ids: list[int],
     env: CompileEnvironment,
+    aligned_dim: dict[int, int] | None = None,
 ) -> dict[int, LoopDimInfo]:
     """Per-dim bounds for an inner device loop, shared by every loop lowering.
 
@@ -1169,6 +1404,7 @@ def _loop_dim_infos(
     """
     from ..tile_strategy import LoopDimInfo
 
+    aligned_dim = aligned_dim or {}
     infos: dict[int, LoopDimInfo] = {}
     for i, block_id in enumerate(block_ids):
         block_size = env.block_sizes[block_id]
@@ -1178,8 +1414,167 @@ def _loop_dim_infos(
             end_var_name=end_expr,
             # No SymPy numel exists when the block size has no static size.
             end_expr=block_size.numel if block_size.size is not None else None,
+            mask_has_lower_bound=block_id in aligned_dim,
         )
     return infos
+
+
+def _pl_when(
+    state: CodegenState,
+    condition: str,
+    name_hint: str,
+    statements: list[ast.stmt],
+) -> ast.FunctionDef:
+    """Wrap ``statements`` in a ``@pl.when(condition)`` nested function."""
+    fn_name = state.device_function.new_var(name_hint)
+    fn_def = statement_from_string(f"@pl.when({condition})\ndef {fn_name}():\n    pass")
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = statements or [ast.Pass()]
+    return fn_def
+
+
+def _tensor_dim_size_expr(size: object, state: CodegenState) -> str | None:
+    """Render a backing-tensor dim size as a device expression, or ``None``.
+
+    ``None`` means the extent is not expressible here, in which case callers
+    must fall back to host-side padding rather than clamping against it.
+    """
+    if isinstance(size, int):
+        return str(size)
+    if isinstance(size, torch.SymInt):
+        return state.sympy_expr(_symint_sympy_expr(size))
+    return None
+
+
+def _pipeline_load_has_packed_worklist_bound(
+    tensor: torch.Tensor,
+    block_id: int,
+) -> bool:
+    """Whether this load uses the compact-worklist packed-offset bound.
+
+    This identifies the narrow shape for which shortened DMA is currently
+    enabled; it does not prove that the logical end is within the backing
+    tensor. The caller installs a separate physical-extent mask for that.
+    ``False`` means unproven, not necessarily unsafe; other emit-pipeline shapes
+    retain host-side padding until they gain their own analysis.
+    """
+    from .compact_worklist import ordered_resident_bound_arg
+    from .compact_worklist import resident_ordered_entries
+    from .memory_access import tensor_origin_key
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None:
+        return False
+    ordered = plan.ordered_axis
+    if (
+        ordered is None
+        or ordered.block_id != block_id
+        or ordered_resident_bound_arg(plan) is None
+    ):
+        return False
+    tensor_key = tensor_origin_key(tensor)
+    return isinstance(tensor_key, str) and any(
+        policy.arg_name == tensor_key for policy in resident_ordered_entries(plan)
+    )
+
+
+def _pipeline_load_physical_mask_plan(
+    state: CodegenState,
+    graph: torch.fx.Graph,
+    tensor: torch.Tensor,
+    block_id: int,
+    dma_dim_expr: str,
+) -> dict[torch.fx.Node, set[str]] | None:
+    """Plan downstream physical masks for a shortened pipeline transfer.
+
+    A short ``BoundedSlice`` DMA can leave the unused VMEM tail stale.  Reuse
+    ``defer_pallas_load_masks``'s dataflow proof, but fail closed on nested
+    control flow, aliases with an unknown access shape, non-plain tile patterns,
+    and bounds that are not the ordered packed-offset idiom.  Every load must
+    defer this tile mask to a downstream ``_mask_to(_, 0)``; its ``jnp.where``
+    is extended with the backing tensor's physical bound so it also clears stale
+    NaN/Inf tails when the logical packed offset exceeds the tensor extent.
+    """
+    from ...language.memory_ops import load
+    from ..node_masking import PALLAS_DEFERRED_MASK_CONSUMERS_META
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import MemoryAccess
+    from .memory_access import MemoryAccessKind
+    from .memory_access import tensors_share_origin_or_storage
+    from .plan_tiling import TilePattern
+
+    if _graph_has_nested_device_control_flow(graph):
+        return None
+    if not _pipeline_load_has_packed_worklist_bound(tensor, block_id):
+        return None
+
+    relevant = False
+    graph_nodes = {node.name: node for node in graph.nodes}
+    physical_masks: dict[torch.fx.Node, set[str]] = {}
+    for node in graph.nodes:
+        if node.op == "call_function" and _is_distributed_op_target(node.target):
+            return None
+        access = node.meta.get(MEMORY_ACCESS_META)
+        if (
+            node.op == "call_function"
+            and node.target is load
+            and not isinstance(access, MemoryAccess)
+        ):
+            return None
+        if not isinstance(access, MemoryAccess):
+            continue
+        if not tensors_share_origin_or_storage(access.tensor, tensor):
+            continue
+        if access.tensor is not tensor:
+            # A distinct view gets its own pipeline argument and BlockSpec, so
+            # its physical extent belongs only on its own downstream masks.
+            # Still reject writes through any alias of this input: remapping
+            # one view to a private DMA scratch would otherwise split accesses
+            # that must observe the same backing allocation.
+            if access.kind is not MemoryAccessKind.LOAD:
+                return None
+            continue
+        if access.kind is not MemoryAccessKind.LOAD:
+            return None
+
+        tensor_dim = 0
+        block_tensor_dims: list[int] = []
+        for index, pattern in zip(access.subscript, access.patterns, strict=True):
+            if index is None:
+                continue
+            if getattr(pattern, "block_id", None) == block_id:
+                if type(pattern) is not TilePattern:
+                    return None
+                block_tensor_dims.append(tensor_dim)
+            tensor_dim += 1
+        # Shortening a DMA needs the exact extent-mask relationship represented
+        # by a plain TilePattern. Offset patterns can carry the same block id but
+        # do not inherit that proof, so they fail closed here.
+        if len(block_tensor_dims) != 1:
+            return None
+        relevant = True
+        if block_id not in (node.meta.get("pallas_deferred_mask_block_ids") or ()):
+            return None
+
+        access_dim_expr = _tensor_dim_size_expr(
+            access.tensor.shape[block_tensor_dims[0]], state
+        )
+        if access_dim_expr is None:
+            return None
+        consumers = node.meta.get(PALLAS_DEFERRED_MASK_CONSUMERS_META)
+        if not isinstance(consumers, dict):
+            return None
+        consumer_names = consumers.get(block_id)
+        if not isinstance(consumer_names, tuple) or not consumer_names:
+            return None
+        for consumer_name in consumer_names:
+            consumer = graph_nodes.get(consumer_name)
+            if consumer is None:
+                return None
+            physical_masks.setdefault(consumer, set()).update(
+                (dma_dim_expr, access_dim_expr)
+            )
+    return physical_masks if relevant else None
 
 
 def _is_static_int(expr: str) -> bool:
@@ -2475,6 +2870,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     body_params: list[str] = []
     pipeline_in_args: list[str] = []
     pipeline_out_args: list[str] = []
+    deferred_physical_mask_bounds: dict[torch.fx.Node, dict[int, set[str]]] = {}
+    clean_physical_mask_bounds: dict[int, set[str]] = {}
 
     # Map outer grid block_ids to program_id variable names.
     # Compute program_ids before emit_pipeline so the BlockSpec lambda
@@ -2529,7 +2926,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
                     begin_expr, bid, env, state
                 )
-                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 begin_is_zero = begin_expr == "0"
                 end_expr = end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
@@ -2547,6 +2943,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     and isinstance(dim_size, int)
                     and int(end_expr) == dim_size
                 )
+                # Set when the emitted access is clamped to the backing tensor,
+                # so it cannot overrun and needs no host-side padding.
+                clamped_to_tensor = False
                 # Loads need a dynamic ``pl.ds`` only for a non-zero begin (a
                 # block-aligned index can't express an arbitrary start; the
                 # over-read past ``end`` is zeroed by the inner-loop mask).
@@ -2564,7 +2963,22 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         f"({begin_expr}) + ({lambda_params[bid_idx]}) "
                         f"* ({iter_step_expr})"
                     )
-                    if is_store and bid not in state.device_function.carry_tiles:
+                    is_carry = bid in state.device_function.carry_tiles
+                    dim_expr = None
+                    physical_mask_plan = None
+                    if not is_store and not is_carry:
+                        candidate_dim_expr = _tensor_dim_size_expr(dim_size, state)
+                        if candidate_dim_expr is not None:
+                            physical_mask_plan = _pipeline_load_physical_mask_plan(
+                                state,
+                                graph_info.graph,
+                                fake,
+                                bid,
+                                candidate_dim_expr,
+                            )
+                            if physical_mask_plan is not None:
+                                dim_expr = candidate_dim_expr
+                    if is_store and not is_carry:
                         # Clamp the store extent to min(block, end - offset) so a
                         # short final tile writes only its valid rows
                         # [begin, end) instead of overrunning into the next
@@ -2579,6 +2993,36 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                             f"jnp.minimum({slice_size_expr}, "
                             f"({end_exprs[bid_idx]}) - ({start_expr}))"
                         )
+                    elif not is_store and dim_expr is not None:
+                        # Clamp the LOAD extent to the backing tensor instead of
+                        # padding the tensor host-side.  A full-block read at a
+                        # data-dependent offset can run off the end of the last
+                        # tile, which is why the alternative is
+                        # ``_ds_pad_dims`` -> ``torch.nn.functional.pad`` on every
+                        # call -- a full copy of the operand per launch.  Letting
+                        # the index map pick the transfer SIZE is the same trick
+                        # ``_compact_window_block_spec`` already uses for the
+                        # outer worklist windows; a short transfer just leaves the
+                        # tail of the block stale instead of zero.  This arm is
+                        # admitted only when ``defer_pallas_load_masks`` proved
+                        # every use reaches a downstream ``_mask_to(_, 0)``. The
+                        # lowering adds this tensor's physical extent to that
+                        # select, clearing stale NaN/Inf even when packed logical
+                        # offsets extend beyond the backing allocation.
+                        size_expr = (
+                            f"jnp.clip(({dim_expr}) - ({start_expr}), 0, "
+                            f"{slice_size_expr})"
+                        )
+                        start_expr = f"jnp.minimum(({start_expr}), ({dim_expr}))"
+                        assert physical_mask_plan is not None
+                        for mask_node, bounds in physical_mask_plan.items():
+                            deferred_physical_mask_bounds.setdefault(
+                                mask_node, {}
+                            ).setdefault(bid, set()).update(bounds)
+                            clean_physical_mask_bounds.setdefault(bid, set()).update(
+                                bounds
+                            )
+                        clamped_to_tensor = True
                     else:
                         size_expr = slice_size_expr
                     if bid in state.device_function.carry_tiles:
@@ -2595,6 +3039,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         lambda_parts.append(
                             f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
                         )
+                if not clamped_to_tensor:
+                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
             elif bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
                 pid_var = _bid_to_pid_var[bid]
@@ -2662,7 +3108,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     def _make_load_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
-        """BlockSpec for a pipelined input (full-block ``pl.ds``; mask zeroes over-read)."""
+        """BlockSpec for a pipelined input, clamped when tail zeroing is proven."""
         return _make_block_spec(fake, subscript_meta, is_store=False)
 
     def _make_store_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
@@ -2786,7 +3232,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     ]
 
     # Build block_id_to_info for the pipeline state
-    block_id_to_info = _loop_dim_infos(state, block_ids, env)
+    block_id_to_info = _loop_dim_infos(state, block_ids, env, aligned_dim)
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -2862,24 +3308,54 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         body_fn_name=body_fn_name,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
+        _deferred_physical_mask_bounds={
+            node: {bid: tuple(sorted(bounds)) for bid, bounds in by_block.items()}
+            for node, by_block in deferred_physical_mask_bounds.items()
+        },
     )
 
-    # For loop-carried state, remap args to scratch reads inside the body
+    # For loop-carried state, remap args to scratch reads inside the body.
     body_args = (
         _remap_args_to_scratch(args, scratch_names, state)
         if has_loop_state
         else [*args]
     )
+    clean_region = _clean_region_predicate(
+        state,
+        graph_info.graph,
+        block_ids,
+        begin_exprs,
+        iter_step_exprs,
+        end_exprs,
+        slice_size_exprs,
+        aligned_dim,
+        clean_physical_mask_bounds,
+    )
 
-    # Generate body code within the pipeline context
+    # Generate body code within the pipeline context.  add_emit_pipeline_loop is
+    # not re-entrant (it appends to active_device_loops and would extend
+    # outer_prefix twice), so it is entered once and each variant gets its own
+    # statement list nested inside.
     with state.codegen.add_emit_pipeline_loop(pipeline_state):
-        graph_results = codegen_call_with_graph(
-            state.codegen, graph_info.graph, body_args
-        )
-
-        # Write updated loop-carried values back to scratch
-        if has_loop_state:
-            _write_back_loop_carried(state, scratch_names, carried, graph_results)
+        if clean_region is None:
+            graph_results = codegen_call_with_graph(
+                state.codegen, graph_info.graph, body_args
+            )
+            if has_loop_state:
+                _write_back_loop_carried(state, scratch_names, carried, graph_results)
+        else:
+            clean_expr, clean_block_ids = clean_region
+            _emit_pipeline_clean_region(
+                state,
+                graph_info,
+                body_stmts,
+                clean_expr,
+                clean_block_ids,
+                body_args,
+                scratch_names,
+                carried,
+                has_loop_state,
+            )
 
     _emit_nonlocal_scratch_declarations(state, body_stmts)
 
@@ -3961,13 +4437,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     def _guarded_statements(
         condition: str, name_hint: str, statements: list[ast.stmt]
     ) -> ast.FunctionDef:
-        fn_name = state.device_function.new_var(name_hint)
-        fn_def = statement_from_string(
-            f"@pl.when({condition})\ndef {fn_name}():\n    pass"
-        )
-        assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = statements or [ast.Pass()]
-        return fn_def
+        return _pl_when(state, condition, name_hint, statements)
 
     prime_statements: list[ast.stmt] = []
     body_prefetch: ast.FunctionDef | None = None
@@ -4232,6 +4702,26 @@ def _(state: CodegenState) -> None:
     return expr_from_string("{lhs} & {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1))
 
 
+def _pipeline_physical_mask_bounds(
+    state: CodegenState, block_id: int
+) -> tuple[str, ...]:
+    """Physical bounds attached to this deferred ``_mask_to`` consumer."""
+    from ..tile_strategy import EmitPipelineLoopState
+
+    assert state.fx_node is not None
+    for loop in reversed(state.codegen.active_device_loops.get(block_id, ())):
+        if not isinstance(loop, EmitPipelineLoopState):
+            continue
+        if block_id in loop._proven_physical_mask_block_ids:
+            return ()
+        bounds = loop._deferred_physical_mask_bounds.get(state.fx_node, {}).get(
+            block_id, ()
+        )
+        if bounds:
+            return bounds
+    return ()
+
+
 @_decorators.codegen(_mask_to, "pallas")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -4243,20 +4733,29 @@ def _(state: CodegenState) -> ast.AST:
     env = CompileEnvironment.current()
     backend = env.backend
     for dim, size in enumerate(input_sizes):
-        if (index := env.resolve_block_id(size)) is not None and (
-            mask_var := state.codegen.mask_var(index)
-        ) is not None:
-            expand = state.tile_strategy.expand_str(input_sizes, dim)
-            if env.is_jagged_tile(index):
-                mask_shape = env.jagged_tile_mask_shapes[index]
-                expand = state.tile_strategy.jagged_tile_expand_str(
-                    mask_shape, input_sizes
-                )
-            # Cast bool mask to float before expanding — Mosaic cannot
-            # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
-            expr = f"({mask_var}.astype(jnp.float32){expand})"
-            if expr not in mask_exprs:
-                mask_exprs.append(expr)
+        index = env.resolve_block_id(size)
+        if index is None:
+            continue
+        mask_var = state.codegen.mask_var(index)
+        physical_bounds = _pipeline_physical_mask_bounds(state, index)
+        if mask_var is None and not physical_bounds:
+            continue
+        mask_terms = [] if mask_var is None else [mask_var]
+        if physical_bounds:
+            index_var = state.codegen.index_var(index)
+            mask_terms.extend(
+                f"(({index_var}) < ({bound}))" for bound in physical_bounds
+            )
+        expand = state.tile_strategy.expand_str(input_sizes, dim)
+        if env.is_jagged_tile(index):
+            mask_shape = env.jagged_tile_mask_shapes[index]
+            expand = state.tile_strategy.jagged_tile_expand_str(mask_shape, input_sizes)
+        # Cast bool mask to float before expanding — Mosaic cannot
+        # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+        mask = " & ".join(f"({term})" for term in mask_terms)
+        expr = f"(({mask}).astype(jnp.float32){expand})"
+        if expr not in mask_exprs:
+            mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
     # Combine float masks via multiplication (equivalent to bool AND).

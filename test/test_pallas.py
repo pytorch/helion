@@ -3511,14 +3511,15 @@ class TestPallas(TestCase):
         # The fix: dynamic ds slice + BoundedSlice block for the runtime begin.
         self.assertIn("pl.BoundedSlice", code)
         self.assertIn("pl.ds(", code)
-        # Load/store asymmetry: the input spec reads a full block (the over-read
-        # past ``end`` is zeroed by the mask), while the output spec clamps its
-        # extent to min(block, end - offset) so a short final tile writes only
-        # its valid rows instead of overrunning into the next segment.
+        # A direct input load keeps the padded full-block transfer: its mask is
+        # multiplicative, so a short DMA could otherwise expose a stale NaN/Inf
+        # tail.  The output spec still clamps to the LOOP end so a short final
+        # tile writes only valid rows instead of overrunning the next segment.
         in_part, _, out_part = code.partition("out_specs=")
         self.assertIn("in_specs=", in_part)
-        self.assertNotIn("jnp.minimum", in_part)  # input: full block
-        self.assertIn("jnp.minimum", out_part)  # output: clamped extent
+        self.assertNotIn("jnp.clip(", in_part)
+        self.assertIn("jnp.minimum", out_part)  # output: clamped to the loop
+        self.assertIn("_ds_pad_dims=", code)
         torch.testing.assert_close(result, x + 1.0, rtol=1e-5, atol=1e-5)
 
     def test_emit_pipeline_static_begin_keeps_block_index(self) -> None:
