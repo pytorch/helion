@@ -300,6 +300,7 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     ab_stage_count: int
     c_stage_count: int
     epi_warp_count: int
+    output_rank: int = 2
     ab_load_warp_count: int = 1
     one_shot_role_scheduler: bool = False
     # Dedicated scheduler warp count for ROLE_LOCAL_WITH_SCHEDULER. Default

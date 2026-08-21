@@ -405,6 +405,7 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        self.fragment_aux_kernel_detected: bool = False
         # True when the kernel feeds a matmul an operand sourced from a load
         # whose dtype is not a tcgen05-native MMA dtype (e.g. an int16 tensor
         # cast to bf16, ``w.to(bfloat16)``). Such an operand cannot be TMA-staged
@@ -838,6 +839,7 @@ class CuteTcgen05Config:
         return (
             self._aux_tma_edge_search_enabled()
             or self._aux_tma_full_tile_search_enabled()
+            or self.fragment_aux_kernel_detected
         )
 
     def _aux_tma_seed_config(self, c_input_seed: Config) -> Config | None:
@@ -1952,6 +1954,14 @@ class CuteTcgen05Config:
             return
         if not self._aux_tma_search_enabled():
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+            return
+        if self.fragment_aux_kernel_detected:
+            if (
+                not self._is_with_scheduler_c_input_config(config)
+                or config.get("tcgen05_cluster_m") != 1
+                or config.get("tcgen05_cluster_n") != 1
+            ):
+                config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
             return
         # Aux-TMA is kept when the projected cluster_m=2 candidate matches either
         # the validated edge+K-tail shape or the cycle-46 full-tile shape, and

@@ -746,6 +746,7 @@ def _append_cute_wrapper_plan(
             dtype=input_dtype,
             kernel_args=kernel_args,
             copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()",
+            epi_tile_raw_expr=plan_optional_str("epi_tile_raw_expr"),
         )
         return
     if kind == "tcgen05_grouped_static_persistent":
