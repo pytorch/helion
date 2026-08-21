@@ -1269,6 +1269,28 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
+def _static_loop_begin_expr(begin_expr: str) -> sympy.Expr | None:
+    if begin_expr.lstrip("-").isdigit():
+        return sympy.Integer(int(begin_expr))
+    return None
+
+
+def _inner_loop_offset_alignment(
+    begin_expr: str,
+    iter_step_expr: str,
+    block_id: int,
+    state: CodegenState,
+) -> int | None:
+    block_value = state.device_function.resolved_block_size(block_id)
+    if not isinstance(block_value, int):
+        return None
+    if not _expr_proven_multiple(begin_expr, block_value, state):
+        return None
+    if not _expr_proven_multiple(iter_step_expr, block_value, state, block_id=block_id):
+        return None
+    return block_value
+
+
 def _pipeline_begin_alignment(
     begin_expr: str,
     state: CodegenState,
@@ -1330,6 +1352,35 @@ def _active_loop_begin_expr(state: CodegenState, block_id: int) -> str:
     if info.begin_expr is not None:
         return str(info.begin_expr)
     return info.begin_var_name or "0"
+
+
+def _expr_proven_multiple(
+    expr: str,
+    required: int,
+    state: CodegenState,
+    *,
+    block_id: int | None = None,
+) -> bool:
+    if required <= 1 or expr == "0":
+        return True
+    try:
+        value = sympy.sympify(expr)
+    except (AttributeError, sympy.SympifyError, TypeError):
+        value = None
+    if isinstance(value, sympy.Integer):
+        return int(value) % required == 0
+    if isinstance(value, sympy.Expr):
+        try:
+            remainder = sympy.simplify(sympy.Mod(value, required))
+        except TypeError:
+            remainder = None
+        if remainder == 0:
+            return True
+    if block_id is not None and expr == state.device_function.block_size_var(block_id):
+        block_value = state.device_function.resolved_block_size(block_id)
+        return isinstance(block_value, int) and block_value % required == 0
+    alignment = _pipeline_begin_alignment(expr, state)
+    return alignment is not None and alignment % required == 0
 
 
 def _scratch_read(state: CodegenState, sname: str) -> str:
@@ -2787,6 +2838,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     # Build block_id_to_info for the pipeline state
     block_id_to_info = _loop_dim_infos(state, block_ids, env)
+    for i, block_id in enumerate(block_ids):
+        info = block_id_to_info[block_id]
+        info.begin_expr = _static_loop_begin_expr(begin_exprs[i])
+        if block_id in aligned_dim and _expr_proven_multiple(
+            iter_step_exprs[i], aligned_dim[block_id], state, block_id=block_id
+        ):
+            info.offset_alignment = aligned_dim[block_id]
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -3267,9 +3325,17 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     )
 
     body_fn_name = state.device_function.new_var("_dynamic_unroll_body")
+    block_id_to_info = _loop_dim_infos(state, block_ids, env)
+    for i, block_id in enumerate(block_ids):
+        info = block_id_to_info[block_id]
+        info.begin_expr = _static_loop_begin_expr(begin_exprs[i])
+        info.offset_alignment = _inner_loop_offset_alignment(
+            begin_exprs[i], iter_step_exprs[i], block_id, state
+        )
+
     fori_state = ForiLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
-        block_id_to_info=_loop_dim_infos(state, block_ids, env),
+        block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
         loop_var_name=loop_var,
         inner_statements=body_stmts,
@@ -3641,6 +3707,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     # Build block_id_to_info
     block_id_to_info = _loop_dim_infos(state, block_ids, env)
+    for i, block_id in enumerate(block_ids):
+        info = block_id_to_info[block_id]
+        info.begin_expr = _static_loop_begin_expr(begin_exprs[i])
+        info.offset_alignment = _inner_loop_offset_alignment(
+            begin_exprs[i], iter_step_exprs[i], block_id, state
+        )
 
     # Emit offset_<bid>/indices_<bid> at the body prologue.
     _emit_inner_loop_offset_indices(
