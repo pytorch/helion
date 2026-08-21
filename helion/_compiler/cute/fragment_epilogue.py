@@ -141,7 +141,6 @@ class Tcgen05FragmentTmaHostLoad:
     node: Node
     flat: _Index
     local_indices: tuple[_Index, _Index]
-    pair_invariant: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,12 +158,6 @@ class Tcgen05FragmentTmaHostTensor:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Pair:
-    left: ast.AST
-    right: ast.AST
-
-
-@dataclasses.dataclass(frozen=True)
 class Tcgen05FragmentEpiloguePlan:
     anchor: Node
     store_node: Node
@@ -179,7 +172,6 @@ class Tcgen05FragmentEpiloguePlan:
     programs: tuple[_DestinationSubtileProgram, ...]
     source_register_count: int
     destination_register_count: int
-    pairwise_output: bool
 
     @property
     def changes_shape(self) -> bool:
@@ -424,36 +416,6 @@ def _query_tcgen05_fragment_ownership(
         destination_registers,
         thread_count,
     )
-
-
-def _fragment_destination_registers_are_adjacent_pairs(
-    ownership: _FragmentOwnership,
-) -> bool:
-    """Whether every register pair names adjacent columns of one output row."""
-    register_count = ownership.destination_register_count
-    if register_count % 2:
-        return False
-    destination_bn = ownership.destination_shape[-1]
-    coordinates: dict[tuple[int, int, int], tuple[int, int]] = {}
-    for flat, slot in enumerate(ownership.destination_slots):
-        key = (slot.thread, slot.subtile, slot.register)
-        if key in coordinates:
-            return False
-        coordinates[key] = divmod(flat, destination_bn)
-    for thread in range(ownership.thread_count):
-        for subtile in range(ownership.destination_subtile_count):
-            for register in range(0, register_count, 2):
-                left = coordinates.get((thread, subtile, register))
-                right = coordinates.get((thread, subtile, register + 1))
-                if (
-                    left is None
-                    or right is None
-                    or left[0] != right[0]
-                    or left[1] % 2
-                    or right[1] != left[1] + 1
-                ):
-                    return False
-    return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2050,30 +2012,11 @@ def _fragment_tma_host_tensors(
                 local_indices[1].compile(),
             )
             evaluators.append(local_evaluators)
-            pair_variables = {"row": 0, "column": 0}
-            pair_invariant = True
-            for pair_m in range(destination_bm):
-                pair_variables["row"] = pair_m
-                for pair_n in range(0, destination_bn, 2):
-                    pair_variables["column"] = pair_n
-                    left = tuple(
-                        evaluate(pair_variables) for evaluate in local_evaluators
-                    )
-                    pair_variables["column"] = pair_n + 1
-                    right = tuple(
-                        evaluate(pair_variables) for evaluate in local_evaluators
-                    )
-                    if left != right:
-                        pair_invariant = False
-                        break
-                if not pair_invariant:
-                    break
             proven_loads.append(
                 Tcgen05FragmentTmaHostLoad(
                     node=load_node,
                     flat=flat,
                     local_indices=(local_indices[0], local_indices[1]),
-                    pair_invariant=pair_invariant,
                 )
             )
         if not supported:
@@ -2314,9 +2257,6 @@ def analyze_tcgen05_fragment_epilogue_plan(
             programs=tuple(programs),
             source_register_count=ownership.source_register_count,
             destination_register_count=ownership.destination_register_count,
-            pairwise_output=_fragment_destination_registers_are_adjacent_pairs(
-                ownership
-            ),
         )
         if not plan.changes_shape and plan.streaming_program is None:
             raise _UnsupportedFragment
@@ -2365,14 +2305,6 @@ def _register_index_expression(registers: Sequence[int], position: str) -> str:
     return f"({expression})"
 
 
-def _program_has_adjacent_destination_pairs(program: _SourceSubtileProgram) -> bool:
-    registers = program.destination_registers
-    return len(registers) % 2 == 0 and all(
-        left % 2 == 0 and right == left + 1
-        for left, right in zip(registers[::2], registers[1::2], strict=True)
-    )
-
-
 @dataclasses.dataclass(frozen=True)
 class _HostPrefetch:
     node: Node
@@ -2394,15 +2326,12 @@ class _Evaluator:
         output_flat: _Index,
         boundary_registers: tuple[_BoundaryRegisterMap, ...],
         indent: str,
-        terminals: dict[tuple[str, Node, _Index], ast.AST | _Pair],
+        terminals: dict[tuple[str, Node, _Index], ast.AST],
         host_prefetches: dict[tuple[Node, _Index], _HostPrefetch] | None = None,
         staged_host_loads: Mapping[
             tuple[Node, _Index], tuple[str, str, Tcgen05FragmentTmaHostLoad]
         ]
         | None = None,
-        partner_position: str | None = None,
-        partner_register: str | None = None,
-        partner_coordinate: str | None = None,
     ) -> None:
         self.state = state
         self.plan = plan
@@ -2415,17 +2344,7 @@ class _Evaluator:
         self.terminals = terminals
         self.host_prefetches = host_prefetches
         self.staged_host_loads = staged_host_loads
-        self.partner_position = partner_position
-        self.partner_register = partner_register
-        self.partner_coordinate = partner_coordinate
-        self.memo: dict[
-            tuple[Node, _Index, int | None, int | None], ast.AST | _Pair
-        ] = {}
-        self.selector_pairs: dict[_Index, tuple[int, int] | None] = {}
-        self.pair_invariance: dict[_Index, bool] = {}
-        self.pointwise_lane_values: dict[
-            tuple[Node, _Index], tuple[tuple[str, ...], ast.AST]
-        ] = {}
+        self.memo: dict[tuple[Node, _Index, int | None], ast.AST] = {}
         self.lines: list[str] = []
         tile_shape = plan.destination_shape
         self.variables = {
@@ -2438,83 +2357,6 @@ class _Evaluator:
                 f"cutlass.Int32({tile_shape[-1]})"
             ),
         }
-        self.partner_variables = (
-            {
-                "row": (
-                    f"cutlass.Int32({partner_coordinate}[0]) % "
-                    f"cutlass.Int32({tile_shape[-2]})"
-                ),
-                "column": (
-                    f"cutlass.Int32({partner_coordinate}[1]) % "
-                    f"cutlass.Int32({tile_shape[-1]})"
-                ),
-            }
-            if partner_coordinate is not None
-            else None
-        )
-
-    @property
-    def pairwise(self) -> bool:
-        return self.partner_variables is not None
-
-    @staticmethod
-    def _pair(value: ast.AST | _Pair) -> _Pair:
-        return value if isinstance(value, _Pair) else _Pair(value, value)
-
-    @staticmethod
-    def _lane(value: ast.AST | _Pair, lane: int | None) -> ast.AST | _Pair:
-        if lane is None or not isinstance(value, _Pair):
-            return value
-        assert lane in (0, 1)
-        return value.left if lane == 0 else value.right
-
-    def _selector_pair(self, selector: _Index) -> tuple[int, int] | None:
-        """Prove a join's selector for each adjacent destination lane."""
-        if selector in self.selector_pairs:
-            return self.selector_pairs[selector]
-        if (constant := _constant_index(selector)) in (0, 1):
-            result = (constant, constant)
-            self.selector_pairs[selector] = result
-            return result
-        evaluate = selector.compile()
-        variables = {"row": 0, "column": 0}
-        result: tuple[int, int] | None = None
-        for row in range(self.plan.destination_shape[-2]):
-            variables["row"] = row
-            for column in range(0, self.plan.destination_shape[-1], 2):
-                variables["column"] = column
-                left = evaluate(variables)
-                variables["column"] = column + 1
-                right = evaluate(variables)
-                current = (left, right)
-                if left not in (0, 1) or right not in (0, 1):
-                    self.selector_pairs[selector] = None
-                    return None
-                if result is None:
-                    result = current
-                elif result != current:
-                    self.selector_pairs[selector] = None
-                    return None
-        self.selector_pairs[selector] = result
-        return result
-
-    def _pair_invariant(self, index: _Index) -> bool:
-        """Whether an index has the same value for each adjacent output pair."""
-        if index in self.pair_invariance:
-            return self.pair_invariance[index]
-        evaluate = index.compile()
-        variables = {"row": 0, "column": 0}
-        for row in range(self.plan.destination_shape[-2]):
-            variables["row"] = row
-            for column in range(0, self.plan.destination_shape[-1], 2):
-                variables["column"] = column
-                left = evaluate(variables)
-                variables["column"] = column + 1
-                if evaluate(variables) != left:
-                    self.pair_invariance[index] = False
-                    return False
-        self.pair_invariance[index] = True
-        return True
 
     def _bind(self, prefix: str, value: ast.AST) -> ast.AST:
         name = self.state.device_function.new_var(prefix)
@@ -2525,7 +2367,7 @@ class _Evaluator:
         )
         return expr_from_string(name)
 
-    def _boundary(self, node: Node, flat: _Index) -> ast.AST | _Pair:
+    def _boundary(self, node: Node, flat: _Index) -> ast.AST:
         key = ("boundary", node, flat)
         if key in self.terminals:
             return self.terminals[key]
@@ -2541,33 +2383,15 @@ class _Evaluator:
             raise RuntimeError(
                 f"missing committed register mapping for {node.name}: {flat.semantic}"
             )
-        left_source_register = _register_index_expression(
+        source_register = _register_index_expression(
             mapping.registers, self.destination_position
         )
-        left = self._bind(
-            "tcgen05_epi_acc",
-            expr_from_string(f"{self.carrier}[{left_source_register}]"),
-        )
-        boundary_pair_invariant = len(mapping.registers) % 2 == 0 and all(
-            mapping.registers[position] == mapping.registers[position + 1]
-            for position in range(0, len(mapping.registers), 2)
-        )
-        if self.pairwise and not boundary_pair_invariant:
-            assert self.partner_position is not None
-            right_source_register = _register_index_expression(
-                mapping.registers, self.partner_position
-            )
-            right = self._bind(
-                "tcgen05_epi_acc",
-                expr_from_string(f"{self.carrier}[{right_source_register}]"),
-            )
-            result: ast.AST | _Pair = _Pair(left, right)
-        else:
-            result = left
+        expression = f"{self.carrier}[{source_register}]"
+        result = self._bind("tcgen05_epi_acc", expr_from_string(expression))
         self.terminals[key] = result
         return result
 
-    def _tile_index(self, node: Node, flat: _Index) -> ast.AST | _Pair:
+    def _tile_index(self, node: Node, flat: _Index) -> ast.AST:
         from ...language.memory_ops import _cute_tile_begin_expr
 
         key = ("index", node, flat)
@@ -2578,30 +2402,17 @@ class _Evaluator:
         coord = _coords_from_flat(
             flat, _shape(node, self.state.device_function.config)
         )[0]
-        tile_begin = _cute_tile_begin_expr(self.state, size)
-        left = self._bind(
+        result = self._bind(
             "tcgen05_epi_index",
             expr_from_string(
-                f"cutlass.Int32({tile_begin}) + "
+                f"cutlass.Int32({_cute_tile_begin_expr(self.state, size)}) + "
                 f"cutlass.Int32({coord.render(self.variables)})"
             ),
         )
-        if self.pairwise and not self._pair_invariant(coord):
-            assert self.partner_variables is not None
-            right = self._bind(
-                "tcgen05_epi_index",
-                expr_from_string(
-                    f"cutlass.Int32({tile_begin}) + "
-                    f"cutlass.Int32({coord.render(self.partner_variables)})"
-                ),
-            )
-            result: ast.AST | _Pair = _Pair(left, right)
-        else:
-            result = left
         self.terminals[key] = result
         return result
 
-    def _host_load(self, node: Node, flat: _Index) -> ast.AST | _Pair:
+    def _host_load(self, node: Node, flat: _Index) -> ast.AST:
         from ...language.memory_ops import _cute_scalar_load_expr
         from ...language.memory_ops import _cute_tensor_dim_size_expr
         from ...language.memory_ops import _cute_tile_begin_expr
@@ -2614,6 +2425,7 @@ class _Evaluator:
         assert isinstance(source, Node) and isinstance(indices, (list, tuple))
         tensor = source.meta["val"]
         assert isinstance(tensor, torch.Tensor)
+
         staged = (
             self.staged_host_loads.get((node, flat))
             if self.staged_host_loads is not None
@@ -2622,7 +2434,7 @@ class _Evaluator:
         if staged is not None:
             smem_name, consumer_state, staged_load = staged
             local_m, local_n = staged_load.local_indices
-            left = self._bind(
+            result = self._bind(
                 "tcgen05_epi_load",
                 expr_from_string(
                     f"{smem_name}[("
@@ -2631,22 +2443,9 @@ class _Evaluator:
                     f"{consumer_state}.index)]"
                 ),
             )
-            if self.pairwise and not staged_load.pair_invariant:
-                assert self.partner_variables is not None
-                right = self._bind(
-                    "tcgen05_epi_load",
-                    expr_from_string(
-                        f"{smem_name}[("
-                        f"{local_m.render(self.partner_variables)}, "
-                        f"{local_n.render(self.partner_variables)}, "
-                        f"{consumer_state}.index)]"
-                    ),
-                )
-                result: ast.AST | _Pair = _Pair(left, right)
-            else:
-                result = left
             self.terminals[key] = result
             return result
+
         if self.host_prefetches is not None:
             prefetch = self.host_prefetches.get((node, flat))
             if prefetch is None:
@@ -2657,17 +2456,10 @@ class _Evaluator:
                     dtype=CompileEnvironment.current().backend.dtype_str(tensor.dtype),
                 )
                 self.host_prefetches[(node, flat)] = prefetch
-            left = expr_from_string(f"{prefetch.buffer}[{self.destination_register}]")
-            if self.pairwise:
-                assert self.partner_register is not None
-                result: ast.AST | _Pair = _Pair(
-                    left,
-                    expr_from_string(f"{prefetch.buffer}[{self.partner_register}]"),
-                )
-            else:
-                result = left
+            result = expr_from_string(f"{prefetch.buffer}[{self.destination_register}]")
             self.terminals[key] = result
             return result
+
         output_shape = _shape(node, self.state.device_function.config)
         output_coords = _coords_from_flat(flat, output_shape)
         tensor_indices = [
@@ -2676,11 +2468,8 @@ class _Evaluator:
             if isinstance(index, Node)
             and isinstance(index.meta.get("val"), torch.Tensor)
         ]
-        left_index_exprs: list[str] = []
-        right_index_exprs: list[str] = []
-        left_bounds: list[str] = []
-        right_bounds: list[str] = []
-        pair_invariant = True
+        index_exprs: list[str] = []
+        bounds: list[str] = []
         env = CompileEnvironment.current()
         if tensor_indices:
             index_dtype = env.index_type()
@@ -2688,24 +2477,15 @@ class _Evaluator:
                 index_flat = _broadcast_flat(
                     flat, output_shape, _shape(index, self.state.device_function.config)
                 )
-                index_value = self.evaluate(index, index_flat)
-                index_pair = self._pair(index_value)
-                pair_invariant = pair_invariant and not isinstance(index_value, _Pair)
-                left_index_expr = ast.unparse(index_pair.left)
-                right_index_expr = ast.unparse(index_pair.right)
-                left_index_exprs.append(left_index_expr)
-                right_index_exprs.append(right_index_expr)
+                index_expr = ast.unparse(self.evaluate(index, index_flat))
+                index_exprs.append(index_expr)
                 if _tile_index_uses_arithmetic(index):
                     dim_size = _cute_tensor_dim_size_expr(
                         self.state, tensor, tensor_dim
                     )
-                    left_bounds.append(
-                        f"({index_dtype}({left_index_expr}) >= {index_dtype}(0) and "
-                        f"{index_dtype}({left_index_expr}) < {index_dtype}({dim_size}))"
-                    )
-                    right_bounds.append(
-                        f"({index_dtype}({right_index_expr}) >= {index_dtype}(0) and "
-                        f"{index_dtype}({right_index_expr}) < {index_dtype}({dim_size}))"
+                    bounds.append(
+                        f"({index_dtype}({index_expr}) >= {index_dtype}(0) and "
+                        f"{index_dtype}({index_expr}) < {index_dtype}({dim_size}))"
                     )
         else:
             output_dim = 0
@@ -2718,54 +2498,24 @@ class _Evaluator:
                     extent = node.meta["val"].shape[output_dim]
                 else:
                     assert isinstance(index, int)
-                    left_index_exprs.append(str(index))
-                    right_index_exprs.append(str(index))
+                    index_exprs.append(str(index))
                     continue
-                left_index_exprs.append(
+                index_exprs.append(
                     f"cutlass.Int32({_cute_tile_begin_expr(self.state, extent)}) + "
                     f"cutlass.Int32({output_coords[output_dim].render(self.variables)})"
-                )
-                right_variables = self.partner_variables or self.variables
-                pair_invariant = pair_invariant and self._pair_invariant(
-                    output_coords[output_dim]
-                )
-                right_index_exprs.append(
-                    f"cutlass.Int32({_cute_tile_begin_expr(self.state, extent)}) + "
-                    f"cutlass.Int32({output_coords[output_dim].render(right_variables)})"
                 )
                 output_dim += 1
         tensor_name = self.state.device_function.tensor_arg(tensor).name
         self.state.device_function.placeholder_args.add(tensor_name)
         dtype = env.backend.dtype_str(tensor.dtype)
-
-        def load_expr(index_exprs: list[str], bounds: list[str]) -> ast.AST:
-            expression = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
-            if bounds and node not in self.plan.unmasked_host_loads:
-                expression = f"({expression} if {' and '.join(bounds)} else {dtype}(0))"
-            return expr_from_string(expression)
-
-        left = self._bind(
-            "tcgen05_epi_load",
-            load_expr(left_index_exprs, left_bounds),
-        )
-        if self.pairwise and not pair_invariant:
-            right = self._bind(
-                "tcgen05_epi_load",
-                load_expr(right_index_exprs, right_bounds),
-            )
-            result: ast.AST | _Pair = _Pair(left, right)
-        else:
-            result = left
+        load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
+        if bounds and node not in self.plan.unmasked_host_loads:
+            load_expr = f"({load_expr} if {' and '.join(bounds)} else {dtype}(0))"
+        result = self._bind("tcgen05_epi_load", expr_from_string(load_expr))
         self.terminals[key] = result
         return result
 
-    def _pointwise(
-        self,
-        node: Node,
-        flat: _Index,
-        inputs: tuple[Node, ...],
-        lane: int | None,
-    ) -> ast.AST | _Pair:
+    def _pointwise(self, node: Node, flat: _Index, inputs: tuple[Node, ...]) -> ast.AST:
         from ..aten_lowering import LoweringContext
         from ..inductor_lowering import PointwiseLowering
 
@@ -2781,133 +2531,47 @@ class _Evaluator:
                     output_shape,
                     _shape(input_node, self.state.device_function.config),
                 ),
-                lane=lane,
             )
             for input_node in inputs
         ]
         output = node.meta.get("val")
-
-        def lower(values: list[ast.AST]) -> ast.AST:
-            # Fragment FP32 values can use the native reciprocal instruction for
-            # sigmoid. Keep the ordinary CuTe epilogue lowering unchanged.
-            if (
-                node.target is torch.ops.aten.sigmoid.default
-                and isinstance(output, torch.Tensor)
-                and output.dtype is torch.float32
-                and CompileEnvironment.current().settings.fast_math
-            ):
-                if len(values) != 1:
-                    raise RuntimeError("invalid fragment sigmoid input count")
-                return self._bind(
-                    "tcgen05_epi_value",
-                    expr_from_string(
-                        "_cute_sigmoid_approx_ftz_f32({x})",
-                        x=values[0],
-                    ),
-                )
-            ctx = LoweringContext.__new__(LoweringContext)
-            ctx.cg = self.state.codegen
-            ctx.env = self.state.env
-            statements: list[ast.AST] = []
-            with (
-                self.state.codegen.set_statements(statements),
-                V.set_current_node(node),
-            ):
-                result = lowering.codegen_from_input_asts(ctx, node, values)
-            if not isinstance(result, ast.AST):
-                raise RuntimeError(f"invalid pointwise fragment result for {node.name}")
-            self.lines.append(_render_statements(statements, self.indent))
-            return self._bind("tcgen05_epi_value", result)
-
-        if lane is not None:
-            lane_values = cast(
-                "list[ast.AST]",
-                [self._lane(value, lane) for value in input_values],
+        # Fragment FP32 values can use the native reciprocal instruction for
+        # sigmoid. Keep the ordinary CuTe epilogue lowering unchanged.
+        if (
+            node.target is torch.ops.aten.sigmoid.default
+            and isinstance(output, torch.Tensor)
+            and output.dtype is torch.float32
+            and CompileEnvironment.current().settings.fast_math
+        ):
+            if len(input_values) != 1:
+                raise RuntimeError("invalid fragment sigmoid input count")
+            return self._bind(
+                "tcgen05_epi_value",
+                expr_from_string(
+                    "_cute_sigmoid_approx_ftz_f32({x})",
+                    x=input_values[0],
+                ),
             )
-            signature = tuple(
-                ast.dump(value, include_attributes=False) for value in lane_values
-            )
-            lane_key = (node, flat)
-            previous = self.pointwise_lane_values.get(lane_key)
-            if previous is not None and previous[0] == signature:
-                return previous[1]
-            result = lower(lane_values)
-            if previous is None:
-                self.pointwise_lane_values[lane_key] = (signature, result)
-            return result
-        if any(isinstance(value, _Pair) for value in input_values):
-            left_values = [
-                value.left if isinstance(value, _Pair) else value
-                for value in input_values
-            ]
-            right_values = [
-                value.right if isinstance(value, _Pair) else value
-                for value in input_values
-            ]
-            return _Pair(
-                lower(cast("list[ast.AST]", left_values)),
-                lower(cast("list[ast.AST]", right_values)),
-            )
-        return lower(cast("list[ast.AST]", input_values))
+        ctx = LoweringContext.__new__(LoweringContext)
+        ctx.cg = self.state.codegen
+        ctx.env = self.state.env
+        statements: list[ast.AST] = []
+        with (
+            self.state.codegen.set_statements(statements),
+            V.set_current_node(node),
+        ):
+            result = lowering.codegen_from_input_asts(ctx, node, input_values)
+        if not isinstance(result, ast.AST):
+            raise RuntimeError(f"invalid pointwise fragment result for {node.name}")
+        self.lines.append(_render_statements(statements, self.indent))
+        return self._bind("tcgen05_epi_value", result)
 
     def evaluate(
-        self,
-        node: Node,
-        flat: _Index,
-        projection: int | None = None,
-        lane: int | None = None,
-    ) -> ast.AST | _Pair:
-        key = (node, flat, projection, lane)
+        self, node: Node, flat: _Index, projection: int | None = None
+    ) -> ast.AST:
+        key = (node, flat, projection)
         if key in self.memo:
             return self.memo[key]
-
-        if node.target is view_ops.join and self.pairwise:
-            left = node.args[0] if node.args else None
-            right = node.args[1] if len(node.args) > 1 else None
-            if isinstance(left, Node) and isinstance(right, Node):
-                coords = _coords_from_flat(
-                    flat, _shape(node, self.state.device_function.config)
-                )
-                selector = coords[-1]
-                selector_pair = self._selector_pair(selector)
-                if selector_pair is not None:
-                    source_flat = _flat_from_coords(
-                        coords[:-1],
-                        _shape(left, self.state.device_function.config),
-                    )
-                    branches = (left, right)
-                    if lane is not None:
-                        result = self.evaluate(
-                            branches[selector_pair[lane]],
-                            source_flat,
-                            lane=lane,
-                        )
-                    elif selector_pair[0] == selector_pair[1]:
-                        result = self.evaluate(
-                            branches[selector_pair[0]],
-                            source_flat,
-                        )
-                    else:
-                        result = _Pair(
-                            cast(
-                                "ast.AST",
-                                self.evaluate(
-                                    branches[selector_pair[0]],
-                                    source_flat,
-                                    lane=0,
-                                ),
-                            ),
-                            cast(
-                                "ast.AST",
-                                self.evaluate(
-                                    branches[selector_pair[1]],
-                                    source_flat,
-                                    lane=1,
-                                ),
-                            ),
-                        )
-                    self.memo[key] = result
-                    return result
 
         def leaf(
             current: Node, current_flat: _Index, current_projection: int | None
@@ -2917,72 +2581,35 @@ class _Evaluator:
                 or current_flat != flat
                 or current_projection != projection
             ):
-                return self.evaluate(
-                    current,
-                    current_flat,
-                    current_projection,
-                    lane=lane,
-                )
+                return self.evaluate(current, current_flat, current_projection)
             if current in self.plan.boundary_nodes:
-                return self._lane(self._boundary(current, current_flat), lane)
+                return self._boundary(current, current_flat)
             if current.target is tile_index:
-                return self._lane(self._tile_index(current, current_flat), lane)
+                return self._tile_index(current, current_flat)
             source = current.args[0] if current.args else None
             if (
                 current.target is memory_ops.load
                 and isinstance(source, Node)
                 and _is_host_tensor(source)
             ):
-                return self._lane(self._host_load(current, current_flat), lane)
+                return self._host_load(current, current_flat)
             inputs = _pointwise_inputs(current)
             if inputs is not None:
-                return self._pointwise(current, current_flat, inputs, lane)
+                return self._pointwise(current, current_flat, inputs)
             raise RuntimeError(f"unsupported committed fragment node {current.name}")
 
         def choose(selector: _Index, left: object, right: object) -> object:
-            if not isinstance(left, (ast.AST, _Pair)) or not isinstance(
-                right, (ast.AST, _Pair)
-            ):
+            if not isinstance(left, ast.AST) or not isinstance(right, ast.AST):
                 raise RuntimeError("invalid fragment selection")
             if (constant := _constant_index(selector)) is not None:
                 return left if constant == 0 else right
-
-            def select(
-                variables: dict[str, str], left_value: ast.AST, right_value: ast.AST
-            ) -> ast.AST:
-                return self._bind(
-                    "tcgen05_epi_select",
-                    expr_from_string(
-                        f"({{left}} if ({selector.render(variables)}) == "
-                        "cutlass.Int32(0) else {right})",
-                        left=left_value,
-                        right=right_value,
-                    ),
-                )
-
-            if lane is not None:
-                variables = (
-                    self.variables
-                    if lane == 0
-                    else cast("dict[str, str]", self.partner_variables)
-                )
-                return select(
-                    variables,
-                    cast("ast.AST", self._lane(left, lane)),
-                    cast("ast.AST", self._lane(right, lane)),
-                )
-            left_pair = self._pair(left)
-            right_pair = self._pair(right)
-            selected_left = select(self.variables, left_pair.left, right_pair.left)
-            if not self.pairwise:
-                return selected_left
-            assert self.partner_variables is not None
-            return _Pair(
-                selected_left,
-                select(
-                    self.partner_variables,
-                    left_pair.right,
-                    right_pair.right,
+            return self._bind(
+                "tcgen05_epi_select",
+                expr_from_string(
+                    f"({{left}} if ({selector.render(self.variables)}) == "
+                    "cutlass.Int32(0) else {right})",
+                    left=left,
+                    right=right,
                 ),
             )
 
@@ -2994,7 +2621,7 @@ class _Evaluator:
             choose=choose,
             projection=projection,
         )
-        if not isinstance(result, (ast.AST, _Pair)):
+        if not isinstance(result, ast.AST):
             raise RuntimeError(f"invalid committed fragment result for {node.name}")
         self.memo[key] = result
         return result
@@ -3025,10 +2652,6 @@ def _render_tcgen05_fragment_group(
     destination_position = df.new_var("tcgen05_epi_position")
     destination_index = df.new_var("tcgen05_epi_register")
     destination_coordinate = df.new_var("tcgen05_epi_coord")
-    pairwise = plan.pairwise_output and _program_has_adjacent_destination_pairs(program)
-    partner_position = f"({destination_position} + 1)" if pairwise else None
-    partner_index = df.new_var("tcgen05_epi_register_partner") if pairwise else None
-    partner_coordinate = df.new_var("tcgen05_epi_coord_partner") if pairwise else None
     body_indent = indent + "    "
     destination_register = _register_index_expression(
         program.destination_registers, destination_position
@@ -3036,18 +2659,6 @@ def _render_tcgen05_fragment_group(
     host_prefetches: dict[tuple[Node, _Index], _HostPrefetch] | None = (
         {} if prefetch_host_loads else None
     )
-    partner_setup = ""
-    if pairwise:
-        assert partner_position is not None
-        assert partner_index is not None
-        assert partner_coordinate is not None
-        partner_setup = (
-            f"{body_indent}{partner_index} = "
-            f"{_register_index_expression(program.destination_registers, partner_position)}\n"
-            f"{body_indent}{partner_coordinate} = "
-            f"{coordinate_name}[{partner_index}]\n"
-        )
-    terminals: dict[tuple[str, Node, _Index], ast.AST | _Pair] = {}
     evaluator = _Evaluator(
         state,
         plan,
@@ -3058,20 +2669,12 @@ def _render_tcgen05_fragment_group(
         output_flat=output_flat,
         boundary_registers=program.boundary_registers,
         indent=body_indent,
-        terminals=terminals,
+        terminals={},
         host_prefetches=host_prefetches,
         staged_host_loads=staged_host_loads,
-        partner_position=partner_position,
-        partner_register=partner_index,
-        partner_coordinate=partner_coordinate,
     )
     value = evaluator.evaluate(plan.value_node, output_flat)
-    pairwise_value = evaluator._pair(value) if pairwise else None
-    loop_range = (
-        f"range(0, {len(program.destination_registers)}, 2)"
-        if pairwise
-        else f"range({len(program.destination_registers)})"
-    )
+
     early_prelude = ""
     if host_prefetches:
         prefetch_evaluator = _Evaluator(
@@ -3086,33 +2689,15 @@ def _render_tcgen05_fragment_group(
             indent=body_indent,
             terminals={},
             staged_host_loads=staged_host_loads,
-            partner_position=partner_position,
-            partner_register=partner_index,
-            partner_coordinate=partner_coordinate,
         )
         prefetch_body: list[str] = []
         for prefetch in host_prefetches.values():
             previous_line_count = len(prefetch_evaluator.lines)
             loaded = prefetch_evaluator.evaluate(prefetch.node, prefetch.flat)
             prefetch_body.extend(prefetch_evaluator.lines[previous_line_count:])
-            loaded_pair = prefetch_evaluator._pair(loaded)
-            prefetch_body.extend(
-                [
-                    (
-                        f"{body_indent}{prefetch.buffer}[{destination_index}] = "
-                        f"{prefetch.dtype}({ast.unparse(loaded_pair.left)})\n"
-                    ),
-                    *(
-                        [
-                            (
-                                f"{body_indent}{prefetch.buffer}[{partner_index}] = "
-                                f"{prefetch.dtype}({ast.unparse(loaded_pair.right)})\n"
-                            )
-                        ]
-                        if pairwise
-                        else []
-                    ),
-                ]
+            prefetch_body.append(
+                f"{body_indent}{prefetch.buffer}[{destination_index}] = "
+                f"{prefetch.dtype}({ast.unparse(loaded)})\n"
             )
         early_prelude = (
             "".join(
@@ -3120,44 +2705,32 @@ def _render_tcgen05_fragment_group(
                 f"cute.make_layout({carrier_name}.shape), {prefetch.dtype})\n"
                 for prefetch in host_prefetches.values()
             )
-            + f"{indent}for {destination_position} in {loop_range}:\n"
+            + f"{indent}for {destination_position} in "
+            f"range({len(program.destination_registers)}):\n"
             f"{body_indent}{destination_index} = {destination_register}\n"
             f"{body_indent}{destination_coordinate} = "
-            f"{coordinate_name}[{destination_index}]\n"
-            f"{partner_setup}" + "".join(prefetch_body)
+            f"{coordinate_name}[{destination_index}]\n" + "".join(prefetch_body)
         )
+
     output_setup = (
         f"{indent}{output} = cute.make_rmem_tensor("
         f"cute.make_layout({carrier_name}.shape), {target_dtype})\n"
         if output_name is None
         else ""
     )
-    output_assignment = (
-        (
-            f"{body_indent}{output}[{destination_index}] = "
-            f"{target_dtype}({ast.unparse(pairwise_value.left)})\n"
-            f"{body_indent}{output}[{partner_index}] = "
-            f"{target_dtype}({ast.unparse(pairwise_value.right)})\n"
-        )
-        if pairwise_value is not None
-        else (
-            f"{body_indent}{output}[{destination_index}] = "
-            f"{target_dtype}({ast.unparse(cast('ast.AST', value))})\n"
-        )
-    )
     late_prelude = (
         f"{indent}assert cute.size({carrier_name}.shape) == "
         f"{plan.source_register_count}, "
         '"tcgen05 source fragment must be complete"\n'
         f"{output_setup}"
-        f"{indent}for {destination_position} in {loop_range}:\n"
-        f"{body_indent}{destination_index} = "
-        f"{destination_register}\n"
+        f"{indent}for {destination_position} in "
+        f"range({len(program.destination_registers)}):\n"
+        f"{body_indent}{destination_index} = {destination_register}\n"
         f"{body_indent}{destination_coordinate} = "
         f"{coordinate_name}[{destination_index}]\n"
-        f"{partner_setup}"
         f"{''.join(evaluator.lines)}"
-        f"{output_assignment}"
+        f"{body_indent}{output}[{destination_index}] = "
+        f"{target_dtype}({ast.unparse(value)})\n"
     )
     return early_prelude, late_prelude, output
 
