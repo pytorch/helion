@@ -304,6 +304,25 @@ class TestTileDependencyAnalysis(unittest.TestCase):
         self.assertEqual(len(analysis.tile_dependencies), 1)
         self.assertEqual(analysis.tile_dependencies[0].name, "tmp")
 
+    def test_reused_root_local_name_is_not_a_dependency(self) -> None:
+        analysis = _analyze_source(
+            """
+            def kernel(x, tmp, out, n):
+                for i in range(n):
+                    acc = 0
+                    acc = acc + x[i]
+                    tmp[i] = acc
+                for j in range(n):
+                    acc = 0
+                    acc = acc + tmp[j]
+                    out[j] = acc
+            """
+        )
+        self.assertEqual(
+            [dependency.name for dependency in analysis.tile_dependencies],
+            ["tmp"],
+        )
+
     def test_unsynchronized_read_after_write(self) -> None:
         analysis = _analyze_source(
             """
@@ -516,6 +535,36 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out0, (x + 1) * 2)
         torch.testing.assert_close(out1, (x + 1) * 3)
         self.assertEqual(code.count("sem='release'"), 1)
+        self.assertIn("ld.acquire.gpu.global.u32", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
+    def test_three_stage_chain(self) -> None:
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            implicit_tile_dependency_three_stage,
+            (x,),
+            block_sizes=[8, 8, 8],
+            pid_type="persistent_blocked",
+            num_warps=1,
+        )
+        torch.testing.assert_close(output, (x + 1) * 2 - 3)
+        self.assertEqual(code.count("sem='release'"), 2)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
+    def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
+        a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
+        b = torch.eye(16, device=DEVICE)
+        c = torch.eye(16, device=DEVICE)
+        code, output = code_and_output(
+            implicit_tile_dependency_matmul_chain,
+            (a, b, c),
+            block_sizes=[16, 16, 16, 16, 16, 16],
+            pid_type="persistent_blocked",
+            num_warps=4,
+        )
+        torch.testing.assert_close(output, a, atol=0, rtol=0)
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 

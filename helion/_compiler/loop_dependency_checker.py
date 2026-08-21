@@ -306,6 +306,36 @@ def _target_names(target: ast.expr) -> tuple[str, ...]:
     return ()
 
 
+def _live_in_read_names(body: list[ast.stmt]) -> set[str]:
+    """Return names read before a definite root-local assignment.
+
+    This deliberately recognizes only straight-line assignments in the root
+    body. Definitions nested in control flow remain conservative live-ins.
+    """
+    defined: set[str] = set()
+    live_in: set[str] = set()
+    for statement in body:
+        rw = ReadWrites.from_ast(statement)
+        loop_targets = {
+            name
+            for node in ast.walk(statement)
+            if isinstance(node, (ast.For, ast.comprehension))
+            for name in _target_names(node.target)
+        }
+        reads = {
+            name
+            for name, count in rw.reads.items()
+            if count > rw.inplace_writes.get(name, 0)
+        } - loop_targets
+        live_in.update(reads - defined)
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                defined.update(_target_names(target))
+        elif isinstance(statement, ast.AnnAssign):
+            defined.update(_target_names(statement.target))
+    return live_in
+
+
 def _update_alias_target(
     target: ast.expr,
     value: ast.expr,
@@ -559,17 +589,22 @@ class LoopDependencyChecker:
             self._source_phase_starts.add(current_root)
             self._barrier_after_root.discard(current_root - 1)
         rw = ReadWrites.from_list(loop_node.body)
-        self.accesses_by_root.append(
-            _collect_tile_accesses(loop_node, current_root, self.aliases)
-        )
+        accesses = _collect_tile_accesses(loop_node, current_root, self.aliases)
+        self.accesses_by_root.append(accesses)
 
         read_names = {
-            self._canonical_name(name)
-            for name, count in rw.reads.items()
-            if count > rw.inplace_writes.get(name, 0)
+            self._canonical_name(name) for name in _live_in_read_names(loop_node.body)
         }
+        read_names.update(
+            access.storage for access in accesses if access.kind is TileAccessKind.READ
+        )
         write_names = {self._canonical_name(name) for name in rw.writes}
-        dependencies = self._tile_dependencies(read_names, write_names, current_root)
+        storage_write_names = {
+            access.storage for access in accesses if access.kind is TileAccessKind.WRITE
+        }
+        dependencies = self._tile_dependencies(
+            read_names, storage_write_names, current_root
+        )
         self.tile_dependencies.extend(dependencies)
         unsynchronized = tuple(
             dependency
