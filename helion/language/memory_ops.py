@@ -52,6 +52,7 @@ from .._compiler.cute.tcgen05_constants import (
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
 from .._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import Tcgen05AuxStagingScope
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
@@ -76,6 +77,8 @@ if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
     from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .._compiler.cute.fragment_epilogue import Tcgen05FragmentTmaHostLoad
+    from .._compiler.cute.fragment_epilogue import _Index
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
 
@@ -2256,6 +2259,40 @@ def _codegen_cute_store_tcgen05_tile(
         aux_pipeline_uses_tma_load = False
         aux_ring_smem_names = tuple(None for _ in aux_step_records)
 
+    fragment_staged_host_loads: dict[
+        tuple[torch.fx.Node, _Index],
+        tuple[str, str, Tcgen05FragmentTmaHostLoad],
+    ] = {}
+    if (
+        fragment_epilogue is not None
+        and aux_matmul_plan is not None
+        and aux_producer_warp_present
+        and aux_pipeline_plan_obj is not None
+        and aux_pipeline_plan_obj.use_tma_load
+        and len(
+            {d.store_value_node for d in aux_matmul_plan.c_input_aux_tensor_descriptors}
+        )
+        <= 1
+    ):
+        fragment_hosts = {
+            host.host_tensor_fx_node: host
+            for host in fragment_epilogue.tma_host_tensors
+        }
+        for descriptor, ring in zip(
+            aux_matmul_plan.c_input_aux_tensor_descriptors,
+            aux_pipeline_plan_obj.rings,
+            strict=True,
+        ):
+            host = fragment_hosts.get(descriptor.host_tensor_fx_node)
+            if host is None:
+                continue
+            for load in host.loads:
+                fragment_staged_host_loads[(load.node, load.flat)] = (
+                    ring.smem,
+                    aux_pipeline_plan_obj.consumer_state,
+                    load,
+                )
+
     # Row-vector aux (``bias[n]`` / rowwise ``scale_b[n]``) reads stay
     # per-subtile (the generic ``ttr_aux_subtile.load()`` path below, placed
     # after the c_pipeline acquire / acc ``consumer_wait`` / T2R prefix per the
@@ -3220,8 +3257,40 @@ def _codegen_cute_store_tcgen05_tile(
                     target_dtype=target_dtype,
                     indent=prelude_indent,
                     prefetch_host_loads=prefetch_fragment_host_loads,
+                    staged_host_loads=fragment_staged_host_loads,
                 )
             )
+            if fragment_staged_host_loads:
+                assert aux_pipeline_plan_obj is not None
+                staging_scope = aux_pipeline_plan_obj.staging_scope
+                aux_indent = prelude_indent + (
+                    "    "
+                    if staging_scope is Tcgen05AuxStagingScope.OUTPUT_TILE
+                    else ""
+                )
+                wait = (
+                    f"{aux_indent}{aux_pipeline_plan_obj.pipeline}.consumer_wait("
+                    f"{aux_pipeline_plan_obj.consumer_state})\n"
+                    f"{aux_indent}cute.arch.fence_view_async_shared()\n"
+                    f"{aux_indent}cute.arch.sync_warp()\n"
+                )
+                release = (
+                    f"{aux_indent}with cute.arch.elect_one():\n"
+                    f"{aux_indent}    {aux_pipeline_plan_obj.pipeline}.consumer_release("
+                    f"{aux_pipeline_plan_obj.consumer_state})\n"
+                    + emit_pipeline_advance(
+                        aux_pipeline_plan_obj.consumer_state,
+                        indent=aux_indent,
+                    )
+                    + "\n"
+                )
+                if staging_scope is Tcgen05AuxStagingScope.OUTPUT_TILE:
+                    wait = f"{prelude_indent}if _tcgen05_subtile == 0:\n" + wait
+                    release = (
+                        f"{prelude_indent}if _tcgen05_subtile == {subtile_count} - 1:\n"
+                        + release
+                    )
+                fragment_late = wait + fragment_late + release
             if fragment_early:
                 return (
                     coordinate_setup + fragment_early,

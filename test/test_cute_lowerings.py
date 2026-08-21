@@ -112,6 +112,9 @@ from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
@@ -159,6 +162,7 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
@@ -297,6 +301,25 @@ def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
     }
     defaults.update(overrides)
     return helion.Config(**defaults)  # type: ignore[arg-type]
+
+
+def _make_tcgen05_fragment_tma_config(*, head_dim: int) -> helion.Config:
+    return _make_tcgen05_persistent_config(
+        block_sizes=[1, 128, head_dim, 32],
+        loop_orders=[[0, 1, 2]],
+        pid_type="persistent_interleaved",
+        **{
+            TCGEN05_STRATEGY_CONFIG_KEY: (
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            ),
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+            ),
+        },
+    )
 
 
 def _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
@@ -15972,7 +15995,12 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
             ),
         )
-        config = cast("Any", {})
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 128, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
+        config.config.update(TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY)
 
         with (
             patch.object(
@@ -16006,6 +16034,22 @@ class TestCuteLowerings(unittest.TestCase):
                 )
 
         self.assertEqual(analyze.call_count, 2)
+
+    def test_tcgen05_fragment_pairing_is_proven_per_source_group(self) -> None:
+        from helion._compiler.cute.fragment_epilogue import (
+            _program_has_adjacent_destination_pairs,
+        )
+
+        def program(*registers: int) -> Any:
+            return cast(
+                "Any",
+                SimpleNamespace(destination_registers=registers),
+            )
+
+        self.assertTrue(_program_has_adjacent_destination_pairs(program(0, 1, 4, 5)))
+        self.assertFalse(_program_has_adjacent_destination_pairs(program(0, 2)))
+        self.assertFalse(_program_has_adjacent_destination_pairs(program(1, 2)))
+        self.assertFalse(_program_has_adjacent_destination_pairs(program(0)))
 
     def test_tcgen05_fragment_projection_rotary_codegen(self) -> None:
         dtype = torch.bfloat16
@@ -16057,6 +16101,45 @@ class TestCuteLowerings(unittest.TestCase):
                 )
                 self.assertIn("tcgen05_epi_prefetch", prefetch_code)
 
+                if head_dim == 128:
+                    simt_scheduler_code = bound.to_triton_code(
+                        _make_tcgen05_persistent_config(
+                            block_sizes=[1, 128, head_dim, 32],
+                            loop_orders=[[0, 1, 2]],
+                            pid_type="persistent_interleaved",
+                            **{
+                                TCGEN05_STRATEGY_CONFIG_KEY: (
+                                    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                                ),
+                                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+                                TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+                                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: (
+                                    TCGEN05_AUX_LOAD_MODE_SIMT
+                                ),
+                            },
+                        )
+                    )
+                    self.assertIn("table.iterator", simt_scheduler_code)
+                    self.assertNotIn("tcgen05_aux_pipeline", simt_scheduler_code)
+                    self.assertNotIn("tcgen05_aux_smem", simt_scheduler_code)
+
+                    tma_code = bound.to_triton_code(
+                        _make_tcgen05_fragment_tma_config(head_dim=head_dim)
+                    )
+                    self.assertIn("'kind': 'tcgen05_aux_tma'", tma_code)
+                    staged_loads = [
+                        line
+                        for line in tma_code.splitlines()
+                        if " = tcgen05_aux_smem_" in line
+                    ]
+                    self.assertEqual(len(staged_loads), 2)
+                    self.assertTrue(
+                        all(
+                            "tile_offset_" not in line and "cute.size" not in line
+                            for line in staged_loads
+                        )
+                    )
+
         with patch_cute_mma_support():
             args = (
                 x,
@@ -16073,6 +16156,81 @@ class TestCuteLowerings(unittest.TestCase):
                 line for line in code.splitlines() if "table.iterator" in line
             ]
             self.assertTrue(any(" else " in line for line in table_loads))
+
+    def test_tcgen05_fragment_aux_tma_rejects_smem_overflow(self) -> None:
+        @helion.kernel(backend="cute")
+        def projection_rotary_two_aux(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            table: torch.Tensor,
+            table2: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            h, _, d = weight.size()
+            out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+            for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+                acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        x[tile_m, tile_k],
+                        weight[tile_h, tile_k, tile_d],
+                        acc=acc,
+                    )
+                pair_index = hl.split(tile_d.index.view(tile_d.block_size // 2, 2))[0]
+                pair_index = pair_index // 2
+                left = table[tile_m.index[:, None], pair_index[None, :]]
+                right = table[tile_m.index[:, None], d // 2 + pair_index[None, :]]
+                left2 = table2[tile_m.index[:, None], pair_index[None, :]]
+                right2 = table2[tile_m.index[:, None], d // 2 + pair_index[None, :]]
+                pairs = acc.view(
+                    tile_h.block_size,
+                    tile_m.block_size,
+                    tile_d.block_size // 2,
+                    2,
+                )
+                x0, x1 = hl.split(pairs)
+                perpendicular = hl.join(-x1, x0)
+                result = (
+                    pairs * right[None, :, :, None]
+                    + perpendicular * left[None, :, :, None]
+                    + pairs * right2[None, :, :, None]
+                    + perpendicular * left2[None, :, :, None]
+                )
+                out[tile_h, tile_m, tile_d] = result.view(
+                    tile_h.block_size,
+                    tile_m.block_size,
+                    tile_d.block_size,
+                ).to(x.dtype)
+            return out
+
+        dtype = torch.bfloat16
+        args = (
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 128, 128],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+            **{
+                TCGEN05_STRATEGY_CONFIG_KEY: (
+                    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                ),
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+                TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+            },
+        )
+        with (
+            patch_cute_mma_support(),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "output-tile auxiliary TMA requires at least .* exceeding",
+            ),
+        ):
+            projection_rotary_two_aux.bind(args).to_triton_code(config)
 
     def test_tcgen05_thread_local_heuristic_promotes_seed(self) -> None:
         dtype = torch.bfloat16
@@ -16174,6 +16332,14 @@ class TestCuteLowerings(unittest.TestCase):
                 torch.testing.assert_close(
                     bound(*args), expected.to(dtype), atol=0.1, rtol=1e-2
                 )
+                if head_dim == 128:
+                    tma_bound = cute_projection_rotary_bf16.bind(args)
+                    tma_bound.set_config(
+                        _make_tcgen05_fragment_tma_config(head_dim=head_dim)
+                    )
+                    torch.testing.assert_close(
+                        tma_bound(*args), expected.to(dtype), atol=0.1, rtol=1e-2
+                    )
 
     def test_tcgen05_thread_local_store_coverage_is_proven(self) -> None:
         dtype = torch.bfloat16
