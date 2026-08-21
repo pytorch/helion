@@ -76,6 +76,7 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
@@ -107,11 +108,13 @@ from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
+from .tcgen05_constants import TCGEN05_LAUNCH_WARPS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -119,6 +122,8 @@ from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
+from .tcgen05_constants import TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -201,6 +206,10 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
     "tcgen05_num_epi_warps",
     TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
+    TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY,
+    TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY,
+    TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY,
+    TCGEN05_LAUNCH_WARPS_CONFIG_KEY,
 )
 CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
     {
@@ -2311,6 +2320,14 @@ class CuteTcgen05Config:
             fragments[TCGEN05_GROUPED_MODE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_MODES
             )
+            fragments[TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY] = EnumFragment((1, 2))
+            fragments[TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY] = IntegerFragment(
+                0, 256, 0
+            )
+            fragments[TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY] = IntegerFragment(
+                0, 16, 0
+            )
+            fragments[TCGEN05_LAUNCH_WARPS_CONFIG_KEY] = IntegerFragment(0, 32, 0)
             fragments[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
             )
@@ -2729,17 +2746,23 @@ class CuteTcgen05Config:
         )
         aux_load_placement = config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
         if (
-            aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            aux_load_placement
+            in (
+                TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+                TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT,
+            )
             and not self.aux_kernel_detected
         ):
             raise InvalidConfig(
                 f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
-                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the kernel has "
+                f"{aux_load_placement!r}: the kernel has "
                 "no per-subtile auxiliary loads to place"
             )
-        if (
-            aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
-            and config.get(
+        if aux_load_placement in (
+            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+            TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT,
+        ) and (
+            config.get(
                 TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
                 TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP,
             )
@@ -2747,7 +2770,7 @@ class CuteTcgen05Config:
         ):
             raise InvalidConfig(
                 f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
-                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: requires "
+                f"{aux_load_placement!r}: requires "
                 f"{TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY}="
                 f"{TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP!r}; per-subtile "
                 "auxiliary loads cannot precede an accumulator wait emitted "

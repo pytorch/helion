@@ -17,18 +17,21 @@ four-CTA tile plus one-shot schedule reduced cold-L2 CUDA-graph latency from
 8.79 to 8.08 us (1.088x) on B200 and reached 1.007x versus the local CUTLASS
 baseline. The other M512 shape retains its existing generic schedule.
 
-The twelve M=64 shapes (vLLM Qwen3 FP8 (K, N) sweep) use cluster_m=1 bm=64 tiles.
+Most M=64 shapes (vLLM Qwen3 FP8 (K, N) sweep) use cluster_m=1 bm=64 tiles.
 ncu showed the main loop dominates the gap to cutlass and was barrier-bound (5 of
 6 warps idle at the post-K-loop sync while 1 MMA warp runs, feeding DRAM at ~47%
 vs cutlass ~62%). PERSISTENT scheduling (pid_type=persistent_blocked +
 static_persistent) keeps each CTA streaming across output tiles: barrier stalls
 collapse (~620 -> ~35 pcsamp), the kernel goes cleanly DRAM-bound (47% -> 57%),
 and a deep A/B pipeline keeps the TMA ahead of the MMA -- lifting the slow shapes
-from 0.69-0.85x to 0.86-0.97x vs cutlass with no codegen change. See the per-shape
-block below for which (bn, bk, ab) each shape uses.
+from 0.69-0.85x to 0.86-0.97x vs cutlass. The M64 K4096 N24576 row is the
+exception: it uses a physical four-CTA cluster with two independent two-CTA MMA
+groups, an exact 32-cluster x 3-work-item unrolled schedule, and seven warps per
+CTA. See the per-shape block below for each shape's configuration.
 
 Each tuned (M, K, N) maps to its own config; an unseen shape falls back to the
-nearest tuned (M, K, N) (smallest sum of absolute log-ratios over M, K, N).
+nearest compatible tuned (M, K, N) (smallest sum of absolute log-ratios over
+M, K, N). Shape-exact schedules are excluded from nearest-neighbor fallback.
 
 Provides, for each kernel <k>:
 - key_<k>(*args): config index (also the runtime cache key)
@@ -47,16 +50,19 @@ def _mkn(args):
     return int(x.shape[0]), int(x.shape[1]), int(y.shape[1])
 
 
-def _select(keys, mkn):
+def _select(keys, mkn, nearest_exclusions=()):
     """Exact (M, K, N) match if tuned, else the nearest tuned shape."""
     for i, k in enumerate(keys):
         if tuple(k) == mkn:
             return i
-    best_i, best_d = 0, float('inf')
+    best_i, best_d = None, float('inf')
     for i, k in enumerate(keys):
+        if tuple(k) in nearest_exclusions:
+            continue
         d = sum(abs(math.log(max(a, 1)) - math.log(max(b, 1))) for a, b in zip(k, mkn))
         if d < best_d:
             best_i, best_d = i, d
+    assert best_i is not None, "nearest-neighbor selection has no compatible configs"
     return best_i
 
 
@@ -154,8 +160,16 @@ _M64_SWAP_CONFIGS = {
         "tcgen05_acc_stages": 2,
         "tcgen05_c_stages": 2,
         "tcgen05_num_epi_warps": 4,
-        "tcgen05_l2_swizzle_size": 2,
+        "tcgen05_l2_swizzle_size": 1,
         "tcgen05_persistence_model": "static_persistent",
+        # Two independent CtaGroup.TWO pairs share one physical four-CTA
+        # cluster.  Thirty-two resident clusters process exactly three output
+        # tiles per pair, and those three iterations are fully unrolled.
+        "tcgen05_independent_2cta_groups": 2,
+        "tcgen05_static_work_grid_clusters": 32,
+        "tcgen05_static_work_iterations": 3,
+        "tcgen05_launch_warps": 7,
+        "tcgen05_aux_load_placement": "subtile_pre_acc_wait",
     },
     (64, 5120, 51200): {
         "block_sizes": [128, 64, 256],
@@ -193,9 +207,15 @@ _CONFIGS_scale_mm_cute_swap_ab = [
     _small_m_swap_config(*key) for key in _SMALL_M_SWAP_KEYS
 ] + list(_M64_SWAP_CONFIGS.values())
 
+_EXACT_ONLY_SCALE_MM_CUTE_SWAP_AB_KEYS = frozenset({(64, 4096, 24576)})
+
 
 def key_scale_mm_cute_swap_ab(*args) -> int:
-    return _select(_KEYS_scale_mm_cute_swap_ab, _mkn(args))
+    return _select(
+        _KEYS_scale_mm_cute_swap_ab,
+        _mkn(args),
+        _EXACT_ONLY_SCALE_MM_CUTE_SWAP_AB_KEYS,
+    )
 
 
 def autotune_scale_mm_cute_swap_ab(*args) -> dict:

@@ -73,6 +73,29 @@ TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
 # CtaGroup.TWO envelope.
 TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
 
+# Independent CtaGroup.TWO groups inside one physical cluster.  The default
+# value 1 preserves the ordinary two-CTA topology.  A value of 2 launches a
+# four-CTA cluster containing two independent V=2 pairs; each pair owns a
+# separate output tile and its own AB/acc pipeline state.
+TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY = "tcgen05_independent_2cta_groups"
+TCGEN05_INDEPENDENT_2CTA_GROUPS_DEFAULT = 1
+
+# Exact static-persistent schedule controls.  These are validation-only knobs
+# (not autotuned): when both are nonzero, role-local scheduling bypasses
+# StaticPersistentTileScheduler and emits a fixed, fully unrolled work loop.
+# The codegen validates that
+#
+#   grid_clusters * independent_2cta_groups * work_iterations
+#
+# exactly equals the static output-tile count before enabling the path.
+TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY = "tcgen05_static_work_grid_clusters"
+TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY = "tcgen05_static_work_iterations"
+
+# Optional launched-warp override for a role-local kernel.  Zero keeps the
+# strategy-derived launch size.  The override may add register-donor warps but
+# cannot be smaller than the number of active role warps.
+TCGEN05_LAUNCH_WARPS_CONFIG_KEY = "tcgen05_launch_warps"
+
 # SMEM budget reserved for non-AB allocations on B200 when sampling the
 # ``tcgen05_ab_stages=3`` search arm. The role-local persistent kernel also
 # allocates space for the C accumulator stages, pipeline mailboxes, and TMEM
@@ -239,10 +262,12 @@ TCGEN05_ACC_WAIT_PLACEMENTS = (
 # family.
 TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY = "tcgen05_aux_load_placement"
 TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT = "pre_acc_wait"
+TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT = "subtile_pre_acc_wait"
 TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT = "post_acc_wait"
 TCGEN05_AUX_LOAD_PLACEMENTS = (
     TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
     TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+    TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT,
 )
 
 

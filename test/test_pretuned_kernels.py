@@ -59,6 +59,20 @@ def _import_pretuned_kernel_module(name):
     return sys.modules[module_name]
 
 
+def _import_pretuned_kernel_heuristic(name: str, compute: str):
+    module_name = f"_helion_pretuned_heuristic_test_{name}_{compute}"
+    if module_name not in sys.modules:
+        file_path = (
+            PRETUNED_KERNELS_DIR / name / f"_helion_aot_{name}_cuda_{compute}.py"
+        )
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[module_name]
+
+
 def _run_pretuned_kernel_main_and_parse_summary(name):
     # main(verbose=False) returns the metrics dict directly (helion vs the best
     # available baseline) without printing the per-shape table.
@@ -518,7 +532,7 @@ class TestPretunedCuteCodegen(TestCase):
                 )
 
     def test_scale_mm_pretuned_swap_ab_aux_load_placement(self) -> None:
-        """Checked-in M=16/32 configs opt into pre-wait auxiliary loads."""
+        """Measured swapped configs select their validated pre-wait mode."""
 
         path = (
             PRETUNED_KERNELS_DIR
@@ -541,6 +555,10 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertTrue(selected)
         for config in selected:
             self.assertEqual(config["tcgen05_aux_load_placement"], "pre_acc_wait")
+        self.assertEqual(
+            configs[(64, 4096, 24576)]["tcgen05_aux_load_placement"],
+            "subtile_pre_acc_wait",
+        )
 
     def test_scale_mm_pretuned_swapped_configs(self) -> None:
         path = (
@@ -562,6 +580,114 @@ class TestPretunedCuteCodegen(TestCase):
             )
         )
         self.assertEqual(set(configs), module._SWAP_AB_SHAPES)
+        self.assertEqual(
+            {
+                key: configs[(64, 4096, 24576)][key]
+                for key in (
+                    "tcgen05_independent_2cta_groups",
+                    "tcgen05_static_work_grid_clusters",
+                    "tcgen05_static_work_iterations",
+                    "tcgen05_launch_warps",
+                )
+            },
+            {
+                "tcgen05_independent_2cta_groups": 2,
+                "tcgen05_static_work_grid_clusters": 32,
+                "tcgen05_static_work_iterations": 3,
+                "tcgen05_launch_warps": 7,
+            },
+        )
+        fallback_index = heuristic._select(
+            heuristic._KEYS_scale_mm_cute_swap_ab,
+            (64, 4096, 20000),
+            heuristic._EXACT_ONLY_SCALE_MM_CUTE_SWAP_AB_KEYS,
+        )
+        self.assertNotEqual(
+            heuristic._KEYS_scale_mm_cute_swap_ab[fallback_index],
+            (64, 4096, 24576),
+        )
+
+    def test_scale_mm_swap_ab_four_cta_exact_schedule(self) -> None:
+        """The winning M64 schedule emits two independent two-CTA groups."""
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        heuristic = _import_pretuned_kernel_heuristic("scale_mm_cute", "sm100")
+        configs = dict(
+            zip(
+                heuristic._KEYS_scale_mm_cute_swap_ab,
+                heuristic._CONFIGS_scale_mm_cute_swap_ab,
+                strict=True,
+            )
+        )
+        m, k, n = 64, 4096, 24576
+        x = torch.empty((m, k), device=DEVICE, dtype=torch.float8_e4m3fn)
+        y = torch.empty((n, k), device=DEVICE, dtype=torch.float8_e4m3fn).T
+        scale_a = torch.empty((m,), device=DEVICE)
+        scale_b = torch.empty((n,), device=DEVICE)
+        args = (x, y, scale_a, scale_b)
+        config = helion.Config(**configs[(m, k, n)])
+
+        with patch_cute_mma_support():
+            bound = module.scale_mm_cute_swap_ab.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+
+        self.assertIn(
+            "cute.make_layout((2, 1, 1, 2), stride=(1, 4, 4, 2))",
+            code,
+        )
+        self.assertEqual(code.count("cutlass.range(3, unroll_full=True)"), 3)
+        self.assertIn("_helion_cute_cluster_shape = (4, 1, 1)", code)
+        self.assertIn("(4, 32, 1)", code)
+        self.assertIn("block=(32, 7, 1)", code)
+        self.assertNotIn("StaticPersistentTileScheduler", code)
+        aux_load = code.index("tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()")
+        acc_wait = code.index(
+            "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
+        )
+        self.assertLess(aux_load, acc_wait)
+        self.assertNotIn("tcgen05_aux_rmem_full_0", code)
+
+    def test_scale_mm_swap_ab_four_cta_exact_schedule_runtime(self) -> None:
+        """A reduced exact schedule launches both independent MMA pairs."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs(64, 512, 512)
+        swap_args = (x, y, scale_a[:, 0], scale_b)
+        config = helion.Config(
+            block_sizes=[128, 64, 128],
+            l2_groupings=[1],
+            indexing=["tensor_descriptor"] * 5,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_independent_2cta_groups=2,
+            tcgen05_static_work_grid_clusters=1,
+            tcgen05_static_work_iterations=2,
+            tcgen05_launch_warps=7,
+            tcgen05_aux_load_placement="subtile_pre_acc_wait",
+        )
+        bound = module.scale_mm_cute_swap_ab.bind(swap_args)
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        code = bound.to_triton_code(config)
+        bound.set_config(config)
+        actual = bound(*swap_args)
+        expected = module._scale_mm_torch(x, y, scale_a, scale_b)
+
+        self.assertIn("_helion_cute_cluster_shape = (4, 1, 1)", code)
+        self.assertIn("(4, 1, 1)", code)
+        self.assertEqual(code.count("cutlass.range(2, unroll_full=True)"), 3)
+        torch.testing.assert_close(actual, expected, atol=4e-1, rtol=1e-2)
 
     def test_scale_mm_explicit_epilogue_tile(self) -> None:
         module = _import_pretuned_kernel_module("scale_mm_cute")
@@ -650,6 +776,50 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertNotIn("while tcgen05_role_local_", code)
         self.assertNotIn(".advance_to_next_work()", code)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_scale_mm_swap_ab_two_cta_prewait_retiles_rowvec(self) -> None:
+        """The swapped column-major path retiles its hoisted row scale."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        module = _import_pretuned_kernel_module("scale_mm_cute")
+        x, y, scale_a, scale_b = module._make_inputs(64, 512, 256)
+        swap_args = (x, y, scale_a[:, 0], scale_b)
+        config = helion.Config(
+            block_sizes=[128, 64, 128],
+            l2_groupings=[1],
+            indexing=["tensor_descriptor"] * 5,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_l2_swizzle_size=1,
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_aux_load_placement="pre_acc_wait",
+        )
+        bound = module.scale_mm_cute_swap_ab.bind(swap_args)
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        code = bound.to_triton_code(config)
+        bound.set_config(config)
+        actual = bound(*swap_args)
+        expected = module._scale_mm_torch(x, y, scale_a, scale_b)
+
+        hoist = code.index("cute.autovec_copy(tcgen05_tTR_gAux_grouped_0")
+        wait = code.index(".consumer_wait(tcgen05_acc_consumer_state)")
+        self.assertLess(hoist, wait)
+        self.assertIn(
+            "tcgen05_tTR_gAux_subtile_0 = tcgen05_aux_rmem_full_0[",
+            code,
+        )
+        # FP8 MMA reduction order differs from the eager reference; retain a
+        # tight BF16-scale bound while allowing a few near-zero elements.
+        torch.testing.assert_close(actual, expected, atol=4e-1, rtol=1e-2)
 
     def test_scale_mm_one_shot_uses_target_sm_count(self) -> None:
         """One-shot codegen follows the compile target's actual SM count."""

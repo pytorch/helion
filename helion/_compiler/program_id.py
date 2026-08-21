@@ -21,10 +21,14 @@ from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
 from .cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
+from .cute.tcgen05_constants import TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_INDEPENDENT_2CTA_GROUPS_DEFAULT
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -1144,6 +1148,34 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         cluster_n = int(str(config.get("tcgen05_cluster_n", 1)))
         return max(1, min(cluster_n, 2))
 
+    def _tcgen05_independent_2cta_groups(self) -> int:
+        if (plan := self._tcgen05_plan()) is not None:
+            return plan.independent_2cta_groups
+        config = DeviceFunction.current().config
+        groups = int(
+            str(
+                config.get(
+                    TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY,
+                    TCGEN05_INDEPENDENT_2CTA_GROUPS_DEFAULT,
+                )
+            )
+        )
+        return max(1, groups)
+
+    def _tcgen05_exact_static_work_schedule(self) -> tuple[int, int] | None:
+        if (plan := self._tcgen05_plan()) is not None:
+            if not plan.has_exact_static_work_schedule:
+                return None
+            return plan.static_work_grid_clusters, plan.static_work_iterations
+        config = DeviceFunction.current().config
+        grid_clusters = int(
+            str(config.get(TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY, 0))
+        )
+        iterations = int(str(config.get(TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY, 0)))
+        if grid_clusters <= 0 or iterations <= 0:
+            return None
+        return grid_clusters, iterations
+
     def _tcgen05_l2_swizzle_size(self) -> int:
         """Return the L2 tile-scheduler swizzle size (Quack ``max_swizzle_size``).
 
@@ -1306,6 +1338,26 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             dims.append("1")
         return dims
 
+    def _decompose_virtual_pid(
+        self,
+        state: CodegenState,
+        virtual_pid_var: str,
+        setup_statements: list[ast.stmt],
+    ) -> None:
+        if self._tcgen05_exact_static_work_schedule() is None:
+            super()._decompose_virtual_pid(state, virtual_pid_var, setup_statements)
+            return
+        assert len(self.pid_info) == 2, (
+            "exact tcgen05 static scheduling requires a two-dimensional output grid"
+        )
+        pid_var = self.shared_pid_var or virtual_pid_var
+        setup_statements.extend(
+            [
+                statement_from_string(f"{self.pid_info[0].pid_var} = {pid_var}"),
+                statement_from_string(f"{self.pid_info[1].pid_var} = cutlass.Int32(0)"),
+            ]
+        )
+
     def _tcgen05_scheduler_tile_dims_expr(self, *, is_device: bool) -> list[str]:
         dims = self._tcgen05_output_tile_dims_expr(is_device=is_device)
         if self._tcgen05_is_two_cta():
@@ -1376,6 +1428,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # is derived from this case's pid_info only.
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
+        if (exact_schedule := self._tcgen05_exact_static_work_schedule()) is not None:
+            grid_clusters, _iterations = exact_schedule
+            physical_cluster_m = cluster_m * self._tcgen05_independent_2cta_groups()
+            return expr_from_string(f"({physical_cluster_m}, {grid_clusters}, 1)")
         total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
         plan = self._tcgen05_plan()
         if plan is not None and plan.is_clc_persistent:
@@ -2727,6 +2783,87 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         return body
 
+    def _build_exact_static_role_local_loop(
+        self,
+        device_function: DeviceFunction,
+        role_block: Tcgen05PersistentProgramIDs._PersistentRoleBlock,
+        scheduler_var_prefix: str,
+        dependency_stmts: list[ast.stmt] | None,
+        role_prelude_stmts: list[ast.stmt] | None,
+        *,
+        emit_pdl_wait: bool,
+        initialize_tile_counter: bool,
+        store_aux_per_tile_stmts: list[ast.stmt] | None,
+    ) -> ast.stmt:
+        exact_schedule = self._tcgen05_exact_static_work_schedule()
+        assert exact_schedule is not None
+        assert role_block.role_predicate is not None
+        assert store_aux_per_tile_stmts is None, (
+            "exact static scheduling does not use a dedicated store warp"
+        )
+        grid_clusters, iterations = exact_schedule
+        groups = self._tcgen05_independent_2cta_groups()
+        cluster_m = self._tcgen05_cluster_m()
+        work_stride = grid_clusters * groups
+
+        prelude: list[ast.stmt] = []
+        if (
+            emit_pdl_wait
+            and self._tcgen05_is_two_cta()
+            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        ):
+            prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
+        tile_counter_var, increment_tile_counter_per_tile = (
+            self._finish_role_local_prelude(
+                device_function,
+                role_block,
+                prelude,
+                role_prelude_stmts=role_prelude_stmts,
+                initialize_tile_counter=initialize_tile_counter,
+            )
+        )
+
+        work_iter_var = device_function.new_var(f"{scheduler_var_prefix}_work_iter")
+        virtual_pid_expr = (
+            f"cute.arch.block_idx()[1] * cutlass.Int32({groups}) + "
+            f"{work_iter_var} * cutlass.Int32({work_stride}) + "
+            "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) "
+            f"// cutlass.Int32({cluster_m})"
+        )
+        per_tile_body: list[ast.stmt] = []
+        if dependency_stmts is not None:
+            per_tile_body.extend(dependency_stmts)
+        per_tile_body.extend(role_block.stmts)
+        if any(
+            self.virtual_pid_var in _stmt_name_uses(stmt)[0] for stmt in per_tile_body
+        ):
+            per_tile_body.insert(
+                0,
+                statement_from_string(f"{self.virtual_pid_var} = {virtual_pid_expr}"),
+            )
+        if tile_counter_var is not None and increment_tile_counter_per_tile:
+            per_tile_body.append(
+                statement_from_string(
+                    f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
+                )
+            )
+        prelude.append(
+            create(
+                ast.For,
+                target=create(ast.Name, id=work_iter_var, ctx=ast.Store()),
+                iter=expr_from_string(f"cutlass.range({iterations}, unroll_full=True)"),
+                body=per_tile_body,
+                orelse=[],
+                type_comment=None,
+            )
+        )
+        return create(
+            ast.If,
+            test=expr_from_string(role_block.role_predicate),
+            body=prelude,
+            orelse=[],
+        )
+
     def _build_role_local_while(
         self,
         device_function: DeviceFunction,
@@ -2774,6 +2911,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "_build_role_local_while requires a non-shared role block; "
             "shared blocks live in the shared while"
         )
+
+        if self._tcgen05_exact_static_work_schedule() is not None:
+            assert store_aux_predicate is None
+            return self._build_exact_static_role_local_loop(
+                device_function,
+                role_block,
+                scheduler_var_prefix,
+                dependency_stmts,
+                role_prelude_stmts,
+                emit_pdl_wait=emit_pdl_wait,
+                initialize_tile_counter=initialize_tile_counter,
+                store_aux_per_tile_stmts=store_aux_per_tile_stmts,
+            )
 
         # ``ROLE_LOCAL_WITH_SCHEDULER`` reroutes the per-role body
         # through the broadcast pipeline. When active, the consumer
