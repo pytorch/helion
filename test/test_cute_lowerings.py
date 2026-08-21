@@ -303,23 +303,23 @@ def _make_tcgen05_persistent_config(**overrides: object) -> helion.Config:
     return helion.Config(**defaults)  # type: ignore[arg-type]
 
 
-def _make_tcgen05_fragment_tma_config(*, head_dim: int) -> helion.Config:
-    return _make_tcgen05_persistent_config(
-        block_sizes=[1, 128, head_dim, 32],
-        loop_orders=[[0, 1, 2]],
-        pid_type="persistent_interleaved",
-        **{
-            TCGEN05_STRATEGY_CONFIG_KEY: (
-                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
-            ),
-            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
-            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
-            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
-            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
-                TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
-            ),
-        },
-    )
+def _make_tcgen05_fragment_tma_config(
+    *, head_dim: int, **overrides: object
+) -> helion.Config:
+    defaults: dict[str, object] = {
+        "block_sizes": [1, 128, head_dim, 32],
+        "loop_orders": [[0, 1, 2]],
+        "pid_type": "persistent_interleaved",
+        TCGEN05_STRATEGY_CONFIG_KEY: (Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value),
+        TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+        TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+        TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+            TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+        ),
+    }
+    defaults.update(overrides)
+    return _make_tcgen05_persistent_config(**defaults)
 
 
 def _make_tcgen05_cluster_m2_cta_group_one_bridge_config(
@@ -513,6 +513,50 @@ def cute_projection_rotary_bf16(
 
 
 @helion.kernel(backend="cute")
+def cute_projection_rotary_split_tables(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Projection with separate half-width rotary tables."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_h, tile_k, tile_d],
+                acc=acc,
+            )
+        bias_tile = bias[tile_h.index[:, None], tile_d.index[None, :]]
+        acc = acc + bias_tile[:, None, :]
+        pair_index = hl.split(tile_d.index.view(tile_d.block_size // 2, 2))[0]
+        pair_index = pair_index // 2
+        cos_value = cos[tile_m.index[:, None], pair_index[None, :]]
+        sin_value = sin[tile_m.index[:, None], pair_index[None, :]]
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        x0, x1 = hl.split(pairs)
+        perpendicular = hl.join(-x1, x0)
+        result = (
+            pairs * cos_value[None, :, :, None]
+            + perpendicular * sin_value[None, :, :, None]
+        )
+        out[tile_h, tile_m, tile_d] = result.view(
+            tile_h.block_size, tile_m.block_size, tile_d.block_size
+        ).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_pair_shifted_table_bf16(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -644,6 +688,37 @@ def cute_pair_butterfly_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Ten
             .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
             .to(x.dtype)
         )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_pair_butterfly_scaled_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Pair-local transform with an ordinary output-coordinate host load."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        scale_tile = scale[tile_m.index[:, None], tile_d.index[None, :]]
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        low, high = hl.split(pairs)
+        mixed = hl.join(low + high, low - high).view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size,
+        )
+        out[tile_h, tile_m, tile_d] = (mixed * scale_tile[None, :, :]).to(x.dtype)
     return out
 
 
@@ -16123,22 +16198,39 @@ class TestCuteLowerings(unittest.TestCase):
                     self.assertNotIn("tcgen05_aux_pipeline", simt_scheduler_code)
                     self.assertNotIn("tcgen05_aux_smem", simt_scheduler_code)
 
-                    tma_code = bound.to_triton_code(
-                        _make_tcgen05_fragment_tma_config(head_dim=head_dim)
+                tma_seeds = [
+                    seed
+                    for seed in bound.config_spec.compiler_seed_configs
+                    if seed.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                    == TCGEN05_AUX_LOAD_MODE_TMA
+                ]
+                self.assertEqual(len(tma_seeds), 1)
+                self.assertEqual(
+                    tma_seeds[0].config["block_sizes"],
+                    [1, 128, head_dim, 128],
+                )
+                tma_code = bound.to_triton_code(tma_seeds[0])
+                self.assertIn("'kind': 'tcgen05_aux_tma'", tma_code)
+                staged_loads = [
+                    line
+                    for line in tma_code.splitlines()
+                    if " = tcgen05_aux_smem_" in line
+                ]
+                self.assertEqual(len(staged_loads), 2)
+                self.assertTrue(
+                    all(
+                        "tile_offset_" not in line and "cute.size" not in line
+                        for line in staged_loads
                     )
-                    self.assertIn("'kind': 'tcgen05_aux_tma'", tma_code)
-                    staged_loads = [
-                        line
-                        for line in tma_code.splitlines()
-                        if " = tcgen05_aux_smem_" in line
-                    ]
-                    self.assertEqual(len(staged_loads), 2)
-                    self.assertTrue(
-                        all(
-                            "tile_offset_" not in line and "cute.size" not in line
-                            for line in staged_loads
+                )
+                if head_dim == 128:
+                    with self.assertRaisesRegex(
+                        exc.BackendUnsupported,
+                        "requires at least one stageable rank-2 auxiliary tensor",
+                    ):
+                        bound.to_triton_code(
+                            _make_tcgen05_fragment_tma_config(head_dim=64)
                         )
-                    )
 
         with patch_cute_mma_support():
             args = (
@@ -16151,11 +16243,17 @@ class TestCuteLowerings(unittest.TestCase):
                 loop_orders=[[0, 1, 2]],
                 pid_type="persistent_interleaved",
             )
-            code = cute_pair_shifted_table_bf16.bind(args).to_triton_code(config)
+            bound = cute_pair_shifted_table_bf16.bind(args)
+            code = bound.to_triton_code(config)
             table_loads = [
                 line for line in code.splitlines() if "table.iterator" in line
             ]
             self.assertTrue(any(" else " in line for line in table_loads))
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "requires at least one stageable rank-2 auxiliary tensor",
+            ):
+                bound.to_triton_code(_make_tcgen05_fragment_tma_config(head_dim=128))
 
     def test_tcgen05_fragment_aux_tma_rejects_smem_overflow(self) -> None:
         @helion.kernel(backend="cute")
@@ -16294,45 +16392,49 @@ class TestCuteLowerings(unittest.TestCase):
         if not get_cute_mma_support().tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
         torch.manual_seed(0)
-        dtype = torch.bfloat16
         heads, m, k = 2, 256, 128
-        x = torch.randn([m, k], device=DEVICE, dtype=dtype)
-        for head_dim in (64, 128):
-            with self.subTest(head_dim=head_dim), patch_cute_mma_support():
-                weight = torch.randn([heads, k, head_dim], device=DEVICE, dtype=dtype)
-                table = torch.randn([m, head_dim], device=DEVICE, dtype=dtype)
-                bias = torch.randn([heads, head_dim], device=DEVICE, dtype=dtype)
-                args = (x, weight, table, bias)
-                bound = cute_projection_rotary_bf16.bind(args)
-                acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
-                pairs = (acc + bias.float()[:, None, :]).view(
-                    heads, m, head_dim // 2, 2
-                )
-                left, right = (
-                    table.float().view(m, 2, head_dim // 2).permute(0, 2, 1)
-                ).unbind(-1)
-                expected = torch.stack(
-                    (
-                        pairs[..., 0] * right - pairs[..., 1] * left,
-                        pairs[..., 1] * right + pairs[..., 0] * left,
-                    ),
-                    dim=-1,
-                ).view(heads, m, head_dim)
-                config = _make_tcgen05_persistent_config(
-                    block_sizes=[1, 128, head_dim, 32],
-                    loop_orders=[[0, 1, 2]],
-                    pid_type="persistent_interleaved",
-                    **{
-                        TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
-                            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
-                        )
-                    },
-                )
-                bound.set_config(config)
-                torch.testing.assert_close(
-                    bound(*args), expected.to(dtype), atol=0.1, rtol=1e-2
-                )
-                if head_dim == 128:
+        for dtype in (torch.bfloat16, torch.float16):
+            x = torch.randn([m, k], device=DEVICE, dtype=dtype)
+            for head_dim in (64, 128):
+                with (
+                    self.subTest(dtype=dtype, head_dim=head_dim),
+                    patch_cute_mma_support(),
+                ):
+                    weight = torch.randn(
+                        [heads, k, head_dim], device=DEVICE, dtype=dtype
+                    )
+                    table = torch.randn([m, head_dim], device=DEVICE, dtype=dtype)
+                    bias = torch.randn([heads, head_dim], device=DEVICE, dtype=dtype)
+                    args = (x, weight, table, bias)
+                    bound = cute_projection_rotary_bf16.bind(args)
+                    acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
+                    pairs = (acc + bias.float()[:, None, :]).view(
+                        heads, m, head_dim // 2, 2
+                    )
+                    left, right = (
+                        table.float().view(m, 2, head_dim // 2).permute(0, 2, 1)
+                    ).unbind(-1)
+                    expected = torch.stack(
+                        (
+                            pairs[..., 0] * right - pairs[..., 1] * left,
+                            pairs[..., 1] * right + pairs[..., 0] * left,
+                        ),
+                        dim=-1,
+                    ).view(heads, m, head_dim)
+                    config = _make_tcgen05_persistent_config(
+                        block_sizes=[1, 128, head_dim, 32],
+                        loop_orders=[[0, 1, 2]],
+                        pid_type="persistent_interleaved",
+                        **{
+                            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                                TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                            )
+                        },
+                    )
+                    bound.set_config(config)
+                    torch.testing.assert_close(
+                        bound(*args), expected.to(dtype), atol=0.1, rtol=1e-2
+                    )
                     tma_bound = cute_projection_rotary_bf16.bind(args)
                     tma_bound.set_config(
                         _make_tcgen05_fragment_tma_config(head_dim=head_dim)
@@ -16340,6 +16442,60 @@ class TestCuteLowerings(unittest.TestCase):
                     torch.testing.assert_close(
                         tma_bound(*args), expected.to(dtype), atol=0.1, rtol=1e-2
                     )
+
+    def test_tcgen05_fragment_split_tables_tma_runtime(self) -> None:
+        """Stage proportional, mixed-dtype tables with nontrivial L2 grouping."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        torch.manual_seed(13)
+        input_dtype = torch.bfloat16
+        heads, m, k, head_dim = 2, 512, 128, 64
+        x = torch.randn([m, k], device=DEVICE, dtype=input_dtype)
+        weight = torch.randn([heads, k, head_dim], device=DEVICE, dtype=input_dtype)
+        cos = torch.randn([m, head_dim // 2], device=DEVICE, dtype=torch.float32)
+        sin = torch.randn([m, head_dim // 2], device=DEVICE, dtype=torch.float32)
+        bias = torch.randn([heads, head_dim], device=DEVICE, dtype=input_dtype)
+        args = (x, weight, cos, sin, bias)
+        acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
+        pairs = (acc + bias.float()[:, None, :]).view(heads, m, head_dim // 2, 2)
+        expected = torch.stack(
+            (
+                pairs[..., 0] * cos - pairs[..., 1] * sin,
+                pairs[..., 1] * cos + pairs[..., 0] * sin,
+            ),
+            dim=-1,
+        ).view(heads, m, head_dim)
+        with patch_cute_mma_support():
+            bound = cute_projection_rotary_split_tables.bind(args)
+            self.assertEqual(
+                sum(
+                    seed.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                    == TCGEN05_AUX_LOAD_MODE_TMA
+                    for seed in bound.config_spec.compiler_seed_configs
+                ),
+                1,
+            )
+            config = _make_tcgen05_fragment_tma_config(
+                head_dim=head_dim,
+                l2_groupings=[4],
+            )
+            code = bound.to_triton_code(config)
+            self.assertEqual(code.count("'kind': 'tcgen05_aux_tma'"), 2)
+            self.assertEqual(
+                code.count("'epi_tile_raw_expr': '(128, 32)'"),
+                2,
+            )
+            self.assertIn("bias.iterator", code)
+            bound.set_config(config)
+            actual = bound(*args)
+        torch.testing.assert_close(
+            actual,
+            expected.to(input_dtype),
+            atol=0.1,
+            rtol=1e-2,
+        )
 
     def test_tcgen05_thread_local_store_coverage_is_proven(self) -> None:
         dtype = torch.bfloat16
@@ -16527,6 +16683,14 @@ class TestCuteLowerings(unittest.TestCase):
                 "thread-local epilogue ownership proof rejected",
             ):
                 cross_thread.to_triton_code(config)
+
+            scale = torch.randn([128, 64], device=DEVICE, dtype=torch.float32)
+            scaled = cute_pair_butterfly_scaled_bf16.bind((x, weight, scale))
+            tma_config = _make_tcgen05_fragment_tma_config(head_dim=64)
+            scaled_code = scaled.to_triton_code(tma_config)
+            self.assertEqual(scaled_code.count("'kind': 'tcgen05_aux_tma'"), 1)
+            scaled.set_config(tma_config)
+            scaled_actual = scaled(x, weight, scale)
         pairs = torch.einsum("mk,hkd->hmd", x.float(), weight.float()).view(
             1, 128, 32, 2
         )
@@ -16534,6 +16698,12 @@ class TestCuteLowerings(unittest.TestCase):
             (pairs[..., 0] + pairs[..., 1], pairs[..., 0] - pairs[..., 1]), dim=-1
         ).view(1, 128, 64)
         torch.testing.assert_close(actual, expected.to(dtype), atol=0.5, rtol=2e-2)
+        torch.testing.assert_close(
+            scaled_actual,
+            (expected * scale).to(dtype),
+            atol=0.5,
+            rtol=2e-2,
+        )
 
     def test_tcgen05_thread_local_fragment_reads_four_registers_runtime(self) -> None:
         torch.manual_seed(11)
@@ -17782,7 +17952,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("tcgen05_aux_pipeline.producer_get_barrier", full_c_input_src)
 
     def test_aux_tma_load_rejects_broadcast_only_aux(self) -> None:
-        """Explicit aux TMA rejects configs with no exact-shape aux tensor."""
+        """Explicit aux TMA rejects configs with no stageable aux tensor."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_bias(
@@ -17824,7 +17994,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 bound.to_triton_code(cfg)
         msg = str(cm.exception)
         self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
-        self.assertIn("exact-shape rank-2 auxiliary tensor", msg)
+        self.assertIn("stageable rank-2 auxiliary tensor", msg)
 
     def test_aux_tma_load_allows_partial_tiles_with_tma_store(self) -> None:
         """Bulk aux TMA can stage partial output tiles for TMA-store epilogues."""
