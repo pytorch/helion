@@ -1490,10 +1490,16 @@ class PallasBackend(Backend):
         return self.build_launcher_name(device_fn.config)
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .aten_lowering import can_lower_static_index_pallas
         from .aten_lowering import cat_lowering_pallas
+        from .aten_lowering import static_index_lowering_pallas
 
         if node.target is torch.ops.aten.cat.default:
             return cat_lowering_pallas
+        if node.target is torch.ops.aten.index.Tensor and can_lower_static_index_pallas(
+            node
+        ):
+            return static_index_lowering_pallas
         return None
 
     def pre_codegen(
