@@ -672,6 +672,28 @@ def pallas_scaled_add_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
+    rows = x.size(0)
+    out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
+    for tile_rows in hl.tile(rows):
+        computed = x[tile_rows, :] + 1
+        heads = computed.reshape(computed.size(0), 4, 64)
+        middle = heads[:, 1 + hl.arange(2), :]
+        out[tile_rows, :] = middle.reshape(computed.size(0), 128)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_loaded_static_slice(x: torch.Tensor) -> torch.Tensor:
+    rows = x.size(0)
+    out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
+    for tile_rows in hl.tile(rows):
+        loaded = x[tile_rows, :]
+        out[tile_rows, :] = loaded[:, 64 + hl.arange(128)]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_shifted_modulo_row_index(x: torch.Tensor) -> torch.Tensor:
     """Exercise a compound modulo operand whose parentheses are significant."""
     out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
@@ -835,6 +857,25 @@ class TestPallas(TestCase):
         lanes = torch.arange(128, device=DEVICE)
         expected = torch.stack((table[:, lanes], table[:, 256 + lanes]))
         torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_computed_static_slice(self) -> None:
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_computed_static_slice,
+            (x,),
+            block_sizes=[128],
+        )
+        expected = (x + 1).reshape(128, 4, 64)[:, 1:3, :].reshape(128, 128)
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_loaded_static_slice(self) -> None:
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_loaded_static_slice,
+            (x,),
+            block_sizes=[128],
+        )
+        torch.testing.assert_close(result.cpu(), x[:, 64:192].cpu())
 
     def test_shifted_modulo_preserves_expression_precedence(self) -> None:
         x = torch.randn(5, 128, device=DEVICE, dtype=torch.float32)
