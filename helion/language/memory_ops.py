@@ -4710,6 +4710,10 @@ def _codegen_cute_store_tcgen05_tile(
             # Identity-store means the epilogue chain is empty, so
             # ``_splice_acc_vec`` returns no auxiliary-load prelude by
             # construction.
+            if early_aux_prelude:
+                raise RuntimeError(
+                    "worklist identity store unexpectedly produced an aux prelude"
+                )
             # The generated worklist clamps valid_m to source_tile_m.  Almost
             # every scheduled tile therefore needs no padding fixup at all.
             # Keep the existing coordinate-derived predicate only in the
