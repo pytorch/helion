@@ -1878,6 +1878,25 @@ class TestPallas(TestCase):
         self.assertNarrowingIsResident(code)
         torch.testing.assert_close(actual, torch.full_like(actual, 8))
 
+    def test_resident_subview_aligned_lane_slice(self) -> None:
+        """An aligned static lane slice remains an address-only Ref view."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([1, 4, 128], device=x.device, dtype=x.dtype)
+            for _request in hl.grid(1):
+                state = hl.zeros([4, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    state += x_block[:, :, 128:256].float().sum(dim=0)
+                out[0, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(8, 4, 256, device=DEVICE, dtype=torch.bfloat16)
+        expected = x[:, :, 128:256].float().sum(dim=0, keepdim=True).bfloat16()
+        _, actual = code_and_output(select_panel, (x,), pallas_loop_type="fori_loop")
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
     def test_resident_subview_composed_views(self) -> None:
         """Subview and reshape transforms compose without materializing."""
 
