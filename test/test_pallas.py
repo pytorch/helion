@@ -632,6 +632,26 @@ def pallas_cat_columns(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_shifted_modulo_row_index(x: torch.Tensor) -> torch.Tensor:
+    """Exercise a compound modulo operand whose parentheses are significant."""
+    out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
+    for _ in hl.grid(1):
+        for tile in hl.tile(4, block_size=1):
+            out[tile.begin, :] = x[(tile.begin - 1) % 4, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_shifted_floor_divide_row_index(x: torch.Tensor) -> torch.Tensor:
+    """Exercise a compound floor-division operand with significant grouping."""
+    out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
+    for _ in hl.grid(1):
+        for tile in hl.tile(4, block_size=1):
+            out[tile.begin, :] = x[(tile.begin + 1) // 2, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
     """Kernel that uses hl.rand to generate random values and add them to x."""
     out = torch.empty_like(x)
@@ -739,6 +759,24 @@ class TestPallas(TestCase):
         )
         self.assertIn("jnp.concatenate((", code)
         torch.testing.assert_close(result.cpu(), torch.cat((x, y), dim=1).cpu())
+
+    def test_shifted_modulo_preserves_expression_precedence(self) -> None:
+        x = torch.randn(5, 128, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_shifted_modulo_row_index,
+            (x,),
+            pallas_loop_type="unroll",
+        )
+        torch.testing.assert_close(result.cpu(), x[[3, 0, 1, 2]].cpu())
+
+    def test_shifted_floor_divide_preserves_expression_precedence(self) -> None:
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_shifted_floor_divide_row_index,
+            (x,),
+            pallas_loop_type="unroll",
+        )
+        torch.testing.assert_close(result.cpu(), x[[0, 1, 1, 2]].cpu())
 
     def test_rsqrt_uses_native_lax_op(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
