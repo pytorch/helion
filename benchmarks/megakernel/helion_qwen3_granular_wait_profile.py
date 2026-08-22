@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 import helion_qwen3_granular_tile_dependency as granular
 import torch
 
-import helion
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.program_id import ForEachProgramID
 
@@ -45,12 +44,11 @@ def _trace_waits() -> dict[int, list[str]]:
         sites.append(kwargs["prefix"])
         trace_arg = trace_arg_by_device_function.get(key)
         if trace_arg is None:
-            trace_arg = ForEachProgramID._register_tile_dependency_state(
+            trace_arg = ForEachProgramID._register_cross_loop_state(
                 device_function,
                 name_hint="tile_dependency_wait_profile",
                 numel="128",
                 dtype=torch.int64,
-                zero_init=True,
             )
             trace_arg_by_device_function[key] = trace_arg
         begin = device_function.new_var("tile_dependency_wait_begin", dce=False)
@@ -134,12 +132,6 @@ def main() -> None:
         probe.merge_attention_splits = granular.tiled_merge_attention_splits
     probe._probe_matched_config = granular._probe_config
     kernel, _source = probe._build_composite_kernel()
-    schedule = helion.TileDependencySchedule()
-    scheduled = helion.kernel(
-        static_shapes=True,
-        autotune_effort="none",
-        tile_dependency_schedule=schedule,
-    )(kernel.fn)
 
     layer_args = argparse.Namespace(
         seed=0,
@@ -163,7 +155,7 @@ def main() -> None:
     )
     tensors = probe.allocate_layer(layer_args)
     composite_args = probe._composite_args(tensors, layer_args)
-    bound = scheduled.bind(composite_args)
+    bound = kernel.bind(composite_args)
     config = granular._probe_config(bound, layer_args)
     compiled = bound.compile_config(config)
     compiled(*composite_args)

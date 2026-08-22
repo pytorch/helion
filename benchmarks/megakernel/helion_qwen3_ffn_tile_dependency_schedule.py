@@ -1,5 +1,5 @@
 # ruff: noqa: ANN202
-"""Opt-in TileDependencySchedule wrapper for the unchanged Qwen3 FFN probe."""
+"""Cross-loop scheduled wrapper for the unchanged Qwen3 FFN probe."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ import sys
 import types
 
 import torch
-
-import helion
 
 _compat_probe = types.ModuleType("triton_qwen3_sm_overlap_probe")
 
@@ -31,11 +29,6 @@ def main() -> None:
 
     import helion_qwen3_ffn_tile_dependency as probe
 
-    probe.qwen3_ffn_tile_dependency = helion.kernel(
-        static_shapes=True,
-        autotune_effort="none",
-        tile_dependency_schedule=helion.TileDependencySchedule(),
-    )(probe.qwen3_ffn_tile_dependency.fn)
     sys.argv = [sys.argv[0], *remaining]
     if not args.strict_validation:
         probe.main()

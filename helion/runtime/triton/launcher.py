@@ -167,9 +167,7 @@ def default_launcher(
     _remote_barrier_signal_slots_per_program: int = 0,
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
-    _persistent_state_specs: tuple[
-        tuple[torch.Tensor, int, torch.dtype, bool], ...
-    ] = (),
+    _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -220,14 +218,9 @@ def default_launcher(
             ptx_options,
             launch_cooperative_grid,
             tuple(sorted((name, repr(value)) for name, value in kwargs.items())),
-            tuple(
-                (numel, dtype, zero_init)
-                for _, numel, dtype, zero_init in _persistent_state_specs
-            ),
+            tuple((numel, dtype) for _, numel, dtype in _persistent_state_specs),
         )
-        for slot, (state_like, numel, dtype, zero_init) in enumerate(
-            _persistent_state_specs
-        ):
+        for slot, (state_like, numel, dtype) in enumerate(_persistent_state_specs):
             state = _get_persistent_state(
                 triton_kernel,
                 state_like,
@@ -235,7 +228,6 @@ def default_launcher(
                 slot,
                 numel,
                 dtype,
-                zero_init,
             )
             args = (*args, state)
     # For both CUDA and MTIA, use the same kernel execution.
@@ -372,7 +364,6 @@ def _get_persistent_state(
     slot: int,
     required_numel: int,
     dtype: torch.dtype,
-    zero_init: bool,
 ) -> torch.Tensor:
     """Return stream-local compiler state retained across kernel launches."""
     if like.device.type != "cuda":
@@ -382,8 +373,7 @@ def _get_persistent_state(
     key = (like.device, dtype, stream.cuda_stream, namespace, slot)
     state = cache.get(key)
     if state is None or state.numel() < required_numel:
-        factory = torch.zeros if zero_init else torch.empty
-        state = factory(required_numel, dtype=dtype, device=like.device)
+        state = torch.zeros(required_numel, dtype=dtype, device=like.device)
         cache[key] = state
     return state
 
@@ -400,10 +390,10 @@ def _validate_resident_program_capacity(
 
     tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
     if tensor is None or tensor.device.type != "cuda":
-        raise RuntimeError("tile-dependency residency checks require a CUDA tensor")
+        raise RuntimeError("cross-loop residency checks require a CUDA tensor")
 
     if compiled_kernel is None:
-        raise RuntimeError("unable to compile tile-dependency kernel")
+        raise RuntimeError("unable to compile cross-loop scheduled kernel")
 
     # Accessing ``run`` initializes Triton's module/function handles without
     # launching the kernel.  Cache the exact driver result on the compiled
@@ -413,7 +403,7 @@ def _validate_resident_program_capacity(
     metadata = getattr(compiled_kernel, "metadata", None)
     shared = getattr(metadata, "shared", None)
     if function is None or not isinstance(shared, int):
-        raise RuntimeError("unable to query tile-dependency kernel occupancy")
+        raise RuntimeError("unable to query cross-loop kernel occupancy")
 
     device = tensor.device
     cache = vars(compiled_kernel).setdefault(
@@ -433,14 +423,14 @@ def _validate_resident_program_capacity(
             )
         if error != cuda_driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(
-                f"CUDA occupancy query failed for tile-dependency kernel: {error}"
+                f"CUDA occupancy query failed for cross-loop kernel: {error}"
             )
         properties = torch.cuda.get_device_properties(device)
         capacity = int(blocks_per_sm) * int(properties.multi_processor_count)
         cache[key] = capacity
     if required_programs > capacity:
         raise RuntimeError(
-            "TileDependencySchedule requires "
+            "Cross-loop scheduling requires "
             f"{required_programs} concurrently resident programs, but this "
             f"kernel/device can residently execute only {capacity}. Choose a "
             "lower-resource configuration, an earlier dependency frontier, "

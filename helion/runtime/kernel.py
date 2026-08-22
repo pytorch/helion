@@ -73,7 +73,6 @@ from .config import Config
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
-from .tile_dependency import TileDependencySchedule
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -437,7 +436,6 @@ class Kernel(Generic[_R]):
         configs: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
-        tile_dependency_schedule: TileDependencySchedule | None = None,
     ) -> None:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
@@ -447,8 +445,6 @@ class Kernel(Generic[_R]):
             configs: A list of configurations to use for the kernel.
             settings: The settings to be used by the Kernel. If None, a new `Settings()` instance is created.
             key: Optional callable that returns an extra hashable component for specialization.
-            tile_dependency_schedule: Optional policy enabling compiler-derived
-                cross-grid scheduling for dependent top-level tile loops.
         """
         super().__init__()
         assert isinstance(fn, types.FunctionType)
@@ -459,7 +455,6 @@ class Kernel(Generic[_R]):
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
-        self.tile_dependency_schedule = tile_dependency_schedule
         # Whether the kernel declares distributed intent via an hl.ProcessGroupName
         # argument. Computed once so the per-call is_distributed check stays cheap
         # on the dispatch hot path (avoids re-running inspect.signature). See #3024.
@@ -1662,10 +1657,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 measure("BoundKernel.create_host_function"),
             ):
                 try:
-                    compiler = KernelCompiler(
-                        self.env,
-                        tile_dependency_schedule=self.kernel.tile_dependency_schedule,
-                    )
+                    compiler = KernelCompiler(self.env)
                     self.host_function: HostFunction = compiler.compile(
                         self.kernel.fn,
                         self.fake_args,
@@ -1797,10 +1789,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
-        if self.kernel.tile_dependency_schedule is not None:
-            parts.append(
-                f"tile_dependency_schedule={self.kernel.tile_dependency_schedule!r}"
-            )
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(
@@ -2671,7 +2659,6 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
-    tile_dependency_schedule: TileDependencySchedule | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -2683,7 +2670,6 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
-    tile_dependency_schedule: TileDependencySchedule | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
 
@@ -2694,7 +2680,6 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
-    tile_dependency_schedule: TileDependencySchedule | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
     """
@@ -2708,8 +2693,6 @@ def kernel(
             one of config or configs. Refer to the ``helion.Config`` class for
             details.
         key: Optional callable returning a hashable that augments the specialization key.
-        tile_dependency_schedule: Opt-in policy for scheduling dependencies
-            between top-level tile loops in one persistent kernel.
         settings: Keyword arguments representing settings for the Kernel.
             Can also use settings=Settings(...) to pass a Settings object
             directly. Refer to the ``helion.Settings`` class for available
@@ -2734,28 +2717,18 @@ def kernel(
     else:
         settings_obj = Settings(**settings)
 
-    if tile_dependency_schedule is not None and not isinstance(
-        tile_dependency_schedule, TileDependencySchedule
-    ):
-        raise TypeError(
-            "tile_dependency_schedule must be a helion.TileDependencySchedule "
-            f"or None, got {type(tile_dependency_schedule)!r}"
-        )
-
     if fn is None:
         return functools.partial(
             kernel,
             configs=configs,
             settings=settings_obj,
             key=key,
-            tile_dependency_schedule=tile_dependency_schedule,
         )
     return Kernel(
         fn,
         configs=configs,
         settings=settings_obj,
         key=key,
-        tile_dependency_schedule=tile_dependency_schedule,
     )
 
 

@@ -21,6 +21,7 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
+DEFAULT_TILE_DEPENDENCY_FRONTIER = -1
 
 
 class Config(Mapping[str, object]):
@@ -56,6 +57,7 @@ class Config(Mapping[str, object]):
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
         xcd_remap: bool | None = None,
+        tile_dependency_frontier: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -105,6 +107,8 @@ class Config(Mapping[str, object]):
                 improve L2 locality on multi-XCD GPUs (MI300/MI350). Supported for pid_type
                 "flat", "persistent_blocked", and "persistent_interleaved"; composes with
                 ``l2_groupings``.
+            tile_dependency_frontier: Compiler-enumerated cross-loop readiness
+                frontier. ``-1`` selects conservative root completion.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -135,6 +139,7 @@ class Config(Mapping[str, object]):
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
             "xcd_remap": xcd_remap,
+            "tile_dependency_frontier": tile_dependency_frontier,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -363,6 +368,15 @@ class Config(Mapping[str, object]):
     @property
     def epilogue_subtile(self) -> int | None:
         return cast("int | None", self.config.get("epilogue_subtile", None))
+
+    @property
+    def tile_dependency_frontier(self) -> int:
+        return cast(
+            "int",
+            self.config.get(
+                "tile_dependency_frontier", DEFAULT_TILE_DEPENDENCY_FRONTIER
+            ),
+        )
 
 
 def _to_hashable(x: object) -> object:

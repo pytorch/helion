@@ -635,7 +635,7 @@ def run(args) -> None:
                 else ()
             ),
             "implicit_phase_starts": sorted(
-                host_function.device_ir.tile_dependency_schedule.implicit_phase_starts
+                host_function.device_ir.implicit_dependency_starts
             ),
             "pid_type": config.pid_type,
         },

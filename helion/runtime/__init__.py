@@ -55,7 +55,6 @@ from .kernel import OutputCodeOptions as OutputCodeOptions
 from .kernel import kernel as kernel
 from .pallas.launcher import default_pallas_launcher as default_pallas_launcher
 from .settings import is_pallas_interpret as _module_is_pallas_interpret
-from .tile_dependency import TileDependencySchedule as TileDependencySchedule
 from .triton.launcher import default_launcher as _triton_default_launcher
 from .triton.launcher import get_num_sm as _triton_get_num_sm
 from .triton.launcher import get_num_xcd as get_num_xcd
@@ -76,9 +75,7 @@ def default_launcher(
     _remote_barrier_signal_slots_per_program: int = 0,
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
-    _persistent_state_specs: tuple[
-        tuple[torch.Tensor, int, torch.dtype, bool], ...
-    ] = (),
+    _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,

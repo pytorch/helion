@@ -29,7 +29,6 @@ import helion.language as hl
 FP8_MAX = 448.0
 FP8_MIN = -448.0
 FP8_MIN_SCALE = 1.0 / (FP8_MAX * 512.0)
-_ACTIVE_TILE_DEPENDENCY_SCHEDULE = helion.TileDependencySchedule()
 _USE_CANONICAL_ATTENTION_VIEWS = False
 _USE_TASK_ALIGNED_ATTENTION = False
 
@@ -641,12 +640,7 @@ def task_aligned_tiled_merge_attention_splits(
 
 def _compile_granular_separate_kernel(kernel, kernel_args, args):
     """Compile an unchanged granular source body as its own Helion launch."""
-    scheduled = helion.kernel(
-        static_shapes=True,
-        autotune_effort="none",
-        tile_dependency_schedule=_ACTIVE_TILE_DEPENDENCY_SCHEDULE,
-    )(kernel.fn)
-    bound = scheduled.bind(kernel_args)
+    bound = kernel.bind(kernel_args)
     values = dict(bound.config_spec.default_config())
     values.update(
         {
@@ -1063,10 +1057,7 @@ def _probe_config(bound, args):
 
 
 def main() -> None:
-    global \
-        _ACTIVE_TILE_DEPENDENCY_SCHEDULE, \
-        _USE_CANONICAL_ATTENTION_VIEWS, \
-        _USE_TASK_ALIGNED_ATTENTION
+    global _USE_CANONICAL_ATTENTION_VIEWS, _USE_TASK_ALIGNED_ATTENTION
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--strict-validation", action="store_true")
@@ -1146,11 +1137,9 @@ def main() -> None:
         probe._compose_qwen3_layer_source = compose_task_aligned_source
     kernel, source = probe._build_composite_kernel()
     probe.GENERATED_SOURCE = source
-    _ACTIVE_TILE_DEPENDENCY_SCHEDULE = helion.TileDependencySchedule()
     probe.qwen3_layer_tile_dependency = helion.kernel(
         static_shapes=True,
         autotune_effort="none",
-        tile_dependency_schedule=_ACTIVE_TILE_DEPENDENCY_SCHEDULE,
     )(kernel.fn)
     sys.argv = [sys.argv[0], *remaining]
     if args.dump_accesses:

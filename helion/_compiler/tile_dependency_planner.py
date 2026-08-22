@@ -11,6 +11,7 @@ from .cross_loop_dependencies import AllocationRegion
 from .cross_loop_dependencies import CrossLoopAccess
 from .cross_loop_dependencies import CrossLoopDependencyEdge
 from .cross_loop_dependencies import CrossLoopDependencyPlan
+from .cross_loop_dependencies import TaskFamily
 from .cross_loop_dependencies import TileDependencyKind
 from .cross_loop_dependencies import UniformTaskPartition
 from .cross_loop_dependencies import WaitSpec
@@ -18,9 +19,8 @@ from .cross_loop_dependencies import access_task_region
 from .cross_loop_dependencies import allocation_regions_may_overlap
 from .cross_loop_dependencies import prove_uniform_task_partition
 
-TILE_DEPENDENCY_FRONTIER_CONFIG = "_tile_dependency_frontier"
+TILE_DEPENDENCY_FRONTIER_CONFIG = "tile_dependency_frontier"
 TILE_DEPENDENCY_FRONTIER_DEFAULT = -1
-TILE_DEPENDENCY_FRONTIER_MAX_INDEX = 63
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,7 +32,6 @@ class AccessProgramPoint:
     explicit access marker; they are never used to infer dependency geometry.
     """
 
-    access_id: int
     coordinate_items: tuple[tuple[int, str], ...] | None
     loop_id: int | None
     loop_depth: int
@@ -49,7 +48,6 @@ class AccessProgramPoint:
 class InstantiatedTaskFamily:
     """A logical task family instantiated for one kernel configuration."""
 
-    root: int
     logical_axis_order: tuple[int, ...]
     physical_axis_order: tuple[int, ...]
     axis_counts_items: tuple[tuple[int, int], ...]
@@ -123,8 +121,11 @@ class KeyedEventContributorPlan:
     source_event_ids: tuple[int, ...]
     producer_root: int
     task_to_key: tuple[int | None, ...]
-    task_to_key_segments: tuple[TaskToKeySegment, ...]
     partition: UniformTaskPartition | None = None
+
+    @property
+    def task_to_key_segments(self) -> tuple[TaskToKeySegment, ...]:
+        return _compress_task_to_key(self.task_to_key)
 
     @property
     def expected_arrivals(self) -> int:
@@ -151,8 +152,11 @@ class KeyedEventPlan:
     key_root: int
     contributors: tuple[KeyedEventContributorPlan, ...]
     consumer_key_by_task: tuple[int, ...]
-    consumer_task_to_key_segments: tuple[TaskToKeySegment, ...]
     on_ready_root: int | None = None
+
+    @property
+    def consumer_task_to_key_segments(self) -> tuple[TaskToKeySegment, ...]:
+        return _compress_task_to_key(self.consumer_key_by_task)
 
     @property
     def source_event_ids(self) -> tuple[int, ...]:
@@ -250,7 +254,6 @@ class GenericSchedulePlan:
 
     task_ready_edges: frozenset[tuple[int, int]]
     root_completion_edges: frozenset[tuple[int, int]]
-    root_waits_by_root: dict[int, tuple[RootCompletionWait, ...]]
     task_waits_by_root: dict[int, tuple[WaitSpec, ...]]
     access_cohorts: tuple[AccessCohortPlan, ...]
     counted_events: tuple[KeyedEventPlan, ...]
@@ -779,16 +782,9 @@ def build_generic_schedule_plan(
         retained_waits = {
             root: waits for root, waits in retained_waits.items() if waits
         }
-    root_waits_by_root: dict[int, list[RootCompletionWait]] = {}
-    for wait in root_waits:
-        root_waits_by_root.setdefault(wait.consumer_root, []).append(wait)
-
     return GenericSchedulePlan(
         task_ready_edges=task_ready_edges,
         root_completion_edges=root_completion_edges,
-        root_waits_by_root={
-            root: tuple(waits) for root, waits in root_waits_by_root.items()
-        },
         task_waits_by_root=retained_waits,
         access_cohorts=access_cohorts,
         counted_events=counted_events,
@@ -1326,9 +1322,6 @@ def _derive_counted_events(
                     source_event_ids=(event_id,),
                     producer_root=producer_root,
                     task_to_key=partition.producer_key_by_task,
-                    task_to_key_segments=_compress_task_to_key(
-                        partition.producer_key_by_task
-                    ),
                     partition=partition,
                 )
             )
@@ -1341,9 +1334,6 @@ def _derive_counted_events(
                 key_root=consumer_root,
                 contributors=tuple(contributors),
                 consumer_key_by_task=tuple(range(consumer.task_count)),
-                consumer_task_to_key_segments=_compress_task_to_key(
-                    tuple(range(consumer.task_count))
-                ),
                 on_ready_root=consumer_root,
             )
         )
@@ -1501,7 +1491,6 @@ def _derive_coalesced_keyed_events(
                     source_event_ids=source_event_ids,
                     producer_root=producer_root,
                     task_to_key=mapping,
-                    task_to_key_segments=segments,
                 )
             )
         consumer_mapping = tuple(consumer_key_by_task)
@@ -1518,7 +1507,6 @@ def _derive_coalesced_keyed_events(
             key_root=consumer_root,
             contributors=tuple(contributors),
             consumer_key_by_task=consumer_mapping,
-            consumer_task_to_key_segments=consumer_segments,
             on_ready_root=(
                 consumer_root
                 if len(signatures) == consumer.task_count
@@ -1654,10 +1642,11 @@ def _select_readiness_frontier(
     return ReadinessFrontierSelection(plans=(candidates[frontier_index],))
 
 
-def has_potential_readiness_frontier(
+def potential_readiness_frontier_stream_axes(
     dependency_plan: CrossLoopDependencyPlan,
-) -> bool:
-    """Return whether the graph can contain a counted-event readiness frontier."""
+    task_families: tuple[TaskFamily, ...],
+) -> frozenset[int]:
+    """Return producer axes that can parameterize a readiness frontier."""
     producer_by_event = {
         event.event_id: event.producer_root
         for event in dependency_plan.events
@@ -1670,9 +1659,21 @@ def has_potential_readiness_frontier(
         and wait.predecessor_map is not None
         and wait.event_id in producer_by_event
     }
-    return any(
-        wait.placement == "access"
-        and wait.predecessor_map is not None
-        and producer_by_event.get(wait.event_id) in root_entry_consumers
-        for wait in dependency_plan.waits
-    )
+    result: set[int] = set()
+    for wait in dependency_plan.waits:
+        predecessor_map = wait.predecessor_map
+        if (
+            wait.placement != "access"
+            or predecessor_map is None
+            or producer_by_event.get(wait.event_id) not in root_entry_consumers
+        ):
+            continue
+        consumer_axes = set(task_families[wait.consumer_root].logical_axis_order)
+        nested_axes = {
+            axis.producer_block_id
+            for axis in predecessor_map.axes
+            if axis.consumer_block_id not in consumer_axes
+        }
+        if len(nested_axes) == 1:
+            result.update(nested_axes)
+    return frozenset(result)

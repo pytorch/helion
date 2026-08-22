@@ -55,7 +55,6 @@ def implicit_tile_dependency_chain(x: torch.Tensor) -> torch.Tensor:
 dynamic_implicit_tile_dependency_chain = helion.kernel(
     static_shapes=False,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )(implicit_tile_dependency_chain.fn)
 
 
@@ -70,15 +69,8 @@ def implicit_atomic_dependency(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-scheduled_atomic_dependency = helion.kernel(
-    autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
-)(implicit_atomic_dependency.fn)
-
-
 @helion.kernel(
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def invalid_cross_root_value(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -91,7 +83,6 @@ def invalid_cross_root_value(x: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def implicit_tile_dependency_fanout(
     x: torch.Tensor,
@@ -110,7 +101,6 @@ def implicit_tile_dependency_fanout(
 
 @helion.kernel(
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def implicit_tile_dependency_three_stage(x: torch.Tensor) -> torch.Tensor:
     tmp0 = torch.empty_like(x)
@@ -127,7 +117,6 @@ def implicit_tile_dependency_three_stage(x: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def implicit_tile_dependency_matmul_chain(
     a: torch.Tensor,
@@ -235,8 +224,8 @@ class TestTileDependencyScheduling(unittest.TestCase):
         cast("Any", device_function).namespace = SimpleNamespace(
             create_name=lambda name, _value: name
         )
-        device_function.triton_noinline_helpers = []
-        device_function.triton_noinline_helper_constexprs = {}
+        device_function.triton_outlined_helpers = []
+        device_function.triton_outlined_helper_constexprs = {}
         device_function._variable_renames = {}
         device_function.dce_vars = []
         cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
@@ -247,7 +236,7 @@ class TestTileDependencyScheduling(unittest.TestCase):
         computation = _ast_fingerprint(body)
         environment = SimpleNamespace(backend_name="triton")
         with mock.patch.object(CompileEnvironment, "current", return_value=environment):
-            helper_name, arguments = device_function.register_triton_noinline_helper(
+            helper_name, arguments = device_function.register_triton_outlined_helper(
                 "opaque_tile", body, noinline=True
             )
             helper = device_function.codegen_helper_functions()[0]
@@ -274,8 +263,8 @@ class TestTileDependencyScheduling(unittest.TestCase):
         cast("Any", device_function).namespace = SimpleNamespace(
             create_name=lambda name, _value: name
         )
-        device_function.triton_noinline_helpers = []
-        device_function.triton_noinline_helper_constexprs = {}
+        device_function.triton_outlined_helpers = []
+        device_function.triton_outlined_helper_constexprs = {}
         device_function._variable_renames = {}
         device_function.dce_vars = []
         cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
@@ -286,7 +275,7 @@ class TestTileDependencyScheduling(unittest.TestCase):
         environment = SimpleNamespace(backend_name="triton")
 
         with mock.patch.object(CompileEnvironment, "current", return_value=environment):
-            helper_name, arguments = device_function.register_triton_noinline_helper(
+            helper_name, arguments = device_function.register_triton_outlined_helper(
                 "descriptor_tile", body
             )
             helper = device_function.codegen_helper_functions()[0]
@@ -299,10 +288,12 @@ class TestTileDependencyScheduling(unittest.TestCase):
             [argument.arg for argument in helper.args.args], ["weight_desc"]
         )
 
-    def test_schedule_has_no_manual_policy_knobs(self) -> None:
+    def test_tile_dependency_schedule_has_no_separate_public_object(self) -> None:
+        self.assertFalse(hasattr(helion, "TileDependencySchedule"))
+        self.assertEqual(helion.Config().tile_dependency_frontier, -1)
         self.assertEqual(
-            repr(helion.TileDependencySchedule()),
-            "helion.TileDependencySchedule()",
+            helion.Config(tile_dependency_frontier=3).tile_dependency_frontier,
+            3,
         )
 
 
@@ -314,39 +305,35 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         bound = tile_dependency_info_across_barrier.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        schedule = host_function.device_ir.tile_dependency_schedule
-        assert schedule is not None
         dependency_plan = host_function.device_ir.cross_loop_dependency_plan
         assert dependency_plan is not None
-        self.assertTrue(host_function.device_ir.cross_loop_accesses)
+        self.assertTrue(dependency_plan.accesses)
         self.assertEqual(dependency_plan.edges, ())
-        self.assertEqual(schedule.stage_by_root, (0, 1))
-        self.assertEqual(schedule.implicit_stage_starts, frozenset())
+        self.assertEqual(
+            tuple(host_function.device_ir.phase_for_root(root) for root in range(2)),
+            (0, 1),
+        )
+        self.assertEqual(
+            host_function.device_ir.implicit_dependency_starts, frozenset()
+        )
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
-    def test_implicit_dependency_requires_explicit_schedule(self) -> None:
+    def test_implicit_dependency_is_scheduled_automatically(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
-        with pytest.raises(exc.LoopDependencyError, match="tmp"):
-            code_and_output(
-                implicit_tile_dependency_chain,
-                (x,),
-                block_sizes=[8, 8],
-                pid_type="persistent_blocked",
-            )
+        code, output = code_and_output(
+            implicit_tile_dependency_chain,
+            (x,),
+            block_sizes=[8, 8],
+            pid_type="persistent_blocked",
+        )
+        torch.testing.assert_close(output, (x + 1) * 2)
+        self.assertIn("tile_dependency_singleton_input_wait", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
     def test_allocation_graph_tracks_atomics_as_writes(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
-        with pytest.raises(exc.LoopDependencyError, match="tmp"):
-            code_and_output(
-                implicit_atomic_dependency,
-                (x,),
-                block_sizes=[8, 8],
-                pid_type="persistent_blocked",
-            )
-
         _code, output = code_and_output(
-            scheduled_atomic_dependency,
+            implicit_atomic_dependency,
             (x,),
             block_sizes=[8, 8],
             pid_type="persistent_blocked",
@@ -380,7 +367,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out0, (x + 1) * 2)
         torch.testing.assert_close(out1, (x + 1) * 3)
         self.assertEqual(code.count("sem='release'"), 1)
-        self.assertIn("tile_dependency_task_epochs", code)
+        self.assertIn("tile_dependency_task_wait", code)
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
@@ -396,8 +383,8 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
         self.assertEqual(code.count("sem='release'"), 2)
-        self.assertIn("tile_dependency_task_epochs", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertIn("tile_dependency_task_wait", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
@@ -464,10 +451,13 @@ class TestLoops(RefEagerTestBase, TestCase):
         bound = tile_dependency_info_across_barrier.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        schedule = host_function.device_ir.tile_dependency_schedule
-        assert schedule is not None
-        self.assertEqual(schedule.stage_by_root, (0, 1))
-        self.assertEqual(schedule.implicit_stage_starts, frozenset())
+        self.assertEqual(
+            tuple(host_function.device_ir.phase_for_root(root) for root in range(2)),
+            (0, 1),
+        )
+        self.assertEqual(
+            host_function.device_ir.implicit_dependency_starts, frozenset()
+        )
 
     @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_loop_dependency_error1(self):

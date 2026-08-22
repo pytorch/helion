@@ -10,7 +10,6 @@ from helion._compiler.cross_loop_dependencies import CrossLoopAccess
 from helion._compiler.cross_loop_dependencies import LogicalTaskAxis
 from helion._compiler.cross_loop_dependencies import TaskFamily
 from helion._compiler.cross_loop_dependencies import TileDependencyKind
-from helion._compiler.cross_loop_dependencies import UniformTaskPartitionSegment
 from helion._compiler.cross_loop_dependencies import build_cross_loop_dependency_plan
 from helion._compiler.cross_loop_dependencies import predecessor_task_ids
 from helion._compiler.cross_loop_dependencies import prove_uniform_task_partition
@@ -27,13 +26,13 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
+from helion.autotuner.config_fragment import IntegerFragment
 import helion.language as hl
 
 
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def grouped_affine_chain(
     x: torch.Tensor,
@@ -89,7 +88,6 @@ def grouped_affine_chain(
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def cartesian_affine_chain(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
@@ -106,7 +104,6 @@ def cartesian_affine_chain(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def size_one_view_chain(x: torch.Tensor) -> torch.Tensor:
     heads, width = x.size()
@@ -126,7 +123,6 @@ def size_one_view_chain(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def three_way_affine_chain(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
@@ -148,7 +144,6 @@ def three_way_affine_chain(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def counted_event_chain(x: torch.Tensor) -> torch.Tensor:
     rows, columns = x.size()
@@ -177,7 +172,6 @@ def counted_event_chain(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def cartesian_affine_join(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
@@ -199,7 +193,6 @@ def cartesian_affine_join(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def singleton_root_join(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
@@ -223,7 +216,6 @@ def singleton_root_join(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def streamed_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
@@ -245,7 +237,6 @@ def streamed_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def offset_affine_chain(x: torch.Tensor) -> torch.Tensor:
     width = x.size(0)
@@ -262,7 +253,6 @@ def offset_affine_chain(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def partial_prefix_continuation(
     x: torch.Tensor,
@@ -281,7 +271,6 @@ def partial_prefix_continuation(
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def partial_prefix_in_place_chain(x: torch.Tensor) -> torch.Tensor:
     width = x.size(0)
@@ -300,7 +289,6 @@ def partial_prefix_in_place_chain(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def multi_producer_join(
     x: torch.Tensor,
@@ -322,7 +310,6 @@ def multi_producer_join(
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def coalesced_multi_producer_join(
     x: torch.Tensor,
@@ -352,7 +339,6 @@ def coalesced_multi_producer_join(
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def coalesced_single_producer_fanout(x: torch.Tensor) -> torch.Tensor:
     heads, width = x.shape
@@ -374,7 +360,6 @@ def coalesced_single_producer_fanout(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def direct_nested_continuation(x: torch.Tensor) -> torch.Tensor:
     width = x.size(0)
@@ -394,7 +379,6 @@ def direct_nested_continuation(x: torch.Tensor) -> torch.Tensor:
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
-    tile_dependency_schedule=helion.TileDependencySchedule(),
 )
 def specialized_quotient_chain(
     x: torch.Tensor,
@@ -480,7 +464,6 @@ class TestCrossLoopDependencies(TestCase):
         )
         task_families = tuple(
             InstantiatedTaskFamily(
-                root=root,
                 logical_axis_order=(10 + root,),
                 physical_axis_order=(10 + root,),
                 axis_counts_items=((10 + root, count),),
@@ -513,32 +496,6 @@ class TestCrossLoopDependencies(TestCase):
             {1: 15},
         )
 
-    def test_dependency_plan_retains_logical_task_families(self) -> None:
-        task_families = (
-            TaskFamily(
-                root=0,
-                graph_id=7,
-                axes=(LogicalTaskAxis(10, None),),
-                access_ids=(0,),
-            ),
-            TaskFamily(
-                root=1,
-                graph_id=9,
-                axes=(LogicalTaskAxis(20, None),),
-                access_ids=(1,),
-            ),
-        )
-        plan = build_cross_loop_dependency_plan(
-            (
-                _access(0, root=0, kind="store", block_ids=(10,)),
-                _access(1, root=1, kind="load", block_ids=(20,)),
-            ),
-            task_families=task_families,
-        )
-
-        self.assertEqual(plan.task_families, task_families)
-        self.assertEqual(plan.task_families[0].logical_axis_order, (10,))
-
     def test_source_phase_boundary_satisfies_allocation_dependency(self) -> None:
         plan = build_cross_loop_dependency_plan(
             (
@@ -546,8 +503,8 @@ class TestCrossLoopDependencies(TestCase):
                 _access(1, root=1, kind="load", block_ids=(20,)),
             ),
             task_families=(
-                TaskFamily(0, 0, (LogicalTaskAxis(10, None),)),
-                TaskFamily(1, 1, (LogicalTaskAxis(20, None),)),
+                TaskFamily((LogicalTaskAxis(10, None),)),
+                TaskFamily((LogicalTaskAxis(20, None),)),
             ),
             root_phases=(0, 1),
         )
@@ -1037,8 +994,8 @@ class TestCrossLoopDependencies(TestCase):
         )
         assert suffix_partition is not None
         self.assertEqual(
-            suffix_partition.producer_task_segments,
-            (UniformTaskPartitionSegment(begin=2, length=6),),
+            suffix_partition.producer_key_by_task,
+            (None, None, 0, 0, 1, 1, 2, 2),
         )
 
     def test_tile_id_indices_use_scalar_extent(self) -> None:
@@ -1116,8 +1073,6 @@ class TestCrossLoopDependencies(TestCase):
     def test_tracks_latest_writer_and_intervening_readers(self) -> None:
         task_families = tuple(
             TaskFamily(
-                root=root,
-                graph_id=root,
                 axes=(LogicalTaskAxis(root, 128),),
             )
             for root in range(4)
@@ -1178,9 +1133,9 @@ class TestCrossLoopDependencies(TestCase):
                 ),
             ),
             task_families=(
-                TaskFamily(0, 0, (LogicalTaskAxis(10, 96),)),
-                TaskFamily(1, 1, (LogicalTaskAxis(20, 64),)),
-                TaskFamily(2, 2, (LogicalTaskAxis(30, 96),)),
+                TaskFamily((LogicalTaskAxis(10, 96),)),
+                TaskFamily((LogicalTaskAxis(20, 64),)),
+                TaskFamily((LogicalTaskAxis(30, 96),)),
             ),
         )
 
@@ -1317,14 +1272,12 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=(
                 InstantiatedTaskFamily(
-                    root=0,
                     logical_axis_order=(10, 11),
                     physical_axis_order=(10, 11),
                     axis_counts_items=((10, 1), (11, 4)),
                     block_sizes_items=((10, 1), (11, 16)),
                 ),
                 InstantiatedTaskFamily(
-                    root=1,
                     logical_axis_order=(20,),
                     physical_axis_order=(20,),
                     axis_counts_items=((20, 1),),
@@ -1334,14 +1287,12 @@ class TestCrossLoopDependencies(TestCase):
             available_access_ids_by_root=(frozenset((0,)), frozenset((1, 2))),
             access_program_points={
                 1: AccessProgramPoint(
-                    1,
                     ((20, "outer"), (21, "inner")),
                     loop_id=7,
                     loop_depth=1,
                     root_statement_index=3,
                 ),
                 2: AccessProgramPoint(
-                    2,
                     None,
                     loop_id=8,
                     loop_depth=1,
@@ -1372,14 +1323,12 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=(
                 InstantiatedTaskFamily(
-                    root=0,
                     logical_axis_order=(10,),
                     physical_axis_order=(10,),
                     axis_counts_items=((10, 1),),
                     block_sizes_items=((10, 128),),
                 ),
                 InstantiatedTaskFamily(
-                    root=1,
                     logical_axis_order=(20,),
                     physical_axis_order=(20,),
                     axis_counts_items=((20, 4),),
@@ -1434,7 +1383,6 @@ class TestCrossLoopDependencies(TestCase):
         )
         task_families = tuple(
             InstantiatedTaskFamily(
-                root=root,
                 logical_axis_order=(10 + root * 10,),
                 physical_axis_order=(10 + root * 10,),
                 axis_counts_items=((10 + root * 10, 8),),
@@ -1523,21 +1471,18 @@ class TestCrossLoopDependencies(TestCase):
         )
         task_families = (
             InstantiatedTaskFamily(
-                root=0,
                 logical_axis_order=(10, 11),
                 physical_axis_order=(11, 10),
                 axis_counts_items=((10, 1), (11, 8)),
                 block_sizes_items=((10, 1), (11, 16)),
             ),
             InstantiatedTaskFamily(
-                root=1,
                 logical_axis_order=(20, 21),
                 physical_axis_order=(21, 20),
                 axis_counts_items=((20, 1), (21, 4)),
                 block_sizes_items=((20, 1), (21, 32)),
             ),
             InstantiatedTaskFamily(
-                root=2,
                 logical_axis_order=(30,),
                 physical_axis_order=(30,),
                 axis_counts_items=((30, 1),),
@@ -1554,7 +1499,6 @@ class TestCrossLoopDependencies(TestCase):
             ),
             "access_program_points": {
                 3: AccessProgramPoint(
-                    3,
                     ((30, "outer"), (31, "inner")),
                     loop_id=7,
                     loop_depth=1,
@@ -1655,7 +1599,6 @@ class TestCrossLoopDependencies(TestCase):
         )
         task_families = tuple(
             InstantiatedTaskFamily(
-                root=root,
                 logical_axis_order=(block_id,),
                 physical_axis_order=(block_id,),
                 axis_counts_items=((block_id, 8),),
@@ -1736,10 +1679,9 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [30], [22, 20, 21]],
         )
         task_families = (
-            InstantiatedTaskFamily(0, (10,), (10,), ((10, 32),), ((10, 1),)),
-            InstantiatedTaskFamily(1, (30,), (30,), ((30, 8),), ((30, 1),)),
+            InstantiatedTaskFamily((10,), (10,), ((10, 32),), ((10, 1),)),
+            InstantiatedTaskFamily((30,), (30,), ((30, 8),), ((30, 1),)),
             InstantiatedTaskFamily(
-                2,
                 (22, 20, 21),
                 (22, 20, 21),
                 ((22, 4), (20, 8), (21, 1)),
@@ -1811,14 +1753,12 @@ class TestCrossLoopDependencies(TestCase):
         )
         task_families = (
             InstantiatedTaskFamily(
-                0,
                 (10,),
                 (10,),
                 ((10, elements),),
                 ((10, 1),),
             ),
             InstantiatedTaskFamily(
-                1,
                 (22, 20, 21),
                 (22, 20, 21),
                 ((22, splits), (20, heads), (21, 1)),
@@ -1889,9 +1829,8 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [22, 20]],
         )
         task_families = (
-            InstantiatedTaskFamily(0, (10,), (10,), ((10, columns),), ((10, 1),)),
+            InstantiatedTaskFamily((10,), (10,), ((10, columns),), ((10, 1),)),
             InstantiatedTaskFamily(
-                1,
                 (22, 20),
                 (22, 20),
                 ((22, splits), (20, columns)),
@@ -1982,14 +1921,12 @@ class TestCrossLoopDependencies(TestCase):
             task_families.extend(
                 (
                     InstantiatedTaskFamily(
-                        root=root_base,
                         logical_axis_order=(block_base, block_base + 1),
                         physical_axis_order=(block_base + 1, block_base),
                         axis_counts_items=((block_base, 1), (block_base + 1, 8)),
                         block_sizes_items=((block_base, 1), (block_base + 1, 16)),
                     ),
                     InstantiatedTaskFamily(
-                        root=root_base + 1,
                         logical_axis_order=(block_base + 10, block_base + 11),
                         physical_axis_order=(block_base + 11, block_base + 10),
                         axis_counts_items=(
@@ -2002,7 +1939,6 @@ class TestCrossLoopDependencies(TestCase):
                         ),
                     ),
                     InstantiatedTaskFamily(
-                        root=root_base + 2,
                         logical_axis_order=(block_base + 20,),
                         physical_axis_order=(block_base + 20,),
                         axis_counts_items=((block_base + 20, 1),),
@@ -2018,7 +1954,6 @@ class TestCrossLoopDependencies(TestCase):
                 )
             )
             access_points[access_base + 3] = AccessProgramPoint(
-                access_base + 3,
                 (
                     (block_base + 20, "outer"),
                     (block_base + 21, "inner"),
@@ -2122,9 +2057,9 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                         num_warps=1,
                     )
                     torch.testing.assert_close(out, ((x + launch) + 1) * 2)
-                self.assertNotIn("tile_dependency_whole_value", code)
+                self.assertNotIn("tile_dependency_root_completion", code)
                 if producer_width < consumer_width:
-                    self.assertIn("tile_dependency_continuation_arrivals", code)
+                    self.assertIn("tile_dependency_continuation_previous", code)
                     self.assertNotIn("tile_dependency_task_wait", code)
                 else:
                     self.assertIn("tile_dependency_keyed_event_wait", code)
@@ -2150,10 +2085,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 + expected_input[:, 64:]
             )
             torch.testing.assert_close(out, expected)
-        self.assertIn("tile_dependency_continuation_arrivals", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("* tl.cast(3, tl.uint32) - 1", code)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2170,7 +2105,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, torch.sum(x + launch + 1).reshape(1))
         self.assertGreaterEqual(code.count("tile_dependency_continuation_previous"), 2)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertIn("tile_dependency_whole_value", code)
+        self.assertIn("tile_dependency_singleton_input_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2186,8 +2121,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_task_epochs", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertIn("tile_dependency_task_wait", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2204,10 +2139,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(tmp, x + launch + 1)
             torch.testing.assert_close(out, (x[:64] + launch + 1) * 2)
-        self.assertIn("tile_dependency_continuation_arrivals", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("< 4", code)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2225,9 +2160,9 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             expected = x + launch + 1
             expected = torch.cat((expected[:64] * 2, expected[64:]))
             torch.testing.assert_close(out, expected)
-        self.assertIn("tile_dependency_continuation_arrivals", code)
-        self.assertIn("tile_dependency_task_epochs", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertIn("tile_dependency_task_wait", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2244,10 +2179,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 num_warps=1,
             )
             torch.testing.assert_close(out, x + launch + 1 + (y + launch) * 2)
-        self.assertIn("tile_dependency_continuation_arrivals", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tl.cast(2, tl.uint32) - 1", code)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2267,7 +2202,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_keyed_event_wait", code)
         self.assertIn("tl.cast(5, tl.uint32)", code)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2286,7 +2221,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_keyed_event_wait", code)
         self.assertIn("tl.cast(4, tl.uint32)", code)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2319,7 +2254,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         self.assertEqual(out.shape, x.shape)
-        self.assertNotIn("tile_dependency_task_epochs", code)
+        self.assertNotIn("tile_dependency_task_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2340,9 +2275,9 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 )
 
                 torch.testing.assert_close(out, (x + 1) * 2)
-                self.assertNotIn("tile_dependency_task_epochs", code)
-                self.assertIn("tile_dependency_continuation_arrivals", code)
-                self.assertNotIn("tile_dependency_whole_value", code)
+                self.assertNotIn("tile_dependency_task_wait", code)
+                self.assertIn("tile_dependency_continuation_previous", code)
+                self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2360,7 +2295,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, ((x + 1) * 2).unsqueeze(0))
         self.assertIn("tile_dependency_keyed_event_wait", code)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2382,8 +2317,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x[32:] + 1) * 2)
-        self.assertNotIn("tile_dependency_task_epochs", code)
-        self.assertIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_task_wait", code)
+        self.assertIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2398,8 +2333,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_task_epochs", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertIn("tile_dependency_task_wait", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2418,9 +2353,9 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_continuation_arrivals", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tile_dependency_continuation_physical_task", code)
-        self.assertNotIn("tile_dependency_whole_value", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2436,10 +2371,9 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, x * 2)
-        self.assertNotIn("tile_dependency_task_epochs", code)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertNotIn("tile_dependency_whole_value_arrivals", code)
-        self.assertIn("tile_dependency_continuation_arrivals", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tl.cast(4, tl.uint32) - 1", code)
 
     @skipIfNotCUDA()
@@ -2479,11 +2413,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
                 self.assertNotIn("tile_dependency_ordered_group", code)
                 if batch == 1:
-                    self.assertIn("tile_dependency_cohort_arrivals", code)
                     self.assertIn("tile_dependency_cohort_wait", code)
-                    self.assertNotIn("tile_dependency_whole_value", code)
+                    self.assertNotIn("tile_dependency_root_completion", code)
                 else:
-                    self.assertIn("tile_dependency_whole_value", code)
+                    self.assertIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2630,13 +2563,13 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
                 if reverse_groups or group_size != 32:
                     self.assertNotIn("tile_dependency_group_arrivals", code)
-                    self.assertIn("tile_dependency_whole_value", code)
+                    self.assertIn("tile_dependency_root_completion", code)
                 else:
                     self.assertNotIn("tile_dependency_group_arrivals", code)
-                    self.assertNotIn("tile_dependency_whole_value", code)
+                    self.assertNotIn("tile_dependency_root_completion", code)
                     self.assertNotIn("tile_dependency_task_wait", code)
-                    self.assertIn("tile_dependency_continuation_arrivals", code)
-                    self.assertIn("tile_dependency_cohort_arrivals", code)
+                    self.assertIn("tile_dependency_continuation_previous", code)
+                    self.assertIn("tile_dependency_cohort_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2647,6 +2580,12 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         w2 = torch.rand((128, 64), device=DEVICE, dtype=torch.float16)
         kernel_args = (x, w13, w2, 32, hl.constexpr(False))
         bound = grouped_affine_chain.bind(kernel_args)
+        frontier = bound.config_spec.user_defined_tunables[
+            TILE_DEPENDENCY_FRONTIER_CONFIG
+        ]
+        self.assertIsInstance(frontier, IntegerFragment)
+        assert isinstance(frontier, IntegerFragment)
+        self.assertEqual((frontier.low, frontier.high), (-1, 3))
         self.assertEqual(
             bound.config_spec.default_config()[TILE_DEPENDENCY_FRONTIER_CONFIG],
             -1,
@@ -2670,9 +2609,9 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             activated.half().float().reshape(1, 4, 32) * scale[:, :, None]
         ).reshape(1, 128) @ w2.float()
         torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
-        self.assertIn("tile_dependency_whole_value", code)
-        self.assertNotIn("tile_dependency_continuation_arrivals", code)
-        self.assertNotIn("tile_dependency_cohort_arrivals", code)
+        self.assertIn("tile_dependency_root_completion", code)
+        self.assertNotIn("tile_dependency_continuation_previous", code)
+        self.assertNotIn("tile_dependency_cohort_wait", code)
 
 
 if __name__ == "__main__":

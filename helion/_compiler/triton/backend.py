@@ -565,10 +565,8 @@ class TritonBackend(Backend):
             out.append(f"_remote_copy_scratch_specs=({specs},)")
         if device_fn.triton_persistent_state_specs:
             specs = ", ".join(
-                f"({tensor}, {numel}, {dtype}, {zero_init!r})"
-                for tensor, numel, dtype, zero_init in (
-                    device_fn.triton_persistent_state_specs
-                )
+                f"({tensor}, {numel}, {dtype})"
+                for tensor, numel, dtype in device_fn.triton_persistent_state_specs
             )
             out.append(f"_persistent_state_specs=({specs},)")
         if device_fn.triton_minimum_resident_programs is not None:

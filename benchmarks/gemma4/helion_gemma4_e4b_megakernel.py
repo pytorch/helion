@@ -449,7 +449,6 @@ def _build_megakernel(kv_shared: bool):
             static_shapes=True,
             autotune_effort="none",
             backend="triton",
-            tile_dependency_schedule=helion.TileDependencySchedule(),
         )(function),
         source,
     )
@@ -680,7 +679,7 @@ def _megakernel_config(bound, args, geometry):
         }
     )
     if args.frontier_index is not None:
-        values["_tile_dependency_frontier"] = args.frontier_index
+        values["tile_dependency_frontier"] = args.frontier_index
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
@@ -797,7 +796,7 @@ def run(args) -> None:
                 else ()
             ),
             "implicit_phase_starts": sorted(
-                host_function.device_ir.tile_dependency_schedule.implicit_phase_starts
+                host_function.device_ir.implicit_dependency_starts
             ),
             "pid_type": config.pid_type,
             "num_warps": config.num_warps,

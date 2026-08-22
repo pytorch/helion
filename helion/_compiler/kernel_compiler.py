@@ -19,7 +19,6 @@ from .tensor_utils import patch_tensor_factories
 if TYPE_CHECKING:
     import types
 
-    from ..runtime.tile_dependency import TileDependencySchedule
     from .compile_environment import CompileEnvironment
 
 
@@ -61,15 +60,9 @@ class KernelCompiler:
     operates on.
     """
 
-    def __init__(
-        self,
-        env: CompileEnvironment,
-        *,
-        tile_dependency_schedule: TileDependencySchedule | None = None,
-    ) -> None:
+    def __init__(self, env: CompileEnvironment) -> None:
         self.env = env
         self.backend = env.backend
-        self.tile_dependency_schedule = tile_dependency_schedule
 
     def compile(
         self,
@@ -165,9 +158,7 @@ class KernelCompiler:
             measure("HostFunction.lower_to_device_ir"),
             factory_padding,
         ):
-            hf.device_ir = lower_to_device_ir(
-                hf, tile_dependency_policy=self.tile_dependency_schedule
-            )
+            hf.device_ir = lower_to_device_ir(hf)
 
     @contextlib.contextmanager
     def _compilation_context(self) -> typing.Generator[None, None, None]:

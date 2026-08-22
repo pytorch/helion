@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
 
 CROSS_LOOP_ACCESS_ID_META = "_cross_loop_access_id"
-CROSS_LOOP_ACCESS_MARKER_PREFIX = "__helion_cross_loop_access_wait__:"
 
 
 class TileDependencyKind(enum.Enum):
@@ -38,20 +37,7 @@ def cross_loop_access_marker(access_id: int) -> ast.stmt:
 def cross_loop_access_marker_id(statement: ast.AST) -> int | None:
     """Return the access attached to an explicit compiler program point."""
     access_id = getattr(statement, CROSS_LOOP_ACCESS_ID_META, None)
-    if isinstance(access_id, int):
-        return access_id
-
-    # Accept the old inert string representation while cached/generated bodies
-    # from the migration branch are still useful for comparison.
-    if not (
-        isinstance(statement, ast.Expr)
-        and isinstance(statement.value, ast.Constant)
-        and isinstance(statement.value.value, str)
-        and statement.value.value.startswith(CROSS_LOOP_ACCESS_MARKER_PREFIX)
-    ):
-        return None
-    suffix = statement.value.value.removeprefix(CROSS_LOOP_ACCESS_MARKER_PREFIX)
-    return int(suffix) if suffix.isdigit() else None
+    return access_id if isinstance(access_id, int) else None
 
 
 def owner_root_by_graph_id(device_ir: DeviceIR) -> tuple[int, ...]:
@@ -110,18 +96,11 @@ class LogicalTaskAxis:
 class TaskFamily:
     """One opaque top-level loop and its authoritative logical task domain."""
 
-    root: int
-    graph_id: int | None
     axes: tuple[LogicalTaskAxis, ...]
-    access_ids: tuple[int, ...] = ()
 
     @property
     def logical_axis_order(self) -> tuple[int, ...]:
         return tuple(axis.block_id for axis in self.axes)
-
-    @property
-    def has_canonical_origin(self) -> bool:
-        return all(axis.canonical_origin for axis in self.axes)
 
     def axis(self, block_id: int) -> LogicalTaskAxis | None:
         return next((axis for axis in self.axes if axis.block_id == block_id), None)
@@ -232,22 +211,34 @@ class UniformTaskPartition:
     may participate while an unrelated producer suffix executes normally.
     """
 
-    producer_axis_order: tuple[int, ...]
-    consumer_axis_order: tuple[int, ...]
-    producer_tasks: int
-    consumer_tasks: int
-    fanin: int
     outer_axes: tuple[UniformTaskPartitionAxis, ...]
     partition_producer_block_id: int
     partition_consumer_block_id: int
     partition_consumer_stride: int
     segments: tuple[UniformTaskPartitionSegment, ...]
-    producer_task_segments: tuple[UniformTaskPartitionSegment, ...]
     producer_key_by_task: tuple[int | None, ...]
 
     @property
+    def producer_tasks(self) -> int:
+        return len(self.producer_key_by_task)
+
+    @property
+    def consumer_tasks(self) -> int:
+        return (
+            max(
+                (key for key in self.producer_key_by_task if key is not None),
+                default=-1,
+            )
+            + 1
+        )
+
+    @property
+    def fanin(self) -> int:
+        return self.participating_producer_tasks // self.consumer_tasks
+
+    @property
     def participating_producer_tasks(self) -> int:
-        return self.consumer_tasks * self.fanin
+        return sum(key is not None for key in self.producer_key_by_task)
 
     @property
     def covers_producer_domain(self) -> bool:
@@ -318,7 +309,6 @@ class CrossLoopDependencyEdge:
 class CrossLoopDependencyPlan:
     """Allocation-derived dependencies and their strongest proven readiness."""
 
-    task_families: tuple[TaskFamily, ...]
     accesses: tuple[CrossLoopAccess, ...]
     edges: tuple[CrossLoopDependencyEdge, ...]
     events: tuple[EventSpec, ...]
@@ -518,28 +508,6 @@ def prove_uniform_task_partition(
     ]
     if len(participating_ids) != participating_producer_tasks:
         return None
-    producer_task_segments: list[UniformTaskPartitionSegment] = []
-    segment_begin = participating_ids[0]
-    previous_task = segment_begin
-    for producer_task in participating_ids[1:]:
-        if producer_task == previous_task + 1:
-            previous_task = producer_task
-            continue
-        producer_task_segments.append(
-            UniformTaskPartitionSegment(
-                begin=segment_begin,
-                length=previous_task - segment_begin + 1,
-            )
-        )
-        segment_begin = producer_task
-        previous_task = producer_task
-    producer_task_segments.append(
-        UniformTaskPartitionSegment(
-            begin=segment_begin,
-            length=previous_task - segment_begin + 1,
-        )
-    )
-
     producer_coordinates_by_task = [
         task_coordinates(task, producer_axis_order, producer_axis_counts)
         for task in range(producer_tasks)
@@ -670,17 +638,11 @@ def prove_uniform_task_partition(
         )
     )
     return UniformTaskPartition(
-        producer_axis_order=producer_axis_order,
-        consumer_axis_order=consumer_axis_order,
-        producer_tasks=producer_tasks,
-        consumer_tasks=consumer_tasks,
-        fanin=fanin,
         outer_axes=tuple(outer_axes),
         partition_producer_block_id=partition_producer_block_id,
         partition_consumer_block_id=partition_consumer_block_id,
         partition_consumer_stride=partition_consumer_stride,
         segments=tuple(segments),
-        producer_task_segments=tuple(producer_task_segments),
         producer_key_by_task=tuple(owner_by_producer),
     )
 
@@ -1034,8 +996,6 @@ def build_cross_loop_dependency_plan(
             raise TypeError("grid_block_ids or task_families must be provided")
         task_families = tuple(
             TaskFamily(
-                root=root,
-                graph_id=None,
                 axes=tuple(
                     LogicalTaskAxis(
                         block_id=block_id,
@@ -1047,7 +1007,7 @@ def build_cross_loop_dependency_plan(
                     for block_id in block_ids
                 ),
             )
-            for root, block_ids in enumerate(grid_block_ids)
+            for block_ids in grid_block_ids
         )
     elif grid_block_ids is not None and tuple(
         tuple(block_ids) for block_ids in grid_block_ids
@@ -1269,7 +1229,6 @@ def build_cross_loop_dependency_plan(
 
     events, waits = _build_event_plan(tuple(edges), grid_block_ids)
     return CrossLoopDependencyPlan(
-        task_families=task_families,
         accesses=accesses,
         edges=tuple(edges),
         events=events,

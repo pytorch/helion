@@ -110,8 +110,8 @@ class CrossRootDeviceValue(BaseError):
     )
 
 
-class TileDependencyScheduleError(BaseError):
-    message = "TileDependencySchedule cannot safely lower dependency {0}."
+class CrossLoopSchedulingError(BaseError):
+    message = "Cross-loop scheduling cannot safely lower dependency {0}."
 
 
 class TopLevelStatementBetweenLoops(BaseError):

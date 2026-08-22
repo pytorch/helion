@@ -32,9 +32,10 @@ counted last-arrival actions, and readiness frontiers. There is no model-name,
 root-number, or flattened-task-ID matcher in that path; the custom partitioned
 attention scheduler has been deleted.
 
-Fresh cache-bypassed B200 measurements are 76.09 microseconds for Qwen versus
-86.27 microseconds for its separate-kernel baseline, and 74.09 microseconds for
-the tuned Gemma sliding non-shared layer versus 78.87 microseconds separately.
+Fresh cache-bypassed B200 measurements after the cleanup are 76.48 microseconds
+for Qwen versus 86.20 microseconds for its separate-kernel baseline, and 75.15
+microseconds for the tuned Gemma sliding non-shared layer versus 78.62
+microseconds separately.
 The Qwen kernel uses 251 registers, no spills, and 17,408 bytes of shared
 memory. The Gemma kernel uses 204 registers, no spills, and 34,816 bytes of
 shared memory. Qwen also matches the retained custom scheduler within noise:
@@ -44,13 +45,16 @@ The main dependency-IR migration is complete. Dynamic task counts use the
 existing cooperative phase fallback, while large static task domains are
 planned without a task-product cutoff: region-derived ready groups use a
 sorted allocation-interval sweep rather than a producer-by-consumer Cartesian
-scan. Remaining work is validation and cleanup: broaden shape coverage,
-replace the fixed-range frontier tuning domain if the autotuner API permits it,
-and keep one-wave reduction replication clearly separate from dependency
-scheduling. Gemma's shared-KV variants remain a root-codegen/resource-envelope
-problem: their current fused kernels use roughly 70 KiB of shared memory and
-support only two resident CTAs per SM, so no legal FFN frontier fits. Do not
-add dependency-scheduler cases to disguise that limitation.
+scan. The public opt-in schedule object is gone; dependent roots are detected
+automatically, and `tile_dependency_frontier` is an ordinary `Config` field.
+Its search bound is derived from potential frontier stream axes and their
+minimum legal block sizes rather than a fixed candidate limit. Remaining work
+is broader shape validation and keeping one-wave reduction replication clearly
+separate from dependency scheduling. Gemma's shared-KV variants remain a
+root-codegen/resource-envelope problem: their current fused kernels use roughly
+70 KiB of shared memory and support only two resident CTAs per SM, so no legal
+FFN frontier fits. Do not add dependency-scheduler cases to disguise that
+limitation.
 
 ### Holistic keyed-event refactor
 
@@ -1289,12 +1293,12 @@ Remaining, in order:
    solver without a second demonstrated need. Specialized scalar quotient task
    extents, including Gemma's natural `q_heads // kv_heads`, are already
    preserved.
-3. Retain the provisional bounded frontier-index fragment for now. The current
-   fragment API is fixed when `ConfigSpec` is built, while the exact legal
-   candidate count depends on the selected block sizes and is known only during
-   lowering. Invalid indices already fail as invalid configurations. Revisit a
-   dependent fragment only as a general autotuner capability; do not couple
-   schedule discovery back into DeviceIR construction for this feature alone.
+3. The frontier index is now a normal autotuner field whose finite upper bound
+   is derived from the potential stream axes and their minimum legal block
+   sizes. The exact per-configuration candidate count remains authoritative;
+   out-of-range points are rejected as invalid configurations. A future
+   dependent-fragment API may remove those invalid points from the search space,
+   but no scheduler-specific hardcoded limit remains.
 4. Expand full-layer shape testing and rerun Qwen/Gemma correctness and
    performance on uncontended GPUs after each structural deletion gate.
 5. Continue broadening the compact relation representation only when a real
@@ -2009,7 +2013,48 @@ Open, to be answered with implementation evidence:
   allocation history loses the fact that V remains defined by the projection
   root. A temporary conservative pass-through wait preserves correctness but
   is explicitly a deletion target, not the final design.
-- Adopted the holistic keyed-event refactor above. The next implementation
-  step is multi-contributor event IR plus region-aware reaching definitions,
-  followed by reconstruction of the Qwen attention pipeline and deletion of
-  `_match_partitioned_dependency_pipeline`.
+- Adopted the holistic keyed-event refactor above. Multi-contributor event IR
+  and region-aware reaching definitions now reconstruct the Qwen attention
+  pipeline from the dependency graph; the old partitioned-attention matcher
+  and its separate lowering have been deleted.
+
+### 2026-08-22 cleanup
+
+- Removed the public `TileDependencySchedule` opt-in and its resolved-schedule
+  mirror. Multi-root dependencies are now detected from DeviceIR allocation
+  facts, and source-order phase boundaries are installed directly.
+- Promoted `tile_dependency_frontier` to an ordinary `Config`/autotuner field.
+  Its search bound is derived from the actual potential stream axes; the former
+  fixed maximum of 63 has been deleted.
+- Collapsed worker epochs, exact task epochs, counted events, access cohorts,
+  singleton completion, root completion, and reduction-fanout bookkeeping into
+  one cache-line-aligned persistent event-state allocation. Logical event kinds
+  retain distinct offsets, but the launcher now receives one state tensor.
+- Canonicalized singleton completion onto the same root-completion event state.
+  A singleton is simply a root with one active contributor, not a separate
+  synchronization protocol.
+- Removed duplicate ownership from `TaskFamily`, `InstantiatedTaskFamily`,
+  `CrossLoopDependencyPlan`, `AccessProgramPoint`, and keyed-event mappings.
+  Source-order tuple position identifies roots; the dependency plan owns
+  accesses; and compact task-to-key segments are derived from the authoritative
+  mapping rather than stored independently.
+- Unified the three opaque-loop AST cloning/rewrite walkers behind one helper
+  while retaining structural fingerprints that prove source computation was
+  not changed.
+- Kept Triton device-function outlining. Fully splicing every helper into the
+  launch body increased Gemma registers from 204 to 230 and regressed roughly
+  74.0 to 77.3 microseconds. Keeping only explicitly noinline regions caused
+  Qwen to rise from 251 registers with no spills to 255 registers with 20-byte
+  spills and regress roughly 76.1 to 78.3 microseconds. These helpers remain
+  internal to one launched kernel and are a register-lifetime boundary, not a
+  separate-kernel schedule.
+- The cleanup removes 238 net production lines relative to the preceding
+  keyed-event commit. Current production code remains about 7,001 net lines
+  above `main`; halving that safely would require deleting substantive
+  dependency proofs or the still-performance-critical reduction-replication
+  path rather than merely consolidating abstractions.
+- Final focused validation passes 77 tests, 4 expected skips, and 13 subtests.
+  The unified event state preserves 251 registers/no spills for Qwen and 204
+  registers/no spills for Gemma. Adjacent cache-bypassed B200 runs measured
+  76.38 versus 76.40 microseconds for Qwen and 74.94 versus 75.10 microseconds
+  for Gemma before/after the state-layout change, within measurement noise.

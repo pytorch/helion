@@ -373,18 +373,18 @@ class DeviceFunction:
         # epoch-scaled tile-dependency counters). The Triton launcher allocates it
         # once per kernel/device/stream and appends it to the kernel arguments.
         self.triton_persistent_state_args: list[str] = []
-        self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
+        self.triton_persistent_state_specs: list[tuple[str, str, str]] = []
         # Cross-grid polling is deadlock-free only when the schedule's required
         # worker cohort can be resident together.  The launcher validates this
         # after Triton has produced exact register/shared-memory metadata.
         self.triton_minimum_resident_programs: str | None = None
         # Opaque tile bodies can be outlined behind Triton helper boundaries.
-        # Triton inlines these helpers, so the boundary carries no device-call
-        # ABI and leaves each body's computation unchanged.
-        self.triton_noinline_helpers: list[
+        # Most helpers are inlined; selected scheduling regions remain
+        # ``noinline`` to bound register lifetimes in the fused kernel.
+        self.triton_outlined_helpers: list[
             tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
         ] = []
-        self.triton_noinline_helper_constexprs: dict[str, int] = {}
+        self.triton_outlined_helper_constexprs: dict[str, int] = {}
         # Task-coordinate expressions available at access-local cross-loop wait
         # sites. ``None`` means the same access was emitted in incompatible
         # coordinate scopes and must use root-completion scheduling.
@@ -1218,7 +1218,7 @@ class DeviceFunction:
         name = self.namespace.create_name(helper_graph_info.name, None)
         self.helper_manager.register_helper_function(helper_graph_info, name)
 
-    def register_triton_noinline_helper(
+    def register_triton_outlined_helper(
         self,
         name_hint: str,
         body: list[ast.stmt],
@@ -1228,7 +1228,7 @@ class DeviceFunction:
     ) -> tuple[str, tuple[str, ...]]:
         """Outline an opaque body without changing its computation AST."""
         if CompileEnvironment.current().backend_name != "triton":
-            raise AssertionError("Triton noinline helpers require the Triton backend")
+            raise AssertionError("outlined Triton helpers require the Triton backend")
         cloned_body = cast("list[ast.stmt]", _clone_extended_ast(body))
         if tuple(
             ast.dump(statement, include_attributes=False) for statement in cloned_body
@@ -1247,7 +1247,7 @@ class DeviceFunction:
             for node in ast.walk(statement)
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         }
-        helper_names = {name for name, _, _, _ in self.triton_noinline_helpers}
+        helper_names = {name for name, _, _, _ in self.triton_outlined_helpers}
         environment = CompileEnvironment.current()
         for name in reads:
             if not name.startswith("_BLOCK_SIZE_"):
@@ -1256,7 +1256,7 @@ class DeviceFunction:
             if not suffix.isdigit():
                 continue
             block_id = int(suffix)
-            self.triton_noinline_helper_constexprs[name] = int(
+            self.triton_outlined_helper_constexprs[name] = int(
                 environment.block_sizes[block_id].from_config_assert(self.config)
             )
         argument_names = [
@@ -1290,6 +1290,10 @@ class DeviceFunction:
             for name in extra_argument_names
             if name in reads and name not in argument_names
         )
+        # Ready actions can create an outlined child before their enclosing
+        # scheduled helper exists. Capture those compiler-owned parent locals
+        # by namespace; ordinary source names must still enter through the
+        # kernel, preamble, or explicit generated ABI above.
         argument_names.extend(
             name
             for name in sorted(reads)
@@ -1299,7 +1303,7 @@ class DeviceFunction:
             and name not in argument_names
         )
         helper_name = self.namespace.create_name(name_hint, None)
-        self.triton_noinline_helpers.append(
+        self.triton_outlined_helpers.append(
             (helper_name, tuple(argument_names), tuple(cloned_body), noinline)
         )
         return helper_name, tuple(argument_names)
@@ -1315,13 +1319,13 @@ class DeviceFunction:
         }
         helpers = [
             statement_from_string(f"{name} = tl.constexpr({value})")
-            for name, value in self.triton_noinline_helper_constexprs.items()
+            for name, value in self.triton_outlined_helper_constexprs.items()
             if name not in existing_module_assignments
         ]
         helpers.extend(self.helper_manager.codegen_helper_functions())
         renames = {name: values[0] for name, values in self._variable_renames.items()}
         argument_by_name = {argument.name: argument for argument in self.arguments}
-        for name, argument_names, body, noinline in self.triton_noinline_helpers:
+        for name, argument_names, body, noinline in self.triton_outlined_helpers:
             arguments: list[ast.arg] = []
             for argument_name in argument_names:
                 argument = argument_by_name.get(argument_name)

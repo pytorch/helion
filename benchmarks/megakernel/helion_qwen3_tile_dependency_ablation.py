@@ -10,7 +10,6 @@ import types
 
 import torch
 
-import helion
 from helion._compiler import tile_dependency_planner
 
 # The original comparison probe was superseded by the production persistent
@@ -60,14 +59,6 @@ def main() -> None:
         )
 
     import helion_qwen3_tile_dependency as probe
-
-    # Attach the new opt-in policy to a fresh Kernel while preserving the
-    # existing probe module and generated Helion source verbatim.
-    probe.qwen3_layer_tile_dependency = helion.kernel(
-        static_shapes=True,
-        autotune_effort="none",
-        tile_dependency_schedule=helion.TileDependencySchedule(),
-    )(probe.qwen3_layer_tile_dependency.fn)
 
     sys.argv = [sys.argv[0], *remaining]
     if not args.strict_validation:

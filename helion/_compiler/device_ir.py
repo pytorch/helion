@@ -53,6 +53,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .host_function import HostFunction
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
@@ -90,12 +91,10 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
-    from ..runtime.tile_dependency import TileDependencySchedule
     from .cross_loop_dependencies import CrossLoopAccess
     from .cross_loop_dependencies import CrossLoopDependencyPlan
     from .cross_loop_dependencies import TaskFamily
     from .cute.layout import CuTeGridExecutionPlan
-    from .tile_dependency_schedule import ResolvedTileDependencySchedule
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -794,8 +793,7 @@ class DeviceIR:
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
-        self.tile_dependency_schedule: ResolvedTileDependencySchedule | None = None
-        self.cross_loop_accesses: tuple[CrossLoopAccess, ...] = ()
+        self.implicit_dependency_starts: frozenset[int] = frozenset()
         self.cross_loop_dependency_plan: CrossLoopDependencyPlan | None = None
         self.task_families: list[TaskFamily] = []
         self.grid_block_ids: list[list[int]] = []
@@ -3191,8 +3189,6 @@ class WalkHostAST(NodeVisitor):
             env = CompileEnvironment.current()
             self.device_ir.task_families.append(
                 TaskFamily(
-                    root=self.root_index,
-                    graph_id=self.device_ir.root_ids[-1],
                     axes=tuple(
                         LogicalTaskAxis(
                             block_id=block_id,
@@ -3962,17 +3958,46 @@ def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
     return tuple(result)
 
 
-def _install_resolved_phases(
+def _install_dependency_phases(
     device_ir: DeviceIR,
     root_nodes: list[ast.For],
-    schedule: ResolvedTileDependencySchedule,
+    dependency_plan: CrossLoopDependencyPlan,
+    source_phase_starts: frozenset[int],
 ) -> None:
+    if dependency_plan.edges and source_phase_starts:
+        raise exc.CrossLoopSchedulingError(
+            "mixing explicit hl.barrier() phases with implicit "
+            "tile-dependency stages is not supported yet"
+        )
+
+    predecessors_by_consumer: list[list[int]] = [[] for _ in device_ir.task_families]
+    for edge in dependency_plan.edges:
+        predecessors_by_consumer[edge.consumer_root].append(edge.producer_root)
+    stage_by_root: list[int] = []
+    implicit_starts: set[int] = set()
+    stage = 0
+    for root in range(len(device_ir.task_families)):
+        if root in source_phase_starts:
+            stage += 1
+        if any(
+            stage_by_root[producer] == stage
+            for producer in predecessors_by_consumer[root]
+        ):
+            implicit_starts.add(root)
+            stage += 1
+        stage_by_root.append(stage)
+
+    device_ir.implicit_dependency_starts = frozenset(implicit_starts)
+    stage_count = stage_by_root[-1] + 1 if stage_by_root else 0
+    roots_by_stage = [[] for _ in range(stage_count)]
+    for root, root_stage in enumerate(stage_by_root):
+        roots_by_stage[root_stage].append(root)
     device_ir.phases = [
         KernelPhase(
-            roots=list(stage.roots),
-            root_nodes=[root_nodes[root] for root in stage.roots],
+            roots=roots,
+            root_nodes=[root_nodes[root] for root in roots],
         )
-        for stage in schedule.stages
+        for roots in roots_by_stage
     ]
     for phase_index, phase in enumerate(device_ir.phases):
         for root in phase.roots:
@@ -3981,11 +4006,27 @@ def _install_resolved_phases(
             graph_info.phase_index = phase_index
 
 
-def lower_to_device_ir(
-    func: HostFunction,
-    *,
-    tile_dependency_policy: TileDependencySchedule | None = None,
-) -> DeviceIR:
+def _maximum_axis_task_count(config_spec: ConfigSpec, block_id: int) -> int:
+    """Upper-bound one axis's task count across its legal block sizes."""
+    env = CompileEnvironment.current()
+    block_info = env.block_sizes[block_id]
+    try:
+        block_spec = config_spec.block_sizes.block_id_lookup(
+            env.canonical_block_id(block_id)
+        )
+        minimum_block = block_spec.min_size
+    except KeyError:
+        source = block_info.block_size_source
+        minimum_block = (
+            env.size_hint(source.value)
+            if isinstance(source, FixedBlockSizeSource)
+            else 1
+        )
+    extent = block_info.size_hint()
+    return (extent + minimum_block - 1) // minimum_block
+
+
+def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
     with func, device_ir, compile_lock:
@@ -4212,21 +4253,8 @@ def lower_to_device_ir(
             cross_loop_accesses,
         ) = _collect_memory_op_facts(device_ir)
         config_spec.memory_op_facts = memory_op_facts
-        device_ir.cross_loop_accesses = cross_loop_accesses
         from .cross_loop_dependencies import build_cross_loop_dependency_plan
-        from .tile_dependency_schedule import resolve_tile_dependency_schedule
 
-        access_ids_by_root: list[list[int]] = [[] for _ in device_ir.task_families]
-        for access in cross_loop_accesses:
-            if 0 <= access.root < len(access_ids_by_root):
-                access_ids_by_root[access.root].append(access.access_id)
-        device_ir.task_families = [
-            dataclasses.replace(
-                family,
-                access_ids=tuple(access_ids_by_root[family.root]),
-            )
-            for family in device_ir.task_families
-        ]
         if len(device_ir.task_families) > 1:
             device_ir.cross_loop_dependency_plan = build_cross_loop_dependency_plan(
                 cross_loop_accesses,
@@ -4236,39 +4264,45 @@ def lower_to_device_ir(
                     device_ir.noncanonical_task_origin_block_ids
                 ),
             )
-            schedule = resolve_tile_dependency_schedule(
+            _install_dependency_phases(
+                device_ir,
+                visitor.root_nodes,
                 device_ir.cross_loop_dependency_plan,
-                tile_dependency_policy,
-                source_phase_starts=source_phase_starts,
+                source_phase_starts,
             )
-            device_ir.tile_dependency_schedule = schedule
-            if schedule.uses_tile_dependency_counters:
+            if device_ir.implicit_dependency_starts:
                 from ..autotuner.config_fragment import IntegerFragment
                 from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_CONFIG
                 from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_DEFAULT
-                from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_MAX_INDEX
-                from .tile_dependency_planner import has_potential_readiness_frontier
+                from .tile_dependency_planner import (
+                    potential_readiness_frontier_stream_axes,
+                )
 
-                if has_potential_readiness_frontier(
-                    device_ir.cross_loop_dependency_plan
-                ):
+                frontier_stream_axes = potential_readiness_frontier_stream_axes(
+                    device_ir.cross_loop_dependency_plan,
+                    tuple(device_ir.task_families),
+                )
+                if frontier_stream_axes:
                     if (
                         TILE_DEPENDENCY_FRONTIER_CONFIG
                         in config_spec.user_defined_tunables
                     ):
-                        raise exc.TileDependencyScheduleError(
+                        raise exc.CrossLoopSchedulingError(
                             f"{TILE_DEPENDENCY_FRONTIER_CONFIG!r} is reserved for "
                             "compiler-derived tile-dependency scheduling"
                         )
+                    max_frontier_index = max(
+                        _maximum_axis_task_count(config_spec, block_id) - 1
+                        for block_id in frontier_stream_axes
+                    )
                     config_spec.user_defined_tunables[
                         TILE_DEPENDENCY_FRONTIER_CONFIG
                     ] = IntegerFragment(
                         -1,
-                        TILE_DEPENDENCY_FRONTIER_MAX_INDEX,
+                        max_frontier_index,
                         default_val=TILE_DEPENDENCY_FRONTIER_DEFAULT,
                     )
-            _install_resolved_phases(device_ir, visitor.root_nodes, schedule)
-            if schedule.implicit_stage_starts:
+            if device_ir.implicit_dependency_starts:
                 if (
                     CompileEnvironment.current().backend_name != "triton"
                     or torch.version.hip is not None
@@ -4276,7 +4310,7 @@ def lower_to_device_ir(
                     edge = next(
                         edge
                         for edge in device_ir.cross_loop_dependency_plan.edges
-                        if edge.consumer_root in schedule.implicit_stage_starts
+                        if edge.consumer_root in device_ir.implicit_dependency_starts
                     )
                     names = sorted(edge.tensor_names)
                     raise exc.LoopDependencyError(

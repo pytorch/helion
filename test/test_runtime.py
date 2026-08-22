@@ -100,21 +100,18 @@ class TestPersistentTritonState(unittest.TestCase):
     def test_is_retained_and_namespaced_by_launch_configuration(self) -> None:
         kernel = SimpleNamespace()
         like = torch.empty(1, device="cuda")
-        namespace = ((1,), 1, 2, None, False, (), ((8, torch.uint32, True),))
-        state = _get_persistent_state(kernel, like, namespace, 0, 8, torch.uint32, True)
+        namespace = ((1,), 1, 2, None, False, (), ((8, torch.uint32),))
+        state = _get_persistent_state(kernel, like, namespace, 0, 8, torch.uint32)
         state.fill_(7)
 
-        retained = _get_persistent_state(
-            kernel, like, namespace, 0, 8, torch.uint32, True
-        )
+        retained = _get_persistent_state(kernel, like, namespace, 0, 8, torch.uint32)
         independent = _get_persistent_state(
             kernel,
             like,
-            (*namespace[:-1], ((16, torch.uint32, True),)),
+            (*namespace[:-1], ((16, torch.uint32),)),
             0,
             16,
             torch.uint32,
-            True,
         )
 
         self.assertEqual(retained.data_ptr(), state.data_ptr())
