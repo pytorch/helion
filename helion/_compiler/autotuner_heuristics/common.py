@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
 
 HardwareTarget = tuple[str, str | None]
+NamedHardwareTarget = tuple[str, str, str | None]
 
 # Reduction op name tokens used to detect a reduction in a traced graph. Shared
 # by the Triton split/join heuristic and the LLM workload-trait detection.
@@ -71,7 +72,7 @@ def matches_hardware(
     env: CompileEnvironment,
     targets: tuple[HardwareTarget, ...] | None,
     *,
-    hardware_names: frozenset[str] | None = None,
+    named_targets: frozenset[NamedHardwareTarget] | None = None,
 ) -> bool:
     from ..._argument_device import _canonicalize_argument_device
     from ..._hardware import get_hardware_info
@@ -87,7 +88,21 @@ def matches_hardware(
         hardware = get_hardware_info(_canonicalize_argument_device(env.device))
     except RuntimeError:
         return False
-    if hardware_names is not None and hardware.hardware_name not in hardware_names:
+    if (
+        named_targets is not None
+        and (
+            hardware.device_kind,
+            hardware.hardware_name,
+            hardware.compute_capability,
+        )
+        not in named_targets
+        and (
+            hardware.device_kind,
+            hardware.hardware_name,
+            None,
+        )
+        not in named_targets
+    ):
         return False
     return targets is None or (
         (hardware.device_kind, hardware.compute_capability) in targets

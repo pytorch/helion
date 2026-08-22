@@ -91,8 +91,12 @@ def get_heuristics(backend: str) -> tuple[AutotunerHeuristicType, ...]:
     return HEURISTICS_BY_BACKEND.get(backend, ())
 
 
-_PromotionRegistryState = tuple[tuple[str, bool, frozenset[str]], ...]
-_PromotionRegistrySignature = tuple[tuple[str, frozenset[str]], ...]
+_PromotionRegistryState = tuple[
+    tuple[str, bool, frozenset[tuple[str, str, str | None]]], ...
+]
+_PromotionRegistrySignature = tuple[
+    tuple[str, frozenset[tuple[str, str, str | None]]], ...
+]
 
 
 def _promotion_registry_state(
@@ -108,7 +112,7 @@ def _promotion_registry_state(
         (
             heuristic.name,
             heuristic.promote_seed_to_default,
-            frozenset(heuristic.PROMOTE_HARDWARE_NAMES or ()),
+            frozenset(heuristic.PROMOTE_NAMED_TARGETS or ()),
         )
         for heuristic in heuristics
     )
@@ -118,26 +122,32 @@ def _promotion_registry_state(
 def _promotion_registry_signature(
     registry_state: _PromotionRegistryState,
 ) -> _PromotionRegistrySignature:
-    """Return the immutable exact-name gate signature for one registry entry."""
+    """Return the immutable exact-target gate signature for one registry entry."""
     return tuple(
-        (heuristic_name, hardware_names)
-        for heuristic_name, promote_seed_to_default, hardware_names in registry_state
-        if promote_seed_to_default and hardware_names
+        (heuristic_name, named_targets)
+        for heuristic_name, promote_seed_to_default, named_targets in registry_state
+        if promote_seed_to_default and named_targets
     )
 
 
 @functools.cache
 def _promotion_key_from_identity(
-    hardware_name: str | None,
+    hardware_identity: tuple[str, str, str | None] | None,
     registry_signature: _PromotionRegistrySignature,
 ) -> tuple[tuple[str, str | None], ...]:
     """Map pure promotion-relevant identity to the bound-kernel cache key."""
     return tuple(
         (
             heuristic_name,
-            hardware_name if hardware_name in hardware_names else None,
+            hardware_identity[1]
+            if hardware_identity is not None
+            and (
+                hardware_identity in named_targets
+                or (*hardware_identity[:2], None) in named_targets
+            )
+            else None,
         )
-        for heuristic_name, hardware_names in registry_signature
+        for heuristic_name, named_targets in registry_signature
     )
 
 
@@ -145,10 +155,10 @@ def compiler_promotion_specialization_key(
     backend: str,
     device: torch.device,
 ) -> tuple[tuple[str, str | None], ...]:
-    """Return exact-name facts that can change a promoted compiler default.
+    """Return named-target facts that can change a promoted compiler default.
 
     Compute capability is already part of the bound-kernel specialization key.
-    Only heuristics with an additional exact-name promotion fence need more
+    Only heuristics with an additional named-target promotion fence need more
     device identity.  Non-matching products share the ``None`` bucket because
     they all decline that promotion; capability-only heuristics add no key at
     all. Registry analysis and result construction are cached from immutable
@@ -165,13 +175,16 @@ def compiler_promotion_specialization_key(
     from ..._hardware import get_hardware_info
 
     try:
-        hardware_name = get_hardware_info(
-            _canonicalize_argument_device(device)
-        ).hardware_name
+        hardware = get_hardware_info(_canonicalize_argument_device(device))
+        hardware_identity = (
+            hardware.device_kind,
+            hardware.hardware_name,
+            hardware.compute_capability,
+        )
     except RuntimeError:
-        hardware_name = None
+        hardware_identity = None
     return _promotion_key_from_identity(
-        hardware_name,
+        hardware_identity,
         registry_signature,
     )
 

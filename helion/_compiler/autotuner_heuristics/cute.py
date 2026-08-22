@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Literal
 from typing import cast
 
 import torch
@@ -10,6 +9,10 @@ import torch
 from ...runtime.config import Config
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
+from ..cute.grouped_worklist_policy import GroupedBMajor
+from ..cute.grouped_worklist_policy import GroupedWorklistHardwareIdentity
+from ..cute.grouped_worklist_policy import get_grouped_worklist_target_policy
+from ..cute.grouped_worklist_policy import grouped_worklist_target_identities
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
@@ -680,12 +683,17 @@ def _tcgen05_grouped_seed_config(bk: int) -> Config:
     return config
 
 
-GroupedBMajor = Literal["k", "n"]
-
 _TCGEN05_GROUPED_B200_REFERENCE_NUM_SMS = 148
 _TCGEN05_GROUPED_B200_LOW_RESERVED_SMS = 32
 _TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS = 52
 _TCGEN05_GROUPED_B200_PANEL_RESERVED_SMS = 20
+_TCGEN05_GROUPED_TARGET_IDENTITIES = grouped_worklist_target_identities()
+_TCGEN05_GROUPED_TARGET_CAPABILITIES = frozenset(
+    identity[2] for identity in _TCGEN05_GROUPED_TARGET_IDENTITIES
+)
+# The bound-kernel key already carries device kind and capability. Registering
+# every policy identity as a named promotion target adds the exact product name,
+# so two products on the same architecture cannot reuse different ranked seeds.
 # These measurements rank the initial seed population only. Other SM counts are
 # scaled proportionally, and live autotuning remains authoritative.
 
@@ -807,6 +815,41 @@ def _tcgen05_grouped_worklist_config(
     )
 
 
+def _tcgen05_grouped_worklist_target_seed(
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    source_m_tile: int,
+    source_tiles: int,
+    num_sm: int,
+    target_hardware_identity: GroupedWorklistHardwareIdentity | None,
+    clc_ready: bool,
+) -> Config | None:
+    tuning = get_grouped_worklist_target_policy(target_hardware_identity).tuning_for(
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        source_m_tile=source_m_tile,
+        source_tiles=source_tiles,
+        num_sm=num_sm,
+    )
+    if tuning is None or (tuning.clc and not clc_ready):
+        return None
+    return _tcgen05_grouped_worklist_config(
+        source_m_tile,
+        tuning.block_k,
+        tuning.ab_stages,
+        tuning.consumer_regs,
+        runtime_direct=tuning.runtime_direct,
+        l2_swizzle_size=tuning.l2_swizzle_size,
+        reserved_sms=tuning.reserved_sms,
+        clc=tuning.clc,
+    )
+
+
 def tcgen05_grouped_worklist_config_keys() -> frozenset[str]:
     """Return the exhaustive grouped-worklist compiler-seed schema."""
     return _TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS
@@ -862,6 +905,7 @@ def tcgen05_grouped_worklist_seed_configs(
     b_major: GroupedBMajor,
     source_m_tile: int,
     num_sm: int,
+    target_hardware_identity: GroupedWorklistHardwareIdentity | None = None,
 ) -> list[Config]:
     """Build ranked, tile-compatible grouped-worklist compiler seeds."""
     if any(
@@ -876,11 +920,31 @@ def tcgen05_grouped_worklist_seed_configs(
     if packed_m % source_m_tile != 0:
         raise ValueError("packed M extent must be divisible by source_m_tile")
 
+    source_tiles = packed_m // source_m_tile
+    logical_n_per_cluster = (
+        128 if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE else 256
+    )
+    work_clusters = source_tiles * (
+        (n + logical_n_per_cluster - 1) // logical_n_per_cluster
+    )
+    clc_ready = (
+        source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+        and n % 256 == 0
+        and num_sm <= work_clusters <= TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
+    )
+    target_seed = _tcgen05_grouped_worklist_target_seed(
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        source_m_tile=source_m_tile,
+        source_tiles=source_tiles,
+        num_sm=num_sm,
+        target_hardware_identity=target_hardware_identity,
+        clc_ready=clc_ready,
+    )
+
     if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
-        logical_n_per_cluster = 128
-        work_clusters = (packed_m // source_m_tile) * (
-            (n + logical_n_per_cluster - 1) // logical_n_per_cluster
-        )
         preferred_reservation, alternate_reservation = (
             _tcgen05_grouped_small_m_reserved_sms(
                 groups=groups,
@@ -953,11 +1017,14 @@ def tcgen05_grouped_worklist_seed_configs(
             primary = bk64["direct"]
         else:
             primary = bk128["preferred_reserved"]
+        if target_seed is not None:
+            primary = target_seed
         return dedupe_configs([primary, *bk128.values(), *bk64.values()])
 
     if source_m_tile == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT:
-        # Source-224 keeps the reviewed panel-8 direct config as its deterministic
-        # primary; the remaining mailbox/BK128 variants are fallback seeds.
+        # Source-224 normally keeps the reviewed panel-8 direct config as its
+        # deterministic primary; target policy may replace it only for an
+        # exact measured workload.
         panel8_direct = _tcgen05_grouped_worklist_config(
             source_m_tile,
             64,
@@ -972,14 +1039,19 @@ def tcgen05_grouped_worklist_seed_configs(
             for ab_stages in range(7, 3, -1)
         }
         bk128_direct = _tcgen05_grouped_worklist_config(source_m_tile, 128, 3, 240)
+        if target_seed is not None:
+            return dedupe_configs(
+                [
+                    target_seed,
+                    panel8_direct,
+                    *mailbox_by_ab_stages.values(),
+                    bk128_direct,
+                ]
+            )
         return dedupe_configs(
             [panel8_direct, *mailbox_by_ab_stages.values(), bk128_direct]
         )
 
-    logical_n_per_cluster = 256
-    work_clusters = (packed_m // source_m_tile) * (
-        (n + logical_n_per_cluster - 1) // logical_n_per_cluster
-    )
     bk128 = {
         "mailbox": _tcgen05_grouped_worklist_config(
             source_m_tile, 128, 3, 240, runtime_direct=False
@@ -1030,9 +1102,11 @@ def tcgen05_grouped_worklist_seed_configs(
     # Ranking-only splits fitted from the reviewed B200 source-256 cases:
     # 16 groups marks high fan-out, N/K=2 and 9/4 are aspect buckets, and
     # 8/24 tiles per group separate short, medium, and long expert waves.
-    tiles_per_group = packed_m // source_m_tile // groups
+    tiles_per_group = source_tiles // groups
     clc_ready = bool(clc_configs) and work_clusters >= num_sm
-    if groups >= 16:
+    if target_seed is not None:
+        primary = target_seed
+    elif groups >= 16:
         if k > n or n >= 9 * k // 4:
             primary = bk128["mailbox"]
         elif n >= 2 * k:
@@ -1078,14 +1152,42 @@ def _tcgen05_grouped_worklist_source_m_tile(spec: ConfigSpec) -> int | None:
     )
 
 
+def _tcgen05_grouped_worklist_hardware_identity(
+    env: CompileEnvironment,
+) -> GroupedWorklistHardwareIdentity | None:
+    """Resolve the exact policy identity, failing closed on inconsistent data."""
+    from ..._argument_device import _canonicalize_argument_device
+    from ..._hardware import get_hardware_info
+
+    try:
+        hardware = get_hardware_info(_canonicalize_argument_device(env.device))
+    except RuntimeError:
+        return None
+    capability = env.config_spec.target_device_capability
+    if (
+        capability is None
+        or hardware.compute_capability != f"sm{capability[0]}{capability[1]}"
+    ):
+        return None
+    return (
+        hardware.device_kind,
+        hardware.hardware_name,
+        hardware.compute_capability,
+    )
+
+
 class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
-    """Rank general grouped-worklist configs while preserving live tuning."""
+    """Rank grouped-worklist configs for validated Blackwell products.
+
+    The generic primary is a supported compiler default on each named target;
+    measured target policies replace it only inside their workload envelopes.
+    Live autotuning still receives the complete ranked seed set.
+    """
 
     name = "cute_tcgen05_grouped_worklist"
     backend = "cute"
     promote_seed_to_default = True
-    PROMOTE_TARGETS = (("cuda", "sm100"),)
-    PROMOTE_HARDWARE_NAMES = frozenset({"NVIDIA B200"})
+    PROMOTE_NAMED_TARGETS = _TCGEN05_GROUPED_TARGET_IDENTITIES
     CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
 
     @classmethod
@@ -1136,7 +1238,9 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             source_m_tile is None
             or fact is None
             or (fact.static_n is not None and fact.static_n % 32 != 0)
-            or spec.target_device_capability != (10, 0)
+            or spec.target_device_capability is None
+            or f"sm{spec.target_device_capability[0]}{spec.target_device_capability[1]}"
+            not in _TCGEN05_GROUPED_TARGET_CAPABILITIES
             or not _block_size_value_reachable(spec, 0, 256)
             or not _block_size_value_reachable(spec, 1, 128)
             or not any(
@@ -1192,6 +1296,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             b_major=seed_facts.b_major,
             source_m_tile=source_m_tile,
             num_sm=spec.num_sm,
+            target_hardware_identity=_tcgen05_grouped_worklist_hardware_identity(env),
         )
         if seed_facts.device_split_sizes:
             # Runtime-direct expands a host worklist. Device split-size kernels

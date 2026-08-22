@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
     from .common import HardwareTarget
+    from .common import NamedHardwareTarget
 
 
 CompilerHeuristicSpecializationFact = Literal[
@@ -32,10 +33,9 @@ class AutotunerHeuristic:
     # be offered everywhere as a search candidate but only defaulted on validated
     # arches.
     PROMOTE_TARGETS: ClassVar[tuple[HardwareTarget, ...] | None] = None
-    # Optional exact device-name fence layered on PROMOTE_TARGETS.  This is for
-    # seeds validated on one product that shares a compute capability with
-    # another (for example B200 and GB300); it never limits where a seed fires.
-    PROMOTE_HARDWARE_NAMES: ClassVar[frozenset[str] | None] = None
+    # Optional exact product targets for seeds validated on one named device.
+    # This never limits where a seed fires, only where it becomes the default.
+    PROMOTE_NAMED_TARGETS: ClassVar[frozenset[NamedHardwareTarget] | None] = None
     # Runtime facts that can change this heuristic's emitted seed configs.  The
     # bound-kernel cache adds these facts only after the heuristic actually
     # fires, so a shape- or SM-sensitive heuristic does not force unrelated
@@ -87,18 +87,17 @@ class AutotunerHeuristic:
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:
         """Whether this heuristic's seed should become the autotune-off default
-        on the current device. Gates the (possibly arch-agnostic) seed's
-        promotion to ``PROMOTE_TARGETS`` without changing where the seed fires."""
+        on the current device. Target gates do not change where the seed fires."""
         if not cls.promote_seed_to_default:
             return False
-        if cls.PROMOTE_TARGETS is None and cls.PROMOTE_HARDWARE_NAMES is None:
+        if cls.PROMOTE_TARGETS is None and cls.PROMOTE_NAMED_TARGETS is None:
             return True
         from .common import matches_hardware
 
         return matches_hardware(
             env,
             cls.PROMOTE_TARGETS,
-            hardware_names=cls.PROMOTE_HARDWARE_NAMES,
+            named_targets=cls.PROMOTE_NAMED_TARGETS,
         )
 
     @classmethod
