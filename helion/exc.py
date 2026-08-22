@@ -103,6 +103,13 @@ class LoopDependencyError(BaseError):
     )
 
 
+class CrossRootDeviceValue(BaseError):
+    message = (
+        "Device value '{0}' cannot be carried between top-level loops. "
+        "Materialize it in a tensor so the dependency can be scheduled."
+    )
+
+
 class TileDependencyScheduleError(BaseError):
     message = "TileDependencySchedule cannot safely lower dependency {0}."
 

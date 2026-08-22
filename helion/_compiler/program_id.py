@@ -31,7 +31,12 @@ from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
-from .loop_dependency_checker import TileDependencyKind
+from .tile_dependency_planner import AccessCohortPlan
+from .tile_dependency_planner import AccessProgramPoint
+from .tile_dependency_planner import InstantiatedTaskFamily
+from .tile_dependency_planner import TaskContinuationPipelinePlan
+from .tile_dependency_planner import TaskContinuationPlan
+from .tile_dependency_planner import build_generic_schedule_plan
 
 
 def typed_program_id(dim: int = 0) -> str:
@@ -73,12 +78,20 @@ def _clone_ast_value(value: object) -> object:
     if isinstance(value, tuple):
         return tuple(_clone_ast_value(item) for item in value)
     if isinstance(value, ast.AST):
+        from .cross_loop_dependencies import CROSS_LOOP_ACCESS_ID_META
+        from .cross_loop_dependencies import cross_loop_access_marker_id
+
+        access_id = cross_loop_access_marker_id(value)
         fields = {
             field: _clone_ast_value(getattr(value, field)) for field in value._fields
         }
         if isinstance(value, ExtendedAST):
-            return value.copy(**fields)
-        return ast.copy_location(type(value)(**fields), value)
+            cloned = value.copy(**fields)
+        else:
+            cloned = ast.copy_location(type(value)(**fields), value)
+        if access_id is not None:
+            setattr(cloned, CROSS_LOOP_ACCESS_ID_META, access_id)
+        return cloned
     return value
 
 
@@ -259,6 +272,130 @@ def _clone_opaque_statements_with_access_stages(
     if not scheduled:
         raise AssertionError("missing coarsened cross-loop consumer loop")
     return cloned
+
+
+_CROSS_LOOP_PROGRAM_POINT_LOOP_ID = "_cross_loop_program_point_loop_id"
+
+
+def _clone_opaque_statements_with_access_iteration_wait(
+    body: list[ast.stmt],
+    *,
+    access_ids: frozenset[int],
+    loop_id: int,
+    wait: list[ast.stmt],
+) -> list[ast.stmt]:
+    """Wait once per iteration of the loop containing related accesses."""
+    from .cross_loop_dependencies import cross_loop_access_marker_id
+
+    scheduled = False
+
+    def clone(value: object) -> object:
+        nonlocal scheduled
+        if isinstance(value, list):
+            result: list[object] = []
+            for item in value:
+                if (
+                    isinstance(item, ast.AST)
+                    and cross_loop_access_marker_id(item) is not None
+                ):
+                    continue
+                result.append(clone(item))
+            return result
+        if isinstance(value, tuple):
+            return tuple(clone(item) for item in value)
+        if not isinstance(value, ast.AST):
+            return value
+        if (
+            isinstance(value, ast.For)
+            and getattr(value, _CROSS_LOOP_PROGRAM_POINT_LOOP_ID, None) == loop_id
+        ):
+            if scheduled:
+                raise AssertionError("cross-loop program point loop is not unique")
+            present_access_ids = {
+                access_id
+                for item in ast.walk(value)
+                if (access_id := cross_loop_access_marker_id(item)) is not None
+            }
+            if not access_ids <= present_access_ids:
+                raise AssertionError(
+                    "cross-loop access markers left their program point"
+                )
+            scheduled = True
+            return _prepend_schedule_to_opaque_loop(
+                value,
+                wait,
+                force_serial_pipeline=True,
+            )
+        fields = {field: clone(getattr(value, field)) for field in value._fields}
+        if isinstance(value, ExtendedAST):
+            return value.copy(**fields)
+        return ast.copy_location(type(value)(**fields), value)
+
+    cloned = cast("list[ast.stmt]", clone(body))
+    if not scheduled:
+        raise AssertionError("missing cross-loop access program point loop")
+    return cloned
+
+
+def _collect_cross_loop_access_program_points(
+    case_bodies: list[list[ast.stmt]],
+    access_coordinates: dict[int, dict[int, str] | None],
+) -> tuple[tuple[frozenset[int], ...], dict[int, AccessProgramPoint]]:
+    """Bind explicit access markers to their lowered logical coordinates."""
+    from .cross_loop_dependencies import cross_loop_access_marker_id
+
+    available_by_root: list[set[int]] = [set() for _ in case_bodies]
+    program_points: dict[int, AccessProgramPoint] = {}
+    ambiguous_accesses: set[int] = set()
+    next_loop_id = 0
+
+    def visit(
+        value: object,
+        root: int,
+        loop_stack: tuple[int, ...],
+        root_statement_index: int,
+    ) -> None:
+        nonlocal next_loop_id
+        if isinstance(value, list | tuple):
+            for item in value:
+                visit(item, root, loop_stack, root_statement_index)
+            return
+        if not isinstance(value, ast.AST):
+            return
+        if (access_id := cross_loop_access_marker_id(value)) is not None:
+            available_by_root[root].add(access_id)
+            coordinates = access_coordinates.get(access_id)
+            point = AccessProgramPoint(
+                access_id=access_id,
+                coordinate_items=(
+                    tuple(sorted(coordinates.items()))
+                    if coordinates is not None
+                    else None
+                ),
+                loop_id=loop_stack[-1] if loop_stack else None,
+                loop_depth=len(loop_stack),
+                root_statement_index=root_statement_index,
+            )
+            if (previous := program_points.get(access_id)) is not None:
+                if previous != point:
+                    ambiguous_accesses.add(access_id)
+            else:
+                program_points[access_id] = point
+            return
+        if isinstance(value, ast.For):
+            loop_id = next_loop_id
+            next_loop_id += 1
+            setattr(value, _CROSS_LOOP_PROGRAM_POINT_LOOP_ID, loop_id)
+            loop_stack = (*loop_stack, loop_id)
+        for field in value._fields:
+            visit(getattr(value, field), root, loop_stack, root_statement_index)
+
+    for root, body in enumerate(case_bodies):
+        for root_statement_index, statement in enumerate(body):
+            visit(statement, root, (), root_statement_index)
+    for access_id in ambiguous_accesses:
+        program_points.pop(access_id, None)
+    return tuple(frozenset(ids) for ids in available_by_root), program_points
 
 
 def _clone_opaque_loop_segment(
@@ -456,8 +593,6 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 if TYPE_CHECKING:
     import sympy
 
-    from .cross_loop_dependencies import AffinePredecessorAxis
-    from .cross_loop_dependencies import UniformTaskPartition
     from .cross_loop_dependencies import WaitSpec
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
@@ -884,101 +1019,60 @@ class ForEachProgramID(ProgramIDs):
         partitioned_pipeline_plans = self._match_partitioned_dependency_pipeline(
             case_bodies, device_function
         )
-        ordered_input_plans = self._match_ordered_input_singletons(
-            singleton_roots, case_bodies, device_function
-        )
         reduction_fanout_plans = self._match_one_wave_reduction_fanouts(
             singleton_roots, case_bodies, device_function
         )
         structural_edges: set[tuple[int, int]] = set()
         for plan in partitioned_pipeline_plans.values():
             structural_edges.update(plan.covered_edges)
-        for plan in ordered_input_plans.values():
-            structural_edges.update(plan.covered_edges)
         for plan in reduction_fanout_plans.values():
             structural_edges.update(plan.covered_edges)
-        structural_roots = {root for edge in structural_edges for root in edge} | set(
-            singleton_roots
-        )
-        generic_task_edges, generic_task_waits = self._generic_task_waits(
-            excluded_roots=structural_roots,
-            task_counts=static_task_counts,
-            case_bodies=case_bodies,
-            device_function=device_function,
-        )
-        # Continuation must see the complete predecessor relation. Cohort
-        # lowering removes access-local waits only after this proof.
-        task_continuation_plans = self._task_continuation_plans(
-            generic_task_waits, device_function
-        )
-        continuation_waits = {
-            (plan.consumer_root, plan.event_id) for plan in task_continuation_plans
-        }
-        access_cohort_plans = self._access_cohort_plans(
-            generic_task_waits, device_function
-        )
-        coarsened_access_waits = {
-            (plan.consumer_root, plan.event_id, access_id)
-            for plan in access_cohort_plans
-            for access_id in plan.access_ids
-        }
-        generic_task_waits = {
-            root: tuple(
-                wait
-                for wait in waits
-                if (
-                    root,
-                    wait.event_id,
-                    wait.consumer_access_id,
-                )
-                not in coarsened_access_waits
-                and (root, wait.event_id) not in continuation_waits
-            )
-            for root, waits in generic_task_waits.items()
-        }
-        generic_task_waits = {
-            root: waits for root, waits in generic_task_waits.items() if waits
-        }
-
-        def is_ordered(
-            producer: int,
-            consumer: int,
-            edges: set[tuple[int, int]],
-        ) -> bool:
-            pending = [producer]
-            visited: set[int] = set()
-            while pending:
-                current = pending.pop()
-                if current == consumer:
-                    return True
-                if current in visited:
-                    continue
-                visited.add(current)
-                pending.extend(target for source, target in edges if source == current)
-            return False
-
+        structural_roots = {root for edge in structural_edges for root in edge}
         schedule = HostFunction.current().device_ir.tile_dependency_schedule
         assert schedule is not None and schedule.policy is not None
-        whole_value_edges: set[tuple[int, int]] = set()
-        ordered_edges = set(structural_edges)
-        for dependency in sorted(
-            schedule.unsynchronized_edges,
-            key=lambda edge: (
-                edge.consumer_root - edge.producer_root,
-                edge.producer_root,
-                edge.consumer_root,
-            ),
-        ):
-            pair = (dependency.producer_root, dependency.consumer_root)
-            if pair in generic_task_edges:
-                continue
-            if not is_ordered(*pair, ordered_edges):
-                whole_value_edges.add(pair)
-                ordered_edges.add(pair)
+        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
+        assert dependency_plan is not None
+        physical_worker_limit = CompileEnvironment.current().config_spec.num_sm * cast(
+            "int", device_function.config.get("num_sm_multiplier", 1)
+        )
+        instantiated_task_families = self._instantiated_task_families(device_function)
+        assert instantiated_task_families is not None
+        assert [family.task_count for family in instantiated_task_families] == (
+            static_task_counts
+        )
+        (
+            available_access_ids_by_root,
+            access_program_points,
+        ) = _collect_cross_loop_access_program_points(
+            case_bodies,
+            device_function.cross_loop_access_coordinates,
+        )
+        axis_geometry = {
+            block_id: geometry
+            for block_id in range(len(CompileEnvironment.current().block_sizes))
+            if (geometry := self._static_block_axis_geometry(block_id, device_function))
+            is not None
+        }
+        generic_plan = build_generic_schedule_plan(
+            dependency_plan=dependency_plan,
+            task_families=instantiated_task_families,
+            available_access_ids_by_root=available_access_ids_by_root,
+            access_program_points=access_program_points,
+            axis_geometry=axis_geometry,
+            excluded_roots=frozenset(structural_roots),
+            preordered_edges=frozenset(structural_edges),
+            physical_worker_limit=physical_worker_limit,
+        )
+        generic_task_edges = generic_plan.task_ready_edges
+        whole_value_edges = set(generic_plan.root_completion_edges)
+        generic_task_waits = generic_plan.task_waits_by_root
+        task_continuation_plans = generic_plan.continuations
+        access_cohort_plans = generic_plan.access_cohorts
+        task_continuation_pipeline_plans = generic_plan.continuation_pipelines
+
         self._validate_tile_dependency_plan_coverage(
             singleton_roots=singleton_roots,
             partitioned_pipeline_plans=partitioned_pipeline_plans,
-            ordered_input_plans=ordered_input_plans,
             reduction_fanout_plans=reduction_fanout_plans,
             task_ready_edges=generic_task_edges,
             whole_value_edges=frozenset(whole_value_edges),
@@ -988,44 +1082,10 @@ class ForEachProgramID(ProgramIDs):
             raise exc.TileDependencyScheduleError(
                 f"epoch_replicas must be a power of two, got {epoch_replicas}"
             )
-        physical_worker_limit = CompileEnvironment.current().config_spec.num_sm * cast(
-            "int", device_function.config.get("num_sm_multiplier", 1)
-        )
-        launch_worker_limit = physical_worker_limit
-        task_continuation_pipeline_plans = self._task_continuation_pipeline_plans(
-            task_continuation_plans,
-            access_cohort_plans,
-            task_counts=static_task_counts,
-            physical_worker_limit=launch_worker_limit,
-            device_function=device_function,
-        )
+        launch_worker_limit = generic_plan.worker_limit
         if task_continuation_pipeline_plans:
-            pipeline_worker_limit = max(
-                plan.worker_count for plan in task_continuation_pipeline_plans
-            )
             strategy.grid_size_expr = (
-                f"min(({strategy.grid_size_expr}), {pipeline_worker_limit})"
-            )
-            launch_worker_limit = min(launch_worker_limit, pipeline_worker_limit)
-            replacement_cohorts = {
-                plan.cohort: dataclasses.replace(
-                    plan.cohort,
-                    stage_sizes=(
-                        plan.initial_stream_tasks,
-                        sum(plan.cohort.stage_sizes) - plan.initial_stream_tasks,
-                    ),
-                )
-                for plan in task_continuation_pipeline_plans
-            }
-            access_cohort_plans = tuple(
-                replacement_cohorts.get(plan, plan) for plan in access_cohort_plans
-            )
-            task_continuation_pipeline_plans = tuple(
-                dataclasses.replace(
-                    plan,
-                    cohort=replacement_cohorts[plan.cohort],
-                )
-                for plan in task_continuation_pipeline_plans
+                f"min(({strategy.grid_size_expr}), {launch_worker_limit})"
             )
 
         def active_worker_count(root: int) -> int:
@@ -1062,15 +1122,12 @@ class ForEachProgramID(ProgramIDs):
             dtype=torch.uint32,
             zero_init=True,
         )
-        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
         task_event_roots = sorted(
             {
                 dependency_plan.event(wait.event_id).producer_root
                 for waits in generic_task_waits.values()
                 for wait in waits
             }
-            if dependency_plan is not None
-            else ()
         )
         task_event_offsets: dict[int, int] = {}
         task_event_count = 0
@@ -1099,7 +1156,9 @@ class ForEachProgramID(ProgramIDs):
             )
             access_cohort_offsets[plan] = access_cohort_counter_count
             access_cohort_counter_count += (
-                outer_count * len(plan.stage_sizes) * _TILE_DEPENDENCY_COUNTER_STRIDE
+                outer_count
+                * plan.milestone_count
+                * (1 if plan.is_per_coordinate else _TILE_DEPENDENCY_COUNTER_STRIDE)
             )
         access_cohort_arg: str | None = None
         if access_cohort_counter_count:
@@ -1182,21 +1241,6 @@ class ForEachProgramID(ProgramIDs):
                     f"{len(whole_value_epoch_roots)} * {epoch_replicas} * "
                     f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
                 ),
-                dtype=torch.uint32,
-                zero_init=True,
-            )
-
-        ordered_counter_arg: str | None = None
-        ordered_counter_offsets: dict[int, int] = {}
-        if ordered_input_plans:
-            ordered_group_count = 0
-            for root, plan in ordered_input_plans.items():
-                ordered_counter_offsets[root] = ordered_group_count
-                ordered_group_count += plan.group_count
-            ordered_counter_arg = self._register_tile_dependency_state(
-                device_function,
-                name_hint="tile_dependency_ordered_group_arrivals",
-                numel=str(ordered_group_count),
                 dtype=torch.uint32,
                 zero_init=True,
             )
@@ -1311,11 +1355,6 @@ class ForEachProgramID(ProgramIDs):
             for plan in partitioned_pipeline_plans.values()
             for root in plan.continuation_roots
         }
-        consumed_ordered_singleton_roots = {
-            root
-            for plan in ordered_input_plans.values()
-            for root in plan.continuation_roots
-        }
         consumed_reduction_fanout_roots = {
             root
             for plan in reduction_fanout_plans.values()
@@ -1380,16 +1419,22 @@ class ForEachProgramID(ProgramIDs):
                 f"tl.cast({epoch_var}, tl.uint32) * tl.cast({active_workers}, tl.uint32)",
             )
 
-        def whole_value_input_dependency(root: int) -> tuple[str, str] | None:
+        def whole_value_input_dependencies(
+            root: int,
+        ) -> tuple[tuple[str, str], ...]:
             producers = whole_value_incoming.get(root, ())
-            if not producers:
+            return tuple(root_completion_dependency(producer) for producer in producers)
+
+        def whole_value_input_dependency(root: int) -> tuple[str, str] | None:
+            dependencies = whole_value_input_dependencies(root)
+            if not dependencies:
                 return None
-            if len(producers) != 1:
+            if len(dependencies) != 1:
                 raise exc.TileDependencyScheduleError(
-                    "a structural TileDependency plan currently supports one "
-                    f"whole-value predecessor, got roots {producers} for root {root}"
+                    "this migration-only structural plan supports one "
+                    f"whole-value predecessor, got {len(dependencies)} for root {root}"
                 )
-            return root_completion_dependency(producers[0])
+            return dependencies[0]
 
         def root_completion_publication(
             root: int, active_workers: int
@@ -1515,7 +1560,7 @@ class ForEachProgramID(ProgramIDs):
             plan: ForEachProgramID._AccessCohort,
             *,
             producer_coordinates: dict[int, str],
-            stage: int,
+            milestone: int | str,
         ) -> str:
             assert access_cohort_arg is not None
             producer_counts = root_axis_counts[plan.producer_root]
@@ -1525,10 +1570,11 @@ class ForEachProgramID(ProgramIDs):
                 outer_terms.append(f"({producer_coordinates[block_id]}) * {multiplier}")
                 multiplier *= producer_counts[block_id]
             outer_key = " + ".join(outer_terms) or "0"
+            stride = 1 if plan.is_per_coordinate else _TILE_DEPENDENCY_COUNTER_STRIDE
             return (
                 f"{access_cohort_arg} + {access_cohort_offsets[plan]} + "
-                f"(({outer_key}) * {len(plan.stage_sizes)} + {stage}) * "
-                f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
+                f"(({outer_key}) * {plan.milestone_count} + ({milestone})) * "
+                f"{stride}"
             )
 
         def cohort_publication(
@@ -1542,9 +1588,17 @@ class ForEachProgramID(ProgramIDs):
             )
             stream_coordinate = coordinates[plan.producer_stream_axis]
 
+            if plan.is_per_coordinate:
+                return [
+                    statement_from_string(
+                        f"tl.atomic_add({cohort_counter(plan, producer_coordinates=coordinates, milestone=stream_coordinate)}, "
+                        "1, sem='release', scope='gpu')"
+                    )
+                ]
+
             def publish(stage: int) -> ast.stmt:
                 return statement_from_string(
-                    f"tl.atomic_add({cohort_counter(plan, producer_coordinates=coordinates, stage=stage)}, "
+                    f"tl.atomic_add({cohort_counter(plan, producer_coordinates=coordinates, milestone=stage)}, "
                     "1, sem='release', scope='gpu')"
                 )
 
@@ -1580,6 +1634,34 @@ class ForEachProgramID(ProgramIDs):
                 ]
                 for block_id in plan.outer_producer_axes
             }
+            if plan.is_per_coordinate:
+                assert plan.consumer_stream_coordinate is not None
+                scheduled_root_body = (
+                    _clone_opaque_statements_with_access_iteration_wait(
+                        case_bodies[plan.consumer_root],
+                        access_ids=frozenset(plan.access_ids),
+                        loop_id=plan.consumer_loop_id,
+                        wait=self._wait_for_counter(
+                            device_function=device_function,
+                            counter=cohort_counter(
+                                plan,
+                                producer_coordinates=producer_coordinates,
+                                milestone=plan.consumer_stream_coordinate,
+                            ),
+                            target=f"tl.cast({epoch_var}, tl.uint32)",
+                            prefix="tile_dependency_cohort_wait",
+                        ),
+                    )
+                )
+                return self._outline_tile_dependency_region(
+                    device_function,
+                    name_hint=f"tile_dependency_root_{plan.consumer_root}",
+                    body=[
+                        statement_from_string(f"{self.shared_pid_var} = {logical_pid}"),
+                        *scheduled_root_body,
+                    ],
+                    extra_argument_names=extra_argument_names,
+                )
             stage_waits = tuple(
                 tuple(
                     self._wait_for_counter(
@@ -1587,7 +1669,7 @@ class ForEachProgramID(ProgramIDs):
                         counter=cohort_counter(
                             plan,
                             producer_coordinates=producer_coordinates,
-                            stage=stage,
+                            milestone=stage,
                         ),
                         target=(
                             f"tl.cast({epoch_var}, tl.uint32) * "
@@ -1623,6 +1705,8 @@ class ForEachProgramID(ProgramIDs):
             local_task: str,
             logical_pid: str,
             extra_argument_names: tuple[str, ...],
+            *,
+            force_noinline: bool = False,
         ) -> list[ast.stmt]:
             body: list[ast.stmt] = []
             has_task_scheduling = root in access_cohorts_by_consumer
@@ -1802,6 +1886,7 @@ class ForEachProgramID(ProgramIDs):
                     logical_pid=scheduled_logical_pid,
                     body=case_bodies[root],
                     extra_argument_names=extra_argument_names,
+                    noinline=force_noinline,
                 )
             body.append(opaque_call)
             publications: list[ast.stmt] = []
@@ -1978,10 +2063,8 @@ class ForEachProgramID(ProgramIDs):
             if root_end != root_begin + 1:
                 structural_roots = (
                     set(partitioned_pipeline_plans)
-                    | set(ordered_input_plans)
                     | set(reduction_fanout_plans)
                     | consumed_partitioned_roots
-                    | consumed_ordered_singleton_roots
                     | consumed_reduction_fanout_roots
                     | consumed_task_continuation_roots
                     | set(task_continuation_pipeline_by_producer)
@@ -1995,22 +2078,27 @@ class ForEachProgramID(ProgramIDs):
                 for stage_root in range(root_begin, root_end):
                     if stage_root in singleton_roots and any(
                         edge.producer_root == stage_root
-                        for edge in schedule.unsynchronized_edges
+                        for edge in dependency_plan.edges
                     ):
                         assert singleton_epoch_arg is not None
+                        singleton_task_body = task_scheduled_body(
+                            stage_root,
+                            "0",
+                            str(case_offsets[stage_root]),
+                            (epoch_var,),
+                            force_noinline=True,
+                        )
                         result.extend(
                             self._emit_opaque_singleton_root(
-                                body=case_bodies[stage_root],
+                                task_body=singleton_task_body,
                                 device_function=device_function,
                                 worker=worker,
                                 epoch_var=epoch_var,
                                 ready_arg=singleton_epoch_arg,
                                 ready_index=singleton_indices[stage_root],
-                                root=stage_root,
                                 epoch_replicas=singleton_replicas[stage_root],
                                 ready_replica_stride=epoch_replicas,
-                                logical_pid=case_offsets[stage_root],
-                                input_dependency=whole_value_input_dependency(
+                                input_dependencies=whole_value_input_dependencies(
                                     stage_root
                                 ),
                             )
@@ -2082,7 +2170,6 @@ class ForEachProgramID(ProgramIDs):
                 continue
             if root_end == root_begin + 1 and root_begin in (
                 consumed_partitioned_roots
-                | consumed_ordered_singleton_roots
                 | consumed_reduction_fanout_roots
                 | consumed_task_continuation_roots
             ):
@@ -2281,54 +2368,6 @@ class ForEachProgramID(ProgramIDs):
                 )
                 start_expr = boundary
                 continue
-            ordered_input_plan = (
-                ordered_input_plans.get(root_begin)
-                if root_end == root_begin + 1
-                else None
-            )
-            if ordered_input_plan is not None:
-                assert ordered_counter_arg is not None
-                assert singleton_epoch_arg is not None
-                ordered_counter = (
-                    f"{ordered_counter_arg} + {ordered_counter_offsets[root_begin]}"
-                )
-                result.extend(
-                    self._emit_ordered_input_producer(
-                        ordered_input_plan,
-                        case_bodies=case_bodies,
-                        case_offsets=case_offsets,
-                        strategy=strategy,
-                        device_function=device_function,
-                        worker=worker,
-                        counter_arg=ordered_counter,
-                        input_dependency=whole_value_input_dependency(root_begin),
-                    )
-                )
-                result.extend(
-                    self._emit_opaque_singleton_root(
-                        body=case_bodies[ordered_input_plan.consumer_root],
-                        device_function=device_function,
-                        worker=worker,
-                        epoch_var=epoch_var,
-                        ready_arg=singleton_epoch_arg,
-                        ready_index=singleton_indices[ordered_input_plan.consumer_root],
-                        root=ordered_input_plan.consumer_root,
-                        epoch_replicas=singleton_replicas[
-                            ordered_input_plan.consumer_root
-                        ],
-                        ready_replica_stride=epoch_replicas,
-                        logical_pid=case_offsets[ordered_input_plan.consumer_root],
-                        ordered_loop_index=ordered_input_plan.ordered_loop_index,
-                        group_ready_counter=ordered_counter,
-                        group_ready_target=(
-                            f"tl.cast({epoch_var}, tl.uint32) * "
-                            f"tl.cast({ordered_input_plan.tasks_per_group}, tl.uint32)"
-                        ),
-                        reduction_step=ordered_input_plan.reduction_step,
-                    )
-                )
-                start_expr = boundary
-                continue
             partitioned_pipeline_plan = (
                 partitioned_pipeline_plans.get(root_begin)
                 if root_end == root_begin + 1
@@ -2375,19 +2414,24 @@ class ForEachProgramID(ProgramIDs):
                 continue
             if root_end == root_begin + 1 and root_begin in singleton_roots:
                 assert singleton_epoch_arg is not None
+                singleton_task_body = task_scheduled_body(
+                    root_begin,
+                    "0",
+                    str(case_offsets[root_begin]),
+                    (epoch_var,),
+                    force_noinline=True,
+                )
                 result.extend(
                     self._emit_opaque_singleton_root(
-                        body=case_bodies[root_begin],
+                        task_body=singleton_task_body,
                         device_function=device_function,
                         worker=worker,
                         epoch_var=epoch_var,
                         ready_arg=singleton_epoch_arg,
                         ready_index=singleton_indices[root_begin],
-                        root=root_begin,
                         epoch_replicas=singleton_replicas[root_begin],
                         ready_replica_stride=epoch_replicas,
-                        logical_pid=case_offsets[root_begin],
-                        input_dependency=whole_value_input_dependency(root_begin),
+                        input_dependencies=whole_value_input_dependencies(root_begin),
                     )
                 )
                 start_expr = boundary
@@ -2461,7 +2505,6 @@ class ForEachProgramID(ProgramIDs):
         partitioned_pipeline_plans: dict[
             int, ForEachProgramID._PartitionedDependencyPipeline
         ],
-        ordered_input_plans: dict[int, ForEachProgramID._OrderedInputSingleton],
         reduction_fanout_plans: dict[int, ForEachProgramID._OneWaveReductionFanout],
         task_ready_edges: frozenset[tuple[int, int]],
         whole_value_edges: frozenset[tuple[int, int]],
@@ -2476,8 +2519,6 @@ class ForEachProgramID(ProgramIDs):
         """
         covered: set[tuple[int, int]] = set()
         for plan in partitioned_pipeline_plans.values():
-            covered.update(plan.covered_edges)
-        for plan in ordered_input_plans.values():
             covered.update(plan.covered_edges)
         for plan in reduction_fanout_plans.values():
             covered.update(plan.covered_edges)
@@ -2507,13 +2548,13 @@ class ForEachProgramID(ProgramIDs):
                 )
             return False
 
-        schedule = HostFunction.current().device_ir.tile_dependency_schedule
-        assert schedule is not None
-        for dependency in schedule.unsynchronized_edges:
+        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
+        assert dependency_plan is not None
+        for dependency in dependency_plan.edges:
             if not is_ordered(dependency.producer_root, dependency.consumer_root):
                 raise exc.TileDependencyScheduleError(
                     f"{dependency.producer_root}->{dependency.consumer_root} "
-                    f"through storage {dependency.storage!r} has no "
+                    f"through allocations {sorted(dependency.tensor_names)!r} has no "
                     "TileDependency synchronization path"
                 )
 
@@ -2565,83 +2606,9 @@ class ForEachProgramID(ProgramIDs):
         assert len(result) == len(self.cases)
         return result
 
-    @dataclasses.dataclass(frozen=True)
-    class _AccessCohort:
-        """A generic contiguous coarsening of one task-ready access relation."""
-
-        event_id: int
-        producer_root: int
-        consumer_root: int
-        axes: tuple[AffinePredecessorAxis, ...]
-        access_ids: tuple[int, ...]
-        producer_stream_axis: int
-        consumer_stream_axis: int
-        stage_sizes: tuple[int, ...]
-        outer_producer_axes: tuple[int, ...]
-
-        @property
-        def stage_offsets(self) -> tuple[int, ...]:
-            result = [0]
-            for size in self.stage_sizes:
-                result.append(result[-1] + size)
-            return tuple(result)
-
-    @dataclasses.dataclass(frozen=True)
-    class _TaskContinuation:
-        """A consumer task elected by the last task in a proven partition."""
-
-        event_id: int
-        producer_root: int
-        consumer_root: int
-        partition: UniformTaskPartition
-
-        @property
-        def producer_tasks(self) -> int:
-            return self.partition.producer_tasks
-
-        @property
-        def consumer_tasks(self) -> int:
-            return self.partition.consumer_tasks
-
-        @property
-        def fanin(self) -> int:
-            return self.partition.fanin
-
-    @dataclasses.dataclass(frozen=True)
-    class _TaskContinuationPipeline:
-        """A continuation followed by a concurrently admitted consumer root."""
-
-        continuation: ForEachProgramID._TaskContinuation
-        cohort: ForEachProgramID._AccessCohort
-        worker_count: int
-        consumer_tasks: int
-        initial_stream_tasks: int
-
-        @property
-        def tail_producer_tasks(self) -> int:
-            return self.continuation.producer_tasks - self.worker_count
-
-        @property
-        def consumer_worker_begin(self) -> int:
-            return self.worker_count - self.consumer_tasks
-
-    @dataclasses.dataclass(frozen=True)
-    class _OrderedInputSingleton:
-        producer_root: int
-        consumer_root: int
-        producer_tasks: int
-        group_count: int
-        tasks_per_group: int
-        ordered_loop_index: int
-        reduction_step: int
-
-        @property
-        def covered_edges(self) -> tuple[tuple[int, int], ...]:
-            return ((self.producer_root, self.consumer_root),)
-
-        @property
-        def continuation_roots(self) -> frozenset[int]:
-            return frozenset((self.consumer_root,))
+    _AccessCohort = AccessCohortPlan
+    _TaskContinuation = TaskContinuationPlan
+    _TaskContinuationPipeline = TaskContinuationPipelinePlan
 
     @dataclasses.dataclass(frozen=True)
     class _OneWaveReductionFanout:
@@ -2755,61 +2722,15 @@ class ForEachProgramID(ProgramIDs):
             )
 
     @staticmethod
-    def _constexpr_int(expr: ast.expr, device_function: DeviceFunction) -> int | None:
-        if isinstance(expr, ast.Constant) and isinstance(expr.value, int):
-            return expr.value
-        if isinstance(expr, ast.Name) and expr.id in device_function._constexpr_args:
-            try:
-                value = ast.literal_eval(
-                    device_function._constexpr_args[expr.id].host_str()
-                )
-                if isinstance(value, int):
-                    return value
-            except (SyntaxError, ValueError):
-                pass
-        if isinstance(expr, ast.Name):
-            for stmt in device_function.codegen.host_statements:
-                if (
-                    isinstance(stmt, ast.Assign)
-                    and len(stmt.targets) == 1
-                    and isinstance(stmt.targets[0], ast.Name)
-                    and stmt.targets[0].id == expr.id
-                    and isinstance(stmt.value, ast.Constant)
-                    and isinstance(stmt.value.value, int)
-                ):
-                    return stmt.value.value
-        if isinstance(expr, ast.Name) and expr.id.startswith("_BLOCK_SIZE_"):
-            try:
-                block_id = int(expr.id.removeprefix("_BLOCK_SIZE_"))
-                return int(
-                    CompileEnvironment.current()
-                    .block_sizes[block_id]
-                    .from_config_assert(device_function.config)
-                )
-            except (KeyError, ValueError):
-                return None
-        return None
-
-    @staticmethod
-    def _is_tl_range(loop: ast.For) -> bool:
-        return (
-            isinstance(loop.iter, ast.Call)
-            and isinstance(loop.iter.func, ast.Attribute)
-            and isinstance(loop.iter.func.value, ast.Name)
-            and loop.iter.func.value.id == "tl"
-            and loop.iter.func.attr == "range"
-        )
-
-    @staticmethod
     def _match_opaque_singleton_roots(
         task_counts: list[int],
     ) -> frozenset[int]:
         """Select one-task roots without inspecting or rewriting their bodies."""
-        schedule = HostFunction.current().device_ir.tile_dependency_schedule
-        assert schedule is not None
+        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
+        assert dependency_plan is not None
         participating_roots = {
             root
-            for edge in schedule.unsynchronized_edges
+            for edge in dependency_plan.edges
             for root in (edge.producer_root, edge.consumer_root)
         }
         return frozenset(
@@ -2826,6 +2747,44 @@ class ForEachProgramID(ProgramIDs):
             assert case.parent_strategy is not None
             return case.parent_strategy.pid_info
         return case.pid_info
+
+    def _instantiated_task_families(
+        self,
+        device_function: DeviceFunction,
+    ) -> tuple[InstantiatedTaskFamily, ...] | None:
+        """Bind DeviceIR logical task families to one physical configuration."""
+        from .tile_strategy import L2GroupingProgramIDs
+
+        logical_families = HostFunction.current().device_ir.task_families
+        if len(logical_families) != len(self.cases):
+            return None
+        result: list[InstantiatedTaskFamily] = []
+        for root, logical_family in enumerate(logical_families):
+            geometry = self._static_case_geometry(root, device_function)
+            if geometry is None:
+                return None
+            physical_axis_order, axis_counts, block_sizes = geometry
+            if set(logical_family.logical_axis_order) != set(physical_axis_order):
+                return None
+            result.append(
+                InstantiatedTaskFamily(
+                    root=root,
+                    logical_axis_order=logical_family.logical_axis_order,
+                    physical_axis_order=physical_axis_order,
+                    axis_counts_items=tuple(
+                        (block_id, axis_counts[block_id])
+                        for block_id in physical_axis_order
+                    ),
+                    block_sizes_items=tuple(
+                        (block_id, block_sizes[block_id])
+                        for block_id in physical_axis_order
+                    ),
+                    has_nontrivial_pid_remap=isinstance(
+                        self.cases[root], L2GroupingProgramIDs
+                    ),
+                )
+            )
+        return tuple(result)
 
     def _static_case_task_counts(
         self, device_function: DeviceFunction
@@ -2877,591 +2836,6 @@ class ForEachProgramID(ProgramIDs):
             return None
         return (numel + block - 1) // block, block
 
-    def _generic_task_waits(
-        self,
-        *,
-        excluded_roots: set[int],
-        task_counts: list[int],
-        case_bodies: list[list[ast.stmt]],
-        device_function: DeviceFunction,
-    ) -> tuple[frozenset[tuple[int, int]], dict[int, tuple[WaitSpec, ...]]]:
-        """Select task-ready edges with a concrete synchronization insertion point.
-
-        Specialized migration paths are kept disjoint from this generic path.
-        Root coordinates wait at admission; nested coordinates wait at the
-        exact consumer access marker recorded by ordinary load codegen.
-        """
-        from .cross_loop_dependencies import cross_loop_access_marker_id
-
-        device_ir = HostFunction.current().device_ir
-        dependency_plan = device_ir.cross_loop_dependency_plan
-        schedule = device_ir.tile_dependency_schedule
-        if dependency_plan is None or schedule is None:
-            return frozenset(), {}
-
-        source_names_by_pair: dict[tuple[int, int], set[str]] = {}
-        source_kinds_by_pair: dict[tuple[int, int], set[TileDependencyKind]] = {}
-        for edge in schedule.unsynchronized_edges:
-            pair = (edge.producer_root, edge.consumer_root)
-            source_names_by_pair.setdefault(pair, set()).add(edge.storage)
-            source_kinds_by_pair.setdefault(pair, set()).update(edge.kinds)
-
-        cross_names_by_pair: dict[tuple[int, int], set[str]] = {}
-        for edge in dependency_plan.edges:
-            cross_names_by_pair.setdefault(
-                (edge.producer_root, edge.consumer_root), set()
-            ).update(edge.tensor_names)
-
-        waits_by_pair: dict[tuple[int, int], list[WaitSpec]] = {}
-        for wait in dependency_plan.waits:
-            event = dependency_plan.event(wait.event_id)
-            waits_by_pair.setdefault(
-                (event.producer_root, wait.consumer_root), []
-            ).append(wait)
-
-        marker_ids_by_root = [
-            {
-                access_id
-                for statement in ast.walk(ast.Module(body=body, type_ignores=[]))
-                if (access_id := cross_loop_access_marker_id(statement)) is not None
-            }
-            for body in case_bodies
-        ]
-
-        selected_pairs: set[tuple[int, int]] = set()
-        waits_by_root: dict[int, list[WaitSpec]] = {}
-        for pair, source_names in source_names_by_pair.items():
-            producer_root, consumer_root = pair
-            if producer_root in excluded_roots or consumer_root in excluded_roots:
-                continue
-            if task_counts[producer_root] == 0 or task_counts[consumer_root] == 0:
-                continue
-            if isinstance(
-                self.cases[producer_root], L2GroupingProgramIDs
-            ) or isinstance(self.cases[consumer_root], L2GroupingProgramIDs):
-                # Event slots currently use the ordinary flattened PID order.
-                # A grouped root remaps that PID before decomposition, so use
-                # root completion until the remap itself is represented.
-                continue
-            if source_kinds_by_pair[pair] != {TileDependencyKind.READ_AFTER_WRITE}:
-                continue
-            pair_waits = waits_by_pair.get(pair, ())
-            if not pair_waits or not source_names <= cross_names_by_pair.get(
-                pair, set()
-            ):
-                continue
-            producer_axes = {
-                info.block_id for info in self._case_pid_info(self.cases[producer_root])
-            }
-            consumer_axes = {
-                info.block_id for info in self._case_pid_info(self.cases[consumer_root])
-            }
-            valid = True
-            for wait in pair_waits:
-                predecessor_map = wait.predecessor_map
-                if (
-                    dependency_plan.event(wait.event_id).granularity != "task"
-                    or predecessor_map is None
-                    or {axis.producer_block_id for axis in predecessor_map.axes}
-                    != producer_axes
-                ):
-                    valid = False
-                    break
-                required_consumer_axes = {
-                    axis.consumer_block_id for axis in predecessor_map.axes
-                }
-                if wait.placement == "root_entry":
-                    if not required_consumer_axes <= consumer_axes:
-                        valid = False
-                        break
-                    continue
-                access_id = wait.consumer_access_id
-                coordinates = (
-                    device_function.cross_loop_access_coordinates.get(access_id)
-                    if access_id is not None
-                    else None
-                )
-                if (
-                    access_id is None
-                    or access_id not in marker_ids_by_root[consumer_root]
-                    or coordinates is None
-                    or not required_consumer_axes <= coordinates.keys()
-                    or any(
-                        self._static_block_axis_geometry(block_id, device_function)
-                        is None
-                        for block_id in required_consumer_axes
-                    )
-                ):
-                    valid = False
-                    break
-            if not valid:
-                continue
-            selected_pairs.add(pair)
-            root_waits = waits_by_root.setdefault(consumer_root, [])
-            existing = {
-                (
-                    wait.event_id,
-                    wait.predecessor_map.axes,
-                    wait.consumer_access_id if wait.placement == "access" else None,
-                )
-                for wait in root_waits
-                if wait.predecessor_map is not None
-            }
-            for wait in pair_waits:
-                assert wait.predecessor_map is not None
-                key = (
-                    wait.event_id,
-                    wait.predecessor_map.axes,
-                    wait.consumer_access_id if wait.placement == "access" else None,
-                )
-                if key not in existing:
-                    root_waits.append(wait)
-                    existing.add(key)
-
-        return frozenset(selected_pairs), {
-            root: tuple(waits) for root, waits in waits_by_root.items()
-        }
-
-    def _access_cohort_plans(
-        self,
-        waits_by_root: dict[int, tuple[WaitSpec, ...]],
-        device_function: DeviceFunction,
-    ) -> tuple[_AccessCohort, ...]:
-        """Coarsen one-to-one nested-axis waits into contiguous completion stages."""
-        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
-        if dependency_plan is None:
-            return ()
-
-        result: list[ForEachProgramID._AccessCohort] = []
-        for consumer_root, waits in waits_by_root.items():
-            waits_by_event: dict[int, list[WaitSpec]] = {}
-            for wait in waits:
-                if wait.placement == "access":
-                    waits_by_event.setdefault(wait.event_id, []).append(wait)
-            for event_id, event_waits in waits_by_event.items():
-                predecessor_maps = [
-                    wait.predecessor_map
-                    for wait in event_waits
-                    if wait.predecessor_map is not None
-                ]
-                if len(predecessor_maps) != len(event_waits):
-                    continue
-                axes = predecessor_maps[0].axes
-                axis_pairs = tuple(
-                    (axis.producer_block_id, axis.consumer_block_id) for axis in axes
-                )
-                if any(
-                    tuple(
-                        (axis.producer_block_id, axis.consumer_block_id)
-                        for axis in mapping.axes
-                    )
-                    != axis_pairs
-                    for mapping in predecessor_maps[1:]
-                ):
-                    continue
-
-                producer_root = dependency_plan.event(event_id).producer_root
-                producer_geometry = self._static_case_geometry(
-                    producer_root, device_function
-                )
-                consumer_geometry = self._static_case_geometry(
-                    consumer_root, device_function
-                )
-                if producer_geometry is None or consumer_geometry is None:
-                    continue
-                producer_order, producer_counts, producer_blocks = producer_geometry
-                _, consumer_root_counts, _ = consumer_geometry
-                axes_by_producer = {axis.producer_block_id: axis for axis in axes}
-                if len(axes_by_producer) != len(axes) or set(axes_by_producer) != set(
-                    producer_order
-                ):
-                    continue
-
-                nested_axes = [
-                    axis
-                    for axis in axes
-                    if axis.consumer_block_id not in consumer_root_counts
-                ]
-                if len(nested_axes) != 1:
-                    continue
-                stream_axis = nested_axes[0]
-                valid = True
-                for predecessor_map in predecessor_maps:
-                    seen_consumer_axes: set[int] = set()
-                    for axis in predecessor_map.axes:
-                        consumer_geometry_for_axis = self._static_block_axis_geometry(
-                            axis.consumer_block_id, device_function
-                        )
-                        if consumer_geometry_for_axis is None:
-                            valid = False
-                            break
-                        consumer_count, consumer_block = consumer_geometry_for_axis
-                        producer_block = producer_blocks[axis.producer_block_id]
-                        producer_width = (
-                            1 if axis.producer_is_scalar else producer_block
-                        )
-                        consumer_width = (
-                            1 if axis.consumer_is_scalar else consumer_block
-                        )
-                        if (
-                            axis.consumer_block_id in seen_consumer_axes
-                            or producer_counts[axis.producer_block_id] != consumer_count
-                            or producer_width != consumer_width
-                            or axis.producer_offset != axis.consumer_offset
-                        ):
-                            valid = False
-                            break
-                        seen_consumer_axes.add(axis.consumer_block_id)
-                    if not valid:
-                        break
-                if not valid:
-                    continue
-
-                stream_count = producer_counts[stream_axis.producer_block_id]
-                if stream_count <= 1:
-                    continue
-                first_stage = 1 << ((stream_count // 2).bit_length() - 1)
-                stage_sizes = [first_stage]
-                remaining = stream_count - first_stage
-                while remaining:
-                    stage = 1 << (remaining.bit_length() - 1)
-                    stage_sizes.append(stage)
-                    remaining -= stage
-                access_ids = tuple(
-                    wait.consumer_access_id
-                    for wait in event_waits
-                    if wait.consumer_access_id is not None
-                )
-                if len(access_ids) != len(event_waits):
-                    continue
-                result.append(
-                    self._AccessCohort(
-                        event_id=event_id,
-                        producer_root=producer_root,
-                        consumer_root=consumer_root,
-                        axes=axes,
-                        access_ids=access_ids,
-                        producer_stream_axis=stream_axis.producer_block_id,
-                        consumer_stream_axis=stream_axis.consumer_block_id,
-                        stage_sizes=tuple(stage_sizes),
-                        outer_producer_axes=tuple(
-                            block_id
-                            for block_id in producer_order
-                            if block_id != stream_axis.producer_block_id
-                        ),
-                    )
-                )
-        plan_count_by_consumer: dict[int, int] = {}
-        for plan in result:
-            plan_count_by_consumer[plan.consumer_root] = (
-                plan_count_by_consumer.get(plan.consumer_root, 0) + 1
-            )
-        return tuple(
-            plan for plan in result if plan_count_by_consumer[plan.consumer_root] == 1
-        )
-
-    def _task_continuation_plans(
-        self,
-        waits_by_root: dict[int, tuple[WaitSpec, ...]],
-        device_function: DeviceFunction,
-    ) -> tuple[_TaskContinuation, ...]:
-        """Find exact producer partitions suitable for last-arrival execution."""
-        from .cross_loop_dependencies import prove_uniform_task_partition
-
-        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
-        if dependency_plan is None:
-            return ()
-        result: list[ForEachProgramID._TaskContinuation] = []
-        for consumer_root, waits in waits_by_root.items():
-            if not waits or any(wait.placement != "root_entry" for wait in waits):
-                continue
-            event_ids = {wait.event_id for wait in waits}
-            if len(event_ids) != 1:
-                continue
-            event_id = event_ids.pop()
-            producer_root = dependency_plan.event(event_id).producer_root
-            schedule = HostFunction.current().device_ir.tile_dependency_schedule
-            assert schedule is not None
-            if {
-                edge.producer_root
-                for edge in schedule.unsynchronized_edges
-                if edge.consumer_root == consumer_root
-            } != {producer_root}:
-                continue
-            if any(
-                event.producer_root == consumer_root and event.granularity == "root"
-                for event in dependency_plan.events
-            ):
-                continue
-            producer_geometry = self._static_case_geometry(
-                producer_root, device_function
-            )
-            consumer_geometry = self._static_case_geometry(
-                consumer_root, device_function
-            )
-            if producer_geometry is None or consumer_geometry is None:
-                continue
-            producer_order, producer_counts, producer_blocks = producer_geometry
-            consumer_order, consumer_counts, consumer_blocks = consumer_geometry
-            block_sizes = {**producer_blocks, **consumer_blocks}
-            predecessor_maps = tuple(
-                wait.predecessor_map
-                for wait in waits
-                if wait.predecessor_map is not None
-            )
-            if len(predecessor_maps) != len(waits):
-                continue
-            partition = prove_uniform_task_partition(
-                predecessor_maps,
-                consumer_axis_order=consumer_order,
-                consumer_axis_counts=consumer_counts,
-                producer_axis_order=producer_order,
-                producer_axis_counts=producer_counts,
-                block_sizes=block_sizes,
-            )
-            if partition is None:
-                continue
-            result.append(
-                self._TaskContinuation(
-                    event_id=event_id,
-                    producer_root=producer_root,
-                    consumer_root=consumer_root,
-                    partition=partition,
-                )
-            )
-        continuation_count_by_root: dict[int, int] = {}
-        for plan in result:
-            for root in (plan.producer_root, plan.consumer_root):
-                continuation_count_by_root[root] = (
-                    continuation_count_by_root.get(root, 0) + 1
-                )
-        return tuple(
-            plan
-            for plan in result
-            if continuation_count_by_root[plan.consumer_root] == 1
-            and continuation_count_by_root[plan.producer_root] == 1
-        )
-
-    def _task_continuation_pipeline_plans(
-        self,
-        task_continuations: tuple[_TaskContinuation, ...],
-        access_cohorts: tuple[_AccessCohort, ...],
-        *,
-        task_counts: list[int],
-        physical_worker_limit: int,
-        device_function: DeviceFunction,
-    ) -> tuple[_TaskContinuationPipeline, ...]:
-        """Compose two proven relations into a static producer/consumer split.
-
-        Every resident worker first executes one consumer-major producer task.
-        A disjoint low-ID cohort then finishes the producer tail while a
-        high-ID cohort consumes the prefix that the initial wave made ready.
-        The policy is admitted only when both tails fit in one wave; otherwise
-        the two underlying primitives retain their ordinary safe lowering.
-        """
-        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
-        schedule = HostFunction.current().device_ir.tile_dependency_schedule
-        if dependency_plan is None or schedule is None:
-            return ()
-
-        result: list[ForEachProgramID._TaskContinuationPipeline] = []
-        for continuation in task_continuations:
-            matching_cohorts = [
-                cohort
-                for cohort in access_cohorts
-                if cohort.producer_root == continuation.consumer_root
-            ]
-            if len(matching_cohorts) != 1:
-                continue
-            cohort = matching_cohorts[0]
-            downstream_root = cohort.consumer_root
-            if {
-                edge.producer_root
-                for edge in schedule.unsynchronized_edges
-                if edge.consumer_root == downstream_root
-            } != {continuation.consumer_root}:
-                continue
-            if any(
-                event.producer_root in (continuation.producer_root, downstream_root)
-                and event.granularity == "root"
-                for event in dependency_plan.events
-            ):
-                continue
-
-            producer_tasks = continuation.producer_tasks
-            consumer_tasks = task_counts[downstream_root]
-            minimum_workers = (producer_tasks + consumer_tasks + 1) // 2
-            worker_count = (
-                (minimum_workers + continuation.fanin - 1)
-                // continuation.fanin
-                * continuation.fanin
-            )
-            if (
-                worker_count > physical_worker_limit
-                or worker_count >= producer_tasks
-                or consumer_tasks <= 0
-            ):
-                continue
-            tail_producer_tasks = producer_tasks - worker_count
-            consumer_worker_begin = worker_count - consumer_tasks
-            if tail_producer_tasks > consumer_worker_begin:
-                continue
-
-            map_geometry = self._static_case_geometry(
-                continuation.consumer_root, device_function
-            )
-            if map_geometry is None:
-                continue
-            map_axis_order, map_axis_counts, _ = map_geometry
-            if (
-                not map_axis_order
-                or map_axis_order[-1] != cohort.producer_stream_axis
-                or map_axis_order[:-1] != cohort.outer_producer_axes
-            ):
-                continue
-            outer_count = math.prod(
-                map_axis_counts[block_id] for block_id in cohort.outer_producer_axes
-            )
-            initial_map_tasks = worker_count // continuation.fanin
-            if initial_map_tasks % outer_count:
-                continue
-            initial_stream_tasks = initial_map_tasks // outer_count
-            stream_tasks = map_axis_counts[cohort.producer_stream_axis]
-            if not 0 < initial_stream_tasks < stream_tasks:
-                continue
-
-            result.append(
-                self._TaskContinuationPipeline(
-                    continuation=continuation,
-                    cohort=cohort,
-                    worker_count=worker_count,
-                    consumer_tasks=consumer_tasks,
-                    initial_stream_tasks=initial_stream_tasks,
-                )
-            )
-        return tuple(result)
-
-    @staticmethod
-    def _pointer_load_count(body: list[ast.stmt], name: str) -> int:
-        count = 0
-        for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "tl"
-                and node.func.attr == "load"
-                and node.args
-            ):
-                continue
-            if any(
-                isinstance(item, ast.Name) and item.id == name
-                for item in ast.walk(node.args[0])
-            ):
-                count += 1
-        return count
-
-    def _match_ordered_input_singletons(
-        self,
-        singleton_roots: frozenset[int],
-        case_bodies: list[list[ast.stmt]],
-        device_function: DeviceFunction,
-    ) -> dict[int, _OrderedInputSingleton]:
-        """Find producer groups consumed in order by an opaque one-tile root.
-
-        The consumer body remains intact.  The only transformation authorized
-        by this match is inserting an acquire wait at the beginning of an
-        existing ``tl.range`` iteration.  Consequently accumulator structure,
-        statement order, and every arithmetic operation remain unchanged.
-        """
-        task_counts = self._static_case_task_counts(device_function)
-        if task_counts is None:
-            return {}
-        schedule = HostFunction.current().device_ir.tile_dependency_schedule
-        assert schedule is not None
-        result: dict[int, ForEachProgramID._OrderedInputSingleton] = {}
-        for consumer_root in singleton_roots:
-            producer_root = consumer_root - 1
-            if producer_root < 0:
-                continue
-            producer_edges = schedule.edges_between(producer_root, consumer_root)
-            if len(producer_edges) != 1:
-                continue
-            storage = producer_edges[0].storage
-            body = case_bodies[consumer_root]
-            ordered_loop_index = next(
-                (
-                    index
-                    for index, statement in enumerate(body)
-                    if isinstance(statement, ast.For)
-                    and self._is_tl_range(statement)
-                    and self._pointer_load_count([statement], storage) > 0
-                ),
-                None,
-            )
-            if ordered_loop_index is None or self._pointer_load_count(
-                body[:ordered_loop_index], storage
-            ):
-                continue
-            ordered_loop = body[ordered_loop_index]
-            assert isinstance(ordered_loop, ast.For)
-            ordered_call = cast("ast.Call", ordered_loop.iter)
-            if len(ordered_call.args) < 2:
-                continue
-            reduction_begin = self._constexpr_int(
-                cast("ast.expr", ordered_call.args[0]), device_function
-            )
-            reduction_end = self._constexpr_int(
-                cast("ast.expr", ordered_call.args[1]), device_function
-            )
-            reduction_step = (
-                self._constexpr_int(
-                    cast("ast.expr", ordered_call.args[2]), device_function
-                )
-                if len(ordered_call.args) >= 3
-                else 1
-            )
-            if (
-                reduction_begin != 0
-                or reduction_end is None
-                or reduction_step is None
-                or reduction_step <= 0
-                or reduction_end % reduction_step
-            ):
-                continue
-            group_count = reduction_end // reduction_step
-            producer_tasks = task_counts[producer_root]
-            resident_workers = CompileEnvironment.current().config_spec.num_sm * cast(
-                "int", device_function.config.get("num_sm_multiplier", 1)
-            )
-            # With a single resident producer wave there is no useful prefix
-            # of work to expose.  Polling once per reduction iteration only
-            # adds synchronization traffic; use the ordinary whole-value edge.
-            if producer_tasks <= resident_workers:
-                continue
-            if group_count <= 1 or producer_tasks % group_count:
-                continue
-            axes = self._static_case_axes(producer_root, device_function)
-            if axes is None:
-                continue
-            nontrivial_axes = [
-                (numel + block - 1) // block
-                for numel, block in axes
-                if (numel + block - 1) // block > 1
-            ]
-            if nontrivial_axes != [producer_tasks]:
-                continue
-            result[producer_root] = self._OrderedInputSingleton(
-                producer_root=producer_root,
-                consumer_root=consumer_root,
-                producer_tasks=producer_tasks,
-                group_count=group_count,
-                tasks_per_group=producer_tasks // group_count,
-                ordered_loop_index=ordered_loop_index,
-                reduction_step=reduction_step,
-            )
-        return result
-
     def _match_one_wave_reduction_fanouts(
         self,
         singleton_roots: frozenset[int],
@@ -3478,14 +2852,12 @@ class ForEachProgramID(ProgramIDs):
         producer must fit in one resident wave, and the singleton may write
         only storage consumed by that immediate consumer.
         """
-        from .loop_dependency_checker import TileAccessKind
-
         task_counts = self._static_case_task_counts(device_function)
         if task_counts is None:
             return {}
-        schedule = HostFunction.current().device_ir.tile_dependency_schedule
         device_ir = HostFunction.current().device_ir
-        assert schedule is not None
+        dependency_plan = device_ir.cross_loop_dependency_plan
+        assert dependency_plan is not None
         resident_workers = CompileEnvironment.current().config_spec.num_sm * cast(
             "int", device_function.config.get("num_sm_multiplier", 1)
         )
@@ -3503,27 +2875,30 @@ class ForEachProgramID(ProgramIDs):
             ):
                 continue
             if not (
-                schedule.edges_between(producer_root, reduction_root)
-                and schedule.edges_between(reduction_root, consumer_root)
-                and schedule.edges_between(producer_root, consumer_root)
+                dependency_plan.edges_between(producer_root, reduction_root)
+                and dependency_plan.edges_between(reduction_root, consumer_root)
+                and dependency_plan.edges_between(producer_root, consumer_root)
             ):
                 continue
             reduction_writes = {
-                access.storage
-                for access in device_ir.tile_accesses[reduction_root]
-                if access.kind is TileAccessKind.WRITE
+                access.allocation_id
+                for access in dependency_plan.accesses
+                if access.root == reduction_root
+                and access.kind == "store"
+                and access.allocation_id >= 0
             }
-            outgoing_storage = {
-                edge.storage
-                for edge in schedule.unsynchronized_edges
+            outgoing_allocations = {
+                edge.allocation_id
+                for edge in dependency_plan.edges
                 if edge.producer_root == reduction_root
                 and edge.consumer_root == consumer_root
+                and edge.allocation_id >= 0
             }
-            if not reduction_writes or reduction_writes != outgoing_storage:
+            if not reduction_writes or reduction_writes != outgoing_allocations:
                 continue
             if any(
                 edge.consumer_root != consumer_root
-                for edge in schedule.unsynchronized_edges
+                for edge in dependency_plan.edges
                 if edge.producer_root == reduction_root
             ):
                 continue
@@ -3538,10 +2913,15 @@ class ForEachProgramID(ProgramIDs):
             upstream_tasks_per_partition = 0
             candidate_upstream = producer_root - 1
             if candidate_upstream >= 0:
-                upstream_edges = schedule.edges_between(
+                upstream_edges = dependency_plan.edges_between(
                     candidate_upstream, producer_root
                 )
-                if len(upstream_edges) == 1:
+                upstream_allocations = {
+                    edge.allocation_id
+                    for edge in upstream_edges
+                    if edge.allocation_id >= 0
+                }
+                if len(upstream_allocations) == 1:
                     candidate_tasks = task_counts[candidate_upstream]
                     candidate_axes = self._static_case_axes(
                         candidate_upstream, device_function
@@ -3573,16 +2953,18 @@ class ForEachProgramID(ProgramIDs):
                             for numel, block in producer_axes or ()
                             if numel == block and numel > 1
                         }
-                        storage = upstream_edges[0].storage
+                        allocation_id = upstream_allocations.pop()
                         upstream_write_count = sum(
-                            access.storage == storage
-                            and access.kind is TileAccessKind.WRITE
-                            for access in device_ir.tile_accesses[candidate_upstream]
+                            access.allocation_id == allocation_id
+                            and access.kind == "store"
+                            and access.root == candidate_upstream
+                            for access in dependency_plan.accesses
                         )
                         producer_read_count = sum(
-                            access.storage == storage
-                            and access.kind is TileAccessKind.READ
-                            for access in device_ir.tile_accesses[producer_root]
+                            access.allocation_id == allocation_id
+                            and access.kind == "load"
+                            and access.root == producer_root
+                            for access in dependency_plan.accesses
                         )
                         if (
                             partition_block == 1
@@ -3610,16 +2992,22 @@ class ForEachProgramID(ProgramIDs):
         self, root: int, device_function: DeviceFunction
     ) -> list[tuple[int, int]] | None:
         env = CompileEnvironment.current()
+        task_families = HostFunction.current().device_ir.task_families
+        task_family = task_families[root] if root < len(task_families) else None
         result: list[tuple[int, int]] = []
         for info in self._case_pid_info(self.cases[root]):
-            if isinstance(info.numel, str):
+            logical_axis = (
+                task_family.axis(info.block_id) if task_family is not None else None
+            )
+            numel_expr = logical_axis.extent if logical_axis is not None else info.numel
+            if isinstance(numel_expr, str) or numel_expr is None:
                 return None
-            if isinstance(info.numel, int):
-                numel = info.numel
-            elif isinstance(info.numel, torch.SymInt):
-                numel = int(env.size_hint(info.numel))
-            elif getattr(info.numel, "is_number", False):
-                numel = int(info.numel)
+            if isinstance(numel_expr, int):
+                numel = numel_expr
+            elif isinstance(numel_expr, torch.SymInt):
+                numel = int(env.size_hint(numel_expr))
+            elif getattr(numel_expr, "is_number", False):
+                numel = int(numel_expr)
             else:
                 return None
             try:
@@ -3649,8 +3037,8 @@ class ForEachProgramID(ProgramIDs):
         task_counts = self._static_case_task_counts(device_function)
         if task_counts is None:
             return {}
-        schedule = HostFunction.current().device_ir.tile_dependency_schedule
-        assert schedule is not None
+        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
+        assert dependency_plan is not None
         result: dict[int, ForEachProgramID._PartitionedDependencyPipeline] = {}
         for producer_root in range(len(self.cases) - 6):
             partition_finalize_root = producer_root + 1
@@ -3658,19 +3046,32 @@ class ForEachProgramID(ProgramIDs):
             partition_map_root = producer_root + 3
             partition_reduce_root = producer_root + 4
             if not (
-                len(schedule.edges_between(producer_root, partition_finalize_root)) >= 1
-                and len(
-                    schedule.edges_between(partition_finalize_root, materialize_root)
+                len(
+                    dependency_plan.edges_between(
+                        producer_root, partition_finalize_root
+                    )
                 )
                 >= 1
                 and len(
-                    schedule.edges_between(partition_finalize_root, partition_map_root)
+                    dependency_plan.edges_between(
+                        partition_finalize_root, materialize_root
+                    )
                 )
                 >= 1
-                and len(schedule.edges_between(materialize_root, partition_map_root))
+                and len(
+                    dependency_plan.edges_between(
+                        partition_finalize_root, partition_map_root
+                    )
+                )
                 >= 1
                 and len(
-                    schedule.edges_between(partition_map_root, partition_reduce_root)
+                    dependency_plan.edges_between(materialize_root, partition_map_root)
+                )
+                >= 1
+                and len(
+                    dependency_plan.edges_between(
+                        partition_map_root, partition_reduce_root
+                    )
                 )
                 == 2
             ):
@@ -3679,8 +3080,8 @@ class ForEachProgramID(ProgramIDs):
             map_root = producer_root + 5
             downstream_root = producer_root + 6
             if not (
-                len(schedule.edges_between(partition_reduce_root, map_root)) == 1
-                and len(schedule.edges_between(map_root, downstream_root)) == 2
+                len(dependency_plan.edges_between(partition_reduce_root, map_root)) == 1
+                and len(dependency_plan.edges_between(map_root, downstream_root)) == 2
             ):
                 if producer_root + 7 >= len(self.cases):
                     continue
@@ -3689,11 +3090,15 @@ class ForEachProgramID(ProgramIDs):
                 downstream_root = producer_root + 7
                 if not (
                     len(
-                        schedule.edges_between(partition_reduce_root, final_reduce_root)
+                        dependency_plan.edges_between(
+                            partition_reduce_root, final_reduce_root
+                        )
                     )
                     == 2
-                    and len(schedule.edges_between(final_reduce_root, map_root)) == 1
-                    and len(schedule.edges_between(map_root, downstream_root)) == 2
+                    and len(dependency_plan.edges_between(final_reduce_root, map_root))
+                    == 1
+                    and len(dependency_plan.edges_between(map_root, downstream_root))
+                    == 2
                 ):
                     continue
             finalize_axes = self._static_case_axes(
@@ -4166,6 +3571,7 @@ class ForEachProgramID(ProgramIDs):
         body: list[ast.stmt],
         name_suffix: str = "",
         extra_argument_names: tuple[str, ...] = (),
+        noinline: bool = False,
     ) -> ast.stmt:
         """Create a noinline call containing exactly one original tile body."""
         suffix = f"_{name_suffix}" if name_suffix else ""
@@ -4177,55 +3583,28 @@ class ForEachProgramID(ProgramIDs):
                 *_clone_opaque_statements(body),
             ],
             extra_argument_names=extra_argument_names,
+            noinline=noinline,
         )
 
     def _emit_opaque_singleton_root(
         self,
         *,
-        body: list[ast.stmt],
+        task_body: list[ast.stmt],
         device_function: DeviceFunction,
         worker: str,
         epoch_var: str,
         ready_arg: str,
         ready_index: int,
-        root: int,
         epoch_replicas: int,
         ready_replica_stride: int | None = None,
-        logical_pid: int,
-        ordered_loop_index: int | None = None,
-        group_ready_counter: str | None = None,
-        group_ready_target: str | None = None,
-        reduction_step: int | None = None,
-        input_dependency: tuple[str, str] | None = None,
+        input_dependencies: tuple[tuple[str, str], ...] = (),
     ) -> list[ast.stmt]:
         """Run one original logical tile and publish its completion epoch.
 
-        ``body`` is cloned wholesale.  For an ordered producer dependency, the
-        only edit is an acquire wait at the start of an existing range-loop
-        iteration; its arithmetic statements and iteration order are retained.
+        ``task_body`` comes from the same generic task scheduler used by every
+        other root.  The singleton wrapper adds only root-level admission and
+        completion publication.
         """
-        opaque_body = _clone_opaque_statements(body)
-        if group_ready_counter is not None:
-            assert group_ready_target is not None and reduction_step is not None
-            assert ordered_loop_index is not None
-            source_loop = body[ordered_loop_index]
-            assert isinstance(source_loop, ast.For)
-            ordered_target = source_loop.target
-            assert isinstance(ordered_target, ast.Name)
-            opaque_body[ordered_loop_index] = _prepend_schedule_to_opaque_loop(
-                source_loop,
-                self._wait_for_counter(
-                    device_function=device_function,
-                    counter=(
-                        f"{group_ready_counter} + "
-                        f"({ordered_target.id} // {reduction_step})"
-                    ),
-                    target=group_ready_target,
-                    prefix="tile_dependency_input_group_wait",
-                ),
-                force_serial_pipeline=True,
-            )
-
         replica_stride = ready_replica_stride or epoch_replicas
         ready_base = (
             f"{ready_arg} + "
@@ -4238,28 +3617,19 @@ class ForEachProgramID(ProgramIDs):
             replicas=epoch_replicas,
         )
 
-        computation_body: list[ast.stmt] = [
-            statement_from_string(f"{self.shared_pid_var} = {logical_pid}"),
-            *opaque_body,
+        input_waits = [
+            statement
+            for counter, target in input_dependencies
+            for statement in self._wait_for_counter(
+                device_function=device_function,
+                counter=counter,
+                target=target,
+                prefix="tile_dependency_singleton_input_wait",
+            )
         ]
         singleton_body: list[ast.stmt] = [
-            *(
-                self._wait_for_counter(
-                    device_function=device_function,
-                    counter=input_dependency[0],
-                    target=input_dependency[1],
-                    prefix="tile_dependency_singleton_input_wait",
-                )
-                if input_dependency is not None
-                else []
-            ),
-            self._outline_tile_dependency_region(
-                device_function,
-                name_hint=f"tile_dependency_root_{root}",
-                body=computation_body,
-                extra_argument_names=(epoch_var,),
-                noinline=True,
-            ),
+            *input_waits,
+            *_clone_opaque_statements(task_body),
             self._tile_dependency_publication_barrier(device_function),
             *publish,
         ]
@@ -4269,62 +3639,6 @@ class ForEachProgramID(ProgramIDs):
                 test=expr_from_string(f"({worker}) == 0"),
                 body=singleton_body,
                 orelse=[],
-            )
-        ]
-
-    def _emit_ordered_input_producer(
-        self,
-        plan: _OrderedInputSingleton,
-        *,
-        case_bodies: list[list[ast.stmt]],
-        case_offsets: list[int],
-        strategy: PersistentProgramIDs,
-        device_function: DeviceFunction,
-        worker: str,
-        counter_arg: str,
-        input_dependency: tuple[str, str] | None = None,
-    ) -> list[ast.stmt]:
-        task = device_function.new_var(
-            "tile_dependency_ordered_producer_task", dce=True
-        )
-        group = device_function.new_var(
-            "tile_dependency_ordered_producer_group", dce=True
-        )
-        producer_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.producer_root,
-            logical_pid=f"{case_offsets[plan.producer_root]} + {task}",
-            body=case_bodies[plan.producer_root],
-            extra_argument_names=(task,),
-        )
-        task_body = [
-            *(
-                self._wait_for_counter(
-                    device_function=device_function,
-                    counter=input_dependency[0],
-                    target=input_dependency[1],
-                    prefix="tile_dependency_ordered_producer_input_wait",
-                )
-                if input_dependency is not None
-                else []
-            ),
-            producer_call,
-            self._tile_dependency_publication_barrier(device_function),
-            statement_from_string(f"{group} = {task} // {plan.tasks_per_group}"),
-            statement_from_string(
-                f"tl.atomic_add({counter_arg} + {group}, 1, sem='release', scope='gpu')"
-            ),
-        ]
-        return [
-            create(
-                ast.For,
-                target=create(ast.Name, id=task, ctx=ast.Store()),
-                iter=expr_from_string(
-                    f"tl.range({worker}, {plan.producer_tasks}, {strategy.grid_size_expr})"
-                ),
-                body=task_body,
-                orelse=[],
-                type_comment=None,
             )
         ]
 

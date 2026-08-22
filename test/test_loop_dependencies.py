@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import textwrap
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -13,23 +12,14 @@ import torch
 
 import helion
 from helion import exc
-from helion._compiler import ast_extension
-from helion._compiler.ast_extension import ExtendedAST
-from helion._compiler.ast_extension import LoopType
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.device_function import DeviceFunction
-from helion._compiler.loop_dependency_checker import TileAccessKind
-from helion._compiler.loop_dependency_checker import TileDependencyAnalysis
-from helion._compiler.loop_dependency_checker import TileDependencyKind
-from helion._compiler.loop_dependency_checker import TileDependencySynchronization
-from helion._compiler.loop_dependency_checker import analyze_top_level_tile_dependencies
 from helion._compiler.program_id import ForEachProgramID
 from helion._compiler.program_id import _ast_fingerprint
 from helion._compiler.program_id import _clone_opaque_loop_segment
 from helion._compiler.program_id import _clone_opaque_statements
 from helion._compiler.program_id import _partitioned_materialization_geometry
 from helion._compiler.program_id import _prepend_schedule_to_opaque_loop
-from helion._compiler.tile_dependency_schedule import build_tile_dependency_stage_graph
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -37,18 +27,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 import helion.language as hl
-
-
-def _analyze_source(source: str) -> TileDependencyAnalysis:
-    module = ast_extension.convert(ast.parse(textwrap.dedent(source)))
-    assert isinstance(module, ast.Module)
-    function = module.body[0]
-    assert isinstance(function, ast.FunctionDef)
-    for statement in function.body:
-        if isinstance(statement, ast.For):
-            assert isinstance(statement, ExtendedAST)
-            statement._loop_type = LoopType.GRID
-    return analyze_top_level_tile_dependencies(function.body)
 
 
 @helion.kernel(autotune_effort="none")
@@ -79,6 +57,36 @@ dynamic_implicit_tile_dependency_chain = helion.kernel(
     autotune_effort="none",
     tile_dependency_schedule=helion.TileDependencySchedule(),
 )(implicit_tile_dependency_chain.fn)
+
+
+@helion.kernel(autotune_effort="none")
+def implicit_atomic_dependency(x: torch.Tensor) -> torch.Tensor:
+    tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        hl.atomic_xchg(tmp, [tile], x[tile])
+    for tile in hl.tile(x.size(0)):
+        out[tile] = tmp[tile] + 1
+    return out
+
+
+scheduled_atomic_dependency = helion.kernel(
+    autotune_effort="none",
+    tile_dependency_schedule=helion.TileDependencySchedule(),
+)(implicit_atomic_dependency.fn)
+
+
+@helion.kernel(
+    autotune_effort="none",
+    tile_dependency_schedule=helion.TileDependencySchedule(),
+)
+def invalid_cross_root_value(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for source_tile in hl.tile(x.size(0)):
+        carry = x[source_tile] + 1
+    for output_tile in hl.tile(x.size(0)):
+        out[output_tile] = carry  # pyrefly: ignore [unbound-name]
+    return out
 
 
 @helion.kernel(
@@ -148,7 +156,7 @@ def implicit_tile_dependency_matmul_chain(
     return out
 
 
-class TestTileDependencyAnalysis(unittest.TestCase):
+class TestTileDependencyScheduling(unittest.TestCase):
     def test_partitioned_materialization_geometry_is_shape_derived(self) -> None:
         self.assertEqual(
             _partitioned_materialization_geometry(
@@ -223,6 +231,7 @@ class TestTileDependencyAnalysis(unittest.TestCase):
         device_function = object.__new__(DeviceFunction)
         device_function.arguments = []
         device_function.wrapper_only_params = []
+        device_function.preamble = []
         cast("Any", device_function).namespace = SimpleNamespace(
             create_name=lambda name, _value: name
         )
@@ -252,250 +261,49 @@ class TestTileDependencyAnalysis(unittest.TestCase):
             ast.unparse(helper.decorator_list[0]), "triton.jit(noinline=True)"
         )
 
+    def test_outlined_tile_body_captures_compiler_preamble_values(self) -> None:
+        device_function = object.__new__(DeviceFunction)
+        device_function.arguments = []
+        device_function.wrapper_only_params = []
+        device_function.preamble = cast(
+            "list[ast.AST]",
+            ast.parse(
+                "weight_desc = tl.make_tensor_descriptor(weight, [size], [1], [16])\n"
+            ).body,
+        )
+        cast("Any", device_function).namespace = SimpleNamespace(
+            create_name=lambda name, _value: name
+        )
+        device_function.triton_noinline_helpers = []
+        device_function.triton_noinline_helper_constexprs = {}
+        device_function._variable_renames = {}
+        device_function.dce_vars = []
+        cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
+        cast("Any", device_function).helper_manager = SimpleNamespace(
+            codegen_helper_functions=list
+        )
+        body = ast.parse("value = weight_desc.load([offset])\n").body
+        environment = SimpleNamespace(backend_name="triton")
+
+        with mock.patch.object(CompileEnvironment, "current", return_value=environment):
+            helper_name, arguments = device_function.register_triton_noinline_helper(
+                "descriptor_tile", body
+            )
+            helper = device_function.codegen_helper_functions()[0]
+
+        self.assertEqual(helper_name, "descriptor_tile")
+        self.assertEqual(arguments, ("weight_desc",))
+        self.assertIsInstance(helper, ast.FunctionDef)
+        assert isinstance(helper, ast.FunctionDef)
+        self.assertEqual(
+            [argument.arg for argument in helper.args.args], ["weight_desc"]
+        )
+
     def test_schedule_knobs_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "epoch_replicas"):
             helion.TileDependencySchedule(epoch_replicas=0)
         with self.assertRaisesRegex(ValueError, "producer_order"):
             helion.TileDependencySchedule(producer_order="grouped")  # type: ignore[arg-type]
-
-    def test_normalizes_host_views_and_aliases_to_base_storage(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, out, n):
-                producer_view = tmp.view(n)
-                consumer_view = tmp[:].reshape(n)
-                for i in range(n):
-                    producer_view[i] = x[i]
-                for j in range(n):
-                    out[j] = consumer_view[j]
-            """
-        )
-        self.assertEqual(len(analysis.tile_dependencies), 1)
-        dependency = analysis.tile_dependencies[0]
-        self.assertEqual(dependency.name, "tmp")
-        self.assertEqual((dependency.producer_root, dependency.consumer_root), (0, 1))
-
-    def test_explicit_store_is_a_producer_write(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, out, n):
-                for i in range(n):
-                    hl.store(tmp, [i], x[i])
-                for j in range(n):
-                    out[j] = tmp[j]
-            """
-        )
-        self.assertEqual(len(analysis.tile_dependencies), 1)
-        self.assertEqual(analysis.tile_dependencies[0].name, "tmp")
-
-    def test_reused_root_local_name_is_not_a_dependency(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, out, n):
-                for i in range(n):
-                    acc = 0
-                    acc = acc + x[i]
-                    tmp[i] = acc
-                for j in range(n):
-                    acc = 0
-                    acc = acc + tmp[j]
-                    out[j] = acc
-            """
-        )
-        self.assertEqual(
-            [dependency.name for dependency in analysis.tile_dependencies],
-            ["tmp"],
-        )
-
-    def test_branch_defined_root_local_name_is_not_a_dependency(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, out, n, pred):
-                for i in range(n):
-                    if pred:
-                        acc = x[i] + 1
-                    else:
-                        acc = x[i] - 1
-                    tmp[i] = acc
-                for j in range(n):
-                    if pred:
-                        acc = tmp[j] * 2
-                    else:
-                        acc = tmp[j] * 3
-                    out[j] = acc
-            """
-        )
-        self.assertEqual(
-            [dependency.name for dependency in analysis.tile_dependencies],
-            ["tmp"],
-        )
-
-    def test_unsynchronized_read_after_write(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, out, n):
-                for i in range(n):
-                    tmp[i] = x[i]
-                for j in range(n):
-                    out[j] = tmp[j]
-            """
-        )
-        self.assertEqual(analysis.root_count, 2)
-        self.assertEqual(analysis.source_phase_starts, frozenset())
-        self.assertEqual(len(analysis.tile_dependencies), 1)
-        dependency = analysis.tile_dependencies[0]
-        self.assertEqual((dependency.producer_root, dependency.consumer_root), (0, 1))
-        self.assertEqual(dependency.name, "tmp")
-        self.assertEqual(
-            dependency.kinds, frozenset({TileDependencyKind.READ_AFTER_WRITE})
-        )
-        self.assertIs(
-            dependency.synchronization,
-            TileDependencySynchronization.UNSYNCHRONIZED,
-        )
-
-    def test_tracks_multiple_consumers_without_creating_a_schedule(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, out0, out1, n):
-                for i in range(n):
-                    tmp[i] = x[i]
-                for j in range(n):
-                    out0[j] = tmp[j]
-                for k in range(n):
-                    out1[k] = tmp[k]
-            """
-        )
-        self.assertEqual(
-            [
-                (dependency.producer_root, dependency.consumer_root)
-                for dependency in analysis.tile_dependencies
-            ],
-            [(0, 1), (0, 2)],
-        )
-        self.assertEqual(len(analysis.unsynchronized_tile_dependencies), 2)
-
-        schedule = build_tile_dependency_stage_graph(analysis)
-        self.assertEqual(schedule.stage_by_root, (0, 1, 1))
-        self.assertEqual(schedule.implicit_stage_starts, frozenset({1}))
-
-    def test_combines_read_and_write_kinds(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, n):
-                for i in range(n):
-                    tmp[i] = x[i]
-                for j in range(n):
-                    tmp[j] += 1
-            """
-        )
-        self.assertEqual(
-            analysis.tile_dependencies[0].kinds,
-            frozenset(
-                {
-                    TileDependencyKind.READ_AFTER_WRITE,
-                    TileDependencyKind.WRITE_AFTER_WRITE,
-                }
-            ),
-        )
-
-    def test_write_after_read_tracks_every_live_reader(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, out0, out1, n):
-                for i in range(n):
-                    out0[i] = x[i]
-                for j in range(n):
-                    out1[j] = x[j]
-                for k in range(n):
-                    x[k] = 0
-            """
-        )
-        dependencies = {
-            (dependency.producer_root, dependency.consumer_root): dependency.kinds
-            for dependency in analysis.tile_dependencies
-        }
-        self.assertEqual(
-            dependencies,
-            {
-                (0, 2): frozenset({TileDependencyKind.WRITE_AFTER_READ}),
-                (1, 2): frozenset({TileDependencyKind.WRITE_AFTER_READ}),
-            },
-        )
-
-    def test_tuple_unpacked_views_alias_base_storage(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp, out, n):
-                left, right = tmp.unbind(0)
-                for i in range(n):
-                    left[i] = x[i]
-                for j in range(n):
-                    out[j] = right[j]
-            """
-        )
-        self.assertEqual(len(analysis.tile_dependencies), 1)
-        self.assertEqual(analysis.tile_dependencies[0].name, "tmp")
-        self.assertEqual(
-            [
-                (access.storage, access.kind)
-                for accesses in analysis.accesses_by_root
-                for access in accesses
-                if access.storage == "tmp"
-            ],
-            [
-                ("tmp", TileAccessKind.WRITE),
-                ("tmp", TileAccessKind.READ),
-            ],
-        )
-
-    def test_chained_dependencies_require_distinct_phases(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(x, tmp0, tmp1, out, n):
-                for i in range(n):
-                    tmp0[i] = x[i]
-                for j in range(n):
-                    tmp1[j] = tmp0[j]
-                for k in range(n):
-                    out[k] = tmp1[k]
-            """
-        )
-        schedule = build_tile_dependency_stage_graph(analysis)
-        self.assertEqual(schedule.stage_by_root, (0, 1, 2))
-        self.assertEqual(schedule.implicit_stage_starts, frozenset({1, 2}))
-        self.assertEqual(
-            [stage.roots for stage in schedule.stages],
-            [(0,), (1,), (2,)],
-        )
-        self.assertEqual(
-            [
-                (edge.producer_stage, edge.consumer_stage, edge.storage)
-                for edge in schedule.edges
-            ],
-            [(0, 1, "tmp0"), (1, 2, "tmp1")],
-        )
-        self.assertEqual(schedule.unsynchronized_edges, schedule.edges)
-        self.assertEqual(
-            tuple(edge.storage for edge in schedule.edges_between(1, 2)),
-            ("tmp1",),
-        )
-
-    def test_schedule_rejects_opaque_nonstorage_dependency(self) -> None:
-        analysis = _analyze_source(
-            """
-            def kernel(out, n):
-                carry = 0
-                for i in range(n):
-                    carry = i
-                for j in range(n):
-                    out[j] = carry
-            """
-        )
-        with self.assertRaisesRegex(
-            exc.TileDependencyScheduleError, "opaque access footprint"
-        ):
-            build_tile_dependency_stage_graph(analysis, helion.TileDependencySchedule())
 
 
 @onlyBackends(["triton"])
@@ -506,19 +314,14 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         bound = tile_dependency_info_across_barrier.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        analysis = host_function.compiler_state.tile_dependency_analysis
         schedule = host_function.device_ir.tile_dependency_schedule
-        assert analysis is not None
         assert schedule is not None
-        self.assertEqual(host_function.device_ir.cross_loop_accesses, ())
-        self.assertIsNone(host_function.device_ir.cross_loop_dependency_plan)
-        self.assertEqual(analysis.source_phase_starts, frozenset({1}))
+        dependency_plan = host_function.device_ir.cross_loop_dependency_plan
+        assert dependency_plan is not None
+        self.assertTrue(host_function.device_ir.cross_loop_accesses)
+        self.assertEqual(dependency_plan.edges, ())
         self.assertEqual(schedule.stage_by_root, (0, 1))
         self.assertEqual(schedule.implicit_stage_starts, frozenset())
-        self.assertIs(
-            analysis.tile_dependencies[0].synchronization,
-            TileDependencySynchronization.SOURCE_BARRIER,
-        )
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
     def test_implicit_dependency_requires_explicit_schedule(self) -> None:
@@ -526,6 +329,39 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         with pytest.raises(exc.LoopDependencyError, match="tmp"):
             code_and_output(
                 implicit_tile_dependency_chain,
+                (x,),
+                block_sizes=[8, 8],
+                pid_type="persistent_blocked",
+            )
+
+    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
+    def test_allocation_graph_tracks_atomics_as_writes(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        with pytest.raises(exc.LoopDependencyError, match="tmp"):
+            code_and_output(
+                implicit_atomic_dependency,
+                (x,),
+                block_sizes=[8, 8],
+                pid_type="persistent_blocked",
+            )
+
+        _code, output = code_and_output(
+            scheduled_atomic_dependency,
+            (x,),
+            block_sizes=[8, 8],
+            pid_type="persistent_blocked",
+        )
+        torch.testing.assert_close(output, x + 1)
+
+    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
+    def test_schedule_rejects_cross_root_device_values(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        with pytest.raises(
+            exc.CrossRootDeviceValue,
+            match="cannot be carried between top-level loops",
+        ):
+            code_and_output(
+                invalid_cross_root_value,
                 (x,),
                 block_sizes=[8, 8],
                 pid_type="persistent_blocked",
@@ -594,33 +430,44 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
+    def test_outlined_matmul_root_threads_tensor_descriptor(self) -> None:
+        a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
+        b = torch.eye(16, device=DEVICE)
+        c = torch.eye(16, device=DEVICE)
+        code, output = code_and_output(
+            implicit_tile_dependency_matmul_chain,
+            (a, b, c),
+            block_sizes=[16, 16, 16, 16, 16, 16],
+            indexing=[
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+            ],
+            pid_type="persistent_blocked",
+            num_warps=4,
+        )
+
+        torch.testing.assert_close(output, a, atol=0, rtol=0)
+        self.assertIn("b_desc = tl.make_tensor_descriptor", code)
+        self.assertIn("def tile_dependency_root_0(a, tmp, b_desc):", code)
+
 
 @onlyBackends(["cute"])
 class TestLoops(RefEagerTestBase, TestCase):
     @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
-    def test_tile_dependency_analysis_is_attached_to_device_ir(self) -> None:
+    def test_device_ir_records_source_barrier_phases(self) -> None:
         x = torch.empty(8, device=DEVICE)
         bound = tile_dependency_info_across_barrier.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        analysis = host_function.compiler_state.tile_dependency_analysis
-        self.assertIsNotNone(analysis)
-        assert analysis is not None
-        self.assertEqual(analysis.source_phase_starts, frozenset({1}))
-        self.assertEqual(len(analysis.tile_dependencies), 1)
-        dependency = analysis.tile_dependencies[0]
-        self.assertIs(
-            dependency.synchronization,
-            TileDependencySynchronization.SOURCE_BARRIER,
-        )
-        self.assertEqual(
-            host_function.device_ir.tile_dependencies,
-            analysis.tile_dependencies,
-        )
-        self.assertEqual(
-            host_function.device_ir.tile_accesses,
-            analysis.accesses_by_root,
-        )
+        schedule = host_function.device_ir.tile_dependency_schedule
+        assert schedule is not None
+        self.assertEqual(schedule.stage_by_root, (0, 1))
+        self.assertEqual(schedule.implicit_stage_starts, frozenset())
 
     @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_loop_dependency_error1(self):

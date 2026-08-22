@@ -39,7 +39,6 @@ def _disable_sequence_plans(self, *args: object, **kwargs: object):
 
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--disable-ordered-input", action="store_true")
     parser.add_argument("--disable-partitioned", action="store_true")
     parser.add_argument("--disable-continuation", action="store_true")
     parser.add_argument("--epoch-replicas", type=int)
@@ -47,8 +46,6 @@ def main() -> None:
     parser.add_argument("--strict-validation", action="store_true")
     args, remaining = parser.parse_known_args()
 
-    if args.disable_ordered_input:
-        ForEachProgramID._match_ordered_input_singletons = _disable_plans
     if args.disable_partitioned:
         ForEachProgramID._match_partitioned_dependency_pipeline = _disable_plans
     if args.disable_continuation:

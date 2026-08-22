@@ -77,9 +77,7 @@ def _mark_cross_loop_access_wait(state: CodegenState) -> None:
             state.device_function.cross_loop_access_coordinates[access_id] = None
             return
     state.device_function.cross_loop_access_coordinates[access_id] = coordinates
-    state.add_statement(
-        statement_from_string(repr(cross_loop_access_marker(access_id)))
-    )
+    state.add_statement(cross_loop_access_marker(access_id))
 
 
 @_decorators.codegen(store, "triton")

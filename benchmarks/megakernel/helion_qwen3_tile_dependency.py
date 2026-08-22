@@ -605,10 +605,14 @@ def run(args) -> None:
     if args.dump_ir:
         print(host_function.device_ir.debug_str(), flush=True)
         print(
-            "TILE_DEPENDENCIES",
+            "CROSS_LOOP_DEPENDENCIES",
             [
                 dataclasses.asdict(dependency)
-                for dependency in host_function.device_ir.tile_dependencies
+                for dependency in (
+                    host_function.device_ir.cross_loop_dependency_plan.edges
+                    if host_function.device_ir.cross_loop_dependency_plan is not None
+                    else ()
+                )
             ],
             flush=True,
         )
@@ -625,7 +629,11 @@ def run(args) -> None:
         "COMPILED",
         {
             "roots": len(host_function.device_ir.root_ids),
-            "tile_dependencies": len(host_function.device_ir.tile_dependencies),
+            "tile_dependencies": len(
+                host_function.device_ir.cross_loop_dependency_plan.edges
+                if host_function.device_ir.cross_loop_dependency_plan is not None
+                else ()
+            ),
             "implicit_phase_starts": sorted(
                 host_function.device_ir.tile_dependency_schedule.implicit_phase_starts
             ),

@@ -32,9 +32,7 @@ if TYPE_CHECKING:
     import types
 
     from .device_ir import DeviceIR
-    from .loop_dependency_checker import TileDependencyAnalysis
     from .source_location import SourceLocation
-    from .tile_dependency_schedule import ResolvedTileDependencySchedule
     from .type_info import TypeInfo
 
     class _TLS(Protocol):
@@ -105,8 +103,6 @@ class CompilerState:
     )
     global_imports: dict[str, GlobalImport] = dataclasses.field(default_factory=dict)
     rng_seed_slot_count: int = 0
-    tile_dependency_analysis: TileDependencyAnalysis | None = None
-    tile_dependency_schedule: ResolvedTileDependencySchedule | None = None
 
 
 class HostFunction:

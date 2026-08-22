@@ -730,7 +730,11 @@ def run(args) -> None:
         {
             "variant": variant_name(geometry),
             "roots": len(host_function.device_ir.root_ids),
-            "tile_dependencies": len(host_function.device_ir.tile_dependencies),
+            "tile_dependencies": len(
+                host_function.device_ir.cross_loop_dependency_plan.edges
+                if host_function.device_ir.cross_loop_dependency_plan is not None
+                else ()
+            ),
             "implicit_phase_starts": sorted(
                 host_function.device_ir.tile_dependency_schedule.implicit_phase_starts
             ),

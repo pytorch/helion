@@ -1272,6 +1272,19 @@ class DeviceFunction:
             for name in self.wrapper_only_params
             if name in reads and name not in argument_names
         )
+        # Outlined roots may read values synthesized by compiler preamble code
+        # rather than kernel arguments.  Tensor descriptors are the common
+        # example: the preamble constructs ``*_desc`` from the underlying
+        # pointer/shape/stride arguments, and the opaque root calls methods on
+        # that descriptor.  Treat every such live preamble definition as part
+        # of the generated helper ABI instead of leaving a free name that only
+        # exists in the parent kernel scope.
+        preamble_writes = ReadWrites.from_list(self.preamble).writes
+        argument_names.extend(
+            name
+            for name in preamble_writes
+            if name in reads and name not in local_names and name not in argument_names
+        )
         argument_names.extend(
             name
             for name in extra_argument_names

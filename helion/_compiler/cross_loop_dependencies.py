@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import enum
 import itertools
 import math
 from typing import TYPE_CHECKING
 from typing import Literal
 
-from .loop_dependency_checker import TileDependencyKind
-
 if TYPE_CHECKING:
+    import sympy
+
     from .device_ir import DeviceIR
 
 
@@ -17,13 +18,31 @@ CROSS_LOOP_ACCESS_ID_META = "_cross_loop_access_id"
 CROSS_LOOP_ACCESS_MARKER_PREFIX = "__helion_cross_loop_access_wait__:"
 
 
-def cross_loop_access_marker(access_id: int) -> str:
-    """Return the inert AST marker placed immediately before one consumer load."""
-    return f"{CROSS_LOOP_ACCESS_MARKER_PREFIX}{access_id}"
+class TileDependencyKind(enum.Enum):
+    """The memory hazard represented by a cross-loop dependency edge."""
+
+    READ_AFTER_WRITE = "read_after_write"
+    WRITE_AFTER_READ = "write_after_read"
+    WRITE_AFTER_WRITE = "write_after_write"
+
+
+def cross_loop_access_marker(access_id: int) -> ast.stmt:
+    """Return a tagged inert program point immediately before a consumer load."""
+    from .ast_extension import create
+
+    marker = create(ast.Expr, value=create(ast.Constant, value=None))
+    setattr(marker, CROSS_LOOP_ACCESS_ID_META, access_id)
+    return marker
 
 
 def cross_loop_access_marker_id(statement: ast.AST) -> int | None:
-    """Decode an access marker without matching ordinary string expressions."""
+    """Return the access attached to an explicit compiler program point."""
+    access_id = getattr(statement, CROSS_LOOP_ACCESS_ID_META, None)
+    if isinstance(access_id, int):
+        return access_id
+
+    # Accept the old inert string representation while cached/generated bodies
+    # from the migration branch are still useful for comparison.
     if not (
         isinstance(statement, ast.Expr)
         and isinstance(statement.value, ast.Constant)
@@ -71,6 +90,41 @@ def owner_root_by_graph_id(device_ir: DeviceIR) -> tuple[int, ...]:
                 owners[graph_info.graph_id] = parent_owners.pop()
                 changed = True
     return tuple(owners)
+
+
+@dataclasses.dataclass(frozen=True)
+class LogicalTaskAxis:
+    """One source-level axis in a root's logical task space.
+
+    ``extent`` comes directly from the block-size registration performed while
+    tracing ``hl.tile``.  It is independent of the later physical PID order or
+    an L2 traversal chosen by a concrete configuration.
+    """
+
+    block_id: int
+    extent: sympy.Expr | str | None
+    canonical_origin: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskFamily:
+    """One opaque top-level loop and its authoritative logical task domain."""
+
+    root: int
+    graph_id: int | None
+    axes: tuple[LogicalTaskAxis, ...]
+    access_ids: tuple[int, ...] = ()
+
+    @property
+    def logical_axis_order(self) -> tuple[int, ...]:
+        return tuple(axis.block_id for axis in self.axes)
+
+    @property
+    def has_canonical_origin(self) -> bool:
+        return all(axis.canonical_origin for axis in self.axes)
+
+    def axis(self, block_id: int) -> LogicalTaskAxis | None:
+        return next((axis for axis in self.axes if axis.block_id == block_id), None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,6 +272,7 @@ class CrossLoopDependencyEdge:
 class CrossLoopDependencyPlan:
     """Allocation-derived dependencies and their strongest proven readiness."""
 
+    task_families: tuple[TaskFamily, ...]
     accesses: tuple[CrossLoopAccess, ...]
     edges: tuple[CrossLoopDependencyEdge, ...]
     events: tuple[EventSpec, ...]
@@ -548,8 +603,10 @@ def prove_uniform_task_partition(
 
 def build_cross_loop_dependency_plan(
     accesses: tuple[CrossLoopAccess, ...],
-    grid_block_ids: list[list[int]],
+    grid_block_ids: list[list[int]] | None = None,
     *,
+    task_families: tuple[TaskFamily, ...] | None = None,
+    root_phases: tuple[int, ...] | None = None,
     noncanonical_task_origin_block_ids: frozenset[int] = frozenset(),
 ) -> CrossLoopDependencyPlan:
     """Build the minimal source-ordered allocation hazard graph.
@@ -559,11 +616,52 @@ def build_cross_loop_dependency_plan(
     task readiness for the strict affine subset. Anything else remains a
     root-completion dependency.
     """
-    root_count = len(grid_block_ids)
+    if task_families is None:
+        if grid_block_ids is None:
+            raise TypeError("grid_block_ids or task_families must be provided")
+        task_families = tuple(
+            TaskFamily(
+                root=root,
+                graph_id=None,
+                axes=tuple(
+                    LogicalTaskAxis(
+                        block_id=block_id,
+                        extent=None,
+                        canonical_origin=(
+                            block_id not in noncanonical_task_origin_block_ids
+                        ),
+                    )
+                    for block_id in block_ids
+                ),
+            )
+            for root, block_ids in enumerate(grid_block_ids)
+        )
+    elif grid_block_ids is not None and tuple(
+        tuple(block_ids) for block_ids in grid_block_ids
+    ) != tuple(family.logical_axis_order for family in task_families):
+        raise ValueError("grid_block_ids disagree with task_families")
+
+    root_count = len(task_families)
+    if root_phases is None:
+        root_phases = (0,) * root_count
+    elif len(root_phases) != root_count:
+        raise ValueError("root_phases must have one entry per task family")
+    grid_block_ids = [list(family.logical_axis_order) for family in task_families]
     accesses_by_root: list[list[CrossLoopAccess]] = [[] for _ in range(root_count)]
     for access in accesses:
         if 0 <= access.root < root_count and access.allocation_id >= 0:
             accesses_by_root[access.root].append(access)
+
+    # Views can carry different source names at different roots while still
+    # naming the same storage.  Keep one diagnostic alias set per allocation so
+    # diagnostics can describe the DeviceIR edge without manufacturing one
+    # duplicate edge per source spelling.
+    tensor_names_by_allocation: dict[int, set[str]] = {}
+    for access in accesses:
+        if access.allocation_id >= 0 and access.tensor_name is not None:
+            tensor_names_by_allocation.setdefault(access.allocation_id, set()).add(
+                access.tensor_name
+            )
 
     reads_by_root = [
         _accesses_by_allocation(root_accesses, "load")
@@ -588,7 +686,13 @@ def build_cross_loop_dependency_plan(
             (producer_root, consumer_root, allocation_id), set()
         ).add(kind)
 
+    current_phase: int | None = None
     for consumer_root in range(root_count):
+        phase = root_phases[consumer_root]
+        if phase != current_phase:
+            latest_writer.clear()
+            readers_since_write.clear()
+            current_phase = phase
         reads = reads_by_root[consumer_root]
         writes = writes_by_root[consumer_root]
         for allocation_id in reads:
@@ -649,9 +753,7 @@ def build_cross_loop_dependency_plan(
                 consumer_root=consumer_root,
                 allocation_id=allocation_id,
                 tensor_names=frozenset(
-                    access.tensor_name
-                    for access in (*producer_accesses, *consumer_accesses)
-                    if access.tensor_name is not None
+                    tensor_names_by_allocation.get(allocation_id, ())
                 ),
                 kinds=kinds,
                 producer_accesses=producer_accesses,
@@ -662,6 +764,7 @@ def build_cross_loop_dependency_plan(
 
     events, waits = _build_event_plan(tuple(edges), grid_block_ids)
     return CrossLoopDependencyPlan(
+        task_families=task_families,
         accesses=accesses,
         edges=tuple(edges),
         events=events,
@@ -705,13 +808,7 @@ def _build_event_plan(
         )
 
     for (producer_root, consumer_root), pair_edges in edges_by_pair.items():
-        requires_root = any(
-            not edge.is_raw_only
-            or not edge.readiness
-            or any(requirement.granularity == "root" for requirement in edge.readiness)
-            for edge in pair_edges
-        )
-        if requires_root:
+        if any(not edge.is_raw_only or not edge.readiness for edge in pair_edges):
             waits.append(
                 WaitSpec(
                     consumer_root=consumer_root,
@@ -723,24 +820,26 @@ def _build_event_plan(
             )
             continue
 
-        task_event_id = event_id(producer_root, "task")
         consumer_grid = set(grid_block_ids[consumer_root])
         for edge in pair_edges:
             for requirement in edge.readiness:
-                assert requirement.predecessor_map is not None
+                granularity = requirement.granularity
+                predecessor_map = requirement.predecessor_map
                 wait = WaitSpec(
                     consumer_root=consumer_root,
                     consumer_access_id=requirement.consumer_access_id,
-                    event_id=task_event_id,
+                    event_id=event_id(producer_root, granularity),
                     placement=(
                         "root_entry"
-                        if all(
+                        if granularity == "task"
+                        and predecessor_map is not None
+                        and all(
                             axis.consumer_block_id in consumer_grid
-                            for axis in requirement.predecessor_map.axes
+                            for axis in predecessor_map.axes
                         )
                         else "access"
                     ),
-                    predecessor_map=requirement.predecessor_map,
+                    predecessor_map=predecessor_map,
                 )
                 if wait not in waits:
                     waits.append(wait)

@@ -503,6 +503,178 @@ introduce the small edge-based planner alongside the current implementation,
 make it authoritative for legality, migrate codegen to its generic plan, and
 then delete the specialized machinery.
 
+## Post-Qwen/Gemma refactor decision
+
+The Qwen and Gemma experiments separate three concerns that the current
+implementation still partially mixes:
+
+1. dependency legality: which producer tasks must complete before a consumer
+   task or access may run;
+2. synchronization representation: root counters, exact task epochs, or a
+   counted event indexed by a consumer key; and
+3. execution policy: ordinary worker traversal, last-arrival continuation, or
+   overlap between producer and consumer worker cohorts.
+
+The compiler should model these independently. A legal continuation is not
+automatically profitable, and a profitable root tile configuration is not a
+new scheduling strategy.
+
+The intended end state is:
+
+```text
+Opaque root + logical task space
+              |
+              v
+Normalized allocation-coordinate accesses
+              |
+              v
+Exact producer-to-consumer task relations
+              |
+              v
+Generic readiness events and legal execution choices
+              |
+              v
+Small deterministic global policy
+              |
+              v
+Generic persistent lowering around unchanged root calls
+```
+
+### First-class logical task families
+
+Every top-level root will have one authoritative task-family description:
+
+- source root and body graph;
+- logical axes, extents, origins, steps, and block-size references;
+- symbolic and instantiated task counts;
+- logical-to-physical PID traversal, including L2 remapping;
+- normalized allocation accesses and stable program points; and
+- the complete outlined-root ABI, including compiler-created descriptors.
+
+Dependency proofs use logical coordinates only. Physical PID traversal is an
+execution choice and must not change event identity.
+
+### One dependency representation
+
+The allocation-derived `CrossLoopDependencyEdge` is the only dependency edge
+stored in DeviceIR. The earlier source-AST dependency and access records are no
+longer copied into DeviceIR or consulted by lowering. Each graph edge carries:
+
+- producer and consumer task families;
+- RAW, WAR, or WAW kind;
+- normalized allocation-coordinate regions;
+- a conservative consumer-key-to-producer-task relation when provable; and
+- root completion otherwise.
+
+The supported exact relation is intentionally small: a union of affine
+Cartesian producer-coordinate intervals. This represents unequal tile sizes,
+outer batch axes, and the two disjoint gate/up regions without requiring a
+general symbolic-set solver. Enumeration remains a test oracle, not the
+production representation.
+
+### Counted readiness as the common synchronization primitive
+
+Root completion, exact task events, joins, and readiness cohorts are all
+instances of a counted event:
+
+- an index/key space;
+- a mapping from completed work to event keys;
+- an exact expected contribution count;
+- publication program points; and
+- consumer wait program points.
+
+Root completion has one key and one contribution per active producer worker.
+An exact task event uses the producer task as its key and count one. A join uses
+the consumer logical key and derives its fan-in from the predecessor relation.
+A cohort event adds a monotone milestone to that key.
+
+Continuation is an execution choice on a counted event: the producer that
+makes the final contribution may execute the now-ready opaque consumer task.
+Disjointness, coverage, and fan-in are proof obligations, never tuning knobs.
+
+### Local proof, small global policy
+
+Dependency legality remains pairwise over producer and consumer task families.
+A thin global planner is still required for joins, worker ownership, progress,
+and the shared resource envelope. Its deterministic cost model considers:
+
+- producer and consumer task counts and wave counts;
+- fan-in, polling fanout, and event storage;
+- critical-path overlap exposed by a strategy;
+- compiled registers and shared memory;
+- driver-reported resident capacity and safety margin; and
+- load balance across the selected worker count.
+
+The 592-worker Gemma experiment shows that satisfying full residency is a
+legality condition, not a reason to fill every resident slot. The planner must
+be allowed to select fewer workers.
+
+### Keep codegen tuning outside the scheduler
+
+The scheduler invokes each outlined root unchanged except for waits,
+publications, and task dispatch. Fusion-aware root configuration is a separate
+autotuning concern. Gemma's gain came from ordinary choices such as QKV N=8,
+output K=512, range stages, and the gate-weight `evict_first` annotation. The
+same schedule regressed from roughly 72.25 to 84.4 microseconds when that load
+annotation was omitted.
+
+The fused autotuner may jointly select existing root tile/range/indexing
+choices using the compiled global resource envelope. It must not encode those
+choices as model-specific scheduler logic.
+
+### Simplification guardrails
+
+The final planner and lowering must not depend on:
+
+- model, operator, or tensor names;
+- adjacency of roots in source order;
+- recognizing a particular number of roots;
+- scanning lowered Triton AST for characteristic loads or reductions;
+- reconstructing logical tasks from flattened PID expressions; or
+- public knobs for fan-in, producer order, event replication, or continuation
+  splits.
+
+Any failed proof selects exact task events, root completion, or the existing
+cooperative barrier fallback. The cross-loop scheduler must not duplicate,
+split, reassociate, or otherwise rewrite opaque computation bodies.
+
+### Refactor sequence and deletion gates
+
+1. Introduce `TaskFamily` geometry and explicit program points in DeviceIR
+   without changing emitted code.
+2. Build the unified dependency graph from normalized allocation accesses and
+   retain the current graph as a checked compatibility view temporarily.
+3. Add a small schedule IR for counted events, waits, publications, and opaque
+   task calls; move pure planning out of `program_id.py`.
+4. Migrate root completion, exact task events, and uniform last-arrival
+   continuation to the generic schedule IR.
+5. Add generic multi-producer joins and monotone nested-loop milestones. Use
+   these to express the Qwen/Gemma FFN stream.
+6. Express the useful attention/reduction composition from these primitives.
+   If a computation-replication optimization remains desirable, place it in a
+   separate transformation pass rather than the dependency scheduler.
+7. Delete `_match_ordered_input_singletons`,
+   `_match_one_wave_reduction_fanouts`, and
+   `_match_partitioned_dependency_pipeline` only after equivalent generic
+   plans pass correctness, codegen-invariance, and performance gates.
+8. Internalize or remove `producer_order` and `epoch_replicas` after all
+   migration users disappear.
+
+The legacy top-level source dependency analysis has been deleted. DeviceIR's
+allocation graph now performs both unscheduled-hazard rejection and scheduled
+stage construction. Explicit `hl.barrier()` calls are recorded directly by the
+ordinary host-AST walker and partition the allocation history into independent
+epochs. A device value accidentally captured by a later root is rejected at
+the exact DeviceIR name lookup that previously asserted; it does not require a
+second memory-dependency analysis.
+
+The resolved schedule stores only phase boundaries and user policy. Its
+duplicate edge/access objects have been removed from DeviceIR and from the
+schedule consumed by code generation. Diagnostics and probes inspect
+`CrossLoopDependencyPlan` directly. Atomic read-modify-write operations also
+enter the allocation graph conservatively as writes, so removing the source
+scanner does not create a synchronization hole.
+
 ## Implementation plan
 
 Status values: **pending**, **in progress**, **complete**, or **blocked**.
@@ -511,34 +683,55 @@ Status values: **pending**, **in progress**, **complete**, or **blocked**.
 | --- | --- | --- | --- |
 | 0 | complete | Record the architecture and migration plan. | This living document exists and is kept current. |
 | 1 | complete | Add scheduler-specific DeviceIR access facts and an allocation-based dependency graph without changing emitted kernels. | Unit tests inspect correct RAW/WAR/WAW edges, multidimensional keys, and conservative fallback. |
-| 2 | in progress | Make the edge proof gate all existing fine-grained schedules. | The reversed-group adversarial kernel is correct by using a proven reversed map or safe root fallback; Qwen still takes a valid fast path. |
+| 2 | complete | Make the edge proof gate all existing fine-grained schedules. | The reversed-group adversarial kernel is correct by using a proven reversed map or safe root fallback; Qwen still takes a valid fast path. |
 | 3 | complete | Add generic root-ready and task-ready events to the current static persistent traversal. | Simple chains, fanout, joins, unequal tiles, and Cartesian grids use one planner/codegen path. |
 | 4 | complete | Support readiness coordinates introduced by existing nested loops and access-aware wait placement. | Nested-loop dependencies are correct without changing computation codegen. |
 | 5 | complete | Add two narrow optimizations over exact readiness: nested-loop cohorts and uniform-partition last-arrival continuations. | Qwen's FFN chain is represented without a topology matcher; failures fall back to exact events or root completion. |
-| 6 | in progress | Remove specialized matcher/emitter families and internalize or remove specialized public knobs. | Planner and codegen contain only root/task/access/event abstractions. |
-| 7 | pending | Audit and separate unrelated codegen changes; handle dynamic task counts without assertions. | Schedule-off codegen is unchanged, and dynamic-shape scheduling selects a valid symbolic path or safe fallback. |
+| 6 | in progress | Remove specialized matcher/emitter families and internalize or remove specialized public knobs. | Planner and codegen contain only root/task/access/event abstractions. The duplicate source dependency analyzer is gone. |
+| 7 | in progress | Audit and separate unrelated codegen changes; handle dynamic task counts without assertions. | Schedule-off codegen is unchanged, and dynamic-shape scheduling selects a valid symbolic path or safe fallback. |
 | 8 | in progress | Final correctness, performance, lint, and design review, including a second-model Gemma4 probe. | Test matrix passes; Qwen meets the agreed performance range; remaining limitations are explicit and structural. |
 
 ### Current migration boundary
 
-The dependency graph now owns ordinary root-entry readiness, nested-loop access
-cohorts, and the FFN producer-to-map continuation. The old flattened-ID grouped
-continuation matcher and its emitter have been deleted. Remaining structural
-emitters cover the attention partition pipeline, ordered singleton inputs, and
-reduction fanout. They are compatibility shims during migration, not templates
-for additional matcher families.
+The dependency graph now owns ordinary root-entry readiness, generic
+multi-producer joins, nested-loop access cohorts, and the FFN
+producer-to-map continuation. The old flattened-ID grouped-continuation and
+ordered-input-singleton matchers and their emitters have been deleted. The
+ordered singleton case is now expressed as one counted readiness event per
+logical stream coordinate, with the wait inserted at the existing consumer
+loop boundary identified by an explicit access program point.
+
+Only two structural emitters remain: one-wave reduction fanout and the
+partitioned attention pipeline. Both now consume the unified allocation-based
+dependency graph for legality; neither may rediscover hazards from the legacy
+tile schedule. They are compatibility shims while their additional execution
+properties are isolated, not templates for more matcher families.
+
+The review classifies those two paths differently:
+
+- One-wave reduction fanout deliberately replicates an opaque singleton
+  computation in every consumer CTA. That is an optional computation-
+  replication transform, not a dependency-scheduling primitive. Keep it
+  outside the generic scheduler until DeviceIR can prove the root is pure and
+  idempotent; do not teach the dependency graph about reductions by inspecting
+  lowered Triton.
+- The partitioned attention path is a composition of counted joins,
+  last-arrival continuations, and worker-affinity traversal. Its legality must
+  continue to come from dependency edges, but replacing it should wait until
+  normalized access relations describe every edge in that subgraph. Deleting
+  it earlier would trade a simpler file for a slower kernel without yielding a
+  genuinely general abstraction.
 
 ### Immediate next steps after the generic FFN continuation
 
-1. Audit each remaining structural planner against the dependency graph and
-   make explicit which additional schedule property it proves beyond edge
-   legality.
-2. Replace the ordered-input singleton and reduction-fanout matchers with small
-   graph-derived composition primitives where that makes the implementation
-   simpler; retain conservative root completion otherwise.
-3. Isolate the attention partition pipeline's useful primitives before trying
+1. Replace reduction fanout with a graph-derived composition primitive if its
+   only extra property is one-wave ownership; retain conservative root
+   completion otherwise.
+2. Isolate the attention partition pipeline's useful primitives before trying
    to replace it wholesale. Do not force its reduction topology into the
    uniform-partition continuation abstraction.
+3. Make logical event identity independent of physical PID traversal so exact
+   readiness remains available under ordinary loop-order and L2 remapping.
 4. Remove or internalize migration-only policy knobs after their remaining
    users disappear. Do not introduce new knobs without measured evidence of
    two materially different legal schedules.
@@ -547,6 +740,12 @@ for additional matcher families.
    exact-event or root-completion paths.
 6. Audit schedule-off generated code and remove dead access-wait experiments or
    helpers that no longer serve a fallback path.
+
+This ordering is intentional. The next compiler work should improve the graph
+inputs (view normalization and logical traversal identity) before adding more
+schedule patterns. Once the graph can express those edges, the remaining
+composite emitter can be reconstructed from generic counted-event operations
+and removed in one step.
 
 ### Current performance evidence
 
@@ -717,6 +916,9 @@ As of 2026-08-21:
   the corresponding separate-kernel runs.
 - The generic FFN continuation is selected for batch sizes 1, 2, and 4 in the
   focused grouped-chain test. Batch remains part of the readiness key.
+- The former ordered-singleton FFN stream is now selected from the same task
+  dependency graph and access program points. No lowered-AST pointer/range
+  recognizer or flattened producer-ID detector remains.
 - A reversed activation-group consumer now declines continuation and uses safe
   root completion. The unsafe topology/count matcher that previously accepted
   it has been deleted.
@@ -917,3 +1119,36 @@ Open, to be answered with implementation evidence:
 - Rejected a 592-worker boundary schedule after it measured 111.2
   microseconds versus 80.2 microseconds. Full residency remains a legality
   invariant, not a reason to fill every available CTA slot.
+- Replaced the ordered-input singleton matcher with graph-derived
+  per-coordinate counted readiness at explicit access program points. The
+  lowered Qwen kernel remains structurally identical to the retained fast
+  kernel apart from constexpr declaration order.
+- Made the outlined-root ABI include live compiler-created preamble values.
+  This mechanically threads tensor descriptors (and analogous generated
+  values) into opaque helpers instead of leaving parent-scope free names.
+- Validated that ABI change with an actual scheduled two-matmul kernel using a
+  tensor descriptor and with the Gemma4 E4B layer using a descriptor for its
+  outlined down-projection root. The latter compiled and ran correctly with
+  the descriptor present in the helper signature (150 registers, zero spills
+  in the diagnostic configuration).
+- Revalidated the current Qwen3 granular lowering after the planner migration:
+  its 1,596-line Triton body is unchanged from the committed fast lowering
+  except for constexpr declaration order, with 252 registers, zero spills, and
+  a 75.8 microsecond median in the latest run.
+- Revalidated the retained Gemma4 pointer configuration after the planner
+  migration: all checked outputs and cache writes pass, with 168 registers and
+  four spills. Timing was not repeated because unrelated processes occupied
+  the GPU; the last idle-GPU result remains approximately 72.2 microseconds.
+- Deleted the legacy pre-DeviceIR dependency analysis, its compiler passes,
+  copied access/edge state, and the duplicate edge list in the resolved
+  schedule. Every multi-root kernel now derives legality and stage boundaries
+  from allocation-identity accesses collected from DeviceIR.
+- Kept only two orthogonal checks outside that graph: the normal host walker
+  records explicit barrier boundaries, and DeviceIR name lookup reports an
+  attempted cross-root device-value capture. Neither constructs memory edges.
+- Added atomic operations to the allocation graph as conservative writes and
+  verified both unscheduled rejection and scheduled execution.
+- Revalidated the exact Qwen3 and Gemma4 lowerings after deleting source
+  analysis. Both generated files retain the same line counts and differ from
+  the prior fast versions only in constexpr declaration order; correctness and
+  resource use remain unchanged.

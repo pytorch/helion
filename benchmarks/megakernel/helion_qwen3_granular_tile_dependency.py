@@ -676,9 +676,14 @@ def main() -> None:
             )
             host_function = bound.host_function
             assert host_function is not None
-            for root, accesses in enumerate(host_function.device_ir.tile_accesses):
+            dependency_plan = host_function.device_ir.cross_loop_dependency_plan
+            assert dependency_plan is not None
+            for root in range(len(host_function.device_ir.task_families)):
+                accesses = tuple(
+                    access for access in dependency_plan.accesses if access.root == root
+                )
                 print(
-                    "TILE_ACCESSES",
+                    "CROSS_LOOP_ACCESSES",
                     root,
                     [dataclasses.asdict(access) for access in accesses],
                     flush=True,

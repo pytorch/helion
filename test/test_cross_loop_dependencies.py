@@ -6,10 +6,15 @@ import torch
 
 import helion
 from helion._compiler.cross_loop_dependencies import CrossLoopAccess
+from helion._compiler.cross_loop_dependencies import LogicalTaskAxis
+from helion._compiler.cross_loop_dependencies import TaskFamily
+from helion._compiler.cross_loop_dependencies import TileDependencyKind
 from helion._compiler.cross_loop_dependencies import build_cross_loop_dependency_plan
 from helion._compiler.cross_loop_dependencies import predecessor_task_ids
 from helion._compiler.cross_loop_dependencies import prove_uniform_task_partition
-from helion._compiler.loop_dependency_checker import TileDependencyKind
+from helion._compiler.tile_dependency_planner import AccessProgramPoint
+from helion._compiler.tile_dependency_planner import InstantiatedTaskFamily
+from helion._compiler.tile_dependency_planner import build_generic_schedule_plan
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -142,6 +147,52 @@ def cartesian_affine_join(x: torch.Tensor) -> torch.Tensor:
     autotune_effort="none",
     tile_dependency_schedule=helion.TileDependencySchedule(),
 )
+def singleton_root_join(x: torch.Tensor) -> torch.Tensor:
+    batch, width = x.size()
+    left = torch.empty_like(x)
+    right = torch.empty_like(x)
+    out = torch.empty((batch,), dtype=torch.float32, device=x.device)
+
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        left[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        right[tile_batch, tile_width] = x[tile_batch, tile_width] - 1
+    for tile_batch in hl.tile(batch, block_size=1):
+        out[tile_batch] = torch.sum(
+            left[tile_batch, :].to(torch.float32)
+            + right[tile_batch, :].to(torch.float32),
+            dim=-1,
+        )
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    tile_dependency_schedule=helion.TileDependencySchedule(),
+)
+def streamed_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
+    batch, width = x.size()
+    tmp = torch.empty_like(x)
+    out = torch.empty((batch,), dtype=torch.float32, device=x.device)
+
+    for producer_batch, producer_width in hl.tile([batch, width]):
+        tmp[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch in hl.tile(batch, block_size=1):
+        acc = hl.zeros([consumer_batch], dtype=torch.float32)
+        for reduction_width in hl.tile(width, block_size=16):
+            acc = acc + torch.sum(
+                tmp[consumer_batch, reduction_width].to(torch.float32), dim=-1
+            )
+        out[consumer_batch] = acc + tmp[consumer_batch, 0].to(torch.float32)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+    tile_dependency_schedule=helion.TileDependencySchedule(),
+)
 def offset_affine_chain(x: torch.Tensor) -> torch.Tensor:
     width = x.size(0)
     tmp = torch.empty_like(x)
@@ -190,6 +241,88 @@ def _access(
 
 
 class TestCrossLoopDependencies(TestCase):
+    def test_dependency_plan_retains_logical_task_families(self) -> None:
+        task_families = (
+            TaskFamily(
+                root=0,
+                graph_id=7,
+                axes=(LogicalTaskAxis(10, None),),
+                access_ids=(0,),
+            ),
+            TaskFamily(
+                root=1,
+                graph_id=9,
+                axes=(LogicalTaskAxis(20, None),),
+                access_ids=(1,),
+            ),
+        )
+        plan = build_cross_loop_dependency_plan(
+            (
+                _access(0, root=0, kind="store", block_ids=(10,)),
+                _access(1, root=1, kind="load", block_ids=(20,)),
+            ),
+            task_families=task_families,
+        )
+
+        self.assertEqual(plan.task_families, task_families)
+        self.assertEqual(plan.task_families[0].logical_axis_order, (10,))
+
+    def test_source_phase_boundary_satisfies_allocation_dependency(self) -> None:
+        plan = build_cross_loop_dependency_plan(
+            (
+                _access(0, root=0, kind="store", block_ids=(10,)),
+                _access(1, root=1, kind="load", block_ids=(20,)),
+            ),
+            task_families=(
+                TaskFamily(0, 0, (LogicalTaskAxis(10, None),)),
+                TaskFamily(1, 1, (LogicalTaskAxis(20, None),)),
+            ),
+            root_phases=(0, 1),
+        )
+
+        self.assertEqual(plan.edges, ())
+
+    def test_edge_retains_every_alias_of_the_allocation(self) -> None:
+        plan = build_cross_loop_dependency_plan(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    tensor_name="base",
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    tensor_name="producer_view",
+                    block_ids=(1,),
+                ),
+                _access(
+                    2,
+                    root=1,
+                    kind="store",
+                    tensor_name="producer_view",
+                    block_ids=(1,),
+                ),
+                _access(
+                    3,
+                    root=2,
+                    kind="load",
+                    tensor_name="consumer_view",
+                    block_ids=(2,),
+                ),
+            ),
+            [[0], [1], [2]],
+        )
+
+        edge = plan.edges_between(1, 2)[0]
+        self.assertEqual(edge.allocation_id, 0)
+        self.assertEqual(
+            edge.tensor_names,
+            frozenset(("base", "producer_view", "consumer_view")),
+        )
+
     def test_identity_mapping_is_task_ready(self) -> None:
         plan = build_cross_loop_dependency_plan(
             (
@@ -243,8 +376,8 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(edge.readiness[0].granularity, "root")
         self.assertIsNone(edge.readiness[0].predecessor_map)
         self.assertEqual(plan.events[0].granularity, "root")
-        self.assertIsNone(plan.waits[0].consumer_access_id)
-        self.assertEqual(plan.waits[0].placement, "root_entry")
+        self.assertEqual(plan.waits[0].consumer_access_id, 1)
+        self.assertEqual(plan.waits[0].placement, "access")
 
     def test_batch_axis_is_part_of_task_mapping(self) -> None:
         plan = build_cross_loop_dependency_plan(
@@ -535,7 +668,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
         self.assertEqual(plan.events[0].granularity, "root")
-        self.assertEqual(plan.waits[0].placement, "root_entry")
+        self.assertEqual(plan.waits[0].placement, "access")
 
     def test_tracks_latest_writer_and_intervening_readers(self) -> None:
         plan = build_cross_loop_dependency_plan(
@@ -582,7 +715,7 @@ class TestCrossLoopDependencies(TestCase):
             [(1, 0), (2, 0)],
         )
 
-    def test_root_wait_subsumes_task_waits_for_the_same_root_pair(self) -> None:
+    def test_mixed_accesses_retain_their_strongest_readiness(self) -> None:
         plan = build_cross_loop_dependency_plan(
             (
                 _access(0, root=0, allocation_id=0, kind="store"),
@@ -603,11 +736,99 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(len(plan.edges), 2)
         self.assertEqual(
             [(event.producer_root, event.granularity) for event in plan.events],
-            [(0, "root")],
+            [(0, "task"), (0, "root")],
         )
-        self.assertEqual(len(plan.waits), 1)
-        self.assertEqual(plan.waits[0].consumer_root, 1)
-        self.assertIsNone(plan.waits[0].consumer_access_id)
+        self.assertEqual(
+            [
+                (wait.consumer_root, wait.consumer_access_id, wait.placement)
+                for wait in plan.waits
+            ],
+            [(1, 1, "root_entry"), (1, 3, "access")],
+        )
+
+    def test_single_consumer_stream_dominates_later_root_ready_access(self) -> None:
+        dependency_plan = build_cross_loop_dependency_plan(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(1, 64),
+                    strides=(64, 1),
+                    block_ids=(10, 11),
+                    scales=(1, 1),
+                    offsets=(0, 0),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(1, 64),
+                    strides=(64, 1),
+                    block_ids=(20, 21),
+                    scales=(1, 1),
+                    offsets=(0, 0),
+                ),
+                _access(
+                    2,
+                    root=1,
+                    kind="load",
+                    shape=(1, 64),
+                    strides=(64, 1),
+                    block_ids=(None, None),
+                    scales=(1, 1),
+                    offsets=(None, None),
+                    masked=True,
+                ),
+            ),
+            [[10, 11], [20]],
+        )
+        schedule = build_generic_schedule_plan(
+            dependency_plan=dependency_plan,
+            task_families=(
+                InstantiatedTaskFamily(
+                    root=0,
+                    logical_axis_order=(10, 11),
+                    physical_axis_order=(10, 11),
+                    axis_counts_items=((10, 1), (11, 4)),
+                    block_sizes_items=((10, 1), (11, 16)),
+                ),
+                InstantiatedTaskFamily(
+                    root=1,
+                    logical_axis_order=(20,),
+                    physical_axis_order=(20,),
+                    axis_counts_items=((20, 1),),
+                    block_sizes_items=((20, 1),),
+                ),
+            ),
+            available_access_ids_by_root=(frozenset((0,)), frozenset((1, 2))),
+            access_program_points={
+                1: AccessProgramPoint(
+                    1,
+                    ((20, "outer"), (21, "inner")),
+                    loop_id=7,
+                    loop_depth=1,
+                    root_statement_index=3,
+                ),
+                2: AccessProgramPoint(
+                    2,
+                    None,
+                    loop_id=8,
+                    loop_depth=1,
+                    root_statement_index=4,
+                ),
+            },
+            axis_geometry={10: (1, 1), 11: (4, 16), 20: (1, 1), 21: (4, 16)},
+            excluded_roots=frozenset(),
+            preordered_edges=frozenset(),
+            physical_worker_limit=2,
+        )
+
+        self.assertEqual(schedule.task_ready_edges, frozenset(((0, 1),)))
+        self.assertEqual(schedule.root_completion_edges, frozenset())
+        self.assertEqual(len(schedule.access_cohorts), 1)
+        self.assertTrue(schedule.access_cohorts[0].is_per_coordinate)
+        self.assertEqual(schedule.access_cohorts[0].milestone_count, 4)
 
     def test_alias_names_share_an_allocation_dependency(self) -> None:
         plan = build_cross_loop_dependency_plan(
@@ -809,6 +1030,48 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_task_epochs", code)
         self.assertGreaterEqual(code.count("tile_dependency_task_wait"), 2)
         self.assertNotIn("tile_dependency_whole_value", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_singleton_root_waits_for_multiple_producers(self) -> None:
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32).reshape(1, 64)
+        code, out = code_and_output(
+            singleton_root_join,
+            (x,),
+            block_sizes=[1, 16, 1, 16],
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, torch.sum(x * 2, dim=-1))
+        self.assertGreaterEqual(code.count("tile_dependency_singleton_input_wait"), 2)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_singleton_stream_uses_graph_derived_per_coordinate_readiness(self) -> None:
+        for batch in (1, 2):
+            with self.subTest(batch=batch):
+                x = torch.arange(
+                    batch * 4096, device=DEVICE, dtype=torch.float32
+                ).reshape(batch, 4096)
+                code, out = code_and_output(
+                    streamed_singleton_reduction,
+                    (x,),
+                    block_sizes=[1, 16],
+                    pid_type="persistent_blocked",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+
+                torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
+                self.assertNotIn("tile_dependency_ordered_group", code)
+                if batch == 1:
+                    self.assertIn("tile_dependency_cohort_arrivals", code)
+                    self.assertIn("tile_dependency_cohort_wait", code)
+                    self.assertNotIn("tile_dependency_whole_value", code)
+                else:
+                    self.assertIn("tile_dependency_whole_value", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

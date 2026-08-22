@@ -60,9 +60,6 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
-from .loop_dependency_checker import LoopDependencyChecker
-from .loop_dependency_checker import TileAccess
-from .loop_dependency_checker import TileDependency
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import defer_pallas_load_masks
@@ -93,8 +90,10 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
+    from ..runtime.tile_dependency import TileDependencySchedule
     from .cross_loop_dependencies import CrossLoopAccess
     from .cross_loop_dependencies import CrossLoopDependencyPlan
+    from .cross_loop_dependencies import TaskFamily
     from .cute.layout import CuTeGridExecutionPlan
     from .tile_dependency_schedule import ResolvedTileDependencySchedule
 
@@ -625,9 +624,6 @@ class RolledReductionInfo(NamedTuple):
 class KernelPhase:
     roots: list[int]  # store root indices
     root_nodes: list[ast.For]
-    loop_dependency_checker: LoopDependencyChecker = dataclasses.field(
-        default_factory=LoopDependencyChecker
-    )
 
 
 def _tensor_to_inter_loop_rw_name(host: HostFunction, t: torch.Tensor) -> str | None:
@@ -798,11 +794,10 @@ class DeviceIR:
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
-        self.tile_dependencies: tuple[TileDependency, ...] = ()
-        self.tile_accesses: tuple[tuple[TileAccess, ...], ...] = ()
         self.tile_dependency_schedule: ResolvedTileDependencySchedule | None = None
         self.cross_loop_accesses: tuple[CrossLoopAccess, ...] = ()
         self.cross_loop_dependency_plan: CrossLoopDependencyPlan | None = None
+        self.task_families: list[TaskFamily] = []
         self.grid_block_ids: list[list[int]] = []
         self.noncanonical_task_origin_block_ids: set[int] = set()
         # Owning HostFunction (captured in ``lower_to_device_ir``).
@@ -2743,7 +2738,9 @@ class WalkDeviceAST(NodeVisitor):
             return self.scope[node.id]
         assert isinstance(node, ExtendedAST)
         type_info = node._type_info
-        assert type_info is not None and type_info.origin.is_host()
+        assert type_info is not None
+        if type_info.origin.is_device():
+            raise exc.CrossRootDeviceValue(node.id)
         try:
             return type_info.proxy()
         except NotImplementedError:
@@ -3148,11 +3145,6 @@ class WalkHostAST(NodeVisitor):
         self.current_phase_roots: list[int] = []
         self.phases: list[KernelPhase] = []
         self.root_nodes: list[ast.For] = []
-        assert device_ir.host_function is not None
-        schedule = device_ir.host_function.compiler_state.tile_dependency_schedule
-        self.tile_dependency_stage_starts = (
-            schedule.implicit_stage_starts if schedule is not None else frozenset()
-        )
 
     def _flush_current_phase(self) -> None:
         assert self.current_phase_roots
@@ -3167,8 +3159,6 @@ class WalkHostAST(NodeVisitor):
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         if node._loop_type == LoopType.GRID:
-            if self.root_index in self.tile_dependency_stage_starts:
-                self._flush_current_phase()
             self.device_ir.add_root_graph(
                 _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
             )
@@ -3188,12 +3178,31 @@ class WalkHostAST(NodeVisitor):
                 if isinstance(inner, SequenceType)
                 else isinstance(inner, GridIndexType)
             )
-            if not _root_loop_has_canonical_task_origin(
+            canonical_origin = _root_loop_has_canonical_task_origin(
                 node.iter,
                 len(block_ids),
                 supports_step=supports_step,
-            ):
+            )
+            if not canonical_origin:
                 self.device_ir.noncanonical_task_origin_block_ids.update(block_ids)
+            from .cross_loop_dependencies import LogicalTaskAxis
+            from .cross_loop_dependencies import TaskFamily
+
+            env = CompileEnvironment.current()
+            self.device_ir.task_families.append(
+                TaskFamily(
+                    root=self.root_index,
+                    graph_id=self.device_ir.root_ids[-1],
+                    axes=tuple(
+                        LogicalTaskAxis(
+                            block_id=block_id,
+                            extent=env.block_sizes[block_id].numel,
+                            canonical_origin=canonical_origin,
+                        )
+                        for block_id in block_ids
+                    ),
+                )
+            )
             # store root index (position) not graph id
             self.root_nodes.append(node)
             self.current_phase_roots.append(len(self.device_ir.root_ids) - 1)
@@ -3451,11 +3460,12 @@ def _collect_memory_op_facts(
 
     Returns ``(memory_op_facts, liveness_by_axis, cross_loop_accesses)``. The
     second result is the per-axis peak simultaneously-live rdim-shaped tile count
-    (max over graphs). The third is the narrow access view used only by cross-root
-    dependency planning.
+    (max over graphs). The third is the allocation-coordinate access view used for
+    cross-root legality and scheduling.
     """
     from ..autotuner.config_spec import MemoryOpFact
     from ..language import memory_ops
+    from ..language.atomic_ops import ATOMIC_OPS
     from .cross_loop_dependencies import CROSS_LOOP_ACCESS_ID_META
     from .cross_loop_dependencies import CrossLoopAccess
     from .cross_loop_dependencies import owner_root_by_graph_id
@@ -3473,10 +3483,10 @@ def _collect_memory_op_facts(
     records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
     cross_loop_accesses: list[CrossLoopAccess] = []
     memory_op_index = 0
+    cross_loop_access_id = 0
     eviction_index = 0
     liveness_by_axis: dict[int, int] = {}
-    schedule = device_ir.tile_dependency_schedule
-    collect_cross_loop_accesses = schedule is not None and schedule.policy is not None
+    collect_cross_loop_accesses = len(device_ir.root_ids) > 1
     graph_owners = (
         owner_root_by_graph_id(device_ir) if collect_cross_loop_accesses else ()
     )
@@ -3515,7 +3525,9 @@ def _collect_memory_op_facts(
                 continue
 
             is_load = node.target is load_op
-            if not (is_load or node.target is store_op):
+            is_store = node.target is store_op
+            is_atomic = node.target in ATOMIC_OPS
+            if not (is_load or is_store or is_atomic):
                 continue
 
             this_eviction_index: int | None = None
@@ -3646,14 +3658,15 @@ def _collect_memory_op_facts(
                     else -1
                 )
                 has_explicit_mask = (
-                    len(node.args) > (2 if is_load else 3)
+                    not is_atomic
+                    and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
-                node.meta[CROSS_LOOP_ACCESS_ID_META] = memory_op_index
+                node.meta[CROSS_LOOP_ACCESS_ID_META] = cross_loop_access_id
                 cross_loop_accesses.append(
                     CrossLoopAccess(
-                        access_id=memory_op_index,
-                        memory_op_index=memory_op_index,
+                        access_id=cross_loop_access_id,
+                        memory_op_index=memory_op_index if not is_atomic else -1,
                         graph_id=graph_info.graph_id,
                         root=owner_root,
                         allocation_id=allocation_id,
@@ -3670,6 +3683,10 @@ def _collect_memory_op_facts(
                         has_explicit_mask=has_explicit_mask,
                     )
                 )
+                cross_loop_access_id += 1
+
+            if is_atomic:
+                continue
 
             records.append(
                 (
@@ -3885,25 +3902,51 @@ def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
         existing.add(block_id)
 
 
-def lower_to_device_ir(func: HostFunction) -> DeviceIR:
+def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
+    result = [-1] * root_count
+    for phase_index, phase in enumerate(phases):
+        for root in phase.roots:
+            result[root] = phase_index
+    assert all(phase >= 0 for phase in result)
+    return tuple(result)
+
+
+def _install_resolved_phases(
+    device_ir: DeviceIR,
+    root_nodes: list[ast.For],
+    schedule: ResolvedTileDependencySchedule,
+) -> None:
+    device_ir.phases = [
+        KernelPhase(
+            roots=list(stage.roots),
+            root_nodes=[root_nodes[root] for root in stage.roots],
+        )
+        for stage in schedule.stages
+    ]
+    for phase_index, phase in enumerate(device_ir.phases):
+        for root in phase.roots:
+            graph_info = device_ir.graphs[device_ir.root_ids[root]]
+            assert isinstance(graph_info, RootGraphInfo)
+            graph_info.phase_index = phase_index
+
+
+def lower_to_device_ir(
+    func: HostFunction,
+    *,
+    tile_dependency_policy: TileDependencySchedule | None = None,
+) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
-    tile_dependency_analysis = func.compiler_state.tile_dependency_analysis
-    if tile_dependency_analysis is not None:
-        device_ir.tile_dependencies = tile_dependency_analysis.tile_dependencies
-        device_ir.tile_accesses = tile_dependency_analysis.accesses_by_root
-    device_ir.tile_dependency_schedule = func.compiler_state.tile_dependency_schedule
     with func, device_ir, compile_lock:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
         visitor.flush_phases()
         device_ir.phases = visitor.phases
-        # Run dependency checks once, per phase, so codegen does not redo it per-config.
-        for phase in device_ir.phases:
-            checker = phase.loop_dependency_checker
-            for loop_node in phase.root_nodes:
-                checker.register_loop(loop_node)
+        source_root_phases = _root_phases(device_ir.phases, len(device_ir.root_ids))
+        source_phase_starts = frozenset(
+            phase.roots[0] for phase in device_ir.phases[1:]
+        )
         for phase_idx, phase in enumerate(device_ir.phases):
             for ridx in phase.roots:
                 graph_info = device_ir.graphs[device_ir.root_ids[ridx]]
@@ -4119,16 +4162,57 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         ) = _collect_memory_op_facts(device_ir)
         config_spec.memory_op_facts = memory_op_facts
         device_ir.cross_loop_accesses = cross_loop_accesses
-        if cross_loop_accesses:
-            from .cross_loop_dependencies import build_cross_loop_dependency_plan
+        from .cross_loop_dependencies import build_cross_loop_dependency_plan
+        from .tile_dependency_schedule import resolve_tile_dependency_schedule
 
+        access_ids_by_root: list[list[int]] = [[] for _ in device_ir.task_families]
+        for access in cross_loop_accesses:
+            if 0 <= access.root < len(access_ids_by_root):
+                access_ids_by_root[access.root].append(access.access_id)
+        device_ir.task_families = [
+            dataclasses.replace(
+                family,
+                access_ids=tuple(access_ids_by_root[family.root]),
+            )
+            for family in device_ir.task_families
+        ]
+        if len(device_ir.task_families) > 1:
             device_ir.cross_loop_dependency_plan = build_cross_loop_dependency_plan(
                 cross_loop_accesses,
-                device_ir.grid_block_ids,
+                task_families=tuple(device_ir.task_families),
+                root_phases=source_root_phases,
                 noncanonical_task_origin_block_ids=frozenset(
                     device_ir.noncanonical_task_origin_block_ids
                 ),
             )
+            schedule = resolve_tile_dependency_schedule(
+                device_ir.cross_loop_dependency_plan,
+                tile_dependency_policy,
+                source_phase_starts=source_phase_starts,
+            )
+            device_ir.tile_dependency_schedule = schedule
+            _install_resolved_phases(device_ir, visitor.root_nodes, schedule)
+            if schedule.implicit_stage_starts:
+                if (
+                    CompileEnvironment.current().backend_name != "triton"
+                    or torch.version.hip is not None
+                ):
+                    edge = next(
+                        edge
+                        for edge in device_ir.cross_loop_dependency_plan.edges
+                        if edge.consumer_root in schedule.implicit_stage_starts
+                    )
+                    names = sorted(edge.tensor_names)
+                    raise exc.LoopDependencyError(
+                        names[0] if names else "tensor allocation"
+                    )
+                reason = (
+                    "tile dependencies require a persistent blocked kernel for "
+                    "tile-dependency scheduling"
+                )
+                CompileEnvironment.current().require_persistent_blocked_without_cooperative_barrier(
+                    reason
+                )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
