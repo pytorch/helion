@@ -63,6 +63,7 @@ class CuteTcgen05GroupedPlan:
     direct_strides: str | None = None
     d_mode: Tcgen05GroupedDMode = Tcgen05GroupedDMode.NONE
     d_tensormap: str | None = None
+    fixed_tensormaps: bool = False
     # N,M worklists carry their source-row tile explicitly so runtime metadata
     # validation and launch bounds consume the exact schedule selected by the
     # compiler.  For the device-split variant, ``layout`` names the device
@@ -81,6 +82,15 @@ class CuteTcgen05GroupedPlan:
         assert (self.direct_pointers is None) == (self.direct_strides is None)
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
         assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+        if self.orientation is Tcgen05Orientation.NM:
+            assert self.real_groups is not None or self.device_split_sizes
+            assert self.fixed_tensormaps == (self.d_mode is Tcgen05GroupedDMode.NONE)
+        if self.fixed_tensormaps:
+            assert self.orientation is Tcgen05Orientation.NM
+            assert not self.device_split_sizes
+            assert self.d_mode is Tcgen05GroupedDMode.NONE
+            assert self.d_tensormap is None
+            assert self.direct_pointers is None
         if self.static_problem_shapes is not None:
             assert self.orientation is Tcgen05Orientation.MN
             assert self.real_groups is None

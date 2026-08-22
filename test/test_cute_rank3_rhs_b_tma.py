@@ -418,9 +418,8 @@ def _make_mixed_non_row_major_args() -> tuple[torch.Tensor, ...]:
 
 def _make_non_k_contiguous_args() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     a, _b_grouped, layout = _make_full_args()
-    b_grouped = torch.empty(
-        (4, 128, 256), device=DEVICE, dtype=torch.bfloat16
-    ).transpose(1, 2)
+    padded_b = torch.empty((4, 256, 256), device=DEVICE, dtype=torch.bfloat16)
+    b_grouped = padded_b[:, :, ::2]
     assert b_grouped.stride(2) != 1
     return a, b_grouped, layout
 
