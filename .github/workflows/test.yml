@@ -342,7 +342,7 @@ jobs:
           fi
 
   test-notebooks:
-    name: test-notebooks-cu130-py3.12-pytorch-2.9-a10g
+    name: test-notebooks-cu130-py3.12-pytorch-2.13-a10g
 
     container:
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04

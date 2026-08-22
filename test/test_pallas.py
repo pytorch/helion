@@ -632,6 +632,99 @@ def pallas_cat_columns(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_aligned_dynamic_window(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for tile in hl.tile(starts.size(0), block_size=1):
+        begin = starts[tile.begin] * 128
+        out[tile, :, :] = table[:, begin + hl.arange(128)][None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_aligned_row_window(x: torch.Tensor) -> torch.Tensor:
+    rows = hl.specialize(x.size(0))
+    out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(rows):
+        row_indices = tile_m.begin + hl.arange(8)
+        window = x[row_indices, :]
+        out[tile_m, :] = window[:, hl.arange(128)] + 1
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_bf16_dynamic_window_1d(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty([starts.size(0), 128], dtype=table.dtype, device=table.device)
+    for tile in hl.tile(starts.size(0), block_size=1):
+        begin = starts[tile.begin] * 128
+        out[tile, :] = table[begin + hl.arange(128)][None, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scaled_add_dynamic_window(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for tile in hl.tile(starts.size(0), block_size=1):
+        begin = starts[tile.begin] * 128
+        indices = torch.add(hl.arange(128), begin, alpha=2)
+        out[tile, :, :] = table[:, indices][None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
+    rows = x.size(0)
+    out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
+    for tile_rows in hl.tile(rows):
+        computed = x[tile_rows, :] + 1
+        heads = computed.reshape(computed.size(0), 4, 64)
+        middle = heads[:, 1 + hl.arange(2), :]
+        out[tile_rows, :] = middle.reshape(computed.size(0), 128)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_loaded_static_slice(x: torch.Tensor) -> torch.Tensor:
+    rows = x.size(0)
+    out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
+    for tile_rows in hl.tile(rows):
+        loaded = x[tile_rows, :]
+        out[tile_rows, :] = loaded[:, 64 + hl.arange(128)]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_shifted_modulo_row_index(x: torch.Tensor) -> torch.Tensor:
+    """Exercise a compound modulo operand whose parentheses are significant."""
+    out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
+    for _ in hl.grid(1):
+        for tile in hl.tile(4, block_size=1):
+            out[tile.begin, :] = x[(tile.begin - 1) % 4, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_shifted_floor_divide_row_index(x: torch.Tensor) -> torch.Tensor:
+    """Exercise a compound floor-division operand with significant grouping."""
+    out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
+    for _ in hl.grid(1):
+        for tile in hl.tile(4, block_size=1):
+            out[tile.begin, :] = x[(tile.begin + 1) // 2, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
     """Kernel that uses hl.rand to generate random values and add them to x."""
     out = torch.empty_like(x)
@@ -739,6 +832,88 @@ class TestPallas(TestCase):
         )
         self.assertIn("jnp.concatenate((", code)
         torch.testing.assert_close(result.cpu(), torch.cat((x, y), dim=1).cpu())
+
+    def test_aligned_dynamic_window_uses_direct_hbm_dma(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_aligned_dynamic_window,
+            (table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        expected = torch.stack(
+            [table[:, begin : begin + 128] for begin in range(0, 512, 128)]
+        )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_aligned_row_window_uses_direct_hbm_dma(self) -> None:
+        x = torch.randn(16, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_aligned_row_window,
+            (x,),
+            block_sizes=[8],
+        )
+        torch.testing.assert_close(result, x[:, :128] + 1)
+
+    def test_dynamic_window_declines_unaligned_1d_dma(self) -> None:
+        table = torch.randn(512, device=DEVICE, dtype=torch.bfloat16)
+        starts = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_bf16_dynamic_window_1d,
+            (table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        expected = torch.stack((table[:128], table[128:256]))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_dynamic_window_declines_scaled_add(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_scaled_add_dynamic_window,
+            (table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        lanes = torch.arange(128, device=DEVICE)
+        expected = torch.stack((table[:, lanes], table[:, 256 + lanes]))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_computed_static_slice(self) -> None:
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_computed_static_slice,
+            (x,),
+            block_sizes=[128],
+        )
+        expected = (x + 1).reshape(128, 4, 64)[:, 1:3, :].reshape(128, 128)
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_loaded_static_slice(self) -> None:
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_loaded_static_slice,
+            (x,),
+            block_sizes=[128],
+        )
+        torch.testing.assert_close(result.cpu(), x[:, 64:192].cpu())
+
+    def test_shifted_modulo_preserves_expression_precedence(self) -> None:
+        x = torch.randn(5, 128, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_shifted_modulo_row_index,
+            (x,),
+            pallas_loop_type="unroll",
+        )
+        torch.testing.assert_close(result.cpu(), x[[3, 0, 1, 2]].cpu())
+
+    def test_shifted_floor_divide_preserves_expression_precedence(self) -> None:
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_shifted_floor_divide_row_index,
+            (x,),
+            pallas_loop_type="unroll",
+        )
+        torch.testing.assert_close(result.cpu(), x[[0, 1, 1, 2]].cpu())
 
     def test_rsqrt_uses_native_lax_op(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1702,6 +1877,25 @@ class TestPallas(TestCase):
         self.assertIn("[:, pl.ds(0, 1), :, :][:, 0, :, :]", code)
         self.assertNarrowingIsResident(code)
         torch.testing.assert_close(actual, torch.full_like(actual, 8))
+
+    def test_resident_subview_aligned_lane_slice(self) -> None:
+        """An aligned static lane slice remains an address-only Ref view."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_panel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([1, 4, 128], device=x.device, dtype=x.dtype)
+            for _request in hl.grid(1):
+                state = hl.zeros([4, 128], dtype=torch.float32)
+                for outer in hl.tile(x.size(0), block_size=4):
+                    x_block = x[outer, :, :]
+                    state += x_block[:, :, 128:256].float().sum(dim=0)
+                out[0, :, :] = state.to(out.dtype)
+            return out
+
+        x = torch.randn(8, 4, 256, device=DEVICE, dtype=torch.bfloat16)
+        expected = x[:, :, 128:256].float().sum(dim=0, keepdim=True).bfloat16()
+        _, actual = code_and_output(select_panel, (x,), pallas_loop_type="fori_loop")
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
     def test_resident_subview_composed_views(self) -> None:
         """Subview and reshape transforms compose without materializing."""

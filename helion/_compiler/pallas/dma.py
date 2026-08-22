@@ -21,6 +21,16 @@ if TYPE_CHECKING:
 DmaDirection = Literal["load", "store"]
 
 
+def is_tpu_dma_aligned_shape(shape: tuple[int, ...], dtype: torch.dtype) -> bool:
+    """Whether a concrete VMEM shape satisfies TPU local-DMA alignment."""
+    if len(shape) >= 2:
+        return shape[-1] % 128 == 0 and shape[-2] % 8 == 0
+    if len(shape) == 1:
+        bitwidth = min(dtype.itemsize * 8, 32)
+        return shape[0] % (128 * (32 // bitwidth)) == 0
+    return True
+
+
 @dataclass(frozen=True, eq=False)
 class DmaTransfer:
     """One local HBM/VMEM transfer before resources are allocated."""
