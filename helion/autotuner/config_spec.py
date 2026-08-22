@@ -264,15 +264,19 @@ class LoopAxisFact(NamedTuple):
     ``tile(outer.begin, outer.end)``); in that case the candidate outer block is
     the real extent, not the whole underlying axis. ``bounded_extent`` is set
     only when that outer extent is a literal; a symbolic fixed parent remains
-    explicitly uncertain. The per-program block is deliberately not recorded
-    here: it is a candidate property and must be resolved from the emitted
-    ``block_sizes`` before the trip count is used.
+    explicitly uncertain. ``prefix_outer_block_id`` records a loop whose bound
+    is ``(outer_tile.id + 1) * outer_block``. Its representative extent depends
+    on both candidate block sizes and is resolved at the lower-median outer
+    tile. The per-program block is deliberately not recorded here: it is a
+    candidate property and must be resolved from the emitted ``block_sizes``
+    before the trip count is used.
     """
 
     block_id: int
     extent: int | None
     bounded_by_block_id: int | None = None
     bounded_extent: int | None = None
+    prefix_outer_block_id: int | None = None
 
 
 class PipelinedRegion(NamedTuple):
@@ -353,24 +357,25 @@ class DotSite(NamedTuple):
     - ``graph_id`` — the device graph the dot's node lives in.
       :class:`KernelGridFact` maps that graph to its root grid; the topology is
       intentionally not copied into each site.
-    - ``loop_trips`` — product of the sequential loop trip counts enclosing it, i.e.
-      how many times one program executes this dot.
     - ``updates_carry`` — the dot writes into a value carried by an enclosing loop
       (``acc=`` into a loop-carried accumulator). Such a dot's accumulator is
       resident for the whole loop, which is why it gets ranking priority.
     - ``loop_axes`` — the enclosing loop axes before a candidate block size is
-      selected. Consumers that need an exact execution count resolve these axes
-      against the candidate instead of treating ``loop_trips`` as exact.
+      selected. This is the canonical execution-count representation; consumers
+      resolve it against the candidate they are evaluating.
     - ``exact_loop_trips`` — an exact dynamic execution count proven independently
       of the loop-bound expression. This is used for work estimation only; it does
       not claim that the same loop is a useful software-pipeline opportunity.
+    - ``max_loop_trips`` — an optional conservative upper bound used only by
+      safety-oriented consumers such as pipeline-depth capping. It must not be used
+      as candidate work.
     """
 
     graph_id: int
-    loop_trips: int
     updates_carry: bool
     loop_axes: tuple[LoopAxisFact, ...] = ()
     exact_loop_trips: int | None = None
+    max_loop_trips: int | None = None
 
 
 class ResolvedMatmulFact(NamedTuple):
@@ -452,22 +457,6 @@ class KernelMatmulFact(NamedTuple):
             if bid == block_id:
                 return users
         return ()
-
-    def dot_work(self, index: int) -> int:
-        """Dynamic work of one dot: ``m*n*k`` per execution times its executions.
-
-        Falls back to the axis classification's per-program extent when the fact's own
-        ``static_*`` is absent, which happens whenever the axis length is dynamic but the
-        per-program extent is not."""
-        resolved = self.matmuls[index]
-        f = resolved.fact
-        ax = resolved.axes
-        m = f.static_m or ax.m_extent or 1
-        n = f.static_n or ax.n_extent or 1
-        k = f.static_k or ax.k_extent or 1
-        site = resolved.site
-        trips = site.exact_loop_trips or site.loop_trips
-        return m * n * k * max(1, trips)
 
 
 class ReductionCategory(enum.Enum):
