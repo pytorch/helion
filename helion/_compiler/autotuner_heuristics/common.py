@@ -69,8 +69,11 @@ def dedupe_configs(configs: Iterable[Config]) -> list[Config]:
 
 def matches_hardware(
     env: CompileEnvironment,
-    targets: tuple[HardwareTarget, ...],
+    targets: tuple[HardwareTarget, ...] | None,
+    *,
+    hardware_names: frozenset[str] | None = None,
 ) -> bool:
+    from ..._argument_device import _canonicalize_argument_device
     from ..._hardware import get_hardware_info
 
     # A device Helion cannot classify raises RuntimeError here (e.g. MTIA, which
@@ -81,13 +84,15 @@ def matches_hardware(
     # is called outside the try/except that guards is_eligible, where an escaping
     # RuntimeError fails the whole compile.
     try:
-        hardware = get_hardware_info(env.device)
+        hardware = get_hardware_info(_canonicalize_argument_device(env.device))
     except RuntimeError:
         return False
-    return (hardware.device_kind, hardware.compute_capability) in targets or (
-        hardware.device_kind,
-        None,
-    ) in targets
+    if hardware_names is not None and hardware.hardware_name not in hardware_names:
+        return False
+    return targets is None or (
+        (hardware.device_kind, hardware.compute_capability) in targets
+        or (hardware.device_kind, None) in targets
+    )
 
 
 def clamp_block_size_targets(

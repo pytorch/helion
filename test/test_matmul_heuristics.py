@@ -166,9 +166,10 @@ def test_triton_b200_matmul_heuristic_gates_on_hardware() -> None:
     with patch(
         "helion._hardware.get_hardware_info",
         return_value=b200,
-    ):
+    ) as get_hardware_info:
         assert TritonB200MatmulHeuristic.is_eligible(env, SimpleNamespace())
         seed = TritonB200MatmulHeuristic.get_seed_config(env, SimpleNamespace())
+        get_hardware_info.assert_called_once_with(None)
 
     assert seed is not None
     assert dict(seed)["block_sizes"] == [128, 64, 64]
@@ -176,8 +177,9 @@ def test_triton_b200_matmul_heuristic_gates_on_hardware() -> None:
     with patch(
         "helion._hardware.get_hardware_info",
         return_value=h100,
-    ):
+    ) as get_hardware_info:
         assert not TritonB200MatmulHeuristic.is_eligible(env, SimpleNamespace())
+        get_hardware_info.assert_called_once_with(None)
 
 
 def test_b200_formula_subsumes_table_promotion_wiring() -> None:

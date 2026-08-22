@@ -201,6 +201,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
@@ -324,6 +325,13 @@ class CompileEnvironment:
             num_sm=_num_sm,
             log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
+        # Correctness facts registered by compiler heuristics can depend on
+        # dynamic runtime inputs even when seed generation is disabled or later
+        # found ineligible. Bound-kernel caching consumes this set separately
+        # from specialization requirements of heuristics that emitted seeds.
+        self.compiler_fact_specialization_facts: frozenset[
+            CompilerHeuristicSpecializationFact
+        ] = frozenset()
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()

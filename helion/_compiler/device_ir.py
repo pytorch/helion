@@ -3892,6 +3892,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         supports_small_n_scalar_fallback=(
                             supports_small_n_scalar_fallback
                         ),
+                        allow_dynamic_hints=(
+                            candidate.operands.rhs.rhs_segment_group is not None
+                        ),
                     )
                     if search_plan is None:
                         continue
