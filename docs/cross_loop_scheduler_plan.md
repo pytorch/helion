@@ -21,6 +21,337 @@ The scheduler should:
 - Become simpler by deriving scheduling from producer and consumer accesses,
   rather than accumulating topology matchers and exceptional cases.
 
+### Current checkpoint
+
+The graph-derived scheduler now lowers the Qwen attention and FFN components
+and the Gemma FFN component with canonical logical task coordinates, including
+roots whose physical traversal uses L2 grouping. Region-aware reaching
+definitions preserve partially overwritten allocation regions, and keyed
+events support multiple producer roots, repeated consumer predecessor sets,
+counted last-arrival actions, and readiness frontiers. There is no model-name,
+root-number, or flattened-task-ID matcher in that path; the custom partitioned
+attention scheduler has been deleted.
+
+Fresh cache-bypassed B200 measurements are 76.09 microseconds for Qwen versus
+86.27 microseconds for its separate-kernel baseline, and 74.09 microseconds for
+the tuned Gemma sliding non-shared layer versus 78.87 microseconds separately.
+The Qwen kernel uses 251 registers, no spills, and 17,408 bytes of shared
+memory. The Gemma kernel uses 204 registers, no spills, and 34,816 bytes of
+shared memory. Qwen also matches the retained custom scheduler within noise:
+76.08 versus 76.16 microseconds in adjacent fresh runs.
+
+The main dependency-IR migration is complete. Dynamic task counts use the
+existing cooperative phase fallback, while large static task domains are
+planned without a task-product cutoff: region-derived ready groups use a
+sorted allocation-interval sweep rather than a producer-by-consumer Cartesian
+scan. Remaining work is validation and cleanup: broaden shape coverage,
+replace the fixed-range frontier tuning domain if the autotuner API permits it,
+and keep one-wave reduction replication clearly separate from dependency
+scheduling. Gemma's shared-KV variants remain a root-codegen/resource-envelope
+problem: their current fused kernels use roughly 70 KiB of shared memory and
+support only two resident CTAs per SM, so no legal FFN frontier fits. Do not
+add dependency-scheduler cases to disguise that limitation.
+
+### Holistic keyed-event refactor
+
+The scheduler must represent readiness of a logical value region, not merely
+completion of the most recent root that touched its allocation. Use three
+separate layers:
+
+```text
+Allocation footprints and reaching definitions    correctness
+    ↓
+Exact logical task-dependency relations            legality
+    ↓
+Keyed events and static dispatch plans             execution policy
+```
+
+The central synchronization IR is a compiler-derived, restricted form of the
+Event Tensor abstraction:
+
+```text
+KeyedEvent
+    key domain: logical readiness coordinates
+    updates:
+        completion source
+        proven participating task domain
+        producer coordinates -> zero, one, or bounded event keys
+    uses:
+        consumer task, access, or cohort
+        event keys -> consumer coordinates
+    expected arrivals per key: derived from the update relations
+```
+
+`KeyedEvent` records dependency semantics, not a chosen execution strategy. A
+separate static dispatch plan decides whether a use becomes a root wait, exact
+event wait, coarsened milestone, last-arrival opaque-task invocation, or
+readiness frontier. In particular, `on_ready` is a lowering choice rather than
+a property of dependency legality.
+
+This is one compiler mechanism, not separate attention and FFN lowerings:
+
+- root completion is one event key receiving contributions from every active
+  producer worker;
+- an exact task event has one key per producer task and fan-in one;
+- a uniform relation has a consumer key and a proved constant fan-in;
+- a partial relation contributes only from a proved producer subdomain;
+- a multi-producer join receives contributions from several roots; and
+- a readiness frontier admits the cohort of tasks associated with ready keys.
+
+The same generic event lowering performs notifications and waits. The static
+dispatch lowering may elect the last arrival and either invoke one existing
+opaque task or publish readiness to a consumer cohort. Region boundaries affect
+only update-domain metadata and guards. They must not create new model-specific
+emitters or rewrite root computation.
+
+#### Why this refactor is necessary
+
+The simpler Qwen source experiments exposed the abstraction gap directly:
+
+- Exact RAW+WAW task readiness correctly proved that each Q/K head consumes 16
+  contiguous eight-element QKV projection tiles. Lowering that relation as 768
+  task publications and 40 consumers each polling 16 epochs measured 83.50
+  microseconds versus 80.31 microseconds separately.
+- A partial counted continuation eliminated those polling loops and correctly
+  let the first 640 Q/K-producing tasks participate while the remaining 128 V
+  tasks ran normally. With conservative downstream completion it measured
+  82.42 microseconds versus 86.35 microseconds for the same-source separate
+  graph.
+- The partial in-place update revealed that a single `latest_writer` per
+  allocation is insufficient: Q/K is supplied by the normalization root while
+  V is still supplied by the projection root. Treating normalization as a
+  whole-allocation definition can release cache or attention before V exists.
+- Canonical out-of-place or head-shaped QKV representations made the dependency
+  easier to express but measured roughly 80.2--81.0 microseconds because they
+  changed materialization or projection codegen. Dependency scheduling should
+  not require that compromise.
+
+The partial-prefix proof and lowering remain useful as the first implementation
+of a contributor domain. The temporary conservative pass-through root wait is
+not the final abstraction; it must disappear once allocation reaching
+definitions and multi-producer keyed joins are represented directly.
+
+#### Event Tensor paper assessment
+
+The paper's event abstraction is a strong match for this synchronization IR:
+an event is a tensor-shaped family of counters, producer task coordinates map
+to event coordinates, and event coordinates map independently to consumer
+tasks. This is more general and cleaner than attaching an event permanently to
+one producer/consumer root pair.
+
+Adopt these ideas:
+
+- Event keys have their own logical shape, including symbolic batch or sequence
+  axes, rather than borrowing one root's flattened task ID.
+- Producer-update and consumer-use maps are independent and may be many-to-one,
+  one-to-many, or restricted to a participating task domain.
+- An event may combine contributions from multiple roots, and its expected
+  count is derived per key.
+- The dependency representation is independent of whether the compiler later
+  chooses static waits, a last-arrival continuation, or a different scheduler.
+- The same abstraction can eventually represent data-dependent mappings, such
+  as MoE routing, without changing the dense-layer event model.
+
+Do not adopt these parts yet:
+
+- Do not require users to annotate Event Tensors. The paper starts from an
+  explicitly annotated graph; Helion must derive safe mappings from ordinary
+  kernel accesses.
+- Do not adopt the paper's centralized dynamic work queue for dense low-batch
+  layers. Its own dense-Qwen results show substantial dynamic-scheduler
+  overhead, consistent with our earlier global-cursor experiments. Keep the
+  structured static persistent scheduler.
+- Do not require decrement-to-zero counters or per-launch reinitialization.
+  Helion's epoch-relative counters are already capture- and replay-friendly.
+- Do not assume the event abstraction solves aliases, partial writes,
+  residency, deadlock, memory ordering, or root ABI preservation. Those remain
+  independent compiler obligations.
+
+Thus `KeyedEvent` is best understood as an internal, compiler-derived Event
+Tensor. A future irregular/MoE backend may lower the same IR to a dynamic queue,
+but Qwen and Gemma should first use a static schedule generated from it.
+
+#### Dependency construction
+
+Replace the single allocation-level `latest_writer` with conservative reaching
+definitions. A later partial or in-place write kills an earlier definition only
+for regions that it is proven to cover. Consumer readiness is formed from all
+reaching definitions needed by its accesses.
+
+Keep this implementation bounded and concrete:
+
+1. DeviceIR supplies logical task axes and allocation-coordinate access facts.
+2. Represent each footprint dimension as an exact interval or a wildcard and
+   retain both may-overlap and must-cover information. An unknown write adds a
+   reaching definition but kills no older definition.
+3. After a candidate kernel configuration instantiates tile sizes, enumerate
+   finite task footprints—not tensor elements and not an unconditional
+   producer/consumer Cartesian product—for supported affine accesses.
+4. Derive exact predecessor sets and contributor ownership from those concrete
+   logical task coordinates. Preserve known axes, such as KV head, even when a
+   different address dimension is indirect.
+5. Compress only proven regular relations into affine intervals, domains, and
+   constant-fan-in events.
+6. Bound compile-time enumeration with an explicit planning-work limit. If the
+   limit is exceeded, task counts remain symbolic, or disjointness, coverage,
+   and contribution counts are not proven, use root completion.
+
+This avoids both a general symbolic-set solver and reconstruction from lowered
+PID arithmetic. Enumeration is a configuration-time proof technique; the
+lowered representation remains compact.
+
+#### Qwen and FFN through the same IR
+
+The intended Qwen event graph is:
+
+```text
+qk_input[batch, q_or_k_head], count 16
+    <- QKV projection tiles 16*h ... 16*h+15
+    -> Q/K norm+RoPE task[batch, h]
+
+cache_input[batch, kv_group], count 17
+    <- normalized K head[batch, group]
+    <- 16 projected V tiles[batch, group]
+    -> cache task[batch, group]
+
+attention_ready[batch, kv_group], count 5
+    <- four normalized Q heads[batch, group]
+    <- cache task completion[batch, group]
+    -> admit that group's split-attention cohort
+
+chunk_ready[batch, chunk, q_head], count 8
+    <- eight split-attention tasks
+    -> chunk merge task
+
+head_ready[batch, q_head], count 16
+    <- sixteen chunk merge tasks
+    -> final merge task and attention quantization readiness
+```
+
+For the current batch-one shape, the first map covers Q/K projection tasks 0
+through 639 while V projection tasks 640 through 767 update `cache_input`
+instead. The event mapping therefore preserves both reaching definitions
+without pretending that Q/K normalization overwrote the V region. A static
+schedule should traverse the backward closure of the first `G` attention keys
+in key-major order, reproducing the useful Q/K/V grouping without a named
+attention lowering.
+
+The FFN is a smaller instance of the same representation:
+
+```text
+gate tiles[group] + up tiles[group]
+    -> activation-ready[group]
+    -> activation task[group]
+    -> downstream readiness frontier
+```
+
+Gemma4 uses the same event IR, with a simpler attention prefix and two explicit
+residual joins. For the non-shared-KV variant:
+
+```text
+input RMSNorm completion -> QKV projection tasks
+
+projected_head[batch, head]
+    <- all projection tiles belonging to that head
+    -> fused Q/K/V norm + RoPE + cache task[batch, head]
+
+attention_ready[batch, kv_group], count 6
+    <- four normalized Q-head tasks
+    <- one K-normalize/cache task
+    <- one V-normalize/cache task
+    -> attention split cohort for that group
+
+attention split completion -> attention merge
+attention merge completion -> output projection
+output projection completion -> post-attention residual/pre-FF norm
+
+gate/up projection contributions[activation group]
+    -> GeGLU task[activation group]
+    -> selected FFN readiness frontier
+    -> down-projection cohort
+
+down completion + saved post-attention residual
+    -> post-FF residual/RMSNorm
+
+post-FF output -> PLE gate -> PLE projection
+PLE projection completion + saved post-FF output
+    -> final PLE norm/residual/scale
+```
+
+For the shared-KV variant, the cache is an already-available external input, so
+the attention prefix becomes:
+
+```text
+input RMSNorm completion -> Q projection tasks
+projected_q_head[batch, q_head]
+    <- all Q-projection tiles belonging to that head
+    -> Q norm/RoPE task[batch, q_head]
+
+attention_ready[batch, kv_group], count 4
+    <- four normalized Q-head tasks
+    -> attention split cohort using the external KV cache
+```
+
+With the retained projection tile size, a projected head receives 32
+contributions for the 256-wide sliding-attention head and 64 contributions for
+the 512-wide full-attention head. Non-shared attention readiness has fan-in six;
+shared-KV readiness has fan-in four. Sliding attention admits 16 split tasks per
+KV group and full attention admits 64. These counts are derived from task and
+event-coordinate maps, not encoded as Gemma constants.
+
+Sliding and full attention change only task extents, split counts, resource
+usage, and therefore which legal frontier fits residency. They do not require
+different event kinds or a different lowering. Existing measurements also show
+that finer attention and output-projection continuations are not profitable for
+Gemma; the same event graph may therefore select root-completion or coarse
+cohort publication on those edges while retaining the FFN counted continuation.
+This is a policy choice within the common event representation, not a separate
+Gemma schedule.
+
+Different models therefore instantiate different event graphs, but use the
+same planner, event state, contribution lowering, last-arrival operation, and
+worker dispatcher.
+
+#### Policy boundary
+
+The compiler derives task domains, predecessor membership, fan-in, and event
+keys as legality facts. After selecting a legal readiness frontier, the static
+scheduler derives its worker-to-task mapping mechanically from the event graph;
+that mapping is policy, but not an independent tuning dimension. The only
+intended scheduling autotuning surface remains the small set of legal readiness
+frontiers (and therefore the derived launch grid). Do not add a static
+model-sensitive cost model or independent producer/consumer worker-assignment
+knobs.
+
+#### Refactor and deletion order
+
+1. Restore conservative root ordering for any partial WAW/WAR relation not yet
+   represented by complete reaching-definition semantics. The experimental
+   partial-prefix lowering remains test scaffolding, not the production default.
+2. Make allocation history retain the reaching definitions of partially
+   overwritten regions and derive each consumer key's complete predecessor
+   set. Change transitive coverage checks from root-pair reachability to
+   readiness facts, because a partial task relation does not order an entire
+   producer root.
+3. Introduce `KeyedEvent` with independent update and use mappings, then port
+   root completion, exact task events, existing counted continuations, and
+   access cohorts without changing their generated code.
+4. Add multi-contributor joins and lower every contribution through one
+   notification helper. Keep last-arrival opaque-task execution and downstream
+   cohort publication in the separate static dispatch plan.
+5. Express the Qwen QKV -> Q/K -> cache -> attention prefix using those events,
+   preserving every existing root body and its configured PID decomposition.
+   Derive a key-coalesced producer traversal from the selected readiness
+   frontier so event semantics alone do not regress to physical-order polling.
+6. Revalidate FFN continuation and all four Gemma variants through the same
+   representation; their generated arithmetic must remain unchanged.
+7. Delete the temporary partial-write pass-through workaround and
+   `_match_partitioned_dependency_pipeline` only after correctness, lowered
+   code, resource use, and performance match the retained fast path. This is
+   complete: the generic Qwen lowering matches the retained custom schedule.
+8. Keep one-wave reduction replication separate because it duplicates
+   computation and is not a dependency protocol.
+
 ## Recommended architecture
 
 ```text
@@ -28,9 +359,9 @@ DeviceIR roots
     ↓
 Memory accesses grouped by allocation
     ↓
-Producer → consumer dependency edges
+Region-aware reaching definitions and task relations
     ↓
-Proven readiness mapping per edge
+Keyed events with one or more contributor domains
     ↓
 Generic persistent execution with waits/publications
 ```
@@ -74,14 +405,17 @@ Use these facts to derive cross-root hazards in source order:
 - WAW: a later root writes an allocation written by an earlier root.
 - WAR: a later root writes an allocation read by an earlier root.
 
-RAW edges are candidates for fine-grained readiness. WAW and WAR edges should
-initially use conservative root-completion ordering. Unsupported side effects,
-atomics, or source-level conflicts that cannot be reconciled with DeviceIR facts
-must remain errors rather than being guessed away.
+RAW, WAW, and WAR edges may use fine-grained readiness only when every relevant
+access relation is proved. Otherwise they use conservative root-completion
+ordering. Unsupported side effects, atomics, or source-level conflicts that
+cannot be reconciled with DeviceIR facts must remain errors rather than being
+guessed away.
 
-Dependency discovery must be based on allocation identity, not only source
-variable names. Source-level dependency analysis remains useful for diagnostics
-and for detecting effects that the memory-fact layer cannot represent.
+Dependency discovery is based on allocation identity, not source variable
+names. The former source-level memory-dependency analysis has been deleted.
+The ordinary host walker now contributes only explicit barrier boundaries, and
+DeviceIR name lookup diagnoses unsupported cross-root value capture; neither
+constructs a second dependency graph.
 
 ### 3. Prove a readiness mapping for each edge
 
@@ -127,9 +461,9 @@ The implementation should have three deliberately small layers:
    relation, such as identity, a uniform partition, or contiguous nested-loop
    cohorts. It may construct an optimized schedule only after proving the
    required property.
-3. **Policy** chooses among the legal schedules. Initially this should be a
-   simple deterministic choice. The autotuner may later choose among a small
-   set of already-proven alternatives.
+3. **Policy** exposes only a small compiler-generated set of legal candidates
+   to measurement. It must not predict performance with a cost model or expose
+   arbitrary worker assignments.
 
 The dependency graph is therefore authoritative. A continuation analysis must
 not independently rediscover memory dependencies from root numbers, task
@@ -204,30 +538,69 @@ the faithful fine-grained lowering, but event storage, publication, polling,
 and poorly placed waits can make it slower than root completion.
 
 A continuation is an optimization of an already-proven task-ready relation.
-When the predecessor sets are disjoint, cover the producer domain, have a
-constant fan-in, and admit a compact mapping, each producer contributes one
-arrival to its consumer key and the final arrival executes the unchanged
-consumer task directly. Continuation does not discover new dependencies or
+When the predecessor sets are disjoint, have a constant fan-in, and admit a
+compact mapping, each participating producer contributes one arrival to its
+consumer key and the final arrival executes the unchanged consumer task
+directly. The participating domain may cover the complete producer family or a
+separately proved subdomain; unowned tasks execute normally and retain their
+own reaching definitions. Continuation does not discover new dependencies or
 make an otherwise illegal edge legal.
 
 For the Gemma gate-up to GeGLU edge, there are 640 producer tasks and 40
 consumer tasks, with 16 exact predecessors per consumer. The partition proof is
-valid, but the continuation was slower because it removed the tuned L2 order,
-added 640 atomic arrivals, increased whole-kernel register pressure, and did
-not create enough useful overlap with the downstream projection. The ordinary
-continuation measured about 153 us, while forcing the larger three-stage
-pipeline measured about 263 us. Therefore:
+valid. An early compiler experiment made the edge legal by removing L2
+remapping and measured about 153 us, while forcing a larger three-stage
+pipeline measured about 263 us. The later exact-codegen probe separated those
+effects: preserving the generated gate/up root and its L2 mapping, root
+completion measured about 85.52 us and consumer-major continuation about
+87.22 us. Thus logical task identity fixes legality, but continuation alone is
+not profitable for this graph. The activation-to-down edge still requires the
+entire activation domain unless the down reduction is admitted in proven K
+segments. Therefore:
 
 ```text
 legal continuation != profitable continuation
 ```
 
-The dependency graph remains the single source of truth for legality. A policy
-layer may choose among root completion, exact events, coarsened events, and
-continuation only when the required proof exists. It should use a small,
-deterministic cost model based on fan-in, task counts, worker balance,
-synchronization volume, resource use, and resident-worker capacity. It should
-not automatically select the finest-grained legal schedule.
+The dependency graph remains the single source of truth for legality. The
+compiler should enumerate only proved alternatives among root completion,
+exact events, coarsened events, and continuation; it should not use a cost
+model to predict which legal alternative is fastest. Alignment, residency, and
+forward progress are proof obligations. Event granularity, continuation, and
+legal worker frontiers belong to a small autotuning surface attached to an edge
+or interacting dependency component.
+
+The controlled Qwen and Gemma experiments narrow the continuation-pipeline
+surface further. Define:
+
+- `Np`: total producer tasks;
+- `Nc`: total downstream consumer tasks;
+- `F`: proved continuation fan-in;
+- `G`: a legal readiness frontier in continuation-consumer coordinates; and
+- `W`: physical persistent workers.
+
+The useful schedule family uses one complete initial producer wave:
+
+```text
+W = F * G
+```
+
+`G` must also place every split consumer access on an existing loop-tile
+boundary. The compiler then derives the assignment rather than tuning it:
+
+- all `W` workers execute one initial producer task;
+- one worker is assigned to each downstream consumer task when `Nc < W`;
+- the remaining producer tasks are assigned to the non-consumer cohort; and
+- the candidate is admitted only when those remaining tasks can make progress
+  within the proved resident grid.
+
+Thus producer and consumer worker counts are not independent choices. The only
+measured structural choice for this family is `G`, equivalently the exact
+worker count `W`. Do not couple it to `num_sm_multiplier`: that global,
+power-of-two multiplier is too coarse and would create a redundant tuning
+cross-product. Compile each graph-derived `(G, W)` candidate directly and
+discard it if its exact compiled resource usage cannot keep all `W` workers
+resident. If no such frontier is legal, use exact events or root completion.
 
 ### 3d. Make logical task geometry authoritative
 
@@ -238,12 +611,15 @@ generated PID expressions.
 
 This directly addresses two Gemma findings:
 
-- A specialized `q_heads // kv_heads` expression remained a string in the
-  lowered PID representation, causing static task-count recovery to fail and
-  silently selecting the cooperative-grid fallback.
-- Nontrivial L2 grouping currently disables task events because the readiness
-  implementation knows only ordinary flattened logical PIDs, not the root's
-  configured remap.
+- A specialized `q_heads // kv_heads` expression originally remained a string
+  in the lowered PID representation, causing static task-count recovery to
+  fail and silently select the cooperative-grid fallback. Task families now
+  preserve the specialized logical extent, and the benchmark again uses the
+  natural quotient expression without a source workaround.
+- Nontrivial L2 grouping previously disabled task events because readiness knew
+  only flattened physical PIDs. The scheduler now retains logical axis order
+  and converts between logical coordinates and each root's existing physical
+  traversal only at dispatch.
 
 The dependency proof should operate entirely in canonical logical coordinates.
 The execution layer should then apply the root's existing PID mapping when it
@@ -263,14 +639,19 @@ extents, and affine expressions. Fine-grained readiness remains unavailable for
 indirect or ambiguous mappings, but simple view algebra should not hide an
 otherwise exact predecessor relation.
 
+The first implemented normalization removes inserted or removed size-one view
+dimensions and records full slices explicitly. This already proves the Qwen
+attention map-to-quantization edge across `(32, 128)` and `(1, 32, 128)` views.
+Nontrivial flatten/unflatten relations remain conservative root-completion
+edges until their allocation-coordinate intervals are represented directly.
+
 ### 4. Represent scheduling with generic events and waits
 
 The plan should contain only generic scheduling concepts:
 
-- An event identifies a producer root and a readiness domain, such as task or
-  root completion.
-- A wait identifies a consumer root/access and the producer readiness keys it
-  requires.
+- An event identifies a logical key domain and one or more producer
+  contribution domains.
+- A wait identifies a consumer root/access and the readiness keys it requires.
 - Multiple incoming edges become multiple waits.
 - Fanout is multiple waits on the same publication.
 - Chains arise naturally because a root can both wait and publish.
@@ -384,39 +765,105 @@ This avoids both a general symbolic set solver and brittle pattern matching on
 flattened task IDs.
 
 Producer ordering is a performance policy, not another dependency proof. A
-consumer-major order makes all producers for one key arrive close together and
-allows useful work to continue early. Native producer order remains correct,
-but may delay every continuation until nearly the entire producer root has
-finished.
+consumer-major order makes each proved key a contiguous logical task interval.
+For the one-wave continuation pipeline this order is derived, not tuned: it is
+the order that makes `W = F * G` complete exactly the first `G` keys while the
+opaque producer body still receives its original physical task coordinates.
+Outside this pipeline the compiler preserves the root's configured traversal.
+
+Continuation should remain in the design, but not as a separate schedule kind.
+Represent it as an optional completion action on a counted event:
+
+```text
+producer contributes to event(key)
+    ↓ final required contribution
+execute opaque consumer_task(key)
+    ↓ publish any readiness produced by that task
+```
+
+The compiler attaches this action automatically when a selected readiness
+frontier requires the intermediate consumer to materialize and publish keys
+before the producer root completes. This is the Qwen and Gemma FFN case. Do not
+apply continuation merely because a uniform partition is legal: Gemma's
+standalone gate/up-to-activation continuation measured about 87.22 us versus
+85.52 us for root completion because it unlocked no useful downstream work.
+Conversely, disabling the continuation in the Qwen pipeline regressed the
+whole layer from about 74.9 us to about 86.7 us. Its value belongs to the
+connected dependency component.
+
+There is therefore no independent continuation toggle in the initial tuning
+surface. A frontier-pipeline candidate includes the proved last-arrival action;
+an edge outside such a candidate uses ordinary counted events or root
+completion. Fan-in, continuation ownership, producer traversal, and worker IDs
+remain compiler-derived.
+
+The execution policy is already performance-confirmed. The retained generic
+Qwen lowering uses last-arrival execution and most recently measures about
+74.66 us versus 85.14 us for separate kernels; disabling that continuation
+path measured about 86.7 us in the earlier controlled ablation. The best Gemma
+probe uses the same operation sequence--the final one of 16 gate/up producer
+arrivals executes the activation task and then publishes its downstream
+readiness--and measures about 72.2 us versus 79.8 us separately. The compiler-
+generated Gemma lowering now measures 73.16 us versus 78.74 us in a paired
+same-process run.
+Gemma's 87.22 us standalone-continuation result is not contradictory: without
+the downstream frontier, early activation execution unlocks no useful work.
+
+Representation invariance is now validated in the Triton probes. Factoring the
+Gemma arrival election into a reusable counted-event helper while leaving the
+opaque `on_ready` body unchanged produced byte-identical final SASS, the same
+198 registers, zero spills, and 34,816 bytes of shared memory. A paired
+same-process run measured 73.061 us for the direct spelling and 73.143 us for
+the counted-event spelling. The established Qwen probe already expresses the
+same factored arrival followed by an inline `on_ready` body; it revalidated at
+37.046 us for the persistent FFN core versus 38.948 us for its matched
+three-kernel graph. The compiler refactor should therefore preserve this exact
+lowering, with lowered-code equivalence and full-layer timing retained as
+regression gates while the old plan hierarchy is removed.
 
 ### 7b. What may be autotuned
 
 The autotuner may choose only among schedules whose legality is already proven.
-Reasonable internal candidates are:
+For the initial continuation-pipeline implementation, expose one dependent
+fragment: the legal readiness frontier `G`. Each value determines the exact
+worker count, producer traversal, continuation action, tail-producer cohort,
+consumer cohort, and two consumer access stages. These are not independent
+knobs.
 
-- exact task events versus a proven partition continuation;
-- native versus consumer-major producer traversal when both lower compactly;
-- the number and boundaries of proven nested-loop readiness cohorts; and
-- existing worker-count or occupancy choices subject to full-residency checks.
+Other edges may later expose event coarsening when they have several proved
+milestone sets, but that is separate from producer/consumer worker allocation.
+Do not add a continuation toggle, native-versus-consumer-major toggle, or raw
+worker-count knob preemptively.
 
 The autotuner must not choose dependency membership, readiness-key dimensions,
 fan-in independently of publication grouping, fence placement, or whether an
 unproved mapping is considered safe.
 
-Do not add these knobs preemptively. First implement the smallest deterministic
-partition continuation and measure it. Add a bounded internal tuning choice
-only when two general, legal strategies have a meaningful workload-dependent
-tradeoff.
+The fragment should store a candidate index rather than a model-shaped group
+count in the public configuration. Its values are regenerated from the current
+task graph and tile sizes. No user-visible Qwen/Gemma schedule parameters are
+introduced.
+
+Root completion is represented by the stable internal candidate value `-1`.
+It is the safe default and remains available to tuning beside any fine-grained
+frontiers. A nonnegative index selects one of the graph-derived frontiers; an
+out-of-range index is rejected rather than aliased to another schedule.
 
 ### 8. Keep the public interface small
 
 The durable public contract should be an opt-in cross-loop/tile-dependency
 schedule, plus explicit barriers where the user requires phase ordering.
 
-Epoch replication and producer order remain migration-time implementation
-details. Remove or internalize them when the remaining structural schedulers no
-longer require controlled experiments. The obsolete stage-count and
-continuation-split parameters have already been removed.
+Epoch replication, producer order, stage count, and continuation split are no
+longer public policy parameters. Worker order and synchronization layout are
+compiler-derived from the proved graph and selected readiness frontier.
+
+Singleton placement is likewise compiler-derived. Ordinary root traversal
+assigns work to low worker IDs first, so a singleton is assigned outside the
+active ranges of its direct predecessors when such a resident worker exists.
+Stable singleton order spreads several such roots without introducing a knob;
+when every worker participated, high worker IDs are preferred because they do
+not receive a partial-wave tail task.
 
 Dynamic shapes must not reach internal assertions. If a task count is symbolic,
 the planner should either emit symbolic expressions or select a documented safe
@@ -436,13 +883,23 @@ Every implementation stage must preserve these invariants:
    dimensions may simplify away, but non-singleton batch/rank dimensions may
    not.
 6. Multiple producers, consumers, stores, and loads are represented as graph
-   edges and sets of waits/publications, not topology-specific cases.
-7. Every waiting launch configuration satisfies the full-residency progress
-   requirement.
-8. Launch epochs and stream-local state prevent cross-launch and cross-stream
-   readiness reuse.
-9. Disabling the schedule leaves ordinary Helion codegen unchanged.
-10. Enabling the schedule changes root bodies only by inserting the required
+   edges and event updates/uses, not topology-specific cases.
+7. Every declared update executes exactly once per key and launch epoch, and
+   the derived expected count equals the number of guaranteed contributions.
+8. A last-arrival action is wait-free: every dependency of the invoked task is
+   included in the triggering event. Event/action dependencies are acyclic, and
+   every logical task has exactly one executor.
+9. Full residency is necessary but not sufficient for progress. The selected
+   static queues or structured traversal must retain a nonwaiting path to every
+   outstanding contribution; validate this with a bounded configuration-time
+   progress simulation where formulas alone are insufficient.
+10. Producer writes complete CTA-wide before release publication; the final
+    arrival acquires prior contributions before executing a consumer, and any
+    downstream publication follows the same barrier/release discipline.
+11. Launch epochs and stream-local state prevent cross-launch and cross-stream
+    readiness reuse.
+12. Disabling the schedule leaves ordinary Helion codegen unchanged.
+13. Enabling the schedule changes root bodies only by inserting the required
     synchronization instrumentation at stable boundaries.
 
 ## What to reuse
@@ -569,8 +1026,9 @@ longer copied into DeviceIR or consulted by lowering. Each graph edge carries:
 The supported exact relation is intentionally small: a union of affine
 Cartesian producer-coordinate intervals. This represents unequal tile sizes,
 outer batch axes, and the two disjoint gate/up regions without requiring a
-general symbolic-set solver. Enumeration remains a test oracle, not the
-production representation.
+general symbolic-set solver. Bounded configuration-time enumeration validates
+the concrete task relation; successful relations are compressed into this
+small production representation before lowering.
 
 ### Counted readiness as the common synchronization primitive
 
@@ -588,26 +1046,56 @@ An exact task event uses the producer task as its key and count one. A join uses
 the consumer logical key and derives its fan-in from the predecessor relation.
 A cohort event adds a monotone milestone to that key.
 
-Continuation is an execution choice on a counted event: the producer that
+Continuation is an execution choice over a keyed event: the producer that
 makes the final contribution may execute the now-ready opaque consumer task.
-Disjointness, coverage, and fan-in are proof obligations, never tuning knobs.
+Disjointness, exact contributor-domain coverage, and fan-in are proof
+obligations, never tuning knobs.
+The continuation action may itself publish another counted event after the
+consumer store, allowing a chain such as producer projection -> activation ->
+ordered down-projection to remain one graph-derived component.
 
-### Local proof, small global policy
+Do not materialize a separate continuation plan hierarchy. The dependency IR
+contains only keyed events and their update/use relations. The static dispatch
+plan may attach a last-arrival opaque-task action and refers to the same events
+for its frontiers and milestones. This keeps root completion, exact events,
+joins, and continuation on one mechanism without mixing legality and policy.
+
+### Local proof, small measured policy
 
 Dependency legality remains pairwise over producer and consumer task families.
 A thin global planner is still required for joins, worker ownership, progress,
-and the shared resource envelope. Its deterministic cost model considers:
+and the shared resource envelope. It should prove and enumerate candidates,
+not rank them with a static performance model.
 
-- producer and consumer task counts and wave counts;
-- fan-in, polling fanout, and event storage;
-- critical-path overlap exposed by a strategy;
-- compiled registers and shared memory;
-- driver-reported resident capacity and safety margin; and
-- load balance across the selected worker count.
+For the one-wave continuation family above, the compiler can derive a compact
+candidate interval. Requiring one consumer wave and at most one tail-producer
+wave gives the lower bound
 
-The 592-worker Gemma experiment shows that satisfying full residency is a
-legality condition, not a reason to fill every resident slot. The planner must
-be allowed to select fewer workers.
+```text
+W >= ceil((Np + Nc) / 2)
+```
+
+and candidate-specific compiled residency gives the upper bound. Only values
+representable as complete continuation keys and complete downstream reduction
+tiles enter the autotuner. For every accepted `W`, the compiler fixes
+`G = W / F`, assigns all `Nc` consumer tasks one worker each, and assigns the
+`Np - W` tail tasks to the low worker IDs. There is no worker-map search and no
+`num_sm_multiplier` dependency.
+
+This produces six legal Gemma candidates rather than an arbitrary assignment
+space: 416, 448, 480, 512, 544, and 576 workers. For Qwen, the same proof makes
+1024 workers the first legal candidate because 1536 producer tasks and 512
+consumer tasks must fit in two overlapping waves. The autotuner measures the
+small frontier set because the best endpoint depends on the generated kernel:
+Qwen selects the first legal frontier, while Gemma selects the largest legal
+frontier below its four-CTA-per-SM resident budget.
+
+The launch grid is kernel-wide. Initially, admit one frontier-driving
+dependency component, or several components only when they derive the same
+`W`. Other components use ordinary counted-event traversal on that grid. If
+future workloads require incompatible profitable frontiers, collect evidence
+before introducing a joint component search; do not begin with a Cartesian
+product of per-edge worker counts.
 
 ### Keep codegen tuning outside the scheduler
 
@@ -644,21 +1132,28 @@ split, reassociate, or otherwise rewrite opaque computation bodies.
    without changing emitted code.
 2. Build the unified dependency graph from normalized allocation accesses and
    retain the current graph as a checked compatibility view temporarily.
-3. Add a small schedule IR for counted events, waits, publications, and opaque
-   task calls; move pure planning out of `program_id.py`.
+3. Add a small schedule IR for counted events, waits, publications, optional
+   last-arrival opaque task calls, and exact logical-worker dispatch; move pure
+   planning out of `program_id.py`.
 4. Migrate root completion, exact task events, and uniform last-arrival
-   continuation to the generic schedule IR.
+   continuation onto that single counted-event representation.
 5. Add generic multi-producer joins and monotone nested-loop milestones. Use
-   these to express the Qwen/Gemma FFN stream.
-6. Express the useful attention/reduction composition from these primitives.
+   these to derive legal frontier candidates and express the Qwen/Gemma FFN
+   stream without a separate pipeline matcher.
+6. Add an internal dependent autotuning fragment that selects a legal frontier
+   candidate. Derive the exact launch grid and both worker cohorts from that
+   candidate, then reject it after compilation if full residency is not
+   satisfied.
+7. Express the useful attention/reduction composition from these primitives.
    If a computation-replication optimization remains desirable, place it in a
    separate transformation pass rather than the dependency scheduler.
-7. Delete `_match_ordered_input_singletons`,
+8. Delete `_match_ordered_input_singletons`,
    `_match_one_wave_reduction_fanouts`, and
    `_match_partitioned_dependency_pipeline` only after equivalent generic
    plans pass correctness, codegen-invariance, and performance gates.
-8. Internalize or remove `producer_order` and `epoch_replicas` after all
-   migration users disappear.
+9. Remove the migration-only `producer_order` and `epoch_replicas` API knobs.
+   This is complete: the compiler owns both choices and the default generated
+   synchronization sequence is unchanged.
 
 The legacy top-level source dependency analysis has been deleted. DeviceIR's
 allocation graph now performs both unscheduled-hazard rejection and scheduled
@@ -687,27 +1182,26 @@ Status values: **pending**, **in progress**, **complete**, or **blocked**.
 | 3 | complete | Add generic root-ready and task-ready events to the current static persistent traversal. | Simple chains, fanout, joins, unequal tiles, and Cartesian grids use one planner/codegen path. |
 | 4 | complete | Support readiness coordinates introduced by existing nested loops and access-aware wait placement. | Nested-loop dependencies are correct without changing computation codegen. |
 | 5 | complete | Add two narrow optimizations over exact readiness: nested-loop cohorts and uniform-partition last-arrival continuations. | Qwen's FFN chain is represented without a topology matcher; failures fall back to exact events or root completion. |
-| 6 | in progress | Remove specialized matcher/emitter families and internalize or remove specialized public knobs. | Planner and codegen contain only root/task/access/event abstractions. The duplicate source dependency analyzer is gone. |
-| 7 | in progress | Audit and separate unrelated codegen changes; handle dynamic task counts without assertions. | Schedule-off codegen is unchanged, and dynamic-shape scheduling selects a valid symbolic path or safe fallback. |
+| 6 | complete | Replace the one-producer event model and partitioned-attention matcher with region-aware, multi-contributor keyed events. | Qwen QKV/QK/cache/attention and both FFN variants use the same contributor/event lowering; the custom matcher and temporary partial-write pass-through are deleted. |
+| 7 | complete | Audit and separate unrelated codegen changes; handle dynamic and large task domains without assertions or arbitrary planning cutoffs. | Schedule-off codegen is unchanged, dynamic shapes use the cooperative phase fallback, and static region matching scales with task domains plus actual overlaps rather than their Cartesian product. |
 | 8 | in progress | Final correctness, performance, lint, and design review, including a second-model Gemma4 probe. | Test matrix passes; Qwen meets the agreed performance range; remaining limitations are explicit and structural. |
 
 ### Current migration boundary
 
-The dependency graph now owns ordinary root-entry readiness, generic
-multi-producer joins, nested-loop access cohorts, and the FFN
-producer-to-map continuation. The old flattened-ID grouped-continuation and
-ordered-input-singleton matchers and their emitters have been deleted. The
-ordered singleton case is now expressed as one counted readiness event per
-logical stream coordinate, with the wait inserted at the existing consumer
-loop boundary identified by an explicit access program point.
+The dependency graph now owns ordinary root-entry readiness, exact task
+readiness, generic multi-producer joins, repeated-predecessor ready groups,
+nested-loop access cohorts, and last-arrival continuations. The old
+flattened-ID grouped-continuation, ordered-input-singleton, and partitioned
+attention matchers and their emitters have been deleted. The Qwen QKV/QK/cache
+join, attention admission, two merge levels, quantization handoff, and FFN all
+use the same keyed-event and root-dispatch machinery.
 
-Only two structural emitters remain: one-wave reduction fanout and the
-partitioned attention pipeline. Both now consume the unified allocation-based
-dependency graph for legality; neither may rediscover hazards from the legacy
-tile schedule. They are compatibility shims while their additional execution
-properties are isolated, not templates for more matcher families.
+Only one structural emitter remains: one-wave reduction fanout. It consumes
+the unified allocation-based dependency graph for legality but deliberately
+replicates computation, so it is not a dependency protocol and should remain a
+separate optimization pass.
 
-The review classifies those two paths differently:
+The review classifies that remaining path as follows:
 
 - One-wave reduction fanout deliberately replicates an opaque singleton
   computation in every consumer CTA. That is an optional computation-
@@ -715,43 +1209,133 @@ The review classifies those two paths differently:
   outside the generic scheduler until DeviceIR can prove the root is pure and
   idempotent; do not teach the dependency graph about reductions by inspecting
   lowered Triton.
-- The partitioned attention path is a composition of counted joins,
-  last-arrival continuations, and worker-affinity traversal. Its legality must
-  continue to come from dependency edges, but replacing it should wait until
-  normalized access relations describe every edge in that subgraph. Deleting
-  it earlier would trade a simpler file for a slower kernel without yielding a
-  genuinely general abstraction.
+Region-aware reaching definitions now split exact partial writes, retain
+unknown earlier definitions conservatively, and derive complete predecessor
+sets for multi-root joins. Ordinary size-one views, storage offsets, and the
+task-aligned Qwen layouts normalize into allocation coordinates. More general
+flatten/unflatten support remains deliberately deferred until a second real
+kernel requires it.
 
-### Immediate next steps after the generic FFN continuation
+A source-only Qwen experiment narrowed that requirement. The attention split
+can write directly to `(split, query_head, dimension)` storage and both merge
+levels can index their multidimensional tensors directly, with no performance
+loss and simpler lowered address arithmetic. This removes ordinary alias/view
+normalization from that path, so a general reshape solver is not a prerequisite
+for replacing the compatibility emitter. It does not, however, prove the
+partitioned reduction dependency by itself: the producer query-head coordinate
+is `kv_head * q_per_kv + query_in_group`, and each first-level merge task reads
+the bounded split interval `chunk * splits_per_chunk + [0, splits_per_chunk)`.
+Those are intrinsic logical task relations, not artifacts of a tensor view.
 
-1. Replace reduction fanout with a graph-derived composition primitive if its
-   only extra property is one-wave ownership; retain conservative root
-   completion otherwise.
-2. Isolate the attention partition pipeline's useful primitives before trying
-   to replace it wholesale. Do not force its reduction topology into the
-   uniform-partition continuation abstraction.
-3. Make logical event identity independent of physical PID traversal so exact
-   readiness remains available under ordinary loop-order and L2 remapping.
-4. Remove or internalize migration-only policy knobs after their remaining
-   users disappear. Do not introduce new knobs without measured evidence of
-   two materially different legal schedules.
-5. Expand shape testing to shorter contexts, changed intermediate widths,
-   partial tiles, and dynamic task counts, keeping unsupported relations on the
-   exact-event or root-completion paths.
-6. Audit schedule-off generated code and remove dead access-wait experiments or
-   helpers that no longer serve a fallback path.
+The implementation should therefore prefer canonical source layouts where
+they are natural and express predecessor intervals with ordinary tile ranges.
+Add affine logical-coordinate facts only for a real relation that cannot be
+written that way. Defer a general allocation-region or in-place relation solver
+until another real kernel requires it. Indirect cache relations fall back to
+root completion unless source-level logical task identity proves the required
+join; Qwen's task-aligned cache source now provides that proof.
 
-This ordering is intentional. The next compiler work should improve the graph
-inputs (view normalization and logical traversal identity) before adding more
-schedule patterns. Once the graph can express those edges, the remaining
-composite emitter can be reconstructed from generic counted-event operations
-and removed in one step.
+An even simpler source form expresses both attention merge reductions as
+ordinary `hl.tile` ranges: eight split tasks per chunk and all sixteen chunks
+for the final merge. With the natural four-dimensional partial tensors, the
+existing DeviceIR proof then classifies split-to-chunk-merge and
+chunk-merge-to-final-merge as exact task-ready edges without any new alias
+analysis. This is the preferred source shape for the generic replacement.
+The query-head merge block is an ordinary kernel tiling choice. A block of four
+makes the predecessor sets a disjoint partition. A block of one makes four
+consumer tasks share each predecessor set; the keyed-event planner represents
+that as one ready-group counter and four independent consumers, rather than
+executing four consumers serially on the last producer. That distinction closes
+the performance gap: the one-head source with generic ready groups matches the
+deleted custom schedule. Let the existing block-size tuner choose task
+granularity; do not add a scheduler-specific fanout knob.
+
+### Next execution plan
+
+Completed in the current implementation:
+
+1. Compiler-generated legal frontier candidates derive `G`, exact `W`,
+   consumer-major producer traversal, the tail-producer cohort, and the
+   one-task-per-consumer cohort.
+2. An internal frontier fragment selects among those candidates. The launch
+   uses the exact derived grid and post-compilation residency rejects an
+   oversized candidate; Gemma's 608-worker candidate was correctly rejected at
+   a measured capacity of 592. `num_sm_multiplier` is not part of this choice.
+3. Logical event identity is independent of physical loop order and L2
+   grouping. Batch and other outer logical axes remain in readiness keys.
+4. The counted-event last-arrival operation sequence was validated in Triton
+   probes and is active in compiler-generated Qwen and Gemma lowerings.
+5. Generic multi-producer root joins no longer force exact per-task polling.
+   Gemma showed why this matters: exact access-local events measured about
+   96.57 us, while the root-join policy recovered approximately 73.69 us in the
+   timing-only run.
+6. Every structural-plan entry accepts the same ordered set of upstream
+   root-completion dependencies. This removes the former singular-input
+   assumption without adding topology cases.
+7. Singleton producer task events are canonicalized to root completion. A
+   one-task event and root completion are identical, and retaining only one
+   representation avoids duplicate counters and preserves compact lowering.
+
+Remaining, in order:
+
+1. Finish separating one-wave reduction replication from dependency
+   scheduling. Treat
+   it as an independently justified pure-computation transform rather than a
+   dependency primitive.
+2. Canonicalize ordinary source views where that is performance-neutral and
+   express reduction intervals as tile ranges. Preserve additional affine
+   logical-coordinate expressions only when source-level tiles cannot express
+   a demonstrated relation. Do not build a general reshape/in-place region
+   solver without a second demonstrated need. Specialized scalar quotient task
+   extents, including Gemma's natural `q_heads // kv_heads`, are already
+   preserved.
+3. Retain the provisional bounded frontier-index fragment for now. The current
+   fragment API is fixed when `ConfigSpec` is built, while the exact legal
+   candidate count depends on the selected block sizes and is known only during
+   lowering. Invalid indices already fail as invalid configurations. Revisit a
+   dependent fragment only as a general autotuner capability; do not couple
+   schedule discovery back into DeviceIR construction for this feature alone.
+4. Expand full-layer shape testing and rerun Qwen/Gemma correctness and
+   performance on uncontended GPUs after each structural deletion gate.
+5. Continue broadening the compact relation representation only when a real
+   workload needs it. Dynamic task domains already use the cooperative phase
+   fallback. Large static domains no longer use a hardcoded task-product
+   cutoff: the region proof sorts task address intervals and visits only actual
+   overlap candidates. Unknown address intervals still select root completion.
+
+Do not add a strategy cost model. The Triton Gemma probe showed that logical
+task identity fixes continuation legality but not profitability by itself:
+root completion was about 85.52 us, consumer-major continuation about 87.22 us,
+an aligned 416-worker frontier about 81.07 us, a 512-worker frontier about
+80.82 us, and the aligned 576-worker frontier about 75.77 us in the same
+experiment. The compiler proves the small legal frontier family and the
+autotuner measures only its candidate index.
+
+The compiler must continue to have one general scheduler. The tuning surface
+belongs to an individually proven dependency edge or interacting graph
+component; it must not select named Qwen, Gemma, FFN, or attention schedules.
+The compiler derives event keys, exact counts, legal split alignment, residency,
+and progress constraints automatically, and the autotuner measures only the
+remaining legal choices.
 
 ### Current performance evidence
 
-- The generic graph-derived Qwen schedule is approximately 74.9 microseconds
-  versus approximately 80.4 microseconds for separate kernels on the current
-  setup, with 252 registers and zero spills.
+- The final generic graph-derived Qwen schedule is 75.82 microseconds versus
+  86.17 microseconds for separate kernels in the latest fresh paired run, with
+  251 registers, zero spills, and 17,408 bytes of shared memory. A fresh run of
+  the retained custom scheduler measured 76.16 microseconds, so the generic
+  replacement is at parity within noise. Earlier software/environment snapshots
+  measured the same designs near 74--75 microseconds.
+- The final tuned Gemma sliding non-shared schedule is 74.02 microseconds versus
+  78.98 microseconds separately, with 204 registers, zero spills, and 34,816
+  bytes of shared memory. Eliminating an exact task wait already dominated by a
+  whole-root dependency path recovered about 2 microseconds without changing
+  any scheduling policy.
+- NCU reports 141.44 microseconds for the final Qwen kernel, compared with
+  150.02 microseconds before ready-group coalescing and 139.14 microseconds for
+  the deleted custom path. The final run transfers 233.4 MB, reaches 21.5% of
+  peak DRAM throughput, and spends 43.9% of active-warp issue cycles on long
+  scoreboard stalls, closely matching the former custom path.
 - Exact access-local task polling for the generic path was approximately 262
   microseconds and caused heavy register spilling.
 - Hoisting exact polls into a preflight traversal improved this only to roughly
@@ -764,6 +1348,13 @@ and removed in one step.
 - The uniform-partition last-arrival continuation plus the derived one-wave
   producer/consumer split recovered the full performance target without an
   autotuner knob or a Qwen-specific matcher.
+- The compiler-generated Gemma schedule is approximately 73.16 microseconds
+  versus approximately 78.74 microseconds for separate kernels in a paired
+  same-process run, with 206 registers, zero spills, and 35,200 bytes of shared
+  memory. Moving singleton work away from worker zero supplied the latest gain.
+- Gemma's fused root configuration remains ordinary benchmark-side codegen
+  tuning, not scheduler special-casing. The retained Triton probe remains about
+  2.5 microseconds faster and is the comparison target for lowering cleanup.
 
 These results validate the narrow generic continuation primitive. They do not
 justify reproducing every specialized ordering or staging detail from the
@@ -771,9 +1362,9 @@ probe.
 
 ### Gemma4 generalization probe
 
-The first full-layer probe outside Qwen stacks the existing Gemma4 E4B Helion
-roots without changing the compiler. Lowered-code inspection is part of the
-evaluation, not just end-to-end timing. The current B200 results are:
+The first full-layer probe outside Qwen stacked the existing Gemma4 E4B Helion
+roots before the graph-derived FFN frontier and fused-root retuning landed.
+Those historical B200 results were:
 
 | Variant | Megakernel | Separate Helion | Delta |
 | --- | ---: | ---: | ---: |
@@ -787,33 +1378,27 @@ They should be compared separately from the older Gemma README numbers, whose
 full-attention separate-kernel results were materially faster on the earlier
 software state.
 
-The probe exposed the following general boundaries:
+The initial probe exposed the following general boundaries; later entries note
+which have since been resolved:
 
-- Most Gemma roots currently lower through whole-value completion. The lowered
-  Triton code has global waits between input norm, projections, Q/K/V
-  normalization, attention split/merge, output projection, and the FFN prefix.
-  Only the PLE tail obtains useful task-level events in the retained
-  configuration.
-- Passing `q_heads // kv_heads` through the composed source left the shared
-  attention task extent symbolic during scheduler construction. Although
-  Triton later folded the value to 4, `_static_case_task_counts` returned
-  `None`, selecting the cooperative-grid fallback and producing a 210.7 us
-  kernel. Passing the already-known `q_per_kv` scalar directly restored the
-  ordinary persistent event schedule and reduced the result to about 100 us.
-  Static task geometry should eventually consume specialized scalar
-  expressions directly so equivalent source forms select the same schedule.
-- Copying a standalone tensor-descriptor choice into an outlined root emits a
-  descriptor load such as `down_weight_desc.load(...)` without threading that
-  descriptor through the generated root helper. This is a compiler correctness
-  bug in the interaction between root outlining and descriptor setup. The
-  benchmark therefore retains pointer indexing rather than changing compiler
-  code in this experiment.
-- Nontrivial L2 PID remaps deliberately force root completion because event
-  IDs are defined in ordinary logical PID order. Removing the remaps exposes
-  the generic gate/up continuation, but the resulting schedule is much slower
-  for Gemma (about 153 us); forcing the full three-stage pipeline was slower
-  still (about 263 us). This confirms that legality and policy must remain
-  separate: a proved continuation is not automatically the best schedule.
+- The first stacked kernel lowered most Gemma roots through whole-value
+  completion. The current compiler now derives the FFN continuation/frontier
+  component generically; unrelated edges still use root completion when finer
+  readiness has no proved or performant representation.
+- Passing `q_heads // kv_heads` through the composed source initially left the
+  shared-attention task extent symbolic during scheduler construction. Task
+  family metadata now consumes the specialized quotient directly, so the
+  natural source expression and L2-remapped dispatch select the same schedule.
+- The initial outlined-root implementation failed to thread tensor descriptors
+  into generated helpers. Outlined ABI discovery now includes compiler-created
+  preamble values, and both a focused descriptor test and a Gemma diagnostic
+  configuration compile correctly. The retained benchmark still uses pointer
+  indexing for direct comparison with the tuned probe.
+- Nontrivial L2 PID remaps initially forced root completion. Logical event keys
+  are now canonical and mapped to each root's physical L2 traversal only at
+  dispatch, so Gemma takes the same proved FFN continuation/frontier path as
+  Qwen. The earlier 153 and 263 microsecond failures remain useful evidence
+  that legality alone does not choose a profitable frontier.
 - The full-attention root demonstrates the resource cost of a single kernel
   configuration. A 512-by-128 attention tile exceeds B200 shared memory even
   at two stages. A 32-token context tile with four warps and three stages is
@@ -821,16 +1406,18 @@ The probe exposed the following general boundaries:
   still reaches 254--255 registers. This is a configuration/resource issue,
   not evidence for a model-specific scheduler case.
 - The two residual RMSNorm joins are singleton consumers with two producer
-  roots. The current structural singleton path accepts only one whole-value
-  predecessor, so the probe output-tiles these roots at width 1024. A generic
-  multi-input root-ready join would remove this source workaround.
+  roots. Generic multi-input root-completion joins are now supported. The probe
+  still output-tiles these roots at width 1024; reverting that source adaptation
+  is a performance comparison, no longer a missing legality primitive.
 
-The next general improvements suggested by Gemma are therefore small and
-orthogonal: preserve specialized task extents through scalar expressions,
-thread generated descriptor arguments through outlined root helpers, normalize
-affine accesses across simple views/reshapes, and let singleton roots wait on
-multiple proven root-completion events. None requires a Gemma-specific
-continuation or a new public tuning knob.
+The remaining general improvements suggested by Gemma are therefore small and
+orthogonal: normalize affine accesses across simple views/reshapes and decide
+whether to retain the output-tiled residual roots as a performance choice. The
+natural singleton forms now compile and run correctly at approximately 75.17
+microseconds with the same FFN frontier, versus approximately 73.16
+microseconds for the retained tiled forms. They are no longer legality
+workarounds. Neither issue requires a Gemma-specific continuation or a new
+public tuning knob.
 
 The later exact-codegen probe recovered a performant lowering without changing
 that architecture. With the actual Helion-generated root bodies, the retained
@@ -850,12 +1437,37 @@ approximately neutral, and more attention splits were slower. Attention and
 output-projection continuations also regressed. Relaxed polling and alternate
 worker placement did not help.
 
-The final concurrency ablation is an important policy boundary: a 592-worker
-shape exactly filled the driver-reported resident capacity but regressed to
-111.2 microseconds. The scheduler must validate full residency for legality,
-but the cost model should preserve margin and must not assume that more
-resident work is faster. This remains a small deterministic policy over task
-counts and compiled resources, not a new dependency case.
+The controlled worker/frontier ablation replaces an earlier incomparable
+592-worker result that also changed activation and down-projection tiling. With
+all root codegen held fixed, the aligned one-wave Gemma candidates measured:
+
+| Workers | Ready groups | Megakernel | Separate Helion |
+| ---: | ---: | ---: | ---: |
+| 416 | 26 | 81.07 us | 80.06 us |
+| 448 | 28 | 82.57 us | 80.16 us |
+| 480 | 30 | 81.20 us | 80.00 us |
+| 512 | 32 | 80.82 us | 80.16 us |
+| 544 | 34 | 80.25 us | 79.97 us |
+| 576 | 36 | **75.77 us** | 80.03 us |
+| 608 | 38 | 83.48 us | 80.05 us |
+
+The two independent-cohort ablations were much worse. Holding the 36-group
+frontier fixed but launching only 560 workers measured 91.00 us because 16
+producer tasks entered a second pre-readiness wave. Holding 576 workers and
+the 36-group frontier fixed but reducing the consumer cohort from 160 to 144
+measured 88.53 us because 16 output tiles entered a second consumer wave; 80
+consumer workers measured about 87.48 us. These results support one structural
+frontier knob, not separate producer/consumer allocation knobs.
+
+Trace timestamps explain the frontier cliff. The 576-worker/36-group schedule
+published its first and final FFN readiness at 23.62 and 35.42 us and finished
+the down tasks at 39.84 us. The exact-wave 608-worker/38-group schedule did not
+publish until 29.79 and 41.44 us and finished at 45.60 us. Targeted NCU measured
+157.4 versus 170.5 us under profiler replay, 1.21 versus 1.12 TB/s DRAM traffic,
+0.104 versus 0.098 eligible warps per scheduler, and 9.23 versus 10.04 long-
+scoreboard-stalled warps per issue cycle. More active warps in the 608-worker
+case did not create more eligible work. Full residency is a legality condition,
+not a performance ordering.
 
 ## Validation matrix
 
@@ -890,7 +1502,13 @@ counts and compiled resources, not a new dependency case.
 - Repeated launches without stale event reuse.
 - Multiple CUDA streams.
 - CUDA graph capture and replay.
+- Exact launch grids derived from frontier candidates, independent of
+  `num_sm_multiplier`.
 - Insufficient-residency configuration rejection.
+- Candidate-specific rejection when changing the frontier changes compiled
+  registers or shared memory.
+- Root-completion fallback when every fine-grained frontier exceeds compiled
+  resident capacity.
 - Zero-task roots and symbolic task counts.
 
 ### Performance checks
@@ -900,6 +1518,11 @@ counts and compiled resources, not a new dependency case.
 - Synchronization overhead on simple chains.
 - Register count and spill count.
 - Generated-code audit confirming unchanged root computation.
+- Lowered-Triton comparison proving that counted-event `on_ready` continuation
+  preserves the existing fast producer order, last-arrival test, consumer call,
+  fences, and downstream publication.
+- Frontier sweeps that include the Qwen first legal point and all aligned Gemma
+  points between the one-tail-wave lower bound and compiled residency limit.
 
 Performance is a required constraint, but correctness proofs may not be weakened
 to recover a few microseconds. Prefer removing overhead from the generic event
@@ -907,11 +1530,11 @@ representation or traversal over adding a model-specific fast path.
 
 ## Known evidence and current baseline
 
-As of 2026-08-21:
+As of 2026-08-22:
 
-- The current full Qwen3 granular schedule runs at approximately 75
-  microseconds versus approximately 81 microseconds for separate kernels on the
-  existing test setup.
+- The current full Qwen3 granular schedule runs at 76.09 microseconds versus
+  86.27 microseconds for separate kernels on the latest cache-bypassed run and
+  matches the retained custom scheduler within measurement noise.
 - Shorter context configurations tested so far remain correct and faster than
   the corresponding separate-kernel runs.
 - The generic FFN continuation is selected for batch sizes 1, 2, and 4 in the
@@ -929,6 +1552,15 @@ As of 2026-08-21:
 - The exact-codegen Gemma4 E4B probe now reaches approximately 72.2
   microseconds versus 79.8--80.0 microseconds for separate Helion, with no
   compiler changes and unchanged graph-derived legality.
+- The compiler-generated Gemma4 E4B sliding non-shared schedule reaches 74.09
+  microseconds versus 78.87 microseconds in the latest paired benchmark. It
+  uses the same keyed-event, continuation, and frontier machinery as Qwen.
+- Full non-shared remains correct and slightly faster than separate Helion at
+  128.51 versus 130.82 microseconds. Sliding-shared and full-shared are correct
+  but currently slow because the fused kernel uses 69--70 KiB shared memory and
+  249--255 registers, leaving only two resident CTAs per SM and no legal FFN
+  frontier. This is a codegen/resource-envelope issue, not evidence for a new
+  dependency schedule.
 - Gemma attention retiling and additional legal continuations did not improve
   the result. Joint fused-envelope tuning of existing root tile and range
   settings supplied the gain.
@@ -951,21 +1583,94 @@ Resolved:
   runtime state unless evidence requires a different dispatcher.
 - Represent the FFN continuation as an exact uniform partition with one varying
   producer axis and affine outer coordinates.
-- Use deterministic cohort boundaries and worker geometry for now; measured
-  performance does not justify an autotuner choice.
+- Derive cohort boundaries and worker geometry from each proved frontier. The
+  autotuner selects only a legal frontier candidate index; it does not tune raw
+  worker assignments or synchronization facts.
 - Remove the now-unused `tile_dependency_stages` and `continuation_split`
   policy parameters.
 
 Open, to be answered with implementation evidence:
 
-- How to express the remaining attention partition and reduction schedules as
-  compositions of graph-derived primitives without losing performance.
-- Whether `producer_order` and `epoch_replicas` can be internalized after those
-  remaining structural schedulers are migrated.
 - How to avoid compile-time enumeration for very large static task domains
   without introducing a broad symbolic-set solver.
+- Whether shared-KV Gemma root tilings can reduce the fused resource envelope
+  enough to admit a legal frontier; this should be explored as ordinary root
+  codegen tuning, not scheduler special-casing.
 
 ## Progress log
+
+### 2026-08-22
+
+- Removed the hardcoded task-product budget and the 64-segment acceptance
+  cutoff from ready-group construction. The planner now indexes each task's
+  graph-derived allocation interval, sorts producer and consumer intervals,
+  and visits only possible overlaps. This preserves conservative
+  flatten/unflatten support without a quadratic Cartesian scan; unknown
+  address geometry still falls back to root completion. A 2,052-by-2,052
+  flattened-view regression verifies that a valid relation above the former
+  cutoff remains a compact 513-key event, and a strided-column regression
+  verifies that exact coordinates disambiguate overlapping address hulls.
+- Regenerated both final kernels after that change. Their Triton bodies are
+  unchanged apart from constexpr declaration order. Fresh B200 measurements
+  are 75.82 microseconds versus 86.17 separately for Qwen and 74.02
+  microseconds versus 78.98 separately for Gemma sliding non-shared. The
+  regenerated lowerings are
+  `/tmp/qwen3_generic_keyed_interval_sweep_lowered.txt` and
+  `/tmp/gemma4_generic_keyed_interval_sweep_lowered.py`.
+- Added region-aware reaching definitions for partial and in-place writes.
+  Exact writes split earlier reaching regions; unknown writes remain
+  conservative and do not erase definitions they cannot prove they cover.
+- Added multi-contributor keyed events with independent producer task-to-key
+  and consumer task-to-key maps. Uniform fan-in is derived from those maps;
+  repeated maps are compressed with an affine period rather than emitted as
+  large tables.
+- Generalized repeated predecessor-set coalescing to a single producer. This
+  turns Qwen's 4,096 attention-to-merge task polls into 128 ready-group counters
+  with fan-in eight and one wait per merge task.
+- Added direct fan-in-one chaining for nested on-ready actions. A uniquely
+  owned key executes its next opaque task in program order without allocating
+  or polling an unnecessary atomic counter.
+- Replaced Qwen's custom partitioned-attention lowering with the generic event
+  graph: projection-to-Q/K fan-in 16, Q/K plus V-to-cache fan-in 17,
+  Q/cache-to-attention fan-in five, split-to-chunk ready groups, chunk-to-final
+  fan-in 16, and direct final-to-quant chaining. Deleted
+  `_match_partitioned_dependency_pipeline` and its custom state and emitter.
+- Retained the task-aligned Qwen source adaptations used to expose logical
+  dependencies without changing scheduler codegen: one cache task per KV head,
+  flat Q/K normalization, task-aligned split/merge loops, and head-shaped
+  attention quantization. These are benchmark/source changes and remain
+  explicitly separate from the compiler scheduler.
+- Found and removed a redundant exact task edge in Gemma. The direct
+  `post_ff -> final` wait was already ordered by the whole-root path through
+  PLE gate and projection. The new generic transitive-elision pass trusts only
+  root-completion/preordered edges, never a partial fine-grained edge. This
+  improved Gemma from 76.09 to 74.09 microseconds.
+- Revalidated Qwen at 76.09 microseconds versus 86.27 separately and Gemma
+  sliding non-shared at 74.09 versus 78.87. Saved final lowered Triton at
+  `/tmp/qwen3_generic_keyed_final_lowered.txt` and
+  `/tmp/gemma4_generic_keyed_final_lowered.py`, with NCU CSVs at
+  `/tmp/ncu_qwen_generic_keyed_final.csv` and
+  `/tmp/ncu_gemma4_generic_final.csv`.
+- Added focused coverage for single-producer ready-group fanout, counter-free
+  fan-in-one nested continuation, and exact task waits dominated by a proven
+  whole-root path. The focused result is 73 tests and 13 subtests passing, with
+  four expected skips; Ruff and `git diff --check` are clean.
+- Fixed two remaining places where a uniform event partition implicitly
+  assumed an `on_ready` continuation. Producer reordering and reverse
+  consumer-coordinate reconstruction now occur only when the dispatch plan
+  actually attaches an on-ready task; the same event can instead lower to an
+  ordinary keyed counter and wait. The continuation-disabled Qwen ablation now
+  compiles and runs again.
+- Revalidated shape changes after the matcher deletion. Context 4096 with 64
+  attention splits measured 72.39 microseconds versus 82.66 separately. A
+  consistent 16-query-head, 4-KV-head, hidden-2048, intermediate-6144 shape
+  measured 40.08 versus 45.99 microseconds. The failed 16-head/hidden-4096
+  invocation was rejected by the probe's model identity
+  `hidden == q_heads * head_dim`, before scheduler comparison.
+- Audited the frontier tuning API. Exact candidate count depends on the chosen
+  block sizes and is therefore unavailable when the static `ConfigSpec`
+  fragment is created. Keep the bounded internal index and reject invalid
+  values during lowering until Helion has a general dependent-fragment API.
 
 ### 2026-08-21
 
@@ -973,12 +1678,11 @@ Open, to be answered with implementation evidence:
   without changing compiler source.
 - Audited the emitted Triton for all four representative layer variants rather
   than relying only on timing and resource summaries.
-- Found and worked around a specialized-expression leak in the benchmark:
-  passing `q_per_kv` directly lets the shared-cache variants use the generic
-  persistent scheduler instead of the cooperative-grid fallback.
-- Confirmed that root outlining currently fails to thread tensor-descriptor
-  handles used by a root body; retained pointer indexing and recorded this as a
-  compiler issue.
+- Initially worked around a specialized-expression leak by passing `q_per_kv`
+  directly; later logical-task work in this log removed that workaround.
+- Initially found that root outlining failed to thread tensor-descriptor
+  handles used by a root body; retained pointer indexing in the benchmark while
+  fixing and validating the generated outlined-root ABI later in this log.
 - Confirmed that making the Gemma FFN continuation legal by removing L2 remaps
   is not sufficient for performance: the ordinary continuation regressed to
   roughly 153 us, and the fully admitted three-stage pipeline regressed to
@@ -1116,9 +1820,19 @@ Open, to be answered with implementation evidence:
   72.25 microseconds versus 80.04 microseconds for separate Helion. The
   gate-weight `evict_first` annotation is required; omitting it regressed to
   84.4 microseconds without changing the schedule.
-- Rejected a 592-worker boundary schedule after it measured 111.2
-  microseconds versus 80.2 microseconds. Full residency remains a legality
-  invariant, not a reason to fill every available CTA slot.
+- Replaced the earlier confounded 592-worker ablation with a controlled
+  worker/frontier matrix that holds root codegen fixed. The winning Gemma point
+  is 576 workers and 36 ready activation groups at 75.77 microseconds versus
+  80.03 microseconds for separate Helion. A 592-worker launch at the same
+  36-group frontier measured 76.99 microseconds, while an exact 608-worker,
+  38-group wave measured 83.48 microseconds. Full residency remains a legality
+  invariant, not a performance ordering.
+- Verified that the successful worker assignment need not be independently
+  tuned. `initial_producer_tasks == workers` is critical: 560 workers at the
+  576-task frontier measured 91.00 microseconds. One worker per downstream
+  consumer tile is likewise important: reducing 160 consumers to 144 or 80
+  measured 88.53 and 87.48 microseconds. The compiler can derive both cohorts
+  after the autotuner selects a legal dependency frontier.
 - Replaced the ordered-input singleton matcher with graph-derived
   per-coordinate counted readiness at explicit access program points. The
   lowered Qwen kernel remains structurally identical to the retained fast
@@ -1152,3 +1866,150 @@ Open, to be answered with implementation evidence:
   analysis. Both generated files retain the same line counts and differ from
   the prior fast versions only in constexpr declaration order; correctness and
   resource use remain unchanged.
+- Validated the proposed counted-event `on_ready` representation before the
+  compiler refactor. In the Gemma Triton probe, direct inline election and a
+  reusable counted-event helper generated byte-identical SASS with identical
+  resources; a paired run measured 73.061 and 73.143 microseconds respectively.
+  The saved lowered source is `/tmp/gemma4_counted_event_ab_lowered.py`, with
+  full compiler dumps under `/tmp/gemma4_direct_ir` and
+  `/tmp/gemma4_generic_ir`.
+- Revalidated the existing Qwen Triton probe, which already factors the
+  counted arrival from its inline ready action. The persistent FFN core measured
+  37.046 microseconds versus 38.948 microseconds for the matched three-kernel
+  graph, with exact outputs and compiler dumps under
+  `/tmp/qwen_counted_event_ir`.
+- Made logical task identity authoritative in planner proofs and readiness
+  keys. Existing physical PID order and L2 grouping are translated only at the
+  dispatch boundary, so root bodies retain their original code generation.
+- Enabled the graph-derived continuation/frontier pipeline through later root-
+  completion dependencies; a continuation consumer can now publish the root
+  completion needed by downstream roots.
+- Added compiler-derived legal frontier candidates and an internal candidate
+  index. Gemma selects 576 workers at frontier index 5; the 608-worker candidate
+  is rejected by exact post-compilation residency at a measured capacity of
+  592.
+- Replaced expensive exact task events for generic multi-producer joins with
+  root-completion waits. In the Gemma layer this reduced the timing-only result
+  from about 96.57 microseconds with exact access-local waits to about 73.69
+  microseconds while retaining correctness.
+- Revalidated Qwen at about 74.92 microseconds versus 85.10 microseconds
+  separately, and Gemma at about 74.75 microseconds versus 78.72 microseconds
+  separately in a paired run. The corresponding lowered Triton is saved at
+  `/tmp/qwen3_helion_logical_frontier_lowered.py` and
+  `/tmp/gemma4_helion_latest_lowered.py`.
+- Replaced the named continuation-plan hierarchy with a counted event carrying
+  an optional `on_ready` opaque task and a separate readiness-frontier plan.
+  Qwen and Gemma lowered bodies are unchanged apart from constexpr declaration
+  order.
+- Removed the public `producer_order` and `epoch_replicas` migration knobs and
+  deleted their inactive replicated-counter branches. The compiler retains the
+  previous default producer-order decision, and both model lowerings changed
+  only by algebraic simplification of one-element state indexing.
+- Routed all four last-arrival actions in the partitioned-attention
+  compatibility emitter through the same epoch-relative counted-event helper.
+  The exact Qwen layer remains at about 74.92 microseconds versus 85.10
+  microseconds separately, with 252 registers and no spills.
+- Added root completion as the stable `-1` member of the internal frontier
+  choice. A lowering default mismatch that still interpreted a missing value
+  as frontier zero was fixed by defining the default once in the planner. A
+  dedicated integration test now verifies that an otherwise frontier-capable
+  graph defaults to root completion unless a nonnegative candidate is selected.
+- Swept representative Gemma specializations. The tuned sliding non-shared
+  layer still selects frontier index 5, `G=36`, and `W=576`. The full
+  non-shared specialization requires at least `W=416` for the same FFN graph,
+  but its compiled 255-register, 70,016-byte-shared kernel supports only 296
+  resident CTAs. Candidate zero is therefore rejected before launch, while
+  root completion is correct and measured 131.13 microseconds versus 131.23
+  microseconds for separate Helion in a short paired run. Sliding-shared and
+  full-shared representative layers also compiled and ran correctly with the
+  first fine-grained frontier.
+- Removed the Gemma `q_per_kv` source workaround. The natural
+  `q_heads // kv_heads` expression now produces the concrete logical task
+  extent and the same lowered attention dispatch.
+- Derived singleton worker affinity from predecessor participation instead of
+  assigning every singleton to worker zero. Each singleton uses an otherwise
+  idle predecessor-external worker when available and stable distinct high
+  workers otherwise. This changed only scheduling placement, kept Qwen at
+  74.66 microseconds versus 85.14 separately, and improved the compiler Gemma
+  result to 73.16 microseconds versus 78.74 separately.
+- Verified that Gemma's two natural singleton RMSNorm/residual roots now lower
+  and execute correctly through generic multi-producer joins. With the same
+  fused root settings they measured approximately 75.17 microseconds, versus
+  73.16 microseconds for the retained output-tiled forms. The two adaptations
+  remain explicitly documented performance choices rather than compiler
+  legality requirements.
+- Generalized every structural-plan entry wait from one predecessor to an
+  arbitrary ordered set of graph-derived root-completion dependencies.
+- Added conservative allocation-view normalization for inserted or removed
+  size-one dimensions and explicit full slices. This upgrades the real Qwen
+  attention root 8-to-9 edge to task readiness while leaving nontrivial
+  flatten/unflatten views on root completion. Singleton producer events are
+  canonicalized back to the equivalent root-completion representation, so the
+  final Qwen and Gemma lowerings remain unchanged apart from constexpr
+  declaration order.
+- Revalidated the unchanged end-to-end kernels on an idle B200: Qwen measured
+  74.95 microseconds versus 85.12 microseconds separately; Gemma measured
+  74.43 microseconds versus 78.51 microseconds separately, with 206 registers,
+  zero spills, and 35,200 bytes of shared memory.
+- Tested the simpler source-first alternative for Qwen attention. The split
+  writes canonical `(split, query_head, dimension)` partials and the merge uses
+  direct multidimensional indexing. It passes strict end-to-end validation and
+  measured 74.16 microseconds versus 84.39 microseconds separately, compared
+  with 74.23 versus 85.08 microseconds for the retained source in an adjacent
+  run. Both use 252 registers, zero spills, and 17,408 bytes of shared memory.
+  The saved lowered Triton is
+  `/tmp/qwen3_canonical_attention_source_lowered.py`.
+- Disabling the partitioned-attention compatibility emitter for that canonical
+  source remains correct but measured 78.84 microseconds versus 84.34
+  microseconds separately, with 248 registers. Its lowering is saved at
+  `/tmp/qwen3_canonical_attention_root_completion_lowered.py`. The remaining
+  roughly 4.7-microsecond gap is therefore scheduling overlap, not view
+  codegen. The allocation graph still classifies split-to-merge and the first
+  merge-to-final-merge edges as root-ready because it does not retain the
+  linearized query-head expression or bounded split interval.
+- Expressing the merge intervals directly as `hl.tile` ranges removes that
+  proof gap without compiler changes: split-to-chunk-merge and
+  chunk-merge-to-final-merge both become task-ready. Keeping one query head per
+  merge task preserves the original root resource shape (the full kernel has
+  no spills), but the generic exact-event traversal measures 83.29
+  microseconds versus 84.58 microseconds separately.
+- Grouping all four query heads into one merge task makes the predecessor sets
+  a disjoint uniform partition. Generic counted events now compose both merge
+  levels and publish the final root-completion event correctly. This path
+  measures 81.30 microseconds versus 87.27 microseconds separately, with 255
+  registers and 26 spills; its no-wait floor is 74.56 microseconds. The saved
+  lowering is `/tmp/qwen3_task_aligned_counted_chain_lowered.py`. The remaining
+  gap comes primarily from root-completion barriers before split attention,
+  not from missing merge dependency information.
+- A direct producer-fan-out continuation was also tested and rejected. With
+  one query head per merge task, the last split arrival executed four ready
+  merge tasks serially and measured 88.27 microseconds. Two heads measured
+  84.27 microseconds. The ordinary four-head merge tile is therefore the
+  simpler current choice; a future worker-ready queue may support fan-out, but
+  it is not required for the first generic replacement.
+- The task-aligned one-head source also exposed a correctness defect in the
+  remaining compatibility matcher: it accepted the familiar task counts while
+  assuming the old flattened logical axis order and produced incorrect
+  attention output. The probe now disables that matcher automatically. The
+  generic replacement must consume the dependency graph's logical coordinates
+  directly; this is further evidence for deleting rather than extending the
+  matcher.
+- Generalized exact readiness to include proved RAW, WAW, and WAR hazards. The
+  flat in-place Q/K source then proved the expected 16 QKV-tile predecessors
+  per Q/K-head task, but exact task publication and polling regressed the layer
+  to 83.50 microseconds versus 80.31 microseconds separately.
+- Added a conservative partial-prefix counted partition: disjoint uniform
+  predecessor sets may cover an exact physical prefix while the unowned suffix
+  executes normally. CUDA tests verify both the continuation and preservation
+  of an in-place allocation's untouched suffix. The emitted Qwen Triton uses
+  40 counters with fan-in 16 and no QKV-to-Q/K polling loop.
+- The safe partial-continuation Qwen path measured 82.42 microseconds versus
+  86.35 microseconds for the same-source separate graph. It still cannot expose
+  the useful cache/attention overlap because the current single-writer
+  allocation history loses the fact that V remains defined by the projection
+  root. A temporary conservative pass-through wait preserves correctness but
+  is explicitly a deletion target, not the final design.
+- Adopted the holistic keyed-event refactor above. The next implementation
+  step is multi-contributor event IR plus region-aware reaching definitions,
+  followed by reconstruction of the Qwen attention pipeline and deletion of
+  `_match_partitioned_dependency_pipeline`.

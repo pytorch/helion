@@ -245,7 +245,7 @@ def _layer_events(kv_shared: bool) -> list[_Invocation | _Bridge]:
                     "context": "context",
                     "attention_context": "attention_context",
                     "block_size": "cache_block",
-                    "q_per_kv": "q_per_kv",
+                    "q_per_kv": "q_heads // kv_heads",
                     "splits": "attention_splits",
                 },
                 {"partial_out": "partial_out", "partial_lse": "partial_lse"},
@@ -375,7 +375,6 @@ def _compose_layer_source(kv_shared: bool) -> str:
         "intermediate",
         "q_heads",
         "kv_heads",
-        "q_per_kv",
         "head_dim",
         "context",
         "attention_context",
@@ -487,7 +486,6 @@ def _megakernel_args(tensors, shape, geometry, splits):
         shape.intermediate,
         shape.q_heads,
         shape.kv_heads,
-        shape.q_heads // shape.kv_heads,
         geometry.head_dim,
         shape.context,
         geometry.attention_context,
@@ -499,7 +497,7 @@ def _megakernel_args(tensors, shape, geometry, splits):
 
 def _megakernel_config(bound, args, geometry):
     values = dict(bound.config_spec.default_config())
-    if args.config_mode == "matched":
+    if args.config_mode in ("matched", "fused"):
         configs = json.loads(Path(args.config_path).read_text())
         q_projection = configs[
             f"{'q_mm' if geometry.kv_shared else 'qkv_mm'}_hd{geometry.head_dim}"
@@ -607,6 +605,68 @@ def _megakernel_config(bound, args, geometry):
                 updated.append(stage_config[key][index])
             values[key] = updated
 
+        if args.config_mode == "fused":
+            fused_block_sizes = {
+                3: 8,
+                4: 256,
+                17: 16,
+                18: 512,
+                21: 32,
+                22: 256,
+                24: 256,
+                26: 16,
+                27: 512,
+                31: 2,
+                32: 256,
+                34: 32,
+                35: 32,
+            }
+            values["block_sizes"] = [
+                fused_block_sizes.get(spec.block_id, value)
+                for spec, value in zip(
+                    bound.config_spec.block_sizes,
+                    values["block_sizes"],
+                    strict=True,
+                )
+            ]
+            fused_range_stages = {
+                (4,): 4,
+                (18,): 3,
+                (22,): 2,
+                (27,): 3,
+                (32,): 3,
+            }
+            values["range_num_stages"] = [
+                fused_range_stages.get(tuple(spec.block_ids), value)
+                for spec, value in zip(
+                    bound.config_spec.range_num_stages,
+                    values["range_num_stages"],
+                    strict=True,
+                )
+            ]
+            fused_range_unroll = {
+                (4,): 0,
+                (18,): 0,
+                (22,): 2,
+                (27,): 0,
+                (32,): 0,
+            }
+            values["range_unroll_factors"] = [
+                fused_range_unroll.get(tuple(spec.block_ids), value)
+                for spec, value in zip(
+                    bound.config_spec.range_unroll_factors,
+                    values["range_unroll_factors"],
+                    strict=True,
+                )
+            ]
+            for fact in bound.config_spec.memory_op_facts:
+                if (
+                    fact.eviction_index is not None
+                    and fact.tensor_name is not None
+                    and "gate_up_weight" in fact.tensor_name
+                ):
+                    values["load_eviction_policies"][fact.eviction_index] = "first"
+
     values.update(
         {
             "pid_type": "persistent_blocked",
@@ -619,6 +679,8 @@ def _megakernel_config(bound, args, geometry):
             else (3 if geometry.layer_type == "full" else 4),
         }
     )
+    if args.frontier_index is not None:
+        values["_tile_dependency_frontier"] = args.frontier_index
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
@@ -670,7 +732,6 @@ def run(args) -> None:
         [
             "post-FF residual RMSNorm is output-tiled with a redundant reduction",
             "final PLE RMSNorm/residual is output-tiled with a redundant reduction",
-            "q_per_kv is passed directly to preserve static task geometry",
             f"attention reduction tiles are capped at {args.attention_block}",
         ],
         flush=True,
@@ -823,10 +884,11 @@ def main() -> None:
     parser.add_argument("--full-splits", type=int, default=64)
     parser.add_argument("--attention-block", type=int, default=32)
     parser.add_argument("--worker-multiplier", type=int, default=2)
+    parser.add_argument("--frontier-index", type=int)
     parser.add_argument("--num-warps", type=int)
     parser.add_argument("--kernel-stages", type=int)
     parser.add_argument(
-        "--config-mode", choices=("default", "matched"), default="matched"
+        "--config-mode", choices=("default", "matched", "fused"), default="matched"
     )
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--batch-replays", type=int, default=20)

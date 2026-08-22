@@ -3316,6 +3316,57 @@ def _subscript_is_scalar_tile_index(subscript: object) -> bool:
     return False
 
 
+def _subscript_static_offset(
+    env: CompileEnvironment,
+    subscript: object,
+) -> int | None:
+    """Recover a constant offset through affine and shape-only FX nodes."""
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    node = subscript
+    scale = 1
+    offset = 0
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        info = subscript_tile_info(env, node)
+        if info is not None:
+            if isinstance(info.offset, int):
+                return offset + scale * info.offset
+            if env.known_equal(info.offset, 0):
+                return offset
+            return None
+        args = node.args
+        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
+            constant, operand = args[1], args[0]
+            if not isinstance(constant, int):
+                constant, operand = operand, constant
+            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
+                offset += scale * constant
+                node = operand
+                continue
+            return None
+        if node.target is torch.ops.aten.mul.Tensor and len(args) == 2:
+            factor, operand = args[1], args[0]
+            if not isinstance(factor, int):
+                factor, operand = operand, factor
+            if isinstance(factor, int) and isinstance(operand, torch.fx.Node):
+                scale *= factor
+                node = operand
+                continue
+            return None
+        node_args = [arg for arg in args if isinstance(arg, torch.fx.Node)]
+        if len(node_args) != 1:
+            return None
+        node = node_args[0]
+    return None
+
+
+def _subscript_is_full_slice(subscript: object) -> bool:
+    """Return whether a tensor subscript covers its complete dimension."""
+    return isinstance(subscript, slice) and subscript == slice(None)
+
+
 def _tile_rank(dims: tuple[int | None, ...]) -> int:
     """The number of BLOCK dims a tile spans (``None`` static/broadcast dims do not count) — the
     block-size-free proxy for tile bytes used by the lexicographic peak selector."""
@@ -3563,6 +3614,7 @@ def _collect_memory_op_facts(
             subscript_dims: tuple[int, ...] = ()
             subscript_offsets: tuple[int | None, ...] = ()
             subscript_is_scalar: tuple[bool, ...] = ()
+            subscript_is_full_slice: tuple[bool, ...] = ()
             inner_extent: int | None = None
             accessed_numel = 0
             allocation_id = -1
@@ -3626,18 +3678,15 @@ def _collect_memory_op_facts(
                     subscript_affine_block_ids = tuple(bid for bid, _ in affine)
                     subscript_index_scales = tuple(scale for _, scale in affine)
                     subscript_offsets = tuple(
-                        (
-                            int(info.offset)
-                            if (info := subscript_tile_info(env, index_list[pos]))
-                            is not None
-                            and isinstance(info.offset, int)
-                            else None
-                        )
+                        _subscript_static_offset(env, index_list[pos])
                         for pos in positions
                     )
                     subscript_is_scalar = tuple(
                         _subscript_is_scalar_tile_index(index_list[pos])
                         for pos in positions
+                    )
+                    subscript_is_full_slice = tuple(
+                        _subscript_is_full_slice(index_list[pos]) for pos in positions
                     )
                     # Extent per subscript position; size_hint, not int(), so a SymInt dim
                     # is not specialized.
@@ -3681,6 +3730,8 @@ def _collect_memory_op_facts(
                         subscript_offsets=subscript_offsets,
                         subscript_is_scalar=subscript_is_scalar,
                         has_explicit_mask=has_explicit_mask,
+                        subscript_is_full_slice=subscript_is_full_slice,
+                        is_atomic=is_atomic,
                     )
                 )
                 cross_loop_access_id += 1
@@ -4191,6 +4242,31 @@ def lower_to_device_ir(
                 source_phase_starts=source_phase_starts,
             )
             device_ir.tile_dependency_schedule = schedule
+            if schedule.uses_tile_dependency_counters:
+                from ..autotuner.config_fragment import IntegerFragment
+                from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_CONFIG
+                from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_DEFAULT
+                from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_MAX_INDEX
+                from .tile_dependency_planner import has_potential_readiness_frontier
+
+                if has_potential_readiness_frontier(
+                    device_ir.cross_loop_dependency_plan
+                ):
+                    if (
+                        TILE_DEPENDENCY_FRONTIER_CONFIG
+                        in config_spec.user_defined_tunables
+                    ):
+                        raise exc.TileDependencyScheduleError(
+                            f"{TILE_DEPENDENCY_FRONTIER_CONFIG!r} is reserved for "
+                            "compiler-derived tile-dependency scheduling"
+                        )
+                    config_spec.user_defined_tunables[
+                        TILE_DEPENDENCY_FRONTIER_CONFIG
+                    ] = IntegerFragment(
+                        -1,
+                        TILE_DEPENDENCY_FRONTIER_MAX_INDEX,
+                        default_val=TILE_DEPENDENCY_FRONTIER_DEFAULT,
+                    )
             _install_resolved_phases(device_ir, visitor.root_nodes, schedule)
             if schedule.implicit_stage_starts:
                 if (

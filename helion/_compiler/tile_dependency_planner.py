@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from operator import itemgetter
 from typing import Literal
 
+from .. import exc
 from .cross_loop_dependencies import AffinePredecessorAxis
+from .cross_loop_dependencies import AllocationRegion
+from .cross_loop_dependencies import CrossLoopAccess
 from .cross_loop_dependencies import CrossLoopDependencyEdge
 from .cross_loop_dependencies import CrossLoopDependencyPlan
 from .cross_loop_dependencies import TileDependencyKind
 from .cross_loop_dependencies import UniformTaskPartition
 from .cross_loop_dependencies import WaitSpec
+from .cross_loop_dependencies import access_task_region
+from .cross_loop_dependencies import allocation_regions_may_overlap
 from .cross_loop_dependencies import prove_uniform_task_partition
+
+TILE_DEPENDENCY_FRONTIER_CONFIG = "_tile_dependency_frontier"
+TILE_DEPENDENCY_FRONTIER_DEFAULT = -1
+TILE_DEPENDENCY_FRONTIER_MAX_INDEX = 63
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,7 +54,6 @@ class InstantiatedTaskFamily:
     physical_axis_order: tuple[int, ...]
     axis_counts_items: tuple[tuple[int, int], ...]
     block_sizes_items: tuple[tuple[int, int], ...]
-    has_nontrivial_pid_remap: bool = False
 
     @property
     def axis_counts(self) -> dict[int, int]:
@@ -73,6 +82,7 @@ class AccessCohortPlan:
     consumer_loop_id: int
     consumer_stream_coordinate: str | None
     stream_count: int
+    stream_task_granularity: int
     stage_sizes: tuple[int, ...]
     outer_producer_axes: tuple[int, ...]
 
@@ -95,44 +105,133 @@ class AccessCohortPlan:
 
 
 @dataclasses.dataclass(frozen=True)
-class TaskContinuationPlan:
-    """A consumer task elected by the last task in a proven partition."""
+class TaskToKeySegment:
+    """One compact run of a flattened task-to-event-key mapping."""
 
-    event_id: int
-    producer_root: int
-    consumer_root: int
-    partition: UniformTaskPartition
-
-    @property
-    def producer_tasks(self) -> int:
-        return self.partition.producer_tasks
-
-    @property
-    def consumer_tasks(self) -> int:
-        return self.partition.consumer_tasks
-
-    @property
-    def fanin(self) -> int:
-        return self.partition.fanin
+    task_begin: int
+    task_count: int
+    tasks_per_key: int
+    first_key: int
+    key_stride: int
+    key_period: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
-class TaskContinuationPipelinePlan:
-    """A continuation followed by a concurrently admitted consumer root."""
+class KeyedEventContributorPlan:
+    """One root's contributions to a keyed readiness event."""
 
-    continuation: TaskContinuationPlan
-    cohort: AccessCohortPlan
+    source_event_ids: tuple[int, ...]
+    producer_root: int
+    task_to_key: tuple[int | None, ...]
+    task_to_key_segments: tuple[TaskToKeySegment, ...]
+    partition: UniformTaskPartition | None = None
+
+    @property
+    def expected_arrivals(self) -> int:
+        arrivals: dict[int, int] = {}
+        for key in self.task_to_key:
+            if key is not None:
+                arrivals[key] = arrivals.get(key, 0) + 1
+        counts = set(arrivals.values())
+        if len(counts) != 1:
+            raise ValueError("keyed event contributor has nonuniform fan-in")
+        return counts.pop()
+
+
+@dataclasses.dataclass(frozen=True)
+class KeyedEventPlan:
+    """A logical key space receiving contributions from one or more roots.
+
+    Each contributor has an independently proved task-to-key relation. The
+    expected count is derived by summing those relations; the event therefore
+    represents both ordinary continuations and generic multi-predecessor joins.
+    ``on_ready_root`` remains dispatch policy rather than dependency semantics.
+    """
+
+    key_root: int
+    contributors: tuple[KeyedEventContributorPlan, ...]
+    consumer_key_by_task: tuple[int, ...]
+    consumer_task_to_key_segments: tuple[TaskToKeySegment, ...]
+    on_ready_root: int | None = None
+
+    @property
+    def source_event_ids(self) -> tuple[int, ...]:
+        return tuple(
+            event_id
+            for contributor in self.contributors
+            for event_id in contributor.source_event_ids
+        )
+
+    @property
+    def key_tasks(self) -> int:
+        return max(self.consumer_key_by_task, default=-1) + 1
+
+    @property
+    def expected_arrivals(self) -> int:
+        arrivals = [0] * self.key_tasks
+        for contributor in self.contributors:
+            for key in contributor.task_to_key:
+                if key is not None:
+                    arrivals[key] += 1
+        counts = set(arrivals)
+        if len(counts) != 1:
+            raise ValueError("keyed event has nonuniform total fan-in")
+        return counts.pop()
+
+    @property
+    def is_single_contributor(self) -> bool:
+        return len(self.contributors) == 1
+
+    @property
+    def single_contributor(self) -> KeyedEventContributorPlan:
+        if not self.is_single_contributor:
+            raise ValueError("keyed event has multiple contributors")
+        return self.contributors[0]
+
+    @property
+    def event_id(self) -> int:
+        event_ids = self.single_contributor.source_event_ids
+        if len(event_ids) != 1:
+            raise ValueError("keyed event has no source event")
+        return event_ids[0]
+
+    @property
+    def producer_root(self) -> int:
+        return self.single_contributor.producer_root
+
+    @property
+    def partition(self) -> UniformTaskPartition:
+        partition = self.single_contributor.partition
+        if partition is None:
+            raise ValueError("keyed event has no uniform partition")
+        return partition
+
+
+@dataclasses.dataclass(frozen=True)
+class ReadinessFrontierPlan:
+    """A counted event followed by a concurrently admitted consumer root."""
+
+    event: KeyedEventPlan
+    downstream_cohort: AccessCohortPlan
     worker_count: int
-    consumer_tasks: int
+    downstream_tasks: int
     initial_stream_tasks: int
 
     @property
     def tail_producer_tasks(self) -> int:
-        return self.continuation.producer_tasks - self.worker_count
+        return self.event.partition.producer_tasks - self.worker_count
 
     @property
-    def consumer_worker_begin(self) -> int:
-        return self.worker_count - self.consumer_tasks
+    def downstream_worker_begin(self) -> int:
+        return self.worker_count - self.downstream_tasks
+
+
+@dataclasses.dataclass(frozen=True)
+class ReadinessFrontierSelection:
+    """One selected frontier, or its conservative root-completion fallback."""
+
+    plans: tuple[ReadinessFrontierPlan, ...] = ()
+    root_completion_key_roots: frozenset[int] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,9 +253,239 @@ class GenericSchedulePlan:
     root_waits_by_root: dict[int, tuple[RootCompletionWait, ...]]
     task_waits_by_root: dict[int, tuple[WaitSpec, ...]]
     access_cohorts: tuple[AccessCohortPlan, ...]
-    continuations: tuple[TaskContinuationPlan, ...]
-    continuation_pipelines: tuple[TaskContinuationPipelinePlan, ...]
+    counted_events: tuple[KeyedEventPlan, ...]
+    readiness_frontiers: tuple[ReadinessFrontierPlan, ...]
     worker_limit: int
+
+
+def _compress_task_to_key(
+    task_to_key: tuple[int | None, ...],
+) -> tuple[TaskToKeySegment, ...]:
+    runs: list[tuple[int, int, int]] = []
+    task = 0
+    while task < len(task_to_key):
+        key = task_to_key[task]
+        if key is None:
+            task += 1
+            continue
+        begin = task
+        task += 1
+        while task < len(task_to_key) and task_to_key[task] == key:
+            task += 1
+        runs.append((begin, task - begin, key))
+
+    segments: list[TaskToKeySegment] = []
+    run = 0
+    while run < len(runs):
+        begin, tasks_per_key, first_key = runs[run]
+        end_run = run + 1
+        key_stride = 0
+        if end_run < len(runs):
+            next_begin, next_length, next_key = runs[end_run]
+            if next_begin == begin + tasks_per_key and next_length == tasks_per_key:
+                key_stride = next_key - first_key
+                end_run += 1
+                while end_run < len(runs):
+                    candidate_begin, candidate_length, candidate_key = runs[end_run]
+                    if (
+                        candidate_begin != begin + (end_run - run) * tasks_per_key
+                        or candidate_length != tasks_per_key
+                        or candidate_key != first_key + (end_run - run) * key_stride
+                    ):
+                        break
+                    end_run += 1
+        segments.append(
+            TaskToKeySegment(
+                task_begin=begin,
+                task_count=(end_run - run) * tasks_per_key,
+                tasks_per_key=tasks_per_key,
+                first_key=first_key,
+                key_stride=key_stride,
+            )
+        )
+        run = end_run
+    repeated: list[TaskToKeySegment] = []
+    for segment in segments:
+        if repeated:
+            previous = repeated[-1]
+            period = previous.key_period or previous.task_count
+            if (
+                segment.task_begin == previous.task_begin + previous.task_count
+                and segment.task_count == period
+                and segment.tasks_per_key == previous.tasks_per_key
+                and segment.first_key == previous.first_key
+                and segment.key_stride == previous.key_stride
+                and segment.key_period is None
+            ):
+                repeated[-1] = dataclasses.replace(
+                    previous,
+                    task_count=previous.task_count + segment.task_count,
+                    key_period=period,
+                )
+                continue
+        repeated.append(segment)
+    return tuple(repeated)
+
+
+def _task_coordinates(
+    task: int,
+    family: InstantiatedTaskFamily,
+) -> dict[int, int]:
+    coordinates: dict[int, int] = {}
+    remainder = task
+    for block_id in family.logical_axis_order:
+        count = family.axis_counts[block_id]
+        coordinates[block_id] = remainder % count
+        remainder //= count
+    if remainder:
+        raise AssertionError("task exceeds its logical coordinate domain")
+    return coordinates
+
+
+def _edge_predecessor_sets(
+    edge: CrossLoopDependencyEdge,
+    *,
+    task_families: tuple[InstantiatedTaskFamily, ...],
+    access_by_id: dict[int, CrossLoopAccess],
+) -> tuple[frozenset[int], ...] | None:
+    """Evaluate conservative task overlap with an interval sweep.
+
+    The prior implementation compared every producer task with every consumer
+    task and needed an arbitrary work cutoff.  Allocation-address intervals
+    provide a complete candidate index: sorting them makes planning cost
+    proportional to the task domains plus the overlaps the relation actually
+    contains.  Unknown intervals are not guessed; they retain root completion.
+    """
+    producer = task_families[edge.producer_root]
+    consumer = task_families[edge.consumer_root]
+    region_cache: dict[tuple[int, int], AllocationRegion] = {}
+
+    def task_region(
+        access_id: int,
+        task: int,
+        family: InstantiatedTaskFamily,
+    ) -> AllocationRegion:
+        key = (access_id, task)
+        if key not in region_cache:
+            access = access_by_id[access_id]
+            region_cache[key] = access_task_region(
+                access,
+                task_coordinates=_task_coordinates(task, family),
+                block_sizes=family.block_sizes,
+            )
+        return region_cache[key]
+
+    def indexed_regions(
+        access_id: int,
+        family: InstantiatedTaskFamily,
+        task_count: int,
+        dependency_region: AllocationRegion,
+    ) -> list[tuple[int, int, int, AllocationRegion]] | None:
+        result: list[tuple[int, int, int, AllocationRegion]] = []
+        for task in range(task_count):
+            region = task_region(access_id, task, family)
+            interval = region.address_interval
+            if interval is None:
+                return None
+            if interval[0] < interval[1] and allocation_regions_may_overlap(
+                region, dependency_region
+            ):
+                result.append((interval[0], interval[1], task, region))
+        result.sort(key=itemgetter(0, 1, 2))
+        return result
+
+    predecessors = [set() for _ in range(consumer.task_count)]
+    for dependency in edge.access_dependencies:
+        producer_regions = indexed_regions(
+            dependency.producer_access_id,
+            producer,
+            producer.task_count,
+            dependency.region,
+        )
+        consumer_regions = indexed_regions(
+            dependency.consumer_access_id,
+            consumer,
+            consumer.task_count,
+            dependency.region,
+        )
+        if producer_regions is None or consumer_regions is None:
+            return None
+
+        # Regions are half-open, so ends precede starts at the same address.
+        # Producer starts precede consumer starts so equal-start pairs are
+        # emitted exactly once.
+        producer_end = 0
+        consumer_end = 1
+        producer_start = 2
+        consumer_start = 3
+        sweep_events: list[tuple[int, int, int, AllocationRegion]] = []
+        for begin, end, task, region in producer_regions:
+            sweep_events.extend(
+                (
+                    (begin, producer_start, task, region),
+                    (end, producer_end, task, region),
+                )
+            )
+        for begin, end, task, region in consumer_regions:
+            sweep_events.extend(
+                (
+                    (begin, consumer_start, task, region),
+                    (end, consumer_end, task, region),
+                )
+            )
+        sweep_events.sort(key=itemgetter(0, 1, 2))
+
+        active_producers: dict[int, AllocationRegion] = {}
+        active_consumers: dict[int, AllocationRegion] = {}
+        for _, event_kind, task, region in sweep_events:
+            if event_kind == producer_end:
+                active_producers.pop(task)
+            elif event_kind == consumer_end:
+                active_consumers.pop(task)
+            elif event_kind == producer_start:
+                for consumer_task, consumer_region in active_consumers.items():
+                    if allocation_regions_may_overlap(region, consumer_region):
+                        predecessors[consumer_task].add(task)
+                active_producers[task] = region
+            else:
+                for producer_task, producer_region in active_producers.items():
+                    if allocation_regions_may_overlap(producer_region, region):
+                        predecessors[task].add(producer_task)
+                active_consumers[task] = region
+    return tuple(frozenset(tasks) for tasks in predecessors)
+
+
+def derive_singleton_worker_affinity(
+    *,
+    dependency_plan: CrossLoopDependencyPlan,
+    task_families: tuple[InstantiatedTaskFamily, ...],
+    singleton_roots: frozenset[int],
+    worker_limit: int,
+) -> dict[int, int]:
+    """Assign singleton roots away from their predecessors' active workers."""
+    if worker_limit <= 0:
+        raise ValueError(f"worker_limit must be positive, got {worker_limit}")
+    predecessors_by_root: dict[int, set[int]] = {}
+    for edge in dependency_plan.edges:
+        predecessors_by_root.setdefault(edge.consumer_root, set()).add(
+            edge.producer_root
+        )
+
+    result: dict[int, int] = {}
+    for singleton_index, root in enumerate(sorted(singleton_roots)):
+        predecessor_workers = max(
+            (
+                min(task_families[producer].task_count, worker_limit)
+                for producer in predecessors_by_root.get(root, ())
+            ),
+            default=0,
+        )
+        idle_workers = worker_limit - predecessor_workers
+        if idle_workers > 0:
+            result[root] = predecessor_workers + singleton_index % idle_workers
+        else:
+            result[root] = worker_limit - 1 - singleton_index % worker_limit
+    return result
 
 
 def build_generic_schedule_plan(
@@ -169,6 +498,7 @@ def build_generic_schedule_plan(
     excluded_roots: frozenset[int],
     preordered_edges: frozenset[tuple[int, int]],
     physical_worker_limit: int,
+    frontier_index: int = TILE_DEPENDENCY_FRONTIER_DEFAULT,
 ) -> GenericSchedulePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
     task_ready_edges, waits_by_root, root_wait_candidates = _select_available_waits(
@@ -179,6 +509,12 @@ def build_generic_schedule_plan(
         axis_geometry=axis_geometry,
         excluded_roots=excluded_roots,
     )
+    candidate_counted_events = _derive_counted_events(
+        dependency_plan=dependency_plan,
+        waits_by_root=waits_by_root,
+        task_families=task_families,
+        physical_worker_limit=physical_worker_limit,
+    )
     access_cohorts = _derive_access_cohorts(
         dependency_plan=dependency_plan,
         waits_by_root=waits_by_root,
@@ -186,7 +522,45 @@ def build_generic_schedule_plan(
         axis_geometry=axis_geometry,
         access_program_points=access_program_points,
         physical_worker_limit=physical_worker_limit,
+        coarse_producer_roots=frozenset(
+            plan.key_root for plan in candidate_counted_events
+        ),
     )
+    cohort_pairs = {(plan.producer_root, plan.consumer_root) for plan in access_cohorts}
+    waits_by_pair: dict[tuple[int, int], list[WaitSpec]] = {}
+    for consumer_root, waits in waits_by_root.items():
+        for wait in waits:
+            producer_root = dependency_plan.event(wait.event_id).producer_root
+            waits_by_pair.setdefault((producer_root, consumer_root), []).append(wait)
+    access_fallback_pairs = {
+        pair
+        for pair, waits in waits_by_pair.items()
+        if pair not in cohort_pairs
+        and waits
+        and all(wait.placement == "access" for wait in waits)
+    }
+    if access_fallback_pairs:
+        task_ready_edges = frozenset(task_ready_edges - access_fallback_pairs)
+        waits_by_root = {
+            root: tuple(
+                wait
+                for wait in waits
+                if (
+                    dependency_plan.event(wait.event_id).producer_root,
+                    root,
+                )
+                not in access_fallback_pairs
+            )
+            for root, waits in waits_by_root.items()
+        }
+        waits_by_root = {root: waits for root, waits in waits_by_root.items() if waits}
+        root_wait_candidates = (
+            *root_wait_candidates,
+            *(
+                RootCompletionWait(producer, consumer, None, "root_entry")
+                for producer, consumer in sorted(access_fallback_pairs)
+            ),
+        )
     root_wait_pairs_before_elision = {
         (wait.producer_root, wait.consumer_root) for wait in root_wait_candidates
     }
@@ -222,12 +596,46 @@ def build_generic_schedule_plan(
         for plan in access_cohorts
         if (plan.producer_root, plan.consumer_root) in task_ready_edges
     )
-    continuations = _derive_task_continuations(
+    counted_events = _derive_counted_events(
         dependency_plan=dependency_plan,
         waits_by_root=waits_by_root,
         task_families=task_families,
+        physical_worker_limit=physical_worker_limit,
     )
-    continuation_waits = {(plan.consumer_root, plan.event_id) for plan in continuations}
+    coalesced_events = _derive_coalesced_keyed_events(
+        dependency_plan=dependency_plan,
+        task_families=task_families,
+        excluded_roots=excluded_roots,
+        excluded_consumer_roots=frozenset(
+            plan.consumer_root for plan in access_cohorts
+        ),
+        existing_events=counted_events,
+        physical_worker_limit=physical_worker_limit,
+    )
+    counted_events = (*counted_events, *coalesced_events)
+    coalesced_pairs = {
+        (contributor.producer_root, event.key_root)
+        for event in coalesced_events
+        for contributor in event.contributors
+    }
+    if coalesced_pairs:
+        task_ready_edges = frozenset(set(task_ready_edges) | coalesced_pairs)
+        root_wait_candidates = tuple(
+            wait
+            for wait in root_wait_candidates
+            if (wait.producer_root, wait.consumer_root) not in coalesced_pairs
+        )
+    on_ready_waits = {
+        (plan.on_ready_root, event_id)
+        for plan in counted_events
+        if plan.on_ready_root is not None
+        for event_id in plan.source_event_ids
+    }
+    keyed_event_waits = {
+        (plan.key_root, event_id)
+        for plan in counted_events
+        for event_id in plan.source_event_ids
+    }
     coarsened_access_waits = {
         (plan.consumer_root, plan.event_id, access_id)
         for plan in access_cohorts
@@ -243,40 +651,82 @@ def build_generic_schedule_plan(
                 wait.consumer_access_id,
             )
             not in coarsened_access_waits
-            and (root, wait.event_id) not in continuation_waits
+            and (root, wait.event_id) not in on_ready_waits
+            and (root, wait.event_id) not in keyed_event_waits
         )
         for root, waits in waits_by_root.items()
     }
     retained_waits = {root: waits for root, waits in retained_waits.items() if waits}
-    pipelines = _derive_task_continuation_pipelines(
+    frontier_selection = _select_readiness_frontier(
         dependency_plan=dependency_plan,
-        task_continuations=continuations,
+        counted_events=counted_events,
         access_cohorts=access_cohorts,
         task_families=task_families,
-        physical_worker_limit=physical_worker_limit,
+        frontier_index=frontier_index,
     )
+    readiness_frontiers = frontier_selection.plans
+    if frontier_selection.root_completion_key_roots:
+        fallback_event_pairs = {
+            (contributor.producer_root, event.key_root)
+            for event in counted_events
+            if event.key_root in frontier_selection.root_completion_key_roots
+            for contributor in event.contributors
+        }
+        task_ready_edges = frozenset(task_ready_edges - fallback_event_pairs)
+        root_wait_candidates = (
+            *root_wait_candidates,
+            *(
+                RootCompletionWait(producer, consumer, None, "root_entry")
+                for producer, consumer in sorted(fallback_event_pairs)
+            ),
+        )
+        counted_events = tuple(
+            event
+            for event in counted_events
+            if event.key_root not in frontier_selection.root_completion_key_roots
+        )
+    selected_frontier_cohorts = {plan.downstream_cohort for plan in readiness_frontiers}
+    inactive_coarse_pairs = {
+        (plan.producer_root, plan.consumer_root)
+        for plan in access_cohorts
+        if not plan.is_per_coordinate and plan not in selected_frontier_cohorts
+    }
+    if inactive_coarse_pairs:
+        task_ready_edges = frozenset(task_ready_edges - inactive_coarse_pairs)
+        root_wait_candidates = (
+            *root_wait_candidates,
+            *(
+                RootCompletionWait(producer, consumer, None, "root_entry")
+                for producer, consumer in sorted(inactive_coarse_pairs)
+            ),
+        )
+        access_cohorts = tuple(
+            plan
+            for plan in access_cohorts
+            if (plan.producer_root, plan.consumer_root) not in inactive_coarse_pairs
+        )
     worker_limit = physical_worker_limit
-    if pipelines:
-        worker_limit = max(plan.worker_count for plan in pipelines)
+    if readiness_frontiers:
+        worker_limit = max(plan.worker_count for plan in readiness_frontiers)
         replacement_cohorts = {
-            plan.cohort: dataclasses.replace(
-                plan.cohort,
+            plan.downstream_cohort: dataclasses.replace(
+                plan.downstream_cohort,
                 stage_sizes=(
                     plan.initial_stream_tasks,
-                    sum(plan.cohort.stage_sizes) - plan.initial_stream_tasks,
+                    sum(plan.downstream_cohort.stage_sizes) - plan.initial_stream_tasks,
                 ),
             )
-            for plan in pipelines
+            for plan in readiness_frontiers
         }
         access_cohorts = tuple(
             replacement_cohorts.get(plan, plan) for plan in access_cohorts
         )
-        pipelines = tuple(
+        readiness_frontiers = tuple(
             dataclasses.replace(
                 plan,
-                cohort=replacement_cohorts[plan.cohort],
+                downstream_cohort=replacement_cohorts[plan.downstream_cohort],
             )
-            for plan in pipelines
+            for plan in readiness_frontiers
         )
 
     root_waits = _select_root_completion_waits(
@@ -288,6 +738,47 @@ def build_generic_schedule_plan(
     root_completion_edges = frozenset(
         (wait.producer_root, wait.consumer_root) for wait in root_waits
     )
+    structural_task_pairs = {
+        (contributor.producer_root, event.key_root)
+        for event in counted_events
+        for contributor in event.contributors
+    }
+    structural_task_pairs.update(
+        (cohort.producer_root, cohort.consumer_root) for cohort in access_cohorts
+    )
+    root_order_edges = set(root_completion_edges) | set(preordered_edges)
+    redundant_task_wait_pairs = {
+        (dependency_plan.event(wait.event_id).producer_root, consumer_root)
+        for consumer_root, waits in retained_waits.items()
+        for wait in waits
+        if (
+            dependency_plan.event(wait.event_id).producer_root,
+            consumer_root,
+        )
+        not in structural_task_pairs
+        and _is_ordered_by_root_completion(
+            dependency_plan.event(wait.event_id).producer_root,
+            consumer_root,
+            root_order_edges,
+        )
+    }
+    if redundant_task_wait_pairs:
+        task_ready_edges = frozenset(task_ready_edges - redundant_task_wait_pairs)
+        retained_waits = {
+            root: tuple(
+                wait
+                for wait in waits
+                if (
+                    dependency_plan.event(wait.event_id).producer_root,
+                    root,
+                )
+                not in redundant_task_wait_pairs
+            )
+            for root, waits in retained_waits.items()
+        }
+        retained_waits = {
+            root: waits for root, waits in retained_waits.items() if waits
+        }
     root_waits_by_root: dict[int, list[RootCompletionWait]] = {}
     for wait in root_waits:
         root_waits_by_root.setdefault(wait.consumer_root, []).append(wait)
@@ -300,8 +791,8 @@ def build_generic_schedule_plan(
         },
         task_waits_by_root=retained_waits,
         access_cohorts=access_cohorts,
-        continuations=continuations,
-        continuation_pipelines=pipelines,
+        counted_events=counted_events,
+        readiness_frontiers=readiness_frontiers,
         worker_limit=worker_limit,
     )
 
@@ -315,30 +806,13 @@ def _select_root_completion_waits(
 ) -> tuple[RootCompletionWait, ...]:
     """Choose the minimal source-ordered root-completion fallback edges."""
 
-    def is_ordered(
-        producer: int,
-        consumer: int,
-        edges: set[tuple[int, int]],
-    ) -> bool:
-        pending = [producer]
-        visited: set[int] = set()
-        while pending:
-            current = pending.pop()
-            if current == consumer:
-                return True
-            if current in visited:
-                continue
-            visited.add(current)
-            pending.extend(target for source, target in edges if source == current)
-        return False
-
     waits_by_pair: dict[tuple[int, int], list[RootCompletionWait]] = {}
     for wait in root_wait_candidates:
         waits_by_pair.setdefault((wait.producer_root, wait.consumer_root), []).append(
             wait
         )
     root_completion_waits: list[RootCompletionWait] = []
-    ordered_edges = set(preordered_edges)
+    ordered_root_edges: set[tuple[int, int]] = set()
     for dependency in sorted(
         dependencies,
         key=lambda edge: (
@@ -348,10 +822,9 @@ def _select_root_completion_waits(
         ),
     ):
         pair = (dependency.producer_root, dependency.consumer_root)
-        if pair in fully_task_ready_edges:
-            ordered_edges.add(pair)
+        if pair in fully_task_ready_edges or pair in preordered_edges:
             continue
-        if is_ordered(*pair, ordered_edges):
+        if _is_ordered_by_root_completion(*pair, ordered_root_edges):
             continue
         root_completion_waits.extend(
             waits_by_pair.get(
@@ -366,8 +839,27 @@ def _select_root_completion_waits(
                 ),
             )
         )
-        ordered_edges.add(pair)
+        ordered_root_edges.add(pair)
     return tuple(dict.fromkeys(root_completion_waits))
+
+
+def _is_ordered_by_root_completion(
+    producer: int,
+    consumer: int,
+    edges: set[tuple[int, int]],
+) -> bool:
+    """Return whether whole-root ordering transitively covers one pair."""
+    pending = [producer]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current == consumer:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(target for source, target in edges if source == current)
+    return False
 
 
 def _select_available_waits(
@@ -398,7 +890,7 @@ def _select_available_waits(
     fully_task_ready_pairs: set[tuple[int, int]] = set()
     waits_by_root: dict[int, list[WaitSpec]] = {}
     root_waits: list[RootCompletionWait] = []
-    for pair, kinds in kinds_by_pair.items():
+    for pair in kinds_by_pair:
         producer_root, consumer_root = pair
         producer = task_families[producer_root]
         consumer = task_families[consumer_root]
@@ -416,15 +908,15 @@ def _select_available_waits(
         can_use_tasks = (
             producer_root not in excluded_roots
             and consumer_root not in excluded_roots
-            and producer.task_count > 0
+            # A one-task event is exactly root completion. Keep one canonical
+            # representation so singleton producers do not allocate and poll
+            # a second, equivalent task-event array.
+            and producer.task_count > 1
             and consumer.task_count > 0
-            and not producer.has_nontrivial_pid_remap
-            and not consumer.has_nontrivial_pid_remap
-            and kinds == {TileDependencyKind.READ_AFTER_WRITE}
             and bool(task_waits)
         )
-        producer_axes = set(producer.physical_axis_order)
-        consumer_axes = set(consumer.physical_axis_order)
+        producer_axes = set(producer.logical_axis_order)
+        consumer_axes = set(consumer.logical_axis_order)
         for wait in task_waits:
             predecessor_map = wait.predecessor_map
             if (
@@ -575,6 +1067,7 @@ def _derive_access_cohorts(
     axis_geometry: dict[int, tuple[int, int]],
     access_program_points: dict[int, AccessProgramPoint],
     physical_worker_limit: int,
+    coarse_producer_roots: frozenset[int],
 ) -> tuple[AccessCohortPlan, ...]:
     result: list[AccessCohortPlan] = []
     for consumer_root, waits in waits_by_root.items():
@@ -612,7 +1105,7 @@ def _derive_access_cohorts(
             consumer_counts = consumer.axis_counts
             axes_by_producer = {axis.producer_block_id: axis for axis in axes}
             if len(axes_by_producer) != len(axes) or set(axes_by_producer) != set(
-                producer.physical_axis_order
+                producer.logical_axis_order
             ):
                 continue
 
@@ -623,6 +1116,7 @@ def _derive_access_cohorts(
                 continue
             stream_axis = nested_axes[0]
             valid = True
+            stream_task_granularity: int | None = None
             for predecessor_map in predecessor_maps:
                 seen_consumer_axes: set[int] = set()
                 for axis in predecessor_map.axes:
@@ -634,18 +1128,54 @@ def _derive_access_cohorts(
                     producer_block = producer_blocks[axis.producer_block_id]
                     producer_width = 1 if axis.producer_is_scalar else producer_block
                     consumer_width = 1 if axis.consumer_is_scalar else consumer_block
-                    if (
-                        axis.consumer_block_id in seen_consumer_axes
-                        or producer_counts[axis.producer_block_id] != consumer_count
-                        or producer_width != consumer_width
-                        or axis.producer_offset != axis.consumer_offset
+                    if axis.consumer_block_id in seen_consumer_axes or (
+                        axis.producer_offset != axis.consumer_offset
                     ):
                         valid = False
                         break
+                    is_stream_axis = (
+                        axis.producer_block_id == stream_axis.producer_block_id
+                        and axis.consumer_block_id == stream_axis.consumer_block_id
+                    )
+                    if not is_stream_axis:
+                        if (
+                            producer_counts[axis.producer_block_id] != consumer_count
+                            or producer_width != consumer_width
+                        ):
+                            valid = False
+                            break
+                        seen_consumer_axes.add(axis.consumer_block_id)
+                        continue
+                    if axis.producer_is_scalar or axis.consumer_is_scalar:
+                        if (
+                            axis.producer_is_scalar != axis.consumer_is_scalar
+                            or producer_counts[axis.producer_block_id] != consumer_count
+                            or producer_width != consumer_width
+                        ):
+                            valid = False
+                            break
+                        ratio = 1
+                    else:
+                        if consumer_width % producer_width:
+                            valid = False
+                            break
+                        ratio = consumer_width // producer_width
+                        if producer_counts[axis.producer_block_id] != (
+                            consumer_count * ratio
+                        ):
+                            valid = False
+                            break
+                    if (
+                        stream_task_granularity is not None
+                        and stream_task_granularity != ratio
+                    ):
+                        valid = False
+                        break
+                    stream_task_granularity = ratio
                     seen_consumer_axes.add(axis.consumer_block_id)
                 if not valid:
                     break
-            if not valid:
+            if not valid or stream_task_granularity is None:
                 continue
 
             stream_count = producer_counts[stream_axis.producer_block_id]
@@ -689,25 +1219,21 @@ def _derive_access_cohorts(
                 if (coordinates := program_point.coordinates) is not None
             }
             per_coordinate = (
-                consumer_fanout == 1
+                stream_task_granularity == 1
+                and consumer_fanout == 1
                 and producer.task_count > physical_worker_limit
                 and len(stream_coordinate_expressions) == 1
                 and None not in stream_coordinate_expressions
             )
+            if not per_coordinate and producer_root not in coarse_producer_roots:
+                continue
             if per_coordinate:
                 consumer_stream_coordinate = next(iter(stream_coordinate_expressions))
                 assert consumer_stream_coordinate is not None
                 stage_sizes: tuple[int, ...] = ()
             else:
                 consumer_stream_coordinate = None
-                first_stage = 1 << ((stream_count // 2).bit_length() - 1)
-                mutable_stage_sizes = [first_stage]
-                remaining = stream_count - first_stage
-                while remaining:
-                    stage = 1 << (remaining.bit_length() - 1)
-                    mutable_stage_sizes.append(stage)
-                    remaining -= stage
-                stage_sizes = tuple(mutable_stage_sizes)
+                stage_sizes = (stream_count,)
             result.append(
                 AccessCohortPlan(
                     event_id=event_id,
@@ -720,10 +1246,11 @@ def _derive_access_cohorts(
                     consumer_loop_id=consumer_loop_id,
                     consumer_stream_coordinate=consumer_stream_coordinate,
                     stream_count=stream_count,
+                    stream_task_granularity=stream_task_granularity,
                     stage_sizes=stage_sizes,
                     outer_producer_axes=tuple(
                         block_id
-                        for block_id in producer.physical_axis_order
+                        for block_id in producer.logical_axis_order
                         if block_id != stream_axis.producer_block_id
                     ),
                 )
@@ -738,86 +1265,308 @@ def _derive_access_cohorts(
     )
 
 
-def _derive_task_continuations(
+def _derive_counted_events(
     *,
     dependency_plan: CrossLoopDependencyPlan,
     waits_by_root: dict[int, tuple[WaitSpec, ...]],
     task_families: tuple[InstantiatedTaskFamily, ...],
-) -> tuple[TaskContinuationPlan, ...]:
-    result: list[TaskContinuationPlan] = []
+    physical_worker_limit: int,
+) -> tuple[KeyedEventPlan, ...]:
+    result: list[KeyedEventPlan] = []
     for consumer_root, waits in waits_by_root.items():
         if not waits or any(wait.placement != "root_entry" for wait in waits):
             continue
-        event_ids = {wait.event_id for wait in waits}
-        if len(event_ids) != 1:
-            continue
-        event_id = event_ids.pop()
-        producer_root = dependency_plan.event(event_id).producer_root
-        if {
+        incoming_producer_roots = {
             edge.producer_root
             for edge in dependency_plan.edges
             if edge.consumer_root == consumer_root
-        } != {producer_root}:
+        }
+        waits_by_event: dict[int, list[WaitSpec]] = {}
+        for wait in waits:
+            waits_by_event.setdefault(wait.event_id, []).append(wait)
+        if {
+            dependency_plan.event(event_id).producer_root for event_id in waits_by_event
+        } != incoming_producer_roots:
             continue
-        if any(
-            event.producer_root == consumer_root and event.granularity == "root"
-            for event in dependency_plan.events
+        consumer = task_families[consumer_root]
+        if (
+            any(
+                event.producer_root == consumer_root and event.granularity == "root"
+                for event in dependency_plan.events
+            )
+            and consumer.task_count > physical_worker_limit
         ):
             continue
-        producer = task_families[producer_root]
-        consumer = task_families[consumer_root]
-        block_sizes = {**producer.block_sizes, **consumer.block_sizes}
-        predecessor_maps = tuple(
-            wait.predecessor_map for wait in waits if wait.predecessor_map is not None
-        )
-        if len(predecessor_maps) != len(waits):
+        contributors: list[KeyedEventContributorPlan] = []
+        for event_id, event_waits in sorted(waits_by_event.items()):
+            event = dependency_plan.event(event_id)
+            if event.granularity != "task":
+                break
+            producer_root = event.producer_root
+            producer = task_families[producer_root]
+            predecessor_maps = tuple(
+                wait.predecessor_map
+                for wait in event_waits
+                if wait.predecessor_map is not None
+            )
+            if len(predecessor_maps) != len(event_waits):
+                break
+            partition = prove_uniform_task_partition(
+                predecessor_maps,
+                consumer_axis_order=consumer.logical_axis_order,
+                consumer_axis_counts=consumer.axis_counts,
+                producer_axis_order=producer.logical_axis_order,
+                producer_axis_counts=producer.axis_counts,
+                block_sizes={**producer.block_sizes, **consumer.block_sizes},
+            )
+            if partition is None:
+                break
+            contributors.append(
+                KeyedEventContributorPlan(
+                    source_event_ids=(event_id,),
+                    producer_root=producer_root,
+                    task_to_key=partition.producer_key_by_task,
+                    task_to_key_segments=_compress_task_to_key(
+                        partition.producer_key_by_task
+                    ),
+                    partition=partition,
+                )
+            )
+        if len(contributors) != len(waits_by_event):
             continue
-        partition = prove_uniform_task_partition(
-            predecessor_maps,
-            consumer_axis_order=consumer.physical_axis_order,
-            consumer_axis_counts=consumer.axis_counts,
-            producer_axis_order=producer.physical_axis_order,
-            producer_axis_counts=producer.axis_counts,
-            block_sizes=block_sizes,
-        )
-        if partition is None:
+        if len(contributors) == 1 and contributors[0].expected_arrivals == 1:
             continue
         result.append(
-            TaskContinuationPlan(
-                event_id=event_id,
-                producer_root=producer_root,
-                consumer_root=consumer_root,
-                partition=partition,
+            KeyedEventPlan(
+                key_root=consumer_root,
+                contributors=tuple(contributors),
+                consumer_key_by_task=tuple(range(consumer.task_count)),
+                consumer_task_to_key_segments=_compress_task_to_key(
+                    tuple(range(consumer.task_count))
+                ),
+                on_ready_root=consumer_root,
             )
         )
-    continuation_count_by_root: dict[int, int] = {}
+    on_ready_roots = {plan.key_root for plan in result}
+
+    def has_simple_reverse(
+        plan: KeyedEventPlan,
+        contributor: KeyedEventContributorPlan,
+    ) -> bool:
+        """Whether lowering can enumerate keys reached by one producer task."""
+        partition = contributor.partition
+        if partition is None:
+            return True
+        if any(axis.scale not in (-1, 0, 1) for axis in partition.outer_axes):
+            return False
+        partition_count = task_families[plan.key_root].axis_counts[
+            partition.partition_consumer_block_id
+        ]
+        if partition_count == 1:
+            return True
+        return (
+            len(partition.segments) == 1
+            and partition.partition_consumer_stride > 0
+            and partition.segments[0].length == partition.partition_consumer_stride
+        )
+
+    filtered: list[KeyedEventPlan] = []
     for plan in result:
-        for root in (plan.producer_root, plan.consumer_root):
-            continuation_count_by_root[root] = (
-                continuation_count_by_root.get(root, 0) + 1
-            )
-    return tuple(
-        plan
-        for plan in result
-        if continuation_count_by_root[plan.consumer_root] == 1
-        and continuation_count_by_root[plan.producer_root] == 1
-    )
+        if all(
+            contributor.producer_root not in on_ready_roots
+            or has_simple_reverse(plan, contributor)
+            for contributor in plan.contributors
+        ):
+            filtered.append(plan)
+    return tuple(filtered)
 
 
-def _derive_task_continuation_pipelines(
+def _derive_coalesced_keyed_events(
     *,
     dependency_plan: CrossLoopDependencyPlan,
-    task_continuations: tuple[TaskContinuationPlan, ...],
+    task_families: tuple[InstantiatedTaskFamily, ...],
+    excluded_roots: frozenset[int],
+    excluded_consumer_roots: frozenset[int],
+    existing_events: tuple[KeyedEventPlan, ...],
+    physical_worker_limit: int,
+) -> tuple[KeyedEventPlan, ...]:
+    """Coalesce repeated consumer predecessor sets into logical event keys."""
+    existing_key_roots = {event.key_root for event in existing_events}
+    existing_on_ready_roots = {
+        event.on_ready_root
+        for event in existing_events
+        if event.on_ready_root is not None
+    }
+    access_by_id = {access.access_id: access for access in dependency_plan.accesses}
+    edges_by_consumer: dict[int, list[CrossLoopDependencyEdge]] = {}
+    for edge in dependency_plan.edges:
+        edges_by_consumer.setdefault(edge.consumer_root, []).append(edge)
+
+    result: list[KeyedEventPlan] = []
+    for consumer_root, incoming_edges in edges_by_consumer.items():
+        if (
+            consumer_root in existing_key_roots
+            or consumer_root in excluded_roots
+            or consumer_root in excluded_consumer_roots
+        ):
+            continue
+        producer_roots = tuple(sorted({edge.producer_root for edge in incoming_edges}))
+        if not producer_roots or any(
+            edge.kinds != frozenset((TileDependencyKind.READ_AFTER_WRITE,))
+            or edge.producer_root in excluded_roots
+            for edge in incoming_edges
+        ):
+            continue
+        consumer = task_families[consumer_root]
+        if consumer.task_count <= 1:
+            continue
+
+        valid = True
+        predecessors_by_producer: dict[int, list[set[int]]] = {
+            producer_root: [set() for _ in range(consumer.task_count)]
+            for producer_root in producer_roots
+        }
+        for edge in incoming_edges:
+            edge_predecessors = _edge_predecessor_sets(
+                edge,
+                task_families=task_families,
+                access_by_id=access_by_id,
+            )
+            if edge_predecessors is None:
+                valid = False
+                break
+            aggregate = predecessors_by_producer[edge.producer_root]
+            for consumer_task, predecessors in enumerate(edge_predecessors):
+                aggregate[consumer_task].update(predecessors)
+        if not valid:
+            continue
+
+        key_by_signature: dict[tuple[frozenset[int], ...], int] = {}
+        consumer_key_by_task: list[int] = []
+        signatures: list[tuple[frozenset[int], ...]] = []
+        for consumer_task in range(consumer.task_count):
+            signature = tuple(
+                frozenset(predecessors_by_producer[producer_root][consumer_task])
+                for producer_root in producer_roots
+            )
+            if any(not predecessors for predecessors in signature):
+                valid = False
+                break
+            key = key_by_signature.setdefault(signature, len(key_by_signature))
+            consumer_key_by_task.append(key)
+            if key == len(signatures):
+                signatures.append(signature)
+        if not valid or not signatures:
+            continue
+        if (
+            len(producer_roots) == 1
+            and len(signatures) == consumer.task_count
+            and producer_roots[0] not in existing_on_ready_roots
+        ):
+            continue
+
+        contributors: list[KeyedEventContributorPlan] = []
+        for producer_index, producer_root in enumerate(producer_roots):
+            producer = task_families[producer_root]
+            task_to_key: list[int | None] = [None] * producer.task_count
+            for key, signature in enumerate(signatures):
+                for producer_task in signature[producer_index]:
+                    previous = task_to_key[producer_task]
+                    if previous is not None and previous != key:
+                        valid = False
+                        break
+                    task_to_key[producer_task] = key
+                if not valid:
+                    break
+            if not valid:
+                break
+            mapping = tuple(task_to_key)
+            segments = _compress_task_to_key(mapping)
+            if not segments:
+                valid = False
+                break
+            source_event_ids = tuple(
+                sorted(
+                    {
+                        wait.event_id
+                        for wait in dependency_plan.waits
+                        if wait.consumer_root == consumer_root
+                        and dependency_plan.event(wait.event_id).producer_root
+                        == producer_root
+                    }
+                )
+            )
+            contributors.append(
+                KeyedEventContributorPlan(
+                    source_event_ids=source_event_ids,
+                    producer_root=producer_root,
+                    task_to_key=mapping,
+                    task_to_key_segments=segments,
+                )
+            )
+        consumer_mapping = tuple(consumer_key_by_task)
+        consumer_segments = _compress_task_to_key(consumer_mapping)
+        if not valid or not consumer_segments:
+            continue
+        if (
+            len(signatures) == 1
+            and len(contributors) == 1
+            and all(key is not None for key in contributors[0].task_to_key)
+        ):
+            continue
+        event = KeyedEventPlan(
+            key_root=consumer_root,
+            contributors=tuple(contributors),
+            consumer_key_by_task=consumer_mapping,
+            consumer_task_to_key_segments=consumer_segments,
+            on_ready_root=(
+                consumer_root
+                if len(signatures) == consumer.task_count
+                and consumer_mapping == tuple(range(consumer.task_count))
+                else None
+            ),
+        )
+        if (
+            event.on_ready_root is not None
+            and any(
+                completion.producer_root == consumer_root
+                and completion.granularity == "root"
+                for completion in dependency_plan.events
+            )
+            and consumer.task_count > physical_worker_limit
+        ):
+            continue
+        try:
+            if event.expected_arrivals <= 0:
+                continue
+        except ValueError:
+            continue
+        result.append(event)
+    return tuple(result)
+
+
+def _select_readiness_frontier(
+    *,
+    dependency_plan: CrossLoopDependencyPlan,
+    counted_events: tuple[KeyedEventPlan, ...],
     access_cohorts: tuple[AccessCohortPlan, ...],
     task_families: tuple[InstantiatedTaskFamily, ...],
-    physical_worker_limit: int,
-) -> tuple[TaskContinuationPipelinePlan, ...]:
-    result: list[TaskContinuationPipelinePlan] = []
-    for continuation in task_continuations:
+    frontier_index: int,
+) -> ReadinessFrontierSelection:
+    candidate_families: list[
+        tuple[KeyedEventPlan, tuple[ReadinessFrontierPlan, ...]]
+    ] = []
+    for event in counted_events:
+        if event.on_ready_root is None or not event.is_single_contributor:
+            continue
+        contributor = event.single_contributor
+        partition = contributor.partition
+        if partition is None:
+            continue
         matching_cohorts = [
             cohort
             for cohort in access_cohorts
-            if cohort.producer_root == continuation.consumer_root
+            if cohort.producer_root == event.on_ready_root
         ]
         if len(matching_cohorts) != 1:
             continue
@@ -829,60 +1578,101 @@ def _derive_task_continuation_pipelines(
             edge.producer_root
             for edge in dependency_plan.edges
             if edge.consumer_root == downstream_root
-        } != {continuation.consumer_root}:
+        } != {event.on_ready_root}:
             continue
-        if any(
-            event.producer_root in (continuation.producer_root, downstream_root)
-            and event.granularity == "root"
-            for event in dependency_plan.events
-        ):
-            continue
-
-        producer_tasks = continuation.producer_tasks
-        consumer_tasks = task_families[downstream_root].task_count
-        minimum_workers = (producer_tasks + consumer_tasks + 1) // 2
-        worker_count = (
-            (minimum_workers + continuation.fanin - 1)
-            // continuation.fanin
-            * continuation.fanin
-        )
+        mapping_family = task_families[event.on_ready_root]
         if (
-            worker_count > physical_worker_limit
-            or worker_count >= producer_tasks
-            or consumer_tasks <= 0
-        ):
-            continue
-        tail_producer_tasks = producer_tasks - worker_count
-        consumer_worker_begin = worker_count - consumer_tasks
-        if tail_producer_tasks > consumer_worker_begin:
-            continue
-
-        mapping_family = task_families[continuation.consumer_root]
-        if (
-            not mapping_family.physical_axis_order
-            or mapping_family.physical_axis_order[-1] != cohort.producer_stream_axis
-            or mapping_family.physical_axis_order[:-1] != cohort.outer_producer_axes
+            not mapping_family.logical_axis_order
+            or mapping_family.logical_axis_order[-1] != cohort.producer_stream_axis
+            or mapping_family.logical_axis_order[:-1] != cohort.outer_producer_axes
         ):
             continue
         mapping_counts = mapping_family.axis_counts
         outer_count = math.prod(
             mapping_counts[block_id] for block_id in cohort.outer_producer_axes
         )
-        initial_map_tasks = worker_count // continuation.fanin
-        if initial_map_tasks % outer_count:
-            continue
-        initial_stream_tasks = initial_map_tasks // outer_count
         stream_tasks = mapping_counts[cohort.producer_stream_axis]
-        if not 0 < initial_stream_tasks < stream_tasks:
+        if partition.producer_tasks != (
+            outer_count * stream_tasks * event.expected_arrivals
+        ):
+            continue
+        downstream_tasks = task_families[downstream_root].task_count
+        if downstream_tasks <= 0:
             continue
 
-        result.append(
-            TaskContinuationPipelinePlan(
-                continuation=continuation,
-                cohort=cohort,
-                worker_count=worker_count,
-                consumer_tasks=consumer_tasks,
+        minimum_workers = (partition.producer_tasks + downstream_tasks + 1) // 2
+        worker_scale = outer_count * event.expected_arrivals
+        minimum_frontier = (minimum_workers + worker_scale - 1) // worker_scale
+        granularity = cohort.stream_task_granularity
+        minimum_frontier = (
+            (minimum_frontier + granularity - 1) // granularity * granularity
+        )
+        candidates = tuple(
+            ReadinessFrontierPlan(
+                event=event,
+                downstream_cohort=cohort,
+                worker_count=worker_scale * initial_stream_tasks,
+                downstream_tasks=downstream_tasks,
                 initial_stream_tasks=initial_stream_tasks,
             )
+            for initial_stream_tasks in range(
+                minimum_frontier,
+                stream_tasks,
+                granularity,
+            )
+            if (
+                partition.producer_tasks - worker_scale * initial_stream_tasks
+                <= worker_scale * initial_stream_tasks - downstream_tasks
+            )
         )
-    return tuple(result)
+        candidate_families.append((event, candidates))
+
+    if frontier_index < -1:
+        raise exc.InvalidConfig(
+            f"{TILE_DEPENDENCY_FRONTIER_CONFIG} must be at least -1, got "
+            f"{frontier_index}"
+        )
+    if frontier_index == -1:
+        return ReadinessFrontierSelection(
+            root_completion_key_roots=frozenset(
+                event.key_root for event, _candidates in candidate_families
+            )
+        )
+    if len(candidate_families) != 1:
+        raise exc.InvalidConfig(
+            f"{TILE_DEPENDENCY_FRONTIER_CONFIG} selects candidate "
+            f"{frontier_index}, but this configuration has no unique "
+            "readiness-frontier component"
+        )
+    event, candidates = candidate_families[0]
+    if frontier_index >= len(candidates):
+        raise exc.InvalidConfig(
+            f"{TILE_DEPENDENCY_FRONTIER_CONFIG} selects candidate "
+            f"{frontier_index}, but this configuration has only "
+            f"{len(candidates)} readiness frontiers"
+        )
+    return ReadinessFrontierSelection(plans=(candidates[frontier_index],))
+
+
+def has_potential_readiness_frontier(
+    dependency_plan: CrossLoopDependencyPlan,
+) -> bool:
+    """Return whether the graph can contain a counted-event readiness frontier."""
+    producer_by_event = {
+        event.event_id: event.producer_root
+        for event in dependency_plan.events
+        if event.granularity == "task"
+    }
+    root_entry_consumers = {
+        wait.consumer_root
+        for wait in dependency_plan.waits
+        if wait.placement == "root_entry"
+        and wait.predecessor_map is not None
+        and wait.event_id in producer_by_event
+    }
+    return any(
+        wait.placement == "access"
+        and wait.predecessor_map is not None
+        and producer_by_event.get(wait.event_id) in root_entry_consumers
+        for wait in dependency_plan.waits
+    )

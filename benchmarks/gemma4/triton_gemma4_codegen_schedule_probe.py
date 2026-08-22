@@ -235,6 +235,17 @@ def _probe_publish(
             tl.atomic_xchg(ready + phase * 32, epoch, sem="release", scope="gpu")
 
 
+@triton.jit
+def _probe_counted_event_arrive(address, count):
+    previous = tl.atomic_add(
+        address,
+        1,
+        sem="acq_rel",
+        scope="gpu",
+    )
+    return previous % count == count - 1
+
+
 @triton.jit(noinline=True)
 def _probe_down_two_splits(
     activation,
@@ -328,6 +339,7 @@ def _probe_stream_ffn_producer(
     ROOT_8_OFFSET: tl.constexpr,
     ROOT_8_TASKS: tl.constexpr,
     FIRST_ACTIVATION_TASKS: tl.constexpr,
+    COUNTED_EVENT_ON_READY: tl.constexpr,
     TRACE: tl.constexpr,
 ):
     subtiles_per_activation: tl.constexpr = _BLOCK_SIZE_24 // _BLOCK_SIZE_21
@@ -350,13 +362,20 @@ def _probe_stream_ffn_producer(
         ROOT_7_OFFSET + physical_task,
     )
     tl.debug_barrier()
-    previous = tl.atomic_add(
-        activation_arrivals + activation_task,
-        1,
-        sem="acq_rel",
-        scope="gpu",
-    )
-    if previous % fan_in == fan_in - 1:
+    if COUNTED_EVENT_ON_READY:
+        activation_ready = _probe_counted_event_arrive(
+            activation_arrivals + activation_task,
+            fan_in,
+        )
+    else:
+        previous = tl.atomic_add(
+            activation_arrivals + activation_task,
+            1,
+            sem="acq_rel",
+            scope="gpu",
+        )
+        activation_ready = previous % fan_in == fan_in - 1
+    if activation_ready:
         tile_dependency_root_8(
             gate_up,
             activation,
@@ -373,13 +392,20 @@ def _probe_stream_ffn_producer(
             FIRST_ACTIVATION_TASKS,
             ROOT_8_TASKS - FIRST_ACTIVATION_TASKS,
         ).to(tl.int32)
-        split_previous = tl.atomic_add(
-            ffn_split_arrivals + split,
-            1,
-            sem="acq_rel",
-            scope="gpu",
-        )
-        if split_previous % split_count == split_count - 1:
+        if COUNTED_EVENT_ON_READY:
+            split_ready = _probe_counted_event_arrive(
+                ffn_split_arrivals + split,
+                split_count,
+            )
+        else:
+            split_previous = tl.atomic_add(
+                ffn_split_arrivals + split,
+                1,
+                sem="acq_rel",
+                scope="gpu",
+            )
+            split_ready = split_previous % split_count == split_count - 1
+        if split_ready:
             tl.atomic_xchg(
                 ffn_ready + split,
                 epoch,
@@ -531,8 +557,11 @@ def gemma4_codegen_schedule_probe(
     QKV_CONTINUATION: tl.constexpr,
     ATTENTION_CONTINUATION: tl.constexpr,
     FFN_CONTINUATION: tl.constexpr,
+    FFN_CONSUMER_MAJOR: tl.constexpr,
     FFN_STREAM: tl.constexpr,
     FFN_FIRST_GROUPS: tl.constexpr,
+    FFN_CONSUMER_WORKERS: tl.constexpr,
+    COUNTED_EVENT_ON_READY: tl.constexpr,
     STREAM_DOWN_STAGES: tl.constexpr,
     STREAM_DOWN_UNROLL: tl.constexpr,
     O_CONTINUATION: tl.constexpr,
@@ -909,8 +938,7 @@ def gemma4_codegen_schedule_probe(
     if FFN_STREAM:
         stream_fan_in: tl.constexpr = 2 * _BLOCK_SIZE_24 // _BLOCK_SIZE_21
         initial_tasks: tl.constexpr = FFN_FIRST_GROUPS * stream_fan_in
-        initial_waves: tl.constexpr = initial_tasks // TOTAL_WORKERS
-        producer_workers: tl.constexpr = TOTAL_WORKERS - root_9_tasks
+        producer_workers: tl.constexpr = TOTAL_WORKERS - FFN_CONSUMER_WORKERS
         if worker < TOTAL_WORKERS:
             _probe_wait_phase(
                 phase_arrivals,
@@ -924,7 +952,7 @@ def gemma4_codegen_schedule_probe(
             )
             if TRACE:
                 tl.store(trace + 2 + 4 * worker, _probe_globaltimer())
-            for initial_wave in range(initial_waves):
+            for logical_task in tl.range(worker, initial_tasks, TOTAL_WORKERS):
                 _probe_stream_ffn_producer(
                     ff_input,
                     gate_up_weight,
@@ -934,13 +962,14 @@ def gemma4_codegen_schedule_probe(
                     ffn_split_arrivals,
                     ffn_ready,
                     trace,
-                    worker + initial_wave * TOTAL_WORKERS,
+                    logical_task,
                     epoch,
                     INTERMEDIATE,
                     root_7_offset,
                     root_8_offset,
                     root_8_tasks,
                     FFN_FIRST_GROUPS,
+                    COUNTED_EVENT_ON_READY,
                     TRACE,
                 )
             if TRACE:
@@ -967,6 +996,7 @@ def gemma4_codegen_schedule_probe(
                         root_8_offset,
                         root_8_tasks,
                         FFN_FIRST_GROUPS,
+                        COUNTED_EVENT_ON_READY,
                         TRACE,
                     )
                 if TRACE:
@@ -982,7 +1012,22 @@ def gemma4_codegen_schedule_probe(
             POLL_DELAY,
             RELAXED_POLL,
         )
-        for task in tl.range(worker, root_7_tasks, TOTAL_WORKERS):
+        ffn_fan_in: tl.constexpr = 2 * _BLOCK_SIZE_24 // _BLOCK_SIZE_21
+        for logical_task in tl.range(worker, root_7_tasks, TOTAL_WORKERS):
+            task = logical_task
+            if FFN_CONSUMER_MAJOR:
+                subtiles: tl.constexpr = _BLOCK_SIZE_24 // _BLOCK_SIZE_21
+                activation_task = logical_task // ffn_fan_in
+                within_activation = logical_task % ffn_fan_in
+                half_tasks: tl.constexpr = INTERMEDIATE // _BLOCK_SIZE_21
+                task = tl.where(
+                    within_activation < subtiles,
+                    activation_task * subtiles + within_activation,
+                    half_tasks
+                    + activation_task * subtiles
+                    + within_activation
+                    - subtiles,
+                )
             tile_dependency_root_7(
                 ff_input,
                 gate_up_weight,
@@ -991,19 +1036,19 @@ def gemma4_codegen_schedule_probe(
             )
             if FFN_CONTINUATION:
                 tl.debug_barrier()
-                half_tasks: tl.constexpr = INTERMEDIATE // _BLOCK_SIZE_21
-                half_task = task % half_tasks
-                activation_task = (
-                    half_task * _BLOCK_SIZE_21
-                ) // _BLOCK_SIZE_24
-                fan_in: tl.constexpr = 2 * _BLOCK_SIZE_24 // _BLOCK_SIZE_21
+                if not FFN_CONSUMER_MAJOR:
+                    half_tasks: tl.constexpr = INTERMEDIATE // _BLOCK_SIZE_21
+                    half_task = task % half_tasks
+                    activation_task = (
+                        half_task * _BLOCK_SIZE_21
+                    ) // _BLOCK_SIZE_24
                 previous = tl.atomic_add(
                     activation_arrivals + activation_task,
                     1,
                     sem="acq_rel",
                     scope="gpu",
                 )
-                if previous % fan_in == fan_in - 1:
+                if previous % ffn_fan_in == ffn_fan_in - 1:
                     tile_dependency_root_8(
                         gate_up,
                         activation,
@@ -1056,26 +1101,31 @@ def gemma4_codegen_schedule_probe(
 
     root_9_participants: tl.constexpr = min(TOTAL_WORKERS, root_9_tasks)
     if FFN_STREAM:
-        consumer_base: tl.constexpr = TOTAL_WORKERS - root_9_tasks
-        if worker >= consumer_base and worker < consumer_base + root_9_tasks:
+        consumer_base: tl.constexpr = TOTAL_WORKERS - FFN_CONSUMER_WORKERS
+        if worker >= consumer_base:
             if TRACE:
                 tl.store(trace + 4 + 4 * worker, _probe_globaltimer())
-            _probe_down_two_splits(
-                activation,
-                down_weight,
-                down,
-                ffn_ready,
+            for task in tl.range(
                 worker - consumer_base,
-                epoch,
-                H,
-                INTERMEDIATE,
-                FFN_FIRST_GROUPS,
-                STREAM_DOWN_STAGES,
-                STREAM_DOWN_UNROLL,
-                POLL_DELAY,
-                FUSED_SIGNALS != 2,
-                RELAXED_POLL,
-            )
+                root_9_tasks,
+                FFN_CONSUMER_WORKERS,
+            ):
+                _probe_down_two_splits(
+                    activation,
+                    down_weight,
+                    down,
+                    ffn_ready,
+                    task,
+                    epoch,
+                    H,
+                    INTERMEDIATE,
+                    FFN_FIRST_GROUPS,
+                    STREAM_DOWN_STAGES,
+                    STREAM_DOWN_UNROLL,
+                    POLL_DELAY,
+                    FUSED_SIGNALS != 2,
+                    RELAXED_POLL,
+                )
             if TRACE:
                 tl.store(trace + 5 + 4 * worker, _probe_globaltimer())
             _probe_publish(
@@ -1083,7 +1133,7 @@ def gemma4_codegen_schedule_probe(
                 phase_ready,
                 phase_down,
                 epoch,
-                root_9_tasks,
+                FFN_CONSUMER_WORKERS,
                 FUSED_SIGNALS,
             )
     else:
@@ -1120,7 +1170,7 @@ def gemma4_codegen_schedule_probe(
     root_10_participants: tl.constexpr = min(TOTAL_WORKERS, root_10_tasks)
     if worker < root_10_participants:
         down_publishers: tl.constexpr = (
-            root_9_tasks if FFN_STREAM else root_9_participants
+            FFN_CONSUMER_WORKERS if FFN_STREAM else root_9_participants
         )
         _probe_wait_phase(
             phase_arrivals,
@@ -1256,6 +1306,7 @@ def _config_for_probe(bound, args, geometry):
         full_splits=args.full_splits,
         sliding_splits=args.sliding_splits,
         worker_multiplier=2,
+        frontier_index=None,
         num_warps=args.num_warps,
         kernel_stages=args.kernel_stages,
     )
@@ -1640,12 +1691,13 @@ def _validate_ffn_stream(bound, config, shape, args) -> None:
 
     fan_in = 2 * activation_block // gate_block
     initial_tasks = args.ffn_first_groups * fan_in
-    if initial_tasks % args.workers:
-        raise ValueError(
-            "the streamed prefix must contain whole full-grid producer waves"
-        )
     down_tasks = shape.hidden // down_block_n
-    producer_workers = args.workers - down_tasks
+    if not 0 < args.ffn_consumer_workers <= min(down_tasks, args.workers - 1):
+        raise ValueError(
+            "--ffn-consumer-workers must be positive and no larger than "
+            "the down task count or workers - 1"
+        )
+    producer_workers = args.workers - args.ffn_consumer_workers
     if producer_workers <= 0:
         raise ValueError("FFN streaming requires at least one tail producer worker")
     gate_tasks = 2 * shape.intermediate // gate_block
@@ -1724,7 +1776,17 @@ def _allocate_buffers(tensors, shape, geometry, splits, workers, activation_bloc
     }
 
 
-def _launch(kernel, tensors, buffers, shape, geometry, splits, args):
+def _launch(
+    kernel,
+    tensors,
+    buffers,
+    shape,
+    geometry,
+    splits,
+    args,
+    *,
+    counted_event_on_ready=None,
+):
     kernel_args = (
         tensors["hidden_states"],
         tensors["input_norm_weight"],
@@ -1792,8 +1854,15 @@ def _launch(kernel, tensors, buffers, shape, geometry, splits, args):
         args.qkv_continuation,
         args.attention_continuation,
         args.ffn_continuation or args.ffn_stream,
+        args.ffn_consumer_major,
         args.ffn_stream,
         args.ffn_first_groups,
+        args.ffn_consumer_workers,
+        (
+            args.counted_event_on_ready
+            if counted_event_on_ready is None
+            else counted_event_on_ready
+        ),
         args.stream_down_stages,
         args.stream_down_unroll,
         args.o_continuation,
@@ -1845,9 +1914,7 @@ def _stream_trace_result(buffers, shape, bound, config, args):
             "max_us": round((int(values.max().item()) - start) / 1000.0, 3),
         }
 
-    down_block_n = _config_block_size(bound, config, 26)
-    down_tasks = shape.hidden // down_block_n
-    consumer_base = args.workers - down_tasks
+    consumer_base = args.workers - args.ffn_consumer_workers
     return {
         "split_ready_us": [
             round((int(value.item()) - start) / 1000.0, 3) for value in trace[:2]
@@ -1947,6 +2014,21 @@ def run(args) -> None:
     kernel = namespace["gemma4_codegen_schedule_probe"]
     compiled = _launch(kernel, tensors, buffers, shape, geometry, splits, args)
     torch.cuda.synchronize()
+    alternate_counted_event = None
+    alternate_compiled = None
+    if args.compare_counted_event:
+        alternate_counted_event = not args.counted_event_on_ready
+        alternate_compiled = _launch(
+            kernel,
+            tensors,
+            buffers,
+            shape,
+            geometry,
+            splits,
+            args,
+            counted_event_on_ready=alternate_counted_event,
+        )
+        torch.cuda.synchronize()
 
     if not args.no_waits:
         _assert_close(
@@ -1984,8 +2066,11 @@ def run(args) -> None:
             "qkv_continuation": args.qkv_continuation,
             "attention_continuation": args.attention_continuation,
             "ffn_continuation": args.ffn_continuation,
+            "ffn_consumer_major": args.ffn_consumer_major,
             "ffn_stream": args.ffn_stream,
             "ffn_first_groups": args.ffn_first_groups,
+            "ffn_consumer_workers": args.ffn_consumer_workers,
+            "counted_event_on_ready": args.counted_event_on_ready,
             "stream_down_stages": args.stream_down_stages,
             "stream_down_unroll": args.stream_down_unroll,
             "o_continuation": args.o_continuation,
@@ -2013,6 +2098,15 @@ def run(args) -> None:
             "resident_workers": resident_workers,
         }
     )
+    if alternate_compiled is not None:
+        result["counted_event_comparison"] = {
+            "alternate_counted_event_on_ready": alternate_counted_event,
+            "alternate_resources": {
+                "registers": alternate_compiled.n_regs,
+                "spills": alternate_compiled.n_spills,
+                "shared": alternate_compiled.metadata.shared,
+            },
+        }
     if args.trace:
         result["stream_trace"] = _stream_trace_result(
             buffers,
@@ -2052,6 +2146,27 @@ def run(args) -> None:
         )
         pids = visible_gpu_pids()
         entries = {"triton_codegen_schedule": graph.replay}
+        if alternate_counted_event is not None:
+            alternate_graph, _ = capture(
+                lambda: (
+                    _launch(
+                        kernel,
+                        tensors,
+                        buffers,
+                        shape,
+                        geometry,
+                        splits,
+                        args,
+                        counted_event_on_ready=alternate_counted_event,
+                    ),
+                    buffers["output"],
+                )[1]
+            )
+            entries[
+                "triton_counted_event"
+                if alternate_counted_event
+                else "triton_direct_event"
+            ] = alternate_graph.replay
         if helion_graph is not None:
             entries["separate_helion"] = helion_graph.replay
         result["timings"] = benchmark_interleaved(
@@ -2132,9 +2247,21 @@ def main() -> None:
         "--ffn-continuation", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument(
+        "--ffn-consumer-major",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
         "--ffn-stream", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--ffn-first-groups", type=int, default=20)
+    parser.add_argument("--ffn-consumer-workers", type=int, default=160)
+    parser.add_argument(
+        "--counted-event-on-ready",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--compare-counted-event", action="store_true")
     parser.add_argument("--stream-down-stages", type=int, default=4)
     parser.add_argument("--stream-down-unroll", type=int, default=0)
     parser.add_argument(

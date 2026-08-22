@@ -14,6 +14,7 @@ import argparse
 import ast
 import dataclasses
 import json
+import math
 from pathlib import Path
 import sys
 import types
@@ -22,12 +23,15 @@ import torch
 
 import helion
 from helion._compiler.program_id import ForEachProgramID
+from helion._compiler.tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_CONFIG
 import helion.language as hl
 
 FP8_MAX = 448.0
 FP8_MIN = -448.0
 FP8_MIN_SCALE = 1.0 / (FP8_MAX * 512.0)
 _ACTIVE_TILE_DEPENDENCY_SCHEDULE = helion.TileDependencySchedule()
+_USE_CANONICAL_ATTENTION_VIEWS = False
+_USE_TASK_ALIGNED_ATTENTION = False
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
@@ -118,36 +122,20 @@ def tiled_reshape_and_cache_flash(
     slot_mapping: torch.Tensor,
     block_size: int,
 ) -> None:
-    """Expose each disjoint K/V cache half as one source-visible tile."""
+    """Store one complete K/V head from each logical cache task."""
     num_tokens, num_kv_heads, head_dim = key.shape
     hl.specialize(num_kv_heads)
     hl.specialize(head_dim)
     hl.specialize(block_size)
     for tile_t, tile_h, tile_d in hl.tile(
-        [num_tokens, 2 * num_kv_heads, head_dim],
+        [num_tokens, num_kv_heads, head_dim],
         block_size=[1, 1, head_dim],
     ):
         token = tile_t.index
-        combined_head = tile_h.index
+        cache_head = tile_h.index
         dimension = tile_d.index
-        cache_half = combined_head // num_kv_heads
-        cache_head = combined_head % num_kv_heads
-        key_value = key[
-            token[:, None, None],
-            cache_head[None, :, None],
-            dimension[None, None, :],
-        ]
-        value_value = value[
-            token[:, None, None],
-            cache_head[None, :, None],
-            dimension[None, None, :],
-        ]
-        cache_value = torch.where(
-            (cache_half == 0)[None, :, None], key_value, value_value
-        )
-        cache_dimension = (cache_half[:, None] * head_dim + dimension[None, :])[
-            None, :, :
-        ]
+        key_value = key[tile_t, tile_h, tile_d]
+        value_value = value[tile_t, tile_h, tile_d]
         slot = slot_mapping[token]
         block = (slot // block_size)[:, None, None]
         offset = (slot % block_size)[:, None, None]
@@ -157,10 +145,230 @@ def tiled_reshape_and_cache_flash(
                 block,
                 offset,
                 cache_head[None, :, None],
-                cache_dimension,
+                dimension[None, None, :],
             ],
-            cache_value,
+            key_value,
         )
+        hl.store(
+            kv_cache,
+            [
+                block,
+                offset,
+                cache_head[None, :, None],
+                (dimension + head_dim)[None, None, :],
+            ],
+            value_value,
+        )
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def flat_fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    forced_token_heads_per_warp: int = -1,
+) -> None:
+    """Apply Q/K normalization and RoPE over contiguous flat head tiles."""
+    num_tokens, qkv_width = qkv.shape
+    total_heads = num_heads_q + num_heads_k + num_heads_v
+    assert qkv_width == total_heads * head_dim
+    _, rotary_dim = cos_sin_cache.shape
+    hl.specialize(qkv_width)
+    hl.specialize(rotary_dim)
+    embed_dim = rotary_dim // 2
+    hl.specialize(num_heads_q)
+    hl.specialize(num_heads_k)
+    hl.specialize(num_heads_v)
+    hl.specialize(head_dim)
+    assert is_neox
+    assert rotary_dim == head_dim
+    qk_width = (num_heads_q + num_heads_k) * head_dim
+
+    for tile_m, tile_n in hl.tile([num_tokens, qk_width], block_size=[1, head_dim]):
+        x = qkv[tile_m, tile_n].to(torch.float32)
+        rms = torch.rsqrt(x.pow(2).sum(-1) * (1.0 / head_dim) + eps)
+        dimension = tile_n.index - tile_n.begin
+        use_q = tile_n.index < num_heads_q * head_dim
+        weight = torch.where(use_q, q_weight[dimension], k_weight[dimension])
+        x = (x * rms[:, None]).to(qkv.dtype) * weight[None, :]
+        position = position_ids[tile_m]
+        first_half = dimension < embed_dim
+        partner_dimension = torch.where(
+            first_half, dimension + embed_dim, dimension - embed_dim
+        )
+        partner = torch.gather(x, 1, partner_dimension[None, :])
+        cos = cos_sin_cache[position, dimension % embed_dim]
+        sin = cos_sin_cache[position, dimension % embed_dim + embed_dim]
+        qkv[tile_m, tile_n] = x * cos[:, :] + torch.where(
+            first_half[None, :], -partner * sin[:, :], partner * sin[:, :]
+        )
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def canonical_paged_gqa_decode_attention_split(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context: int,
+    block_size: int,
+    q_per_kv: int,
+    splits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split attention with partials stored in canonical query-head coordinates."""
+    _, num_q_heads, head_dim = query.shape
+    num_kv_heads = kv_cache.shape[2]
+    assert num_q_heads == num_kv_heads * q_per_kv
+    assert context % splits == 0
+    hl.specialize(head_dim)
+    hl.specialize(num_kv_heads)
+    hl.specialize(q_per_kv)
+    hl.specialize(context)
+    hl.specialize(block_size)
+    hl.specialize(splits)
+    split_context = context // splits
+    q = query.view(num_kv_heads, q_per_kv, head_dim)
+    partial_out = torch.empty(
+        (splits, num_q_heads, head_dim),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    partial_lse = torch.empty(
+        (splits, num_q_heads),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_split, tile_g, tile_q in hl.tile(
+        [splits, num_kv_heads, q_per_kv], block_size=[1, 1, None]
+    ):
+        m_i = hl.full([tile_g, tile_q], float("-inf"), dtype=torch.float32)
+        l_i = hl.full([tile_g, tile_q], 1.0, dtype=torch.float32)
+        acc = hl.zeros([tile_g, tile_q, head_dim], dtype=torch.float32)
+        split_idx = tile_split.begin
+        q_blk = (q[tile_g, tile_q, :] * qk_scale).to(q.dtype)
+        for tile_local_n in hl.tile(split_context):
+            n = split_idx * split_context + tile_local_n.index
+            physical_block = block_table[0, n // block_size]
+            block_offset = n % block_size
+            d = hl.arange(head_dim)
+            k = hl.load(
+                kv_cache,
+                [
+                    physical_block[None, :, None],
+                    block_offset[None, :, None],
+                    tile_g.index[:, None, None],
+                    d[None, None, :],
+                ],
+            )
+            scores = torch.bmm(q_blk, k.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(scores, -1))
+            p = torch.exp2(scores - m_ij[:, :, None])
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + torch.sum(p, -1)
+            acc = acc * alpha[:, :, None]
+            v = hl.load(
+                kv_cache,
+                [
+                    physical_block[None, :, None],
+                    block_offset[None, :, None],
+                    tile_g.index[:, None, None],
+                    (d + head_dim)[None, None, :],
+                ],
+            )
+            acc = torch.baddbmm(acc, p.to(v.dtype), v)
+            m_i = m_ij
+        query_head = tile_g.index[:, None] * q_per_kv + tile_q.index[None, :]
+        partial_out[tile_split, query_head, :] = (acc / l_i[:, :, None])[None, :, :, :]
+        partial_lse[tile_split, query_head] = (m_i + torch.log2(l_i))[None, :, :]
+    return partial_out, partial_lse
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def task_aligned_paged_gqa_decode_attention_split(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context: int,
+    block_size: int,
+    q_per_kv: int,
+    splits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Retain the baseline layout while exposing the KV-head task coordinate."""
+    _, num_q_heads, head_dim = query.shape
+    num_kv_heads = kv_cache.shape[2]
+    assert num_q_heads == num_kv_heads * q_per_kv
+    assert context % splits == 0
+    hl.specialize(head_dim)
+    hl.specialize(num_kv_heads)
+    hl.specialize(q_per_kv)
+    hl.specialize(context)
+    hl.specialize(block_size)
+    hl.specialize(splits)
+    split_context = context // splits
+    q = query.view(num_kv_heads, q_per_kv, head_dim)
+    partial_out = torch.empty(
+        (splits, num_kv_heads, q_per_kv, head_dim),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    partial_lse = torch.empty(
+        (splits, num_kv_heads, q_per_kv),
+        device=query.device,
+        dtype=torch.float32,
+    )
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_split, tile_g, tile_q in hl.tile(
+        [splits, num_kv_heads, q_per_kv], block_size=[1, 1, None]
+    ):
+        m_i = hl.full([tile_g, tile_q], float("-inf"), dtype=torch.float32)
+        l_i = hl.full([tile_g, tile_q], 1.0, dtype=torch.float32)
+        acc = hl.zeros([tile_g, tile_q, head_dim], dtype=torch.float32)
+        split_idx = tile_split.begin
+        q_blk = (q[tile_g, tile_q, :] * qk_scale).to(q.dtype)
+        for tile_local_n in hl.tile(split_context):
+            n = split_idx * split_context + tile_local_n.index
+            physical_block = block_table[0, n // block_size]
+            block_offset = n % block_size
+            d = hl.arange(head_dim)
+            k = hl.load(
+                kv_cache,
+                [
+                    physical_block[None, :, None],
+                    block_offset[None, :, None],
+                    tile_g.index[:, None, None],
+                    d[None, None, :],
+                ],
+            )
+            scores = torch.bmm(q_blk, k.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(scores, -1))
+            p = torch.exp2(scores - m_ij[:, :, None])
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + torch.sum(p, -1)
+            acc = acc * alpha[:, :, None]
+            v = hl.load(
+                kv_cache,
+                [
+                    physical_block[None, :, None],
+                    block_offset[None, :, None],
+                    tile_g.index[:, None, None],
+                    (d + head_dim)[None, None, :],
+                ],
+            )
+            acc = torch.baddbmm(acc, p.to(v.dtype), v)
+            m_i = m_ij
+        partial_out[tile_split, tile_g, tile_q, :] = (acc / l_i[:, :, None])[
+            None, :, :, :
+        ]
+        partial_lse[tile_split, tile_g, tile_q] = (m_i + torch.log2(l_i))[None, :, :]
+    return partial_out, partial_lse
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
@@ -248,6 +456,186 @@ def tiled_merge_attention_splits(
         output[final_head, :] = (final_merged / final_denominator[:, None]).to(
             output.dtype
         )
+    return output
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def task_aligned_per_token_group_fp8_quant(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    scale_ue8m0: bool,
+    dummy_is_scale_transposed: bool,
+    dummy_is_tma_aligned: bool,
+) -> None:
+    """Quantize head-shaped attention without flattening its logical axes."""
+    num_kv_heads, q_per_kv, head_dim = input.shape
+    assert group_size == head_dim
+    assert not scale_ue8m0
+    hl.specialize(num_kv_heads)
+    hl.specialize(q_per_kv)
+    hl.specialize(head_dim)
+    hl.specialize(group_size)
+    for tile_g, tile_q, tile_n in hl.tile(
+        [num_kv_heads, q_per_kv, head_dim],
+        block_size=[1, None, group_size],
+    ):
+        value = input[tile_g, tile_q, tile_n]
+        scale = torch.amax(torch.abs(value), dim=-1).clamp(min=eps) / fp8_max
+        flat_group = tile_g.index[:, None] * q_per_kv + tile_q.index[None, :]
+        output_s[0, flat_group] = scale
+        flat_n = flat_group[:, :, None] * group_size + tile_n.index[None, None, :]
+        output_q[0, flat_n] = (
+            (value / scale[:, :, None]).clamp(fp8_min, fp8_max).to(output_q.dtype)
+        )
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def canonical_tiled_merge_attention_splits(
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+) -> torch.Tensor:
+    """The same merge tiles indexed through canonical multidimensional views."""
+    splits, query_heads, head_dim = partial_out.shape
+    hl.specialize(splits)
+    hl.specialize(query_heads)
+    hl.specialize(head_dim)
+    merge_chunks = 16
+    hl.specialize(merge_chunks)
+    assert splits % merge_chunks == 0
+    splits_per_chunk = splits // merge_chunks
+    hl.specialize(splits_per_chunk)
+
+    chunk_out = torch.empty(
+        (merge_chunks, query_heads, head_dim),
+        dtype=torch.float32,
+        device=partial_out.device,
+    )
+    chunk_lse = torch.empty(
+        (merge_chunks, query_heads),
+        dtype=torch.float32,
+        device=partial_out.device,
+    )
+    output = torch.empty(
+        (query_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=partial_out.device,
+    )
+
+    for tile_chunk, chunk_head in hl.tile(
+        [merge_chunks, query_heads], block_size=[1, 1]
+    ):
+        chunk_split_idx = (
+            tile_chunk.index[:, None] * splits_per_chunk
+            + hl.arange(splits_per_chunk)[None, :]
+        )
+        chunk_lse_values = partial_lse[
+            chunk_split_idx[:, :, None],
+            chunk_head.index[None, None, :],
+        ]
+        chunk_max_lse = torch.amax(chunk_lse_values, dim=1)
+        chunk_weights = torch.exp2(chunk_lse_values - chunk_max_lse[:, None, :])
+        chunk_values = partial_out[
+            chunk_split_idx[:, :, None, None],
+            chunk_head.index[None, None, :, None],
+            hl.arange(head_dim)[None, None, None, :],
+        ]
+        chunk_denominator = torch.sum(chunk_weights, dim=1)
+        chunk_merged = torch.sum(chunk_values * chunk_weights[:, :, :, None], dim=1)
+        chunk_merged = chunk_merged / chunk_denominator[:, :, None]
+        chunk_out[tile_chunk, chunk_head, :] = chunk_merged
+        chunk_lse[tile_chunk, chunk_head] = chunk_max_lse + torch.log2(
+            chunk_denominator
+        )
+
+    for final_head in hl.tile(query_heads, block_size=1):
+        final_chunk_idx = hl.arange(merge_chunks)
+        final_lse_values = chunk_lse[
+            final_chunk_idx[:, None],
+            final_head.index[None, :],
+        ]
+        final_max_lse = torch.amax(final_lse_values, dim=0)
+        final_weights = torch.exp2(final_lse_values - final_max_lse[None, :])
+        final_values = chunk_out[
+            final_chunk_idx[:, None, None],
+            final_head.index[None, :, None],
+            hl.arange(head_dim)[None, None, :],
+        ]
+        final_denominator = torch.sum(final_weights, dim=0)
+        final_merged = torch.sum(final_values * final_weights[:, :, None], dim=0)
+        output[final_head, :] = (final_merged / final_denominator[:, None]).to(
+            output.dtype
+        )
+    return output.view(1, query_heads, head_dim)
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def task_aligned_tiled_merge_attention_splits(
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+) -> torch.Tensor:
+    """Express both merge fan-ins as ordinary tile ranges."""
+    splits, num_kv_heads, q_per_kv, head_dim = partial_out.shape
+    hl.specialize(splits)
+    hl.specialize(num_kv_heads)
+    hl.specialize(q_per_kv)
+    hl.specialize(head_dim)
+    merge_chunks = 16
+    hl.specialize(merge_chunks)
+    assert splits % merge_chunks == 0
+    splits_per_chunk = splits // merge_chunks
+    hl.specialize(splits_per_chunk)
+
+    chunk_out = torch.empty(
+        (merge_chunks, num_kv_heads, q_per_kv, head_dim),
+        dtype=torch.float32,
+        device=partial_out.device,
+    )
+    chunk_lse = torch.empty(
+        (merge_chunks, num_kv_heads, q_per_kv),
+        dtype=torch.float32,
+        device=partial_out.device,
+    )
+    output = torch.empty(
+        (num_kv_heads, q_per_kv, head_dim),
+        dtype=torch.bfloat16,
+        device=partial_out.device,
+    )
+
+    for tile_split, tile_g, tile_q in hl.tile(
+        [splits, num_kv_heads, q_per_kv],
+        block_size=[splits_per_chunk, 1, None],
+    ):
+        chunk_lse_values = partial_lse[tile_split, tile_g, tile_q]
+        chunk_max_lse = torch.amax(chunk_lse_values, dim=0)
+        chunk_weights = torch.exp2(chunk_lse_values - chunk_max_lse[None, :, :])
+        chunk_values = partial_out[tile_split, tile_g, tile_q, :]
+        chunk_denominator = torch.sum(chunk_weights, dim=0)
+        chunk_merged = torch.sum(chunk_values * chunk_weights[:, :, :, None], dim=0)
+        chunk_out[tile_split.id, tile_g, tile_q, :] = (
+            chunk_merged / chunk_denominator[:, :, None]
+        )
+        chunk_lse[tile_split.id, tile_g, tile_q] = chunk_max_lse + torch.log2(
+            chunk_denominator
+        )
+
+    for tile_chunk, tile_g, tile_q in hl.tile(
+        [merge_chunks, num_kv_heads, q_per_kv],
+        block_size=[merge_chunks, 1, None],
+    ):
+        final_lse_values = chunk_lse[tile_chunk, tile_g, tile_q]
+        final_max_lse = torch.amax(final_lse_values, dim=0)
+        final_weights = torch.exp2(final_lse_values - final_max_lse[None, :, :])
+        final_values = chunk_out[tile_chunk, tile_g, tile_q, :]
+        final_denominator = torch.sum(final_weights, dim=0)
+        final_merged = torch.sum(final_values * final_weights[:, :, :, None], dim=0)
+        output[tile_g, tile_q, :] = (final_merged / final_denominator[:, :, None]).to(
+            output.dtype
+        )
     return output.view(1, num_kv_heads * q_per_kv, head_dim)
 
 
@@ -324,8 +712,15 @@ def _build_helion_reference(args, tensors):
         tensors["position"],
         -1,
     )
-    _, qk = compile_config(fused_qk_norm_rope, qk_args, configs["qk_norm_rope"])
-    qk(*qk_args)
+    qk_source = (
+        flat_fused_qk_norm_rope if _USE_TASK_ALIGNED_ATTENTION else fused_qk_norm_rope
+    )
+    if _USE_TASK_ALIGNED_ATTENTION:
+        _, qk = _compile_granular_separate_kernel(qk_source, qk_args, args)
+        qk(*qk_args)
+    else:
+        _, qk = compile_config(qk_source, qk_args, configs["qk_norm_rope"])
+        qk(*qk_args)
     key_begin = args.q_heads * args.head_dim
     qkv_width = (args.q_heads + 2 * args.kv_heads) * args.head_dim
     query = qkv[:, :key_begin].view(1, args.q_heads, args.head_dim)
@@ -355,16 +750,25 @@ def _build_helion_reference(args, tensors):
         args.q_heads // args.kv_heads,
         args.attention_splits,
     )
+    split_source = (
+        canonical_paged_gqa_decode_attention_split
+        if _USE_CANONICAL_ATTENTION_VIEWS
+        else paged_gqa_decode_attention_split
+    )
     _, split_kernel = compile_config(
-        paged_gqa_decode_attention_split,
+        split_source,
         split_args,
         configs["decode_attention_split"],
     )
     partial_out, partial_lse = split_kernel(*split_args)
     merge_args = (partial_out, partial_lse)
-    _, merge = _compile_granular_separate_kernel(
-        tiled_merge_attention_splits, merge_args, args
-    )
+    if _USE_CANONICAL_ATTENTION_VIEWS:
+        merge_kernel = canonical_tiled_merge_attention_splits
+    elif _USE_TASK_ALIGNED_ATTENTION:
+        merge_kernel = task_aligned_tiled_merge_attention_splits
+    else:
+        merge_kernel = tiled_merge_attention_splits
+    _, merge = _compile_granular_separate_kernel(merge_kernel, merge_args, args)
     attention = merge(*merge_args)
     quant_args = (
         attention.view(1, args.hidden),
@@ -532,20 +936,38 @@ def _build_original_helion_reference(*args: object, **kwargs: object):
 def _probe_config(bound, args):
     """Map the retained one-warp probe geometry onto the granular source."""
     values = dict(bound.config_spec.default_config())
+    values.pop(TILE_DEPENDENCY_FRONTIER_CONFIG, None)
+    uses_flat_qk = _USE_TASK_ALIGNED_ATTENTION or _USE_CANONICAL_ATTENTION_VIEWS
+    downstream_shift = (
+        2
+        if _USE_TASK_ALIGNED_ATTENTION
+        else -1
+        if _USE_CANONICAL_ATTENTION_VIEWS
+        else 0
+    )
     block_size_by_id = {
         9: 8,  # QKV output tile
-        12: args.qk_head_block,
-        19: 4,  # four queries per attention task
-        21: args.attention_context_block,
-        26: 1,  # one attention quant group
-        29: 8,  # O output tile
-        40: 16,  # W13 output tile
-        45: 8,  # W2 output tile
+        (18 if uses_flat_qk else 19): 4,
+        (20 if uses_flat_qk else 21): args.attention_context_block,
+        26 + downstream_shift: (
+            args.merge_q_block if _USE_TASK_ALIGNED_ATTENTION else 1
+        ),
+        29 + downstream_shift: 8,  # O output tile
+        40 + downstream_shift: 16,  # W13 output tile
+        45 + downstream_shift: 8,  # W2 output tile
     }
+    if not _USE_TASK_ALIGNED_ATTENTION:
+        block_size_by_id[12] = args.qk_head_block
+    if _USE_TASK_ALIGNED_ATTENTION:
+        block_size_by_id[23] = args.merge_q_block
+        block_size_by_id[26] = args.merge_q_block
     values["block_sizes"] = [
-        block_size_by_id[spec.block_id] for spec in bound.config_spec.block_sizes
+        block_size_by_id.get(spec.block_id, default)
+        for spec, default in zip(
+            bound.config_spec.block_sizes, values["block_sizes"], strict=True
+        )
     ]
-    values["loop_orders"] = [
+    loop_orders = [
         [0, 1, 2],
         [0, 1, 2],
         [0, 1],
@@ -561,6 +983,12 @@ def _probe_config(bound, args):
         [0, 1],
         [0, 1],
     ]
+    if uses_flat_qk:
+        loop_orders[3] = [0, 1]
+    if _USE_TASK_ALIGNED_ATTENTION:
+        loop_orders[6] = [0, 1, 2]
+        loop_orders.insert(7, [0, 1, 2])
+    values["loop_orders"] = loop_orders
     values["l2_groupings"] = [1] * len(bound.config_spec.l2_groupings)
 
     def by_block_id(specs, choices, default):
@@ -576,23 +1004,47 @@ def _probe_config(bound, args):
             for spec in specs
         ]
 
-    projection_ranges = {10: 4, 30: 4, 41: 4, 46: 4}
+    qkv_range = 10
+    attention_range = 20 if uses_flat_qk else 21
+    projection_ranges = {
+        qkv_range: 4,
+        30 + downstream_shift: 4,
+        41 + downstream_shift: 4,
+        46 + downstream_shift: 4,
+    }
     values["range_num_stages"] = by_block_id(
         bound.config_spec.range_num_stages, projection_ranges, 0
     )
     values["range_unroll_factors"] = by_block_id(
         bound.config_spec.range_unroll_factors,
-        {10: 2, 30: 2, 41: 2, 46: 4},
+        {
+            qkv_range: 2,
+            30 + downstream_shift: 2,
+            41 + downstream_shift: 2,
+            46 + downstream_shift: 4,
+        },
         0,
     )
     values["range_multi_buffers"] = by_block_id(
         bound.config_spec.range_multi_buffers,
-        {10: True, 21: True, 30: False, 41: True, 46: False},
+        {
+            qkv_range: True,
+            attention_range: True,
+            30 + downstream_shift: False,
+            41 + downstream_shift: True,
+            46 + downstream_shift: False,
+        },
         None,
     )
     values["range_flattens"] = by_block_id(
         bound.config_spec.range_flattens,
-        {10: False, 21: True, 30: False, 41: False, 46: True},
+        {
+            qkv_range: False,
+            attention_range: True,
+            30 + downstream_shift: False,
+            41 + downstream_shift: False,
+            46 + downstream_shift: True,
+        },
         None,
     )
     values.update(
@@ -603,27 +1055,39 @@ def _probe_config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
+    if TILE_DEPENDENCY_FRONTIER_CONFIG in bound.config_spec.user_defined_tunables:
+        values[TILE_DEPENDENCY_FRONTIER_CONFIG] = 0
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
 
 
 def main() -> None:
-    global _ACTIVE_TILE_DEPENDENCY_SCHEDULE
+    global \
+        _ACTIVE_TILE_DEPENDENCY_SCHEDULE, \
+        _USE_CANONICAL_ATTENTION_VIEWS, \
+        _USE_TASK_ALIGNED_ATTENTION
 
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--epoch-replicas", type=int)
-    parser.add_argument("--producer-order", choices=("physical", "consumer_major"))
     parser.add_argument("--strict-validation", action="store_true")
     parser.add_argument("--no-waits", action="store_true")
     parser.add_argument("--skip-wait-prefix", action="append", default=[])
     parser.add_argument("--dump-accesses", action="store_true")
+    parser.add_argument("--canonical-attention-views", action="store_true")
+    parser.add_argument("--task-aligned-attention", action="store_true")
     parser.add_argument(
         "--reference",
         choices=("same_source", "tuned"),
         default="same_source",
     )
     args, remaining = parser.parse_known_args()
+    if args.canonical_attention_views and args.task_aligned_attention:
+        parser.error(
+            "--canonical-attention-views and --task-aligned-attention are "
+            "mutually exclusive"
+        )
+    _USE_CANONICAL_ATTENTION_VIEWS = args.canonical_attention_views
+    _USE_TASK_ALIGNED_ATTENTION = args.task_aligned_attention
 
     if args.no_waits:
         ForEachProgramID._wait_for_counter = staticmethod(
@@ -640,7 +1104,6 @@ def main() -> None:
             return original_wait_for_counter(**kwargs)
 
         ForEachProgramID._wait_for_counter = staticmethod(filtered_wait_for_counter)
-
     compatibility = types.ModuleType("triton_qwen3_sm_overlap_probe")
     compatibility.build_helion_reference = (
         _build_helion_reference
@@ -653,14 +1116,37 @@ def main() -> None:
 
     probe.rms_norm_per_block_quant = tiled_rms_norm_per_block_quant
     probe.reshape_and_cache_flash = tiled_reshape_and_cache_flash
-    probe.merge_attention_splits = tiled_merge_attention_splits
+    if args.task_aligned_attention or args.canonical_attention_views:
+        probe.fused_qk_norm_rope = flat_fused_qk_norm_rope
+    if args.task_aligned_attention:
+        probe.paged_gqa_decode_attention_split = (
+            task_aligned_paged_gqa_decode_attention_split
+        )
+        probe.per_token_group_fp8_quant = task_aligned_per_token_group_fp8_quant
+    if args.canonical_attention_views:
+        probe.paged_gqa_decode_attention_split = (
+            canonical_paged_gqa_decode_attention_split
+        )
+    if args.canonical_attention_views:
+        probe.merge_attention_splits = canonical_tiled_merge_attention_splits
+    elif args.task_aligned_attention:
+        probe.merge_attention_splits = task_aligned_tiled_merge_attention_splits
+    else:
+        probe.merge_attention_splits = tiled_merge_attention_splits
     probe._probe_matched_config = _probe_config
+    if args.task_aligned_attention:
+        original_compose = probe._compose_qwen3_layer_source
+
+        def compose_task_aligned_source() -> str:
+            return original_compose().replace(
+                "attention_flat = attention.view(1, hidden)",
+                "attention_flat = attention",
+            )
+
+        probe._compose_qwen3_layer_source = compose_task_aligned_source
     kernel, source = probe._build_composite_kernel()
     probe.GENERATED_SOURCE = source
-    _ACTIVE_TILE_DEPENDENCY_SCHEDULE = helion.TileDependencySchedule(
-        epoch_replicas=args.epoch_replicas,
-        producer_order=args.producer_order,
-    )
+    _ACTIVE_TILE_DEPENDENCY_SCHEDULE = helion.TileDependencySchedule()
     probe.qwen3_layer_tile_dependency = helion.kernel(
         static_shapes=True,
         autotune_effort="none",
@@ -678,6 +1164,14 @@ def main() -> None:
             assert host_function is not None
             dependency_plan = host_function.device_ir.cross_loop_dependency_plan
             assert dependency_plan is not None
+            print(
+                "TASK_FAMILIES",
+                [
+                    dataclasses.asdict(family)
+                    for family in host_function.device_ir.task_families
+                ],
+                flush=True,
+            )
             for root in range(len(host_function.device_ir.task_families)):
                 accesses = tuple(
                     access for access in dependency_plan.accesses if access.root == root
@@ -686,6 +1180,14 @@ def main() -> None:
                     "CROSS_LOOP_ACCESSES",
                     root,
                     [dataclasses.asdict(access) for access in accesses],
+                    flush=True,
+                )
+            for edge in dependency_plan.edges:
+                print(
+                    "CROSS_LOOP_EDGE",
+                    edge.producer_root,
+                    edge.consumer_root,
+                    dataclasses.asdict(edge),
                     flush=True,
                 )
 

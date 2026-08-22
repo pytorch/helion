@@ -299,11 +299,11 @@ class TestTileDependencyScheduling(unittest.TestCase):
             [argument.arg for argument in helper.args.args], ["weight_desc"]
         )
 
-    def test_schedule_knobs_must_be_positive(self) -> None:
-        with self.assertRaisesRegex(ValueError, "epoch_replicas"):
-            helion.TileDependencySchedule(epoch_replicas=0)
-        with self.assertRaisesRegex(ValueError, "producer_order"):
-            helion.TileDependencySchedule(producer_order="grouped")  # type: ignore[arg-type]
+    def test_schedule_has_no_manual_policy_knobs(self) -> None:
+        self.assertEqual(
+            repr(helion.TileDependencySchedule()),
+            "helion.TileDependencySchedule()",
+        )
 
 
 @onlyBackends(["triton"])

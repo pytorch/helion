@@ -442,6 +442,7 @@ def _validate_resident_program_capacity(
         raise RuntimeError(
             "TileDependencySchedule requires "
             f"{required_programs} concurrently resident programs, but this "
-            f"kernel/device can residently execute only {capacity}. Reduce "
-            "num_sm_multiplier or choose a lower-resource configuration."
+            f"kernel/device can residently execute only {capacity}. Choose a "
+            "lower-resource configuration, an earlier dependency frontier, "
+            "or root completion."
         )

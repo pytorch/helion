@@ -31,12 +31,17 @@ from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
+from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_CONFIG
+from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_DEFAULT
 from .tile_dependency_planner import AccessCohortPlan
 from .tile_dependency_planner import AccessProgramPoint
 from .tile_dependency_planner import InstantiatedTaskFamily
-from .tile_dependency_planner import TaskContinuationPipelinePlan
-from .tile_dependency_planner import TaskContinuationPlan
+from .tile_dependency_planner import KeyedEventContributorPlan
+from .tile_dependency_planner import KeyedEventPlan
+from .tile_dependency_planner import ReadinessFrontierPlan
+from .tile_dependency_planner import TaskToKeySegment
 from .tile_dependency_planner import build_generic_schedule_plan
+from .tile_dependency_planner import derive_singleton_worker_affinity
 
 
 def typed_program_id(dim: int = 0) -> str:
@@ -605,7 +610,6 @@ NUM_XCD_VAR = "_NUM_XCDS"
 # are padded by this amount so polling one dependency does not invalidate a
 # neighboring dependency's line.
 _TILE_DEPENDENCY_COUNTER_STRIDE = 32
-_TILE_DEPENDENCY_DIRECT_POLL_FANOUT_LIMIT = 100
 
 
 def _partitioned_materialization_geometry(
@@ -1016,15 +1020,10 @@ class ForEachProgramID(ProgramIDs):
             case_offsets.append(running_offset)
             running_offset += task_count
         singleton_roots = self._match_opaque_singleton_roots(static_task_counts)
-        partitioned_pipeline_plans = self._match_partitioned_dependency_pipeline(
-            case_bodies, device_function
-        )
         reduction_fanout_plans = self._match_one_wave_reduction_fanouts(
-            singleton_roots, case_bodies, device_function
+            singleton_roots, device_function
         )
         structural_edges: set[tuple[int, int]] = set()
-        for plan in partitioned_pipeline_plans.values():
-            structural_edges.update(plan.covered_edges)
         for plan in reduction_fanout_plans.values():
             structural_edges.update(plan.covered_edges)
         structural_roots = {root for edge in structural_edges for root in edge}
@@ -1062,52 +1061,34 @@ class ForEachProgramID(ProgramIDs):
             excluded_roots=frozenset(structural_roots),
             preordered_edges=frozenset(structural_edges),
             physical_worker_limit=physical_worker_limit,
+            frontier_index=cast(
+                "int",
+                device_function.config.get(
+                    TILE_DEPENDENCY_FRONTIER_CONFIG,
+                    TILE_DEPENDENCY_FRONTIER_DEFAULT,
+                ),
+            ),
         )
         generic_task_edges = generic_plan.task_ready_edges
         whole_value_edges = set(generic_plan.root_completion_edges)
         generic_task_waits = generic_plan.task_waits_by_root
-        task_continuation_plans = generic_plan.continuations
+        counted_event_plans = generic_plan.counted_events
         access_cohort_plans = generic_plan.access_cohorts
-        task_continuation_pipeline_plans = generic_plan.continuation_pipelines
+        readiness_frontier_plans = generic_plan.readiness_frontiers
 
         self._validate_tile_dependency_plan_coverage(
-            singleton_roots=singleton_roots,
-            partitioned_pipeline_plans=partitioned_pipeline_plans,
             reduction_fanout_plans=reduction_fanout_plans,
             task_ready_edges=generic_task_edges,
             whole_value_edges=frozenset(whole_value_edges),
         )
-        epoch_replicas = schedule.policy.epoch_replicas or 1
-        if epoch_replicas & (epoch_replicas - 1):
-            raise exc.TileDependencyScheduleError(
-                f"epoch_replicas must be a power of two, got {epoch_replicas}"
-            )
         launch_worker_limit = generic_plan.worker_limit
-        if task_continuation_pipeline_plans:
-            strategy.grid_size_expr = (
-                f"min(({strategy.grid_size_expr}), {launch_worker_limit})"
-            )
+        if readiness_frontier_plans:
+            strategy.grid_size_expr = str(launch_worker_limit)
 
         def active_worker_count(root: int) -> int:
             assert static_task_counts is not None
             return min(static_task_counts[root], launch_worker_limit)
 
-        whole_value_poller_count = {
-            producer: max(
-                active_worker_count(consumer)
-                for source, consumer in whole_value_edges
-                if source == producer
-            )
-            for producer in {source for source, _ in whole_value_edges}
-        }
-        whole_value_replicas = {
-            producer: (
-                epoch_replicas
-                if pollers > _TILE_DEPENDENCY_DIRECT_POLL_FANOUT_LIMIT
-                else 1
-            )
-            for producer, pollers in whole_value_poller_count.items()
-        }
         # Until a smaller progress-critical cohort is proven for a schedule,
         # require every launched worker to fit concurrently.  This is checked
         # by the launcher using CUDA's exact occupancy calculation after ptxas.
@@ -1169,17 +1150,17 @@ class ForEachProgramID(ProgramIDs):
                 dtype=torch.uint32,
                 zero_init=True,
             )
-        task_continuation_offsets: dict[ForEachProgramID._TaskContinuation, int] = {}
-        task_continuation_counter_count = 0
-        for plan in task_continuation_plans:
-            task_continuation_offsets[plan] = task_continuation_counter_count
-            task_continuation_counter_count += plan.consumer_tasks
-        task_continuation_arg: str | None = None
-        if task_continuation_counter_count:
-            task_continuation_arg = self._register_tile_dependency_state(
+        counted_event_offsets: dict[ForEachProgramID._KeyedEvent, int] = {}
+        counted_event_counter_count = 0
+        for plan in counted_event_plans:
+            counted_event_offsets[plan] = counted_event_counter_count
+            counted_event_counter_count += plan.key_tasks
+        counted_event_arg: str | None = None
+        if counted_event_counter_count:
+            counted_event_arg = self._register_tile_dependency_state(
                 device_function,
                 name_hint="tile_dependency_continuation_arrivals",
-                numel=str(task_continuation_counter_count),
+                numel=str(counted_event_counter_count),
                 dtype=torch.uint32,
                 zero_init=True,
             )
@@ -1187,17 +1168,17 @@ class ForEachProgramID(ProgramIDs):
         singleton_indices = {
             root: index for index, root in enumerate(sorted(singleton_roots))
         }
-        singleton_replicas = {
-            root: whole_value_replicas.get(root, 1) for root in singleton_roots
-        }
+        singleton_workers = derive_singleton_worker_affinity(
+            dependency_plan=dependency_plan,
+            task_families=instantiated_task_families,
+            singleton_roots=singleton_roots,
+            worker_limit=launch_worker_limit,
+        )
         if singleton_roots:
             singleton_epoch_arg = self._register_tile_dependency_state(
                 device_function,
                 name_hint="tile_dependency_singleton_epochs",
-                numel=(
-                    f"{len(singleton_roots)} * {epoch_replicas} * "
-                    f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
-                ),
+                numel=f"{len(singleton_roots)} * {_TILE_DEPENDENCY_COUNTER_STRIDE}",
                 dtype=torch.uint32,
                 zero_init=True,
             )
@@ -1224,27 +1205,6 @@ class ForEachProgramID(ProgramIDs):
                 dtype=torch.uint32,
                 zero_init=True,
             )
-        whole_value_epoch_roots = sorted(
-            root
-            for root in whole_value_producer_roots
-            if whole_value_replicas[root] > 1
-        )
-        whole_value_epoch_indices = {
-            root: index for index, root in enumerate(whole_value_epoch_roots)
-        }
-        whole_value_epoch_arg: str | None = None
-        if whole_value_epoch_roots:
-            whole_value_epoch_arg = self._register_tile_dependency_state(
-                device_function,
-                name_hint="tile_dependency_whole_value_epochs",
-                numel=(
-                    f"{len(whole_value_epoch_roots)} * {epoch_replicas} * "
-                    f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
-                ),
-                dtype=torch.uint32,
-                zero_init=True,
-            )
-
         reduction_fanout_indices = {
             root: index for index, root in enumerate(reduction_fanout_plans)
         }
@@ -1276,106 +1236,31 @@ class ForEachProgramID(ProgramIDs):
                 zero_init=True,
             )
 
-        partitioned_pipeline_args: dict[str, str] = {}
-        partitioned_pipeline_offsets: dict[int, dict[str, int]] = {}
-        partitioned_pipeline_plan_indices = {
-            root: index for index, root in enumerate(partitioned_pipeline_plans)
-        }
-        if partitioned_pipeline_plans:
-            totals = {
-                "primary_arrivals": 0,
-                "first_side_arrivals": 0,
-                "second_side_arrivals": 0,
-                "primary_ready": 0,
-                "materialized_ready": 0,
-                "partition_map_arrivals": 0,
-                "reduction_arrivals": 0,
-            }
-            for root, plan in partitioned_pipeline_plans.items():
-                partitioned_pipeline_offsets[root] = dict(totals)
-                totals["primary_arrivals"] += (
-                    plan.group_count
-                    * plan.primary_members_per_partition
-                    // plan.finalize_partition_block
-                )
-                totals["first_side_arrivals"] += (
-                    plan.group_count + plan.finalize_partition_block - 1
-                ) // plan.finalize_partition_block
-                totals["second_side_arrivals"] += plan.group_count
-                totals["primary_ready"] += plan.group_count
-                totals["materialized_ready"] += plan.group_count
-                totals["partition_map_arrivals"] += plan.partition_map_counter_count
-                if plan.final_reduce_root is not None:
-                    totals["reduction_arrivals"] += plan.final_reduce_tasks
-            for name, count in totals.items():
-                argument = self._register_tile_dependency_state(
-                    device_function,
-                    name_hint=f"tile_dependency_{name}",
-                    numel=str(max(1, count)),
-                    dtype=torch.uint32,
-                    zero_init=True,
-                )
-                partitioned_pipeline_args[name] = argument
-            pipeline_ready = self._register_tile_dependency_state(
-                device_function,
-                name_hint="tile_dependency_partitioned_pipeline_ready",
-                numel=(
-                    f"{len(partitioned_pipeline_plans)} * "
-                    f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
-                ),
-                dtype=torch.uint32,
-                zero_init=True,
-            )
-            partitioned_pipeline_args["pipeline_ready"] = pipeline_ready
-            if epoch_replicas > 1 and any(
-                plan.downstream_tasks > _TILE_DEPENDENCY_DIRECT_POLL_FANOUT_LIMIT
-                for plan in partitioned_pipeline_plans.values()
-            ):
-                partitioned_pipeline_args["pipeline_epochs"] = (
-                    self._register_tile_dependency_state(
-                        device_function,
-                        name_hint="tile_dependency_partitioned_pipeline_epochs",
-                        numel=(
-                            f"{len(partitioned_pipeline_plans)} * "
-                            f"{epoch_replicas} * "
-                            f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
-                        ),
-                        dtype=torch.uint32,
-                        zero_init=True,
-                    )
-                )
-
         stage_root_ranges = self._tile_dependency_stage_root_ranges()
         result: list[ast.stmt] = [
             statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
         ]
         start_expr = "0"
-        consumed_partitioned_roots = {
-            root
-            for plan in partitioned_pipeline_plans.values()
-            for root in plan.continuation_roots
-        }
         consumed_reduction_fanout_roots = {
             root
             for plan in reduction_fanout_plans.values()
             for root in plan.continuation_roots
         }
-        consumed_task_continuation_roots = {
-            plan.consumer_root for plan in task_continuation_plans
-        } | {plan.cohort.consumer_root for plan in task_continuation_pipeline_plans}
+        consumed_on_ready_roots = {
+            plan.on_ready_root
+            for plan in counted_event_plans
+            if plan.on_ready_root is not None
+        } | {plan.downstream_cohort.consumer_root for plan in readiness_frontier_plans}
 
         def singleton_dependency(root: int) -> tuple[str, str] | None:
             if root not in singleton_roots:
                 return None
             assert singleton_epoch_arg is not None
             plan_index = singleton_indices[root]
-            replicas = singleton_replicas[root]
             return (
                 (
                     f"{singleton_epoch_arg} + "
-                    f"({plan_index} * {epoch_replicas} + "
-                    f"(({worker}) % {replicas})) * "
-                    f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
+                    f"{plan_index * _TILE_DEPENDENCY_COUNTER_STRIDE}"
                 ),
                 f"tl.cast({epoch_var}, tl.uint32)",
             )
@@ -1396,19 +1281,6 @@ class ForEachProgramID(ProgramIDs):
             if singleton is not None:
                 return singleton
             assert static_task_counts is not None
-            replicas = whole_value_replicas[root]
-            if replicas > 1:
-                assert whole_value_epoch_arg is not None
-                epoch_index = whole_value_epoch_indices[root]
-                return (
-                    (
-                        f"{whole_value_epoch_arg} + "
-                        f"({epoch_index * epoch_replicas} + "
-                        f"(({worker}) % {replicas})) * "
-                        f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
-                    ),
-                    f"tl.cast({epoch_var}, tl.uint32)",
-                )
             assert whole_value_counter_arg is not None
             active_workers = active_worker_count(root)
             return (
@@ -1425,20 +1297,7 @@ class ForEachProgramID(ProgramIDs):
             producers = whole_value_incoming.get(root, ())
             return tuple(root_completion_dependency(producer) for producer in producers)
 
-        def whole_value_input_dependency(root: int) -> tuple[str, str] | None:
-            dependencies = whole_value_input_dependencies(root)
-            if not dependencies:
-                return None
-            if len(dependencies) != 1:
-                raise exc.TileDependencyScheduleError(
-                    "this migration-only structural plan supports one "
-                    f"whole-value predecessor, got {len(dependencies)} for root {root}"
-                )
-            return dependencies[0]
-
-        def root_completion_publication(
-            root: int, active_workers: int
-        ) -> list[ast.stmt]:
+        def root_completion_publication(root: int) -> list[ast.stmt]:
             if root not in whole_value_indices:
                 return []
             assert whole_value_counter_arg is not None
@@ -1447,59 +1306,24 @@ class ForEachProgramID(ProgramIDs):
                 f"{whole_value_indices[root] * _TILE_DEPENDENCY_COUNTER_STRIDE}"
             )
             result = [self._tile_dependency_publication_barrier(device_function)]
-            replicas = whole_value_replicas[root]
-            if replicas == 1:
-                result.append(
-                    statement_from_string(
-                        f"tl.atomic_add({completion_counter}, 1, "
-                        "sem='release', scope='gpu')"
-                    )
+            result.append(
+                statement_from_string(
+                    f"tl.atomic_add({completion_counter}, 1, "
+                    "sem='release', scope='gpu')"
                 )
-                return result
-            assert whole_value_epoch_arg is not None
-            completion_previous = device_function.new_var(
-                "tile_dependency_whole_value_previous", dce=False
-            )
-            epoch_index = whole_value_epoch_indices[root]
-            epoch_base = (
-                f"{whole_value_epoch_arg} + "
-                f"{epoch_index * epoch_replicas * _TILE_DEPENDENCY_COUNTER_STRIDE}"
-            )
-            result.extend(
-                [
-                    statement_from_string(
-                        f"{completion_previous} = "
-                        f"tl.atomic_add({completion_counter}, 1, "
-                        "sem='acq_rel', scope='gpu')"
-                    ),
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"({completion_previous} % "
-                            f"tl.cast({active_workers}, tl.uint32)) == "
-                            f"tl.cast({active_workers - 1}, tl.uint32)"
-                        ),
-                        body=self._publish_tile_dependency_epoch(
-                            device_function,
-                            base=epoch_base,
-                            epoch=epoch_var,
-                            replicas=replicas,
-                        ),
-                        orelse=[],
-                    ),
-                ]
             )
             return result
 
-        root_axis_order: list[tuple[int, ...]] = []
+        root_physical_axis_order: list[tuple[int, ...]] = []
+        root_logical_axis_order: list[tuple[int, ...]] = []
         root_axis_counts: list[dict[int, int]] = []
         all_axis_counts: dict[int, int] = {}
         block_sizes: dict[int, int] = {}
-        for root in range(len(self.cases)):
-            geometry = self._static_case_geometry(root, device_function)
-            assert geometry is not None
-            axis_order, root_counts, axis_block_sizes = geometry
-            root_axis_order.append(axis_order)
+        for family in instantiated_task_families:
+            root_physical_axis_order.append(family.physical_axis_order)
+            root_logical_axis_order.append(family.logical_axis_order)
+            root_counts = family.axis_counts
+            axis_block_sizes = family.block_sizes
             root_axis_counts.append(root_counts)
             all_axis_counts.update(root_counts)
             block_sizes.update(axis_block_sizes)
@@ -1534,15 +1358,31 @@ class ForEachProgramID(ProgramIDs):
         for plan in access_cohort_plans:
             access_cohorts_by_producer.setdefault(plan.producer_root, []).append(plan)
             access_cohorts_by_consumer.setdefault(plan.consumer_root, []).append(plan)
-        task_continuation_by_producer = {
-            plan.producer_root: plan for plan in task_continuation_plans
+        counted_events_by_producer: dict[
+            int,
+            list[
+                tuple[
+                    ForEachProgramID._KeyedEvent,
+                    ForEachProgramID._KeyedEventContributor,
+                ]
+            ],
+        ] = {}
+        for plan in counted_event_plans:
+            for contributor in plan.contributors:
+                counted_events_by_producer.setdefault(
+                    contributor.producer_root, []
+                ).append((plan, contributor))
+        counted_event_by_waiting_root = {
+            plan.key_root: plan
+            for plan in counted_event_plans
+            if plan.on_ready_root is None
         }
-        task_continuation_pipeline_by_producer = {
-            plan.continuation.producer_root: plan
-            for plan in task_continuation_pipeline_plans
+        readiness_frontier_by_producer = {
+            plan.event.single_contributor.producer_root: plan
+            for plan in readiness_frontier_plans
         }
 
-        def task_coordinates(
+        def flat_task_coordinates(
             task: str,
             axis_order: tuple[int, ...],
             counts: dict[int, int],
@@ -1550,11 +1390,142 @@ class ForEachProgramID(ProgramIDs):
             coordinates: dict[int, str] = {}
             multiplier = 1
             for block_id in axis_order:
+                count = counts[block_id]
+                if count == 1:
+                    coordinates[block_id] = "0"
+                elif multiplier == 1:
+                    coordinates[block_id] = f"(({task}) % {count})"
+                else:
+                    coordinates[block_id] = f"((({task}) // {multiplier}) % {count})"
+                multiplier *= counts[block_id]
+            return coordinates
+
+        from .tile_strategy import L2GroupingProgramIDs
+
+        def logical_coordinates_for_physical_task(
+            root: int,
+            physical_task: str,
+        ) -> dict[int, str]:
+            """Apply the root's existing PID traversal to one physical task."""
+            axis_order = root_physical_axis_order[root]
+            counts = root_axis_counts[root]
+            case = self.cases[root]
+            if not isinstance(case, L2GroupingProgramIDs) or (
+                len(axis_order) >= 2
+                and (
+                    counts[axis_order[1]] == 1
+                    or case.group_size >= counts[axis_order[0]]
+                )
+            ):
+                return flat_task_coordinates(physical_task, axis_order, counts)
+
+            assert len(axis_order) >= 2
+            first_axis, second_axis = axis_order[:2]
+            first_count = counts[first_axis]
+            second_count = counts[second_axis]
+            group_size = case.group_size
+            inner_size = first_count * second_count
+            group_span = group_size * second_count
+            inner_task = (
+                f"(({physical_task}) % {inner_size})"
+                if len(axis_order) > 2
+                else f"({physical_task})"
+            )
+            group = f"(({inner_task}) // {group_span})"
+            first_in_group = f"({group}) * {group_size}"
+            actual_group_size = (
+                f"tl.minimum({first_count} - ({first_in_group}), {group_size})"
+            )
+            within_group = f"(({inner_task}) % {group_span})"
+            coordinates = {
+                first_axis: (
+                    f"({first_in_group}) + (({within_group}) % ({actual_group_size}))"
+                ),
+                second_axis: f"({within_group}) // ({actual_group_size})",
+            }
+            multiplier = inner_size
+            for block_id in axis_order[2:]:
+                count = counts[block_id]
                 coordinates[block_id] = (
-                    f"((({task}) // {multiplier}) % {counts[block_id]})"
+                    "0"
+                    if count == 1
+                    else f"((({physical_task}) // {multiplier}) % {count})"
                 )
                 multiplier *= counts[block_id]
             return coordinates
+
+        def physical_task_for_logical_coordinates(
+            root: int,
+            coordinates: dict[int, str],
+        ) -> str:
+            """Invert the root's PID traversal without changing its body."""
+            axis_order = root_physical_axis_order[root]
+            counts = root_axis_counts[root]
+            case = self.cases[root]
+            if not isinstance(case, L2GroupingProgramIDs) or (
+                len(axis_order) >= 2
+                and (
+                    counts[axis_order[1]] == 1
+                    or case.group_size >= counts[axis_order[0]]
+                )
+            ):
+                terms: list[str] = []
+                multiplier = 1
+                for block_id in axis_order:
+                    count = counts[block_id]
+                    if count != 1:
+                        coordinate = coordinates[block_id]
+                        terms.append(
+                            f"({coordinate})"
+                            if multiplier == 1
+                            else f"({coordinate}) * {multiplier}"
+                        )
+                    multiplier *= count
+                return " + ".join(terms) or "0"
+
+            assert len(axis_order) >= 2
+            first_axis, second_axis = axis_order[:2]
+            first_count = counts[first_axis]
+            second_count = counts[second_axis]
+            group_size = case.group_size
+            first_coordinate = coordinates[first_axis]
+            second_coordinate = coordinates[second_axis]
+            group = f"(({first_coordinate}) // {group_size})"
+            first_in_group = f"({group}) * {group_size}"
+            actual_group_size = (
+                f"tl.minimum({first_count} - ({first_in_group}), {group_size})"
+            )
+            inner_task = (
+                f"({group}) * {group_size * second_count} + "
+                f"({second_coordinate}) * ({actual_group_size}) + "
+                f"({first_coordinate}) - ({first_in_group})"
+            )
+            terms = [f"({inner_task})"]
+            multiplier = first_count * second_count
+            for block_id in axis_order[2:]:
+                count = counts[block_id]
+                if count != 1:
+                    terms.append(f"({coordinates[block_id]}) * {multiplier}")
+                multiplier *= count
+            return " + ".join(terms)
+
+        def logical_task_from_coordinates(
+            root: int,
+            coordinates: dict[int, str],
+        ) -> str:
+            terms: list[str] = []
+            multiplier = 1
+            for block_id in root_logical_axis_order[root]:
+                count = root_axis_counts[root][block_id]
+                if count != 1:
+                    coordinate = coordinates[block_id]
+                    terms.append(
+                        f"({coordinate})"
+                        if multiplier == 1
+                        else f"({coordinate}) * {multiplier}"
+                    )
+                multiplier *= count
+            return " + ".join(terms) or "0"
 
         def cohort_counter(
             plan: ForEachProgramID._AccessCohort,
@@ -1579,26 +1550,21 @@ class ForEachProgramID(ProgramIDs):
 
         def cohort_publication(
             plan: ForEachProgramID._AccessCohort,
-            local_task: str,
+            producer_coordinates: dict[int, str],
         ) -> list[ast.stmt]:
-            coordinates = task_coordinates(
-                local_task,
-                root_axis_order[plan.producer_root],
-                root_axis_counts[plan.producer_root],
-            )
-            stream_coordinate = coordinates[plan.producer_stream_axis]
+            stream_coordinate = producer_coordinates[plan.producer_stream_axis]
 
             if plan.is_per_coordinate:
                 return [
                     statement_from_string(
-                        f"tl.atomic_add({cohort_counter(plan, producer_coordinates=coordinates, milestone=stream_coordinate)}, "
+                        f"tl.atomic_add({cohort_counter(plan, producer_coordinates=producer_coordinates, milestone=stream_coordinate)}, "
                         "1, sem='release', scope='gpu')"
                     )
                 ]
 
             def publish(stage: int) -> ast.stmt:
                 return statement_from_string(
-                    f"tl.atomic_add({cohort_counter(plan, producer_coordinates=coordinates, milestone=stage)}, "
+                    f"tl.atomic_add({cohort_counter(plan, producer_coordinates=producer_coordinates, milestone=stage)}, "
                     "1, sem='release', scope='gpu')"
                 )
 
@@ -1618,15 +1584,10 @@ class ForEachProgramID(ProgramIDs):
 
         def cohort_consumer_body(
             plan: ForEachProgramID._AccessCohort,
-            local_task: str,
+            consumer_coordinates: dict[int, str],
             logical_pid: str,
             extra_argument_names: tuple[str, ...],
         ) -> ast.stmt:
-            consumer_coordinates = task_coordinates(
-                local_task,
-                root_axis_order[plan.consumer_root],
-                root_axis_counts[plan.consumer_root],
-            )
             axes_by_producer = {axis.producer_block_id: axis for axis in plan.axes}
             producer_coordinates = {
                 block_id: consumer_coordinates[
@@ -1680,7 +1641,7 @@ class ForEachProgramID(ProgramIDs):
                 )
                 for stage, stage_size in enumerate(plan.stage_sizes)
             )
-            stream_block = block_sizes[plan.consumer_stream_axis]
+            stream_block = block_sizes[plan.producer_stream_axis]
             split_offsets = tuple(
                 str(offset * stream_block) for offset in plan.stage_offsets[1:-1]
             )
@@ -1700,6 +1661,260 @@ class ForEachProgramID(ProgramIDs):
                 extra_argument_names=extra_argument_names,
             )
 
+        def reverse_counted_event_coordinates(
+            plan: ForEachProgramID._KeyedEvent,
+            contributor: ForEachProgramID._KeyedEventContributor,
+            producer_coordinates: dict[int, str],
+        ) -> dict[int, str]:
+            """Map one producer task to its unique counted-event key."""
+            partition = contributor.partition
+            assert partition is not None
+            consumer_counts = root_axis_counts[plan.key_root]
+            consumer_coordinates: dict[int, str] = {}
+            for axis in partition.outer_axes:
+                producer_coordinate = producer_coordinates[axis.producer_block_id]
+                consumer_count = consumer_counts[axis.consumer_block_id]
+                if axis.scale == 0:
+                    if consumer_count != 1:
+                        raise AssertionError("counted-event reverse map fans out")
+                    consumer_coordinates[axis.consumer_block_id] = "0"
+                    continue
+                if axis.scale not in (-1, 1):
+                    raise AssertionError("counted-event reverse map is not affine")
+                consumer_coordinates[axis.consumer_block_id] = (
+                    f"(({producer_coordinate}) - ({axis.offset})) // ({axis.scale})"
+                )
+
+            partition_consumer_count = consumer_counts[
+                partition.partition_consumer_block_id
+            ]
+            if partition_consumer_count == 1:
+                partition_consumer_coordinate = "0"
+            else:
+                if (
+                    len(partition.segments) != 1
+                    or partition.partition_consumer_stride <= 0
+                    or partition.segments[0].length
+                    != partition.partition_consumer_stride
+                ):
+                    raise AssertionError(
+                        "counted-event partition has no simple reverse map"
+                    )
+                segment = partition.segments[0]
+                producer_coordinate = producer_coordinates[
+                    partition.partition_producer_block_id
+                ]
+                partition_consumer_coordinate = (
+                    f"(({producer_coordinate}) - {segment.begin}) // "
+                    f"{partition.partition_consumer_stride}"
+                )
+            consumer_coordinates[partition.partition_consumer_block_id] = (
+                partition_consumer_coordinate
+            )
+            for block_id in partition.consumer_axis_order:
+                if block_id in consumer_coordinates:
+                    continue
+                if consumer_counts[block_id] != 1:
+                    raise AssertionError("counted-event consumer axis is unmapped")
+                consumer_coordinates[block_id] = "0"
+            return consumer_coordinates
+
+        def task_to_key_expression(
+            task: str,
+            segments: tuple[TaskToKeySegment, ...],
+        ) -> tuple[str, str]:
+            key_expression = ""
+            membership_parts: list[str] = []
+            for segment in reversed(segments):
+                begin = segment.task_begin
+                end = begin + segment.task_count
+                condition = f"(({task}) >= {begin} and ({task}) < {end})"
+                membership_parts.append(condition)
+                task_offset = f"(({task}) - {begin})"
+                if segment.key_period is not None:
+                    task_offset = f"({task_offset} % {segment.key_period})"
+                segment_key = (
+                    f"{segment.first_key} + "
+                    f"({task_offset} // {segment.tasks_per_key}) * "
+                    f"{segment.key_stride}"
+                )
+                if not key_expression:
+                    key_expression = segment_key
+                else:
+                    key_expression = (
+                        f"tl.where({condition}, {segment_key}, {key_expression})"
+                    )
+            if not key_expression:
+                raise AssertionError("keyed event has no task-to-key mapping")
+            return key_expression, " or ".join(reversed(membership_parts))
+
+        def emit_counted_event_for_key(
+            plan: ForEachProgramID._KeyedEvent,
+            key: str,
+        ) -> list[ast.stmt]:
+            assert counted_event_arg is not None
+            if plan.on_ready_root is not None:
+                key_variable = device_function.new_var(
+                    "tile_dependency_continuation_task", dce=True
+                )
+                return [
+                    statement_from_string(f"{key_variable} = {key}"),
+                    *emit_counted_event_for_coordinates(
+                        plan,
+                        flat_task_coordinates(
+                            key_variable,
+                            root_logical_axis_order[plan.key_root],
+                            root_axis_counts[plan.key_root],
+                        ),
+                        key_variable,
+                    ),
+                ]
+            counter = f"{counted_event_arg} + {counted_event_offsets[plan]} + ({key})"
+            return [
+                statement_from_string(
+                    f"tl.atomic_add({counter}, 1, sem='release', scope='gpu')"
+                )
+            ]
+
+        def emit_counted_event_for_coordinates(
+            plan: ForEachProgramID._KeyedEvent,
+            consumer_coordinates: dict[int, str],
+            consumer_task: str | None = None,
+        ) -> list[ast.stmt]:
+            """Contribute to one key and recursively execute its ready action."""
+            assert counted_event_arg is not None
+            assert plan.on_ready_root is not None
+            assignments: list[ast.stmt] = []
+            if consumer_task is None:
+                consumer_task = device_function.new_var(
+                    "tile_dependency_continuation_task", dce=True
+                )
+                consumer_physical_task = device_function.new_var(
+                    "tile_dependency_continuation_physical_task", dce=True
+                )
+                assignments.extend(
+                    (
+                        statement_from_string(
+                            f"{consumer_task} = "
+                            f"{logical_task_from_coordinates(plan.key_root, consumer_coordinates)}"
+                        ),
+                        statement_from_string(
+                            f"{consumer_physical_task} = "
+                            f"{physical_task_for_logical_coordinates(plan.on_ready_root, consumer_coordinates)}"
+                        ),
+                    )
+                )
+                consumer_logical_pid = (
+                    f"{case_offsets[plan.on_ready_root]} + {consumer_physical_task}"
+                )
+                consumer_extra_arguments = (consumer_physical_task,)
+            else:
+                consumer_logical_pid = (
+                    f"{case_offsets[plan.on_ready_root]} + "
+                    f"{physical_task_for_logical_coordinates(plan.on_ready_root, consumer_coordinates)}"
+                )
+                consumer_extra_arguments = (consumer_task,)
+            previous = device_function.new_var(
+                "tile_dependency_continuation_previous", dce=False
+            )
+            on_ready_root = plan.on_ready_root
+            consumer_call = self._outline_opaque_tile_body(
+                device_function,
+                root=on_ready_root,
+                logical_pid=consumer_logical_pid,
+                body=case_bodies[on_ready_root],
+                extra_argument_names=consumer_extra_arguments,
+            )
+            consumer_publications: list[ast.stmt] = []
+            if on_ready_root in task_event_offsets:
+                assert task_event_arg is not None
+                consumer_publications.append(
+                    statement_from_string(
+                        f"tl.atomic_xchg({task_event_arg} + "
+                        f"{task_event_offsets[on_ready_root]} + "
+                        f"{consumer_task}, {epoch_var}, "
+                        "sem='release', scope='gpu')"
+                    )
+                )
+            for cohort in access_cohorts_by_producer.get(on_ready_root, ()):
+                consumer_publications.extend(
+                    cohort_publication(cohort, consumer_coordinates)
+                )
+            for nested_event, nested_contributor in counted_events_by_producer.get(
+                on_ready_root, ()
+            ):
+                consumer_publications.extend(
+                    emit_counted_event_from_producer_coordinates(
+                        nested_event,
+                        nested_contributor,
+                        consumer_coordinates,
+                    )
+                )
+
+            last_arrival_body = [consumer_call]
+            if consumer_publications:
+                last_arrival_body.append(
+                    self._tile_dependency_publication_barrier(device_function)
+                )
+                last_arrival_body.extend(consumer_publications)
+            last_arrival_body.extend(root_completion_publication(on_ready_root))
+            if plan.expected_arrivals == 1:
+                return [*assignments, *last_arrival_body]
+            arrival_counter = (
+                f"{counted_event_arg} + {counted_event_offsets[plan]} + {consumer_task}"
+            )
+            return [
+                *assignments,
+                *self._emit_counted_event_on_ready(
+                    counter=arrival_counter,
+                    epoch=epoch_var,
+                    expected_arrivals=plan.expected_arrivals,
+                    previous=previous,
+                    on_ready=last_arrival_body,
+                ),
+            ]
+
+        def emit_counted_event_from_producer_coordinates(
+            plan: ForEachProgramID._KeyedEvent,
+            contributor: ForEachProgramID._KeyedEventContributor,
+            producer_coordinates: dict[int, str],
+        ) -> list[ast.stmt]:
+            producer_task = logical_task_from_coordinates(
+                contributor.producer_root, producer_coordinates
+            )
+            if contributor.partition is None or plan.on_ready_root is None:
+                key, membership = task_to_key_expression(
+                    producer_task, contributor.task_to_key_segments
+                )
+                return [
+                    create(
+                        ast.If,
+                        test=expr_from_string(membership),
+                        body=emit_counted_event_for_key(plan, key),
+                        orelse=[],
+                    )
+                ]
+            event_body = emit_counted_event_for_coordinates(
+                plan,
+                reverse_counted_event_coordinates(
+                    plan, contributor, producer_coordinates
+                ),
+            )
+            partition = contributor.partition
+            if partition.covers_producer_domain:
+                return event_body
+            _, membership = task_to_key_expression(
+                producer_task, contributor.task_to_key_segments
+            )
+            return [
+                create(
+                    ast.If,
+                    test=expr_from_string(membership),
+                    body=event_body,
+                    orelse=[],
+                )
+            ]
+
         def task_scheduled_body(
             root: int,
             local_task: str,
@@ -1710,13 +1925,33 @@ class ForEachProgramID(ProgramIDs):
         ) -> list[ast.stmt]:
             body: list[ast.stmt] = []
             has_task_scheduling = root in access_cohorts_by_consumer
-            continuation_plan = task_continuation_by_producer.get(root)
+            producer_events = tuple(counted_events_by_producer.get(root, ()))
             scheduled_local_task = local_task
             scheduled_logical_pid = logical_pid
-            continuation_consumer_task: str | None = None
-            if continuation_plan is not None:
+            reordered_event: ForEachProgramID._KeyedEvent | None = None
+            reordered_contributor: ForEachProgramID._KeyedEventContributor | None = None
+            reordered_key_task: str | None = None
+            reordered_key_coordinates: dict[int, str] | None = None
+            scheduled_coordinates: dict[int, str] | None = None
+            if len(producer_events) == 1:
+                counted_event, contributor = producer_events[0]
+                partition = contributor.partition
+                can_reorder = (
+                    counted_event.is_single_contributor
+                    and counted_event.on_ready_root is not None
+                    and partition is not None
+                    and partition.covers_producer_domain
+                )
+                if can_reorder:
+                    reordered_event = counted_event
+                    reordered_contributor = contributor
+            if producer_events:
                 has_task_scheduling = True
-                continuation_consumer_task = device_function.new_var(
+            if reordered_event is not None and reordered_contributor is not None:
+                assert reordered_event.on_ready_root is not None
+                partition = reordered_contributor.partition
+                assert partition is not None
+                reordered_key_task = device_function.new_var(
                     "tile_dependency_continuation_task", dce=True
                 )
                 continuation_local = device_function.new_var(
@@ -1725,20 +1960,19 @@ class ForEachProgramID(ProgramIDs):
                 physical_task = device_function.new_var(
                     "tile_dependency_continuation_physical_task", dce=True
                 )
-                partition = continuation_plan.partition
-                consumer_coordinates = task_coordinates(
-                    continuation_consumer_task,
+                reordered_key_coordinates = flat_task_coordinates(
+                    reordered_key_task,
                     partition.consumer_axis_order,
-                    root_axis_counts[continuation_plan.consumer_root],
+                    root_axis_counts[reordered_event.key_root],
                 )
                 producer_coordinates = {
                     axis.producer_block_id: (
-                        f"({consumer_coordinates[axis.consumer_block_id]}) * "
+                        f"({reordered_key_coordinates[axis.consumer_block_id]}) * "
                         f"{axis.scale} + {axis.offset}"
                     )
                     for axis in partition.outer_axes
                 }
-                partition_consumer_coordinate = consumer_coordinates[
+                partition_consumer_coordinate = reordered_key_coordinates[
                     partition.partition_consumer_block_id
                 ]
                 segment_offsets: list[int] = []
@@ -1768,24 +2002,18 @@ class ForEachProgramID(ProgramIDs):
                 producer_coordinates[partition.partition_producer_block_id] = (
                     partition_coordinate
                 )
-                physical_task_terms: list[str] = []
-                physical_task_multiplier = 1
-                for block_id in partition.producer_axis_order:
-                    physical_task_terms.append(
-                        f"({producer_coordinates[block_id]}) * "
-                        f"{physical_task_multiplier}"
-                    )
-                    physical_task_multiplier *= root_axis_counts[root][block_id]
-                physical_task_expr = " + ".join(physical_task_terms)
+                physical_task_expr = physical_task_for_logical_coordinates(
+                    root, producer_coordinates
+                )
                 body.extend(
                     [
                         statement_from_string(
-                            f"{continuation_consumer_task} = "
-                            f"({local_task}) // {continuation_plan.fanin}"
+                            f"{reordered_key_task} = "
+                            f"({local_task}) // {reordered_event.expected_arrivals}"
                         ),
                         statement_from_string(
                             f"{continuation_local} = "
-                            f"({local_task}) % {continuation_plan.fanin}"
+                            f"({local_task}) % {reordered_event.expected_arrivals}"
                         ),
                         statement_from_string(
                             f"{physical_task} = {physical_task_expr}"
@@ -1794,6 +2022,39 @@ class ForEachProgramID(ProgramIDs):
                 )
                 scheduled_local_task = physical_task
                 scheduled_logical_pid = f"{case_offsets[root]} + {physical_task}"
+                scheduled_coordinates = producer_coordinates
+            if scheduled_coordinates is None:
+                scheduled_coordinates = logical_coordinates_for_physical_task(
+                    root, scheduled_local_task
+                )
+            scheduled_event_task = logical_task_from_coordinates(
+                root, scheduled_coordinates
+            )
+            if (
+                incoming_counted_event := counted_event_by_waiting_root.get(root)
+            ) is not None:
+                has_task_scheduling = True
+                assert counted_event_arg is not None
+                event_key, _ = task_to_key_expression(
+                    scheduled_event_task,
+                    incoming_counted_event.consumer_task_to_key_segments,
+                )
+                body.extend(
+                    self._wait_for_counter(
+                        device_function=device_function,
+                        counter=(
+                            f"{counted_event_arg} + "
+                            f"{counted_event_offsets[incoming_counted_event]} + "
+                            f"({event_key})"
+                        ),
+                        target=(
+                            f"tl.cast({epoch_var}, tl.uint32) * "
+                            f"tl.cast({incoming_counted_event.expected_arrivals}, "
+                            "tl.uint32)"
+                        ),
+                        prefix="tile_dependency_keyed_event_wait",
+                    )
+                )
             emitted_access_waits: set[tuple[int, tuple[object, ...]]] = set()
             access_split_offsets: dict[int, str] = {}
             if root in generic_task_waits:
@@ -1809,10 +2070,11 @@ class ForEachProgramID(ProgramIDs):
                                 task_event_arg=task_event_arg,
                                 task_event_offset=task_event_offsets[producer_root],
                                 epoch_var=epoch_var,
-                                consumer_task=scheduled_local_task,
-                                consumer_axis_order=root_axis_order[root],
+                                consumer_coordinates=scheduled_coordinates,
                                 consumer_axis_counts=root_axis_counts[root],
-                                producer_axis_order=root_axis_order[producer_root],
+                                producer_axis_order=root_logical_axis_order[
+                                    producer_root
+                                ],
                                 producer_axis_counts=root_axis_counts[producer_root],
                                 block_sizes=block_sizes,
                             )
@@ -1844,10 +2106,9 @@ class ForEachProgramID(ProgramIDs):
                             task_event_arg=task_event_arg,
                             task_event_offset=task_event_offsets[producer_root],
                             epoch_var=epoch_var,
-                            consumer_task=scheduled_local_task,
-                            consumer_axis_order=root_axis_order[root],
+                            consumer_coordinates=scheduled_coordinates,
                             consumer_axis_counts=all_axis_counts,
-                            producer_axis_order=root_axis_order[producer_root],
+                            producer_axis_order=root_logical_axis_order[producer_root],
                             producer_axis_counts=root_axis_counts[producer_root],
                             block_sizes=block_sizes,
                         )
@@ -1860,7 +2121,7 @@ class ForEachProgramID(ProgramIDs):
                     )
                 opaque_call = cohort_consumer_body(
                     cohort_plans[0],
-                    scheduled_local_task,
+                    scheduled_coordinates,
                     scheduled_logical_pid,
                     extra_argument_names,
                 )
@@ -1895,77 +2156,35 @@ class ForEachProgramID(ProgramIDs):
                 publications.append(
                     statement_from_string(
                         f"tl.atomic_xchg({task_event_arg} + "
-                        f"{task_event_offsets[root]} + ({scheduled_local_task}), "
+                        f"{task_event_offsets[root]} + ({scheduled_event_task}), "
                         f"{epoch_var}, sem='release', scope='gpu')"
                     )
                 )
             for plan in access_cohorts_by_producer.get(root, ()):
-                publications.extend(cohort_publication(plan, scheduled_local_task))
-            if publications or continuation_plan is not None:
+                publications.extend(cohort_publication(plan, scheduled_coordinates))
+            if publications or producer_events:
                 has_task_scheduling = True
                 body.append(self._tile_dependency_publication_barrier(device_function))
                 body.extend(publications)
-            if continuation_plan is not None:
-                assert task_continuation_arg is not None
-                assert continuation_consumer_task is not None
-                previous = device_function.new_var(
-                    "tile_dependency_continuation_previous", dce=False
-                )
-                arrival_counter = (
-                    f"{task_continuation_arg} + "
-                    f"{task_continuation_offsets[continuation_plan]} + "
-                    f"{continuation_consumer_task}"
-                )
-                consumer_call = self._outline_opaque_tile_body(
-                    device_function,
-                    root=continuation_plan.consumer_root,
-                    logical_pid=(
-                        f"{case_offsets[continuation_plan.consumer_root]} + "
-                        f"{continuation_consumer_task}"
-                    ),
-                    body=case_bodies[continuation_plan.consumer_root],
-                    extra_argument_names=(continuation_consumer_task,),
-                )
-                consumer_publications: list[ast.stmt] = []
-                if continuation_plan.consumer_root in task_event_offsets:
-                    assert task_event_arg is not None
-                    consumer_publications.append(
-                        statement_from_string(
-                            f"tl.atomic_xchg({task_event_arg} + "
-                            f"{task_event_offsets[continuation_plan.consumer_root]} + "
-                            f"{continuation_consumer_task}, {epoch_var}, "
-                            "sem='release', scope='gpu')"
+            for counted_event, contributor in producer_events:
+                if counted_event is reordered_event:
+                    assert contributor is reordered_contributor
+                    assert reordered_key_task is not None
+                    assert reordered_key_coordinates is not None
+                    body.extend(
+                        emit_counted_event_for_coordinates(
+                            counted_event,
+                            reordered_key_coordinates,
+                            reordered_key_task,
                         )
                     )
-                for plan in access_cohorts_by_producer.get(
-                    continuation_plan.consumer_root, ()
-                ):
-                    consumer_publications.extend(
-                        cohort_publication(plan, continuation_consumer_task)
-                    )
-                last_arrival_body = [consumer_call]
-                if consumer_publications:
-                    last_arrival_body.append(
-                        self._tile_dependency_publication_barrier(device_function)
-                    )
-                    last_arrival_body.extend(consumer_publications)
+                    continue
                 body.extend(
-                    [
-                        statement_from_string(
-                            f"{previous} = tl.atomic_add({arrival_counter}, 1, "
-                            "sem='acq_rel', scope='gpu')"
-                        ),
-                        create(
-                            ast.If,
-                            test=expr_from_string(
-                                f"{previous} == "
-                                f"tl.cast({epoch_var}, tl.uint32) * "
-                                f"tl.cast({continuation_plan.fanin}, tl.uint32) - 1"
-                            ),
-                            body=last_arrival_body,
-                            orelse=[],
-                        ),
-                    ]
+                    emit_counted_event_from_producer_coordinates(
+                        counted_event,
+                        contributor,
+                        scheduled_coordinates,
+                    )
                 )
             if not has_task_scheduling:
                 return body
@@ -1979,11 +2198,11 @@ class ForEachProgramID(ProgramIDs):
                 )
             ]
 
-        def task_continuation_pipeline_body(
-            plan: ForEachProgramID._TaskContinuationPipeline,
+        def readiness_frontier_body(
+            plan: ForEachProgramID._ReadinessFrontier,
         ) -> list[ast.stmt]:
-            producer_root = plan.continuation.producer_root
-            consumer_root = plan.cohort.consumer_root
+            producer_root = plan.event.single_contributor.producer_root
+            consumer_root = plan.downstream_cohort.consumer_root
             producer_task = device_function.new_var(
                 "tile_dependency_pipeline_producer_task", dce=True
             )
@@ -2003,17 +2222,13 @@ class ForEachProgramID(ProgramIDs):
                 (consumer_task, epoch_var),
             )
             body: list[ast.stmt] = []
-            if (
-                input_dependency := whole_value_input_dependency(producer_root)
-            ) is not None:
-                body.extend(
-                    self._wait_for_counter(
-                        device_function=device_function,
-                        counter=input_dependency[0],
-                        target=input_dependency[1],
-                        prefix="tile_dependency_pipeline_input_wait",
-                    )
+            body.extend(
+                self._wait_for_dependencies(
+                    device_function=device_function,
+                    dependencies=whole_value_input_dependencies(producer_root),
+                    prefix="tile_dependency_pipeline_input_wait",
                 )
+            )
             body.extend(
                 [
                     statement_from_string(f"{producer_task} = {worker}"),
@@ -2031,17 +2246,19 @@ class ForEachProgramID(ProgramIDs):
                         ],
                         orelse=[],
                     ),
+                    *root_completion_publication(producer_root),
                     create(
                         ast.If,
                         test=expr_from_string(
-                            f"({worker}) >= {plan.consumer_worker_begin}"
+                            f"({worker}) >= {plan.downstream_worker_begin}"
                         ),
                         body=[
                             statement_from_string(
                                 f"{consumer_task} = "
-                                f"{worker} - {plan.consumer_worker_begin}"
+                                f"{worker} - {plan.downstream_worker_begin}"
                             ),
                             *consumer_body,
+                            *root_completion_publication(consumer_root),
                         ],
                         orelse=[],
                     ),
@@ -2062,12 +2279,10 @@ class ForEachProgramID(ProgramIDs):
             root_begin, root_end = root_range
             if root_end != root_begin + 1:
                 structural_roots = (
-                    set(partitioned_pipeline_plans)
-                    | set(reduction_fanout_plans)
-                    | consumed_partitioned_roots
+                    set(reduction_fanout_plans)
                     | consumed_reduction_fanout_roots
-                    | consumed_task_continuation_roots
-                    | set(task_continuation_pipeline_by_producer)
+                    | consumed_on_ready_roots
+                    | set(readiness_frontier_by_producer)
                 )
                 if structural_roots.intersection(range(root_begin, root_end)):
                     raise exc.TileDependencyScheduleError(
@@ -2093,11 +2308,10 @@ class ForEachProgramID(ProgramIDs):
                                 task_body=singleton_task_body,
                                 device_function=device_function,
                                 worker=worker,
+                                assigned_worker=singleton_workers[stage_root],
                                 epoch_var=epoch_var,
                                 ready_arg=singleton_epoch_arg,
                                 ready_index=singleton_indices[stage_root],
-                                epoch_replicas=singleton_replicas[stage_root],
-                                ready_replica_stride=epoch_replicas,
                                 input_dependencies=whole_value_input_dependencies(
                                     stage_root
                                 ),
@@ -2107,17 +2321,11 @@ class ForEachProgramID(ProgramIDs):
                     stage_workers = min(
                         static_task_counts[stage_root], launch_worker_limit
                     )
-                    stage_body: list[ast.stmt] = []
-                    for producer_root in whole_value_incoming.get(stage_root, ()):
-                        counter, target = root_completion_dependency(producer_root)
-                        stage_body.extend(
-                            self._wait_for_counter(
-                                device_function=device_function,
-                                counter=counter,
-                                target=target,
-                                prefix="tile_dependency_whole_value_wait",
-                            )
-                        )
+                    stage_body = self._wait_for_dependencies(
+                        device_function=device_function,
+                        dependencies=whole_value_input_dependencies(stage_root),
+                        prefix="tile_dependency_whole_value_wait",
+                    )
                     stage_body.append(
                         create(
                             ast.For,
@@ -2144,9 +2352,7 @@ class ForEachProgramID(ProgramIDs):
                             type_comment=None,
                         )
                     )
-                    stage_body.extend(
-                        root_completion_publication(stage_root, stage_workers)
-                    )
+                    stage_body.extend(root_completion_publication(stage_root))
                     result.append(
                         create(
                             ast.If,
@@ -2157,21 +2363,17 @@ class ForEachProgramID(ProgramIDs):
                     )
                 start_expr = boundary
                 continue
-            task_continuation_pipeline = (
-                task_continuation_pipeline_by_producer.get(root_begin)
+            readiness_frontier = (
+                readiness_frontier_by_producer.get(root_begin)
                 if root_end == root_begin + 1
                 else None
             )
-            if task_continuation_pipeline is not None:
-                result.extend(
-                    task_continuation_pipeline_body(task_continuation_pipeline)
-                )
+            if readiness_frontier is not None:
+                result.extend(readiness_frontier_body(readiness_frontier))
                 start_expr = boundary
                 continue
             if root_end == root_begin + 1 and root_begin in (
-                consumed_partitioned_roots
-                | consumed_reduction_fanout_roots
-                | consumed_task_continuation_roots
+                consumed_reduction_fanout_roots | consumed_on_ready_roots
             ):
                 start_expr = boundary
                 continue
@@ -2199,17 +2401,11 @@ class ForEachProgramID(ProgramIDs):
                     body=case_bodies[reduction_fanout_plan.producer_root],
                     extra_argument_names=(fanout_task,),
                 )
-                producer_prefix: list[ast.stmt] = []
-                producer_input = whole_value_input_dependency(root_begin)
-                if producer_input is not None:
-                    producer_prefix.extend(
-                        self._wait_for_counter(
-                            device_function=device_function,
-                            counter=producer_input[0],
-                            target=producer_input[1],
-                            prefix="tile_dependency_reduction_fanout_input_wait",
-                        )
-                    )
+                producer_prefix = self._wait_for_dependencies(
+                    device_function=device_function,
+                    dependencies=whole_value_input_dependencies(root_begin),
+                    prefix="tile_dependency_reduction_fanout_input_wait",
+                )
                 producer_body: list[ast.stmt]
                 producer_loop_task_count: int
                 if reduction_fanout_plan.upstream_root is None:
@@ -2329,10 +2525,7 @@ class ForEachProgramID(ProgramIDs):
                     reduction_call,
                     self._tile_dependency_publication_barrier(device_function),
                     consumer_call,
-                    *root_completion_publication(
-                        reduction_fanout_plan.consumer_root,
-                        reduction_fanout_plan.task_count,
-                    ),
+                    *root_completion_publication(reduction_fanout_plan.consumer_root),
                 ]
                 result.extend(
                     [
@@ -2368,50 +2561,6 @@ class ForEachProgramID(ProgramIDs):
                 )
                 start_expr = boundary
                 continue
-            partitioned_pipeline_plan = (
-                partitioned_pipeline_plans.get(root_begin)
-                if root_end == root_begin + 1
-                else None
-            )
-            if partitioned_pipeline_plan is not None:
-                assert static_task_counts is not None
-                offsets = partitioned_pipeline_offsets[root_begin]
-                input_dependency = whole_value_input_dependency(root_begin)
-                result.extend(
-                    self._emit_partitioned_dependency_pipeline(
-                        partitioned_pipeline_plan,
-                        case_bodies=case_bodies,
-                        case_offsets=case_offsets,
-                        strategy=strategy,
-                        device_function=device_function,
-                        worker=worker,
-                        epoch_var=epoch_var,
-                        primary_arrivals=f"{partitioned_pipeline_args['primary_arrivals']} + {offsets['primary_arrivals']}",
-                        first_side_arrivals=f"{partitioned_pipeline_args['first_side_arrivals']} + {offsets['first_side_arrivals']}",
-                        second_side_arrivals=f"{partitioned_pipeline_args['second_side_arrivals']} + {offsets['second_side_arrivals']}",
-                        primary_ready=f"{partitioned_pipeline_args['primary_ready']} + {offsets['primary_ready']}",
-                        materialized_ready=f"{partitioned_pipeline_args['materialized_ready']} + {offsets['materialized_ready']}",
-                        partition_map_arrivals=f"{partitioned_pipeline_args['partition_map_arrivals']} + {offsets['partition_map_arrivals']}",
-                        reduction_arrivals=f"{partitioned_pipeline_args['reduction_arrivals']} + {offsets['reduction_arrivals']}",
-                        pipeline_ready=partitioned_pipeline_args["pipeline_ready"],
-                        pipeline_epochs=partitioned_pipeline_args.get(
-                            "pipeline_epochs"
-                        ),
-                        plan_index=partitioned_pipeline_plan_indices[root_begin],
-                        input_ready_counter=(
-                            input_dependency[0]
-                            if input_dependency is not None
-                            else None
-                        ),
-                        input_ready_target=(
-                            input_dependency[1]
-                            if input_dependency is not None
-                            else None
-                        ),
-                    )
-                )
-                start_expr = boundary
-                continue
             if root_end == root_begin + 1 and root_begin in singleton_roots:
                 assert singleton_epoch_arg is not None
                 singleton_task_body = task_scheduled_body(
@@ -2426,11 +2575,10 @@ class ForEachProgramID(ProgramIDs):
                         task_body=singleton_task_body,
                         device_function=device_function,
                         worker=worker,
+                        assigned_worker=singleton_workers[root_begin],
                         epoch_var=epoch_var,
                         ready_arg=singleton_epoch_arg,
                         ready_index=singleton_indices[root_begin],
-                        epoch_replicas=singleton_replicas[root_begin],
-                        ready_replica_stride=epoch_replicas,
                         input_dependencies=whole_value_input_dependencies(root_begin),
                     )
                 )
@@ -2461,22 +2609,14 @@ class ForEachProgramID(ProgramIDs):
 
             assert static_task_counts is not None
             active_workers = active_worker_count(root_begin)
-            active_body: list[ast.stmt] = []
-            for producer_root in incoming_roots:
-                counter, target = root_completion_dependency(producer_root)
-                active_body.extend(
-                    self._wait_for_counter(
-                        device_function=device_function,
-                        counter=counter,
-                        target=target,
-                        prefix="tile_dependency_whole_value_wait",
-                    )
-                )
+            active_body = self._wait_for_dependencies(
+                device_function=device_function,
+                dependencies=whole_value_input_dependencies(root_begin),
+                prefix="tile_dependency_whole_value_wait",
+            )
             active_body.append(task_loop)
             if publishes_completion:
-                active_body.extend(
-                    root_completion_publication(root_begin, active_workers)
-                )
+                active_body.extend(root_completion_publication(root_begin))
             result.append(
                 create(
                     ast.If,
@@ -2501,10 +2641,6 @@ class ForEachProgramID(ProgramIDs):
     @staticmethod
     def _validate_tile_dependency_plan_coverage(
         *,
-        singleton_roots: frozenset[int],
-        partitioned_pipeline_plans: dict[
-            int, ForEachProgramID._PartitionedDependencyPipeline
-        ],
         reduction_fanout_plans: dict[int, ForEachProgramID._OneWaveReductionFanout],
         task_ready_edges: frozenset[tuple[int, int]],
         whole_value_edges: frozenset[tuple[int, int]],
@@ -2518,22 +2654,12 @@ class ForEachProgramID(ProgramIDs):
         opaque computation body.
         """
         covered: set[tuple[int, int]] = set()
-        for plan in partitioned_pipeline_plans.values():
-            covered.update(plan.covered_edges)
         for plan in reduction_fanout_plans.values():
             covered.update(plan.covered_edges)
         covered.update(task_ready_edges)
         covered.update(whole_value_edges)
 
-        # An opaque singleton root publishes one completion epoch consumed by
-        # the next recognized producer chain.  The root body itself is never
-        # split or rewritten.
-        chain_starts = set(partitioned_pipeline_plans)
-        for singleton_root in singleton_roots:
-            if singleton_root + 1 in chain_starts:
-                covered.add((singleton_root, singleton_root + 1))
-
-        def is_ordered(producer: int, consumer: int) -> bool:
+        def is_ordered_by_root_completion(producer: int, consumer: int) -> bool:
             pending = [producer]
             visited: set[int] = set()
             while pending:
@@ -2544,38 +2670,20 @@ class ForEachProgramID(ProgramIDs):
                     continue
                 visited.add(current)
                 pending.extend(
-                    target for source, target in covered if source == current
+                    target for source, target in whole_value_edges if source == current
                 )
             return False
 
         dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
         assert dependency_plan is not None
         for dependency in dependency_plan.edges:
-            if not is_ordered(dependency.producer_root, dependency.consumer_root):
-                raise exc.TileDependencyScheduleError(
-                    f"{dependency.producer_root}->{dependency.consumer_root} "
-                    f"through allocations {sorted(dependency.tensor_names)!r} has no "
-                    "TileDependency synchronization path"
-                )
-
-        # The remaining partitioned-attention emitter still uses prior-value
-        # modulo election. Unlike the generic continuation's epoch-relative
-        # exact target, that legacy protocol requires power-of-two fan-ins.
-        fanins: list[int] = []
-        for plan in partitioned_pipeline_plans.values():
-            fanins.extend(
-                (
-                    plan.finalize_partition_block * plan.tiles_per_member,
-                    plan.tiles_per_member,
-                )
-            )
-        invalid_fanin = next(
-            (fanin for fanin in fanins if fanin <= 0 or fanin & (fanin - 1)), None
-        )
-        if invalid_fanin is not None:
+            pair = (dependency.producer_root, dependency.consumer_root)
+            if pair in covered or is_ordered_by_root_completion(*pair):
+                continue
             raise exc.TileDependencyScheduleError(
-                "32-bit last-arrival counters require a power-of-two fan-in; "
-                f"got {invalid_fanin}"
+                f"{dependency.producer_root}->{dependency.consumer_root} "
+                f"through allocations {sorted(dependency.tensor_names)!r} has no "
+                "TileDependency synchronization path"
             )
 
     def _tile_dependency_stage_root_ranges(self) -> list[tuple[int, int]]:
@@ -2607,8 +2715,9 @@ class ForEachProgramID(ProgramIDs):
         return result
 
     _AccessCohort = AccessCohortPlan
-    _TaskContinuation = TaskContinuationPlan
-    _TaskContinuationPipeline = TaskContinuationPipelinePlan
+    _KeyedEvent = KeyedEventPlan
+    _KeyedEventContributor = KeyedEventContributorPlan
+    _ReadinessFrontier = ReadinessFrontierPlan
 
     @dataclasses.dataclass(frozen=True)
     class _OneWaveReductionFanout:
@@ -2645,82 +2754,6 @@ class ForEachProgramID(ProgramIDs):
                 (self.producer_root, self.reduction_root, self.consumer_root)
             ) - {self.start_root}
 
-    @dataclasses.dataclass(frozen=True)
-    class _PartitionedDependencyPipeline:
-        producer_root: int
-        partition_finalize_root: int
-        materialize_root: int
-        partition_map_root: int
-        partition_reduce_root: int
-        final_reduce_root: int | None
-        map_root: int
-        downstream_root: int
-        producer_tasks: int
-        group_count: int
-        primary_members_per_partition: int
-        finalize_partition_block: int
-        tiles_per_member: int
-        materialize_tasks_per_partition: int
-        partition_tasks: int
-        partition_tasks_per_partition: int
-        reduction_tasks: int
-        reduction_tasks_per_partition: int
-        final_reduce_tasks: int
-        final_reduce_tasks_per_partition: int
-        subpartitions_per_partition: int
-        output_tasks_per_partition: int
-        downstream_tasks: int
-        consumer_affinity_order: bool
-
-        @property
-        def covered_edges(self) -> tuple[tuple[int, int], ...]:
-            prefix = (
-                (self.producer_root, self.partition_finalize_root),
-                (self.partition_finalize_root, self.materialize_root),
-                (self.partition_finalize_root, self.partition_map_root),
-                (self.materialize_root, self.partition_map_root),
-                (self.partition_map_root, self.partition_reduce_root),
-            )
-            if self.final_reduce_root is None:
-                return (
-                    *prefix,
-                    (self.partition_reduce_root, self.map_root),
-                    (self.map_root, self.downstream_root),
-                )
-            return (
-                *prefix,
-                (self.partition_reduce_root, self.final_reduce_root),
-                (self.final_reduce_root, self.map_root),
-                (self.map_root, self.downstream_root),
-            )
-
-        @property
-        def continuation_roots(self) -> frozenset[int]:
-            return frozenset(
-                root
-                for root in (
-                    self.partition_finalize_root,
-                    self.materialize_root,
-                    self.partition_map_root,
-                    self.partition_reduce_root,
-                    self.final_reduce_root,
-                    self.map_root,
-                )
-                if root is not None
-            )
-
-        @property
-        def partition_map_counter_count(self) -> int:
-            return self.group_count * self.subpartitions_per_partition
-
-        @property
-        def completion_tasks(self) -> int:
-            return (
-                self.reduction_tasks
-                if self.final_reduce_root is None
-                else self.final_reduce_tasks
-            )
-
     @staticmethod
     def _match_opaque_singleton_roots(
         task_counts: list[int],
@@ -2753,8 +2786,6 @@ class ForEachProgramID(ProgramIDs):
         device_function: DeviceFunction,
     ) -> tuple[InstantiatedTaskFamily, ...] | None:
         """Bind DeviceIR logical task families to one physical configuration."""
-        from .tile_strategy import L2GroupingProgramIDs
-
         logical_families = HostFunction.current().device_ir.task_families
         if len(logical_families) != len(self.cases):
             return None
@@ -2773,14 +2804,11 @@ class ForEachProgramID(ProgramIDs):
                     physical_axis_order=physical_axis_order,
                     axis_counts_items=tuple(
                         (block_id, axis_counts[block_id])
-                        for block_id in physical_axis_order
+                        for block_id in logical_family.logical_axis_order
                     ),
                     block_sizes_items=tuple(
                         (block_id, block_sizes[block_id])
-                        for block_id in physical_axis_order
-                    ),
-                    has_nontrivial_pid_remap=isinstance(
-                        self.cases[root], L2GroupingProgramIDs
+                        for block_id in logical_family.logical_axis_order
                     ),
                 )
             )
@@ -2839,7 +2867,6 @@ class ForEachProgramID(ProgramIDs):
     def _match_one_wave_reduction_fanouts(
         self,
         singleton_roots: frozenset[int],
-        case_bodies: list[list[ast.stmt]],
         device_function: DeviceFunction,
     ) -> dict[int, _OneWaveReductionFanout]:
         """Find a pure singleton reduction feeding one resident tile wave.
@@ -2903,9 +2930,8 @@ class ForEachProgramID(ProgramIDs):
             ):
                 continue
             if any(
-                isinstance(node, ast.Attribute) and node.attr.startswith("atomic_")
-                for statement in case_bodies[reduction_root]
-                for node in ast.walk(statement)
+                access.root == reduction_root and access.is_atomic
+                for access in dependency_plan.accesses
             ):
                 continue
             upstream_root: int | None = None
@@ -3021,248 +3047,6 @@ class ForEachProgramID(ProgramIDs):
             result.append((numel, block))
         return result
 
-    def _match_partitioned_dependency_pipeline(
-        self,
-        case_bodies: list[list[ast.stmt]],
-        device_function: DeviceFunction,
-    ) -> dict[int, _PartitionedDependencyPipeline]:
-        """Match a static partitioned producer/consumer pipeline.
-
-        This is a topology match over adjacent opaque tile programs with
-        statically compatible task domains.  The reduction tail may contain
-        either one level or two nested levels.  Absolute sizes, source names,
-        and computation operators are irrelevant. A failed proof is rejected
-        by the coverage check rather than triggering a computation rewrite.
-        """
-        task_counts = self._static_case_task_counts(device_function)
-        if task_counts is None:
-            return {}
-        dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
-        assert dependency_plan is not None
-        result: dict[int, ForEachProgramID._PartitionedDependencyPipeline] = {}
-        for producer_root in range(len(self.cases) - 6):
-            partition_finalize_root = producer_root + 1
-            materialize_root = producer_root + 2
-            partition_map_root = producer_root + 3
-            partition_reduce_root = producer_root + 4
-            if not (
-                len(
-                    dependency_plan.edges_between(
-                        producer_root, partition_finalize_root
-                    )
-                )
-                >= 1
-                and len(
-                    dependency_plan.edges_between(
-                        partition_finalize_root, materialize_root
-                    )
-                )
-                >= 1
-                and len(
-                    dependency_plan.edges_between(
-                        partition_finalize_root, partition_map_root
-                    )
-                )
-                >= 1
-                and len(
-                    dependency_plan.edges_between(materialize_root, partition_map_root)
-                )
-                >= 1
-                and len(
-                    dependency_plan.edges_between(
-                        partition_map_root, partition_reduce_root
-                    )
-                )
-                == 2
-            ):
-                continue
-            final_reduce_root: int | None = None
-            map_root = producer_root + 5
-            downstream_root = producer_root + 6
-            if not (
-                len(dependency_plan.edges_between(partition_reduce_root, map_root)) == 1
-                and len(dependency_plan.edges_between(map_root, downstream_root)) == 2
-            ):
-                if producer_root + 7 >= len(self.cases):
-                    continue
-                final_reduce_root = producer_root + 5
-                map_root = producer_root + 6
-                downstream_root = producer_root + 7
-                if not (
-                    len(
-                        dependency_plan.edges_between(
-                            partition_reduce_root, final_reduce_root
-                        )
-                    )
-                    == 2
-                    and len(dependency_plan.edges_between(final_reduce_root, map_root))
-                    == 1
-                    and len(dependency_plan.edges_between(map_root, downstream_root))
-                    == 2
-                ):
-                    continue
-            finalize_axes = self._static_case_axes(
-                partition_finalize_root, device_function
-            )
-            materialize_axes = self._static_case_axes(materialize_root, device_function)
-            if finalize_axes is None or materialize_axes is None:
-                continue
-            finalize_nontrivial = [
-                (numel, block)
-                for numel, block in finalize_axes
-                if (numel + block - 1) // block > 1
-            ]
-            materialize_nontrivial = [
-                (numel, block)
-                for numel, block in materialize_axes
-                if (numel + block - 1) // block > 1
-            ]
-            if len(finalize_nontrivial) != 1 or len(materialize_nontrivial) != 1:
-                continue
-            finalized_members, finalize_partition_block = finalize_nontrivial[0]
-            partition_extent, partition_block = materialize_nontrivial[0]
-            if partition_block != 1:
-                continue
-            producer_tasks = task_counts[producer_root]
-            materialize_tasks = task_counts[materialize_root]
-            if materialize_tasks != partition_extent:
-                continue
-            geometry = _partitioned_materialization_geometry(
-                producer_tasks=producer_tasks,
-                finalized_members=finalized_members,
-                finalize_partition_block=finalize_partition_block,
-                materialize_tasks=materialize_tasks,
-            )
-            if geometry is None:
-                continue
-            (
-                group_count,
-                primary_members_per_partition,
-                tiles_per_member,
-                materialize_tasks_per_partition,
-            ) = geometry
-            producer_axes = self._static_case_axes(producer_root, device_function)
-            if producer_axes is None:
-                continue
-            producer_nontrivial = [
-                (numel + block - 1) // block
-                for numel, block in producer_axes
-                if (numel + block - 1) // block > 1
-            ]
-            if producer_nontrivial != [producer_tasks]:
-                continue
-            partition_tasks = task_counts[partition_map_root]
-            if partition_tasks % group_count:
-                continue
-            reduction_tasks = task_counts[partition_reduce_root]
-            if reduction_tasks % group_count:
-                continue
-            final_reduce_tasks = (
-                reduction_tasks
-                if final_reduce_root is None
-                else task_counts[final_reduce_root]
-            )
-            if final_reduce_tasks % group_count:
-                continue
-            output_map_tasks = task_counts[map_root]
-            if output_map_tasks % group_count:
-                continue
-            reduction_tasks_per_partition = reduction_tasks // group_count
-            final_reduce_tasks_per_partition = final_reduce_tasks // group_count
-            output_tasks_per_partition = output_map_tasks // group_count
-            if output_tasks_per_partition % final_reduce_tasks_per_partition:
-                continue
-            if reduction_tasks_per_partition % final_reduce_tasks_per_partition:
-                continue
-            subpartitions_per_partition = (
-                reduction_tasks_per_partition // final_reduce_tasks_per_partition
-            )
-            if partition_tasks // group_count % subpartitions_per_partition:
-                continue
-
-            # Prove the mixed-radix task maps used by lowering from physical
-            # PID-axis order.  The partition map must vary partition first;
-            # for a two-level reduction, the first reduction must vary the
-            # nested subpartition first and retain the final task as its outer
-            # coordinate.  This is a scheduling-layout proof only: no tile
-            # body or tensor expression is inspected or changed.
-            partition_axis_counts = [
-                (numel + block - 1) // block
-                for numel, block in self._static_case_axes(
-                    partition_map_root, device_function
-                )
-                or ()
-                if (numel + block - 1) // block > 1
-            ]
-            if not partition_axis_counts or partition_axis_counts[0] != group_count:
-                continue
-            if math.prod(partition_axis_counts[1:]) != partition_tasks // group_count:
-                continue
-            if final_reduce_root is not None:
-                reduction_axis_counts = [
-                    (numel + block - 1) // block
-                    for numel, block in self._static_case_axes(
-                        partition_reduce_root, device_function
-                    )
-                    or ()
-                    if (numel + block - 1) // block > 1
-                ]
-                if (
-                    not reduction_axis_counts
-                    or reduction_axis_counts[0] != subpartitions_per_partition
-                    or math.prod(reduction_axis_counts[1:]) != final_reduce_tasks
-                ):
-                    continue
-            resident_workers = CompileEnvironment.current().config_spec.num_sm * cast(
-                "int", device_function.config.get("num_sm_multiplier", 1)
-            )
-            tasks_per_group = (primary_members_per_partition + 2) * tiles_per_member
-            affinity_prefix = min(group_count, resident_workers // tasks_per_group)
-            physical_completed_members = resident_workers // tiles_per_member
-            physical_prefix = min(
-                group_count,
-                max(
-                    0,
-                    physical_completed_members
-                    - group_count * (primary_members_per_partition + 1),
-                ),
-            )
-            schedule = HostFunction.current().device_ir.tile_dependency_schedule
-            assert schedule is not None and schedule.policy is not None
-            requested_order = schedule.policy.producer_order
-            consumer_affinity_order = (
-                affinity_prefix > physical_prefix
-                if requested_order is None
-                else requested_order == "consumer_major"
-            )
-            result[producer_root] = self._PartitionedDependencyPipeline(
-                producer_root=producer_root,
-                partition_finalize_root=partition_finalize_root,
-                materialize_root=materialize_root,
-                partition_map_root=partition_map_root,
-                partition_reduce_root=partition_reduce_root,
-                final_reduce_root=final_reduce_root,
-                map_root=map_root,
-                downstream_root=downstream_root,
-                producer_tasks=producer_tasks,
-                group_count=group_count,
-                primary_members_per_partition=primary_members_per_partition,
-                finalize_partition_block=finalize_partition_block,
-                tiles_per_member=tiles_per_member,
-                materialize_tasks_per_partition=materialize_tasks_per_partition,
-                partition_tasks=partition_tasks,
-                partition_tasks_per_partition=partition_tasks // group_count,
-                reduction_tasks=reduction_tasks,
-                reduction_tasks_per_partition=reduction_tasks_per_partition,
-                final_reduce_tasks=final_reduce_tasks,
-                final_reduce_tasks_per_partition=final_reduce_tasks_per_partition,
-                subpartitions_per_partition=subpartitions_per_partition,
-                output_tasks_per_partition=output_tasks_per_partition,
-                downstream_tasks=task_counts[downstream_root],
-                consumer_affinity_order=consumer_affinity_order,
-            )
-        return result
-
     @staticmethod
     def _emit_root_admission_task_wait(
         *,
@@ -3271,23 +3055,13 @@ class ForEachProgramID(ProgramIDs):
         task_event_arg: str,
         task_event_offset: int,
         epoch_var: str,
-        consumer_task: str,
-        consumer_axis_order: tuple[int, ...],
+        consumer_coordinates: dict[int, str],
         consumer_axis_counts: dict[int, int],
         producer_axis_order: tuple[int, ...],
         producer_axis_counts: dict[int, int],
         block_sizes: dict[int, int],
     ) -> list[ast.stmt]:
         """Wait for the exact producer tasks required by one consumer task."""
-        consumer_coordinates: dict[int, str] = {}
-        multiplier = 1
-        for block_id in consumer_axis_order:
-            count = consumer_axis_counts[block_id]
-            consumer_coordinates[block_id] = (
-                f"((({consumer_task}) // {multiplier}) % {count})"
-            )
-            multiplier *= count
-
         return ForEachProgramID._emit_task_wait(
             wait=wait,
             device_function=device_function,
@@ -3309,8 +3083,7 @@ class ForEachProgramID(ProgramIDs):
         task_event_arg: str,
         task_event_offset: int,
         epoch_var: str,
-        consumer_task: str,
-        consumer_axis_order: tuple[int, ...],
+        consumer_coordinates: dict[int, str],
         consumer_axis_counts: dict[int, int],
         producer_axis_order: tuple[int, ...],
         producer_axis_counts: dict[int, int],
@@ -3320,14 +3093,7 @@ class ForEachProgramID(ProgramIDs):
         predecessor_map = wait.predecessor_map
         assert predecessor_map is not None
 
-        consumer_coordinates: dict[int, str] = {}
-        multiplier = 1
-        for block_id in consumer_axis_order:
-            count = consumer_axis_counts[block_id]
-            consumer_coordinates[block_id] = (
-                f"((({consumer_task}) // {multiplier}) % {count})"
-            )
-            multiplier *= count
+        consumer_coordinates = dict(consumer_coordinates)
 
         nested_coordinates: list[tuple[str, int]] = []
         for axis in predecessor_map.axes:
@@ -3481,6 +3247,50 @@ class ForEachProgramID(ProgramIDs):
         ]
 
     @staticmethod
+    def _wait_for_dependencies(
+        *,
+        device_function: DeviceFunction,
+        dependencies: tuple[tuple[str, str], ...],
+        prefix: str,
+    ) -> list[ast.stmt]:
+        """Emit every acquire wait in one graph-derived dependency set."""
+        return [
+            statement
+            for counter, target in dependencies
+            for statement in ForEachProgramID._wait_for_counter(
+                device_function=device_function,
+                counter=counter,
+                target=target,
+                prefix=prefix,
+            )
+        ]
+
+    @staticmethod
+    def _emit_counted_event_on_ready(
+        *,
+        counter: str,
+        epoch: str,
+        expected_arrivals: int,
+        previous: str,
+        on_ready: list[ast.stmt],
+    ) -> list[ast.stmt]:
+        """Contribute once and run ``on_ready`` for the final arrival."""
+        return [
+            statement_from_string(
+                f"{previous} = tl.atomic_add({counter}, 1, sem='acq_rel', scope='gpu')"
+            ),
+            create(
+                ast.If,
+                test=expr_from_string(
+                    f"{previous} == tl.cast({epoch}, tl.uint32) * "
+                    f"tl.cast({expected_arrivals}, tl.uint32) - 1"
+                ),
+                body=on_ready,
+                orelse=[],
+            ),
+        ]
+
+    @staticmethod
     def _tile_dependency_publication_barrier(
         device_function: DeviceFunction,
     ) -> ast.stmt:
@@ -3493,33 +3303,6 @@ class ForEachProgramID(ProgramIDs):
             "constraints='=r,r', args=[tl.arange(0, 32)], "
             "dtype=tl.uint32, is_pure=False, pack=1)"
         )
-
-    @staticmethod
-    def _publish_tile_dependency_epoch(
-        device_function: DeviceFunction,
-        *,
-        base: str,
-        epoch: str,
-        replicas: int,
-    ) -> list[ast.stmt]:
-        """Release-publish one epoch, vectorizing replicated cache lines."""
-        if replicas == 1:
-            return [
-                statement_from_string(
-                    f"tl.atomic_xchg({base}, {epoch}, sem='release', scope='gpu')"
-                )
-            ]
-        offsets = device_function.new_var("tile_dependency_epoch_offsets", dce=True)
-        return [
-            statement_from_string(
-                f"{offsets} = tl.arange(0, {replicas}) * "
-                f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
-            ),
-            statement_from_string(
-                f"tl.atomic_xchg({base} + {offsets}, {epoch}, "
-                "sem='release', scope='gpu')"
-            ),
-        ]
 
     @staticmethod
     def _register_tile_dependency_state(
@@ -3592,11 +3375,10 @@ class ForEachProgramID(ProgramIDs):
         task_body: list[ast.stmt],
         device_function: DeviceFunction,
         worker: str,
+        assigned_worker: int,
         epoch_var: str,
         ready_arg: str,
         ready_index: int,
-        epoch_replicas: int,
-        ready_replica_stride: int | None = None,
         input_dependencies: tuple[tuple[str, str], ...] = (),
     ) -> list[ast.stmt]:
         """Run one original logical tile and publish its completion epoch.
@@ -3605,28 +3387,18 @@ class ForEachProgramID(ProgramIDs):
         other root.  The singleton wrapper adds only root-level admission and
         completion publication.
         """
-        replica_stride = ready_replica_stride or epoch_replicas
-        ready_base = (
-            f"{ready_arg} + "
-            f"{ready_index * replica_stride * _TILE_DEPENDENCY_COUNTER_STRIDE}"
-        )
-        publish = self._publish_tile_dependency_epoch(
-            device_function,
-            base=ready_base,
-            epoch=epoch_var,
-            replicas=epoch_replicas,
-        )
-
-        input_waits = [
-            statement
-            for counter, target in input_dependencies
-            for statement in self._wait_for_counter(
-                device_function=device_function,
-                counter=counter,
-                target=target,
-                prefix="tile_dependency_singleton_input_wait",
+        ready_base = f"{ready_arg} + {ready_index * _TILE_DEPENDENCY_COUNTER_STRIDE}"
+        publish = [
+            statement_from_string(
+                f"tl.atomic_xchg({ready_base}, {epoch_var}, sem='release', scope='gpu')"
             )
         ]
+
+        input_waits = self._wait_for_dependencies(
+            device_function=device_function,
+            dependencies=input_dependencies,
+            prefix="tile_dependency_singleton_input_wait",
+        )
         singleton_body: list[ast.stmt] = [
             *input_waits,
             *_clone_opaque_statements(task_body),
@@ -3636,698 +3408,11 @@ class ForEachProgramID(ProgramIDs):
         return [
             create(
                 ast.If,
-                test=expr_from_string(f"({worker}) == 0"),
+                test=expr_from_string(f"({worker}) == {assigned_worker}"),
                 body=singleton_body,
                 orelse=[],
             )
         ]
-
-    def _emit_partitioned_dependency_pipeline(
-        self,
-        plan: _PartitionedDependencyPipeline,
-        *,
-        case_bodies: list[list[ast.stmt]],
-        case_offsets: list[int],
-        strategy: PersistentProgramIDs,
-        device_function: DeviceFunction,
-        worker: str,
-        epoch_var: str,
-        primary_arrivals: str,
-        first_side_arrivals: str,
-        second_side_arrivals: str,
-        primary_ready: str,
-        materialized_ready: str,
-        partition_map_arrivals: str,
-        reduction_arrivals: str,
-        pipeline_ready: str,
-        pipeline_epochs: str | None,
-        plan_index: int,
-        input_ready_counter: str | None = None,
-        input_ready_target: str | None = None,
-    ) -> list[ast.stmt]:
-        logical_task = device_function.new_var(
-            "tile_dependency_partitioned_producer_task", dce=True
-        )
-        group = device_function.new_var("tile_dependency_partition_group", dce=True)
-        local = device_function.new_var("tile_dependency_partition_local", dce=True)
-        member = device_function.new_var("tile_dependency_partition_member", dce=True)
-        subtile = device_function.new_var("tile_dependency_partition_subtile", dce=True)
-        physical_member = device_function.new_var(
-            "tile_dependency_partition_physical_member", dce=True
-        )
-        physical_task = device_function.new_var(
-            "tile_dependency_partition_physical_task", dce=True
-        )
-        primary_finalize_task = device_function.new_var(
-            "tile_dependency_primary_finalize_task", dce=True
-        )
-        previous = device_function.new_var(
-            "tile_dependency_partition_previous", dce=False
-        )
-        members_per_group = plan.primary_members_per_partition + 2
-        tasks_per_group = members_per_group * plan.tiles_per_member
-        primary_finalize_tasks = (
-            plan.group_count
-            * plan.primary_members_per_partition
-            // plan.finalize_partition_block
-        )
-        primary_arrivals_per_finalizer = (
-            plan.finalize_partition_block * plan.tiles_per_member
-        )
-        first_side_arrivals_per_cluster = (
-            plan.finalize_partition_block * plan.tiles_per_member
-        )
-        primary_finalize_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.partition_finalize_root,
-            logical_pid=(
-                f"{case_offsets[plan.partition_finalize_root]} + "
-                f"{primary_finalize_task}"
-            ),
-            body=case_bodies[plan.partition_finalize_root],
-            name_suffix="primary",
-            extra_argument_names=(primary_finalize_task,),
-        )
-        primary_finalizer = [
-            primary_finalize_call,
-            self._tile_dependency_publication_barrier(device_function),
-            statement_from_string(
-                f"tl.atomic_add({primary_ready} + {group}, {plan.finalize_partition_block}, sem='release', scope='gpu')"
-            ),
-        ]
-        side_cluster = device_function.new_var("tile_dependency_side_cluster", dce=True)
-        side_partition_local = device_function.new_var(
-            "tile_dependency_side_partition_local", dce=True
-        )
-        side_partition = device_function.new_var(
-            "tile_dependency_side_partition", dce=True
-        )
-        materialize_partition = device_function.new_var(
-            "tile_dependency_materialize_partition", dce=True
-        )
-        materialize_tile_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.materialize_root,
-            logical_pid=(
-                f"{case_offsets[plan.materialize_root]} + {materialize_partition}"
-            ),
-            body=case_bodies[plan.materialize_root],
-            extra_argument_names=(materialize_partition,),
-        )
-        side_partition_body: list[ast.stmt] = [
-            statement_from_string(
-                f"{side_partition} = {side_cluster} * {plan.finalize_partition_block} + {side_partition_local}"
-            ),
-            statement_from_string(f"{materialize_partition} = {side_partition}"),
-        ]
-        if plan.materialize_tasks_per_partition == 1:
-            side_partition_body.extend(
-                self._wait_for_counter(
-                    device_function=device_function,
-                    counter=f"{second_side_arrivals} + {materialize_partition}",
-                    target=(
-                        f"tl.cast({epoch_var}, tl.uint32) * "
-                        f"tl.cast({plan.tiles_per_member}, tl.uint32)"
-                    ),
-                    prefix="tile_dependency_side_continuation_wait",
-                )
-            )
-        side_partition_body.extend(
-            (
-                materialize_tile_call,
-                self._tile_dependency_publication_barrier(device_function),
-            )
-        )
-        if plan.materialize_tasks_per_partition == 1:
-            side_partition_body.append(
-                statement_from_string(
-                    f"tl.atomic_xchg({materialized_ready} + {side_partition}, {epoch_var}, sem='release', scope='gpu')"
-                )
-            )
-        else:
-            side_partition_body.append(
-                statement_from_string(
-                    f"tl.atomic_add({materialized_ready} + {side_partition}, 1, sem='release', scope='gpu')"
-                )
-            )
-        side_finalize_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.partition_finalize_root,
-            logical_pid=(
-                f"{case_offsets[plan.partition_finalize_root]} + "
-                f"{primary_finalize_tasks} + {side_cluster}"
-            ),
-            body=case_bodies[plan.partition_finalize_root],
-            name_suffix="side",
-            extra_argument_names=(side_cluster,),
-        )
-        side_finalizer = [
-            statement_from_string(
-                f"{side_cluster} = {group} // {plan.finalize_partition_block}"
-            ),
-            side_finalize_call,
-            self._tile_dependency_publication_barrier(device_function),
-            create(
-                ast.For,
-                target=create(ast.Name, id=side_partition_local, ctx=ast.Store()),
-                iter=expr_from_string(
-                    f"tl.static_range(0, {plan.finalize_partition_block})"
-                ),
-                body=side_partition_body,
-                orelse=[],
-                type_comment=None,
-            ),
-        ]
-        consumer_affinity_order_mapping = [
-            statement_from_string(f"{group} = {logical_task} // {tasks_per_group}"),
-            statement_from_string(f"{local} = {logical_task} % {tasks_per_group}"),
-            statement_from_string(f"{member} = {local} // {plan.tiles_per_member}"),
-            statement_from_string(f"{subtile} = {local} % {plan.tiles_per_member}"),
-            create(
-                ast.If,
-                test=expr_from_string(
-                    f"{member} < {plan.primary_members_per_partition}"
-                ),
-                body=[
-                    statement_from_string(
-                        f"{physical_member} = {group} * {plan.primary_members_per_partition} + {member}"
-                    )
-                ],
-                orelse=[
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{member} == {plan.primary_members_per_partition}"
-                        ),
-                        body=[
-                            statement_from_string(
-                                f"{physical_member} = {plan.group_count * plan.primary_members_per_partition} + {group}"
-                            )
-                        ],
-                        orelse=[
-                            statement_from_string(
-                                f"{physical_member} = {plan.group_count * (plan.primary_members_per_partition + 1)} + {group}"
-                            )
-                        ],
-                    )
-                ],
-            ),
-        ]
-        physical_mapping = [
-            statement_from_string(
-                f"{physical_member} = {logical_task} // {plan.tiles_per_member}"
-            ),
-            statement_from_string(
-                f"{subtile} = {logical_task} % {plan.tiles_per_member}"
-            ),
-            create(
-                ast.If,
-                test=expr_from_string(
-                    f"{physical_member} < {plan.group_count * plan.primary_members_per_partition}"
-                ),
-                body=[
-                    statement_from_string(
-                        f"{group} = {physical_member} // {plan.primary_members_per_partition}"
-                    ),
-                    statement_from_string(
-                        f"{member} = {physical_member} % {plan.primary_members_per_partition}"
-                    ),
-                ],
-                orelse=[
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{physical_member} < {plan.group_count * (plan.primary_members_per_partition + 1)}"
-                        ),
-                        body=[
-                            statement_from_string(
-                                f"{group} = {physical_member} - {plan.group_count * plan.primary_members_per_partition}"
-                            ),
-                            statement_from_string(
-                                f"{member} = {plan.primary_members_per_partition}"
-                            ),
-                        ],
-                        orelse=[
-                            statement_from_string(
-                                f"{group} = {physical_member} - {plan.group_count * (plan.primary_members_per_partition + 1)}"
-                            ),
-                            statement_from_string(
-                                f"{member} = {plan.primary_members_per_partition + 1}"
-                            ),
-                        ],
-                    )
-                ],
-            ),
-        ]
-        producer_tile_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.producer_root,
-            logical_pid=f"{case_offsets[plan.producer_root]} + {physical_task}",
-            body=case_bodies[plan.producer_root],
-            extra_argument_names=(physical_task,),
-        )
-        if plan.materialize_tasks_per_partition == 1:
-            second_side_body = [
-                statement_from_string(
-                    f"tl.atomic_add({second_side_arrivals} + {group}, 1, sem='acq_rel', scope='gpu')"
-                )
-            ]
-        else:
-            second_side_body = [
-                statement_from_string(
-                    f"{previous} = tl.atomic_add({second_side_arrivals} + {group}, 1, sem='acq_rel', scope='gpu')"
-                ),
-                create(
-                    ast.If,
-                    test=expr_from_string(
-                        f"({previous} % {plan.tiles_per_member}) == "
-                        f"{plan.tiles_per_member - 1}"
-                    ),
-                    body=[
-                        statement_from_string(
-                            f"{materialize_partition} = {plan.group_count} + {group}"
-                        ),
-                        _clone_stmt(materialize_tile_call),
-                        self._tile_dependency_publication_barrier(device_function),
-                        statement_from_string(
-                            f"tl.atomic_add({materialized_ready} + {group}, 1, sem='release', scope='gpu')"
-                        ),
-                    ],
-                    orelse=[],
-                ),
-            ]
-        producer_body: list[ast.stmt] = [
-            *(
-                consumer_affinity_order_mapping
-                if plan.consumer_affinity_order
-                else physical_mapping
-            ),
-            statement_from_string(
-                f"{physical_task} = {physical_member} * {plan.tiles_per_member} + {subtile}"
-            ),
-            producer_tile_call,
-            self._tile_dependency_publication_barrier(device_function),
-            create(
-                ast.If,
-                test=expr_from_string(
-                    f"{member} < {plan.primary_members_per_partition}"
-                ),
-                body=[
-                    statement_from_string(
-                        f"{primary_finalize_task} = {physical_member} // {plan.finalize_partition_block}"
-                    ),
-                    statement_from_string(
-                        f"{previous} = tl.atomic_add({primary_arrivals} + {primary_finalize_task}, 1, sem='acq_rel', scope='gpu')"
-                    ),
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"({previous} % {primary_arrivals_per_finalizer}) == {primary_arrivals_per_finalizer - 1}"
-                        ),
-                        body=primary_finalizer,
-                        orelse=[],
-                    ),
-                ],
-                orelse=[
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{member} == {plan.primary_members_per_partition}"
-                        ),
-                        body=[
-                            statement_from_string(
-                                f"{side_cluster} = {group} // {plan.finalize_partition_block}"
-                            ),
-                            statement_from_string(
-                                f"{previous} = tl.atomic_add({first_side_arrivals} + {side_cluster}, 1, sem='acq_rel', scope='gpu')"
-                            ),
-                            create(
-                                ast.If,
-                                test=expr_from_string(
-                                    f"({previous} % {first_side_arrivals_per_cluster}) == {first_side_arrivals_per_cluster - 1}"
-                                ),
-                                body=side_finalizer,
-                                orelse=[],
-                            ),
-                        ],
-                        orelse=second_side_body,
-                    )
-                ],
-            ),
-        ]
-        result: list[ast.stmt] = []
-        if input_ready_counter is not None:
-            assert input_ready_target is not None
-            result.append(
-                create(
-                    ast.If,
-                    test=expr_from_string(f"{worker} < {plan.producer_tasks}"),
-                    body=self._wait_for_counter(
-                        device_function=device_function,
-                        counter=input_ready_counter,
-                        target=input_ready_target,
-                        prefix="tile_dependency_producer_input_wait",
-                    ),
-                    orelse=[],
-                )
-            )
-        result.append(
-            create(
-                ast.For,
-                target=create(ast.Name, id=logical_task, ctx=ast.Store()),
-                iter=expr_from_string(
-                    f"tl.range({worker}, {plan.producer_tasks}, {strategy.grid_size_expr})"
-                ),
-                body=producer_body,
-                orelse=[],
-                type_comment=None,
-            )
-        )
-
-        partition_task = device_function.new_var(
-            "tile_dependency_partition_task", dce=True
-        )
-        partition_index = device_function.new_var(
-            "tile_dependency_partition_index", dce=True
-        )
-        reduction_task = device_function.new_var(
-            "tile_dependency_reduction_task", dce=True
-        )
-        reduction_local = device_function.new_var(
-            "tile_dependency_reduction_local", dce=True
-        )
-        reduction_subpartition = device_function.new_var(
-            "tile_dependency_reduction_subpartition", dce=True
-        )
-        reduction_counter_index = device_function.new_var(
-            "tile_dependency_reduction_counter_index", dce=True
-        )
-        final_reduction_task = device_function.new_var(
-            "tile_dependency_final_reduction_task", dce=True
-        )
-        output_map_local = device_function.new_var(
-            "tile_dependency_output_map_local", dce=True
-        )
-        output_maps_per_reduction = (
-            plan.output_tasks_per_partition // plan.final_reduce_tasks_per_partition
-        )
-        pipeline_counter = (
-            f"{pipeline_ready} + {plan_index * _TILE_DEPENDENCY_COUNTER_STRIDE}"
-        )
-        schedule = HostFunction.current().device_ir.tile_dependency_schedule
-        assert schedule is not None and schedule.policy is not None
-        epoch_replicas = schedule.policy.epoch_replicas or 1
-        replicate_pipeline_completion = (
-            pipeline_epochs is not None
-            and plan.downstream_tasks > _TILE_DEPENDENCY_DIRECT_POLL_FANOUT_LIMIT
-        )
-        if replicate_pipeline_completion:
-            pipeline_previous = device_function.new_var(
-                "tile_dependency_pipeline_previous", dce=False
-            )
-            pipeline_epoch_base = (
-                f"{pipeline_epochs} + "
-                f"{plan_index * epoch_replicas * _TILE_DEPENDENCY_COUNTER_STRIDE}"
-            )
-            chain_completion = [
-                statement_from_string(
-                    f"{pipeline_previous} = tl.atomic_add({pipeline_counter}, 1, "
-                    "sem='acq_rel', scope='gpu')"
-                ),
-                create(
-                    ast.If,
-                    test=expr_from_string(
-                        f"({pipeline_previous} % "
-                        f"tl.cast({plan.completion_tasks}, tl.uint32)) == "
-                        f"tl.cast({plan.completion_tasks - 1}, tl.uint32)"
-                    ),
-                    body=self._publish_tile_dependency_epoch(
-                        device_function,
-                        base=pipeline_epoch_base,
-                        epoch=epoch_var,
-                        replicas=epoch_replicas,
-                    ),
-                    orelse=[],
-                ),
-            ]
-        else:
-            chain_completion = [
-                statement_from_string(
-                    f"tl.atomic_add({pipeline_counter}, 1, sem='release', scope='gpu')"
-                )
-            ]
-        output_map_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.map_root,
-            logical_pid=(
-                f"{case_offsets[plan.map_root]} + {partition_index} * "
-                f"{plan.output_tasks_per_partition} + {reduction_local} * "
-                f"{output_maps_per_reduction} + {output_map_local}"
-            ),
-            body=case_bodies[plan.map_root],
-            extra_argument_names=(partition_index, reduction_local, output_map_local),
-        )
-        output_map_tail = [
-            create(
-                ast.For,
-                target=create(ast.Name, id=output_map_local, ctx=ast.Store()),
-                iter=expr_from_string(
-                    f"tl.static_range(0, {output_maps_per_reduction})"
-                ),
-                body=[output_map_call],
-                orelse=[],
-                type_comment=None,
-            ),
-            self._tile_dependency_publication_barrier(device_function),
-            *chain_completion,
-        ]
-        reduction_tile_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.partition_reduce_root,
-            logical_pid=(
-                f"{case_offsets[plan.partition_reduce_root]} + {reduction_task}"
-            ),
-            body=case_bodies[plan.partition_reduce_root],
-            extra_argument_names=(reduction_task,),
-        )
-        final_reduction_call: ast.stmt | None = None
-        if plan.final_reduce_root is not None:
-            final_reduction_call = self._outline_opaque_tile_body(
-                device_function,
-                root=plan.final_reduce_root,
-                logical_pid=(
-                    f"{case_offsets[plan.final_reduce_root]} + {final_reduction_task}"
-                ),
-                body=case_bodies[plan.final_reduce_root],
-                extra_argument_names=(final_reduction_task,),
-            )
-        partition_continuation: list[ast.stmt] = [
-            statement_from_string(f"{reduction_task} = {worker}"),
-        ]
-        if plan.final_reduce_root is None:
-            partition_continuation.extend(
-                [
-                    statement_from_string(
-                        f"{partition_index} = {reduction_task} // "
-                        f"{plan.reduction_tasks_per_partition}"
-                    ),
-                    statement_from_string(
-                        f"{reduction_local} = {reduction_task} % "
-                        f"{plan.reduction_tasks_per_partition}"
-                    ),
-                    *self._wait_for_counter(
-                        device_function=device_function,
-                        counter=f"{partition_map_arrivals} + {partition_index}",
-                        target=(
-                            f"tl.cast({epoch_var}, tl.uint32) * "
-                            f"tl.cast({plan.partition_tasks_per_partition}, tl.uint32)"
-                        ),
-                        prefix="tile_dependency_partition_index_wait",
-                    ),
-                    reduction_tile_call,
-                    self._tile_dependency_publication_barrier(device_function),
-                    *[_clone_stmt(stmt) for stmt in output_map_tail],
-                ]
-            )
-        else:
-            assert final_reduction_call is not None
-            arrivals_per_subpartition = (
-                plan.partition_tasks_per_partition // plan.subpartitions_per_partition
-            )
-            reduction_previous = device_function.new_var(
-                "tile_dependency_reduction_previous", dce=False
-            )
-            partition_continuation.extend(
-                [
-                    statement_from_string(
-                        f"{final_reduction_task} = {reduction_task} // "
-                        f"{plan.subpartitions_per_partition}"
-                    ),
-                    statement_from_string(
-                        f"{partition_index} = {final_reduction_task} // "
-                        f"{plan.final_reduce_tasks_per_partition}"
-                    ),
-                    statement_from_string(
-                        f"{reduction_local} = {final_reduction_task} % "
-                        f"{plan.final_reduce_tasks_per_partition}"
-                    ),
-                    statement_from_string(
-                        f"{reduction_subpartition} = {reduction_task} % "
-                        f"{plan.subpartitions_per_partition}"
-                    ),
-                    statement_from_string(
-                        f"{reduction_counter_index} = {partition_index} * "
-                        f"{plan.subpartitions_per_partition} + "
-                        f"{reduction_subpartition}"
-                    ),
-                    *self._wait_for_counter(
-                        device_function=device_function,
-                        counter=(
-                            f"{partition_map_arrivals} + {reduction_counter_index}"
-                        ),
-                        target=(
-                            f"tl.cast({epoch_var}, tl.uint32) * "
-                            f"tl.cast({arrivals_per_subpartition}, tl.uint32)"
-                        ),
-                        prefix="tile_dependency_partition_subgroup_wait",
-                    ),
-                    reduction_tile_call,
-                    self._tile_dependency_publication_barrier(device_function),
-                    statement_from_string(
-                        f"{reduction_previous} = "
-                        f"tl.atomic_add({reduction_arrivals} + "
-                        f"{final_reduction_task}, 1, sem='acq_rel', scope='gpu')"
-                    ),
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"({reduction_previous} % "
-                            f"{plan.subpartitions_per_partition}) == "
-                            f"{plan.subpartitions_per_partition - 1}"
-                        ),
-                        body=[
-                            final_reduction_call,
-                            self._tile_dependency_publication_barrier(device_function),
-                            *[_clone_stmt(stmt) for stmt in output_map_tail],
-                        ],
-                        orelse=[],
-                    ),
-                ]
-            )
-        partition_dependency = self._wait_for_counter(
-            device_function=device_function,
-            counter=f"{primary_ready} + {partition_index}",
-            target=(
-                f"tl.cast({epoch_var}, tl.uint32) * "
-                f"tl.cast({plan.primary_members_per_partition}, tl.uint32)"
-            ),
-            prefix="tile_dependency_primary_ready_wait",
-        )
-        partition_dependency.extend(
-            self._wait_for_counter(
-                device_function=device_function,
-                counter=f"{materialized_ready} + {partition_index}",
-                target=(
-                    f"tl.cast({epoch_var}, tl.uint32) * "
-                    f"tl.cast({plan.materialize_tasks_per_partition}, tl.uint32)"
-                ),
-                prefix="tile_dependency_materialized_ready_wait",
-            )
-        )
-        partition_tile_call = self._outline_opaque_tile_body(
-            device_function,
-            root=plan.partition_map_root,
-            logical_pid=(f"{case_offsets[plan.partition_map_root]} + {partition_task}"),
-            body=case_bodies[plan.partition_map_root],
-            extra_argument_names=(partition_task,),
-        )
-        partition_body = [
-            statement_from_string(f"{partition_task} = {worker}"),
-            statement_from_string(
-                f"{partition_index} = {partition_task} % {plan.group_count}"
-            ),
-            *partition_dependency,
-            partition_tile_call,
-            self._tile_dependency_publication_barrier(device_function),
-        ]
-        if plan.final_reduce_root is None:
-            partition_body.append(
-                statement_from_string(
-                    f"tl.atomic_add({partition_map_arrivals} + "
-                    f"{partition_index}, 1, sem='release', scope='gpu')"
-                )
-            )
-        else:
-            arrivals_per_subpartition = (
-                plan.partition_tasks_per_partition // plan.subpartitions_per_partition
-            )
-            partition_body.extend(
-                [
-                    statement_from_string(
-                        f"{reduction_subpartition} = "
-                        f"({partition_task} // {plan.group_count}) // "
-                        f"{arrivals_per_subpartition}"
-                    ),
-                    statement_from_string(
-                        f"{reduction_counter_index} = {partition_index} * "
-                        f"{plan.subpartitions_per_partition} + "
-                        f"{reduction_subpartition}"
-                    ),
-                    statement_from_string(
-                        f"tl.atomic_add({partition_map_arrivals} + "
-                        f"{reduction_counter_index}, 1, sem='release', scope='gpu')"
-                    ),
-                ]
-            )
-        result.extend(
-            [
-                create(
-                    ast.If,
-                    test=expr_from_string(f"{worker} < {plan.partition_tasks}"),
-                    body=partition_body,
-                    orelse=[],
-                ),
-                create(
-                    ast.If,
-                    test=expr_from_string(f"{worker} < {plan.reduction_tasks}"),
-                    body=partition_continuation,
-                    orelse=[],
-                ),
-            ]
-        )
-        pipeline_dependency = (
-            (
-                (
-                    f"{pipeline_epochs} + "
-                    f"({plan_index * epoch_replicas} + "
-                    f"(({worker}) % {epoch_replicas})) * "
-                    f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
-                ),
-                f"tl.cast({epoch_var}, tl.uint32)",
-            )
-            if replicate_pipeline_completion
-            else (
-                pipeline_counter,
-                (
-                    f"tl.cast({epoch_var}, tl.uint32) * "
-                    f"tl.cast({plan.completion_tasks}, tl.uint32)"
-                ),
-            )
-        )
-        result.append(
-            create(
-                ast.If,
-                test=expr_from_string(f"{worker} < {plan.downstream_tasks}"),
-                body=self._wait_for_counter(
-                    device_function=device_function,
-                    counter=pipeline_dependency[0],
-                    target=pipeline_dependency[1],
-                    prefix="tile_dependency_partition_chain_wait",
-                ),
-                orelse=[],
-            )
-        )
-        return result
 
 
 class XYZProgramIDs(ProgramIDs):

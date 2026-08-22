@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 import types
 
 import torch
 
 import helion
-from helion._compiler.program_id import ForEachProgramID
+from helion._compiler import tile_dependency_planner
 
 # The original comparison probe was superseded by the production persistent
 # probe in the exploration worktree.  Keep this new ablation self-contained by
@@ -29,27 +30,34 @@ _compat_probe.build_helion_reference = _build_helion_reference
 sys.modules.setdefault("triton_qwen3_sm_overlap_probe", _compat_probe)
 
 
-def _disable_plans(self, *args: object, **kwargs: object):
-    return {}
-
-
-def _disable_sequence_plans(self, *args: object, **kwargs: object):
-    return ()
+def _without_on_ready(events):
+    return tuple(dataclasses.replace(event, on_ready_root=None) for event in events)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--disable-partitioned", action="store_true")
     parser.add_argument("--disable-continuation", action="store_true")
-    parser.add_argument("--epoch-replicas", type=int)
-    parser.add_argument("--producer-order", choices=("physical", "consumer_major"))
     parser.add_argument("--strict-validation", action="store_true")
     args, remaining = parser.parse_known_args()
 
-    if args.disable_partitioned:
-        ForEachProgramID._match_partitioned_dependency_pipeline = _disable_plans
     if args.disable_continuation:
-        ForEachProgramID._task_continuation_plans = _disable_sequence_plans
+        original_counted_events = tile_dependency_planner._derive_counted_events
+        original_coalesced_events = (
+            tile_dependency_planner._derive_coalesced_keyed_events
+        )
+
+        def derive_counted_events_without_continuation(**kwargs: object):
+            return _without_on_ready(original_counted_events(**kwargs))
+
+        def derive_coalesced_events_without_continuation(**kwargs: object):
+            return _without_on_ready(original_coalesced_events(**kwargs))
+
+        tile_dependency_planner._derive_counted_events = (
+            derive_counted_events_without_continuation
+        )
+        tile_dependency_planner._derive_coalesced_keyed_events = (
+            derive_coalesced_events_without_continuation
+        )
 
     import helion_qwen3_tile_dependency as probe
 
@@ -58,10 +66,7 @@ def main() -> None:
     probe.qwen3_layer_tile_dependency = helion.kernel(
         static_shapes=True,
         autotune_effort="none",
-        tile_dependency_schedule=helion.TileDependencySchedule(
-            epoch_replicas=args.epoch_replicas,
-            producer_order=args.producer_order,
-        ),
+        tile_dependency_schedule=helion.TileDependencySchedule(),
     )(probe.qwen3_layer_tile_dependency.fn)
 
     sys.argv = [sys.argv[0], *remaining]
@@ -120,7 +125,6 @@ def main() -> None:
 
     def exact_assert_close(actual, expected, **kwargs: object) -> None:
         nonlocal checked_bridge_state
-        del kwargs
         if not checked_bridge_state and len(allocations) >= 2:
             checked_bridge_state = True
             persistent_tensors, reference_tensors = allocations[:2]

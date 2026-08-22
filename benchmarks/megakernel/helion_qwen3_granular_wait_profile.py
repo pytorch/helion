@@ -94,8 +94,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker-multiplier", type=int, default=8)
     parser.add_argument("--kernel-stages", type=int, default=2)
-    parser.add_argument("--epoch-replicas", type=int)
-    parser.add_argument("--producer-order", choices=("physical", "consumer_major"))
+    parser.add_argument("--merge-q-block", type=int, default=4)
+    parser.add_argument("--task-aligned-attention", action="store_true")
     args = parser.parse_args()
 
     compatibility = types.ModuleType("triton_qwen3_sm_overlap_probe")
@@ -108,13 +108,33 @@ def main() -> None:
     sites_by_device_function = _trace_waits()
     probe.rms_norm_per_block_quant = granular.tiled_rms_norm_per_block_quant
     probe.reshape_and_cache_flash = granular.tiled_reshape_and_cache_flash
-    probe.merge_attention_splits = granular.tiled_merge_attention_splits
+    granular._USE_CANONICAL_ATTENTION_VIEWS = False
+    granular._USE_TASK_ALIGNED_ATTENTION = args.task_aligned_attention
+    if args.task_aligned_attention:
+        probe.fused_qk_norm_rope = granular.flat_fused_qk_norm_rope
+        probe.paged_gqa_decode_attention_split = (
+            granular.task_aligned_paged_gqa_decode_attention_split
+        )
+        probe.merge_attention_splits = (
+            granular.task_aligned_tiled_merge_attention_splits
+        )
+        probe.per_token_group_fp8_quant = (
+            granular.task_aligned_per_token_group_fp8_quant
+        )
+        original_compose = probe._compose_qwen3_layer_source
+
+        def compose_task_aligned_source() -> str:
+            return original_compose().replace(
+                "attention_flat = attention.view(1, hidden)",
+                "attention_flat = attention",
+            )
+
+        probe._compose_qwen3_layer_source = compose_task_aligned_source
+    else:
+        probe.merge_attention_splits = granular.tiled_merge_attention_splits
     probe._probe_matched_config = granular._probe_config
     kernel, _source = probe._build_composite_kernel()
-    schedule = helion.TileDependencySchedule(
-        epoch_replicas=args.epoch_replicas,
-        producer_order=args.producer_order,
-    )
+    schedule = helion.TileDependencySchedule()
     scheduled = helion.kernel(
         static_shapes=True,
         autotune_effort="none",
@@ -138,6 +158,8 @@ def main() -> None:
         kernel_stages=args.kernel_stages,
         qk_head_block=1,
         attention_context_block=32,
+        merge_q_block=args.merge_q_block,
+        projection_stages=4,
     )
     tensors = probe.allocate_layer(layer_args)
     composite_args = probe._composite_args(tensors, layer_args)
