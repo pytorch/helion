@@ -32,6 +32,7 @@ from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _not
 from ...language._tracing_ops import _phi
 from ...language._tracing_ops import _pre_broadcast_tile
+from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -195,6 +196,14 @@ def _raise_unsupported_dynamic_unroll() -> None:
     )
 
 
+def _uses_buffered_static_unroll(state: CodegenState) -> bool:
+    """Whether a static loop requested the existing depth-two load route."""
+    if state.config.get("pallas_loop_type", "unroll") != "unroll":
+        return False
+    counts = state.config.get("pallas_load_buffer_count", ())
+    return isinstance(counts, (list, tuple)) and 2 in counts
+
+
 def _extract_subscript_vals(subscript: object) -> list[object]:
     """Extract meta values from a subscript argument in an FX graph.
 
@@ -243,6 +252,8 @@ def _(state: CodegenState) -> object:
         return _codegen_dynamic_unroll(state)
     if _has_dynamic_unroll_bound(state):
         _raise_unsupported_dynamic_unroll()
+    if _uses_buffered_static_unroll(state):
+        return _codegen_fori_loop(state, static_unroll=True)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -281,6 +292,9 @@ def _(state: CodegenState) -> None:
         return None
     if _has_dynamic_unroll_bound(state):
         _raise_unsupported_dynamic_unroll()
+    if _uses_buffered_static_unroll(state):
+        _codegen_fori_loop(state, static_unroll=True)
+        return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -3322,12 +3336,13 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     return [expr_from_string(f"{result_var}[{i}]") for i in range(len(carried))]
 
 
-def _codegen_fori_loop(state: CodegenState) -> object:
+def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
     Tensors admitted by the existing streaming classifier use explicit DMA.
     Selected read-only input tensors use two DMA buffers; all other routes keep
-    their existing single-buffered lowering.
+    their existing single-buffered lowering. ``static_unroll`` retains that DMA
+    schedule while using Python ``range`` so JAX traces a straight-line program.
     """
     from ..device_ir import ForLoopGraphInfo
     from ..device_ir import LiftTensorArgs
@@ -3451,9 +3466,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     dma_stores: list[ScheduledDmaTransfer] = []
     scheduled_by_hbm_name: dict[str, ScheduledDmaTransfer] = {}
     memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = {}
-    # compact_worklist shares this lowering but keeps its compact/resident routes;
-    # only an actual fori_loop config enables depth-two staging.
-    load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
+    # compact_worklist shares this lowering but keeps its compact/resident routes.
+    # Ordinary fori loops and explicitly buffered static unrolls honor the
+    # per-input depth; other callers keep the historical single-buffer route.
+    load_buffer_counts_active = state.config.get("pallas_loop_type") in (
+        "fori_loop",
+        "unroll",
+    )
 
     input_tensors = cast(
         "list[torch.Tensor]",
@@ -3652,6 +3671,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         block_id_to_info=block_id_to_info,
         body_fn_name="_fori_body_0",
         loop_var_name=loop_vars[-1],
+        static_unroll=static_unroll,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
@@ -4057,7 +4077,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             state.add_statement(stmt)
         return None
 
-    _emit_nonlocal_scratch_declarations(state, body_stmts)
+    if not static_unroll:
+        _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     # Emit nested fori_loop calls — one per dimension.
     # Build inside-out: innermost function wraps body_stmts, each outer
@@ -4068,6 +4089,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # not affect correctness; for loop-carried state the user's source order
     # (block_ids order) is the correct semantic order.
     current_body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    if static_unroll:
+        for dim in reversed(range(len(loop_vars))):
+            loop = statement_from_string(
+                f"for {loop_vars[dim]} in range({grid_parts[dim]}):\n    pass"
+            )
+            assert isinstance(loop, ast.For)
+            loop.body = current_body  # pyrefly: ignore[bad-assignment]
+            if dim == len(loop_vars) - 1:
+                current_body = [*prime_statements, loop]
+            else:
+                current_body = [loop]
+        for statement in current_body:
+            state.add_statement(statement)
+        if has_loop_state:
+            return _read_final_loop_state(state, result_vars)
+        return None
+
     for dim in reversed(range(len(loop_vars))):
         fn_name = state.device_function.new_var(f"_fori_body_{dim}")
         fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
@@ -4091,6 +4129,46 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     if has_loop_state:
         return _read_final_loop_state(state, result_vars)
     return None
+
+
+def _is_static_unroll_predicate(state: CodegenState) -> bool:
+    """Whether this predicate is resolved by a surrounding Python tile loop."""
+    test = state.proxy_arg(0)
+    if isinstance(test, (bool, int)):
+        return True
+    if not isinstance(test, torch.SymBool):
+        return False
+
+    from ..tile_strategy import ForiLoopState
+    from ..variable_origin import BlockSizeOrigin
+    from ..variable_origin import GridOrigin
+
+    static_block_ids: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, ForiLoopState) and loop.static_unroll:
+                static_block_ids.update(loop.block_ids)
+    if not static_block_ids:
+        return False
+
+    expr = test._sympy_()
+    if not isinstance(expr, sympy.Basic):
+        return False
+    origins = HostFunction.current().expr_to_origin
+    for symbol in expr.free_symbols:
+        origin_info = origins.get(symbol)
+        if origin_info is None:
+            return False
+        origin = origin_info.origin
+        base_type = origin.base_type()
+        if issubclass(base_type, BlockSizeOrigin):
+            continue
+        if not issubclass(base_type, GridOrigin):
+            return False
+        block_id = getattr(origin, "block_id", None)
+        if block_id not in static_block_ids:
+            return False
+    return True
 
 
 @_decorators.codegen(_if, "pallas")
@@ -4148,6 +4226,20 @@ def _(state: CodegenState) -> list[object]:
     if_return_names, else_return_names = graph_info.get_branches_return_names(
         state, if_outputs, else_outputs
     )
+
+    if (
+        _is_static_unroll_predicate(state)
+        and not if_return_names
+        and not else_return_names
+    ):
+        if_node = create(
+            ast.If,
+            test=test,
+            body=if_body_stmts or [ast.Pass()],
+            orelse=else_body_stmts or [ast.Pass()],
+        )
+        state.add_statement(if_node)
+        return []
 
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
