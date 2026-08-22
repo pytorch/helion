@@ -986,6 +986,10 @@ def _generated_index_code(
     if isinstance(pattern, TensorIndexPattern):
         if tensor_indices_are_scalars:
             return _index_expr_from_ast(state, subscript_index, ast_subscripts)
+        if pattern.index_ndim == 0:
+            assert isinstance(idx, torch.Tensor)
+            scalar_arg = state.device_function.tensor_arg(idx)
+            return f"{scalar_arg.name}[0]"
         from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
         from helion._compiler.pallas.tensorcore_plan import TensorCorePlan
 
