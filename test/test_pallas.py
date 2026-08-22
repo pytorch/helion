@@ -646,6 +646,17 @@ def pallas_aligned_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_aligned_row_window(x: torch.Tensor) -> torch.Tensor:
+    rows = hl.specialize(x.size(0))
+    out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(rows):
+        row_indices = tile_m.begin + hl.arange(8)
+        window = x[row_indices, :]
+        out[tile_m, :] = window[:, hl.arange(128)] + 1
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_bf16_dynamic_window_1d(
     table: torch.Tensor, starts: torch.Tensor
 ) -> torch.Tensor:
@@ -834,6 +845,15 @@ class TestPallas(TestCase):
             [table[:, begin : begin + 128] for begin in range(0, 512, 128)]
         )
         torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_aligned_row_window_uses_direct_hbm_dma(self) -> None:
+        x = torch.randn(16, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_aligned_row_window,
+            (x,),
+            block_sizes=[8],
+        )
+        torch.testing.assert_close(result, x[:, :128] + 1)
 
     def test_dynamic_window_declines_unaligned_1d_dma(self) -> None:
         table = torch.randn(512, device=DEVICE, dtype=torch.bfloat16)

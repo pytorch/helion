@@ -548,7 +548,9 @@ def indirect_access_modes(device_ir: DeviceIR) -> tuple[str, ...]:
     if not indirect_nodes:
         return ()
 
-    required_dma_loads = indirect_loads_requiring_resident_refs(device_ir.graphs)
+    required_dma_loads = (
+        indirect_loads_requiring_resident_refs(device_ir.graphs) & indirect_nodes
+    )
     env = CompileEnvironment.current()
     config_spec = env.config_spec
     block_size_ranges = {
