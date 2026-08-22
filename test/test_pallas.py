@@ -632,6 +632,46 @@ def pallas_cat_columns(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_aligned_dynamic_window(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for tile in hl.tile(starts.size(0), block_size=1):
+        begin = starts[tile.begin] * 128
+        out[tile, :, :] = table[:, begin + hl.arange(128)][None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_bf16_dynamic_window_1d(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty([starts.size(0), 128], dtype=table.dtype, device=table.device)
+    for tile in hl.tile(starts.size(0), block_size=1):
+        begin = starts[tile.begin] * 128
+        out[tile, :] = table[begin + hl.arange(128)][None, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scaled_add_dynamic_window(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for tile in hl.tile(starts.size(0), block_size=1):
+        begin = starts[tile.begin] * 128
+        indices = torch.add(hl.arange(128), begin, alpha=2)
+        out[tile, :, :] = table[:, indices][None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_shifted_modulo_row_index(x: torch.Tensor) -> torch.Tensor:
     """Exercise a compound modulo operand whose parentheses are significant."""
     out = torch.empty([4, x.size(1)], dtype=x.dtype, device=x.device)
@@ -759,6 +799,42 @@ class TestPallas(TestCase):
         )
         self.assertIn("jnp.concatenate((", code)
         torch.testing.assert_close(result.cpu(), torch.cat((x, y), dim=1).cpu())
+
+    def test_aligned_dynamic_window_uses_direct_hbm_dma(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_aligned_dynamic_window,
+            (table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        expected = torch.stack(
+            [table[:, begin : begin + 128] for begin in range(0, 512, 128)]
+        )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_dynamic_window_declines_unaligned_1d_dma(self) -> None:
+        table = torch.randn(512, device=DEVICE, dtype=torch.bfloat16)
+        starts = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_bf16_dynamic_window_1d,
+            (table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        expected = torch.stack((table[:128], table[128:256]))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_dynamic_window_declines_scaled_add(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            pallas_scaled_add_dynamic_window,
+            (table, starts),
+            pallas_loop_type="fori_loop",
+        )
+        lanes = torch.arange(128, device=DEVICE)
+        expected = torch.stack((table[:, lanes], table[:, 256 + lanes]))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_shifted_modulo_preserves_expression_precedence(self) -> None:
         x = torch.randn(5, 128, device=DEVICE, dtype=torch.float32)
