@@ -1045,6 +1045,28 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    def test_sparse_attn_indexer(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=128, kv_len=512)
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits",
+            block_sizes=[16, 128],
+        )
+
+    def test_sparse_attn_indexer_decode(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=1, kv_len=512)
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits_decode",
+            block_sizes=[1, 128],
+        )
+
     def test_xsa(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
