@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.pallas.dma import DmaTransfer
 from helion._compiler.pallas.dma import allocate_dma_resources
 from helion._compiler.pallas.dma import async_copy_statements
@@ -74,6 +76,7 @@ def load_expr(
         and device_fn.pallas_memory_space.get(id(tensor)) == PallasMemorySpace.HBM
         and (
             device_fn.is_pallas_remote_copy_operand(tensor)
+            or device_fn.is_pallas_direct_hbm_load(tensor)
             or any(
                 isinstance(pattern, ContiguousRangeIndexPattern) for pattern in patterns
             )
@@ -114,6 +117,7 @@ def _hbm_load_expr(
     preserves ordering with nearby remote-copy waits and avoids changing the
     placement of unrelated tensor arguments.
     """
+    device_fn = state.device_function
     assert state.fx_node is not None
     value = state.fx_node.meta.get("val")
     if not isinstance(value, torch.Tensor):
@@ -128,35 +132,98 @@ def _hbm_load_expr(
         pipeline_scalar_indices_local=False,
         raw_hbm_ref=True,
     )
-    scratch_shape = list(value.shape)
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    scratch_shape: list[int | torch.SymInt] = list(value.shape)
     for dim in reversed(none_dims):
         scratch_shape.pop(dim)
     if not scratch_shape:
         raise NotImplementedError("Pallas cannot DMA a scalar HBM load into VMEM")
+    for dimension, size in enumerate(scratch_shape):
+        block_id = env.resolve_block_id(size)
+        if block_id is not None:
+            resolved = state.device_function.resolved_block_size(block_id)
+            if resolved is not None:
+                scratch_shape[dimension] = resolved
+        elif isinstance(size, torch.SymInt):
+            scratch_shape[dimension] = env.size_hint(size)
+    if not all(isinstance(size, int) for size in scratch_shape):
+        raise RuntimeError(f"Pallas HBM load has unresolved shape {scratch_shape}")
+    concrete_scratch_shape = cast("tuple[int, ...]", tuple(scratch_shape))
 
     transfer = DmaTransfer(
         tensor=tensor,
         subscript=tuple(subscript),
         direction="load",
     )
-    resources = allocate_dma_resources(
-        state.device_function,
-        transfer,
-        vmem_shape=tuple(scratch_shape),
-        buffer_count=1,
-        scratch_hint=f"{name}_load",
-        semaphore_hint=f"{name}_load_sem",
+    from helion._compiler.pallas.plan_tiling import ContiguousRangeIndexPattern
+
+    reusable_window = not device_fn.is_pallas_direct_hbm_load(tensor) and any(
+        isinstance(pattern, ContiguousRangeIndexPattern) for pattern in patterns
     )
+    resource_key = (name, concrete_scratch_shape, tensor.dtype)
+    resources = (
+        state.codegen.pallas_immediate_hbm_dma_resource_cache.get(resource_key)
+        if reusable_window
+        else None
+    )
+    if resources is None:
+        resources = allocate_dma_resources(
+            state.device_function,
+            transfer,
+            vmem_shape=concrete_scratch_shape,
+            buffer_count=1,
+            scratch_hint=f"{name}_load",
+            semaphore_hint=f"{name}_load_sem",
+        )
+        if reusable_window:
+            state.codegen.pallas_immediate_hbm_dma_resource_cache[resource_key] = (
+                resources
+            )
     source = f"{name}.at[{', '.join(parts)}]"
-    for statement in async_copy_statements(
-        state,
-        source,
-        resources.scratch,
-        resources.semaphore,
-        ("start", "wait"),
-        f"{name}_load_copy",
-    ):
-        state.codegen.add_statement(statement)
+    if device_fn.is_pallas_direct_hbm_load(tensor):
+        from helion._compiler.tile_strategy import DeviceGridState
+
+        grid_state = state.codegen.current_grid_state
+        if isinstance(grid_state, DeviceGridState):
+            start_statements = async_copy_statements(
+                state,
+                source,
+                resources.scratch,
+                resources.semaphore,
+                ("start",),
+                f"{name}_load_copy",
+            )
+            copy_assignment = start_statements[0]
+            assert isinstance(copy_assignment, ast.Assign)
+            copy_target = copy_assignment.targets[0]
+            assert isinstance(copy_target, ast.Name)
+            device_fn.pallas_hoisted_direct_dma_copy_names.add(copy_target.id)
+            grid_state.outer_prefix.extend(start_statements)
+            state.codegen.add_statement(
+                statement_from_string(f"{copy_target.id}.wait()")
+            )
+        else:
+            for statement in async_copy_statements(
+                state,
+                source,
+                resources.scratch,
+                resources.semaphore,
+                ("start", "wait"),
+                f"{name}_load_copy",
+            ):
+                state.codegen.add_statement(statement)
+    else:
+        for statement in async_copy_statements(
+            state,
+            source,
+            resources.scratch,
+            resources.semaphore,
+            ("start", "wait"),
+            f"{name}_load_copy",
+        ):
+            state.codegen.add_statement(statement)
 
     result = expr_from_string(f"{resources.scratch}[...]")
     mask_expr = _load_mask_expr(state, subscript, tensor)
