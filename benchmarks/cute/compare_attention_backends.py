@@ -20,6 +20,8 @@ Impls:
                   (triton) backend.
     helion-tileir examples.attention attention kernels with NVIDIA's
                   Triton-to-Tile-IR backend (ENABLE_TILE=1).
+    tilegym-tileir NVIDIA TileGym's handwritten Triton FMHA variant compiled
+                   with the active NV Triton TileIR backend.
     helion-cute   examples.attention attention kernels with
                   HELION_BACKEND=cute. By default this uses output-only
                   variants for dense, causal, and biased attention so Helion
@@ -121,6 +123,7 @@ ALL_IMPLS = (
     "helion-triton",
     "helion-cute",
     "helion-tileir",
+    "tilegym-tileir",
     "gluon",
     "tlx",
     "flexattention",
@@ -213,6 +216,7 @@ _SHAPE_SUITES = {
 _DISPLAY_IMPLS = (
     "helion-triton",
     "helion-tileir",
+    "tilegym-tileir",
     "flexattention",
     "gluon",
     "tlx",
@@ -229,6 +233,7 @@ _DISPLAY_IMPLS = (
 _IMPL_LABELS = {
     "helion-triton": "Helion (backend=Triton)",
     "helion-tileir": "Helion (backend=TileIR)",
+    "tilegym-tileir": "TileGym+TileIR",
     "helion-cute": "Helion (backend=CuTe)",
     "gluon": "Gluon attention",
     "tlx": "TLX attention",
@@ -245,6 +250,7 @@ _IMPL_LABELS = {
 _IMPL_KEYS = {
     "helion-triton": "helion_triton",
     "helion-tileir": "helion_tileir",
+    "tilegym-tileir": "tilegym_tileir",
     "helion-cute": "helion_cute",
     "gluon": "gluon",
     "tlx": "tlx",
@@ -550,6 +556,47 @@ def _resolve_fa4_root() -> Path:
     return _ensure_fa4_checkout(_FA4_STANDALONE_ROOT)
 
 
+def _import_tilegym_fmha() -> tuple[
+    Callable[..., torch.Tensor],
+    Callable[[], object | None],
+]:
+    # TileGym's recommended TileIR path enables these before its Triton kernels
+    # compile. ``setdefault`` preserves explicit per-run overrides.
+    os.environ.setdefault("TILEIR_ENABLE_APPROX", "1")
+    os.environ.setdefault("TILEIR_ENABLE_FTZ", "1")
+
+    from benchmarks.cute import tilegym_attention
+
+    if tilegym_attention._get_available_triton_backend() != "nvt":
+        raise RuntimeError(
+            "TileGym attention did not detect the NV Triton TileIR backend; "
+            "set ENABLE_TILE=1 and put NV Triton first on PYTHONPATH"
+        )
+
+    def get_best_config() -> object | None:
+        return getattr(tilegym_attention._prefill_fmha, "best_config", None)
+
+    return (
+        cast(
+            "Callable[..., torch.Tensor]",
+            tilegym_attention.fmha_variant_triton,
+        ),
+        get_best_config,
+    )
+
+
+def _tilegym_attention_kwargs(
+    args: argparse.Namespace, bias: torch.Tensor | None
+) -> dict[str, object]:
+    return {
+        "scaling": None,
+        "is_causal": bool(args.causal),
+        "bias_type": "matrix" if bias is not None else None,
+        "bias": bias,
+        "layout": "bnsd",
+    }
+
+
 def _package_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -732,6 +779,18 @@ def _implementation_version(
             "version_label": (
                 f"Helion {helion_version} / nvtriton {nvtriton_version} / "
                 f"TileIR {tileir_version}"
+            ),
+        }
+    if impl == "tilegym-tileir":
+        nvtriton_version = _package_version("nvtriton")
+        tileir_version = _tileir_toolchain_version()
+        return {
+            "version": (
+                f"TileGym attention; nvtriton {nvtriton_version}; "
+                f"TileIR {tileir_version}"
+            ),
+            "version_label": (
+                f"TileGym / nvtriton {nvtriton_version} / TileIR {tileir_version}"
             ),
         }
     if impl == "gluon":
@@ -2050,6 +2109,60 @@ def _benchmark_fa4(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _benchmark_tilegym_tileir(args: argparse.Namespace) -> dict[str, Any]:
+    """TileGym's handwritten Triton FMHA running through NV Triton TileIR."""
+    try:
+        fmha, get_best_config = _import_tilegym_fmha()
+    except (ImportError, RuntimeError) as exc:
+        return {
+            "impl": "tilegym-tileir",
+            "shape": _shape_dict(args),
+            "accuracy": "SKIP",
+            "skipped_reason": str(exc),
+        }
+
+    dtype = _dtype_from_name(args.dtype)
+    q, k, v = _make_inputs(args, dtype)
+    bias = _make_bias(args, dtype)
+    kwargs = _tilegym_attention_kwargs(args, bias)
+
+    def run() -> torch.Tensor:
+        return fmha(q, k, v, **kwargs)
+
+    accuracy = "PASS"
+    if not args.skip_correctness:
+        expected = _sdpa_reference(q, k, v, causal=bool(args.causal), bias=bias)
+        accuracy = "PASS" if _check_close(run(), expected, dtype) else "FAIL"
+
+    stats = _bench_steady(
+        run,
+        num_runs=args.num_runs,
+        warmup_ms=args.warmup_ms,
+        rep_ms=args.rep_ms,
+    )
+    best_config = get_best_config()
+    config = (
+        dict(cast("Any", best_config).all_kwargs()) if best_config is not None else None
+    )
+    return _result(
+        "tilegym-tileir",
+        args,
+        stats,
+        accuracy=accuracy,
+        benchmark_timer="event",
+        config=config,
+        notes=[
+            "Kernel source: benchmarks/cute/tilegym_attention.py",
+            (
+                "TILEIR_ENABLE_APPROX="
+                f"{os.environ.get('TILEIR_ENABLE_APPROX', '<unset>')}; "
+                "TILEIR_ENABLE_FTZ="
+                f"{os.environ.get('TILEIR_ENABLE_FTZ', '<unset>')}"
+            ),
+        ],
+    )
+
+
 def _helion_benchmark_timer(args: argparse.Namespace, backend: str) -> str:
     if backend == "cute":
         return str(getattr(args, "helion_cute_benchmark_timer", "wall"))
@@ -2218,6 +2331,8 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
     if args.impl == "helion-tileir":
         args.helion_backend = "tileir"
         return _benchmark_helion(args)
+    if args.impl == "tilegym-tileir":
+        return _benchmark_tilegym_tileir(args)
     if args.impl == "sdpa":
         return _benchmark_sdpa(args)
     if args.impl in _KERNELAGENT_BUDGET_LABELS:
