@@ -7,6 +7,7 @@ import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
@@ -51,6 +52,7 @@ def matmul_operand_positions() -> dict[object, tuple[int, int]]:
         matmul_ops.dot: (0, 1),
         torch.ops.aten.mm.default: (0, 1),
         torch.ops.aten.bmm.default: (0, 1),
+        torch.ops.aten.bmm.dtype: (0, 1),
         torch.ops.aten.addmm.default: (1, 2),
         torch.ops.aten.baddbmm.default: (1, 2),
     }
@@ -1104,9 +1106,159 @@ class DeviceIRAnalysis:
         spec: ConfigSpec,
     ) -> KernelMatmulFact | None:
         """Compose the whole-kernel contraction fact from analyzed FX graphs."""
-        facts = spec.matmul_facts
+        facts = list(spec.matmul_facts)
         if not facts:
             return None
+
+        def axis_extent_or_none(block_id: int) -> int | None:
+            if 0 <= block_id < len(env.block_sizes):
+                size = env.block_sizes[block_id].size
+                if isinstance(size, (int, torch.SymInt)):
+                    try:
+                        return max(1, int(env.size_hint(size)))
+                    except Exception:
+                        return None
+            return None
+
+        from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
+        from ..language.matmul_ops import MATMUL_FACT_ID_META
+
+        n_dot_nodes = len(self.dot_nodes)
+        nodes_by_fact_id: dict[int, tuple[int, torch.fx.Node]] = {}
+        duplicate_fact_ids: set[int] = set()
+        for graph_id, node in self.dot_nodes:
+            fact_id = node.meta.get(MATMUL_FACT_ID_META)
+            if not isinstance(fact_id, int) or not 0 <= fact_id < len(facts):
+                continue
+            if fact_id in nodes_by_fact_id:
+                duplicate_fact_ids.add(fact_id)
+            else:
+                nodes_by_fact_id[fact_id] = (graph_id, node)
+        attribution_complete = (
+            n_dot_nodes == len(facts)
+            and len(nodes_by_fact_id) == len(facts)
+            and not duplicate_fact_ids
+        )
+
+        if attribution_complete:
+            operand_positions = matmul_operand_positions()
+
+            def shape_block_ids(node: torch.fx.Node) -> tuple[int | None, ...]:
+                value = node.meta.get("val")
+                if not isinstance(value, torch.Tensor):
+                    return ()
+                result: list[int | None] = []
+                for size in value.shape:
+                    try:
+                        # Only accept direct symbolic identity here. ``resolve_block_id``
+                        # may match a concrete padded extent to a reduction axis, which
+                        # would turn an unrelated fixed dimension of the same value into
+                        # false provenance.
+                        result.append(env.get_block_id(size))
+                    except Exception:
+                        result.append(None)
+                annotated = node.meta.get(MATMUL_DIM_BLOCK_IDS_META)
+                if isinstance(annotated, (list, tuple)) and len(annotated) == len(
+                    result
+                ):
+                    for index, block_id in enumerate(annotated):
+                        if isinstance(block_id, int):
+                            result[index] = block_id
+                return tuple(result)
+
+            def same_shape(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+                lhs_value = lhs.meta.get("val")
+                rhs_value = rhs.meta.get("val")
+                return (
+                    isinstance(lhs_value, torch.Tensor)
+                    and isinstance(rhs_value, torch.Tensor)
+                    and tuple(map(str, lhs_value.shape))
+                    == tuple(map(str, rhs_value.shape))
+                )
+
+            def choose_axis(
+                original: int | None,
+                *inferred: int | None,
+            ) -> int | None:
+                if original is not None:
+                    return original
+                candidates = {value for value in inferred if value is not None}
+                return candidates.pop() if len(candidates) == 1 else None
+
+            def full_extent(block_id: int | None, fallback: int | None) -> int | None:
+                if block_id is None:
+                    return fallback
+                return axis_extent_or_none(block_id) or fallback
+
+            # Keep block identity separate from representative fake sizes. A dot
+            # establishes the identity of its output M/N dimensions; shape-preserving
+            # pointwise operations carry it until a later dot consumes that tensor.
+            for graph in self.graphs:
+                for node in graph.nodes:
+                    value = node.meta.get("val")
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    result_ids = list(shape_block_ids(node))
+                    fact_id = node.meta.get(MATMUL_FACT_ID_META)
+                    if isinstance(fact_id, int) and fact_id in nodes_by_fact_id:
+                        positions = operand_positions.get(node.target)
+                        if positions is None:
+                            continue
+                        lhs = node.args[positions[0]]
+                        rhs = node.args[positions[1]]
+                        if not isinstance(lhs, torch.fx.Node) or not isinstance(
+                            rhs, torch.fx.Node
+                        ):
+                            continue
+                        lhs_ids = shape_block_ids(lhs)
+                        rhs_ids = shape_block_ids(rhs)
+                        fact = facts[fact_id]
+                        m_block_id = choose_axis(
+                            fact.m_block_id,
+                            lhs_ids[-2] if len(lhs_ids) >= 2 else None,
+                        )
+                        n_block_id = choose_axis(
+                            fact.n_block_id,
+                            rhs_ids[-1] if rhs_ids else None,
+                        )
+                        k_block_id = choose_axis(
+                            fact.k_block_id,
+                            lhs_ids[-1] if lhs_ids else None,
+                            rhs_ids[-2] if len(rhs_ids) >= 2 else None,
+                        )
+                        fact = fact._replace(
+                            m_block_id=m_block_id,
+                            n_block_id=n_block_id,
+                            k_block_id=k_block_id,
+                            static_m=full_extent(m_block_id, fact.static_m),
+                            static_n=full_extent(n_block_id, fact.static_n),
+                            static_k=full_extent(k_block_id, fact.static_k),
+                        )
+                        facts[fact_id] = fact
+                        if len(result_ids) >= 2:
+                            result_ids[-2:] = [m_block_id, n_block_id]
+                    elif torch.Tag.pointwise in getattr(node.target, "tags", ()):
+                        matching_inputs = [
+                            input_node
+                            for input_node in node.all_input_nodes
+                            if same_shape(input_node, node)
+                        ]
+                        for index in range(len(result_ids)):
+                            if result_ids[index] is not None:
+                                continue
+                            candidates = {
+                                input_ids[index]
+                                for input_node in matching_inputs
+                                if len(input_ids := shape_block_ids(input_node))
+                                == len(result_ids)
+                                and input_ids[index] is not None
+                            }
+                            if len(candidates) == 1:
+                                result_ids[index] = candidates.pop()
+                    if any(block_id is not None for block_id in result_ids):
+                        node.meta[MATMUL_DIM_BLOCK_IDS_META] = tuple(result_ids)
+
+            spec.matmul_facts[:] = facts
 
         valid_block_ids = set(spec.block_sizes.valid_block_ids())
 
@@ -1150,18 +1302,58 @@ class DeviceIRAnalysis:
                 if block_id is not None and block_id in valid_block_ids:
                     knob_users.setdefault(block_id, []).append((index, axis))
 
-        def axis_extent_or_none(block_id: int) -> int | None:
-            if 0 <= block_id < len(env.block_sizes):
-                size = env.block_sizes[block_id].size
-                if isinstance(size, (int, torch.SymInt)):
-                    try:
-                        return max(1, int(env.size_hint(size)))
-                    except Exception:
-                        return None
-            return None
-
         def axis_extent(block_id: int) -> int:
             return axis_extent_or_none(block_id) or 1
+
+        def prefix_outer_block_id(block_id: int) -> int | None:
+            """Match ``(outer_tile.id + 1) * outer_block`` loop bounds."""
+            if not 0 <= block_id < len(env.block_sizes):
+                return None
+            size = env.block_sizes[block_id].size
+            if not isinstance(size, torch.SymInt):
+                return None
+            expr = size._sympy_()
+            if not isinstance(expr, sympy.Expr):
+                return None
+
+            from .host_function import HostFunction
+            from .variable_origin import BlockSizeOrigin
+            from .variable_origin import TileIdOrigin
+
+            origins = HostFunction.current().expr_to_origin
+            matches: set[int] = set()
+            for symbol in expr.free_symbols:
+                if not isinstance(symbol, sympy.Symbol):
+                    continue
+                origin_info = origins.get(symbol)
+                if origin_info is None or not isinstance(
+                    origin_info.origin,
+                    TileIdOrigin,
+                ):
+                    continue
+                outer_block_id = origin_info.origin.block_id
+                if outer_block_id == block_id or not 0 <= outer_block_id < len(
+                    env.block_sizes
+                ):
+                    continue
+                outer_symbol = env.block_sizes[outer_block_id].symbol()
+                outer_origin = origins.get(outer_symbol)
+                if outer_origin is None or not isinstance(
+                    outer_origin.origin,
+                    BlockSizeOrigin,
+                ):
+                    continue
+                if outer_origin.origin.block_id != outer_block_id:
+                    continue
+                expected = sympy.Mul(
+                    sympy.Add(symbol, sympy.Integer(1)),
+                    outer_symbol,
+                )
+                if sympy.expand(expr) == sympy.expand(expected):
+                    matches.add(outer_block_id)
+            if len(matches) != 1:
+                return None
+            return matches.pop()
 
         grid_block_ids = set(spec.grid_block_ids)
         matmul_output_block_ids = {fact.m_block_id for fact in facts} | {
@@ -1199,22 +1391,32 @@ class DeviceIRAnalysis:
                     if block_id in grid_block_ids or block_id in seen_axes:
                         continue
                     seen_axes.add(block_id)
+                    prefix_outer = prefix_outer_block_id(block_id)
                     axes_out.append(
                         LoopAxisFact(
                             block_id,
-                            axis_extent_or_none(block_id),
+                            (
+                                None
+                                if prefix_outer is not None
+                                else axis_extent_or_none(block_id)
+                            ),
                             bounded_by.get(block_id),
                             bounded_extent.get(block_id),
+                            prefix_outer,
                         )
                     )
                 current = self.parent_of.get(current, -1)
             return tuple(axes_out)
 
-        def trips_for(graph_id: int) -> int:
+        def max_trips_for(graph_id: int) -> int | None:
             trips = 1
             for axis in loop_axes_for(graph_id):
-                extent = axis.extent or 1
-                if axis.bounded_by_block_id is not None:
+                extent = axis.extent
+                if axis.prefix_outer_block_id is not None:
+                    # Preserve the derivable last-tile bound as the raw fallback.
+                    # Candidate-aware consumers use the representative prefix.
+                    extent = axis_extent_or_none(axis.prefix_outer_block_id)
+                elif axis.bounded_by_block_id is not None:
                     extent = (
                         axis.bounded_extent
                         or _immovable_extent(
@@ -1222,8 +1424,10 @@ class DeviceIRAnalysis:
                             spec,
                             axis.bounded_by_block_id,
                         )
-                        or axis_extent(axis.bounded_by_block_id)
+                        or axis_extent_or_none(axis.bounded_by_block_id)
                     )
+                if extent is None:
+                    return None
                 block = _immovable_extent(env, spec, axis.block_id)
                 trips *= max(1, -(-extent // block)) if block else extent
             return trips
@@ -1343,6 +1547,7 @@ class DeviceIRAnalysis:
                 if block_id not in grid_block_ids
                 and axis_extent_or_none(block_id) is None
                 and block_id not in bounded_by
+                and prefix_outer_block_id(block_id) is None
             ]
             enclosing_axes = loop_axes_for(body_graph_id)
             if len(block_ids) != 1 or len(unresolved) != 1 or len(enclosing_axes) != 1:
@@ -1366,16 +1571,30 @@ class DeviceIRAnalysis:
             if len(trip_by_load) >= 2 and len(trips) == 1:
                 inferred_work_trips[(body_graph_id, block_id)] = trips.pop()
 
-        n_dot_nodes = len(self.dot_nodes)
-        attribution_complete = n_dot_nodes == len(facts)
         sites: list[DotSite] = []
         if attribution_complete:
-            for index, (graph_id, node) in enumerate(self.dot_nodes):
+            for index, fact in enumerate(facts):
+                graph_id, node = nodes_by_fact_id[index]
                 value = node.meta.get("val")
                 if isinstance(value, torch.Tensor) and value.ndim >= 2:
                     observed_extents: list[int] = []
-                    for dimension in value.shape[-2:]:
-                        block_id = env.resolve_block_id(dimension)
+                    annotated = node.meta.get(MATMUL_DIM_BLOCK_IDS_META)
+                    annotated_tail = (
+                        annotated[-2:]
+                        if isinstance(annotated, (list, tuple))
+                        and len(annotated) == value.ndim
+                        else (None, None)
+                    )
+                    for dimension, annotated_block_id in zip(
+                        value.shape[-2:],
+                        annotated_tail,
+                        strict=True,
+                    ):
+                        block_id = (
+                            annotated_block_id
+                            if isinstance(annotated_block_id, int)
+                            else env.resolve_block_id(dimension)
+                        )
                         if block_id is not None and 0 <= block_id < len(
                             env.block_sizes
                         ):
@@ -1388,8 +1607,8 @@ class DeviceIRAnalysis:
                         except Exception:
                             observed_extents.append(-1)
                     expected_extents = [
-                        facts[index].static_m,
-                        facts[index].static_n,
+                        fact.static_m,
+                        fact.static_n,
                     ]
                     if any(
                         expected is not None and observed != -1 and expected != observed
@@ -1413,23 +1632,22 @@ class DeviceIRAnalysis:
                 sites.append(
                     DotSite(
                         graph_id,
-                        trips_for(graph_id),
                         updates_carry,
                         loop_axes,
                         exact_loop_trips,
+                        max_trips_for(graph_id),
                     )
                 )
         if not attribution_complete:
-            sites = [DotSite(-1, 1, False, (), None) for _ in facts]
+            sites = [DotSite(-1, False, (), None, None) for _ in facts]
 
         sequential_loop_trips = 1
         for body_graph_id, block_ids in self.loop_block_ids.items():
             if any(block_id in spec.grid_block_ids for block_id in block_ids):
                 continue
-            sequential_loop_trips = max(
-                sequential_loop_trips,
-                trips_for(body_graph_id),
-            )
+            max_trips = max_trips_for(body_graph_id)
+            if max_trips is not None:
+                sequential_loop_trips = max(sequential_loop_trips, max_trips)
 
         pipelined_regions: list[PipelinedRegion] = []
         resident_regions: list[ResidentRegion] = []

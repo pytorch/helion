@@ -617,6 +617,198 @@ class TestMatmulFacts(TestCase):
                 self.assertEqual(fact.lhs_dtype, HALF_DTYPE)
                 self.assertEqual(fact.rhs_dtype, HALF_DTYPE)
 
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_matmul_fact_identity_does_not_depend_on_graph_walk_order(self) -> None:
+        from helion._compiler.device_ir_analysis import DeviceIRAnalysis
+
+        @helion.kernel(backend="triton", static_shapes=True)
+        def two_matmuls(
+            x0: torch.Tensor,
+            y0: torch.Tensor,
+            x1: torch.Tensor,
+            y1: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m0, k0 = x0.shape
+            _, n0 = y0.shape
+            out0 = torch.empty([m0, n0], device=x0.device, dtype=x0.dtype)
+            m1, k1 = x1.shape
+            _, n1 = y1.shape
+            out1 = torch.empty([m1, n1], device=x1.device, dtype=x1.dtype)
+            for tile_m0, tile_n0 in hl.tile([m0, n0]):
+                out0[tile_m0, tile_n0] = hl.dot(
+                    x0[tile_m0, :],
+                    y0[:, tile_n0],
+                )
+
+            for tile_m1, tile_n1 in hl.tile([m1, n1]):
+                out1[tile_m1, tile_n1] = hl.dot(
+                    x1[tile_m1, :],
+                    y1[:, tile_n1],
+                )
+            return out0, out1
+
+        args = (
+            torch.empty([64, 32], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([32, 96], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([128, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([64, 160], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        original = DeviceIRAnalysis.kernel_matmul_fact
+
+        def reverse_walk_order(
+            analysis: DeviceIRAnalysis,
+            *method_args: object,
+            **method_kwargs: object,
+        ) -> object:
+            analysis.dot_nodes = tuple(reversed(analysis.dot_nodes))
+            return original(analysis, *method_args, **method_kwargs)
+
+        with patch.object(
+            DeviceIRAnalysis,
+            "kernel_matmul_fact",
+            reverse_walk_order,
+        ):
+            spec = two_matmuls.bind(args).config_spec
+
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        self.assertTrue(fact.attribution_complete)
+        self.assertEqual(
+            [
+                (resolved.fact.static_m, resolved.fact.static_n)
+                for resolved in fact.matmuls
+            ],
+            [(64, 96), (128, 160)],
+        )
+        self.assertNotEqual(
+            fact.matmuls[0].site.graph_id,
+            fact.matmuls[1].site.graph_id,
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_bmm_dtype_and_nested_loop_ancestry(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True)
+        def nested_attention(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+        ) -> torch.Tensor:
+            batches = q.size(0)
+            heads = hl.specialize(q.size(1))
+            queries = q.size(2)
+            keys = k.size(2)
+            dim = hl.specialize(q.size(3))
+            out = torch.empty_like(q)
+            for batch in hl.grid(batches):
+                for tile_q in hl.tile(queries):
+                    query = q[batch, :, tile_q, :]
+                    acc = hl.zeros([heads, tile_q, dim], dtype=torch.float32)
+                    for tile_kv in hl.tile(keys):
+                        key = k[batch, :, tile_kv, :]
+                        value = v[batch, :, tile_kv, :]
+                        scores = torch.bmm(
+                            query,
+                            key.transpose(-2, -1),
+                            torch.float32,
+                        )
+                        acc = acc + torch.bmm(scores.to(value.dtype), value)
+                    out[batch, :, tile_q, :] = acc.to(out.dtype)
+            return out
+
+        args = tuple(
+            torch.empty([2, 4, 128, 64], device=DEVICE, dtype=HALF_DTYPE)
+            for _ in range(3)
+        )
+        spec = nested_attention.bind(args).config_spec
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        self.assertEqual(len(spec.matmul_facts), 2)
+        self.assertEqual(fact.n_dot_nodes, 2)
+        self.assertTrue(fact.attribution_complete)
+
+        query_block_id = spec.matmul_facts[0].m_block_id
+        key_block_id = spec.matmul_facts[0].n_block_id
+        assert query_block_id is not None
+        assert key_block_id is not None
+        qk, pv = fact.matmuls
+        self.assertEqual(
+            (
+                qk.fact.m_block_id,
+                qk.fact.static_m,
+                qk.fact.n_block_id,
+                qk.fact.static_n,
+                qk.fact.k_block_id,
+                qk.fact.static_k,
+            ),
+            (query_block_id, 128, key_block_id, 128, None, 64),
+        )
+        self.assertEqual(
+            (
+                pv.fact.m_block_id,
+                pv.fact.static_m,
+                pv.fact.n_block_id,
+                pv.fact.static_n,
+                pv.fact.k_block_id,
+                pv.fact.static_k,
+            ),
+            (query_block_id, 128, None, 64, key_block_id, 128),
+        )
+        nested_axes = [
+            {axis.block_id for axis in region.loop_axes}
+            for region in fact.pipelined_regions
+        ]
+        self.assertTrue(
+            any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_prefix_loop_retains_outer_tile_identity(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True)
+        def prefix_matmul(
+            lhs: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            rows, _ = lhs.shape
+            cols = hl.specialize(rhs.size(1))
+            block_m = hl.register_block_size(rows)
+            block_k = hl.register_block_size(64, 64)
+            out = torch.empty([rows, cols], device=lhs.device, dtype=lhs.dtype)
+            for tile_m in hl.tile(rows, block_size=block_m):
+                acc = hl.zeros([tile_m, cols], dtype=torch.float32)
+                for tile_k in hl.tile(
+                    (tile_m.id + 1) * block_m,
+                    block_size=block_k,
+                ):
+                    acc = hl.dot(
+                        lhs[tile_m, tile_k],
+                        rhs[tile_k, :],
+                        acc=acc,
+                    )
+                out[tile_m, :] = acc.to(out.dtype)
+            return out
+
+        args = (
+            torch.empty([256, 256], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([256, 64], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        spec = prefix_matmul.bind(args).config_spec
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        self.assertTrue(fact.attribution_complete)
+        resolved = fact.matmuls[0]
+        inner_block_id = resolved.fact.k_block_id
+        outer_block_id = resolved.fact.m_block_id
+        self.assertIsNotNone(inner_block_id)
+        self.assertIsNotNone(outer_block_id)
+        axis = next(
+            axis for axis in resolved.site.loop_axes if axis.block_id == inner_block_id
+        )
+        self.assertIsNone(axis.extent)
+        self.assertEqual(axis.prefix_outer_block_id, outer_block_id)
+
 
 class TestTritonSkinnyGemmHeuristic(TestCase):
     def _make_triton_env_with_block_sizes(

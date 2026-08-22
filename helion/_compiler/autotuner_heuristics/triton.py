@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -30,6 +31,9 @@ from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
+    from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from ...autotuner.config_spec import BlockSizeSpec
     from ...autotuner.config_spec import ConfigSpec
@@ -58,6 +62,31 @@ class CandidateDotWork(NamedTuple):
     tcgen05_independent: int = 0
     tcgen05_carried: int = 0
     uncertain: bool = False
+
+
+def _candidate_launch_grid_size(
+    groups: Sequence[Sequence[int]],
+    extents: Mapping[int, int | None],
+    blocks: Mapping[int, int],
+    *,
+    collapsed_block_ids: Collection[int] = (),
+) -> int:
+    """Candidate program count from proven root-grid block IDs."""
+    collapsed = set(collapsed_block_ids)
+    grid = 0
+    for group in groups:
+        group_grid = 1
+        for block_id in group:
+            if block_id in collapsed:
+                continue
+            extent = extents.get(block_id)
+            if extent is None:
+                # Unknown extents contribute no proven launch parallelism.
+                continue
+            block = max(1, blocks.get(block_id, 1))
+            group_grid *= max(1, -(-extent // block))
+        grid += group_grid
+    return max(1, grid)
 
 
 # Heuristic was originally contributed by @umechand-amd
@@ -454,30 +483,6 @@ def _h100_build_block_sizes(
     return out
 
 
-def _h100_pinned_grid(
-    env: CompileEnvironment,
-    fact: MatmulFact,
-    block_of: dict[int, int],
-    grid_block_ids: tuple[int, ...],
-) -> int:
-    """Programs contributed by this dot's non-M/N grid axes.
-
-    A grid axis may cover one config-derived tile rather than one scalar. Split-K,
-    for example, walks K=8192 in 64 fixed partitions of 128 elements. Counting its
-    full extent as 8192 programs makes every output tile look deeply saturated.
-    """
-    pinned_grid = 1
-    for bid in grid_block_ids:
-        if bid in (fact.m_block_id, fact.n_block_id):
-            continue
-        size = env.block_sizes[bid].size
-        if isinstance(size, (int, torch.SymInt)):
-            extent = max(1, env.size_hint(size))
-            block = max(1, block_of.get(bid, 1))
-            pinned_grid *= max(1, -(-extent // block))
-    return pinned_grid
-
-
 def _h100_config(
     spec: ConfigSpec,
     fact: MatmulFact,
@@ -586,6 +591,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # column check is inert (which is what keeps sm90 byte-identical).
     TMEM_LANES = 128
     TMEM_COLUMN_BUDGET: int | None = None
+    TMEM_ALLOC_COLUMNS = 0
     # Register-file bytes per thread available to the register-resident live set: the
     # ARCHITECTURAL ceiling of 255 registers x 4 B. This budget answers "will this spill
     # catastrophically", not "is occupancy ideal", so the hard ceiling is the right bound -- and it
@@ -673,10 +679,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # enabled by a measured architecture subclass.
     SUBSTANTIAL_DOT_WORK = 1 << 20
     TCGEN05_DOT_WORK = 1 << 20
-    # The tcgen work threshold may rise when entering a warpgroup reduces
-    # effective CTA residency, but never with the number of queued launch
-    # waves after that residency is saturated.
-    TCGEN_OCCUPANCY_PENALTY_MAX = 4.0
+    # Every work-driven warp transition pays for any effective CTA residency it
+    # gives up, but never for queued launch waves after residency is saturated.
+    WARP_TRANSITION_OCCUPANCY_PENALTY_MAX = 4.0
     EIGHT_WARP_DOT_WORK = 1 << 26
     NON_TCGEN_WIDE_N = 128
     WARP1_SOFT_PRESSURE = 1.2
@@ -709,7 +714,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_warps: int,
         num_stages: int,
         l2_grouping: int,
-        pinned_grid: int,
         num_sm: int,
     ) -> dict[str, Any]:
         """Hook for hardware-specific extra Config fields (e.g. sm100 Blackwell levers). The sm90
@@ -778,8 +782,13 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return max(ring, epilogue) + cls.SMEM_SLACK
 
     @classmethod
-    def _tmem_columns(cls, tiles: list[tuple[int, int, int]]) -> int:
-        """Tensor-memory COLUMNS a set of live fp32 accumulators reserves.
+    def _tmem_columns(
+        cls,
+        tiles: Sequence[tuple[int, int, int] | tuple[int, int, int, int]],
+        *,
+        include_lhs_scratch: bool = False,
+    ) -> int:
+        """Tensor-memory COLUMNS a set of dots reserves.
 
         tcgen05 tensor memory is allocated as ``TMEM_LANES`` (128) lanes x N columns of
         32 bits; a request is denominated in columns, not bytes. Measured on B200 over the
@@ -795,20 +804,44 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         ``OutOfResources: tensor memory, Required: 768, limit 512`` -- exactly
         ``3 x 256`` columns against the 512-column budget.
 
-        ``tiles`` is ``[(bm, bn, itemsize), ...]``. An accumulator whose ``bm`` is below
-        ``TCGEN05_MIN_BM`` is charged nothing: below that the dot lowers to a non-tcgen05
-        path that uses no tensor memory at all (measured ``tmem_size == 0``), and its cost
-        lands on the register file instead -- see ``_register_live_bytes``.
+        ``tiles`` may include K as ``(bm, bn, bk, itemsize)``. With
+        ``include_lhs_scratch``, also reserve each dot's power-of-two LHS promotion
+        allocation. Triton can keep those allocations distinct across dots, just as
+        accumulator allocations can add. The scratch-inclusive value is a hard
+        launchability check; the calibrated residency policy continues to use
+        accumulator columns alone because this all-dot bound is not a reliable
+        peak-residency estimate.
+
+        An accumulator whose ``bm`` is below ``TCGEN05_MIN_BM`` is charged nothing:
+        below that the dot lowers to a non-tcgen05 path that uses no tensor memory at
+        all (measured ``tmem_size == 0``), and its cost lands on the register file
+        instead -- see ``_register_live_bytes``.
         """
         if cls.TMEM_COLUMN_BUDGET is None:
             return 0
         total = 0
-        for bm, bn, _itemsize in tiles:
+        lhs_columns = 0
+        for tile in tiles:
+            if len(tile) == 3:
+                bm, bn, itemsize = tile
+                bk = None
+            else:
+                bm, bn, bk, itemsize = tile
             if bm < cls.TCGEN05_MIN_BM:
                 continue
             lane_groups = max(1, -(-bm // cls.TMEM_LANES))
             total += lane_groups * bn
-        return total
+            if include_lhs_scratch and bk is not None:
+                raw_columns = max(
+                    1,
+                    -(-(bm * bk * itemsize) // (cls.TMEM_LANES * 4)),
+                )
+                allocated_columns = 1 << (raw_columns - 1).bit_length()
+                lhs_columns += max(
+                    cls.TMEM_ALLOC_COLUMNS,
+                    allocated_columns,
+                )
+        return total + lhs_columns
 
     @classmethod
     def _warps_for_live_set(
@@ -947,21 +980,27 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         p2 = pressure(2)
         wide_register_accumulator = any(
             rows < cls.TCGEN05_MIN_BM and cols >= cls.NON_TCGEN_WIDE_N
-            for rows, cols, _itemsize in cls._all_dot_acc_tiles(env, block_sizes)
+            for rows, cols, _inner, _itemsize in cls._all_dot_acc_tiles(
+                env, block_sizes
+            )
         )
-        mma_ctas = resident_ctas(2)
-        tcgen_ctas = resident_ctas(cls.TCGEN05_WARPGROUP_WARPS)
-        occupancy_penalty = cls._tcgen_occupancy_penalty(
-            mma_ctas,
-            tcgen_ctas,
-        )
-        if work.tcgen05_eligible >= cls.EIGHT_WARP_DOT_WORK:
-            warps = 8
-        elif work.tcgen05_eligible > cls.TCGEN05_DOT_WORK * occupancy_penalty or (
-            not work.tcgen05_eligible and wide_register_accumulator
+
+        def transition_penalty(lower: int, upper: int) -> float:
+            return cls._warp_transition_occupancy_penalty(
+                resident_ctas(lower),
+                resident_ctas(upper),
+            )
+
+        if work.tcgen05_eligible >= (
+            cls.EIGHT_WARP_DOT_WORK
+            * transition_penalty(cls.TCGEN05_WARPGROUP_WARPS, cls.MAX_NUM_WARPS)
         ):
+            warps = 8
+        elif work.tcgen05_eligible > (
+            cls.TCGEN05_DOT_WORK * transition_penalty(2, cls.TCGEN05_WARPGROUP_WARPS)
+        ) or (not work.tcgen05_eligible and wide_register_accumulator):
             warps = 4
-        elif work.total >= cls.SUBSTANTIAL_DOT_WORK:
+        elif work.total >= (cls.SUBSTANTIAL_DOT_WORK * transition_penalty(1, 2)):
             warps = 2
         else:
             warps = 1 if p1 <= cls.WARP1_SOFT_PRESSURE else 2
@@ -1001,14 +1040,19 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return min(cls.MAX_NUM_WARPS, max(1, warps))
 
     @classmethod
-    def _tcgen_occupancy_penalty(cls, mma_ctas: int, tcgen_ctas: int) -> float:
-        """Bounded tcgen work penalty for a real effective-residency loss.
+    def _warp_transition_occupancy_penalty(
+        cls, lower_warp_ctas: int, higher_warp_ctas: int
+    ) -> float:
+        """Bounded work penalty for a real effective-residency loss.
 
-        ``mma_ctas`` and ``tcgen_ctas`` already include launch demand, so queued
-        waves beyond resident capacity cannot inflate this value.
+        Both inputs already include launch demand, so queued waves beyond
+        resident capacity cannot inflate this value.
         """
-        ratio = max(1.0, max(1, mma_ctas) / max(1, tcgen_ctas))
-        return min(cls.TCGEN_OCCUPANCY_PENALTY_MAX, ratio)
+        ratio = max(
+            1.0,
+            max(1, lower_warp_ctas) / max(1, higher_warp_ctas),
+        )
+        return min(cls.WARP_TRANSITION_OCCUPANCY_PENALTY_MAX, ratio)
 
     @classmethod
     def _full_block_map(
@@ -1084,54 +1128,100 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return out
 
     @classmethod
-    def _axis_extent(cls, env: CompileEnvironment, block_id: int) -> int:
-        """Full length of one block axis (not the per-program tile)."""
+    def _base_block_sizes(cls, env: CompileEnvironment) -> list[int]:
+        """Complete base-default block vector, with legal floors as a fallback."""
+        raw: list[int] = []
+        base_default = getattr(env.config_spec, "_base_default_config", None)
+        if callable(base_default):
+            default_config = cast("Config", base_default())
+            raw = list(
+                cast(
+                    "list[int]",
+                    default_config.config.get("block_sizes", []),
+                )
+            )
+        out: list[int] = []
+        for slot in range(len(env.config_spec.block_sizes)):
+            spec = cast("BlockSizeSpec", env.config_spec.block_sizes[slot])
+            floor = max(1, spec.min_size, spec.autotuner_min)
+            value = raw[slot] if slot < len(raw) else floor
+            out.append(max(floor, min(spec.max_size, value)))
+        return out
+
+    @classmethod
+    def _axis_extent(cls, env: CompileEnvironment, block_id: int) -> int | None:
+        """Known full length of one block axis, or None when unresolved."""
         if 0 <= block_id < len(env.block_sizes):
             size = env.block_sizes[block_id].size
             if isinstance(size, (int, torch.SymInt)):
                 return max(1, env.size_hint(size))
-        return 1
+        return None
 
     @classmethod
     def _launch_grid(cls, env: CompileEnvironment, block_sizes: list[int]) -> int:
         """Logical programs in dot-bearing roots, or all roots without attribution."""
+        return cls._launch_grid_for_graphs(env, block_sizes)
+
+    @classmethod
+    def _launch_grid_for_graphs(
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        *,
+        graph_ids: tuple[int, ...] | None = None,
+        collapsed_block_ids: Collection[int] = (),
+    ) -> int:
+        """Candidate launch grid for selected roots using only proven grid axes."""
         block_of = cls._full_block_map(env, block_sizes)
         grid_fact = getattr(env.config_spec, "kernel_grid_fact", None)
         mm = env.config_spec.kernel_matmul_fact
         groups: tuple[tuple[int, ...], ...] = ()
         if grid_fact is not None:
-            if mm is not None:
+            if graph_ids is not None:
+                groups = grid_fact.groups_for_graphs(graph_ids)
+            elif mm is not None:
                 groups = grid_fact.groups_for_graphs(
                     tuple(resolved.site.graph_id for resolved in mm.matmuls)
                 )
             groups = groups or grid_fact.grid_groups
         if not groups:
             groups = (tuple(env.config_spec.grid_block_ids),)
-        grid = 0
-        for group in groups:
-            group_grid = 1
-            for bid in group:
-                extent = cls._axis_extent(env, bid)
-                group_grid *= max(
-                    1,
-                    -(-extent // max(1, block_of.get(bid, 1))),
-                )
-            grid += group_grid
-        return max(1, grid)
+        extents = {
+            block_id: cls._axis_extent(env, block_id)
+            for group in groups
+            for block_id in group
+        }
+        return _candidate_launch_grid_size(
+            groups,
+            extents,
+            block_of,
+            collapsed_block_ids=collapsed_block_ids,
+        )
 
     @classmethod
-    def _smem_from_map(
-        cls, env: CompileEnvironment, block_sizes: list[int], num_stages: int
-    ) -> int:
-        """Whole-kernel shared-memory ring under an emitted ``block_sizes`` list.
+    def _smem_region_demands(
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        num_stages: int,
+        *,
+        hard_allocation: bool = False,
+    ) -> tuple[int, ...]:
+        """Shared-memory demand of each independently executing region.
 
         Region ring = SUM of the region's loads (the pipeliner gives each load in the body
         its own multi-stage buffer, so within a stage they are all resident) x
         ``num_stages``, PLUS the region's store staging when it stores from inside itself;
-        then MAX across regions, because separate loops run one after the other."""
+        separate loops remain separate entries because resource fixup must be able
+        to relieve tied peaks independently.
+
+        Candidate ranking caps useful depth by known loop trips. Hard launchability
+        accounting charges the emitted global depth because Triton can reserve that
+        allocation even for a shorter loop.
+        """
         mm = env.config_spec.kernel_matmul_fact
         if mm is None or not (mm.pipelined_regions or mm.resident_regions):
-            return 0
+            return ()
         block_of = cls._full_block_map(env, block_sizes)
 
         def region_bytes(tiles: tuple[LiveTile, ...], stages: int) -> int:
@@ -1155,26 +1245,34 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             )
             return staged_loads * max(1, stages) + resident_loads + stores
 
-        # MAX across regions: separate loops run one after the other, not together. A LOOP
-        # BODY's loads are multi-buffered ``num_stages`` deep; a load in a NON-loop graph is
-        # issued once, so charging it per stage over-states shared memory -- measured, that
-        # over-charge computed 325632 B for a kernel already at its floor tile and pinned it
-        # there for an overflow that cannot happen.
-        ring = 0
+        # Separate loops run one after the other, not together. A LOOP BODY's
+        # loads are multi-buffered ``num_stages`` deep; a load in a NON-loop
+        # graph is issued once.
+        demands: list[int] = []
         for region in mm.pipelined_regions:
-            trips = cls._resolved_loop_trips(
-                env,
-                block_sizes,
-                region.loop_axes,
-                fallback=max(1, num_stages),
-            )
-            ring = max(
-                ring,
-                region_bytes(region.tiles, min(max(1, num_stages), trips)),
-            )
+            stages = max(1, num_stages)
+            if not hard_allocation:
+                trips = cls._resolved_loop_trips(
+                    env,
+                    block_sizes,
+                    region.loop_axes,
+                )
+                if trips is not None:
+                    stages = min(stages, trips)
+            demands.append(region_bytes(region.tiles, stages))
         for region in mm.resident_regions:
-            ring = max(ring, region_bytes(region.tiles, 1))
-        return ring
+            demands.append(region_bytes(region.tiles, 1))
+        return tuple(demands)
+
+    @classmethod
+    def _smem_from_map(
+        cls, env: CompileEnvironment, block_sizes: list[int], num_stages: int
+    ) -> int:
+        """Peak whole-kernel shared-memory ring."""
+        return max(
+            cls._smem_region_demands(env, block_sizes, num_stages),
+            default=0,
+        )
 
     @classmethod
     def _resolved_loop_trips(
@@ -1182,47 +1280,39 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         env: CompileEnvironment,
         block_sizes: list[int],
         loop_axes: tuple[LoopAxisFact, ...],
-        *,
-        fallback: int,
-    ) -> int:
-        """Candidate-real product of enclosing sequential loop trip counts."""
-        trips, _exact = cls._resolved_loop_trips_detail(
-            env,
-            block_sizes,
-            loop_axes,
-            fallback=fallback,
-        )
-        return trips
-
-    @classmethod
-    def _resolved_loop_trips_detail(
-        cls,
-        env: CompileEnvironment,
-        block_sizes: list[int],
-        loop_axes: tuple[LoopAxisFact, ...],
-        *,
-        fallback: int,
-    ) -> tuple[int, bool]:
-        """Resolved trips and whether every enclosing extent was proven."""
+    ) -> int | None:
+        """Candidate-real enclosing loop trips, or unknown when not provable."""
         if not loop_axes:
-            return max(1, fallback), True
+            return 1
         block_of = cls._full_block_map(env, block_sizes)
         trips = 1
         for axis in loop_axes:
-            bound = getattr(axis, "bounded_by_block_id", None)
-            if bound is not None:
+            prefix_outer = getattr(axis, "prefix_outer_block_id", None)
+            if prefix_outer is not None:
+                outer_extent = cls._axis_extent(env, prefix_outer)
+                outer_block = block_of.get(prefix_outer)
+                if outer_extent is None or outer_block is None:
+                    return None
+                outer_block = max(1, outer_block)
+                outer_tiles = max(1, -(-outer_extent // outer_block))
+                lower_median_id = (outer_tiles - 1) // 2
+                extent = (lower_median_id + 1) * outer_block
+            elif (bound := getattr(axis, "bounded_by_block_id", None)) is not None:
                 extent = getattr(axis, "bounded_extent", None)
                 if extent is None:
                     extent = block_of.get(bound)
                 if extent is None:
-                    return max(1, fallback), False
+                    return None
             else:
                 extent = axis.extent
             if extent is None:
-                return max(1, fallback), False
-            block = max(1, block_of.get(axis.block_id, 1))
+                return None
+            block = block_of.get(axis.block_id)
+            if block is None:
+                return None
+            block = max(1, block)
             trips *= max(1, -(-extent // block))
-        return trips, True
+        return trips
 
     @classmethod
     def _pipelined_loop_trips(
@@ -1230,27 +1320,30 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         env: CompileEnvironment,
         block_sizes: list[int],
         *,
-        fallback: int,
+        max_loop_trips: int | None,
     ) -> int:
-        """Longest useful pipeline among sibling regions for one global stage knob."""
+        """Longest useful pipeline, with an explicitly named safety upper bound."""
         mm = env.config_spec.kernel_matmul_fact
         if mm is None or not mm.pipelined_regions:
-            return max(1, fallback)
-        return max(
+            return max(1, max_loop_trips or 1)
+        resolved = [
             cls._resolved_loop_trips(
                 env,
                 block_sizes,
                 region.loop_axes,
-                fallback=fallback,
             )
             for region in mm.pipelined_regions
+        ]
+        return max(
+            trips if trips is not None else max(1, max_loop_trips or 1)
+            for trips in resolved
         )
 
     @classmethod
     def _all_dot_acc_tiles(
         cls, env: CompileEnvironment, block_sizes: list[int]
-    ) -> list[tuple[int, int, int]]:
-        """EVERY dot's accumulator tile, for the tensor-memory budget.
+    ) -> list[tuple[int, int, int, int]]:
+        """EVERY dot's accumulator and LHS tile, for the tensor-memory budget.
 
         Tensor memory is a static per-CTA reservation, and measured on B200 the compiler does
         not always reuse it across the dots of one kernel: a 5-dot kernel whose PEAK-LIVE dot
@@ -1273,25 +1366,31 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 return max(1, block_of[bid])
             return max(1, axes_extent or static or 1)
 
-        out: list[tuple[int, int, int]] = []
+        out: list[tuple[int, int, int, int]] = []
         for resolved in mm.matmuls:
             f = resolved.fact
             ax = resolved.axes
             rows = extent(f.m_block_id, ax.m_extent, f.static_m)
             cols = extent(f.n_block_id, ax.n_extent, f.static_n)
-            out.append((rows, cols, max(1, f.lhs_dtype.itemsize)))
+            inner = extent(f.k_block_id, ax.k_extent, f.static_k)
+            out.append((rows, cols, inner, max(1, f.lhs_dtype.itemsize)))
         return out
 
     @classmethod
     def _candidate_dot_work(
-        cls, env: CompileEnvironment, block_sizes: list[int]
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        *,
+        indices: Sequence[int] | None = None,
     ) -> CandidateDotWork:
         """Dynamic dot work performed by one CTA under ``block_sizes``.
 
         Per-invocation dimensions use the candidate tile. Enclosing loop axes use
         the matching candidate trip count, so an axis represented by both terms is
         covered once as ``block * ceil(extent / block)`` rather than once at full
-        extent and again as an unresolved loop multiplier.
+        extent and again as an unresolved loop multiplier. ``indices`` restricts
+        the same calculation to selected dots for proposal ranking.
         """
         mm = env.config_spec.kernel_matmul_fact
         if mm is None:
@@ -1302,7 +1401,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         tcgen05_independent = 0
         tcgen05_carried = 0
         uncertain = False
-        for resolved in mm.matmuls:
+        selected = range(len(mm.matmuls)) if indices is None else indices
+        for index in selected:
+            resolved = mm.matmuls[index]
             fact = resolved.fact
             axes = resolved.axes
 
@@ -1320,7 +1421,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             n = extent("n", fact.n_block_id, fact.static_n)
             k = extent("k", fact.k_block_id, fact.static_k)
             site = resolved.site
-            fallback = max(1, site.loop_trips) if site is not None else 1
             loop_axes = getattr(site, "loop_axes", ()) if site is not None else ()
             exact_loop_trips = (
                 getattr(site, "exact_loop_trips", None) if site is not None else None
@@ -1328,19 +1428,17 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             if exact_loop_trips is not None:
                 trips = max(1, exact_loop_trips)
             elif site is not None:
-                resolved_trips, exact = cls._resolved_loop_trips_detail(
+                resolved_trips = cls._resolved_loop_trips(
                     env,
                     block_sizes,
                     loop_axes,
-                    fallback=fallback,
                 )
-                # An unresolved upper bound is safe for stages but is not positive
-                # evidence that tcgen05 setup can be amortized. Use one proven
-                # invocation as the work lower bound and retain the uncertainty.
-                trips = resolved_trips if exact else 1
-                uncertain = uncertain or not exact
+                # Unknown work is not evidence that tcgen05 setup can be
+                # amortized. Retain one proven invocation as a lower bound.
+                trips = resolved_trips if resolved_trips is not None else 1
+                uncertain = uncertain or resolved_trips is None
             else:
-                trips = fallback
+                trips = 1
             work = m * n * k * trips
             total += work
             if m >= cls.TCGEN05_MIN_BM:
@@ -1449,7 +1547,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return max(
             (
                 rows * cols * cls.EPILOGUE_ACC_ITEMSIZE
-                for rows, cols, _itemsize in cls._all_dot_acc_tiles(env, block_sizes)
+                for rows, cols, _inner, _itemsize in cls._all_dot_acc_tiles(
+                    env, block_sizes
+                )
             ),
             default=0,
         )
@@ -1462,9 +1562,35 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_stages: int,
     ) -> int:
         """Peak whole-kernel SMEM under one complete block-size candidate."""
-        region_peak = cls._smem_from_map(env, block_sizes, num_stages)
-        epilogue_peak = cls._epilogue_smem(env, block_sizes)
-        return max(region_peak, epilogue_peak) + cls.SMEM_SLACK
+        return max(
+            cls._kernel_smem_demands(env, block_sizes, num_stages),
+            default=cls.SMEM_SLACK,
+        )
+
+    @classmethod
+    def _kernel_smem_demands(
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        num_stages: int,
+        *,
+        hard_allocation: bool = False,
+    ) -> tuple[int, ...]:
+        """Independently binding SMEM demands under one candidate."""
+        demands = list(
+            cls._smem_region_demands(
+                env,
+                block_sizes,
+                num_stages,
+                hard_allocation=hard_allocation,
+            )
+        )
+        epilogue = cls._epilogue_smem(env, block_sizes)
+        if epilogue:
+            demands.append(epilogue)
+        if not demands:
+            demands.append(0)
+        return tuple(demand + cls.SMEM_SLACK for demand in demands)
 
     @classmethod
     def _apply_knob_roles(
@@ -1738,10 +1864,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_sm: int,
         shrinkable: list[int],
         largest_first: bool,
-        max_corrections: int,
-        extra_over_budget: Callable[[list[int], int], bool] | None = None,
     ) -> tuple[int, int]:
-        """Reduce stages, then selected block knobs, until hard resources fit."""
+        """Reduce stages, then shrink knobs that relieve an overflowing resource."""
         slot_of: dict[int, int] = {}
         floors: dict[int, int] = {}
         for slot in range(len(env.config_spec.block_sizes)):
@@ -1749,60 +1873,153 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             slot_of[bs.block_id] = slot
             floors[bs.block_id] = max(1, bs.min_size, bs.autotuner_min)
 
-        def smem_over() -> bool:
-            return cls.ENFORCE_SMEM_BUDGET and (
-                cls._kernel_smem_bytes(env, block_sizes, num_stages) > cls.SMEM_BUDGET
-            )
-
-        def tmem_over() -> bool:
-            return (
-                cls.TMEM_COLUMN_BUDGET is not None
-                and num_warps >= cls.TCGEN05_WARPGROUP_WARPS
-                and cls._tmem_columns(cls._all_dot_acc_tiles(env, block_sizes))
-                > cls.TMEM_COLUMN_BUDGET
-            )
-
-        def over_budget() -> bool:
-            return (
-                smem_over()
-                or tmem_over()
-                or (
-                    extra_over_budget is not None
-                    and extra_over_budget(block_sizes, num_warps)
+        def hard_resources(
+            candidate: list[int],
+            warps: int,
+            stages: int,
+        ) -> tuple[tuple[int, int], ...]:
+            resources: list[tuple[int, int]] = []
+            if cls.ENFORCE_SMEM_BUDGET:
+                resources.extend(
+                    (demand, cls.SMEM_BUDGET)
+                    for demand in cls._kernel_smem_demands(
+                        env,
+                        candidate,
+                        stages,
+                        hard_allocation=True,
+                    )
                 )
+            if cls.TMEM_COLUMN_BUDGET is not None:
+                # This scratch-inclusive allocation-unit model also dominates
+                # the old per-dot TMEM byte check.
+                resources.append(
+                    (
+                        (
+                            cls._tmem_columns(
+                                cls._all_dot_acc_tiles(env, candidate),
+                                include_lhs_scratch=True,
+                            )
+                            if warps >= cls.TCGEN05_WARPGROUP_WARPS
+                            else 0
+                        ),
+                        cls.TMEM_COLUMN_BUDGET,
+                    )
+                )
+            return tuple(resources)
+
+        def relief(
+            current: tuple[tuple[int, int], ...],
+            trial: tuple[tuple[int, int], ...],
+        ) -> tuple[int, float] | None:
+            reductions = tuple(
+                (demand, budget, trial_demand)
+                for (demand, budget), (trial_demand, _trial_budget) in zip(
+                    current,
+                    trial,
+                    strict=True,
+                )
+                if demand > budget and trial_demand < demand
+            )
+            if not reductions:
+                return None
+            return (
+                sum(trial_demand <= budget for _, budget, trial_demand in reductions),
+                sum(
+                    (demand - trial_demand) / max(1, demand)
+                    for demand, _, trial_demand in reductions
+                ),
             )
 
-        guard = 0
-        while over_budget() and guard < max_corrections:
-            guard += 1
-            if num_stages > cls.MIN_NUM_STAGES and smem_over():
-                num_stages -= 1
-                continue
+        while True:
+            current = hard_resources(block_sizes, num_warps, num_stages)
+            if all(demand <= budget for demand, budget in current):
+                break
+
+            if num_stages > cls.MIN_NUM_STAGES:
+                trial_stages = num_stages - 1
+                trial_resources = hard_resources(
+                    block_sizes,
+                    num_warps,
+                    trial_stages,
+                )
+                if relief(current, trial_resources) is not None:
+                    num_stages = trial_stages
+                    continue
+
             candidates = [
                 bid
-                for bid in shrinkable
+                for bid in dict.fromkeys(shrinkable)
                 if bid in slot_of
-                and block_sizes[slot_of[bid]] // 2
-                >= max(
-                    floors[bid],
-                    min(cls.DOT_MIN, block_sizes[slot_of[bid]]),
-                )
+                and block_sizes[slot_of[bid]] // 2 >= max(floors[bid], cls.DOT_MIN)
             ]
-            if not candidates:
+            mm = env.config_spec.kernel_matmul_fact
+            # Keep per-dot work fixed while scoring trials: only crossing the
+            # tcgen05 eligibility boundary should change this preference.
+            dot_weights = (
+                tuple(
+                    cls._candidate_dot_work(
+                        env,
+                        block_sizes,
+                        indices=(index,),
+                    ).total
+                    for index in range(len(mm.matmuls))
+                )
+                if mm is not None
+                else ()
+            )
+            trials: list[tuple[tuple[int, int, int, float, int], list[int], int]] = []
+            for position, bid in enumerate(candidates):
+                trial = list(block_sizes)
+                trial[slot_of[bid]] //= 2
+                trial_warps = cls._solve_candidate_warps(
+                    env,
+                    trial,
+                    num_warps,
+                    num_stages,
+                    num_sm,
+                )
+                trial_resources = hard_resources(trial, trial_warps, num_stages)
+                impact = relief(
+                    current,
+                    trial_resources,
+                )
+                if impact is None:
+                    continue
+                legal = all(demand <= budget for demand, budget in trial_resources)
+                tcgen05_work = (
+                    sum(
+                        weight
+                        for index, weight in enumerate(dot_weights)
+                        if cls._candidate_dot_work(
+                            env,
+                            trial,
+                            indices=(index,),
+                        ).tcgen05_eligible
+                    )
+                    if trial_warps >= cls.TCGEN05_WARPGROUP_WARPS
+                    else 0
+                )
+                legacy_tiebreak = (
+                    block_sizes[slot_of[bid]] if largest_first else -position
+                )
+                cleared, normalized_relief = impact
+                trials.append(
+                    (
+                        (
+                            int(legal),
+                            cleared,
+                            tcgen05_work,
+                            0.0 if legal else normalized_relief,
+                            legacy_tiebreak,
+                        ),
+                        trial,
+                        trial_warps,
+                    )
+                )
+            if not trials:
                 break
-            victim = (
-                max(candidates, key=lambda bid: block_sizes[slot_of[bid]])
-                if largest_first
-                else candidates[0]
-            )
-            block_sizes[slot_of[victim]] //= 2
-            num_warps = cls._solve_candidate_warps(
-                env,
-                block_sizes,
-                num_warps,
-                num_stages,
-                num_sm,
-            )
+            _score, winner, num_warps = max(trials, key=itemgetter(0))
+            block_sizes[:] = winner
 
         num_warps = cls._solve_candidate_warps(
             env,
@@ -1822,6 +2039,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         itemsize: int,
         num_sm: int,
         pinned_grid: int = 1,
+        *,
+        launch_grid: Callable[[int, int], int] | None = None,
+        allow_l2_grouping: bool = True,
     ) -> tuple[int, int, int, int, int, int]:
         """Budget/roofline formula: turns ``(M, N, K, operand-width)`` into ``(block_m, block_n,
         block_k, num_warps, num_stages, l2_grouping)`` with no lookup. Reads its budget constants
@@ -1880,8 +2100,21 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
 
         wave_full = cls.WAVE_FULL
 
+        if launch_grid is None:
+            # The standalone formula helper is explicitly a clean GEMM: M and N
+            # are proven grid axes, while ``pinned_grid`` represents the remaining
+            # launch dimensions. Production dot proposals supply the exact
+            # DeviceIR-derived callback below.
+            def launch_grid(_bm: int, _bn: int) -> int:
+                return (
+                    max(1, pinned_grid)
+                    * max(1, -(-m // max(1, _bm)))
+                    * max(1, -(-n // max(1, _bn)))
+                )
+
         def _wave_eff(_bm: int, _bn: int) -> float:
-            g = max(1, pinned_grid) * ((m + _bm - 1) // _bm) * ((n + _bn - 1) // _bn)
+            assert launch_grid is not None
+            g = launch_grid(_bm, _bn)
             waves = (g + num_sm - 1) // num_sm
             return g / (waves * num_sm)
 
@@ -2017,9 +2250,14 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         # (6) l2_grouping: reorder PIDs so a group of M-tiles shares an L2-resident B operand. Helps
         # a tall tile-grid (many M-tiles reuse one B) but hurts a wide/square grid, so gate on the
         # measured crossover grid_m >= L2_TALL_RATIO * grid_n.
-        grid_m = (m + bm - 1) // bm
-        grid_n = (n + bn - 1) // bn
-        l2_grouping = 2 if grid_m > 1 and grid_m >= cls.L2_TALL_RATIO * grid_n else 1
+        if allow_l2_grouping:
+            grid_m = (m + bm - 1) // bm
+            grid_n = (n + bn - 1) // bn
+            l2_grouping = (
+                2 if grid_m > 1 and grid_m >= cls.L2_TALL_RATIO * grid_n else 1
+            )
+        else:
+            l2_grouping = 1
 
         return bm, bn, bk, num_warps, num_stages, l2_grouping
 
@@ -2031,7 +2269,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         axes: DotAxes | None,
         itemsize: int,
         num_sm: int,
-        pinned_grid: int,
         site: DotSite | None = None,
     ) -> tuple[int, int, int, int, int, int]:
         """Project one dot-local formula proposal onto the axes the kernel exposes."""
@@ -2054,23 +2291,67 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         elif k_logical is None and axes is not None and axes.k_extent:
             k_logical = axes.k_extent
 
+        spec = env.config_spec
+        bounds: dict[int, tuple[int, int]] = {}
+        slot_of: dict[int, int] = {}
+        for slot in range(len(spec.block_sizes)):
+            block_spec = cast("BlockSizeSpec", spec.block_sizes[slot])
+            slot_of[block_spec.block_id] = slot
+            bounds[block_spec.block_id] = (
+                max(1, block_spec.min_size, block_spec.autotuner_min),
+                block_spec.max_size,
+            )
+        base_blocks = cls._base_block_sizes(env)
+        graph_ids = (site.graph_id,) if site is not None else None
+        grid_ids = set(_grid_group_for_site(spec, site))
+        output_axes = (("m", fact.m_block_id), ("n", fact.n_block_id))
+        allow_l2_grouping = all(
+            block_id is not None
+            and block_id in slot_of
+            and block_id in grid_ids
+            and (axes is None or axes.kind(axis) is DotAxisKind.TUNABLE_TILED)
+            for axis, block_id in output_axes
+        )
+        pinned_grid = cls._launch_grid_for_graphs(
+            env,
+            base_blocks,
+            graph_ids=graph_ids,
+            collapsed_block_ids=tuple(
+                block_id for _axis, block_id in output_axes if block_id is not None
+            ),
+        )
+
+        def candidate_launch_grid(candidate_m: int, candidate_n: int) -> int:
+            block_sizes = list(base_blocks)
+            for block_id, value in (
+                (fact.m_block_id, candidate_m),
+                (fact.n_block_id, candidate_n),
+            ):
+                if block_id is None or block_id not in slot_of:
+                    continue
+                lo, hi = bounds[block_id]
+                block_sizes[slot_of[block_id]] = max(lo, min(hi, value))
+            return cls._launch_grid_for_graphs(
+                env,
+                block_sizes,
+                graph_ids=graph_ids,
+            )
+
         bm, bn, bk, num_warps, num_stages, l2 = cls._matmul_tile(
-            m_extent, n_extent, k_logical or cls.DOT_MIN, itemsize, num_sm, pinned_grid
+            m_extent,
+            n_extent,
+            k_logical or cls.DOT_MIN,
+            itemsize,
+            num_sm,
+            pinned_grid,
+            launch_grid=candidate_launch_grid,
+            allow_l2_grouping=allow_l2_grouping,
         )
 
         if axes is None:
             return bm, bn, bk, num_warps, num_stages, l2
 
         # (2) project
-        spec = env.config_spec
-        bounds: dict[int, tuple[int, int]] = {}
-        for i in range(len(spec.block_sizes)):
-            bs = cast("BlockSizeSpec", spec.block_sizes[i])
-            bounds[bs.block_id] = (
-                max(1, bs.min_size, bs.autotuner_min),
-                bs.max_size,
-            )
-
         def project(axis: str, value: int, bid: int | None) -> int:
             if axes.kind(axis) is DotAxisKind.FIXED_FULL_EXTENT:
                 return max(1, axes.extent(axis) or value)
@@ -2107,7 +2388,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         axes: DotAxes | None,
         itemsize: int,
         num_sm: int,
-        pinned_grid: int,
         site: DotSite | None = None,
     ) -> tuple[int, int, int, int, int, int]:
         """Finalize one projected dot against its complete kernel block-size candidate."""
@@ -2117,7 +2397,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             axes,
             itemsize,
             num_sm,
-            pinned_grid,
             site=site,
         )
         if axes is None:
@@ -2137,12 +2416,15 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         if cls.SINGLE_ROLE_AWARE_KNOBS and mm is not None:
             cls._apply_knob_roles(env, mm, emitted, num_sm)
         if site_loop_axes:
-            loop_trips = cls._resolved_loop_trips(
+            resolved_loop_trips = cls._resolved_loop_trips(
                 env,
                 emitted,
                 site_loop_axes,
-                fallback=loop_trips,
             )
+            if resolved_loop_trips is not None:
+                loop_trips = resolved_loop_trips
+            elif site is not None and site.max_loop_trips is not None:
+                loop_trips = max(1, site.max_loop_trips)
 
         if cls.GRADED_STAGES and k_fixed:
             num_stages = cls._solve_candidate_stages(
@@ -2174,12 +2456,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 value(fact.k_block_id, base_tile[2]),
             )
 
-        def focal_tmem_over(block_sizes: list[int], warps: int) -> bool:
-            if warps < cls.TCGEN05_WARPGROUP_WARPS or cls.TMEM_BUDGET is None:
-                return False
-            tile_m, tile_n, tile_k = dot_tile(block_sizes)
-            return cls._tmem_bytes(tile_m, tile_n, tile_k, itemsize) > cls.TMEM_BUDGET
-
         shrinkable = [
             block_id
             for axis, block_id in (
@@ -2196,8 +2472,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             num_sm=num_sm,
             shrinkable=shrinkable,
             largest_first=False,
-            max_corrections=40,
-            extra_over_budget=focal_tmem_over,
         )
         bm, bn, bk = dot_tile(emitted)
         return bm, bn, bk, num_warps, num_stages, l2
@@ -2217,20 +2491,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_sm = max(1, get_num_sm(env.device))
         mm = env.config_spec.kernel_matmul_fact
         site = mm.matmuls[0].site if mm is not None and mm.matmuls else None
-        base_blocks = list(
-            cast(
-                "list[int]",
-                spec._base_default_config().config.get("block_sizes", []),
-            )
-        )
-        block_of = cls._full_block_map(env, base_blocks)
-        grid_block_ids = _grid_group_for_site(spec, site)
-        pinned_grid = _h100_pinned_grid(
-            env,
-            fact,
-            block_of,
-            grid_block_ids,
-        )
         # The budget formula sizes the dot tile under a register/SMEM budget, keyed on
         # (M, N, K, operand-width via itemsize) and the pinned batch grid. ``_tile_for_dot``
         # then projects that proposal onto the axes this kernel actually exposes and
@@ -2238,7 +2498,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         # tunable axes and one live accumulator it returns the proposal unchanged.
         axes = _axis_roles(env.config_spec, 0) if cls.GENERALIZED_AXES else None
         bm, bn, bk, nw, ns, l2 = cls._tile_for_dot(
-            env, fact, axes, itemsize, num_sm, pinned_grid, site=site
+            env, fact, axes, itemsize, num_sm, site=site
         )
 
         def _extra(
@@ -2255,7 +2515,6 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 _nw,
                 _ns,
                 _l2,
-                pinned_grid,
                 num_sm,
             )
 
@@ -2469,13 +2728,10 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     SINGLE_ROLE_AWARE_KNOBS = True
     ROLE_FLAT_OUTPUT = True
     ROLE_GRID_FILL = True
-    # tcgen05 tensor memory is allocated by ``tcgen05.alloc``, whose column count is a
-    # power of two and AT LEAST 32. An accumulator narrower than 32 columns therefore
-    # reserves 32 columns anyway while issuing half the MMA work per instruction, so 32
-    # is a hardware floor on any knob that sizes an accumulator extent -- not a tuned
-    # constant. Measured: on a reuse-free output axis, 32 beats 16 on every case swept
-    # (wy_delta#2 1.209 vs 1.111, #10 1.192 vs 1.139, #15 1.179 vs 1.090,
-    # wy_delta_varlen#0 1.737 vs 1.460) and beats the un-corrected draft by 1.2-1.8x.
+    # tcgen05 tensor memory allocates at least 32 columns. Use that as the floor
+    # only for a non-grid, reuse-free N output knob: below 32 it reserves the
+    # same tensor memory while issuing less MMA work. M uses the tcgen05 row
+    # threshold, and launch-grid knobs use their legal block minimum.
     TMEM_ALLOC_COLUMNS = 32
 
     @classmethod
@@ -2501,9 +2757,15 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
         """
         for region in mm.pipelined_regions:
             tiles = region.tiles
-            if not any(block_id in t.dim_block_ids for t in tiles):
+            loop_block_ids = {axis.block_id for axis in region.loop_axes}
+            if block_id not in loop_block_ids and not any(
+                block_id in tile.dim_block_ids for tile in tiles
+            ):
                 continue
-            if any(t.kind == "load" and block_id not in t.dim_block_ids for t in tiles):
+            if any(
+                tile.kind == "load" and block_id not in tile.dim_block_ids
+                for tile in tiles
+            ):
                 return True
         return False
 
@@ -2531,8 +2793,11 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
           while the launch is below one wave and the shrink strictly improves wave
           utilization.
 
-        The floor is the same quantity in both cases, ``TMEM_ALLOC_COLUMNS``, because
-        it is a hardware allocation granularity rather than a policy choice.
+        Reuse-free N axes stop at the tensor-memory column granularity. M axes
+        stop at ``TCGEN05_MIN_BM`` so this correction does not remove tcgen05
+        from the later regime-aware warp solve. Grid axes stop at their legal
+        block minimum; tensor-memory allocation granularity is not a launch-grid
+        constraint.
         """
         spec = env.config_spec
         grid_ids = set(spec.grid_block_ids)
@@ -2543,17 +2808,24 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
             slot_of[bs.block_id] = slot
             lo_of[bs.block_id] = max(1, bs.min_size, bs.autotuner_min)
 
-        def claimed_as_output(users: tuple[tuple[int, str], ...]) -> bool:
-            return any(axis in ("m", "n") for _i, axis in users)
+        def output_floor(users: tuple[tuple[int, str], ...]) -> int | None:
+            roles = {axis for _index, axis in users}
+            if "m" in roles:
+                return cls.TCGEN05_MIN_BM
+            if "n" in roles:
+                return cls.TMEM_ALLOC_COLUMNS
+            return None
 
         # (1) reuse-free output knobs -> the allocation floor.
         for bid, users in mm.knob_users if cls.ROLE_FLAT_OUTPUT else ():
             if bid not in slot_of or bid in grid_ids or not users:
                 continue
-            if not claimed_as_output(users) or cls._knob_amortizes(mm, bid):
+            floor = output_floor(users)
+            if floor is None or cls._knob_amortizes(mm, bid):
                 continue
             slot = slot_of[bid]
-            target = min(cls._axis_extent(env, bid), cls.TMEM_ALLOC_COLUMNS)
+            extent = cls._axis_extent(env, bid)
+            target = floor if extent is None else min(extent, floor)
             block_sizes[slot] = max(lo_of[bid], min(block_sizes[slot], target))
 
         # (2) grid knobs -> fill one wave, but only across a favorable wave boundary.
@@ -2575,7 +2847,7 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
             candidates: list[int] = []
             for bid in grid_knobs:
                 slot = slot_of[bid]
-                if block_sizes[slot] // 2 < max(lo_of[bid], cls.TMEM_ALLOC_COLUMNS):
+                if block_sizes[slot] // 2 < lo_of[bid]:
                     continue
                 trial = list(block_sizes)
                 trial[slot] //= 2
@@ -2678,21 +2950,31 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
         return not any(_is_fp8_matmul_fact(resolved.fact) for resolved in mm.matmuls)
 
     @classmethod
-    def _rank_key(cls, mm: KernelMatmulFact, index: int) -> tuple[int, int, int]:
+    def _rank_key(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        index: int,
+        block_sizes: list[int],
+    ) -> tuple[int, int, int]:
         """Dynamic importance of one dot. Higher wins.
 
         ``updates_carry`` leads because a dot writing a loop-carried accumulator keeps that
-        accumulator resident for the whole loop; ``dot_work`` (``m*n*k`` times executions) is
-        the magnitude term; the dot's own output area breaks remaining ties toward the dot
-        with the most to lose from a bad tile. Untrusted attribution collapses the first term
-        for every dot equally, so ranking degrades to pure work rather than to an arbitrary
-        order."""
+        accumulator resident for the whole loop; candidate-resolved dynamic work is the
+        magnitude term; the dot's own output area breaks remaining ties toward the dot with
+        the most to lose from a bad tile. Untrusted attribution collapses the first term for
+        every dot equally, so ranking degrades to pure work rather than to an arbitrary order."""
         resolved = mm.matmuls[index]
         carry = 1 if (mm.attribution_complete and resolved.site.updates_carry) else 0
         f = resolved.fact
         ax = resolved.axes
         area = (f.static_m or ax.m_extent or 1) * (f.static_n or ax.n_extent or 1)
-        return (carry, mm.dot_work(index), area)
+        work = cls._candidate_dot_work(
+            env,
+            block_sizes,
+            indices=(index,),
+        ).total
+        return (carry, work, area)
 
     @classmethod
     def _proposal_for(
@@ -2714,7 +2996,6 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
             ax,
             itemsize,
             num_sm,
-            max(1, mm.outer_grid),
             site=resolved.site,
         )
 
@@ -2735,7 +3016,26 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
         if not proposals:
             return None
 
-        order = sorted(proposals, key=lambda i: cls._rank_key(mm, i), reverse=True)
+        proposal_blocks = {
+            index: _h100_build_block_sizes(
+                spec,
+                mm.matmuls[index].fact,
+                proposal[0],
+                proposal[1],
+                proposal[2],
+            )
+            for index, proposal in proposals.items()
+        }
+        order = sorted(
+            proposals,
+            key=lambda i: cls._rank_key(
+                env,
+                mm,
+                i,
+                proposal_blocks[i],
+            ),
+            reverse=True,
+        )
         rank_of = {i: r for r, i in enumerate(order)}
 
         # --- block sizes: the winning dot's value for each contested knob ---------------
@@ -2794,7 +3094,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
             loop_trips = cls._pipelined_loop_trips(
                 env,
                 stage_ring,
-                fallback=max(1, mm.sequential_loop_trips),
+                max_loop_trips=max(1, mm.sequential_loop_trips),
             )
             num_stages = cls._solve_candidate_stages(
                 env,
@@ -2834,7 +3134,6 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
             num_sm=draft["_num_sm"],
             shrinkable=[bid for bid, _users in mm.knob_users],
             largest_first=True,
-            max_corrections=64,
         )
         draft["_grid"] = cls._launch_grid(env, block_sizes)
 
