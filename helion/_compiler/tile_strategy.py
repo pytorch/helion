@@ -1876,6 +1876,17 @@ class RemoteRecvDrain:
 
 
 @dataclasses.dataclass
+class RemoteSendDrain:
+    """Deferred send completions for one looped computed-source ring."""
+
+    semaphore: str
+    references: tuple[ast.AST, ...]
+    slot: ast.AST
+    pending_counter: str | None = None
+    waits_deferred: bool = False
+
+
+@dataclasses.dataclass
 class ForiLoopState(DeviceLoopOrGridState):
     """State for fori_loop-based loops on TPU (Pallas backend).
 
@@ -1902,6 +1913,7 @@ class ForiLoopState(DeviceLoopOrGridState):
     _remote_recv_drains: dict[tuple[str, tuple[int, ...]], RemoteRecvDrain] = (
         dataclasses.field(default_factory=dict)
     )
+    _remote_send_drains: list[RemoteSendDrain] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
