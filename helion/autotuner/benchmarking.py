@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import functools
 import glob
 import logging
 import math
@@ -16,9 +15,11 @@ from typing import TypeVar
 
 import torch
 
+from .._compiler.ascend.config import is_npu
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
+from helion import _compat
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
@@ -28,6 +29,19 @@ T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+
+
+def _bench_device_synchronize() -> None:
+    """Synchronize the active device for wall-clock microbenchmarks.
+
+    On Ascend, ``torch.accelerator.synchronize()`` can disagree with torch_npu's
+    stream bookkeeping when multiple kernels were queued; use
+    ``torch.npu.synchronize()`` when NPU is available.
+    """
+    if is_npu():
+        torch.npu.synchronize()  # pyrefly: ignore[missing-attribute]
+    else:
+        torch.accelerator.synchronize()
 
 
 def _make_l2_cache_clearer() -> Callable[[], None]:
@@ -126,8 +140,11 @@ def clear_jit_fast_path_caches(
 
 def synchronize_device() -> None:
     """Wait for device computation to complete."""
-    if not is_pallas_interpret() and torch.accelerator.is_available():
-        torch.accelerator.synchronize()
+    if not is_pallas_interpret():
+        if is_npu():
+            torch.npu.synchronize()  # pyrefly: ignore[missing-attribute]
+        elif torch.accelerator.is_available():
+            torch.accelerator.synchronize()
 
 
 def compute_repeat(
@@ -147,7 +164,6 @@ def compute_repeat(
     from triton import runtime
 
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
 
     # Warm the pipeline once before collecting timing samples.
     fn()
@@ -158,7 +174,7 @@ def compute_repeat(
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(estimate_runs):
-        runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
+        _compat.safe_clear_cache()
         benchmark_function()
     end_event.record()
     di.synchronize()
@@ -227,11 +243,7 @@ def interleaved_bench(
     # warmup
     for fn in fns:
         fn()
-    clear_cache = functools.partial(
-        runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
-        runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
-    )
-    clear_cache()
+    _compat.safe_clear_cache()
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     start_events = [
         [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
@@ -255,7 +267,7 @@ def interleaved_bench(
     )
     for i in iterator:
         for j in range(len(benchmark_functions)):
-            clear_cache()
+            _compat.safe_clear_cache()
             start_events[j][i].record()
             benchmark_functions[j]()
             end_events[j][i].record()
@@ -385,7 +397,7 @@ def _pallas_device_micros_for_fn(
     xplane/TPU plane, too few events). Kernel exceptions from ``fn`` propagate.
     """
     try:
-        import jax  # pyrefly: ignore[missing-module-attribute]
+        import jax  # pyrefly: ignore[missing-import]
     except ImportError:
         return math.inf
 
@@ -466,30 +478,71 @@ def make_pallas_paired_device_micros_bench(
     return _bench
 
 
+def _coerce_triton_timing(val: object) -> float | tuple[float, ...]:
+    """Coerce a timing value from ``_summarize_statistics`` to plain float(s).
+
+    Handles plain numbers and tuples of numbers; some triton builds return
+    Tensors (or tuples containing Tensors), which are moved to CPU first.
+    """
+    if isinstance(val, torch.Tensor):
+        return float(val.detach().cpu().item())
+    if isinstance(val, tuple):
+        return tuple(
+            float(x.detach().cpu().item()) if isinstance(x, torch.Tensor) else float(x)
+            for x in val
+        )
+    return float(val)  # pyrefly: ignore[bad-argument-type]
+
+
+def _npu_summarize_times(
+    times: list[float], quantiles: list[float] | None, return_mode: str
+) -> float | tuple[float, ...]:
+    """Summarize do_bench timings on NPU.
+
+    Ascend's triton ``_summarize_statistics`` takes a Tensor input where CUDA
+    upstream takes a list, and some builds return Tensor outputs, so the
+    result is coerced back to plain floats via ``_coerce_triton_timing``.
+    """
+    from triton.testing import _summarize_statistics
+
+    raw = _summarize_statistics(torch.tensor(times), quantiles, return_mode)  # pyrefly: ignore
+    return _coerce_triton_timing(raw)
+
+
 def _summarize_statistics_fallback(
-    times: list[float],
+    times: list[float] | object,
     quantiles: list[float] | None,
     return_mode: str,
 ) -> float | tuple[float, ...]:
-    """Fallback statistics summarizer when triton.testing._summarize_statistics is unavailable."""
+    """Fallback statistics summarizer when triton.testing._summarize_statistics is unavailable.
+
+    Handles both Python lists and torch tensors.
+    """
+    if isinstance(times, torch.Tensor):
+        times_list = times.cpu().tolist()
+    elif isinstance(times, list):
+        times_list = times
+    else:
+        times_list = list(times)  # type: ignore[arg-type]
+
     if return_mode == "min":
-        return min(times)
+        return min(times_list)
     if return_mode == "max":
-        return max(times)
+        return max(times_list)
     if return_mode == "mean":
-        return statistics.mean(times)
+        return statistics.mean(times_list)
     if return_mode == "median":
-        return statistics.median(times)
+        return statistics.median(times_list)
     # "all" mode
     if quantiles is not None:
-        sorted_times = sorted(times)
+        sorted_times = sorted(times_list)
         n = len(sorted_times)
         result = []
         for q in quantiles:
             idx = min(int(q * n), n - 1)
             result.append(sorted_times[idx])
         return tuple(result)
-    return statistics.median(times)
+    return statistics.median(times_list)
 
 
 # This function is copied from triton._testing.do_bench with modification
@@ -543,15 +596,13 @@ def do_bench(
         else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
     )
 
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
-
     if fixed_repetitions is None:
         # Estimate the runtime of the function
         start_event = di.Event(enable_timing=True)
         end_event = di.Event(enable_timing=True)
         start_event.record()
         for _ in range(5):
-            runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+            _compat.safe_clear_cache()
             benchmark_function()
         end_event.record()
         di.synchronize()
@@ -581,8 +632,8 @@ def do_bench(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        # we clear the L2 cache before each run if supported
+        _compat.safe_clear_cache()
         # record time of `fn`
         start_event[i].record()
         benchmark_function()
@@ -590,6 +641,10 @@ def do_bench(
     # Record clocks
     di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+    # Ascend's triton ``_summarize_statistics`` expects a Tensor input where
+    # CUDA upstream takes a list; coerce its output back to plain floats.
+    if is_npu():
+        return _npu_summarize_times(times, quantiles, return_mode)
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
 
 
