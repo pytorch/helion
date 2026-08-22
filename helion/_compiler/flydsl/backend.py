@@ -267,11 +267,10 @@ class FlyDSLBackend(Backend):
         # Reset per-compilation state so helpers are re-emitted on each compile.
         self._flydsl_helpers_emitted = False
         # Elementwise regime: block_sizes = [bm] (or [bm, 256]) -> bm rows/block,
-        # one warp (64 lanes) per row, block = 64*bm threads. W is always 1.
+        # one warp (64 lanes) per row, block = 64*bm threads.
         bs = getattr(config, "block_sizes", None) or [1]
         bm = int(bs[0]) if bs else 1
 
-        self._flydsl_warps_per_row = 1
         self._flydsl_bm = bm
         self._flydsl_num_threads = 64 * bm
 
@@ -303,9 +302,6 @@ class FlyDSLBackend(Backend):
         # Row (grid) tile -> warps. A block holds bm rows as bm warps; warp
         # w = thread_idx.x // 64 owns row (block_idx.x * bm + w). Force dim x
         # (flat block) regardless of the axis Helion assigns.
-        # W>1 regime is one row per block (bm=1) -> row = block_idx.x, no warp offset.
-        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
-            return offset_var
         if block_size_var == "1":
             return offset_var
         return f"({offset_var}) + fx.thread_idx.x // 64"
@@ -313,13 +309,10 @@ class FlyDSLBackend(Backend):
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
-        # Column (loop) tile -> lanes. chunk = col_offset//vec + lane_id.
-        # W=1: lane_id = thread_idx.x % 64 (one warp/row).
-        # W>1: W*64 lanes cover one row -> lane_id = full thread_idx.x (no % 64).
+        # Column (loop) tile -> lanes. chunk = col_offset//vec + lane_id;
+        # one warp (64 lanes) per row so lane_id = thread_idx.x % 64.
         if block_size_var == "1":
             return offset_var
-        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
-            return f"({offset_var}) // 4 + fx.thread_idx.x"
         return f"({offset_var}) // 4 + fx.thread_idx.x % 64"
 
     def arange_expr(
@@ -331,18 +324,13 @@ class FlyDSLBackend(Backend):
         *,
         axis: int = 0,
     ) -> str:
-        # Column lane chunk: element_offset//vec + lane_id.
-        # W>1 uses the full thread id (W*64 lanes/row); W=1 uses thread_idx.x % 64.
-        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
-            return f"{offsets_var} = ({lid}) // 4 + fx.thread_idx.x"
+        # Column lane chunk: element_offset//vec + lane_id (one warp/row).
         return f"{offsets_var} = ({lid}) // 4 + fx.thread_idx.x % 64"
 
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
-        # Lane mask (flat block, dim x). W>1 spans W*64 lanes/row -> full thread id.
-        if getattr(self, "_flydsl_warps_per_row", 1) > 1:
-            return f"fx.thread_idx.x < ({block_size_var})"
+        # Lane mask (flat block, dim x): one warp (64 lanes) per row.
         return f"fx.thread_idx.x % 64 < ({block_size_var})"
 
     def lane_index_expr(

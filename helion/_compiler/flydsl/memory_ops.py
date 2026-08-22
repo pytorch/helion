@@ -123,8 +123,6 @@ def _flydsl_buffer_setup(
     Returns a dict the callers consume; the write/read tail handling is the only
     part that differs between store and load.
     """
-    backend = env.backend
-
     row_block_id = 0
     col_block_id = None
     seen_row = False
@@ -201,10 +199,6 @@ def _flydsl_buffer_setup(
     # Vectorized path (col_block_id is not None): x[tile_m,tile_n] -- 4 elems/thread, 256/tile.
     # Keep separate div/atom per (tensor, mode) so both paths can coexist for the same tensor.
     is_vec = col_block_id is not None
-    if getattr(backend, "_flydsl_warps_per_row", 1) > 1:
-        assert col_block_id is not None, (
-            "flydsl W>1 regime requires the vectorized (2D-tile) path"
-        )
 
     device_fn = state.device_function
     if not hasattr(device_fn, "_flydsl_setup"):
@@ -376,13 +370,13 @@ def _(state: CodegenState) -> None:
         # store needs no such guard because it never reads/writes the tail wide.
         #
         # Explicit hl.tile(n) column tail: N not a multiple of the per-iteration
-        # span (4 * 64 * W) -> the last chunk's high lanes address past column N.
+        # span (4 * 64) -> the last chunk's high lanes address past column N.
         _expl_tail = (
             is_vec
             and not is_rolled_col
             and not env.known_multiple(
                 env.block_sizes[col_block_id].numel,
-                4 * 64 * (getattr(backend, "_flydsl_warps_per_row", 1) or 1),
+                4 * 64,
             )
         )
         if rolled_col_pred is not None:
@@ -493,7 +487,7 @@ def _(state: CodegenState) -> ast.AST:
             chunk_idx = "fx.thread_idx.x"
 
         # Explicit hl.tile(n) column tail: N not a multiple of the per-iteration
-        # span (4 * 64 * W) -> the last chunk's high lanes would read past column N
+        # span (4 * 64) -> the last chunk's high lanes would read past column N
         # via the vectorized BufferCopy. The AMD buffer descriptor has max_size set
         # to 0xFFFFFFFF which should return 0 for OOB reads, but in practice the
         # hardware still fires a GPU page fault when the byte address exceeds the
@@ -505,7 +499,7 @@ def _(state: CodegenState) -> ast.AST:
             and not is_rolled_col
             and not env.known_multiple(
                 env.block_sizes[col_block_id].numel,
-                4 * 64 * (getattr(backend, "_flydsl_warps_per_row", 1) or 1),
+                4 * 64,
             )
         )
 
