@@ -39,7 +39,8 @@ def _(state: CodegenState) -> None:
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
     arg_name = state.device_function.tensor_arg(tensor).name
-    name = pallas_codegen.vmem_name(state, arg_name)
+    name = state.device_function.pallas_tensor_ref_name(tensor)
+    name = pallas_codegen.vmem_name(state, name)
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_store_index += 1
