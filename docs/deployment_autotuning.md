@@ -10,6 +10,17 @@ or package them as data files and load them with `helion.Config.load`
 deterministic, while also giving explicit control over when autotuning
 happens.
 
+> **Upgrade / release migration notice:** `HELION_AOT_MODE=disabled` now
+> bypasses deployed AOT heuristics and uses the compiler default config without
+> starting live autotuning; use `evaluate` to consume a deployed heuristic.
+> Generic `$HELION_AOT_DATA_DIR/heuristic_<kernel>.py` artifacts now require a
+> sibling `hardware.json`. Pre-manifest directories fail closed and must be
+> recollected into a fresh data directory rather than upgraded in place. See
+> *AOT hardware-manifest migration* below for the safe migration procedure.
+> Strict local-cache entries created with `autotune_best_of_k > 1` will miss
+> once and re-tune because their cache key now includes K correctly. The
+> default `autotune_best_of_k=1` cache hashes are unchanged.
+
 If you don't specify pre-tuned configs, Helion will autotune on the
 first call for each specialization key. This is convenient for
 experimentation, but not ideal for production since the first call
@@ -693,6 +704,19 @@ The decorator accepts a few extras:
 - `collect_fn` / `measure_fn` define the input sweeps the offline
   workflow uses for each phase, so the workflow can run end-to-end from
   a single benchmark invocation.
+- `standalone=False` disables standalone dispatcher emission in `compile`
+  mode. Runtime `evaluate` selection still uses the deployed heuristic.
+
+**AOT specialization compatibility:** in `evaluate` and `compile` modes, Helion
+combines every specialization key with the resolved artifact identity. This
+includes automatic shape keys, generated minimal projections, and explicit
+`key=fn` values, so hardware selection or `HELION_HEURISTIC_DIR` keeps different
+artifacts isolated. For an explicit key in `evaluate` mode, Helion flattens its
+value and applies the generated heuristic's minimal projection; inputs that the
+heuristic treats identically therefore share a specialization. `compile` mode
+retains the raw key value so every observed compile-time signature remains
+available. `collect`, `measure`, and `disabled` do not attach an artifact
+identity. User key functions do not need to encode hardware identity.
 
 See [`examples/aot_example.py`](https://github.com/pytorch/helion/blob/main/examples/aot_example.py)
 for runnable demonstrations of each option, and
@@ -711,6 +735,17 @@ python -m helion.autotuner.aot_runner -- python my_benchmark.py
 `my_benchmark.py` is *your* script — it imports the kernel and calls it
 on every shape in the sweep.  The runner re-invokes the script three
 times with different `HELION_AOT_MODE` settings:
+
+Each phase must run in a fresh process. Do not change `HELION_AOT_MODE` after
+an AOT kernel has been called in a process; Helion raises rather than reuse a
+warm bound-kernel/config cache under different phase semantics. The AOT runner
+enforces this contract by launching a new benchmark subprocess for each phase.
+
+The AOT key dispatcher also pins its data directory on first active use. Set
+`HELION_AOT_DATA_DIR` before the first call and do not change it afterward. If
+the variable is unset, Helion resolves `.helion_aot` relative to the working
+directory at that first call; a later `chdir` does not retarget the pinned
+directory. `HELION_AOT_MODE=disabled` does not inspect or pin this directory.
 
 1. **`collect`** — for each unique shape, autotune the kernel from
    scratch and record `(kernel, shape, config, timing)` triples in
@@ -746,6 +781,15 @@ HELION_AOT_MODE=measure HELION_AOT_DATA_DIR=./aot_data python my_benchmark.py
 # ...then call the heuristic generator directly via aot_runner.
 ```
 
+### Standalone compile contract
+
+`aot_kernel(..., standalone=True)` is the default. In `compile` mode, Helion
+may emit a standalone dispatcher containing the observed compiled variants.
+Set `standalone=False` when a kernel's runtime specializations can share one
+heuristic config but cannot be represented safely as one standalone dispatcher.
+This flag affects only standalone emission; it does not disable `collect`,
+`measure`, or runtime `evaluate` mode.
+
 ### Generated artifacts
 
 The runner emits two kinds of output: per-run *data files* (collected
@@ -773,9 +817,9 @@ AOT cache can find it at runtime.
 compute capability used for runtime lookup (e.g. `cuda_sm100`,
 `rocm_gfx950`).
 
-Only the heuristic file is meant to be checked in — it is the entire
-runtime artifact.  Everything under the data directory is disposable
-per-run state used to build the heuristic.
+For ordinary generated heuristics, the heuristic file is the entire runtime
+artifact and the only file meant to be checked in. Everything under the data
+directory is disposable per-run state used to build the heuristic.
 
 ### Heuristic file format
 
@@ -806,6 +850,45 @@ Because the file is plain Python, it is easy to inspect, hand-edit, or
 regenerate.  Helion ignores `_helion_aot_*.py` for ruff and pyrefly so
 they do not need to follow the project's lint rules.
 
+### Exact hardware-name contract
+
+Compute capability is sometimes too broad for a hand-reviewed heuristic. Such
+an artifact can declare an exact product-name allowlist as one module-level
+literal assignment:
+
+```python
+SUPPORTED_HARDWARE_NAMES = ("NVIDIA B200",)
+```
+
+Helion inspects `SUPPORTED_HARDWARE_NAMES` before executing the artifact. The
+value must be a nonempty literal sequence or set of nonempty strings. If the
+current `HardwareInfo.hardware_name` is absent, Helion skips that artifact even
+when its compute-capability filename is otherwise compatible. The declaration
+also becomes part of the artifact cache identity, preventing results selected
+for one exact product from aliasing another product.
+
+### AOT hardware-manifest migration
+
+Generic fallback artifacts stored as
+`$HELION_AOT_DATA_DIR/heuristic_<kernel>.py` now require a sibling
+`hardware.json`. The manifest proves the exact hardware identity that produced
+the directory. A directory created by an older Helion release may not contain
+this file; `evaluate` and `compile` then raise
+`AOTHardwareManifestError` before executing the generic heuristic rather than
+guessing its provenance.
+
+Do not backfill `hardware.json` or recollect into a directory that still
+contains legacy AOT artifacts, including `heuristic_*.py`,
+`tuned_configs_*.json`, `measurements_*.csv`, heuristic summaries, evaluation
+reports, or generated standalone modules. Helion intentionally refuses to
+adopt those files as products of the current machine. Re-run the workflow with
+a fresh, empty `HELION_AOT_DATA_DIR` (or a new `aot_runner --run-id`), then
+retire the legacy directory after the new collect → measure → evaluate run
+succeeds.
+Compute-capability-named artifacts deployed next to kernel source are not this
+generic data-directory fallback, but their optional exact-name contract above
+still applies.
+
 ### Runtime lookup and compute-capability fallback
 
 At kernel-call time, `AOTAutotuneCache` looks for a heuristic file in
@@ -822,6 +905,12 @@ this order:
 
 If no file is found, the cache falls back to the kernel's default
 config and prints a one-time warning naming the AOT runner.
+
+> **Behavior change — `HELION_AOT_MODE=disabled`:** disabled mode no longer
+> loads checked-in heuristic files. It now bypasses every AOT artifact and uses
+> the kernel's compiler default config without starting a live autotuning
+> search. Use `evaluate` (the default when `HELION_AOT_MODE` is unset) to load a
+> deployed heuristic.
 
 ### Pretuning a kernel for new hardware
 

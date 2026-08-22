@@ -31,12 +31,16 @@ import logging
 from pathlib import Path
 import re
 import sys
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
 
 import numpy as np
 
 from ..runtime.config import Config
+
+if TYPE_CHECKING:
+    from .._hardware import HardwareInfo
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -865,6 +869,7 @@ def generate_heuristic(
     kernel_name: str | None = None,
     target: PerformanceTarget | None = None,
     kernel_source_files: dict[str, str] | None = None,
+    hardware: HardwareInfo | None = None,
 ) -> dict[str, HeuristicResult]:
     """
     Generate heuristics for all kernels in the measurements file.
@@ -877,12 +882,12 @@ def generate_heuristic(
         kernel_source_files: Optional dict mapping kernel names to source file paths.
             If provided, heuristics are also saved next to source files as
             _<filename>_<device>_<compute>.py
+        hardware: Hardware identity used for adjacent heuristic filenames. If omitted,
+            discovers hardware in the current process.
 
     Returns:
         Dictionary mapping kernel names to HeuristicResult
     """
-    from .._hardware import get_hardware_info
-
     if target is None:
         target = PerformanceTarget()
 
@@ -893,8 +898,12 @@ def generate_heuristic(
     results: dict[str, HeuristicResult] = {}
 
     # Get device info for naming heuristic files
-    hw = get_hardware_info()
-    device_kind, compute_kind = hw.device_kind, hw.compute_capability
+    if hardware is None:
+        from .._hardware import get_hardware_info
+
+        hardware = get_hardware_info()
+    device_kind = hardware.device_kind
+    compute_kind = hardware.compute_capability
 
     for kname, data in all_data.items():
         log.info(f"Generating heuristic for kernel: {kname}")

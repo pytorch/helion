@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 
 import torch
+
+log: logging.Logger = logging.getLogger(__name__)
 
 # Compute capability lists for fallback (newest to oldest)
 _CUDA_COMPUTE_CAPS: list[str] = [
@@ -36,7 +39,7 @@ class HardwareInfo:
     Hardware information for cache keys and heuristic selection.
 
     Attributes:
-        device_kind: Device type ('cuda', 'rocm', 'xpu')
+        device_kind: Device type ('cuda', 'rocm', 'xpu', or 'tpu')
         hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a')
         runtime_version: Runtime version (e.g., '12.4', 'gfx90a')
         compute_capability: Compute capability for heuristics (e.g., 'sm90', 'gfx90a')
@@ -75,17 +78,34 @@ class HardwareInfo:
             return [self.compute_capability, *arch_list]
 
 
-@functools.cache
 def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     """
     Get hardware information for the current or specified device.
 
     Args:
-        device: Optional device to get info for. If None, uses first available GPU or CPU.
+        device: Optional device to get info for. If None, discovers an accelerator.
+            An explicit CPU device prefers a TPU because Pallas uses CPU tensors as
+            its bridge, then retains the normal CUDA/ROCm fallback.
 
     Returns:
         HardwareInfo with device details for caching and heuristic lookup.
     """
+    if device is not None:
+        from ._argument_device import _canonicalize_argument_device
+
+        device = _canonicalize_argument_device(device)
+    return _get_hardware_info(device)
+
+
+@functools.cache
+def _get_hardware_info(device: torch.device | None) -> HardwareInfo:
+    # Pallas represents TPU inputs as CPU tensors.  Prefer TPU for that explicit
+    # bridge device, but preserve the historical accelerator fallback when no TPU
+    # is present.
+    prefer_tpu = device is not None and device.type == "cpu"
+    if prefer_tpu and (hardware := _get_tpu_hardware_info()) is not None:
+        return hardware
+
     # XPU (Intel) path
     if (
         device is not None
@@ -101,7 +121,8 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
             compute_capability=props.name,  # XPU doesn't have compute capability
         )
 
-    # CUDA/ROCm path
+    # CUDA/ROCm path.  Unsupported or unavailable explicit device kinds retain
+    # the historical fallback to the first visible CUDA/ROCm device.
     if torch.cuda.is_available():
         dev = (
             device
@@ -125,22 +146,42 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
                 compute_capability=props.gcnArchName,
             )
 
-    # TPU / Pallas path
-    try:
-        import jax
-
-        tpu_devices = [d for d in jax.devices() if d.platform == "tpu"]
-        if tpu_devices:
-            first_tpu = tpu_devices[0]
-            return HardwareInfo(
-                device_kind="tpu",
-                hardware_name=first_tpu.device_kind,
-                runtime_version=jax.__version__,
-                compute_capability=first_tpu.device_kind,
-            )
-    except ImportError:
-        pass
+    if not prefer_tpu and (hardware := _get_tpu_hardware_info()) is not None:
+        return hardware
 
     raise RuntimeError(
         "No supported GPU or TPU device found. Helion requires CUDA, ROCm, XPU, or TPU."
     )
+
+
+def clear_hardware_info_cache() -> None:
+    """Clear cached explicit-device hardware identities."""
+
+    _get_hardware_info.cache_clear()
+
+
+def _get_tpu_hardware_info() -> HardwareInfo | None:
+    """Return the first JAX TPU, when the optional TPU runtime is available."""
+    try:
+        import jax
+    except ImportError:
+        return None
+
+    try:
+        devices = jax.devices("tpu")
+    except (ImportError, OSError, RuntimeError):
+        log.debug(
+            "JAX TPU discovery failed; continuing accelerator discovery",
+            exc_info=True,
+        )
+        return None
+
+    if devices:
+        first_tpu = devices[0]
+        return HardwareInfo(
+            device_kind="tpu",
+            hardware_name=first_tpu.device_kind,
+            runtime_version=jax.__version__,
+            compute_capability=first_tpu.device_kind,
+        )
+    return None
