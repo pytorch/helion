@@ -158,9 +158,18 @@ def test_cuda_stack_uses_latest_pinned_releases() -> None:
         "nvidia-cuda-nvcc": "13.3.73",
         "nvidia-nvvm": "13.3.73",
         "nvidia-cuda-crt": "13.3.73",
+        "nvidia-cuda-cccl": "13.3.3.4.1",
         "nvidia-cuda-nvrtc": "13.3.33",
         "nvidia-cublas": "13.6.1.10",
     }
+    assert common.CUDA_STACK_REQUIRED_ARTIFACTS["cccl_target_header"] == (
+        "nvidia-cuda-cccl",
+        Path("nvidia/cu13/include/nv/target"),
+    )
+    assert common.CUDA_STACK_REQUIRED_ARTIFACTS["cccl_version_header"] == (
+        "nvidia-cuda-cccl",
+        Path("nvidia/cu13/include/cccl/cuda/std/version"),
+    )
 
 
 def test_public_cli_requires_external_output_directory() -> None:

@@ -38,6 +38,7 @@ python -m venv --system-site-packages /tmp/helion-grouped-gemm-venv
 /tmp/helion-grouped-gemm-venv/bin/python -m pip install \
   nvidia-cuda-runtime==13.3.29 nvidia-cuda-nvcc==13.3.73 \
   nvidia-nvvm==13.3.73 nvidia-cuda-crt==13.3.73 \
+  nvidia-cuda-cccl==13.3.3.4.1 \
   nvidia-cuda-nvrtc==13.3.33 nvidia-cublas==13.6.1.10 \
   nvidia-cudnn-cu13==9.24.0.43 nvidia-cudnn-frontend==1.27.0 \
   apache-tvm-ffi==0.1.13.post3 torch-c-dlpack-ext==0.1.5 einops==0.8.2
@@ -93,16 +94,18 @@ clean set of Helion, provider, compiler, and CUDA loader controls. The CUDA
 stack must come from the exact installed distributions
 `nvidia-cuda-runtime==13.3.29`, `nvidia-cuda-nvcc==13.3.73`,
 `nvidia-nvvm==13.3.73`, and `nvidia-cuda-crt==13.3.73`. The campaign uses
-that package root directly, together with `nvidia-cuda-nvrtc==13.3.33` and
-`nvidia-cublas==13.6.1.10`, and also requires `nvcc` to report release 13.3,
-version 13.3.73. It preloads the pinned CUDA runtime, NVRTC, cuBLAS, and
-cuBLASLt libraries, then verifies their mapped paths and hashes after each
-worker; it never falls back to an arbitrary toolkit or a library from the
-underlying development environment. `TORCH_*` and `PYTORCH_*` controls are
-scrubbed along with the other compiler/runtime controls. Each result records
-semantic CUDA package, artifact, compiler, and driver identities. The summary
-rejects any semantic stack drift across providers or replicates while
-deliberately ignoring installation-path differences.
+`nvidia-cuda-cccl==13.3.3.4.1`, `nvidia-cuda-nvrtc==13.3.33`, and
+`nvidia-cublas==13.6.1.10` from that same package root. The CCCL pin is required
+for fresh provider JITs such as DeepGEMM, not only for Helion compilation. The
+campaign also requires `nvcc` to report release 13.3, version 13.3.73. It
+preloads the pinned CUDA runtime, NVRTC, cuBLAS, and cuBLASLt libraries, then
+verifies their mapped paths and hashes after each worker; it never falls back
+to an arbitrary toolkit or a library from the underlying development
+environment. `TORCH_*` and `PYTORCH_*` controls are scrubbed along with the
+other compiler/runtime controls. Each result records semantic CUDA package,
+artifact, compiler, and driver identities. The summary rejects any semantic
+stack drift across providers or replicates while deliberately ignoring
+installation-path differences.
 SIGINT and SIGTERM terminate the active worker process group before the campaign
 exits. GPU-idle and software power-cap clock events are reported and allowed;
 the latter is reproducible only when the reported power limit remains constant
