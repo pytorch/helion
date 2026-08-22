@@ -92,6 +92,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    import sympy
+
     from .._compiler.backend import Backend
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
@@ -262,6 +264,19 @@ class LiveTile(NamedTuple):
     stageable: bool | None = None
 
 
+class SymbolicLoopBound(NamedTuple):
+    """A preserved SymPy loop extent and its candidate-dependent symbols.
+
+    The expression remains the one produced by symbolic tracing. Symbol maps
+    identify only leaves a concrete autotuner candidate can resolve; any other
+    free symbol keeps evaluation explicitly unknown.
+    """
+
+    expression: sympy.Expr
+    block_size_symbols: tuple[tuple[sympy.Symbol, int], ...] = ()
+    tile_id_symbols: tuple[tuple[sympy.Symbol, int], ...] = ()
+
+
 class LoopAxisFact(NamedTuple):
     """One tunable or fixed axis in an enclosing device loop.
 
@@ -270,15 +285,19 @@ class LoopAxisFact(NamedTuple):
     ``tile(outer.begin, outer.end)``); in that case the candidate outer block is
     the real extent, not the whole underlying axis. ``bounded_extent`` is set
     only when that outer extent is a literal; a symbolic fixed parent remains
-    explicitly uncertain. The per-program block is deliberately not recorded
-    here: it is a candidate property and must be resolved from the emitted
-    ``block_sizes`` before the trip count is used.
+    explicitly uncertain. ``symbolic_bound`` preserves a candidate-dependent
+    loop bound instead of matching one source expression. Block-size leaves are
+    replaced with the candidate values and tile IDs with the lower-median valid
+    tile before evaluating it. The per-program block is deliberately not
+    recorded here: it is a candidate property and must be resolved from the
+    emitted ``block_sizes`` before the trip count is used.
     """
 
     block_id: int
     extent: int | None
     bounded_by_block_id: int | None = None
     bounded_extent: int | None = None
+    symbolic_bound: SymbolicLoopBound | None = None
 
 
 class PipelinedRegion(NamedTuple):
@@ -359,24 +378,25 @@ class DotSite(NamedTuple):
     - ``graph_id`` — the device graph the dot's node lives in.
       :class:`KernelGridFact` maps that graph to its root grid; the topology is
       intentionally not copied into each site.
-    - ``loop_trips`` — product of the sequential loop trip counts enclosing it, i.e.
-      how many times one program executes this dot.
     - ``updates_carry`` — the dot writes into a value carried by an enclosing loop
       (``acc=`` into a loop-carried accumulator). Such a dot's accumulator is
       resident for the whole loop, which is why it gets ranking priority.
     - ``loop_axes`` — the enclosing loop axes before a candidate block size is
-      selected. Consumers that need an exact execution count resolve these axes
-      against the candidate instead of treating ``loop_trips`` as exact.
+      selected. This is the canonical execution-count representation; consumers
+      resolve it against the candidate they are evaluating.
     - ``exact_loop_trips`` — an exact dynamic execution count proven independently
       of the loop-bound expression. This is used for work estimation only; it does
       not claim that the same loop is a useful software-pipeline opportunity.
+    - ``max_loop_trips`` — an optional conservative upper bound used only by
+      safety-oriented consumers such as pipeline-depth capping. It must not be used
+      as candidate work.
     """
 
     graph_id: int
-    loop_trips: int
     updates_carry: bool
     loop_axes: tuple[LoopAxisFact, ...] = ()
     exact_loop_trips: int | None = None
+    max_loop_trips: int | None = None
 
 
 class ResolvedMatmulFact(NamedTuple):
@@ -404,28 +424,13 @@ class KernelMatmulFact(NamedTuple):
     - ``matmuls`` — the contextual facts, one per dot.
     - ``knob_users`` — for each tunable block id, the ``(dot_index, axis)`` pairs
       whose axis maps onto it, i.e. which dots COMPETE for that knob.
-    - ``outer_grid`` — parallel programs contributed by grid axes that are no dot's
-      M or N tile: the occupancy the kernel already has before any tiling choice.
     - ``sequential_loop_trips`` — product of the trip counts of the kernel's
       sequential (non-grid) loops. For a chunked recurrence this is the number of
       chunks, so ``sequential_loop_trips * fixed_k`` recovers the logical contraction
       length even though each dot only sees one chunk.
-    - ``live_tiles`` — the peak simultaneously-live tile set over the whole kernel
-      (:class:`LiveTile`), from the same last-use liveness sweep the reduction fact
-      uses. The maximum simultaneously-live footprint, NOT the sum of every op.
-    - ``live_dot_outputs`` — the live set at the step holding the most simultaneously
-      live DOT OUTPUT tiles. A separate measurement from ``live_tiles`` because that
-      one's peak is chosen by rank profile (the right question for a reduction's
-      register working set, the wrong one for the accumulator budget: the rank peak can
-      be a step where the heavy loads are live and the accumulators are not). This is
-      what a sum-over-live-accumulators tensor-memory/register term is computed from.
     - ``live_tile_steps`` — the live tile set at EVERY step of the kernel's graphs, deduped.
-      ``live_tiles`` above is one step chosen by RANK PROFILE, which is block-size-free and so
-      the right question when block sizes are unknown; a register estimate is asked later, when
-      the candidate block sizes ARE known, and should pick its peak by resolved BYTES. Keeping
-      every step is what lets it. Selecting by rank instead under-counted a kernel that spills
-      540 registers at one warp while over-counting one that spills none — the ordering
-      inverted, so no threshold on that estimate could separate them.
+      A register estimate resolves each step under the candidate block sizes and selects
+      the peak by bytes.
     - ``pipelined_regions`` — the loads/stores and enclosing loop axes of each LOOP
       BODY. The axes let a candidate cap useful pipeline depth by the iterations it
       actually executes. The SMEM operand ring is charged over every conservatively
@@ -436,21 +441,15 @@ class KernelMatmulFact(NamedTuple):
       ONCE, with no stage multiplier: a load outside a loop is not multi-buffered, and
       charging it per stage over-states shared memory badly enough to shrink a tile to the
       dot minimum for a phantom overflow.
-    - ``n_dot_nodes`` — contraction sites counted spelling-independently, so a kernel
-      whose dots are written as ``torch.matmul``/``@`` is not read as having none.
     - ``attribution_complete`` — post-condition flag described above.
     """
 
     matmuls: tuple[ResolvedMatmulFact, ...]
     knob_users: tuple[tuple[int, tuple[tuple[int, str], ...]], ...]
-    outer_grid: int
     sequential_loop_trips: int
-    live_tiles: tuple[LiveTile, ...]
-    live_dot_outputs: tuple[LiveTile, ...]
     live_tile_steps: tuple[tuple[LiveTile, ...], ...]
     pipelined_regions: tuple[PipelinedRegion, ...]
     resident_regions: tuple[ResidentRegion, ...]
-    n_dot_nodes: int
     attribution_complete: bool
 
     def users_of(self, block_id: int) -> tuple[tuple[int, str], ...]:
@@ -458,22 +457,6 @@ class KernelMatmulFact(NamedTuple):
             if bid == block_id:
                 return users
         return ()
-
-    def dot_work(self, index: int) -> int:
-        """Dynamic work of one dot: ``m*n*k`` per execution times its executions.
-
-        Falls back to the axis classification's per-program extent when the fact's own
-        ``static_*`` is absent, which happens whenever the axis length is dynamic but the
-        per-program extent is not."""
-        resolved = self.matmuls[index]
-        f = resolved.fact
-        ax = resolved.axes
-        m = f.static_m or ax.m_extent or 1
-        n = f.static_n or ax.n_extent or 1
-        k = f.static_k or ax.k_extent or 1
-        site = resolved.site
-        trips = site.exact_loop_trips or site.loop_trips
-        return m * n * k * max(1, trips)
 
 
 class ReductionCategory(enum.Enum):

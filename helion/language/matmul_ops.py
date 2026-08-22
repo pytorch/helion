@@ -22,6 +22,9 @@ from .._compiler.matmul_utils import _compute_out_dtype
 from ..autotuner.config_spec import MatmulFact
 from . import _decorators
 
+MATMUL_FACT_ID_META = "helion_matmul_fact_id"
+MATMUL_DIM_BLOCK_IDS_META = "helion_matmul_dim_block_ids"
+
 
 def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int | None:
     if isinstance(size, int):
@@ -242,7 +245,7 @@ def _static_problem_extent(
     return _static_dim_value(env, size)
 
 
-def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
+def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
     """Record a matmul fact and apply backend-independent dot constraints."""
     m, n, k = _dot_dimensions(lhs, rhs)
 
@@ -280,6 +283,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 else:
                     spec.allow_overshoot(SMALL_DIM_BLOCK_SIZE_OVERSHOOT)
 
+    fact_id = len(env.config_spec.matmul_facts)
     env.config_spec.matmul_facts.append(
         MatmulFact(
             lhs_ndim=lhs.ndim,
@@ -308,6 +312,25 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             block_idx = env.get_block_id(leading_dim)
             if block_idx is not None:
                 env.block_sizes[block_idx].update_max_block(1)
+    return fact_id
+
+
+def _associate_latest_matmul_fact(node: torch.fx.Node, *_args: object) -> None:
+    """Attach the fact created by prepare_args to this exact API node."""
+    facts = CompileEnvironment.current().config_spec.matmul_facts
+    fact_id = len(facts) - 1
+    assert fact_id >= 0
+    node.meta[MATMUL_FACT_ID_META] = fact_id
+    fact = facts[fact_id]
+    output_ndim = max(fact.lhs_ndim, fact.rhs_ndim)
+    node.meta[MATMUL_DIM_BLOCK_IDS_META] = (
+        *(None for _ in range(output_ndim - 2)),
+        fact.m_block_id,
+        fact.n_block_id,
+    )
+
+
+_decorators.post_create_proxy(dot)(_associate_latest_matmul_fact)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -781,6 +804,9 @@ def _(
         return acc.new_empty(result_shape)
     resolved_dtype = out_dtype or torch.float32
     return torch.empty(result_shape, dtype=resolved_dtype, device=mat1.device)
+
+
+_decorators.post_create_proxy(dot_scaled)(_associate_latest_matmul_fact)
 
 
 @_decorators.ref(dot_scaled)
