@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from dataclasses import dataclass
+from functools import cached_property
 from hashlib import sha256
 from itertools import accumulate
+from itertools import starmap
 import json
 import math
 import os
+from pathlib import Path
 import subprocess
 from typing import TYPE_CHECKING
 from typing import Any
@@ -17,13 +20,57 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Mapping
     from collections.abc import Sequence
-    from pathlib import Path
 
 
 ORACLE_FLOAT32_MATMUL_PRECISION = "highest"
 CORRECTNESS_MAX_NORMALIZED_DIFF = 1e-5
-CANONICAL_DEVICE_NAME = "NVIDIA B200"
-CANONICAL_DEVICE_CAPABILITY = (10, 0)
+CORRECTNESS_RTOL = 2e-2
+CORRECTNESS_ATOL = 2e-2
+SUPPORTED_DEVICE_CAPABILITIES = {
+    "NVIDIA B200": (10, 0),
+    "NVIDIA GB300": (10, 3),
+}
+CUDA_RUNTIME_DISTRIBUTION = "nvidia-cuda-runtime"
+CUDA_RUNTIME_VERSION = "13.3.29"
+CUDA_NVCC_DISTRIBUTION = "nvidia-cuda-nvcc"
+CUDA_NVVM_DISTRIBUTION = "nvidia-nvvm"
+CUDA_CRT_DISTRIBUTION = "nvidia-cuda-crt"
+CUDA_NVRTC_DISTRIBUTION = "nvidia-cuda-nvrtc"
+CUDA_NVRTC_VERSION = "13.3.33"
+CUDA_CUBLAS_DISTRIBUTION = "nvidia-cublas"
+CUDA_CUBLAS_VERSION = "13.6.1.10"
+CUDA_COMPILER_VERSION = "13.3.73"
+CUDA_TOOLKIT_RELEASE = "13.3"
+CUDA_RUNTIME_LIBRARY_RELATIVE_PATH = Path("nvidia/cu13/lib/libcudart.so.13")
+CUDA_NVCC_EXECUTABLE_RELATIVE_PATH = Path("nvidia/cu13/bin/nvcc")
+CUDA_NVVM_LIBRARY_RELATIVE_PATH = Path("nvidia/cu13/lib/libnvvm.so.4")
+CUDA_CRT_HEADER_RELATIVE_PATH = Path("nvidia/cu13/include/crt/host_config.h")
+CUDA_NVRTC_LIBRARY_RELATIVE_PATH = Path("nvidia/cu13/lib/libnvrtc.so.13")
+CUDA_CUBLAS_LIBRARY_RELATIVE_PATH = Path("nvidia/cu13/lib/libcublas.so.13")
+CUDA_CUBLASLT_LIBRARY_RELATIVE_PATH = Path("nvidia/cu13/lib/libcublasLt.so.13")
+CUDA_STACK_DISTRIBUTION_VERSIONS = {
+    CUDA_RUNTIME_DISTRIBUTION: CUDA_RUNTIME_VERSION,
+    CUDA_NVCC_DISTRIBUTION: CUDA_COMPILER_VERSION,
+    CUDA_NVVM_DISTRIBUTION: CUDA_COMPILER_VERSION,
+    CUDA_CRT_DISTRIBUTION: CUDA_COMPILER_VERSION,
+    CUDA_NVRTC_DISTRIBUTION: CUDA_NVRTC_VERSION,
+    CUDA_CUBLAS_DISTRIBUTION: CUDA_CUBLAS_VERSION,
+}
+CUDA_STACK_REQUIRED_ARTIFACTS = {
+    "cudart": (CUDA_RUNTIME_DISTRIBUTION, CUDA_RUNTIME_LIBRARY_RELATIVE_PATH),
+    "nvcc": (CUDA_NVCC_DISTRIBUTION, CUDA_NVCC_EXECUTABLE_RELATIVE_PATH),
+    "nvvm": (CUDA_NVVM_DISTRIBUTION, CUDA_NVVM_LIBRARY_RELATIVE_PATH),
+    "crt_header": (CUDA_CRT_DISTRIBUTION, CUDA_CRT_HEADER_RELATIVE_PATH),
+    "nvrtc": (CUDA_NVRTC_DISTRIBUTION, CUDA_NVRTC_LIBRARY_RELATIVE_PATH),
+    "cublas": (CUDA_CUBLAS_DISTRIBUTION, CUDA_CUBLAS_LIBRARY_RELATIVE_PATH),
+    "cublaslt": (CUDA_CUBLAS_DISTRIBUTION, CUDA_CUBLASLT_LIBRARY_RELATIVE_PATH),
+}
+CUDA_STACK_PRELOAD_LIBRARY_PREFIXES = {
+    "cudart": "libcudart.so",
+    "cublas": "libcublas.so",
+    "cublaslt": "libcublasLt.so",
+    "nvrtc": "libnvrtc.so",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,9 +126,16 @@ class GroupedGemmInputs:
     case: GroupedGemmCase
     compact_a: torch.Tensor
     b: torch.Tensor
-    b_n_major: torch.Tensor
     offsets: torch.Tensor
     oracle: tuple[torch.Tensor, ...]
+
+    @cached_property
+    def b_n_major(self) -> torch.Tensor:
+        """Materialize the alternate physical B layout only when requested."""
+        converted = self.b.transpose(1, 2).contiguous().transpose(1, 2)
+        if not torch.equal(self.b, converted):
+            raise RuntimeError("grouped B layout conversion changed logical values")
+        return converted
 
     def compact_a_slices(self) -> tuple[torch.Tensor, ...]:
         ends = tuple(accumulate(self.case.actual_ms))
@@ -201,6 +255,41 @@ def align(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def make_inputs(
+    case: GroupedGemmCase,
+    device: torch.device,
+    *,
+    seed: int,
+) -> GroupedGemmInputs:
+    """Create seeded logical inputs without coupling to ambient RNG state."""
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+    compact_a = torch.randn(
+        (case.total_m, case.k),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    b = torch.randn(
+        (case.groups, case.n, case.k),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    oracle = []
+    start = 0
+    for group, actual_m in enumerate(case.actual_ms):
+        end = start + actual_m
+        oracle.append(compact_a[start:end].float() @ b[group].float().T)
+        start = end
+    offsets = torch.tensor(
+        (0, *accumulate(case.actual_ms)),
+        device=device,
+        dtype=torch.int32,
+    )
+    return GroupedGemmInputs(case, compact_a, b, offsets, tuple(oracle))
+
+
 def compact_contiguous_a_layout() -> dict[str, str | bool]:
     layout: dict[str, str | bool] = {"kind": "compact_contiguous"}
     layout["shared_compact_allocation"] = True
@@ -281,6 +370,20 @@ def poison_and_replay(captured: CapturedImplementation) -> bool:
     return all(not bool(torch.isnan(output).any().item()) for output in logical)
 
 
+def replay_is_repeatable(captured: CapturedImplementation) -> bool:
+    """Require two consecutive graph replays to produce identical outputs."""
+
+    first = tuple(
+        output.clone() for output in captured.prepared.logical_outputs(captured.result)
+    )
+    captured.replay()
+    torch.cuda.synchronize()
+    second = captured.prepared.logical_outputs(captured.result)
+    return len(first) == len(second) and all(
+        starmap(torch.equal, zip(first, second, strict=True))
+    )
+
+
 def normalized_difference(actual: torch.Tensor, expected: torch.Tensor) -> float:
     """Return the symmetric normalized difference used by correctness checks."""
 
@@ -296,15 +399,16 @@ def normalized_difference(actual: torch.Tensor, expected: torch.Tensor) -> float
     return max(0.0, value) if math.isfinite(value) else math.inf
 
 
-def check_correctness(
-    captured: CapturedImplementation,
+def check_logical_outputs(
+    actual: Sequence[torch.Tensor],
     oracle: Sequence[torch.Tensor],
     *,
     max_diff: float = CORRECTNESS_MAX_NORMALIZED_DIFF,
+    rtol: float = CORRECTNESS_RTOL,
+    atol: float = CORRECTNESS_ATOL,
 ) -> dict[str, Any]:
     """Compare every logical group against the shared FP32 oracle."""
 
-    actual = captured.prepared.logical_outputs(captured.result)
     if len(actual) != len(oracle):
         raise ValueError(
             f"implementation produced {len(actual)} groups, expected {len(oracle)}"
@@ -313,6 +417,7 @@ def check_correctness(
     passed = True
     max_abs = 0.0
     max_normalized_diff = 0.0
+    mismatch_count = 0
     for group, (output, expected) in enumerate(zip(actual, oracle, strict=True)):
         shape_ok = output.shape == expected.shape
         dtype_ok = output.dtype is torch.bfloat16 and expected.dtype is torch.float32
@@ -327,11 +432,13 @@ def check_correctness(
                     "device_ok": device_ok,
                     "normalized_diff": math.inf,
                     "max_abs": math.inf,
+                    "mismatch_count": output.numel(),
                 }
             )
             passed = False
             max_abs = math.inf
             max_normalized_diff = math.inf
+            mismatch_count += output.numel()
             continue
         output_fp32 = output.float()
         difference = (output_fp32 - expected).abs()
@@ -345,7 +452,9 @@ def check_correctness(
         normalized_diff = (
             normalized_difference(output_fp32, expected) if finite else math.inf
         )
-        group_ok = normalized_diff <= max_diff
+        close = torch.isclose(output_fp32, expected, rtol=rtol, atol=atol)
+        group_mismatch_count = int((~close).sum().item()) if finite else output.numel()
+        group_ok = finite and normalized_diff <= max_diff and group_mismatch_count == 0
         groups.append(
             {
                 "group": group,
@@ -355,17 +464,41 @@ def check_correctness(
                 "device_ok": device_ok,
                 "normalized_diff": normalized_diff,
                 "max_abs": group_max_abs,
+                "mismatch_count": group_mismatch_count,
             }
         )
         passed = passed and group_ok
         max_abs = max(max_abs, group_max_abs)
         max_normalized_diff = max(max_normalized_diff, normalized_diff)
+        mismatch_count += group_mismatch_count
     return {
         "ok": passed,
         "max_normalized_diff": max_normalized_diff,
         "max_abs": max_abs,
+        "mismatch_count": mismatch_count,
+        "rtol": rtol,
+        "atol": atol,
         "groups": groups,
     }
+
+
+def check_correctness(
+    captured: CapturedImplementation,
+    oracle: Sequence[torch.Tensor],
+    *,
+    max_diff: float = CORRECTNESS_MAX_NORMALIZED_DIFF,
+    rtol: float = CORRECTNESS_RTOL,
+    atol: float = CORRECTNESS_ATOL,
+) -> dict[str, Any]:
+    """Compare a captured implementation's logical groups with the oracle."""
+
+    return check_logical_outputs(
+        captured.prepared.logical_outputs(captured.result),
+        oracle,
+        max_diff=max_diff,
+        rtol=rtol,
+        atol=atol,
+    )
 
 
 def validate_capture(
@@ -373,11 +506,13 @@ def validate_capture(
     oracle: Sequence[torch.Tensor],
 ) -> dict[str, Any]:
     rewritten = poison_and_replay(captured)
+    repeatable = replay_is_repeatable(captured)
     correctness = check_correctness(captured, oracle)
     return {
         **correctness,
         "poisoned_replay_rewrote_output": rewritten,
-        "ok": rewritten and bool(correctness["ok"]),
+        "repeat_replay_exact": repeatable,
+        "ok": rewritten and repeatable and bool(correctness["ok"]),
     }
 
 
@@ -391,6 +526,28 @@ def config_sha256(config: Mapping[str, Any]) -> str:
         sort_keys=True,
     )
     return sha256(identity.encode()).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    """Return the SHA256 digest of a benchmark provenance artifact."""
+
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mapped_library_paths(name_prefix: str) -> tuple[Path, ...]:
+    """Return unique loaded shared libraries whose basename starts with a prefix."""
+
+    paths = {
+        path.resolve(strict=True)
+        for line in Path("/proc/self/maps").read_text().splitlines()
+        if (path := Path(line.rsplit(maxsplit=1)[-1])).is_absolute()
+        and path.name.startswith(name_prefix)
+    }
+    return tuple(sorted(paths))
 
 
 def require_single_visible_device(value: str | None = None) -> str:
@@ -407,18 +564,18 @@ def require_single_visible_device(value: str | None = None) -> str:
     return entries[0]
 
 
-def is_canonical_b200(
+def is_supported_grouped_gemm_device(
     device_kind: object,
     name: object,
     capability: object,
 ) -> bool:
-    """Return whether identity exactly matches the validated CUDA B200 target."""
+    """Return whether identity matches a validated grouped-GEMM target."""
 
     return (
-        name == CANONICAL_DEVICE_NAME
-        and device_kind == "cuda"
+        device_kind == "cuda"
+        and isinstance(name, str)
         and isinstance(capability, list | tuple)
-        and tuple(capability) == CANONICAL_DEVICE_CAPABILITY
+        and tuple(capability) == SUPPORTED_DEVICE_CAPABILITIES.get(name)
     )
 
 

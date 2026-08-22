@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 import weakref
 
+from benchmarks.cute import grouped_gemm_benchmark as common
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -17,9 +19,9 @@ if TYPE_CHECKING:
     import torch
 
 CUBLASLT_B_LAYOUTS = ("k_major", "n_major")
-CUBLASLT_DISTRIBUTION = "nvidia-cublas"
-CUBLASLT_DISTRIBUTION_VERSION = "13.6.1.10"
-CUBLASLT_LIBRARY_RELATIVE_PATH = Path("nvidia/cu13/lib/libcublasLt.so.13")
+CUBLASLT_DISTRIBUTION = common.CUDA_CUBLAS_DISTRIBUTION
+CUBLASLT_DISTRIBUTION_VERSION = common.CUDA_CUBLAS_VERSION
+CUBLASLT_LIBRARY_RELATIVE_PATH = common.CUDA_CUBLASLT_LIBRARY_RELATIVE_PATH
 # These ABI values are from the CUDA 13.6 cuBLASLt API shipped by the pinned
 # nvidia-cublas distribution below. The grouped extension is version-gated by
 # cublasLtGetVersion before any descriptor is created.
@@ -127,6 +129,17 @@ def _validated_cublaslt_library() -> tuple[ctypes.CDLL, dict[str, object]]:
         strict=True
     )
     library = ctypes.CDLL(str(path))
+    loaded_path = Path(str(library._name)).resolve(strict=True)
+    if loaded_path != path:
+        raise RuntimeError(
+            f"cuBLASLt loaded {loaded_path}, expected distribution library {path}"
+        )
+    mapped = common.mapped_library_paths("libcublasLt.so")
+    if mapped != (path,):
+        raise RuntimeError(
+            f"mapped cuBLASLt libraries are {tuple(map(str, mapped))}, "
+            f"expected {(str(path),)}"
+        )
     _configure_library(library)
     library_version = int(library.cublasLtGetVersion())
     if library_version != CUBLASLT_LIBRARY_VERSION:
@@ -138,6 +151,7 @@ def _validated_cublaslt_library() -> tuple[ctypes.CDLL, dict[str, object]]:
         "distribution": CUBLASLT_DISTRIBUTION,
         "package_version": distribution.version,
         "library_path": str(path),
+        "library_sha256": common.file_sha256(path),
         "library_version": library_version,
     }
 
@@ -294,7 +308,7 @@ class _CublasLtGroupedGemm:
             raise ValueError(f"unsupported cuBLASLt B layout {b_layout!r}")
         if any(actual_m <= 0 for actual_m in inputs.case.actual_ms):
             raise ValueError("cuBLASLt requires every group to contain a row")
-        _distribution()
+        library, library_identity = _validated_cublaslt_library()
         problems = tuple(
             (actual_m, inputs.case.n, inputs.case.k, 1)
             for actual_m in inputs.case.actual_ms
@@ -322,7 +336,6 @@ class _CublasLtGroupedGemm:
         )
         offset = (-workspace_storage.data_ptr()) % _WORKSPACE_ALIGNMENT
         workspace = workspace_storage[offset : offset + _DEFAULT_WORKSPACE_BYTES]
-        library, library_identity = _validated_cublaslt_library()
 
         group_count = len(problems)
         transa, dimension_values = cublaslt_layout_values(problems, b_layout)
@@ -499,8 +512,6 @@ class _CublasLtGroupedGemm:
     def prepared_implementation(
         self,
     ) -> PreparedImplementation:
-        from benchmarks.cute import grouped_gemm_benchmark as common
-
         selected = self.selected_algorithm
         algorithm = _CublasLtMatmulAlgo.from_buffer_copy(
             bytes.fromhex(selected.serialized_hex)

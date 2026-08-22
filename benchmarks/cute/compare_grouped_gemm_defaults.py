@@ -1,4 +1,4 @@
-"""Compare Helion grouped GEMM with selectable provider public defaults.
+"""Compare Helion grouped GEMM with reproducible public provider baselines.
 
 The public command launches one fresh worker process per provider/replicate.
 Each worker validates and captures both implementations, performs a 10-second
@@ -13,13 +13,14 @@ import argparse
 from collections import Counter
 from contextlib import suppress
 import importlib.metadata
-from itertools import accumulate
 import json
 import math
 from operator import itemgetter
 import os
 from pathlib import Path
+import re
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -58,17 +59,19 @@ if __name__ == "__main__":
 
 from benchmarks.cute import grouped_gemm_benchmark as common  # noqa: E402
 
-RESULT_SCHEMA = "helion-grouped-gemm-provider-defaults-v2"
-SUMMARY_SCHEMA = "helion-grouped-gemm-provider-summary-v2"
+RESULT_SCHEMA = "helion-grouped-gemm-provider-defaults-v4"
+SUMMARY_SCHEMA = "helion-grouped-gemm-provider-summary-v4"
 BENCHMARK_REPETITIONS = 102
+MIN_PUBLICATION_REPLICATES = 3
 THERMAL_WARMUP_MS = 10_000
 CAPTURE_WARMUPS = 2
 TELEMETRY_INTERVAL_SECONDS = 5
 POST_WORKER_IDLE_GRACE_SECONDS = 5
+NVCC_RELEASE_PATTERN = re.compile(r"\brelease\s+(\d+\.\d+),\s+V([0-9.]+)")
 PROVIDERS = ("deepgemm", "quack", "cudnn", "cublaslt", "cutlass")
 PROVIDER_SELECTIONS = {
     "deepgemm": "public_kmajor_nk_no_psum_zero_padding_off",
-    "quack": "public_tuned_false_config_none",
+    "quack": "public_api_default_tuned",
     "cudnn": "public_a_fallback_build_execute",
     "cublaslt": "heuristic_result_zero_requested_one",
     "cutlass": "registry_first_no_timing_search",
@@ -79,6 +82,8 @@ HELION_SELECTIONS = (
     "final_reviewed_aot",
 )
 GROUPED_WORKLIST_HEURISTIC = "cute_tcgen05_grouped_worklist"
+BENCHMARK_B_LAYOUT = "k_major"
+BENCHMARK_LAYOUT_POLICY = "canonical_k_major_for_all_implementations"
 HELION_SELECTION_ENVIRONMENT_VARIABLES = (
     "HELION_AOT_MODE",
     "HELION_AUTOTUNER",
@@ -134,12 +139,18 @@ WORKER_CACHE_NAMES = {
     "XDG_CACHE_HOME": "xdg",
 }
 WORKER_CONTROL_PREFIXES = (
+    "CUBLAS_",
     "CUDA_",
+    "CUDNN_",
     "CUTE_DSL_",
+    "CUTLASS_",
     "DG_",
     "HELION_",
     "LD_",
+    "NVIDIA_",
     "QUACK_",
+    "PYTORCH_",
+    "TORCH_",
     "TORCHINDUCTOR_",
     "TRITON_",
 )
@@ -195,6 +206,11 @@ TELEMETRY_FIELDS = (
 )
 WORKER_TERMINATION_GRACE_SECONDS = 5
 NVIDIA_SMI_TIMEOUT_SECONDS = 10
+GPU_IDLE_CLOCK_EVENT_REASON = 0x1
+SW_POWER_CAP_CLOCK_EVENT_REASON = 0x4
+ALLOWED_CLOCK_EVENT_REASONS = (
+    GPU_IDLE_CLOCK_EVENT_REASON | SW_POWER_CAP_CLOCK_EVENT_REASON
+)
 
 
 class _CampaignInterrupted(Exception):
@@ -225,14 +241,12 @@ def make_exact_common_inputs(
     case: GroupedGemmCase,
     shape: OfficialShape,
     device: torch.device,
+    *,
+    seed: int,
 ) -> tuple[GroupedGemmInputs, ReviewedWorklistProfile]:
     """Generate the final benchmark's exact logical values for one row."""
 
-    from pretuned_kernels.grouped_gemm_deepgemm import (
-        _deepgemm_public_api as public_api,
-    )
     from pretuned_kernels.grouped_gemm_deepgemm import reviewed_profiles
-    import torch
 
     expected_shape = (
         shape.groups,
@@ -249,44 +263,7 @@ def make_exact_common_inputs(
     if case_shape != expected_shape:
         raise RuntimeError(f"workload shape mismatch: {case_shape} != {expected_shape}")
     profile = reviewed_profiles.exact_reviewed_worklist_profile(*expected_shape)
-    packed_a, logical_b, _helion_b, _layout, reference, _worklist = (
-        public_api._make_reviewed_case(
-            shape,
-            case.actual_ms,
-            device,
-        )
-    )
-    stored_ms = tuple(
-        common.align(actual_m, profile.source_m_tile) for actual_m in case.actual_ms
-    )
-    starts = tuple(accumulate((0, *stored_ms)))[:-1]
-    compact_a = torch.cat(
-        tuple(
-            packed_a[start : start + actual_m]
-            for start, actual_m in zip(starts, case.actual_ms, strict=True)
-        )
-    )
-    oracle = tuple(
-        reference[start : start + actual_m]
-        for start, actual_m in zip(starts, case.actual_ms, strict=True)
-    )
-    b_n_major = logical_b.transpose(1, 2).contiguous().transpose(1, 2)
-    if not torch.equal(logical_b, b_n_major):
-        raise RuntimeError("grouped B layout conversion changed logical values")
-    offsets = torch.tensor(
-        (0, *accumulate(case.actual_ms)),
-        device=device,
-        dtype=torch.int32,
-    )
-    inputs = common.GroupedGemmInputs(
-        case=case,
-        compact_a=compact_a,
-        b=logical_b,
-        b_n_major=b_n_major,
-        offsets=offsets,
-        oracle=oracle,
-    )
-    return inputs, profile
+    return common.make_inputs(case, device, seed=seed), profile
 
 
 def prepare_helion(
@@ -296,15 +273,14 @@ def prepare_helion(
 ) -> PreparedImplementation:
     """Bind Helion with compiler, live-autotune, or reviewed-AOT selection."""
 
-    from pretuned_kernels.grouped_gemm_deepgemm import (
-        _deepgemm_public_api as public_api,
-    )
     from pretuned_kernels.grouped_gemm_deepgemm import grouped_gemm_deepgemm
     from pretuned_kernels.grouped_gemm_deepgemm import reviewed_profiles
+    from pretuned_kernels.grouped_gemm_deepgemm import reviewed_runtime
     import torch
 
     packed = common.pack_compact_rows(inputs, profile.source_m_tile)
-    b_layout = _layout_name(profile.b_major)
+    reviewed_b_layout = _layout_name(profile.b_major)
+    b_layout = BENCHMARK_B_LAYOUT
     b = inputs.b_for_layout(b_layout)
     kernel_args = (
         packed.a,
@@ -317,19 +293,22 @@ def prepare_helion(
     if selection_mode == "live_autotune":
         kernel.settings.autotune_cache = LIVE_AUTOTUNE_CACHE
     bound = kernel.bind(kernel_args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
     if selection_mode == "final_reviewed_aot":
         initial_output = bound(*kernel_args)
-        config = public_api._effective_reviewed_config(bound, profile)
+        config = reviewed_runtime.effective_reviewed_config(bound, profile)
         selection_evidence: dict[str, object] = {
             "selection_mode": selection_mode,
             "reviewed_profile": {
                 "name": profile.config_name,
                 "manifest_sha256": (reviewed_profiles.REVIEWED_PROFILE_MANIFEST_SHA256),
-                "role": "selected_config_and_packing",
-                "b_layout": b_layout,
+                "role": "selected_config_and_a_packing",
+                "b_layout": reviewed_b_layout,
                 "source_m_tile": profile.source_m_tile,
             },
+            "benchmark_b_layout": b_layout,
+            "benchmark_b_layout_matches_reviewed_profile": (
+                b_layout == reviewed_b_layout
+            ),
             "config": config,
             "config_sha256": common.config_sha256(config["effective"]),
             "a_layout": {
@@ -474,10 +453,14 @@ def prepare_helion(
             "reviewed_profile": {
                 "name": profile.config_name,
                 "manifest_sha256": (reviewed_profiles.REVIEWED_PROFILE_MANIFEST_SHA256),
-                "role": "packing_constraints_only",
-                "b_layout": b_layout,
+                "role": "a_packing_manifest_and_reference_config",
+                "b_layout": reviewed_b_layout,
                 "source_m_tile": profile.source_m_tile,
             },
+            "benchmark_b_layout": b_layout,
+            "benchmark_b_layout_matches_reviewed_profile": (
+                b_layout == reviewed_b_layout
+            ),
             "compiler_heuristic": compiler_evidence,
             "selection_api": selection_api,
             "config": {
@@ -531,79 +514,23 @@ def prepare_helion(
 def prepare_provider_default(
     provider: str,
     inputs: GroupedGemmInputs,
-    profile: ReviewedWorklistProfile,
     *,
     cutlass_root: Path | None,
     deepgemm_root: Path | None,
+    quack_root: Path | None = None,
 ) -> PreparedImplementation:
     """Prepare exactly one provider-selected default implementation."""
 
-    reviewed_layout = _layout_name(profile.b_major)
     if provider == "deepgemm":
-        from benchmarks.cute import grouped_gemm_deepgemm_support as support
-        from pretuned_kernels.grouped_gemm_deepgemm import (
-            _deepgemm_public_api as public_api,
+        from benchmarks.cute.grouped_gemm_deepgemm_support import (
+            prepare_deepgemm_default,
         )
-        import torch
 
         if deepgemm_root is None:
             raise ValueError("--deepgemm-root is required for the DeepGEMM provider")
-        deep_gemm, provenance = support.import_deepgemm(
-            deepgemm_root,
-            support.M_ALIGNMENT,
-        )
-        packed = common.pack_compact_rows(inputs, support.M_ALIGNMENT)
-        layout = torch.full(
-            (packed.a.size(0),),
-            -1,
-            device=packed.a.device,
-            dtype=torch.int32,
-        )
-        for group, (start, actual_m) in enumerate(
-            zip(packed.starts, packed.actual_ms, strict=True)
-        ):
-            layout[start : start + actual_m] = group
-        output = torch.empty(
-            (packed.a.size(0), inputs.case.n),
-            device=packed.a.device,
-            dtype=packed.a.dtype,
-        )
-
-        def call() -> torch.Tensor:
-            return public_api._launch_deepgemm(
-                deep_gemm,
-                packed.a,
-                inputs.b,
-                output,
-                layout,
-            )
-
-        prepared = common.PreparedImplementation(
-            name="deepgemm-public-default",
-            call=call,
-            output_tensors=lambda result: (cast("torch.Tensor", result),),
-            logical_outputs=lambda result: packed.output_slices(
-                cast("torch.Tensor", result)
-            ),
-            config={
-                "provider": "deepgemm",
-                "selection_mode": "public_api_fixed_no_tune",
-                "b_layout": "k_major",
-                "api": {
-                    "function": "m_grouped_bf16_gemm_nt_contiguous",
-                    "compiled_dims": "nk",
-                    "use_psum_layout": False,
-                    "ensure_zero_padding": False,
-                },
-                "a_layout": {
-                    "kind": "aligned_contiguous_layout",
-                    "alignment": support.M_ALIGNMENT,
-                    "logical_values_bitwise_equal": True,
-                },
-                "preprocessing_timed": False,
-                "provenance": provenance,
-            },
-            owners=(deep_gemm, inputs, packed, layout, output),
+        prepared = prepare_deepgemm_default(
+            inputs,
+            deepgemm_root=deepgemm_root,
         )
     elif provider == "cutlass":
         from benchmarks.cute.cutlass_contiguous_grouped_gemm import (
@@ -616,22 +543,29 @@ def prepare_provider_default(
     elif provider == "quack":
         from benchmarks.cute.quack_grouped_gemm import prepare_quack_default
 
-        prepared = prepare_quack_default(inputs, b_layout=reviewed_layout)
+        prepared = prepare_quack_default(
+            inputs,
+            b_layout=BENCHMARK_B_LAYOUT,
+            quack_root=quack_root,
+        )
     elif provider == "cudnn":
         from benchmarks.cute.cudnn_grouped_gemm import prepare_cudnn_default
 
-        prepared = prepare_cudnn_default(inputs, b_layout=reviewed_layout)
+        prepared = prepare_cudnn_default(inputs, b_layout=BENCHMARK_B_LAYOUT)
     elif provider == "cublaslt":
         from benchmarks.cute.cublaslt_grouped_gemm import prepare_cublaslt_default
 
-        prepared = prepare_cublaslt_default(inputs, b_layout=reviewed_layout)
+        prepared = prepare_cublaslt_default(inputs, b_layout=BENCHMARK_B_LAYOUT)
     else:
         raise ValueError(f"unsupported provider {provider!r}")
     provider_layout = cast("str", prepared.config["b_layout"])
+    if provider_layout != BENCHMARK_B_LAYOUT:
+        raise RuntimeError(
+            f"{provider} produced {provider_layout}, expected {BENCHMARK_B_LAYOUT}"
+        )
     prepared.config.update(
         {
-            "reviewed_helion_b_layout": reviewed_layout,
-            "physical_b_layout_matches_reviewed": provider_layout == reviewed_layout,
+            "benchmark_b_layout": BENCHMARK_B_LAYOUT,
             "logical_b_values_bitwise_equal": True,
         }
     )
@@ -658,24 +592,29 @@ def run_case(
     helion_selection: str,
     cutlass_root: Path | None,
     deepgemm_root: Path | None,
+    quack_root: Path | None = None,
 ) -> dict[str, object]:
     """Validate and time one selected Helion/provider-default pair."""
 
     from pretuned_kernels import _bench
     import torch
 
-    inputs, profile = make_exact_common_inputs(case, shape, device)
-    # Provider imports, compilation, graph capture, and paired timing must not
-    # perturb later rows. Thermal warmup intentionally advances the continuous
-    # seed-0 public input stream once between the two isolated scopes.
+    inputs, profile = make_exact_common_inputs(
+        case,
+        shape,
+        device,
+        seed=shape.row_index,
+    )
+    # Provider imports, compilation, graph capture, and timing must not perturb
+    # the deterministic per-row input streams.
     with torch.random.fork_rng(devices=[device.index]):
         helion = prepare_helion(inputs, profile, helion_selection)
         provider_impl = prepare_provider_default(
             provider,
             inputs,
-            profile,
             cutlass_root=cutlass_root,
             deepgemm_root=deepgemm_root,
+            quack_root=quack_root,
         )
         helion_capture, helion_correctness = _validated_capture(helion, inputs.oracle)
         provider_capture, provider_correctness = _validated_capture(
@@ -692,12 +631,16 @@ def run_case(
         math.isfinite(value) and value > 0.0 for value in (helion_ms, provider_ms)
     ):
         raise RuntimeError("benchmark timings must be finite and positive")
+    provider_config = {
+        **provider_impl.config,
+        "config_sha256": common.config_sha256(provider_impl.config),
+    }
     return {
         "case": case.as_dict(),
         "row_index": shape.row_index,
         "configs": {
             "helion": helion.config,
-            "provider": provider_impl.config,
+            "provider": provider_config,
         },
         "correctness": {
             "passed": True,
@@ -775,9 +718,12 @@ def _device_info(device: torch.device) -> dict[str, object]:
 
     properties = torch.cuda.get_device_properties(device)
     capability = torch.cuda.get_device_capability(device)
-    if not common.is_canonical_b200(device.type, properties.name, capability):
+    if not common.is_supported_grouped_gemm_device(
+        device.type, properties.name, capability
+    ):
         raise RuntimeError(
-            "grouped-GEMM defaults benchmark requires NVIDIA B200/SM100, got "
+            "grouped-GEMM defaults benchmark requires NVIDIA B200/SM100 or "
+            "NVIDIA GB300/SM103, got "
             f"{properties.name!r} capability {capability}"
         )
     uuid = str(properties.uuid)
@@ -789,6 +735,14 @@ def _device_info(device: torch.device) -> dict[str, object]:
         "multi_processor_count": properties.multi_processor_count,
         "total_memory": properties.total_memory,
     }
+
+
+def _validate_helion_selection_for_device(
+    selection: str,
+    device_info: dict[str, object],
+) -> None:
+    if selection == "final_reviewed_aot" and device_info["capability"] != [10, 0]:
+        raise RuntimeError("final_reviewed_aot is validated only on B200/SM100")
 
 
 def _worker_cache_directories(run_dir: Path) -> dict[str, str]:
@@ -817,7 +771,18 @@ def _selection_environment(selection: str) -> dict[str, str]:
     return environment
 
 
+def _restore_provider_import_path(provider: str, quack_root: Path | None) -> None:
+    """Restore a validated source override removed by direct-script startup."""
+
+    if provider != "quack" or quack_root is None:
+        return
+    root = str(quack_root.resolve(strict=True))
+    if root not in sys.path:
+        sys.path.insert(1, root)
+
+
 def _run_worker(args: argparse.Namespace) -> int:
+    _restore_provider_import_path(args.provider, args.quack_root)
     selection_environment = _selection_environment(args.helion_selection)
     expected_selection_environment = {
         key: selection_environment.get(key)
@@ -839,13 +804,13 @@ def _run_worker(args: argparse.Namespace) -> int:
     torch.cuda.set_device(0)
     device = torch.device("cuda", 0)
     device_info = _device_info(device)
+    _validate_helion_selection_for_device(args.helion_selection, device_info)
     oracle_precision = common.configure_oracle_precision()
     from pretuned_kernels.grouped_gemm_deepgemm import reviewed_profiles
 
     cases = common.official_cases()
     if len(cases) != 8 or len(reviewed_profiles.OFFICIAL_SHAPES) != 8:
         raise RuntimeError("benchmark requires exactly eight reviewed cases")
-    torch.manual_seed(0)
     rows = [
         run_case(
             args.provider,
@@ -855,6 +820,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             helion_selection=args.helion_selection,
             cutlass_root=args.cutlass_root,
             deepgemm_root=args.deepgemm_root,
+            quack_root=args.quack_root,
         )
         for case, shape in zip(
             cases,
@@ -873,9 +839,14 @@ def _run_worker(args: argparse.Namespace) -> int:
             "python": sys.version.split()[0],
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,
+            "cutlass_dsl": importlib.metadata.version("nvidia-cutlass-dsl"),
+            "triton": importlib.metadata.version("triton"),
+            "cuda_driver": _cuda_driver_version(cast("str", device_info["uuid"])),
+            "cuda_stack": _cuda_toolchain_identity(),
         },
         "settings": {
-            "input_seed": 0,
+            "actual_m_seed": 0,
+            "tensor_seed_policy": "row_index",
             "provider_selection": PROVIDER_SELECTIONS[args.provider],
             "helion_selection_timed": False,
             "provider_selection_timed": False,
@@ -885,6 +856,13 @@ def _run_worker(args: argparse.Namespace) -> int:
             "cold_l2": True,
             "balanced_rotated_reversed_order": True,
             "oracle_float32_matmul_precision": oracle_precision,
+            "correctness_rtol": common.CORRECTNESS_RTOL,
+            "correctness_atol": common.CORRECTNESS_ATOL,
+            "max_normalized_diff": common.CORRECTNESS_MAX_NORMALIZED_DIFF,
+            "layout_policy": BENCHMARK_LAYOUT_POLICY,
+            "selection_scope": (
+                "exploratory" if args.helion_selection == "live_autotune" else "fixed"
+            ),
         },
         "rows": rows,
     }
@@ -900,13 +878,16 @@ def _provider_roots(args: argparse.Namespace) -> dict[str, Path]:
         for provider, root in (
             ("deepgemm", args.deepgemm_root),
             ("cutlass", args.cutlass_root),
+            ("quack", args.quack_root),
         )
         if root is not None
     }
+    selected = frozenset(args.providers)
     for provider in ("deepgemm", "cutlass"):
-        if provider in args.providers and provider not in roots:
+        if provider in selected and provider not in roots:
             raise ValueError(f"--{provider}-root is required for {provider}")
-        if provider not in args.providers and provider in roots:
+    for provider in roots:
+        if provider not in selected:
             raise ValueError(f"--{provider}-root requires selecting {provider}")
     return roots
 
@@ -916,6 +897,7 @@ def _worker_environment(
     *,
     cuda_visible_devices: str,
     helion_selection: str,
+    quack_root: Path | None = None,
 ) -> dict[str, str]:
     environment = os.environ.copy()
     for name in tuple(environment):
@@ -923,13 +905,17 @@ def _worker_environment(
             name in COMPILER_AND_LOADER_CONTROLS
         ):
             environment.pop(name)
-    cuda_home, cudart = _installed_cuda_runtime()
+    cuda_home, artifacts = _installed_cuda_stack()
+    cudart = artifacts["cudart"]
     environment.update(_selection_environment(helion_selection))
     environment.update(_worker_cache_directories(run_dir))
     environment["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     environment["CUDA_HOME"] = str(cuda_home)
     environment["CUDA_PATH"] = str(cuda_home)
     environment["CUDNN_FRONTEND_CUDART_LIB_NAME"] = str(cudart)
+    environment["LD_PRELOAD"] = os.pathsep.join(
+        str(artifacts[name]) for name in common.CUDA_STACK_PRELOAD_LIBRARY_PREFIXES
+    )
     environment["PYTHONHASHSEED"] = "0"
     environment["PYTHONNOUSERSITE"] = "1"
     environment["PYTHONSAFEPATH"] = "1"
@@ -946,26 +932,141 @@ def _worker_environment(
             "/bin",
         )
     )
-    environment["PYTHONPATH"] = str(REPO_ROOT)
+    python_paths = [str(REPO_ROOT)]
+    if quack_root is not None:
+        python_paths.append(str(quack_root.resolve(strict=True)))
+    environment["PYTHONPATH"] = os.pathsep.join(python_paths)
     return environment
 
 
-def _installed_cuda_runtime() -> tuple[Path, Path]:
-    distribution = importlib.metadata.distribution("nvidia-cuda-runtime")
-    candidates = [
+def _cuda_toolkit_identity(cuda_home: Path) -> dict[str, str]:
+    cuda_home = cuda_home.resolve()
+    nvcc = cuda_home / "bin" / "nvcc"
+    completed = subprocess.run(
+        (str(nvcc), "--version"),
+        check=False,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        timeout=30,
+    )
+    output = f"{completed.stdout}\n{completed.stderr}".strip()
+    match = NVCC_RELEASE_PATTERN.search(output)
+    if completed.returncode or match is None:
+        raise RuntimeError(f"could not identify CUDA toolkit nvcc at {nvcc}")
+    return {
+        "cuda_home": str(cuda_home),
+        "nvcc": str(nvcc),
+        "release": match.group(1),
+        "compiler_version": match.group(2),
+    }
+
+
+def _required_cuda_distributions() -> dict[str, importlib.metadata.Distribution]:
+    distributions = {}
+    problems = []
+    for name, expected_version in common.CUDA_STACK_DISTRIBUTION_VERSIONS.items():
+        try:
+            distribution = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            problems.append(f"{name} is not installed")
+            continue
+        if distribution.version != expected_version:
+            problems.append(
+                f"{name} is {distribution.version}, expected {expected_version}"
+            )
+        distributions[name] = distribution
+    if problems:
+        raise RuntimeError("CUDA stack is not pinned: " + "; ".join(problems))
+    return distributions
+
+
+def _distribution_file(
+    name: str,
+    distribution: importlib.metadata.Distribution,
+    relative_path: Path,
+) -> Path:
+    matches = [
         Path(str(distribution.locate_file(path))).resolve(strict=True)
         for path in distribution.files or ()
-        if Path(path).name == "libcudart.so.13"
+        if Path(str(path)) == relative_path
     ]
-    if len(candidates) != 1 or not candidates[0].is_file():
+    if len(matches) != 1 or not matches[0].is_file():
+        raise RuntimeError(f"{name} must contain exactly one {relative_path}")
+    return matches[0]
+
+
+def _cuda_stack_artifacts(
+    distributions: dict[str, importlib.metadata.Distribution],
+) -> dict[str, Path]:
+    return {
+        label: _distribution_file(distribution, distributions[distribution], path)
+        for label, (distribution, path) in common.CUDA_STACK_REQUIRED_ARTIFACTS.items()
+    }
+
+
+def _installed_cuda_stack() -> tuple[Path, dict[str, Path]]:
+    distributions = _required_cuda_distributions()
+    artifacts = _cuda_stack_artifacts(distributions)
+    roots = {
+        label: artifact.parents[
+            len(common.CUDA_STACK_REQUIRED_ARTIFACTS[label][1].parts) - 3
+        ]
+        for label, artifact in artifacts.items()
+    }
+    if len(set(roots.values())) != 1:
+        raise RuntimeError(f"CUDA stack distributions use different roots: {roots}")
+    cuda_home = next(iter(roots.values()))
+    nvcc = artifacts["nvcc"]
+    toolkit = _cuda_toolkit_identity(cuda_home)
+    if Path(toolkit["nvcc"]).resolve(strict=True) != nvcc:
+        raise RuntimeError("CUDA compiler does not resolve to the pinned nvcc package")
+    if (
+        toolkit["release"] != common.CUDA_TOOLKIT_RELEASE
+        or toolkit["compiler_version"] != common.CUDA_COMPILER_VERSION
+    ):
         raise RuntimeError(
-            "installed nvidia-cuda-runtime must contain one libcudart.so.13"
+            "nvcc reports release "
+            f"{toolkit['release']} V{toolkit['compiler_version']}, expected release "
+            f"{common.CUDA_TOOLKIT_RELEASE} V{common.CUDA_COMPILER_VERSION}"
         )
-    cudart = candidates[0]
-    cuda_home = cudart.parents[1]
-    if not (cuda_home / "bin" / "nvcc").is_file():
-        raise RuntimeError(f"installed CUDA runtime has no nvcc: {cuda_home}")
-    return cuda_home, cudart
+    return cuda_home, artifacts
+
+
+def _cuda_toolchain_identity() -> dict[str, object]:
+    expected_cuda_home, artifacts = _installed_cuda_stack()
+    expected_cudart = artifacts["cudart"]
+    distributions = _required_cuda_distributions()
+    cuda_home_text = os.environ.get("CUDA_HOME")
+    cudart_text = os.environ.get("CUDNN_FRONTEND_CUDART_LIB_NAME")
+    if cuda_home_text is None or cudart_text is None:
+        raise RuntimeError("worker CUDA toolkit environment is incomplete")
+    cuda_home = Path(cuda_home_text).resolve(strict=True)
+    cudart = Path(cudart_text).resolve(strict=True)
+    if cuda_home != expected_cuda_home or cudart != expected_cudart:
+        raise RuntimeError("worker CUDA toolkit environment changed after validation")
+    loaded_preloads = {}
+    for label, prefix in common.CUDA_STACK_PRELOAD_LIBRARY_PREFIXES.items():
+        expected = artifacts[label]
+        loaded = common.mapped_library_paths(prefix)
+        if loaded != (expected,):
+            raise RuntimeError(
+                f"worker loaded {label} libraries {tuple(map(str, loaded))}, "
+                f"expected {(str(expected),)}"
+            )
+        loaded_preloads[label] = common.file_sha256(expected)
+    identity = _cuda_toolkit_identity(cuda_home)
+    return {
+        **identity,
+        "distribution_versions": {
+            name: distribution.version for name, distribution in distributions.items()
+        },
+        "cudart": str(cudart),
+        "artifact_sha256": {
+            label: common.file_sha256(path) for label, path in artifacts.items()
+        },
+        "loaded_preload_sha256": loaded_preloads,
+    }
 
 
 def _worker_command(
@@ -988,8 +1089,6 @@ def _worker_command(
         str(replicate),
         "--run-dir",
         str(run_dir),
-        "--output-dir",
-        str(args.output_dir),
         "--helion-selection",
         args.helion_selection,
     ]
@@ -1011,6 +1110,19 @@ def _nvidia_smi(*arguments: str) -> str:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise RuntimeError(f"nvidia-smi failed ({completed.returncode}): {detail}")
     return completed.stdout
+
+
+def _cuda_driver_version(device_uuid: str) -> str:
+    output = _nvidia_smi(
+        "-i",
+        device_uuid,
+        "--query-gpu=driver_version",
+        "--format=csv,noheader,nounits",
+    )
+    rows = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise RuntimeError(f"could not identify CUDA driver for {device_uuid}")
+    return rows[0]
 
 
 def _resolve_target_gpu(cuda_visible_devices: str) -> str:
@@ -1075,20 +1187,34 @@ def _summarize_telemetry(path: Path, target_gpu_uuid: str) -> dict[str, Any]:
     if not lines or tuple(lines[0].split(",")) != TELEMETRY_FIELDS:
         raise RuntimeError(f"malformed telemetry header: {path}")
     active_reasons: Counter[str] = Counter()
+    disallowed_reasons: Counter[str] = Counter()
+    power_limits: set[float] = set()
+    power_limit_index = TELEMETRY_FIELDS.index("power.limit")
     for line in lines[1:]:
         fields = tuple(field.strip() for field in line.split(","))
         if len(fields) != len(TELEMETRY_FIELDS) or fields[1] != target_gpu_uuid:
             raise RuntimeError(f"telemetry is not bound to {target_gpu_uuid}: {path}")
         try:
             active = int(fields[-1], 0)
+            power_limit = float(fields[power_limit_index])
         except ValueError as error:
-            raise RuntimeError(f"invalid active clock-event reason: {path}") from error
+            raise RuntimeError(f"invalid numeric telemetry value: {path}") from error
+        if not math.isfinite(power_limit) or power_limit <= 0:
+            raise RuntimeError(f"invalid GPU power limit: {path}")
+        power_limits.add(power_limit)
         if active:
             active_reasons[fields[-1]] += 1
+        if disallowed := active & ~ALLOWED_CLOCK_EVENT_REASONS:
+            disallowed_reasons[f"0x{disallowed:x}"] += 1
+    if len(power_limits) != 1:
+        raise RuntimeError(f"GPU power limit changed during worker: {path}")
     return {
         "sample_count": len(lines) - 1,
+        "power_limit_watts": next(iter(power_limits)),
         "active_clock_event_reason_sample_count": sum(active_reasons.values()),
         "active_clock_event_reasons": dict(sorted(active_reasons.items())),
+        "disallowed_clock_event_reason_sample_count": sum(disallowed_reasons.values()),
+        "disallowed_clock_event_reasons": dict(sorted(disallowed_reasons.items())),
     }
 
 
@@ -1169,6 +1295,72 @@ def _geomean(values: Sequence[float]) -> float:
     return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
+def _required_string(mapping: dict[str, Any], key: str, label: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"{label} is missing {key}")
+    return value
+
+
+def _semantic_stack_identity(result: dict[str, Any]) -> dict[str, object]:
+    versions = result.get("versions")
+    if not isinstance(versions, dict):
+        raise RuntimeError("worker result is missing software stack versions")
+    cuda_stack = versions.get("cuda_stack")
+    if not isinstance(cuda_stack, dict):
+        raise RuntimeError("worker result is missing CUDA stack identity")
+    distribution_versions = cuda_stack.get("distribution_versions")
+    if not isinstance(distribution_versions, dict) or (
+        distribution_versions != common.CUDA_STACK_DISTRIBUTION_VERSIONS
+    ):
+        raise RuntimeError(
+            "worker CUDA distributions do not match the pinned stack: "
+            f"{distribution_versions}"
+        )
+    release = _required_string(cuda_stack, "release", "CUDA stack")
+    compiler_version = _required_string(cuda_stack, "compiler_version", "CUDA stack")
+    artifact_sha256 = cuda_stack.get("artifact_sha256")
+    if not isinstance(artifact_sha256, dict) or set(artifact_sha256) != set(
+        common.CUDA_STACK_REQUIRED_ARTIFACTS
+    ):
+        raise RuntimeError("worker CUDA stack is missing artifact hashes")
+    if any(
+        not isinstance(value, str) or not value for value in artifact_sha256.values()
+    ):
+        raise RuntimeError("worker CUDA stack contains invalid artifact hashes")
+    loaded_preload_sha256 = cuda_stack.get("loaded_preload_sha256")
+    if not isinstance(loaded_preload_sha256, dict) or set(loaded_preload_sha256) != set(
+        common.CUDA_STACK_PRELOAD_LIBRARY_PREFIXES
+    ):
+        raise RuntimeError("worker CUDA stack is missing loaded preload hashes")
+    if any(
+        not isinstance(value, str) or not value
+        for value in loaded_preload_sha256.values()
+    ):
+        raise RuntimeError("worker CUDA stack contains invalid preload hashes")
+    if (
+        release != common.CUDA_TOOLKIT_RELEASE
+        or compiler_version != common.CUDA_COMPILER_VERSION
+    ):
+        raise RuntimeError(
+            "worker CUDA compiler does not match the pinned stack: "
+            f"release {release} V{compiler_version}"
+        )
+    return {
+        "python": _required_string(versions, "python", "software stack"),
+        "torch": _required_string(versions, "torch", "software stack"),
+        "torch_cuda": _required_string(versions, "torch_cuda", "software stack"),
+        "triton": _required_string(versions, "triton", "software stack"),
+        "cutlass_dsl": _required_string(versions, "cutlass_dsl", "software stack"),
+        "cuda_driver": _required_string(versions, "cuda_driver", "software stack"),
+        "cuda_distribution_versions": dict(distribution_versions),
+        "cuda_compiler_release": release,
+        "cuda_compiler_version": compiler_version,
+        "cuda_artifact_sha256": dict(artifact_sha256),
+        "loaded_preload_sha256": dict(loaded_preload_sha256),
+    }
+
+
 def summarize_results(
     results: Sequence[dict[str, Any]],
     *,
@@ -1177,6 +1369,16 @@ def summarize_results(
     helion_selection: str,
 ) -> dict[str, Any]:
     row_count = len(common.official_cases())
+    if len(results) != len(providers) * replicates:
+        raise RuntimeError("campaign produced an unexpected worker result count")
+    stack_identities = [_semantic_stack_identity(result) for result in results]
+    canonical_stack_identities = {
+        json.dumps(identity, allow_nan=False, sort_keys=True)
+        for identity in stack_identities
+    }
+    if len(canonical_stack_identities) != 1:
+        raise RuntimeError("semantic software stack changed across campaign workers")
+    software_stack = stack_identities[0]
     provider_summaries = {}
     config_hashes: list[list[str]] = [[] for _ in range(row_count)]
     for provider in providers:
@@ -1192,11 +1394,16 @@ def summarize_results(
             result.get("schema") != RESULT_SCHEMA
             or result.get("provider") != provider
             or result.get("helion_selection") != helion_selection
+            or result.get("settings", {}).get("layout_policy")
+            != BENCHMARK_LAYOUT_POLICY
             for result in provider_results
         ):
             raise RuntimeError(f"{provider} result identity is inconsistent")
         replicate_summaries = []
         row_speedups: list[list[float]] = [[] for _ in range(row_count)]
+        row_helion_ms: list[list[float]] = [[] for _ in range(row_count)]
+        row_provider_ms: list[list[float]] = [[] for _ in range(row_count)]
+        provider_config_hashes: list[list[str]] = [[] for _ in range(row_count)]
         for result in provider_results:
             rows = result["rows"]
             if len(rows) != row_count or [row.get("row_index") for row in rows] != list(
@@ -1205,13 +1412,40 @@ def summarize_results(
                 raise RuntimeError(
                     f"{provider} result does not contain {row_count} rows"
                 )
+            helion_times = [float(row["timings"]["helion_ms"]) for row in rows]
+            provider_times = [float(row["timings"]["provider_ms"]) for row in rows]
             speedups = [float(row["timings"]["helion_speedup"]) for row in rows]
-            for row_index, (row, speedup) in enumerate(
-                zip(rows, speedups, strict=True)
+            if any(
+                not math.isfinite(value) or value <= 0
+                for value in (*helion_times, *provider_times, *speedups)
+            ):
+                raise RuntimeError(f"{provider} result contains invalid timings")
+            if any(
+                not math.isclose(
+                    speedup,
+                    provider_ms / helion_ms,
+                    rel_tol=1e-12,
+                    abs_tol=0.0,
+                )
+                for helion_ms, provider_ms, speedup in zip(
+                    helion_times,
+                    provider_times,
+                    speedups,
+                    strict=True,
+                )
+            ):
+                raise RuntimeError(f"{provider} result contains inconsistent speedups")
+            for row_index, (row, helion_ms, provider_ms, speedup) in enumerate(
+                zip(rows, helion_times, provider_times, speedups, strict=True)
             ):
                 row_speedups[row_index].append(speedup)
+                row_helion_ms[row_index].append(helion_ms)
+                row_provider_ms[row_index].append(provider_ms)
                 config_hashes[row_index].append(
                     row["configs"]["helion"]["config_sha256"]
+                )
+                provider_config_hashes[row_index].append(
+                    row["configs"]["provider"]["config_sha256"]
                 )
             worst_index = min(range(row_count), key=speedups.__getitem__)
             replicate_summaries.append(
@@ -1221,6 +1455,8 @@ def summarize_results(
                     "wins": sum(speedup > 1.0 for speedup in speedups),
                     "worst_row": worst_index,
                     "worst_speedup": speedups[worst_index],
+                    "helion_ms_geomean": _geomean(helion_times),
+                    "provider_ms_geomean": _geomean(provider_times),
                 }
             )
         row_summaries = [
@@ -1228,11 +1464,33 @@ def summarize_results(
                 "row_index": row_index,
                 "geomean_speedup": _geomean(speedups),
                 "replicate_speedups": speedups,
+                "helion_ms": {
+                    "median_across_replicates": statistics.median(
+                        row_helion_ms[row_index]
+                    ),
+                    "replicate_medians": row_helion_ms[row_index],
+                },
+                "provider_ms": {
+                    "median_across_replicates": statistics.median(
+                        row_provider_ms[row_index]
+                    ),
+                    "replicate_medians": row_provider_ms[row_index],
+                },
             }
             for row_index, speedups in enumerate(row_speedups)
         ]
         all_speedups = [speedup for row in row_speedups for speedup in row]
         worst_row = min(row_summaries, key=itemgetter("geomean_speedup"))
+        provider_distributions = [
+            {
+                "row_index": row_index,
+                "config_sha256_counts": dict(sorted(Counter(hashes).items())),
+                "invariant": len(set(hashes)) == 1,
+            }
+            for row_index, hashes in enumerate(provider_config_hashes)
+        ]
+        if not all(item["invariant"] for item in provider_distributions):
+            raise RuntimeError(f"{provider} selected config changed across replicates")
         provider_summaries[provider] = {
             "selection": PROVIDER_SELECTIONS[provider],
             "cross_replicate_geomean": _geomean(all_speedups),
@@ -1241,6 +1499,7 @@ def summarize_results(
             "worst_row": worst_row,
             "replicates": replicate_summaries,
             "rows": row_summaries,
+            "config_distributions": provider_distributions,
         }
     distributions = [
         {
@@ -1259,6 +1518,12 @@ def summarize_results(
         "providers": list(providers),
         "replicates": replicates,
         "helion_selection": helion_selection,
+        "publication_eligible": (
+            helion_selection != "live_autotune"
+            and replicates >= MIN_PUBLICATION_REPLICATES
+        ),
+        "minimum_publication_replicates": MIN_PUBLICATION_REPLICATES,
+        "software_stack": software_stack,
         "speedup_definition": "provider_ms / helion_ms; higher favors Helion",
         "protocol": {
             "fresh_process_and_caches_per_provider_replicate": True,
@@ -1266,6 +1531,12 @@ def summarize_results(
             "thermal_warmup_ms": THERMAL_WARMUP_MS,
             "paired_cold_l2_samples": BENCHMARK_REPETITIONS,
             "balanced_rotated_reversed_order": True,
+            "row_timing_statistic": "median_ms",
+            "raw_paired_samples_retained": False,
+            "raw_paired_samples_note": (
+                "the shared timer returns one median per implementation"
+            ),
+            "layout_policy": BENCHMARK_LAYOUT_POLICY,
         },
         "helion_config_distributions": distributions,
         "provider_results": provider_summaries,
@@ -1288,6 +1559,11 @@ def _print_summary(summary: dict[str, Any]) -> None:
         print(
             "active GPU clock-event reasons: "
             f"{monitoring['active_clock_event_reasons']}"
+        )
+    if not summary["publication_eligible"]:
+        print(
+            "not publication-eligible: use a fixed Helion selection with at least "
+            f"{summary['minimum_publication_replicates']} replicates"
         )
 
 
@@ -1316,6 +1592,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
                     run_dir,
                     cuda_visible_devices=target_gpu_uuid,
                     helion_selection=args.helion_selection,
+                    quack_root=(roots.get("quack") if provider == "quack" else None),
                 ),
                 log_path=log_path,
                 telemetry_path=telemetry_path,
@@ -1341,6 +1618,11 @@ def _run_campaign(args: argparse.Namespace) -> int:
             monitoring = _summarize_telemetry(telemetry_path, target_gpu_uuid)
             if monitoring["sample_count"] != samples:
                 raise RuntimeError(f"{run_id} telemetry sample count changed")
+            if monitoring["disallowed_clock_event_reason_sample_count"]:
+                raise RuntimeError(
+                    f"{run_id} telemetry reported disallowed clock-event reasons: "
+                    f"{monitoring['disallowed_clock_event_reasons']}"
+                )
             results.append(result)
             runs.append(
                 {
@@ -1350,6 +1632,7 @@ def _run_campaign(args: argparse.Namespace) -> int:
                     "log": str(log_path.relative_to(output_dir)),
                     "telemetry": str(telemetry_path.relative_to(output_dir)),
                     "telemetry_samples": monitoring["sample_count"],
+                    "power_limit_watts": monitoring["power_limit_watts"],
                     "active_clock_event_reason_sample_count": monitoring[
                         "active_clock_event_reason_sample_count"
                     ],
@@ -1367,15 +1650,24 @@ def _run_campaign(args: argparse.Namespace) -> int:
         helion_selection=args.helion_selection,
     )
     summary["source"] = source
+    power_limits = {run["power_limit_watts"] for run in runs}
+    if len(power_limits) != 1:
+        raise RuntimeError("GPU power limit changed across campaign workers")
     active_reasons: Counter[str] = Counter()
     for run in runs:
         active_reasons.update(run["active_clock_event_reasons"])
     summary["monitoring"] = {
         "target_gpu_uuid": target_gpu_uuid,
         "target_gpu_idle_before_after_each_run": True,
+        "power_limit_watts": next(iter(power_limits)),
+        "power_limit_constant_across_campaign": True,
         "telemetry_sample_count": sum(run["telemetry_samples"] for run in runs),
         "active_clock_event_reason_sample_count": sum(active_reasons.values()),
         "active_clock_event_reasons": dict(sorted(active_reasons.items())),
+        "allowed_clock_event_reason_mask": f"0x{ALLOWED_CLOCK_EVENT_REASONS:x}",
+        "disallowed_clock_event_reason_sample_count": 0,
+        "disallowed_clock_event_reasons": {},
+        "disallowed_clock_events_invalidate_run": True,
         "runs_with_active_clock_event_reasons": [
             f"{run['provider']}-r{run['replicate']}"
             for run in runs
@@ -1408,9 +1700,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--helion-selection",
         choices=HELION_SELECTIONS,
-        default="final_reviewed_aot",
+        default="compiler_heuristic",
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
         "--cuda-visible-devices",
         default=os.environ.get("CUDA_VISIBLE_DEVICES"),
@@ -1418,6 +1710,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cutlass-root", type=_existing_directory)
     parser.add_argument("--deepgemm-root", type=_existing_directory)
+    parser.add_argument("--quack-root", type=_existing_directory)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--provider", choices=PROVIDERS, help=argparse.SUPPRESS)
     parser.add_argument("--replicate", type=_nonnegative_int, help=argparse.SUPPRESS)
@@ -1433,6 +1726,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "internal --worker requires provider, replicate, and run-dir"
             )
         return _run_worker(args)
+    if args.output_dir is None:
+        raise ValueError("--output-dir is required")
     if args.cuda_visible_devices is None:
         raise ValueError("set CUDA_VISIBLE_DEVICES or --cuda-visible-devices")
     common.require_single_visible_device(args.cuda_visible_devices)

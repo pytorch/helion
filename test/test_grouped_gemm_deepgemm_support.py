@@ -1,19 +1,49 @@
 from __future__ import annotations
 
+import importlib.machinery
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 
 from benchmarks.cute import grouped_gemm_deepgemm_support as support
-from pretuned_kernels.grouped_gemm_deepgemm import _deepgemm_public_api
+from pretuned_kernels.grouped_gemm_deepgemm import reviewed_runtime
 import pytest
 import torch
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 # CPU tensors and mocked DeepGEMM modules isolate these host-side contracts from CUDA.
+def test_native_extension_accepts_in_tree_build_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "DeepGEMM"
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    target = root / "build" / "deep_gemm" / f"_C{suffix}"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"extension")
+    link = root / "deep_gemm" / f"_C{suffix}"
+    link.parent.mkdir()
+    link.symlink_to(Path("..") / "build" / "deep_gemm" / target.name)
+
+    extension, identity = support._native_extension(root)
+
+    assert extension == target
+    assert identity["path"] == f"deep_gemm/_C{suffix}"
+    assert identity["resolved_path"] == f"build/deep_gemm/_C{suffix}"
+    assert identity["is_symlink"] is True
+
+
+def test_native_extension_rejects_symlink_outside_checkout(tmp_path: Path) -> None:
+    root = tmp_path / "DeepGEMM"
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    target = tmp_path / f"_C{suffix}"
+    target.write_bytes(b"extension")
+    link = root / "deep_gemm" / f"_C{suffix}"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="within the checkout"):
+        support._native_extension(root)
+
+
 def test_repack_case_alignment_preserves_logical_values() -> None:
     torch.manual_seed(0)
     actual_ms = (2, 3)
@@ -67,9 +97,9 @@ def test_correctness_padding_contract(
     require_zero_padding: bool,
     expected: bool,
 ) -> None:
-    reference = torch.tensor([[1.0], [0.0], [2.0]])
+    reference = torch.tensor([[1.0], [0.0], [2.0]], dtype=torch.float32)
     layout = torch.tensor([0, -1, 1], dtype=torch.int32)
-    output = torch.tensor(output_values).unsqueeze(1)
+    output = torch.tensor(output_values, dtype=torch.bfloat16).unsqueeze(1)
 
     assert (
         support.correctness(
@@ -98,9 +128,11 @@ def test_import_deepgemm_records_public_module_and_alignment(
 
     heads: list[tuple[Path, str, str]] = []
     monkeypatch.setattr(
-        support,
-        "_clean_checkout",
-        lambda path, expected, label: heads.append((path, expected, label)) or expected,
+        support.common,
+        "clean_checkout",
+        lambda path, expected, label: (
+            heads.append((path, expected, label)) or {"commit": expected}
+        ),
     )
     monkeypatch.setattr(
         support,
@@ -140,13 +172,17 @@ def test_import_deepgemm_records_public_module_and_alignment(
     assert alignments == [support.M_ALIGNMENT]
     assert provenance["git_head"] == support.DEEPGEMM_COMMIT
     assert provenance["m_alignment"] == support.M_ALIGNMENT
-    assert provenance["native_extension"]["sha256"] == "abc"
+    native_extension = cast("dict[str, object]", provenance["native_extension"])
+    assert native_extension["sha256"] == "abc"
     assert provenance["runtime_controls"] == {
-        "num_sms": 148,
-        "tc_util": 100,
-        "pdl": False,
-        "ignore_compile_dims": False,
-        "block_size_multiple_of": 1,
+        "requested": {
+            "num_sms": 0,
+            "tc_util": 100,
+            "pdl": False,
+            "ignore_compile_dims": False,
+            "block_size_multiple_of": 1,
+        },
+        "observed": {"num_sms": 148, "tc_util": 100, "pdl": False},
     }
     assert [item[2] for item in heads] == [
         "DeepGEMM",
@@ -163,7 +199,11 @@ def test_import_deepgemm_rejects_module_outside_checkout(
     root.mkdir()
     extension = root / "_C.so"
     extension.write_bytes(b"extension")
-    monkeypatch.setattr(support, "_clean_checkout", lambda *_args: "head")
+    monkeypatch.setattr(
+        support.common,
+        "clean_checkout",
+        lambda *_args: {"commit": "head"},
+    )
     monkeypatch.setattr(
         support,
         "_native_extension",
@@ -190,13 +230,13 @@ def test_import_deepgemm_rejects_control_environment(
         support.import_deepgemm(tmp_path, support.M_ALIGNMENT)
 
 
-def test_effective_reviewed_config_checks_requested_and_normalized(
+def test_effective_reviewed_config_checks_requested_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requested = {"block_sizes": [256, 128, 64], "num_warps": 8}
     profile = SimpleNamespace(config_name="reviewed")
     monkeypatch.setattr(
-        _deepgemm_public_api._REVIEWED,
+        reviewed_runtime.reviewed_profiles,
         "reviewed_config_values",
         lambda _name: requested,
     )
@@ -212,10 +252,14 @@ def test_effective_reviewed_config_checks_requested_and_normalized(
         config_spec=ConfigSpec(),
     )
 
-    assert _deepgemm_public_api._effective_reviewed_config(bound, profile) == {
+    assert reviewed_runtime.effective_reviewed_config(
+        cast("Any", bound), cast("Any", profile)
+    ) == {
         "requested": requested,
         "effective": {**requested, "normalized": True},
     }
     bound._config = SimpleNamespace(config={"num_warps": 4})
     with pytest.raises(RuntimeError, match="exact reviewed config"):
-        _deepgemm_public_api._effective_reviewed_config(bound, profile)
+        reviewed_runtime.effective_reviewed_config(
+            cast("Any", bound), cast("Any", profile)
+        )

@@ -17,11 +17,14 @@ if TYPE_CHECKING:
     import torch
 
 CUTLASS_REPOSITORY = "https://github.com/NVIDIA/cutlass"
-CUTLASS_TAG = "4.7.0"
+CUTLASS_RELEASE_TAG = "v4.7.0"
 CUTLASS_COMMIT = "dcf215af68a2d08d305076c152a06f201728cd53"
 CUTLASS_DSL_VERSION = "4.7.0"
 CUTLASS_OPERATOR_API_VERSION = "0.2.0"
-CUTLASS_TARGET_SM = "100a"
+CUTLASS_TARGET_SMS = {
+    (10, 0): "100a",
+    (10, 3): "103a",
+}
 CUTLASS_OPERATOR_BASELINE = "cutlass_operator_contiguous_offset_bf16"
 _OPERATOR_MODULE = (
     "cutlass.operators.providers.cutedsl.gemm.sm100_contiguous_offset_2d3d_dense_gemm"
@@ -49,6 +52,17 @@ def _int3(values: Sequence[int], name: str) -> tuple[int, int, int]:
         raise RuntimeError(f"CUTLASS {name} must contain three positive integers")
     first, second, third = result
     return first, second, third
+
+
+def cutlass_target_sm(capability: tuple[int, int]) -> str:
+    """Return the CUTLASS architecture target for a validated device."""
+
+    try:
+        return CUTLASS_TARGET_SMS[capability]
+    except KeyError as error:
+        raise RuntimeError(
+            "CUTLASS grouped adapter targets B200/SM100 or GB300/SM103"
+        ) from error
 
 
 def require_cutlass_dependencies() -> None:
@@ -81,12 +95,32 @@ def verify_cutlass_checkout(cutlass_root: Path) -> dict[str, object]:
         raise RuntimeError(f"CUTLASS Operator API package is missing below {root}")
     return {
         "repository": CUTLASS_REPOSITORY,
-        "tag": CUTLASS_TAG,
+        "release_tag": CUTLASS_RELEASE_TAG,
         **checkout,
     }
 
 
-def _load_operator_api(cutlass_root: Path) -> tuple[Any, type[object]]:
+def _module_identity(module: object, root: Path, name: str) -> dict[str, str]:
+    from benchmarks.cute import grouped_gemm_benchmark as common
+
+    module_file = cast("Any", module).__file__
+    if module_file is None:
+        raise RuntimeError(f"CUTLASS module {name!r} has no source origin")
+    origin = Path(str(module_file)).resolve(strict=True)
+    if not origin.is_relative_to(root):
+        raise RuntimeError(
+            f"CUTLASS module {name!r} was imported outside the validated checkout: "
+            f"{origin}"
+        )
+    return {
+        "path": origin.relative_to(root).as_posix(),
+        "sha256": common.file_sha256(origin),
+    }
+
+
+def _load_operator_api(
+    cutlass_root: Path,
+) -> tuple[Any, type[object], dict[str, dict[str, str]]]:
     package_root = (cutlass_root / "operators" / "cutlass").resolve()
     cutlass = importlib.import_module("cutlass")
     package_path = cutlass.__path__
@@ -106,7 +140,16 @@ def _load_operator_api(cutlass_root: Path) -> tuple[Any, type[object]]:
         )
     except (AttributeError, ImportError, OSError) as error:
         raise RuntimeError("failed to import CUTLASS grouped operators") from error
-    return ops, operator_class
+    if operator_class.__module__ != _OPERATOR_MODULE:
+        raise RuntimeError(
+            "CUTLASS grouped operator class came from "
+            f"{operator_class.__module__!r}, expected {_OPERATOR_MODULE!r}"
+        )
+    origins = {
+        "operator_api": _module_identity(ops, cutlass_root, "cutlass.operators"),
+        "operator_module": _module_identity(module, cutlass_root, _OPERATOR_MODULE),
+    }
+    return ops, operator_class, origins
 
 
 def _operator_config(metadata: object) -> _CutlassOperatorConfig:
@@ -129,10 +172,10 @@ def prepare_cutlass_default(
     import torch
 
     checkout = verify_cutlass_checkout(cutlass_root)
+    cutlass_root = Path(cast("str", checkout["path"]))
     require_cutlass_dependencies()
     device = inputs.compact_a.device
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        raise RuntimeError("CUTLASS grouped adapter targets B200/SM100")
+    target_sm = cutlass_target_sm(torch.cuda.get_device_capability(device))
     if inputs.case.k % 8 or inputs.case.n % 8:
         raise ValueError("CUTLASS BF16 K and N must be multiples of 8")
 
@@ -144,7 +187,7 @@ def prepare_cutlass_default(
         device=device,
         dtype=torch.bfloat16,
     )
-    ops, operator_class = _load_operator_api(cutlass_root)
+    ops, operator_class, module_origins = _load_operator_api(cutlass_root)
     operator_api_version = str(ops.__version__)
     if operator_api_version != CUTLASS_OPERATOR_API_VERSION:
         raise RuntimeError(
@@ -166,7 +209,7 @@ def prepare_cutlass_default(
         discovered = ops.get_operators(
             args,
             metadata_filter=lambda metadata: metadata.operator_class is operator_class,
-            target_sm=CUTLASS_TARGET_SM,
+            target_sm=target_sm,
             providers=[ops.CuTeDSLProvider],
         )
     if not discovered:
@@ -176,7 +219,7 @@ def prepare_cutlass_default(
     operator = discovered[0]
     config = _operator_config(operator.metadata)
     with torch.cuda.device(device):
-        artifact = operator.compile(args, target_sm=CUTLASS_TARGET_SM)
+        artifact = operator.compile(args, target_sm=target_sm)
 
     def call() -> torch.Tensor:
         with torch.cuda.device(device):
@@ -198,11 +241,12 @@ def prepare_cutlass_default(
             "selection_mode": "public_registry_first",
             "baseline": CUTLASS_OPERATOR_BASELINE,
             "repository": CUTLASS_REPOSITORY,
-            "tag": CUTLASS_TAG,
+            "release_tag": CUTLASS_RELEASE_TAG,
             "checkout": checkout,
             "operator_api_version": operator_api_version,
+            "module_origins": module_origins,
             "global_options": {"use_tvm_ffi": True},
-            "target_sm": CUTLASS_TARGET_SM,
+            "target_sm": target_sm,
             "b_layout": "k_major",
             "selected_config": asdict(config),
             "operator_name": str(operator.metadata.operator_name),

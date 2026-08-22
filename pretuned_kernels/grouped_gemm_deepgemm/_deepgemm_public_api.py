@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from benchmarks.cute import grouped_gemm_deepgemm_support as _SUPPORT
 from pretuned_kernels import _bench as _BENCH
 from pretuned_kernels.grouped_gemm_deepgemm import reviewed_profiles as _REVIEWED
+from pretuned_kernels.grouped_gemm_deepgemm import reviewed_runtime as _REVIEWED_RUNTIME
 import torch
 
 import helion.runtime as helion_runtime
@@ -19,11 +20,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from types import ModuleType
 
-    from pretuned_kernels.grouped_gemm_deepgemm.reviewed_profiles import (
-        ReviewedWorklistProfile,
-    )
-
-    from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
 
 DEEPGEMM_ROOT_ENV = "HELION_DEEPGEMM_ROOT"
@@ -127,48 +123,6 @@ def _check_output(
         raise RuntimeError(f"grouped GEMM correctness failed: {result}")
 
 
-def _launch_deepgemm(
-    deep_gemm: ModuleType,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    output: torch.Tensor,
-    layout: torch.Tensor,
-) -> torch.Tensor:
-    """Call the public API while excluding undefined padding from the work."""
-    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
-        a,
-        b,
-        output,
-        layout,
-        compiled_dims="nk",
-        use_psum_layout=False,
-        ensure_zero_padding=False,
-    )
-    return output
-
-
-def _effective_reviewed_config(
-    bound: BoundKernel[torch.Tensor], profile: ReviewedWorklistProfile
-) -> dict[str, dict[str, object]]:
-    requested = _REVIEWED.reviewed_config_values(profile.config_name)
-    actual = bound._config
-    if actual is None or actual.config != requested:
-        raise RuntimeError(
-            "AOT evaluation did not select the exact reviewed config "
-            f"{profile.config_name}"
-        )
-    expected_effective = bound.config_spec.normalized_config(requested)
-    effective = bound.config_spec.normalized_config(actual)
-    if effective.config != expected_effective.config:
-        raise RuntimeError(
-            f"reviewed config normalization changed for {profile.config_name}"
-        )
-    return {
-        "requested": dict(actual.config),
-        "effective": dict(effective.config),
-    }
-
-
 def _captured_calls(
     shape_and_ms: tuple[_REVIEWED.OfficialShape, tuple[int, ...]],
     deep_gemm: ModuleType,
@@ -216,13 +170,13 @@ def _captured_calls(
         "config_name": profile.config_name,
         "b_major": profile.b_major,
         "source_m_tile": profile.source_m_tile,
-        "config": _effective_reviewed_config(bound, profile),
+        "config": _REVIEWED_RUNTIME.effective_reviewed_config(bound, profile),
     }
 
     deep_output = torch.empty_like(external_reference, dtype=external_a.dtype)
 
     def deepgemm_call() -> torch.Tensor:
-        return _launch_deepgemm(
+        return _SUPPORT.launch_deepgemm(
             deep_gemm,
             external_a,
             external_b,
