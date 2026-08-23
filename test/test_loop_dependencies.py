@@ -18,7 +18,6 @@ from helion._compiler.program_id import ForEachProgramID
 from helion._compiler.program_id import _ast_fingerprint
 from helion._compiler.program_id import _clone_opaque_loop_segment
 from helion._compiler.program_id import _clone_opaque_statements
-from helion._compiler.program_id import _partitioned_materialization_geometry
 from helion._compiler.program_id import _prepend_schedule_to_opaque_loop
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -146,47 +145,6 @@ def implicit_tile_dependency_matmul_chain(
 
 
 class TestTileDependencyScheduling(unittest.TestCase):
-    def test_partitioned_materialization_geometry_is_shape_derived(self) -> None:
-        self.assertEqual(
-            _partitioned_materialization_geometry(
-                producer_tasks=768,
-                finalized_members=40,
-                finalize_partition_block=1,
-                materialize_tasks=8,
-            ),
-            (8, 4, 16, 1),
-        )
-        self.assertEqual(
-            _partitioned_materialization_geometry(
-                producer_tasks=768,
-                finalized_members=40,
-                finalize_partition_block=1,
-                materialize_tasks=16,
-            ),
-            (8, 4, 16, 2),
-        )
-        self.assertIsNone(
-            _partitioned_materialization_geometry(
-                producer_tasks=17,
-                finalized_members=5,
-                finalize_partition_block=1,
-                materialize_tasks=4,
-            )
-        )
-
-    def test_reduction_fanout_consumes_an_upstream_producer_once(self) -> None:
-        plan = ForEachProgramID._OneWaveReductionFanout(
-            producer_root=11,
-            reduction_root=12,
-            consumer_root=13,
-            task_count=32,
-            upstream_root=10,
-            upstream_tasks=512,
-            upstream_tasks_per_partition=16,
-        )
-        self.assertEqual(plan.start_root, 10)
-        self.assertEqual(plan.continuation_roots, frozenset({11, 12, 13}))
-
     def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
         body = ast.parse("value = value * 2\nout[index] = value\n").body
         cloned = _clone_opaque_statements(body)
@@ -390,6 +348,15 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
     def test_dynamic_shape_schedule_uses_safe_phase_fallback(self) -> None:
         x = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_implicit_tile_dependency_chain.bind((x,))
+        host_function = bound.host_function
+        assert host_function is not None
+        dependency_plan = host_function.device_ir.cross_loop_dependency_plan
+        assert dependency_plan is not None
+        self.assertTrue(dependency_plan.accesses)
+        self.assertTrue(
+            all(not access.layout_is_static for access in dependency_plan.accesses)
+        )
         code, output = code_and_output(
             dynamic_implicit_tile_dependency_chain,
             (x,),

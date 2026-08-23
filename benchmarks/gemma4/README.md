@@ -4,12 +4,14 @@
 from the existing Helion layer roots and replaces only their cross-root
 dispatch, waits, publications, and continuation schedule.
 
-On one NVIDIA B200 at context length 8192, the retained layer-0 configuration
-measured 72.19 microseconds versus 79.80 microseconds for the separate Helion
-CUDA graph. A clean run from this worktree measured 72.25 versus 80.04
-microseconds. Repeated-launch correctness passed. The checked-in
-`triton_gemma4_codegen_schedule_best_lowered.txt` is the corresponding lowered
-Triton snapshot for inspection.
+On GPU 0 of the current NVIDIA B200 host at context length 8192, three fresh
+processes measured 74.72--74.78 microseconds for direct keyed activation
+scheduling versus 80.11--80.16 microseconds for the tuned separate Helion CUDA
+graph. Each process used 50 interleaved samples of 20 graph replays, and
+repeated-launch correctness passed. Absolute performance varies materially
+between otherwise-idle GPUs on this host, so comparisons must be same-process
+and same-GPU. The checked-in `triton_gemma4_codegen_schedule_best_lowered.txt`
+and each run's `--lowered-output` provide lowered Triton for inspection.
 
 Run the measured configuration from the repository root:
 
@@ -19,6 +21,8 @@ python benchmarks/gemma4/triton_gemma4_codegen_schedule_probe.py \
     --layer 0 \
     --workers 576 \
     --ffn-stream \
+    --ffn-scheduled-activation \
+    --compare-scheduled-activation \
     --ffn-first-groups 36 \
     --qkv-block-n 8 \
     --qkv-block-k 256 \
@@ -41,7 +45,7 @@ python benchmarks/gemma4/triton_gemma4_codegen_schedule_probe.py \
     --fused-signals \
     --benchmark \
     --compare-helion \
-    --repeats 20 \
+    --repeats 50 \
     --batch-replays 20 \
     --lowered-output /tmp/gemma4_codegen_schedule_best_lowered.py
 ```

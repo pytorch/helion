@@ -6,10 +6,12 @@ from typing import Literal
 import torch
 
 import helion
+from helion._compiler.cross_loop_dependencies import AllocationRegion
 from helion._compiler.cross_loop_dependencies import CrossLoopAccess
 from helion._compiler.cross_loop_dependencies import LogicalTaskAxis
 from helion._compiler.cross_loop_dependencies import TaskFamily
 from helion._compiler.cross_loop_dependencies import TileDependencyKind
+from helion._compiler.cross_loop_dependencies import allocation_regions_may_overlap
 from helion._compiler.cross_loop_dependencies import build_cross_loop_dependency_plan
 from helion._compiler.cross_loop_dependencies import predecessor_task_ids
 from helion._compiler.cross_loop_dependencies import prove_uniform_task_partition
@@ -413,6 +415,8 @@ def _access(
     full_slice: tuple[bool, ...] | None = None,
     masked: bool = False,
     tensor_name: str = "tmp",
+    storage_offset: int = 0,
+    layout_is_static: bool = True,
 ) -> CrossLoopAccess:
     return CrossLoopAccess(
         access_id=access_id,
@@ -424,7 +428,7 @@ def _access(
         tensor_name=tensor_name,
         tensor_shape=shape,
         tensor_strides=strides,
-        storage_offset=0,
+        storage_offset=storage_offset,
         subscript_dims=tuple(range(len(block_ids))),
         subscript_affine_block_ids=block_ids,
         subscript_index_scales=scales,
@@ -432,10 +436,105 @@ def _access(
         subscript_is_scalar=scalar or tuple(False for _ in block_ids),
         has_explicit_mask=masked,
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
+        layout_is_static=layout_is_static,
     )
 
 
 class TestCrossLoopDependencies(TestCase):
+    def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
+        for layout, left_interval, right_interval, second_dimension in (
+            (((2, 1), (0, 1), 0), (0, 1), (0, 1), (0, 1)),
+            (((2, 2), (1, 1), 0), (0, 2), (1, 3), (0, 2)),
+        ):
+            with self.subTest(layout=layout):
+                left = AllocationRegion(
+                    left_interval,
+                    False,
+                    layout,
+                    ((0, 1), second_dimension),
+                    True,
+                )
+                right = AllocationRegion(
+                    right_interval,
+                    False,
+                    layout,
+                    ((1, 2), second_dimension),
+                    True,
+                )
+
+                self.assertTrue(allocation_regions_may_overlap(left, right))
+
+    def test_nonstatic_layout_falls_back_to_root_readiness(self) -> None:
+        plan = build_cross_loop_dependency_plan(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    block_ids=(10,),
+                    layout_is_static=False,
+                ),
+                _access(1, root=1, kind="load", block_ids=(20,)),
+            ),
+            [[10], [20]],
+        )
+
+        self.assertEqual(plan.events[0].granularity, "root")
+
+    def test_multidimensional_storage_offset_falls_back_to_root(self) -> None:
+        plan = build_cross_loop_dependency_plan(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(4, 4),
+                    strides=(4, 1),
+                    block_ids=(10, 11),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(3, 3),
+                    strides=(4, 1),
+                    block_ids=(20, 21),
+                    storage_offset=5,
+                ),
+            ),
+            [[10, 11], [20, 21]],
+        )
+
+        self.assertEqual(plan.events[0].granularity, "root")
+
+    def test_one_dimensional_storage_offset_remains_task_ready(self) -> None:
+        plan = build_cross_loop_dependency_plan(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(128,),
+                    strides=(1,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(64,),
+                    strides=(1,),
+                    block_ids=(20,),
+                    storage_offset=32,
+                ),
+            ),
+            [[10], [20]],
+        )
+
+        predecessor_map = plan.edges[0].readiness[0].predecessor_map
+        assert predecessor_map is not None
+        self.assertEqual(predecessor_map.axes[0].consumer_offset, 32)
+
     def test_repeated_task_to_key_map_uses_one_periodic_segment(self) -> None:
         segments = _compress_task_to_key(tuple(range(8)) * 4)
 
@@ -575,14 +674,12 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.waits[0].placement, "root_entry")
         predecessor_map = edge.readiness[0].predecessor_map
         assert predecessor_map is not None
-        self.assertEqual(predecessor_map.producer_access_id, 0)
-        self.assertEqual(predecessor_map.consumer_access_id, 1)
         self.assertEqual(
             [
-                (axis.producer_block_id, axis.consumer_block_id, axis.tensor_dim)
+                (axis.producer_block_id, axis.consumer_block_id)
                 for axis in predecessor_map.axes
             ],
-            [(10, 20, 0)],
+            [(10, 20)],
         )
 
     def test_aligned_in_place_update_is_task_ready(self) -> None:
@@ -1044,7 +1141,6 @@ class TestCrossLoopDependencies(TestCase):
 
         edge = plan.edges[0]
         self.assertFalse(edge.is_task_ready)
-        self.assertEqual(edge.readiness[0].producer_access_ids, (0, 1))
 
     def test_masked_store_falls_back_to_root(self) -> None:
         plan = build_cross_loop_dependency_plan(

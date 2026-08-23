@@ -159,60 +159,6 @@ def _clone_opaque_statements_with_loop_rewrite(
     return cast("list[ast.stmt]", clone(body))
 
 
-def _clone_opaque_statements_with_split_access_loops(
-    body: list[ast.stmt],
-    split_offsets_by_access: dict[int, str],
-) -> list[ast.stmt]:
-    """Split loops containing selected accesses without changing their bodies."""
-    from .cross_loop_dependencies import cross_loop_access_marker_id
-
-    split_accesses: set[int] = set()
-
-    def direct_marker_ids(value: object) -> list[int]:
-        result: list[int] = []
-
-        def visit(item: object) -> None:
-            if isinstance(item, list | tuple):
-                for child in item:
-                    visit(child)
-                return
-            if not isinstance(item, ast.AST):
-                return
-            if (access_id := cross_loop_access_marker_id(item)) is not None:
-                if access_id in split_offsets_by_access and access_id not in result:
-                    result.append(access_id)
-                return
-            if isinstance(item, ast.For):
-                return
-            for field in item._fields:
-                visit(getattr(item, field))
-
-        visit(value)
-        return result
-
-    def rewrite(loop: ast.For) -> list[ast.stmt] | None:
-        access_ids = direct_marker_ids(loop.body)
-        if not access_ids:
-            return None
-        split_offsets = {split_offsets_by_access[access_id] for access_id in access_ids}
-        if len(split_offsets) != 1:
-            raise AssertionError(
-                "one consumer loop cannot use incompatible cross-loop split offsets"
-            )
-        split = cast("ast.expr", expr_from_string(split_offsets.pop()))
-        split_accesses.update(access_ids)
-        return [
-            _clone_opaque_loop_segment(loop, end=split),
-            _clone_opaque_loop_segment(loop, begin=split),
-        ]
-
-    cloned = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
-    if split_accesses != split_offsets_by_access.keys():
-        missing = sorted(split_offsets_by_access.keys() - split_accesses)
-        raise AssertionError(f"missing cross-loop access loops: {missing}")
-    return cloned
-
-
 def _clone_opaque_statements_with_access_stages(
     body: list[ast.stmt],
     *,
@@ -579,54 +525,16 @@ if TYPE_CHECKING:
 NUM_SM_VAR = "_NUM_SM"
 NUM_XCD_VAR = "_NUM_XCDS"
 
-# One 128-byte cache line in uint32 elements.  Independent broadcast counters
-# are padded by this amount so polling one dependency does not invalidate a
-# neighboring dependency's line.
-_TILE_DEPENDENCY_COUNTER_STRIDE = 32
-
-
-def _partitioned_materialization_geometry(
-    *,
-    producer_tasks: int,
-    finalized_members: int,
-    finalize_partition_block: int,
-    materialize_tasks: int,
-) -> tuple[int, int, int, int] | None:
-    """Infer a unique two-side partition geometry from static task counts.
-
-    The materializer may expose one combined task per partition or one task
-    for each of the two disjoint side values.  Returning ``None`` for an
-    ambiguous or incompatible domain keeps the lowering conservative.
-    """
-    candidates: list[tuple[int, int, int, int]] = []
-    for materialize_tasks_per_partition in (1, 2):
-        if materialize_tasks % materialize_tasks_per_partition:
-            continue
-        group_count = materialize_tasks // materialize_tasks_per_partition
-        if finalized_members <= group_count:
-            continue
-        primary_members = finalized_members - group_count
-        if primary_members % group_count:
-            continue
-        primary_members_per_partition = primary_members // group_count
-        total_members = finalized_members + group_count
-        if producer_tasks % total_members:
-            continue
-        tiles_per_member = producer_tasks // total_members
-        if (
-            primary_members_per_partition % finalize_partition_block
-            or group_count % finalize_partition_block
-        ):
-            continue
-        candidates.append(
-            (
-                group_count,
-                primary_members_per_partition,
-                tiles_per_member,
-                materialize_tasks_per_partition,
-            )
-        )
-    return candidates[0] if len(candidates) == 1 else None
+# Independent broadcast counters occupy distinct cache lines so polling one
+# dependency does not contend with publication to another. Cross-loop event
+# state is currently CUDA-only, where 128 bytes is a conservative L2 line
+# alignment. The layout is expressed in bytes rather than a model-shaped
+# counter count.
+_CROSS_LOOP_COUNTER_ALIGNMENT_BYTES = 128
+_CROSS_LOOP_COUNTER_DTYPE = torch.uint32
+_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
+    _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
+)
 
 
 class PIDInfo(NamedTuple):
@@ -992,13 +900,6 @@ class ForEachProgramID(ProgramIDs):
             case_offsets.append(running_offset)
             running_offset += task_count
         singleton_roots = self._match_opaque_singleton_roots(static_task_counts)
-        reduction_fanout_plans = self._match_one_wave_reduction_fanouts(
-            singleton_roots, device_function
-        )
-        structural_edges: set[tuple[int, int]] = set()
-        for plan in reduction_fanout_plans.values():
-            structural_edges.update(plan.covered_edges)
-        structural_roots = {root for edge in structural_edges for root in edge}
         dependency_plan = HostFunction.current().device_ir.cross_loop_dependency_plan
         assert dependency_plan is not None
         physical_worker_limit = CompileEnvironment.current().config_spec.num_sm * cast(
@@ -1028,8 +929,8 @@ class ForEachProgramID(ProgramIDs):
             available_access_ids_by_root=available_access_ids_by_root,
             access_program_points=access_program_points,
             axis_geometry=axis_geometry,
-            excluded_roots=frozenset(structural_roots),
-            preordered_edges=frozenset(structural_edges),
+            excluded_roots=frozenset(),
+            preordered_edges=frozenset(),
             physical_worker_limit=physical_worker_limit,
             frontier_index=cast(
                 "int",
@@ -1047,7 +948,6 @@ class ForEachProgramID(ProgramIDs):
         readiness_frontier_plans = generic_plan.readiness_frontiers
 
         self._validate_tile_dependency_plan_coverage(
-            reduction_fanout_plans=reduction_fanout_plans,
             task_ready_edges=generic_task_edges,
             root_completion_edges=frozenset(root_completion_edges),
         )
@@ -1093,7 +993,7 @@ class ForEachProgramID(ProgramIDs):
             access_cohort_counter_count += (
                 outer_count
                 * plan.milestone_count
-                * (1 if plan.is_per_coordinate else _TILE_DEPENDENCY_COUNTER_STRIDE)
+                * (1 if plan.is_per_coordinate else _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS)
             )
         counted_event_offsets: dict[KeyedEventPlan, int] = {}
         counted_event_counter_count = 0
@@ -1112,16 +1012,6 @@ class ForEachProgramID(ProgramIDs):
         root_completion_indices = {
             root: index for index, root in enumerate(root_completion_producer_roots)
         }
-        reduction_fanout_indices = {
-            root: index for index, root in enumerate(reduction_fanout_plans)
-        }
-        reduction_fanout_partition_offsets: dict[int, int] = {}
-        reduction_fanout_partition_count = 0
-        for root, plan in reduction_fanout_plans.items():
-            if plan.upstream_root is None:
-                continue
-            reduction_fanout_partition_offsets[root] = reduction_fanout_partition_count
-            reduction_fanout_partition_count += plan.task_count
         state_count = 0
 
         def reserve_state(count: int) -> int | None:
@@ -1129,9 +1019,9 @@ class ForEachProgramID(ProgramIDs):
             if not count:
                 return None
             state_count = (
-                (state_count + _TILE_DEPENDENCY_COUNTER_STRIDE - 1)
-                // _TILE_DEPENDENCY_COUNTER_STRIDE
-                * _TILE_DEPENDENCY_COUNTER_STRIDE
+                (state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
+                // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+                * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
             )
             offset = state_count
             state_count += count
@@ -1141,24 +1031,18 @@ class ForEachProgramID(ProgramIDs):
         access_cohort_state_offset = reserve_state(access_cohort_counter_count)
         counted_event_state_offset = reserve_state(counted_event_counter_count)
         root_completion_state_offset = reserve_state(
-            len(root_completion_producer_roots) * _TILE_DEPENDENCY_COUNTER_STRIDE
-        )
-        reduction_fanout_state_offset = reserve_state(
-            len(reduction_fanout_plans) * _TILE_DEPENDENCY_COUNTER_STRIDE
-        )
-        reduction_fanout_partition_state_offset = reserve_state(
-            reduction_fanout_partition_count
+            len(root_completion_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         )
         static_state_base = (
-            f"(({strategy.grid_size_expr} + {_TILE_DEPENDENCY_COUNTER_STRIDE - 1}) "
-            f"// {_TILE_DEPENDENCY_COUNTER_STRIDE}) * "
-            f"{_TILE_DEPENDENCY_COUNTER_STRIDE}"
+            f"(({strategy.grid_size_expr} + {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1}) "
+            f"// {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}) * "
+            f"{_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}"
         )
         state_arg = self._register_cross_loop_state(
             device_function,
             name_hint="tile_dependency_state",
             numel=f"{static_state_base} + {state_count}",
-            dtype=torch.uint32,
+            dtype=_CROSS_LOOP_COUNTER_DTYPE,
         )
 
         def state_section(offset: int | None) -> str | None:
@@ -1171,21 +1055,12 @@ class ForEachProgramID(ProgramIDs):
         access_cohort_arg = state_section(access_cohort_state_offset)
         counted_event_arg = state_section(counted_event_state_offset)
         root_completion_counter_arg = state_section(root_completion_state_offset)
-        reduction_fanout_arrival_arg = state_section(reduction_fanout_state_offset)
-        reduction_fanout_partition_arg = state_section(
-            reduction_fanout_partition_state_offset
-        )
 
         stage_root_ranges = self._tile_dependency_stage_root_ranges()
         result: list[ast.stmt] = [
             statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
         ]
         start_expr = "0"
-        consumed_reduction_fanout_roots = {
-            root
-            for plan in reduction_fanout_plans.values()
-            for root in plan.continuation_roots
-        }
         consumed_on_ready_roots = {
             plan.on_ready_root
             for plan in counted_event_plans
@@ -1207,7 +1082,7 @@ class ForEachProgramID(ProgramIDs):
             assert root_completion_counter_arg is not None
             return (
                 f"{root_completion_counter_arg} + "
-                f"{root_completion_indices[root] * _TILE_DEPENDENCY_COUNTER_STRIDE}"
+                f"{root_completion_indices[root] * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}"
             )
 
         def root_completion_dependency(root: int) -> tuple[str, str]:
@@ -1463,7 +1338,9 @@ class ForEachProgramID(ProgramIDs):
                 outer_terms.append(f"({producer_coordinates[block_id]}) * {multiplier}")
                 multiplier *= producer_counts[block_id]
             outer_key = " + ".join(outer_terms) or "0"
-            stride = 1 if plan.is_per_coordinate else _TILE_DEPENDENCY_COUNTER_STRIDE
+            stride = (
+                1 if plan.is_per_coordinate else _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+            )
             return (
                 f"{access_cohort_arg} + {access_cohort_offsets[plan]} + "
                 f"(({outer_key}) * {plan.milestone_count} + ({milestone})) * "
@@ -1978,7 +1855,6 @@ class ForEachProgramID(ProgramIDs):
                     )
                 )
             emitted_access_waits: set[tuple[int, tuple[object, ...]]] = set()
-            access_split_offsets: dict[int, str] = {}
             if root in generic_task_waits:
                 has_task_scheduling = True
                 assert dependency_plan is not None and task_event_arg is not None
@@ -2007,20 +1883,6 @@ class ForEachProgramID(ProgramIDs):
                     if wait_key in emitted_access_waits:
                         continue
                     emitted_access_waits.add(wait_key)
-                    nested_axes = {
-                        axis.consumer_block_id
-                        for axis in wait.predecessor_map.axes
-                        if axis.consumer_block_id not in root_axis_counts[root]
-                    }
-                    if len(nested_axes) == 1:
-                        nested_axis = nested_axes.pop()
-                        nested_count = all_axis_counts[nested_axis]
-                        if nested_count > 1:
-                            access_id = wait.consumer_access_id
-                            assert access_id is not None
-                            access_split_offsets[access_id] = str(
-                                (nested_count // 2) * block_sizes[nested_axis]
-                            )
                     body.extend(
                         self._emit_access_preflight_task_wait(
                             wait=wait,
@@ -2046,21 +1908,6 @@ class ForEachProgramID(ProgramIDs):
                     scheduled_coordinates,
                     scheduled_logical_pid,
                     extra_argument_names,
-                )
-            elif access_split_offsets:
-                scheduled_root_body = _clone_opaque_statements_with_split_access_loops(
-                    case_bodies[root], access_split_offsets
-                )
-                opaque_call = self._outline_tile_dependency_region(
-                    device_function,
-                    name_hint=f"tile_dependency_root_{root}",
-                    body=[
-                        statement_from_string(
-                            f"{self.shared_pid_var} = {scheduled_logical_pid}"
-                        ),
-                        *scheduled_root_body,
-                    ],
-                    extra_argument_names=extra_argument_names,
                 )
             else:
                 opaque_call = self._outline_opaque_tile_body(
@@ -2201,9 +2048,7 @@ class ForEachProgramID(ProgramIDs):
             root_begin, root_end = root_range
             if root_end != root_begin + 1:
                 structural_roots = (
-                    set(reduction_fanout_plans)
-                    | consumed_reduction_fanout_roots
-                    | consumed_on_ready_roots
+                    consumed_on_ready_roots
                     | set(readiness_frontier_by_producer)
                 )
                 if structural_roots.intersection(range(root_begin, root_end)):
@@ -2296,193 +2141,7 @@ class ForEachProgramID(ProgramIDs):
                 result.extend(readiness_frontier_body(readiness_frontier))
                 start_expr = boundary
                 continue
-            if root_end == root_begin + 1 and root_begin in (
-                consumed_reduction_fanout_roots | consumed_on_ready_roots
-            ):
-                start_expr = boundary
-                continue
-            reduction_fanout_plan = (
-                reduction_fanout_plans.get(root_begin)
-                if root_end == root_begin + 1
-                else None
-            )
-            if reduction_fanout_plan is not None:
-                assert reduction_fanout_arrival_arg is not None
-                fanout_task = device_function.new_var(
-                    "tile_dependency_reduction_fanout_task", dce=True
-                )
-                fanout_counter = (
-                    f"{reduction_fanout_arrival_arg} + "
-                    f"{reduction_fanout_indices[root_begin] * _TILE_DEPENDENCY_COUNTER_STRIDE}"
-                )
-                producer_call = self._outline_opaque_tile_body(
-                    device_function,
-                    root=reduction_fanout_plan.producer_root,
-                    logical_pid=(
-                        f"{case_offsets[reduction_fanout_plan.producer_root]} + "
-                        f"{fanout_task}"
-                    ),
-                    body=case_bodies[reduction_fanout_plan.producer_root],
-                    extra_argument_names=(fanout_task,),
-                )
-                producer_prefix = self._wait_for_dependencies(
-                    device_function=device_function,
-                    dependencies=root_completion_input_dependencies(root_begin),
-                    prefix="tile_dependency_reduction_fanout_input_wait",
-                )
-                producer_body: list[ast.stmt]
-                producer_loop_task_count: int
-                if reduction_fanout_plan.upstream_root is None:
-                    producer_loop_task_count = reduction_fanout_plan.task_count
-                    producer_body = [
-                        *producer_prefix,
-                        producer_call,
-                        self._tile_dependency_publication_barrier(device_function),
-                        statement_from_string(
-                            f"tl.atomic_add({fanout_counter}, 1, "
-                            "sem='release', scope='gpu')"
-                        ),
-                    ]
-                else:
-                    assert reduction_fanout_partition_arg is not None
-                    partition_offset = reduction_fanout_partition_offsets[root_begin]
-                    fanout_partition = device_function.new_var(
-                        "tile_dependency_reduction_fanout_partition", dce=True
-                    )
-                    partition_counter = (
-                        f"{reduction_fanout_partition_arg} + "
-                        f"{partition_offset} + {fanout_partition}"
-                    )
-                    upstream_call = self._outline_opaque_tile_body(
-                        device_function,
-                        root=reduction_fanout_plan.upstream_root,
-                        logical_pid=(
-                            f"{case_offsets[reduction_fanout_plan.upstream_root]} + "
-                            f"{fanout_task}"
-                        ),
-                        body=case_bodies[reduction_fanout_plan.upstream_root],
-                        extra_argument_names=(fanout_task,),
-                    )
-                    producer_loop_task_count = reduction_fanout_plan.upstream_tasks
-                    producer_body = [
-                        *producer_prefix,
-                        upstream_call,
-                        self._tile_dependency_publication_barrier(device_function),
-                        statement_from_string(
-                            f"{fanout_partition} = {fanout_task} // "
-                            f"{reduction_fanout_plan.upstream_tasks_per_partition}"
-                        ),
-                        statement_from_string(
-                            f"tl.atomic_add({partition_counter}, 1, "
-                            "sem='release', scope='gpu')"
-                        ),
-                    ]
-                    producer_call = self._outline_opaque_tile_body(
-                        device_function,
-                        root=reduction_fanout_plan.producer_root,
-                        logical_pid=(
-                            f"{case_offsets[reduction_fanout_plan.producer_root]} + "
-                            f"{fanout_task}"
-                        ),
-                        body=case_bodies[reduction_fanout_plan.producer_root],
-                        name_suffix="partition_consumer",
-                        extra_argument_names=(fanout_task,),
-                    )
-                    producer_call = create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{worker} < {reduction_fanout_plan.task_count}"
-                        ),
-                        body=[
-                            statement_from_string(f"{fanout_task} = {worker}"),
-                            *self._wait_for_counter(
-                                device_function=device_function,
-                                counter=(
-                                    f"{reduction_fanout_partition_arg} + "
-                                    f"{partition_offset} + {fanout_task}"
-                                ),
-                                target=(
-                                    f"tl.cast({epoch_var}, tl.uint32) * "
-                                    f"tl.cast("
-                                    f"{reduction_fanout_plan.upstream_tasks_per_partition}, "
-                                    "tl.uint32)"
-                                ),
-                                prefix="tile_dependency_partitioned_input_wait",
-                            ),
-                            producer_call,
-                            self._tile_dependency_publication_barrier(device_function),
-                            statement_from_string(
-                                f"tl.atomic_add({fanout_counter}, 1, "
-                                "sem='release', scope='gpu')"
-                            ),
-                        ],
-                        orelse=[],
-                    )
-                reduction_call = self._outline_opaque_tile_body(
-                    device_function,
-                    root=reduction_fanout_plan.reduction_root,
-                    logical_pid=str(case_offsets[reduction_fanout_plan.reduction_root]),
-                    body=case_bodies[reduction_fanout_plan.reduction_root],
-                    name_suffix="replicated",
-                    extra_argument_names=(fanout_task,),
-                )
-                consumer_call = self._outline_opaque_tile_body(
-                    device_function,
-                    root=reduction_fanout_plan.consumer_root,
-                    logical_pid=(
-                        f"{case_offsets[reduction_fanout_plan.consumer_root]} + "
-                        f"{fanout_task}"
-                    ),
-                    body=case_bodies[reduction_fanout_plan.consumer_root],
-                    extra_argument_names=(fanout_task,),
-                )
-                consumer_body = [
-                    *self._wait_for_counter(
-                        device_function=device_function,
-                        counter=fanout_counter,
-                        target=(
-                            f"tl.cast({epoch_var}, tl.uint32) * "
-                            f"tl.cast({reduction_fanout_plan.task_count}, tl.uint32)"
-                        ),
-                        prefix="tile_dependency_reduction_fanout_wait",
-                    ),
-                    reduction_call,
-                    self._tile_dependency_publication_barrier(device_function),
-                    consumer_call,
-                    *root_completion_publication(reduction_fanout_plan.consumer_root),
-                ]
-                result.extend(
-                    [
-                        create(
-                            ast.For,
-                            target=create(ast.Name, id=fanout_task, ctx=ast.Store()),
-                            iter=expr_from_string(
-                                f"tl.range({worker}, "
-                                f"{producer_loop_task_count}, "
-                                f"{strategy.grid_size_expr})"
-                            ),
-                            body=producer_body,
-                            orelse=[],
-                            type_comment=None,
-                        ),
-                        *(
-                            [producer_call]
-                            if reduction_fanout_plan.upstream_root is not None
-                            else []
-                        ),
-                        create(
-                            ast.If,
-                            test=expr_from_string(
-                                f"{worker} < {reduction_fanout_plan.task_count}"
-                            ),
-                            body=[
-                                statement_from_string(f"{fanout_task} = {worker}"),
-                                *consumer_body,
-                            ],
-                            orelse=[],
-                        ),
-                    ]
-                )
+            if root_end == root_begin + 1 and root_begin in consumed_on_ready_roots:
                 start_expr = boundary
                 continue
             if root_end == root_begin + 1 and root_begin in singleton_roots:
@@ -2569,7 +2228,6 @@ class ForEachProgramID(ProgramIDs):
     @staticmethod
     def _validate_tile_dependency_plan_coverage(
         *,
-        reduction_fanout_plans: dict[int, ForEachProgramID._OneWaveReductionFanout],
         task_ready_edges: frozenset[tuple[int, int]],
         root_completion_edges: frozenset[tuple[int, int]],
     ) -> None:
@@ -2581,10 +2239,7 @@ class ForEachProgramID(ProgramIDs):
         first-class whole-value dependency, not permission to reinterpret an
         opaque computation body.
         """
-        covered: set[tuple[int, int]] = set()
-        for plan in reduction_fanout_plans.values():
-            covered.update(plan.covered_edges)
-        covered.update(task_ready_edges)
+        covered = set(task_ready_edges)
         covered.update(root_completion_edges)
 
         def is_ordered_by_root_completion(producer: int, consumer: int) -> bool:
@@ -2643,41 +2298,6 @@ class ForEachProgramID(ProgramIDs):
             break
         assert len(result) == len(self.cases)
         return result
-
-    @dataclasses.dataclass(frozen=True)
-    class _OneWaveReductionFanout:
-        """Replicate one pure scalar reduction across its one-wave consumers."""
-
-        producer_root: int
-        reduction_root: int
-        consumer_root: int
-        task_count: int
-        upstream_root: int | None = None
-        upstream_tasks: int = 0
-        upstream_tasks_per_partition: int = 0
-
-        @property
-        def start_root(self) -> int:
-            return (
-                self.producer_root if self.upstream_root is None else self.upstream_root
-            )
-
-        @property
-        def covered_edges(self) -> tuple[tuple[int, int], ...]:
-            edges = (
-                (self.producer_root, self.reduction_root),
-                (self.producer_root, self.consumer_root),
-                (self.reduction_root, self.consumer_root),
-            )
-            if self.upstream_root is None:
-                return edges
-            return ((self.upstream_root, self.producer_root), *edges)
-
-        @property
-        def continuation_roots(self) -> frozenset[int]:
-            return frozenset(
-                (self.producer_root, self.reduction_root, self.consumer_root)
-            ) - {self.start_root}
 
     @staticmethod
     def _match_opaque_singleton_roots(
@@ -2787,156 +2407,6 @@ class ForEachProgramID(ProgramIDs):
         except (KeyError, TypeError, ValueError):
             return None
         return (numel + block - 1) // block, block
-
-    def _match_one_wave_reduction_fanouts(
-        self,
-        singleton_roots: frozenset[int],
-        device_function: DeviceFunction,
-    ) -> dict[int, _OneWaveReductionFanout]:
-        """Find a pure singleton reduction feeding one resident tile wave.
-
-        The reduction body is not rewritten.  Each consumer worker executes
-        the same opaque singleton body immediately before its own opaque tile.
-        This removes a global scalar publication hop while preserving the
-        reduction's statement and iteration order.  The match is deliberately
-        conservative: producer and consumer domains must be identical, the
-        producer must fit in one resident wave, and the singleton may write
-        only storage consumed by that immediate consumer.
-        """
-        task_counts = self._static_case_task_counts(device_function)
-        if task_counts is None:
-            return {}
-        device_ir = HostFunction.current().device_ir
-        dependency_plan = device_ir.cross_loop_dependency_plan
-        assert dependency_plan is not None
-        resident_workers = CompileEnvironment.current().config_spec.num_sm * cast(
-            "int", device_function.config.get("num_sm_multiplier", 1)
-        )
-        result: dict[int, ForEachProgramID._OneWaveReductionFanout] = {}
-        for reduction_root in singleton_roots:
-            producer_root = reduction_root - 1
-            consumer_root = reduction_root + 1
-            if producer_root < 0 or consumer_root >= len(self.cases):
-                continue
-            task_count = task_counts[producer_root]
-            if (
-                task_count <= 1
-                or task_count != task_counts[consumer_root]
-                or task_count > resident_workers
-            ):
-                continue
-            if not (
-                dependency_plan.edges_between(producer_root, reduction_root)
-                and dependency_plan.edges_between(reduction_root, consumer_root)
-                and dependency_plan.edges_between(producer_root, consumer_root)
-            ):
-                continue
-            reduction_writes = {
-                access.allocation_id
-                for access in dependency_plan.accesses
-                if access.root == reduction_root
-                and access.kind == "store"
-                and access.allocation_id >= 0
-            }
-            outgoing_allocations = {
-                edge.allocation_id
-                for edge in dependency_plan.edges
-                if edge.producer_root == reduction_root
-                and edge.consumer_root == consumer_root
-                and edge.allocation_id >= 0
-            }
-            if not reduction_writes or reduction_writes != outgoing_allocations:
-                continue
-            if any(
-                edge.consumer_root != consumer_root
-                for edge in dependency_plan.edges
-                if edge.producer_root == reduction_root
-            ):
-                continue
-            if any(
-                access.root == reduction_root and access.is_atomic
-                for access in dependency_plan.accesses
-            ):
-                continue
-            upstream_root: int | None = None
-            upstream_tasks = 0
-            upstream_tasks_per_partition = 0
-            candidate_upstream = producer_root - 1
-            if candidate_upstream >= 0:
-                upstream_edges = dependency_plan.edges_between(
-                    candidate_upstream, producer_root
-                )
-                upstream_allocations = {
-                    edge.allocation_id
-                    for edge in upstream_edges
-                    if edge.allocation_id >= 0
-                }
-                if len(upstream_allocations) == 1:
-                    candidate_tasks = task_counts[candidate_upstream]
-                    candidate_axes = self._static_case_axes(
-                        candidate_upstream, device_function
-                    )
-                    producer_axes = self._static_case_axes(
-                        producer_root, device_function
-                    )
-                    candidate_nontrivial = [
-                        (numel, block)
-                        for numel, block in candidate_axes or ()
-                        if (numel + block - 1) // block > 1
-                    ]
-                    producer_nontrivial = [
-                        (numel, block)
-                        for numel, block in producer_axes or ()
-                        if (numel + block - 1) // block > 1
-                    ]
-                    if (
-                        candidate_tasks % task_count == 0
-                        and len(candidate_nontrivial) == 1
-                        and len(producer_nontrivial) == 1
-                    ):
-                        tasks_per_partition = candidate_tasks // task_count
-                        candidate_numel, candidate_block = candidate_nontrivial[0]
-                        partition_numel, partition_block = producer_nontrivial[0]
-                        vector_extent = candidate_block * tasks_per_partition
-                        full_vector_axes = {
-                            numel
-                            for numel, block in producer_axes or ()
-                            if numel == block and numel > 1
-                        }
-                        allocation_id = upstream_allocations.pop()
-                        upstream_write_count = sum(
-                            access.allocation_id == allocation_id
-                            and access.kind == "store"
-                            and access.root == candidate_upstream
-                            for access in dependency_plan.accesses
-                        )
-                        producer_read_count = sum(
-                            access.allocation_id == allocation_id
-                            and access.kind == "load"
-                            and access.root == producer_root
-                            for access in dependency_plan.accesses
-                        )
-                        if (
-                            partition_block == 1
-                            and candidate_numel == partition_numel * vector_extent
-                            and vector_extent in full_vector_axes
-                            and upstream_write_count == 1
-                            and producer_read_count == 1
-                        ):
-                            upstream_root = candidate_upstream
-                            upstream_tasks = candidate_tasks
-                            upstream_tasks_per_partition = tasks_per_partition
-            plan = self._OneWaveReductionFanout(
-                producer_root=producer_root,
-                reduction_root=reduction_root,
-                consumer_root=consumer_root,
-                task_count=task_count,
-                upstream_root=upstream_root,
-                upstream_tasks=upstream_tasks,
-                upstream_tasks_per_partition=upstream_tasks_per_partition,
-            )
-            result[plan.start_root] = plan
-        return result
 
     def _static_case_axes(
         self, root: int, device_function: DeviceFunction

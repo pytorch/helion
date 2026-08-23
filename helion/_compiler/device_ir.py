@@ -3617,6 +3617,7 @@ def _collect_memory_op_facts(
             tensor_shape: tuple[int, ...] = ()
             tensor_strides: tuple[int, ...] = ()
             storage_offset = 0
+            layout_is_static = False
             if fake is not None:
                 if collect_cross_loop_accesses:
                     storage = fake.untyped_storage()
@@ -3629,6 +3630,17 @@ def _collect_memory_op_facts(
                         env.size_hint(stride) for stride in fake.stride()
                     )
                     storage_offset = env.size_hint(fake.storage_offset())
+                    # Size hints are legality facts only when the kernel is
+                    # shape-specialized. Dynamic kernels may reuse this IR for
+                    # different shapes, strides, or view offsets.
+                    layout_is_static = env.settings.static_shapes or all(
+                        type(value) is int
+                        for value in (
+                            *fake.shape,
+                            *fake.stride(),
+                            fake.storage_offset(),
+                        )
+                    )
                 # Distinct HBM elements the op touches = product of size-hinted shape dims over
                 # NON-broadcast dims (stride != 0). A stride-0 dim (an .expand()/broadcast — full
                 # SIZE but one underlying element, e.g. bias[N].expand_as(x) or a broadcast_tensors
@@ -3728,6 +3740,7 @@ def _collect_memory_op_facts(
                         has_explicit_mask=has_explicit_mask,
                         subscript_is_full_slice=subscript_is_full_slice,
                         is_atomic=is_atomic,
+                        layout_is_static=layout_is_static,
                     )
                 )
                 cross_loop_access_id += 1

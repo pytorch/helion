@@ -60,34 +60,18 @@ def tiled_rms_norm_per_block_quant(
         (num_tokens, groups_per_row), dtype=torch.float32, device=input.device
     )
     unrounded_values = torch.empty_like(input, dtype=torch.float32)
-    inv_rms = torch.empty((num_tokens,), dtype=torch.float32, device=input.device)
 
-    for partial_m, partial_g, partial_n in hl.tile(
-        [num_tokens, groups_per_row, group_size], block_size=[1, 1, group_size]
+    for partial_m, partial_n in hl.tile(
+        [num_tokens, hidden_size], block_size=[1, group_size]
     ):
-        partial_m_idx = partial_m.begin + hl.arange(partial_m.block_size)
-        partial_group_idx = partial_g.index
-        partial_n_idx = (
-            partial_group_idx[:, None] * group_size + partial_n.index[None, :]
-        )
-        partial_m_blk = partial_m_idx[:, None, None]
-        partial_n_blk = partial_n_idx[None, :, :]
-        partial_values = input[partial_m_blk, partial_n_blk].to(torch.float32)
+        partial_values = input[partial_m, partial_n].to(torch.float32)
         if residual is not None:
-            partial_values = partial_values + residual[partial_m_blk, partial_n_blk]
-            residual[partial_m_blk, partial_n_blk] = partial_values.to(residual.dtype)
-        unrounded_values[partial_m_blk, partial_n_blk] = partial_values
-        rms_partials[partial_m, partial_g] = torch.sum(
+            partial_values = partial_values + residual[partial_m, partial_n]
+            residual[partial_m, partial_n] = partial_values.to(residual.dtype)
+        unrounded_values[partial_m, partial_n] = partial_values
+        rms_partials[partial_m, partial_n.id] = torch.sum(
             partial_values * partial_values, dim=-1
         )
-
-    for reduce_m in hl.tile(num_tokens, block_size=1):
-        square_sum = hl.zeros([reduce_m], dtype=torch.float32)
-        for reduce_g in hl.tile(groups_per_row, block_size=1):
-            square_sum = square_sum + torch.sum(
-                rms_partials[reduce_m, reduce_g], dim=-1
-            )
-        inv_rms[reduce_m] = torch.rsqrt(square_sum * (1.0 / hidden_size) + epsilon)
 
     for quant_m, quant_g, quant_n in hl.tile(
         [num_tokens, groups_per_row, group_size], block_size=[1, 1, group_size]
@@ -97,8 +81,14 @@ def tiled_rms_norm_per_block_quant(
         quant_n_idx = quant_group_idx[:, None] * group_size + quant_n.index[None, :]
         quant_m_blk = quant_m_idx[:, None, None]
         quant_n_blk = quant_n_idx[None, :, :]
+        square_sum = hl.zeros([quant_m], dtype=torch.float32)
+        for reduce_g in hl.tile(groups_per_row, block_size=1):
+            square_sum = square_sum + torch.sum(
+                rms_partials[quant_m, reduce_g], dim=-1
+            )
+        inv_rms = torch.rsqrt(square_sum * (1.0 / hidden_size) + epsilon)
         quant_values = unrounded_values[quant_m_blk, quant_n_blk]
-        normalized = (quant_values * inv_rms[quant_m][:, None, None]).to(
+        normalized = (quant_values * inv_rms[:, None, None]).to(
             torch.bfloat16
         ) * weight[quant_n_blk]
         quant_scale = torch.amax(torch.abs(normalized), dim=-1).to(torch.float32)
@@ -940,21 +930,21 @@ def _probe_config(bound, args):
         else 0
     )
     block_size_by_id = {
-        9: 8,  # QKV output tile
-        (18 if uses_flat_qk else 19): 4,
-        (20 if uses_flat_qk else 21): args.attention_context_block,
-        26 + downstream_shift: (
+        7: 8,  # QKV output tile
+        (16 if uses_flat_qk else 17): 4,
+        (18 if uses_flat_qk else 19): args.attention_context_block,
+        24 + downstream_shift: (
             args.merge_q_block if _USE_TASK_ALIGNED_ATTENTION else 1
         ),
-        29 + downstream_shift: 8,  # O output tile
-        40 + downstream_shift: 16,  # W13 output tile
-        45 + downstream_shift: 8,  # W2 output tile
+        27 + downstream_shift: 8,  # O output tile
+        36 + downstream_shift: 16,  # W13 output tile
+        41 + downstream_shift: 8,  # W2 output tile
     }
     if not _USE_TASK_ALIGNED_ATTENTION:
-        block_size_by_id[12] = args.qk_head_block
+        block_size_by_id[10] = args.qk_head_block
     if _USE_TASK_ALIGNED_ATTENTION:
-        block_size_by_id[23] = args.merge_q_block
-        block_size_by_id[26] = args.merge_q_block
+        block_size_by_id[21] = args.merge_q_block
+        block_size_by_id[24] = args.merge_q_block
     values["block_sizes"] = [
         block_size_by_id.get(spec.block_id, default)
         for spec, default in zip(
@@ -962,7 +952,7 @@ def _probe_config(bound, args):
         )
     ]
     loop_orders = [
-        [0, 1, 2],
+        [0, 1],
         [0, 1, 2],
         [0, 1],
         [0, 1, 2],
@@ -971,7 +961,7 @@ def _probe_config(bound, args):
         [0, 1],
         [0, 1, 2],
         [1, 0],
-        [0, 1, 2],
+        [0, 1],
         [0, 1, 2],
         [0, 1],
         [0, 1],
@@ -998,13 +988,13 @@ def _probe_config(bound, args):
             for spec in specs
         ]
 
-    qkv_range = 10
-    attention_range = 20 if uses_flat_qk else 21
+    qkv_range = 8
+    attention_range = 18 if uses_flat_qk else 19
     projection_ranges = {
         qkv_range: 4,
-        30 + downstream_shift: 4,
-        41 + downstream_shift: 4,
-        46 + downstream_shift: 4,
+        28 + downstream_shift: 4,
+        37 + downstream_shift: 4,
+        42 + downstream_shift: 4,
     }
     values["range_num_stages"] = by_block_id(
         bound.config_spec.range_num_stages, projection_ranges, 0
@@ -1013,9 +1003,9 @@ def _probe_config(bound, args):
         bound.config_spec.range_unroll_factors,
         {
             qkv_range: 2,
-            30 + downstream_shift: 2,
-            41 + downstream_shift: 2,
-            46 + downstream_shift: 4,
+            28 + downstream_shift: 2,
+            37 + downstream_shift: 2,
+            42 + downstream_shift: 4,
         },
         0,
     )
@@ -1024,9 +1014,9 @@ def _probe_config(bound, args):
         {
             qkv_range: True,
             attention_range: True,
-            30 + downstream_shift: False,
-            41 + downstream_shift: True,
-            46 + downstream_shift: False,
+            28 + downstream_shift: False,
+            37 + downstream_shift: True,
+            42 + downstream_shift: False,
         },
         None,
     )
@@ -1035,9 +1025,9 @@ def _probe_config(bound, args):
         {
             qkv_range: False,
             attention_range: True,
-            30 + downstream_shift: False,
-            41 + downstream_shift: False,
-            46 + downstream_shift: True,
+            28 + downstream_shift: False,
+            37 + downstream_shift: False,
+            42 + downstream_shift: True,
         },
         None,
     )

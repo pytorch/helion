@@ -76,7 +76,6 @@ class AccessCohortPlan:
     axes: tuple[AffinePredecessorAxis, ...]
     access_ids: tuple[int, ...]
     producer_stream_axis: int
-    consumer_stream_axis: int
     consumer_loop_id: int
     consumer_stream_coordinate: str | None
     stream_count: int
@@ -1238,7 +1237,6 @@ def _derive_access_cohorts(
                     axes=axes,
                     access_ids=access_ids,
                     producer_stream_axis=stream_axis.producer_block_id,
-                    consumer_stream_axis=stream_axis.consumer_block_id,
                     consumer_loop_id=consumer_loop_id,
                     consumer_stream_coordinate=consumer_stream_coordinate,
                     stream_count=stream_count,

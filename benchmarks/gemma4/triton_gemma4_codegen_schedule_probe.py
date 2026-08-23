@@ -339,6 +339,7 @@ def _probe_stream_ffn_producer(
     ROOT_8_OFFSET: tl.constexpr,
     ROOT_8_TASKS: tl.constexpr,
     FIRST_ACTIVATION_TASKS: tl.constexpr,
+    IMMEDIATE_ACTIVATION: tl.constexpr,
     COUNTED_EVENT_ON_READY: tl.constexpr,
     TRACE: tl.constexpr,
 ):
@@ -375,7 +376,7 @@ def _probe_stream_ffn_producer(
             scope="gpu",
         )
         activation_ready = previous % fan_in == fan_in - 1
-    if activation_ready:
+    if activation_ready and IMMEDIATE_ACTIVATION:
         tile_dependency_root_8(
             gate_up,
             activation,
@@ -559,6 +560,7 @@ def gemma4_codegen_schedule_probe(
     FFN_CONTINUATION: tl.constexpr,
     FFN_CONSUMER_MAJOR: tl.constexpr,
     FFN_STREAM: tl.constexpr,
+    FFN_SCHEDULED_ACTIVATION: tl.constexpr,
     FFN_FIRST_GROUPS: tl.constexpr,
     FFN_CONSUMER_WORKERS: tl.constexpr,
     COUNTED_EVENT_ON_READY: tl.constexpr,
@@ -939,6 +941,11 @@ def gemma4_codegen_schedule_probe(
         stream_fan_in: tl.constexpr = 2 * _BLOCK_SIZE_24 // _BLOCK_SIZE_21
         initial_tasks: tl.constexpr = FFN_FIRST_GROUPS * stream_fan_in
         producer_workers: tl.constexpr = TOTAL_WORKERS - FFN_CONSUMER_WORKERS
+        tail_tasks: tl.constexpr = root_7_tasks - initial_tasks
+        tail_producer_workers: tl.constexpr = min(
+            producer_workers,
+            tail_tasks,
+        )
         if worker < TOTAL_WORKERS:
             _probe_wait_phase(
                 phase_arrivals,
@@ -969,6 +976,7 @@ def gemma4_codegen_schedule_probe(
                     root_8_offset,
                     root_8_tasks,
                     FFN_FIRST_GROUPS,
+                    not FFN_SCHEDULED_ACTIVATION,
                     COUNTED_EVENT_ON_READY,
                     TRACE,
                 )
@@ -996,11 +1004,72 @@ def gemma4_codegen_schedule_probe(
                         root_8_offset,
                         root_8_tasks,
                         FFN_FIRST_GROUPS,
+                        not FFN_SCHEDULED_ACTIVATION,
                         COUNTED_EVENT_ON_READY,
                         TRACE,
                     )
                 if TRACE:
                     tl.store(trace + 4 + 4 * worker, _probe_globaltimer())
+
+        if FFN_SCHEDULED_ACTIVATION:
+            activation_worker_base: tl.constexpr = tail_producer_workers
+            activation_workers: tl.constexpr = (
+                TOTAL_WORKERS - activation_worker_base
+            )
+            if worker >= activation_worker_base:
+                for activation_task in tl.range(
+                    worker - activation_worker_base,
+                    root_8_tasks,
+                    activation_workers,
+                ):
+                    if FUSED_SIGNALS != 2:
+                        _probe_wait_count(
+                            activation_arrivals + activation_task,
+                            epoch * stream_fan_in,
+                            POLL_DELAY,
+                            RELAXED_POLL,
+                        )
+                    tile_dependency_root_8(
+                        gate_up,
+                        activation,
+                        root_8_offset + activation_task,
+                    )
+                    tl.debug_barrier()
+                    split = tl.where(
+                        activation_task < FFN_FIRST_GROUPS,
+                        0,
+                        1,
+                    )
+                    split_count = tl.where(
+                        split == 0,
+                        FFN_FIRST_GROUPS,
+                        root_8_tasks - FFN_FIRST_GROUPS,
+                    ).to(tl.int32)
+                    if COUNTED_EVENT_ON_READY:
+                        split_ready = _probe_counted_event_arrive(
+                            ffn_split_arrivals + split,
+                            split_count,
+                        )
+                    else:
+                        split_previous = tl.atomic_add(
+                            ffn_split_arrivals + split,
+                            1,
+                            sem="acq_rel",
+                            scope="gpu",
+                        )
+                        split_ready = (
+                            split_previous % split_count == split_count - 1
+                        )
+                    if split_ready:
+                        tl.atomic_xchg(
+                            ffn_ready + split,
+                            epoch,
+                            sem="release",
+                            scope="gpu",
+                        )
+                        if TRACE:
+                            tl.store(trace + split, _probe_globaltimer())
+
     elif worker < root_7_participants:
         _probe_wait_phase(
             phase_arrivals,
@@ -1666,6 +1735,8 @@ def _config_block_size(bound, config, block_id: int) -> int:
 
 
 def _validate_ffn_stream(bound, config, shape, args) -> None:
+    if args.ffn_scheduled_activation and not args.ffn_stream:
+        raise ValueError("--ffn-scheduled-activation requires --ffn-stream")
     if not args.ffn_stream:
         return
 
@@ -1786,6 +1857,7 @@ def _launch(
     args,
     *,
     counted_event_on_ready=None,
+    scheduled_activation=None,
 ):
     kernel_args = (
         tensors["hidden_states"],
@@ -1856,6 +1928,11 @@ def _launch(
         args.ffn_continuation or args.ffn_stream,
         args.ffn_consumer_major,
         args.ffn_stream,
+        (
+            args.ffn_scheduled_activation
+            if scheduled_activation is None
+            else scheduled_activation
+        ),
         args.ffn_first_groups,
         args.ffn_consumer_workers,
         (
@@ -2029,6 +2106,21 @@ def run(args) -> None:
             counted_event_on_ready=alternate_counted_event,
         )
         torch.cuda.synchronize()
+    alternate_scheduled_activation = None
+    alternate_scheduled_compiled = None
+    if args.compare_scheduled_activation:
+        alternate_scheduled_activation = not args.ffn_scheduled_activation
+        alternate_scheduled_compiled = _launch(
+            kernel,
+            tensors,
+            buffers,
+            shape,
+            geometry,
+            splits,
+            args,
+            scheduled_activation=alternate_scheduled_activation,
+        )
+        torch.cuda.synchronize()
 
     if not args.no_waits:
         _assert_close(
@@ -2068,6 +2160,7 @@ def run(args) -> None:
             "ffn_continuation": args.ffn_continuation,
             "ffn_consumer_major": args.ffn_consumer_major,
             "ffn_stream": args.ffn_stream,
+            "ffn_scheduled_activation": args.ffn_scheduled_activation,
             "ffn_first_groups": args.ffn_first_groups,
             "ffn_consumer_workers": args.ffn_consumer_workers,
             "counted_event_on_ready": args.counted_event_on_ready,
@@ -2105,6 +2198,15 @@ def run(args) -> None:
                 "registers": alternate_compiled.n_regs,
                 "spills": alternate_compiled.n_spills,
                 "shared": alternate_compiled.metadata.shared,
+            },
+        }
+    if alternate_scheduled_compiled is not None:
+        result["scheduled_activation_comparison"] = {
+            "alternate_scheduled_activation": alternate_scheduled_activation,
+            "alternate_resources": {
+                "registers": alternate_scheduled_compiled.n_regs,
+                "spills": alternate_scheduled_compiled.n_spills,
+                "shared": alternate_scheduled_compiled.metadata.shared,
             },
         }
     if args.trace:
@@ -2167,6 +2269,27 @@ def run(args) -> None:
                 if alternate_counted_event
                 else "triton_direct_event"
             ] = alternate_graph.replay
+        if alternate_scheduled_activation is not None:
+            alternate_scheduled_graph, _ = capture(
+                lambda: (
+                    _launch(
+                        kernel,
+                        tensors,
+                        buffers,
+                        shape,
+                        geometry,
+                        splits,
+                        args,
+                        scheduled_activation=alternate_scheduled_activation,
+                    ),
+                    buffers["output"],
+                )[1]
+            )
+            entries[
+                "triton_scheduled_activation"
+                if alternate_scheduled_activation
+                else "triton_immediate_activation"
+            ] = alternate_scheduled_graph.replay
         if helion_graph is not None:
             entries["separate_helion"] = helion_graph.replay
         result["timings"] = benchmark_interleaved(
@@ -2254,6 +2377,12 @@ def main() -> None:
     parser.add_argument(
         "--ffn-stream", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--ffn-scheduled-activation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--compare-scheduled-activation", action="store_true")
     parser.add_argument("--ffn-first-groups", type=int, default=20)
     parser.add_argument("--ffn-consumer-workers", type=int, default=160)
     parser.add_argument(

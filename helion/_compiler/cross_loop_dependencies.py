@@ -126,6 +126,7 @@ class CrossLoopAccess:
     subscript_offsets: tuple[int | None, ...]
     subscript_is_scalar: tuple[bool, ...]
     has_explicit_mask: bool
+    layout_is_static: bool
     subscript_is_full_slice: tuple[bool, ...] = ()
     is_atomic: bool = False
 
@@ -163,7 +164,6 @@ class AffinePredecessorAxis:
     """One producer task axis mapped through a tensor dimension."""
 
     producer_block_id: int
-    tensor_dim: int
     producer_offset: int
     producer_is_scalar: bool
     consumer_block_id: int
@@ -175,9 +175,6 @@ class AffinePredecessorAxis:
 class AffinePredecessorMap:
     """A proven mapping from one consumer access to producer task coordinates."""
 
-    producer_root: int
-    producer_access_id: int
-    consumer_access_id: int
     axes: tuple[AffinePredecessorAxis, ...]
 
 
@@ -251,7 +248,6 @@ class ReadinessRequirement:
 
     kind: TileDependencyKind
     consumer_access_id: int
-    producer_access_ids: tuple[int, ...]
     granularity: Literal["task", "root"]
     predecessor_map: AffinePredecessorMap | None
 
@@ -665,6 +661,8 @@ def _access_region(
     indirect dimensions retain a may-access bound but are not allowed to kill
     an earlier reaching definition.
     """
+    if not access.layout_is_static:
+        return AllocationRegion(None, False)
     shape = access.tensor_shape
     strides = access.tensor_strides
     if len(shape) != len(strides) or any(size < 0 for size in shape):
@@ -737,6 +735,8 @@ def access_task_region(
     block_sizes: dict[int, int],
 ) -> AllocationRegion:
     """Return one configured logical task's conservative access footprint."""
+    if not access.layout_is_static:
+        return AllocationRegion(None, False)
     shape = access.tensor_shape
     if len(shape) != len(access.tensor_strides) or any(size < 0 for size in shape):
         return AllocationRegion(None, False)
@@ -864,6 +864,7 @@ def allocation_regions_may_overlap(
     return not (
         left.layout is not None
         and left.layout == right.layout
+        and _layout_is_injective(left.layout)
         and left.coordinate_bounds
         and len(left.coordinate_bounds) == len(right.coordinate_bounds)
         and any(
@@ -875,6 +876,23 @@ def allocation_regions_may_overlap(
             )
         )
     )
+
+
+def _layout_is_injective(
+    layout: tuple[tuple[int, ...], tuple[int, ...], int],
+) -> bool:
+    """Conservatively prove that distinct coordinates have distinct addresses."""
+    shape, strides, _storage_offset = layout
+    span = 1
+    for stride, size in sorted(
+        (abs(stride), size)
+        for size, stride in zip(shape, strides, strict=True)
+        if size > 1
+    ):
+        if stride < span:
+            return False
+        span += stride * (size - 1)
+    return True
 
 
 def _region_must_cover(cover: AllocationRegion, target: AllocationRegion) -> bool:
@@ -1201,7 +1219,6 @@ def build_cross_loop_dependency_plan(
                 )
                 readiness += _build_access_readiness(
                     kind=kind,
-                    producer_root=producer_root,
                     producer_accesses=tuple(
                         access_by_id[access_id] for access_id in producer_access_ids
                     ),
@@ -1328,17 +1345,14 @@ def _accesses_by_allocation(
 def _build_access_readiness(
     *,
     kind: TileDependencyKind,
-    producer_root: int,
     producer_accesses: tuple[CrossLoopAccess, ...],
     consumer_accesses: tuple[CrossLoopAccess, ...],
     producer_grid_block_ids: list[int],
     noncanonical_task_origin_block_ids: frozenset[int],
 ) -> tuple[ReadinessRequirement, ...]:
     requirements: list[ReadinessRequirement] = []
-    producer_access_ids = tuple(access.access_id for access in producer_accesses)
     for consumer_access in consumer_accesses:
         predecessor_map = _build_affine_predecessor_map(
-            producer_root=producer_root,
             producer_accesses=producer_accesses,
             consumer_access=consumer_access,
             producer_grid_block_ids=producer_grid_block_ids,
@@ -1348,7 +1362,6 @@ def _build_access_readiness(
             ReadinessRequirement(
                 kind=kind,
                 consumer_access_id=consumer_access.access_id,
-                producer_access_ids=producer_access_ids,
                 granularity="task" if predecessor_map is not None else "root",
                 predecessor_map=predecessor_map,
             )
@@ -1358,7 +1371,6 @@ def _build_access_readiness(
 
 def _build_affine_predecessor_map(
     *,
-    producer_root: int,
     producer_accesses: tuple[CrossLoopAccess, ...],
     consumer_access: CrossLoopAccess,
     producer_grid_block_ids: list[int],
@@ -1368,7 +1380,11 @@ def _build_affine_predecessor_map(
     if len(producer_accesses) != 1 or not producer_grid_block_ids:
         return None
     producer_access = producer_accesses[0]
-    if producer_access.has_explicit_mask:
+    if (
+        producer_access.has_explicit_mask
+        or not producer_access.layout_is_static
+        or not consumer_access.layout_is_static
+    ):
         return None
 
     # A task proof must account for every tensor dimension. Bare integers,
@@ -1459,20 +1475,18 @@ def _build_affine_predecessor_map(
     storage_delta = consumer_access.storage_offset - producer_access.storage_offset
     offset_adjustments = [0] * len(dimension_pairs)
     if storage_delta:
-        adjustment_position = next(
-            (
-                index
-                for index in range(len(dimension_pairs) - 1, -1, -1)
-                if producer_strides[index] != 0
-                and storage_delta % producer_strides[index] == 0
-            ),
-            None,
-        )
-        if adjustment_position is None:
+        # A one-dimensional shift has a unique coordinate interpretation.
+        # In multiple dimensions, divisibility by one stride is insufficient:
+        # e.g. offset 5 in a contiguous (4, 4) view is (1, 1), not (0, 5).
+        # Keep those cases on root completion until allocation-coordinate
+        # decomposition is represented explicitly.
+        if (
+            len(dimension_pairs) != 1
+            or producer_strides[0] == 0
+            or storage_delta % producer_strides[0]
+        ):
             return None
-        offset_adjustments[adjustment_position] = (
-            storage_delta // producer_strides[adjustment_position]
-        )
+        offset_adjustments[0] = storage_delta // producer_strides[0]
 
     producer_block_ids = tuple(
         producer_access.subscript_affine_block_ids[position]
@@ -1525,7 +1539,6 @@ def _build_affine_predecessor_map(
         axes.append(
             AffinePredecessorAxis(
                 producer_block_id=producer_block_id,
-                tensor_dim=tensor_dim,
                 producer_offset=producer_offset,
                 producer_is_scalar=producer_access.subscript_is_scalar[position],
                 consumer_block_id=consumer_block_id,
@@ -1536,12 +1549,7 @@ def _build_affine_predecessor_map(
             )
         )
 
-    return AffinePredecessorMap(
-        producer_root=producer_root,
-        producer_access_id=producer_access.access_id,
-        consumer_access_id=consumer_access.access_id,
-        axes=tuple(axes),
-    )
+    return AffinePredecessorMap(axes=tuple(axes))
 
 
 def _normalized_access_positions(
