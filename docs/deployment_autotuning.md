@@ -823,6 +823,12 @@ this order:
 If no file is found, the cache falls back to the kernel's default
 config and prints a one-time warning naming the AOT runner.
 
+> **Behavior change — `HELION_AOT_MODE=disabled`:** disabled mode no longer
+> loads checked-in heuristic files. It now bypasses every AOT artifact and uses
+> the kernel's compiler default config without starting a live autotuning
+> search. Use `evaluate` (the default when `HELION_AOT_MODE` is unset) to load a
+> deployed heuristic.
+
 ### Pretuning a kernel for new hardware
 
 A heuristic file is specific to one device kind + compute capability —

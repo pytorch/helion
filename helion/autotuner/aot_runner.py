@@ -398,7 +398,8 @@ def run_evaluate_phase(config: RunConfig) -> bool:
         )
 
         if return_code != 0:
-            log.warning(f"Evaluate benchmark failed with return code {return_code}")
+            log.error(f"Evaluate benchmark failed with return code {return_code}")
+            all_passed = False
 
     # Save evaluation results
     eval_file = config.run_dir / f"evaluation_{config.hardware_id}.json"

@@ -278,7 +278,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
     - collect: Tune each shape individually, record results
     - measure: Measure each shape with all observed configs
     - evaluate: Use heuristics to select configs, validate performance
-    - disabled: Fall through to underlying autotuner (default)
+    - disabled: Ignore AOT artifacts and return the compiler default config
 
     When collect_fn/measure_fn are set on the kernel:
     - collect_fn: In collect mode, only these inputs are autotuned
@@ -333,13 +333,14 @@ class AOTAutotuneCache(AutotuneCacheBase):
         if not isinstance(self.args, _MultiShapeAutotuneArgs):
             self.args = self.kernel.kernel.normalize_args(*self.args)
         self.mode = get_aot_mode()
+        self._verbose = is_aot_verbose()
+        if self.mode == "disabled":
+            return
         self.hardware_id = get_hardware_info().hardware_id
         self.data_dir = get_aot_data_dir()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._tuned_configs: dict[str, list[TunedConfig]] = self._load_tuned_configs()
         self.shape_key = self._create_shape_key()
-        self._verbose = is_aot_verbose()
-
         # Look up optional collect_fn/measure_fn from the Kernel object
         # These are set by @aot_kernel() decorator
         self._collect_fn = getattr(self.kernel.kernel, "_aot_collect_fn", None)
@@ -535,6 +536,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def get(self) -> Config | None:
         """Get a cached config based on current mode."""
+        if self.mode == "disabled":
+            return self.autotuner.config_spec.default_config()
+
         if self.mode == "collect":
             # In collect mode, check if we already have a config for this exact shape
             kernel_name = self.kernel.kernel.name
@@ -553,7 +557,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             # In compile mode: use heuristic + generate standalone Triton code
             self._maybe_run_compile()
 
-        # For disabled/evaluate/compile modes: try heuristic, fall back to default config
+        # For evaluate/compile modes: try heuristic, fall back to default config
         # (never trigger autotuning for aot_kernel)
         config = self._get_heuristic_config(self.args)
         if config is not None:
@@ -1121,6 +1125,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """Perform autotuning based on current mode."""
+        if self.mode == "disabled":
+            return self.autotuner.config_spec.default_config()
+
         self._maybe_run_input_fn_workflows()
 
         if self.mode == "collect":

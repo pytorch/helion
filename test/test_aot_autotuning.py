@@ -39,6 +39,8 @@ from helion.autotuner.aot_compile import _standalone_call_key
 from helion.autotuner.aot_compile import generate_standalone_file
 from helion.autotuner.aot_kernel import aot_key
 from helion.autotuner.aot_kernel import extract_shape_features
+import helion.autotuner.aot_runner as aot_runner_module
+from helion.autotuner.aot_runner import RunConfig
 from helion.autotuner.heuristic_generator import PerformanceTarget
 from helion.autotuner.heuristic_generator import ShapeConfigData
 from helion.autotuner.heuristic_generator import compute_validity_partitions
@@ -256,6 +258,72 @@ class TestGetAOTMode:
             pytest.raises(ValueError),
         ):
             get_aot_mode()
+
+
+def test_disabled_mode_uses_default_without_initializing_or_loading_aot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = Config(block_sizes=[16])
+    kernel_api = SimpleNamespace(normalize_args=lambda *args: args)
+    bound_kernel = SimpleNamespace(kernel=kernel_api, is_cacheable=lambda: True)
+    autotuner = SimpleNamespace(
+        kernel=bound_kernel,
+        args=(torch.empty(1),),
+        config_spec=SimpleNamespace(default_config=lambda: expected),
+    )
+    monkeypatch.setenv("HELION_AOT_MODE", "disabled")
+    monkeypatch.setattr(
+        aot_cache_module,
+        "get_hardware_info",
+        lambda: pytest.fail("disabled mode must not inspect hardware"),
+    )
+    monkeypatch.setattr(
+        aot_cache_module,
+        "get_aot_data_dir",
+        lambda: pytest.fail("disabled mode must not inspect AOT storage"),
+    )
+
+    cache: Any = AOTAutotuneCache(autotuner)  # pyrefly: ignore [bad-argument-type]
+    cache._get_heuristic_config = lambda _args: pytest.fail(
+        "disabled mode must not load an AOT heuristic"
+    )
+    cache._maybe_run_input_fn_workflows = lambda: pytest.fail(
+        "disabled mode must not run an AOT workflow"
+    )
+
+    assert cache.get() is expected
+    assert cache.autotune(skip_cache=True) is expected
+
+
+def test_evaluate_benchmark_failure_fails_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = RunConfig(["benchmark"], tmp_path, "test-hardware", "run")
+    config.run_dir.mkdir()
+    results = {
+        "demo": {
+            "max_slowdown": 1.0,
+            "geomean_slowdown": 1.0,
+            "avg_slowdown": 1.0,
+        }
+    }
+    monkeypatch.setattr(
+        aot_runner_module,
+        "evaluate_heuristic",
+        lambda **_kwargs: results,
+    )
+    monkeypatch.setattr(
+        aot_runner_module,
+        "run_benchmark",
+        lambda *_args, **_kwargs: (23, "", ""),
+    )
+
+    assert not aot_runner_module.run_evaluate_phase(config)
+    assert (
+        json.loads((config.run_dir / "evaluation_test-hardware.json").read_text())
+        == results
+    )
 
 
 @onlyBackends(["triton", "cute"])
