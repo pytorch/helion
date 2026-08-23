@@ -3966,11 +3966,12 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         return False
     if kind != "tcgen05_ab_tma":
         return True
-    for extent_key, block_key in (
-        ("m_size", "bm"),
-        ("n_size", "bn"),
-        ("k_total_size", "bk"),
-    ):
+    extent_blocks = (
+        (("n_size", "bm"), ("m_size", "bn"), ("k_total_size", "bk"))
+        if _tcgen05_plan_orientation(plan) == "nm"
+        else (("m_size", "bm"), ("n_size", "bn"), ("k_total_size", "bk"))
+    )
+    for extent_key, block_key in extent_blocks:
         extent = plan.get(extent_key)
         block = plan.get(block_key)
         if type(extent) is not int or type(block) is not int or extent % block:

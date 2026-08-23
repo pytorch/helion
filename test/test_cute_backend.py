@@ -10315,6 +10315,7 @@ class TestCuteBackend(TestCase):
         tensor = torch.empty((2, 128, 64), device=DEVICE, dtype=torch.float16)
         full_tcgen05_plan = {
             "kind": "tcgen05_ab_tma",
+            "orientation": "mn",
             "m_size": 128,
             "n_size": 128,
             "k_total_size": 64,
@@ -10326,6 +10327,30 @@ class TestCuteBackend(TestCase):
             ({"kind": "helion_small_biased_attention"}, False, True),
             (full_tcgen05_plan, False, True),
             ({**full_tcgen05_plan, "n_size": 136}, False, False),
+            (
+                {
+                    **full_tcgen05_plan,
+                    "orientation": "nm",
+                    "m_size": 192,
+                    "n_size": 4096,
+                    "bm": 128,
+                    "bn": 32,
+                },
+                False,
+                True,
+            ),
+            (
+                {
+                    **full_tcgen05_plan,
+                    "orientation": "nm",
+                    "m_size": 128,
+                    "n_size": 160,
+                    "bm": 128,
+                    "bn": 32,
+                },
+                False,
+                False,
+            ),
             ({"kind": "helion_flash"}, False, False),
             (full_tcgen05_plan, True, False),
         )
