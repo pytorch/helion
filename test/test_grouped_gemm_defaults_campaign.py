@@ -87,12 +87,16 @@ def _result(
 ) -> dict[str, object]:
     speedups = row_speedups or tuple(speedup + index / 100 for index in range(8))
     assert len(speedups) == 8
+    selection_policy = benchmark.PROVIDER_SELECTION_POLICIES[provider]
     return {
         "schema": benchmark.RESULT_SCHEMA,
         "provider": provider,
         "replicate": replicate,
         "helion_selection": helion_selection,
-        "settings": {"layout_policy": benchmark.BENCHMARK_LAYOUT_POLICY},
+        "settings": {
+            "provider_selection": selection_policy.mode,
+            "layout_policy": benchmark.BENCHMARK_LAYOUT_POLICY,
+        },
         "device": {"uuid": "GPU-test", "visible": "GPU-test"},
         "source": SOURCE,
         "versions": versions or _versions(),
@@ -150,6 +154,21 @@ def test_parse_provider_subset_preserves_order_and_rejects_invalid() -> None:
     for invalid in ("", "quack,quack", "unknown"):
         with pytest.raises(argparse.ArgumentTypeError):
             benchmark.parse_providers(invalid)
+
+
+def test_provider_selection_policies_classify_fresh_autotuning() -> None:
+    assert set(benchmark.PROVIDER_SELECTION_POLICIES) == set(benchmark.PROVIDERS)
+    assert benchmark.PROVIDER_SELECTION_POLICIES["quack"] == (
+        benchmark.ProviderSelectionPolicy(
+            mode="public_api_default_tuned",
+            stability="fresh_autotuned",
+        )
+    )
+    assert all(
+        policy.stability == "fixed"
+        for provider, policy in benchmark.PROVIDER_SELECTION_POLICIES.items()
+        if provider != "quack"
+    )
 
 
 def test_cuda_stack_uses_latest_pinned_releases() -> None:
@@ -862,6 +881,11 @@ def test_summary_keeps_provider_geomeans_worst_rows_and_configs_separate() -> No
     assert quack["row_wins"] == 7
     assert cudnn["cross_replicate_geomean"] == pytest.approx(9.0)
     assert cudnn["worst_row"]["geomean_speedup"] == pytest.approx(9.0)
+    assert quack["selection_stability"] == "fresh_autotuned"
+    assert quack["config_invariance_required"] is False
+    assert quack["all_configs_invariant"] is True
+    assert cudnn["selection_stability"] == "fixed"
+    assert cudnn["config_invariance_required"] is True
     assert all(item["invariant"] for item in quack["config_distributions"])
     assert all(item["invariant"] for item in cudnn["config_distributions"])
     assert all(item["invariant"] for item in summary["helion_config_distributions"])
@@ -924,22 +948,61 @@ def test_fixed_summary_requires_same_config_across_providers(
     assert summary["publication_eligible"] is False
 
 
-def test_summary_rejects_provider_config_drift() -> None:
+def test_summary_reports_fresh_autotuned_provider_config_drift() -> None:
+    assert benchmark.RESULT_SCHEMA == "helion-grouped-gemm-provider-defaults-v4"
     results = [
         _result("quack", 0),
-        _result("quack", 1, provider_config_prefix="changed"),
+        _result("quack", 1, provider_config_prefix="second"),
+        _result("quack", 2, provider_config_prefix="third"),
     ]
 
-    with pytest.raises(RuntimeError, match="quack selected config changed"):
+    summary = benchmark.summarize_results(
+        results,
+        providers=("quack",),
+        replicates=3,
+        helion_selection="compiler_heuristic",
+    )
+
+    quack = summary["provider_results"]["quack"]
+    assert summary["schema"] == "helion-grouped-gemm-provider-summary-v5"
+    assert summary["publication_eligible"] is True
+    assert quack["selection"] == "public_api_default_tuned"
+    assert quack["selection_stability"] == "fresh_autotuned"
+    assert quack["config_invariance_required"] is False
+    assert quack["all_configs_invariant"] is False
+    assert all(not item["invariant"] for item in quack["config_distributions"])
+
+
+def test_summary_rejects_fixed_provider_config_drift() -> None:
+    results = [
+        _result("cudnn", 0),
+        _result("cudnn", 1, provider_config_prefix="changed"),
+    ]
+
+    with pytest.raises(RuntimeError, match="cudnn selected config changed"):
         benchmark.summarize_results(
             results,
-            providers=("quack",),
+            providers=("cudnn",),
             replicates=2,
             helion_selection="compiler_heuristic",
         )
 
 
-def test_summary_publication_boundary_requires_three_fixed_replicates() -> None:
+def test_summary_rejects_provider_selection_mode_drift() -> None:
+    result = _result("quack", 0)
+    settings = cast("dict[str, object]", result["settings"])
+    settings["provider_selection"] = "unregistered_selection"
+
+    with pytest.raises(RuntimeError, match="quack result identity is inconsistent"):
+        benchmark.summarize_results(
+            [result],
+            providers=("quack",),
+            replicates=1,
+            helion_selection="compiler_heuristic",
+        )
+
+
+def test_summary_publication_boundary_requires_three_replicates() -> None:
     summary = benchmark.summarize_results(
         [_result("quack", replicate) for replicate in range(3)],
         providers=("quack",),

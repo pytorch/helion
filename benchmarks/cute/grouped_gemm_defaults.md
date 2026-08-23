@@ -3,9 +3,10 @@
 `compare_grouped_gemm_defaults.py` compares Helion with reproducible public
 baselines from DeepGEMM, QuACK, cuDNN, cuBLASLt, and CUTLASS on the eight
 reviewed BF16 grouped-GEMM shapes. QuACK is deliberately run with
-its public default `tuned=True`; its tuning and selected-config resolution run
-before graph capture and timing. CUTLASS uses the first compatible public
-registry operator without a timing search.
+its public default `tuned=True`; every fresh replicate tunes independently,
+and its tuning and selected-config resolution run before graph capture and
+timing. CUTLASS uses the first compatible public registry operator without a
+timing search.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 nohup /tmp/helion-grouped-gemm-venv/bin/python \
@@ -67,10 +68,14 @@ Helion modes are:
   row. This mode is exploratory, because every provider worker may discover a
   different Helion winner; its summaries are marked non-publishable.
 
-Every provider/replicate gets a fresh process and fresh compiler caches. Each
-row uses identical seeded logical inputs, one contiguous K-major B layout for
-all implementations, and a shared FP32 oracle. The reviewed manifest still
-selects Helion's A packing. It selects the timed configuration only in
+Every provider/replicate gets a fresh process and fresh compiler caches. Fixed
+provider-selection modes must resolve to the same config in every replicate.
+Fresh-autotuned modes such as QuACK may select different configs; the summary
+reports the complete per-row config-hash distribution instead of rejecting the
+campaign. This does not weaken the fixed Helion-config check. Each row uses
+identical seeded logical inputs, one contiguous K-major B layout for all
+implementations, and a shared FP32 oracle. The reviewed manifest still selects
+Helion's A packing. It selects the timed configuration only in
 `final_reviewed_aot`; compiler and live modes merely record it as a reference.
 Its preferred B layout is recorded separately when it differs from the
 canonical benchmark layout.
@@ -82,7 +87,9 @@ calls
 That timer clears L2 before every replay and rotates then reverses ordering, so
 Helion and the provider each run first in exactly 51 samples.
 Summaries are publication-eligible only for fixed Helion selection modes with
-at least three fresh-process replicates.
+at least three fresh-process replicates. Variation from a declared
+fresh-autotuned provider does not make the campaign ineligible; fixed provider
+modes still require config invariance.
 
 Run from a clean Helion checkout and write `--output-dir` outside that checkout.
 The controller records and rechecks the source commit/tree after every worker.
@@ -126,8 +133,8 @@ The output directory contains one `result.json`, `worker.log`, and
 `telemetry.csv` per provider/replicate plus `summary.json`. Telemetry is sampled
 with `nvidia-smi` every five seconds. `--output-dir` is controller-only;
 workers receive only their isolated `--run-dir`. The summary reports
-per-provider geometric mean speedup, wins, worst row, Helion/provider config
-distributions, and any
+per-provider geometric mean speedup, wins, worst row, provider selection
+stability, Helion/provider config distributions, and any
 active GPU clock-event reason samples. Each row also retains the Helion and
 provider median latency from every replicate and their median across
 replicates, so absolute timing regressions remain visible after refactors. The

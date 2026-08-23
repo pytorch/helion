@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import suppress
+from dataclasses import dataclass
 import importlib.metadata
 import json
 import math
@@ -26,6 +27,7 @@ import sys
 import time
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import cast
 
 if TYPE_CHECKING:
@@ -60,7 +62,7 @@ if __name__ == "__main__":
 from benchmarks.cute import grouped_gemm_benchmark as common  # noqa: E402
 
 RESULT_SCHEMA = "helion-grouped-gemm-provider-defaults-v4"
-SUMMARY_SCHEMA = "helion-grouped-gemm-provider-summary-v4"
+SUMMARY_SCHEMA = "helion-grouped-gemm-provider-summary-v5"
 BENCHMARK_REPETITIONS = 102
 MIN_PUBLICATION_REPLICATES = 3
 THERMAL_WARMUP_MS = 10_000
@@ -69,12 +71,28 @@ TELEMETRY_INTERVAL_SECONDS = 5
 POST_WORKER_IDLE_GRACE_SECONDS = 5
 NVCC_RELEASE_PATTERN = re.compile(r"\brelease\s+(\d+\.\d+),\s+V([0-9.]+)")
 PROVIDERS = ("deepgemm", "quack", "cudnn", "cublaslt", "cutlass")
-PROVIDER_SELECTIONS = {
-    "deepgemm": "public_kmajor_nk_no_psum_zero_padding_off",
-    "quack": "public_api_default_tuned",
-    "cudnn": "public_a_fallback_build_execute",
-    "cublaslt": "heuristic_result_zero_requested_one",
-    "cutlass": "registry_first_no_timing_search",
+
+
+@dataclass(frozen=True)
+class ProviderSelectionPolicy:
+    """Describe a provider's public selector and its expected repeatability."""
+
+    mode: str
+    stability: Literal["fixed", "fresh_autotuned"]
+
+    @property
+    def requires_config_invariance(self) -> bool:
+        return self.stability == "fixed"
+
+
+PROVIDER_SELECTION_POLICIES = {
+    "deepgemm": ProviderSelectionPolicy(
+        "public_kmajor_nk_no_psum_zero_padding_off", "fixed"
+    ),
+    "quack": ProviderSelectionPolicy("public_api_default_tuned", "fresh_autotuned"),
+    "cudnn": ProviderSelectionPolicy("public_a_fallback_build_execute", "fixed"),
+    "cublaslt": ProviderSelectionPolicy("heuristic_result_zero_requested_one", "fixed"),
+    "cutlass": ProviderSelectionPolicy("registry_first_no_timing_search", "fixed"),
 }
 HELION_SELECTIONS = (
     "compiler_heuristic",
@@ -828,6 +846,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             strict=True,
         )
     ]
+    provider_selection = PROVIDER_SELECTION_POLICIES[args.provider]
     result = {
         "schema": RESULT_SCHEMA,
         "provider": args.provider,
@@ -847,7 +866,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         "settings": {
             "actual_m_seed": 0,
             "tensor_seed_policy": "row_index",
-            "provider_selection": PROVIDER_SELECTIONS[args.provider],
+            "provider_selection": provider_selection.mode,
             "helion_selection_timed": False,
             "provider_selection_timed": False,
             "capture_warmups": CAPTURE_WARMUPS,
@@ -1382,6 +1401,7 @@ def summarize_results(
     provider_summaries = {}
     config_hashes: list[list[str]] = [[] for _ in range(row_count)]
     for provider in providers:
+        selection_policy = PROVIDER_SELECTION_POLICIES[provider]
         provider_results = sorted(
             (result for result in results if result["provider"] == provider),
             key=itemgetter("replicate"),
@@ -1394,6 +1414,8 @@ def summarize_results(
             result.get("schema") != RESULT_SCHEMA
             or result.get("provider") != provider
             or result.get("helion_selection") != helion_selection
+            or result.get("settings", {}).get("provider_selection")
+            != selection_policy.mode
             or result.get("settings", {}).get("layout_policy")
             != BENCHMARK_LAYOUT_POLICY
             for result in provider_results
@@ -1489,10 +1511,16 @@ def summarize_results(
             }
             for row_index, hashes in enumerate(provider_config_hashes)
         ]
-        if not all(item["invariant"] for item in provider_distributions):
+        all_configs_invariant = all(
+            item["invariant"] for item in provider_distributions
+        )
+        if selection_policy.requires_config_invariance and not all_configs_invariant:
             raise RuntimeError(f"{provider} selected config changed across replicates")
         provider_summaries[provider] = {
-            "selection": PROVIDER_SELECTIONS[provider],
+            "selection": selection_policy.mode,
+            "selection_stability": selection_policy.stability,
+            "config_invariance_required": selection_policy.requires_config_invariance,
+            "all_configs_invariant": all_configs_invariant,
             "cross_replicate_geomean": _geomean(all_speedups),
             "row_wins": sum(row["geomean_speedup"] > 1.0 for row in row_summaries),
             "row_count": row_count,
@@ -1554,6 +1582,16 @@ def _print_summary(summary: dict[str, Any]) -> None:
             f"{result['row_wins']:>2}/{row_count}  row {worst['row_index']}: "
             f"{worst['geomean_speedup']:.3f}x"
         )
+        if not result["all_configs_invariant"]:
+            varying_rows = [
+                item["row_index"]
+                for item in result["config_distributions"]
+                if not item["invariant"]
+            ]
+            print(
+                f"  {result['selection_stability']} config variation on rows "
+                f"{varying_rows}"
+            )
     monitoring = summary["monitoring"]
     if monitoring["active_clock_event_reason_sample_count"]:
         print(
