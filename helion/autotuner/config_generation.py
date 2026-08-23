@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import functools
 import itertools
 import math
@@ -8,6 +9,7 @@ import operator
 import random
 from typing import TYPE_CHECKING
 from typing import Callable
+from typing import Literal
 from typing import cast
 
 from .._compat import warps_to_threads
@@ -32,6 +34,20 @@ if TYPE_CHECKING:
     from .config_priors import ValuePrior
 
 FlatConfig = list[object]
+
+
+@dataclasses.dataclass(frozen=True)
+class CoordinateNeighborProjection:
+    """One deterministic raw coordinate change and its normalized result."""
+
+    flat_index: int
+    key: str
+    sequence_index: int | None
+    from_value: object
+    to_value: object
+    outcome: Literal["candidate", "incumbent_alias", "candidate_alias", "invalid"]
+    flat_values: FlatConfig | None
+    config: Config | None
 
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
@@ -415,6 +431,241 @@ class ConfigGeneration:
         """Normalize a flat config and return an owned matching flat/config pair."""
         config = self.unflatten(copy.deepcopy(flat_values))
         return self.flatten(config), config
+
+    def _flat_coordinate_identities(self) -> list[tuple[str, int | None]]:
+        identities: list[tuple[str, int | None]] = [("", None) for _ in self.flat_spec]
+        for key, (indices, is_sequence) in self._key_to_flat_indices.items():
+            for sequence_index, flat_index in enumerate(indices):
+                identities[flat_index] = (
+                    key,
+                    sequence_index if is_sequence else None,
+                )
+        return identities
+
+    @staticmethod
+    def _coordinate_catalog_value(value: object) -> object:
+        """Return a JSON-safe copy of one coordinate value."""
+        if value is None or isinstance(value, (bool, int, str)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise AutotuneError(f"non-finite coordinate surface value {value!r}")
+            return value
+        if isinstance(value, (list, tuple)):
+            return [ConfigGeneration._coordinate_catalog_value(item) for item in value]
+        raise AutotuneError(
+            f"terminal coordinate surface contains a non-JSON value: {value!r}"
+        )
+
+    def coordinate_surface_catalog(self, *, radius: int = 1) -> dict[str, object]:
+        """Describe every deterministic pattern-neighbor row for this surface."""
+        if type(radius) is not int or radius < 1:
+            raise ValueError(f"Expected positive int radius, got {radius!r}")
+
+        identities = self._flat_coordinate_identities()
+        overridden = self.overridden_flat_indices
+        coordinates: list[dict[str, object]] = []
+        for flat_index, spec in enumerate(self.flat_spec):
+            active_values = spec.search_values(limit=10_000)
+            if active_values is None:
+                raise AutotuneError(
+                    "terminal coordinate surface is not finitely enumerable for "
+                    f"flat index {flat_index} ({type(spec).__name__})"
+                )
+            base_values = (
+                list(spec.choices)
+                if isinstance(spec, EnumFragment)
+                else list(active_values)
+            )
+            default = spec.default()
+            if default not in base_values:
+                base_values.append(default)
+            key, sequence_index = identities[flat_index]
+            coordinates.append(
+                {
+                    "flat_index": flat_index,
+                    "key": key,
+                    "sequence_index": sequence_index,
+                    "fragment_type": type(spec).__name__,
+                    "overridden": flat_index in overridden,
+                    "active_values": [
+                        self._coordinate_catalog_value(value) for value in active_values
+                    ],
+                    "neighbors_by_value": [
+                        {
+                            "from_value": self._coordinate_catalog_value(value),
+                            "to_values": [
+                                self._coordinate_catalog_value(neighbor)
+                                for neighbor in spec.pattern_neighbors(value, radius)
+                            ],
+                        }
+                        for value in base_values
+                    ],
+                }
+            )
+        return {
+            "schema_version": 1,
+            "radius": radius,
+            "coordinates": coordinates,
+        }
+
+    def flash_terminal_coordinate_surface_catalog(
+        self, *, radius: int = 1
+    ) -> dict[str, object]:
+        """Return the ordered coordinate surface for every reachable flash leaf."""
+        if not self.config_spec.cute_flash_search_enabled:
+            raise AutotuneError("terminal coordinate surface requires CuTe flash")
+
+        from .._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
+        from .._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
+        from .._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
+
+        leaves: list[dict[str, object]] = []
+        for leaf in self.flash_structural_leaf_catalog():
+            overrides = dict(self._override_values)
+            overrides[FLASH_PIPELINE_FAMILY_KEY] = leaf.pipeline_family
+            overrides[FLASH_SOFTMAX_DISC_KEY] = leaf.softmax_disc
+            if leaf.compound_exp2_packet is not None:
+                overrides[FLASH_EXP2_PACKET_KEY] = leaf.compound_exp2_packet
+            leaf_generation = self.config_spec.create_config_generation(
+                overrides=overrides,
+                advanced_controls_files=self._advanced_controls_files,
+                process_group_name=self.process_group_name,
+            )
+            surface = leaf_generation.coordinate_surface_catalog(radius=radius)
+            leaves.append(
+                {
+                    "leaf": {
+                        "family": leaf.pipeline_family,
+                        "compound_packet": leaf.compound_exp2_packet,
+                        "softmax_disc": leaf.softmax_disc,
+                    },
+                    "coordinates": surface["coordinates"],
+                }
+            )
+        return {
+            "schema_version": 1,
+            "radius": radius,
+            "leaves": leaves,
+        }
+
+    def coordinate_neighbor_projections(
+        self, base: FlatConfig, *, radius: int = 1
+    ) -> list[CoordinateNeighborProjection]:
+        """Enumerate every normalized one-coordinate pattern neighbor.
+
+        The returned order follows the flat ConfigSpec layout and each fragment's
+        own deterministic ``pattern_neighbors`` order. Invalid and normalized
+        alias requests remain in the result so callers can audit completeness.
+        """
+        canonical_base, base_config = self.canonicalize_flat(base)
+        flat_identities = self._flat_coordinate_identities()
+
+        seen = {base_config}
+        result: list[CoordinateNeighborProjection] = []
+        overridden = self.overridden_flat_indices
+        for flat_index, spec in enumerate(self.flat_spec):
+            if flat_index in overridden:
+                continue
+            key, sequence_index = flat_identities[flat_index]
+            current = canonical_base[flat_index]
+            for value in spec.pattern_neighbors(current, radius):
+                requested = copy.deepcopy(canonical_base)
+                requested[flat_index] = copy.deepcopy(value)
+                try:
+                    normalized_flat, config = self.canonicalize_flat(requested)
+                except InvalidConfig:
+                    result.append(
+                        CoordinateNeighborProjection(
+                            flat_index,
+                            key,
+                            sequence_index,
+                            copy.deepcopy(current),
+                            copy.deepcopy(value),
+                            "invalid",
+                            None,
+                            None,
+                        )
+                    )
+                    continue
+
+                if config == base_config:
+                    outcome = "incumbent_alias"
+                elif config in seen:
+                    outcome = "candidate_alias"
+                else:
+                    outcome = "candidate"
+                    seen.add(config)
+                result.append(
+                    CoordinateNeighborProjection(
+                        flat_index,
+                        key,
+                        sequence_index,
+                        copy.deepcopy(current),
+                        copy.deepcopy(value),
+                        outcome,
+                        normalized_flat,
+                        config,
+                    )
+                )
+        return result
+
+    def canonicalize_coordinate_projections(
+        self,
+        projections: Sequence[CoordinateNeighborProjection],
+        *,
+        base_config: Config,
+    ) -> list[CoordinateNeighborProjection]:
+        """Canonicalize projections against this generation's full surface.
+
+        A conditional generation can inject values for fields that are inactive
+        on the full search surface. Recanonicalizing here keeps recorded config
+        identities aligned with the configs that are actually benchmarked.
+        """
+        _, canonical_base = self.canonicalize_flat(self.flatten(base_config))
+        seen = {canonical_base}
+        result: list[CoordinateNeighborProjection] = []
+        for projection in projections:
+            if projection.config is None:
+                result.append(
+                    dataclasses.replace(
+                        projection,
+                        outcome="invalid",
+                        flat_values=None,
+                        config=None,
+                    )
+                )
+                continue
+            try:
+                flat_values, config = self.canonicalize_flat(
+                    self.flatten(projection.config)
+                )
+            except InvalidConfig:
+                result.append(
+                    dataclasses.replace(
+                        projection,
+                        outcome="invalid",
+                        flat_values=None,
+                        config=None,
+                    )
+                )
+                continue
+            if config == canonical_base:
+                outcome = "incumbent_alias"
+            elif config in seen:
+                outcome = "candidate_alias"
+            else:
+                outcome = "candidate"
+                seen.add(config)
+            result.append(
+                dataclasses.replace(
+                    projection,
+                    outcome=outcome,
+                    flat_values=flat_values,
+                    config=config,
+                )
+            )
+        return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """

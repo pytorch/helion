@@ -7,6 +7,7 @@ import csv
 from dataclasses import replace
 import functools
 import inspect
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -70,6 +71,11 @@ from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.benchmark_provider import _compile_config_failure_source_hash
+from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmarking import MirroredBenchmarkTrace
+from helion.autotuner.benchmarking import _mirrored_bench_call_layout
 from helion.autotuner.config_fragment import BlockSizeFragment
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import ConfigSpecFragment
@@ -81,6 +87,7 @@ from helion.autotuner.config_fragment import NumWarpsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_generation import CoordinateNeighborProjection
 from helion.autotuner.config_generation import _flash_log_maximin_refinements
 from helion.autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -93,9 +100,16 @@ from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.local_cache import _cute_flash_search_policy_hash
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import KernelMetadata
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
+from helion.autotuner.surrogate_pattern_search import (
+    flash_terminal_measurement_is_valid,
+)
+from helion.autotuner.surrogate_pattern_search import (
+    flash_terminal_refinement_result_is_valid,
+)
 import helion.language as hl
 from helion.language import loops
 from helion.runtime.settings import Settings
@@ -133,6 +147,7 @@ examples_dir = Path(__file__).parent.parent / "examples"
 
 
 _FINAL_REBENCHMARK_ENV_KEYS = (
+    "HELION_CAP_REBENCHMARK_REPEAT",
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K",
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS",
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED",
@@ -649,6 +664,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(results[1].perf, float("inf"))
         self.assertEqual(results[1].status, "error")
         self.assertEqual(results[2].perf, 1.0)
+        self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
     def test_autotune_log_sink_writes_csv_and_log(self):
         tmpdir = tempfile.TemporaryDirectory()
@@ -1637,6 +1653,542 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             diffs = sum(1 for a, b in zip(neighbor, [5, 5], strict=True) if a != b)
             self.assertEqual(diffs, 1)
 
+    def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(self):
+        def make_fn(source_id: int):
+            def fn():
+                return None
+
+            fn.source_hash = f"{source_id:064x}"
+            return fn
+
+        def make_member(value: int, perf: float | None) -> PopulationMember:
+            return PopulationMember(
+                fn=make_fn(value),
+                perfs=[] if perf is None else [perf],
+                flat_values=[value],
+                config=helion.Config(
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family="fa4",
+                    cute_flash_exp2_packet="1x1",
+                    cute_flash_softmax_disc=True,
+                    cute_flash_wait_hint=value,
+                ),
+                status="unknown" if perf is None else "ok",
+            )
+
+        def projections(value: int) -> list[CoordinateNeighborProjection]:
+            targets = (1, 2) if value == 0 else (0, 2)
+            result = []
+            for target in targets:
+                projected = make_member(target, None).config
+                projected.config["cute_vector_widths"] = [1, 1, 1]
+                result.append(
+                    CoordinateNeighborProjection(
+                        flat_index=0,
+                        key=cute_flash.FLASH_WAIT_HINT_KEY,
+                        sequence_index=None,
+                        from_value=value,
+                        to_value=target,
+                        outcome="candidate",
+                        flat_values=[target],
+                        config=projected,
+                    )
+                )
+            return result
+
+        def canonicalize_projections(projections, *, base_config):
+            return [
+                replace(
+                    projection,
+                    config=make_member(int(projection.to_value), None).config,
+                )
+                for projection in projections
+            ]
+
+        best = make_member(0, 10.0)
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.args = ()
+        search.best_perf_so_far = best.perf
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: fn.source_hash,
+            ),
+        )
+        search.config_gen = SimpleNamespace(
+            flatten=lambda config: [config.config[cute_flash.FLASH_WAIT_HINT_KEY]],
+            canonicalize_coordinate_projections=canonicalize_projections,
+        )
+        leaf_generation = SimpleNamespace(
+            flatten=search.config_gen.flatten,
+            coordinate_neighbor_projections=lambda flat, *, radius: projections(
+                int(flat[0])
+            ),
+        )
+        search._flash_leaf_config_generation = Mock(return_value=leaf_generation)
+        search.flash_structural_search = replace(
+            get_effort_profile("full").flash_structural_search,
+            terminal_coordinate_rounds=2,
+            terminal_coordinate_beam_width=2,
+        )
+        search._cute_flash_lane_policy_enabled = True
+        search._terminal_refinement_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search._benchmarked_members = {}
+        search._autotune_metrics = SimpleNamespace(
+            num_generations=20,
+            num_configs_tested=100,
+            search_phase_metrics={},
+        )
+        search.settings = SimpleNamespace(
+            autotune_benchmark_fn=None,
+            autotune_budget_seconds=None,
+        )
+        search.radius = 2
+        search.min_improvement_delta = 0.001
+        search.log = Mock()
+        search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
+        search.make_unbenchmarked = Mock(
+            side_effect=lambda flat: make_member(int(flat[0]), None)
+        )
+
+        initial_perfs = {1: 9.9, 2: 10.2}
+
+        def benchmark_population(members, *, desc):
+            self.assertIn("Terminal coordinate refinement", desc)
+            self.assertEqual(
+                search._autotune_metrics.search_phase_metrics[
+                    "terminal_coordinate_refinement"
+                ]["preterminal_num_configs_tested"],
+                100,
+            )
+            search._autotune_metrics.num_configs_tested += len(members)
+            for member in members:
+                value = member.config.config[cute_flash.FLASH_WAIT_HINT_KEY]
+                member.perfs.append(initial_perfs[value])
+                member.status = "ok"
+                search._record_benchmarked_member(member)
+            return members
+
+        search.benchmark_population = Mock(side_effect=benchmark_population)
+        timing_rounds = (
+            {0: 10.0, 1: 9.8, 2: 10.3},
+            {0: 10.0, 1: 10.4, 2: 9.5},
+            {0: 10.2, 1: 9.9, 2: 9.6},
+        )
+
+        def mirrored_rebenchmark(members, *, desc, target_ms):
+            values = timing_rounds[mirrored_rebenchmark.calls]
+            mirrored_rebenchmark.calls += 1
+            timings = [
+                values[member.config.config[cute_flash.FLASH_WAIT_HINT_KEY]]
+                for member in members
+            ]
+            for member, timing in zip(members, timings, strict=True):
+                member.perfs.append(timing)
+            order = list(range(len(members)))
+            return MirroredBenchmarkTrace(
+                orders=[order, list(reversed(order))],
+                elapsed_ms=[timings, list(reversed(timings))],
+                medians_ms=timings,
+                sweep_count=2,
+                calls_per_sample=1,
+                total_calls=2,
+            )
+
+        mirrored_rebenchmark.calls = 0
+        search.mirrored_rebenchmark = Mock(side_effect=mirrored_rebenchmark)
+
+        selected = search.run_terminal_refinement(best)
+
+        self.assertEqual(
+            selected.config.config[cute_flash.FLASH_WAIT_HINT_KEY],
+            2,
+        )
+        self.assertEqual(search._autotune_metrics.num_generations, 20)
+        self.assertEqual(search.mirrored_rebenchmark.call_count, 3)
+        self.assertEqual(
+            [
+                invocation.kwargs["target_ms"]
+                for invocation in search.mirrored_rebenchmark.call_args_list
+            ],
+            [200.0, 200.0, 5000.0],
+        )
+        transcript = search._autotune_metrics.search_phase_metrics[
+            "terminal_coordinate_refinement"
+        ]
+        self.assertTrue(
+            all(
+                "cute_vector_widths" not in entry["config"]
+                for entry in transcript["config_manifest"].values()
+            )
+        )
+        self.assertTrue(transcript["completed"])
+        self.assertEqual(transcript["termination_reason"], "round_limit")
+        self.assertEqual(transcript["rounds_started"], 2)
+        self.assertEqual(transcript["rounds_completed"], 2)
+        self.assertEqual(
+            [round_metric["accepted"] for round_metric in transcript["rounds"]],
+            [True, True],
+        )
+        self.assertEqual(transcript["new_candidate_count"], 2)
+        self.assertEqual(transcript["preterminal_num_configs_tested"], 100)
+        self.assertEqual(search._autotune_metrics.num_configs_tested, 102)
+        self.assertEqual(transcript["preterminal_registry_config_count"], 1)
+        self.assertRegex(
+            transcript["preterminal_registry_config_ids_sha256"], r"^[0-9a-f]{64}$"
+        )
+        self.assertEqual(transcript["beam_width"], 2)
+        self.assertEqual(transcript["projection_parent_count"], 3)
+        self.assertEqual(transcript["maximum_projection_parent_count"], 3)
+        self.assertTrue(
+            all(
+                len(round_metric["parent_config_ids"]) <= transcript["beam_width"]
+                for round_metric in transcript["rounds"]
+            )
+        )
+        self.assertEqual(transcript["reused_candidate_count"], 0)
+        self.assertEqual(transcript["intra_terminal_reused_candidate_count"], 1)
+        self.assertEqual(
+            transcript["accepted_config_ids"],
+            [canonical_config_id(make_member(value, 1.0).config) for value in (1, 2)],
+        )
+        self.assertNotIn(
+            canonical_config_id(make_member(1, 1.0).config),
+            transcript["rounds"][1]["beam_config_ids"],
+        )
+        self.assertEqual(
+            transcript["final_config_id"], canonical_config_id(selected.config)
+        )
+        self.assertEqual(
+            transcript["confirmation"]["candidate_config_ids"],
+            [
+                canonical_config_id(make_member(value, 1.0).config)
+                for value in (0, 1, 2)
+            ],
+        )
+        self.assertEqual(
+            transcript["rounds"][0]["measurement"]["elapsed_ms"][0],
+            [10.0, 9.8, 10.3],
+        )
+
+    def test_lfbo_flash_terminal_coordinate_refinement_skips_multi_shape(self):
+        best = Mock(spec=PopulationMember)
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.args = ()
+        search.flash_structural_search = get_effort_profile(
+            "full"
+        ).flash_structural_search
+        search._cute_flash_lane_policy_enabled = True
+        search._autotune_metrics = SimpleNamespace(search_phase_metrics={})
+        search.settings = SimpleNamespace(
+            autotune_benchmark_fn=None,
+            autotune_budget_seconds=None,
+        )
+        search.benchmark_provider = object.__new__(MultiShapeBenchmarkProvider)
+
+        self.assertIs(search.run_terminal_refinement(best), best)
+        self.assertEqual(search._autotune_metrics.search_phase_metrics, {})
+
+    def test_lfbo_flash_terminal_coordinate_refinement_finalizes_missing_leaf(self):
+        best = PopulationMember(
+            fn=lambda: None,
+            perfs=[10.0],
+            flat_values=[1],
+            config=helion.Config(block_sizes=[1, 128, 128]),
+            status="ok",
+        )
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.args = ()
+        search.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        search.flash_structural_search = get_effort_profile(
+            "full"
+        ).flash_structural_search
+        search._cute_flash_lane_policy_enabled = True
+        search._terminal_refinement_members = {}
+        search._autotune_metrics = SimpleNamespace(
+            num_generations=20,
+            num_configs_tested=100,
+            search_phase_metrics={},
+        )
+        search.settings = SimpleNamespace(
+            autotune_benchmark_fn=None,
+            autotune_budget_seconds=None,
+        )
+        search.radius = 2
+        search.min_improvement_delta = 0.001
+        search.log = Mock()
+
+        self.assertIs(search.run_terminal_refinement(best), best)
+        transcript = search._autotune_metrics.search_phase_metrics[
+            "terminal_coordinate_refinement"
+        ]
+        self.assertTrue(transcript["completed"])
+        self.assertEqual(transcript["termination_reason"], "no_candidates")
+        self.assertEqual(
+            transcript["confirmation"]["skipped_reason"],
+            "missing_structural_leaf",
+        )
+        self.assertRegex(transcript["config_manifest_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_terminal_refinement_registry_preserves_successful_duplicate(self):
+        config = helion.Config(block_sizes=[1, 128, 128])
+        successful = PopulationMember(
+            fn=lambda: None,
+            perfs=[10.0],
+            flat_values=[1],
+            config=config,
+            status="ok",
+        )
+        failed = PopulationMember(
+            fn=lambda: None,
+            perfs=[math.inf],
+            flat_values=[1],
+            config=copy.deepcopy(config),
+            status="error",
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        search._terminal_refinement_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search._benchmarked_members = {}
+
+        search._record_benchmarked_member(successful)
+        search._record_benchmarked_member(failed)
+
+        stored = search._terminal_refinement_members[config]
+        self.assertEqual(stored.status, "ok")
+        self.assertEqual(stored.perf, 10.0)
+
+    def test_terminal_refinement_registry_drops_quarantined_config(self):
+        config = helion.Config(block_sizes=[1, 128, 128])
+        successful = PopulationMember(
+            fn=lambda: None,
+            perfs=[10.0],
+            flat_values=[1],
+            config=config,
+            status="ok",
+        )
+        quarantined = PopulationMember(
+            fn=lambda: None,
+            perfs=[math.inf],
+            flat_values=[1],
+            config=copy.deepcopy(config),
+            status="error",
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True, backend_name="cute"
+        )
+        search._terminal_refinement_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search._benchmarked_members = {}
+
+        search._record_benchmarked_member(successful)
+        self.assertIn(config, search._terminal_refinement_members)
+
+        search._refresh_benchmarked_members_after_rebenchmark([quarantined])
+
+        self.assertNotIn(config, search._terminal_refinement_members)
+
+    def test_lfbo_flash_terminal_refinement_skips_budgeted_search(self):
+        best = PopulationMember(
+            fn=lambda: None,
+            perfs=[10.0],
+            flat_values=[0],
+            config=helion.Config(block_sizes=[1]),
+            status="ok",
+        )
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.args = ()
+        search.flash_structural_search = get_effort_profile(
+            "full"
+        ).flash_structural_search
+        search._cute_flash_lane_policy_enabled = True
+        search._autotune_metrics = SimpleNamespace(search_phase_metrics={})
+        search.settings = SimpleNamespace(
+            autotune_benchmark_fn=None,
+            autotune_budget_seconds=1.0,
+        )
+        search.benchmark_population = Mock()
+        search.mirrored_rebenchmark = Mock()
+
+        self.assertIs(search.run_terminal_refinement(best), best)
+        self.assertEqual(search._autotune_metrics.search_phase_metrics, {})
+        search.benchmark_population.assert_not_called()
+        search.mirrored_rebenchmark.assert_not_called()
+
+    def test_lfbo_flash_terminal_coordinate_refinement_crosses_beam_valley(self):
+        def member(
+            e2e_offset: int,
+            rescale_threshold: int,
+            perf: float | None,
+        ) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda: None,
+                perfs=[] if perf is None else [perf],
+                flat_values=[e2e_offset, rescale_threshold],
+                config=helion.Config(
+                    block_sizes=[1, 128, 128],
+                    cute_flash_pipeline_family="fa4",
+                    cute_flash_exp2_packet="1x1",
+                    cute_flash_softmax_disc=True,
+                    cute_flash_e2e_offset=e2e_offset,
+                    cute_flash_rescale_threshold=float(rescale_threshold),
+                ),
+                status="unknown" if perf is None else "ok",
+            )
+
+        best = member(7, 12, 10.0)
+        intermediate_config = member(5, 12, None).config
+        endpoint_config = member(5, 4, None).config
+
+        def projections(flat) -> list[CoordinateNeighborProjection]:
+            if flat == [7, 12.0]:
+                return [
+                    CoordinateNeighborProjection(
+                        0,
+                        cute_flash.FLASH_E2E_OFFSET_KEY,
+                        None,
+                        7,
+                        5,
+                        "candidate",
+                        [5, 12.0],
+                        intermediate_config,
+                    )
+                ]
+            if flat == [5, 12.0]:
+                return [
+                    CoordinateNeighborProjection(
+                        1,
+                        cute_flash.FLASH_RESCALE_THRESHOLD_KEY,
+                        None,
+                        12.0,
+                        4.0,
+                        "candidate",
+                        [5, 4.0],
+                        endpoint_config,
+                    )
+                ]
+            return []
+
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.args = ()
+        search.best_perf_so_far = best.perf
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            backend=SimpleNamespace(generated_source_hash=lambda _fn: None),
+        )
+        search.config_gen = SimpleNamespace(
+            flatten=lambda config: [
+                config.config[cute_flash.FLASH_E2E_OFFSET_KEY],
+                config.config[cute_flash.FLASH_RESCALE_THRESHOLD_KEY],
+            ],
+            canonicalize_coordinate_projections=lambda projections, *, base_config: (
+                projections
+            ),
+        )
+        search._flash_leaf_config_generation = Mock(
+            return_value=SimpleNamespace(
+                flatten=search.config_gen.flatten,
+                coordinate_neighbor_projections=lambda flat, *, radius: projections(
+                    flat
+                ),
+            )
+        )
+        search.flash_structural_search = replace(
+            get_effort_profile("full").flash_structural_search,
+            terminal_coordinate_rounds=2,
+        )
+        search._cute_flash_lane_policy_enabled = True
+        search._terminal_refinement_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search._benchmarked_members = {}
+        search._autotune_metrics = SimpleNamespace(
+            num_generations=20,
+            search_phase_metrics={},
+        )
+        search.settings = SimpleNamespace(
+            autotune_benchmark_fn=None,
+            autotune_budget_seconds=None,
+        )
+        search.radius = 2
+        search.min_improvement_delta = 0.001
+        search.log = Mock()
+        search._autotune_budget_exceeded_across_ranks = Mock(return_value=False)
+        search.make_unbenchmarked = Mock(
+            side_effect=lambda flat: member(int(flat[0]), int(flat[1]), None)
+        )
+
+        def benchmark_population(members, **_kwargs):
+            attempt_perfs = {(5, 12): 10.1, (5, 4): 9.9}
+            for candidate in members:
+                values = tuple(int(value) for value in candidate.flat_values)
+                candidate.perfs.append(attempt_perfs[values])
+                candidate.status = "ok"
+                search._record_benchmarked_member(candidate)
+            return members
+
+        search.benchmark_population = Mock(side_effect=benchmark_population)
+
+        timing_rounds = (
+            {(7, 12): 10.0, (5, 12): 10.005},
+            {(7, 12): 10.0, (5, 12): 10.02, (5, 4): 9.8},
+            {(7, 12): 10.0, (5, 12): 10.02, (5, 4): 9.75},
+        )
+
+        def mirrored_rebenchmark(members, **_kwargs):
+            values = timing_rounds[mirrored_rebenchmark.calls]
+            mirrored_rebenchmark.calls += 1
+            timings = [
+                values[tuple(int(value) for value in candidate.flat_values)]
+                for candidate in members
+            ]
+            for candidate, timing in zip(members, timings, strict=True):
+                candidate.perfs.append(timing)
+            order = list(range(len(members)))
+            return MirroredBenchmarkTrace(
+                orders=[order, list(reversed(order))],
+                elapsed_ms=[timings, list(reversed(timings))],
+                medians_ms=timings,
+                sweep_count=2,
+                calls_per_sample=1,
+                total_calls=2,
+            )
+
+        mirrored_rebenchmark.calls = 0
+        search.mirrored_rebenchmark = Mock(side_effect=mirrored_rebenchmark)
+
+        selected = search.run_terminal_refinement(best)
+
+        self.assertEqual(selected.config, endpoint_config)
+        self.assertEqual(search.mirrored_rebenchmark.call_count, 3)
+        transcript = search._autotune_metrics.search_phase_metrics[
+            "terminal_coordinate_refinement"
+        ]
+        self.assertEqual(transcript["rounds_completed"], 2)
+        self.assertEqual(transcript["termination_reason"], "round_limit")
+        self.assertEqual(
+            [round_metric["accepted"] for round_metric in transcript["rounds"]],
+            [False, True],
+        )
+        self.assertIn(
+            canonical_config_id(intermediate_config),
+            transcript["rounds"][1]["parent_config_ids"],
+        )
+        self.assertEqual(
+            transcript["rounds"][0]["candidate_results"][0]["selection_perf"],
+            10.005,
+        )
+        self.assertTrue(transcript["confirmation"]["accepted"])
+        self.assertEqual(
+            transcript["final_config_id"], canonical_config_id(endpoint_config)
+        )
+
     def test_pattern_search_block_size_pair_neighbors(self):
         search = PatternSearch.__new__(PatternSearch)
         search._visited = set()
@@ -2117,18 +2669,37 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         assert policy is not None
 
         def initialize_pattern_search(
-            search, *, kernel, copies: int, **_kwargs
+            search, *, kernel, args, copies: int, **_kwargs
         ) -> None:
             search.config_spec = kernel.config_spec
+            search.settings = kernel.settings
+            search.benchmark_provider = SimpleNamespace()
+            search._terminal_refinement_members = None
+            search.args = args
             search.copies = copies
             search.config_gen = SimpleNamespace(
                 flash_structural_starting_path_limit=lambda **_kwargs: 17,
                 flash_structural_family_probe_path_limit=lambda _cap, _generations: 18,
             )
 
-        flash_kernel = SimpleNamespace(config_spec=_cute_flash_test_config_spec())
+        flash_kernel = SimpleNamespace(
+            config_spec=_cute_flash_test_config_spec(),
+            settings=Settings(autotune_budget_seconds=None),
+        )
+        budgeted_flash_kernel = SimpleNamespace(
+            config_spec=_cute_flash_test_config_spec(),
+            settings=Settings(autotune_budget_seconds=1.0),
+        )
+        multi_shape_args = _MultiShapeAutotuneArgs(
+            cases=((Mock(), (object(),)),),
+            aggregation="geomean",
+            relative_to=None,
+            cache_tag=None,
+            workload_key=("test",),
+        )
         non_flash_kernel = SimpleNamespace(
-            config_spec=SimpleNamespace(cute_flash_search_enabled=False)
+            config_spec=SimpleNamespace(cute_flash_search_enabled=False),
+            settings=Settings(autotune_budget_seconds=None),
         )
         with (
             patch("helion.autotuner.surrogate_pattern_search.HAS_ML_DEPS", True),
@@ -2137,6 +2708,18 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             flash_search = LFBOPatternSearch(
                 flash_kernel,
                 (),
+                copies=2,
+                flash_structural_search=policy,
+            )
+            budgeted_flash_search = LFBOPatternSearch(
+                budgeted_flash_kernel,
+                (),
+                copies=2,
+                flash_structural_search=policy,
+            )
+            multi_shape_search = LFBOPatternSearch(
+                flash_kernel,
+                multi_shape_args,
                 copies=2,
                 flash_structural_search=policy,
             )
@@ -2150,6 +2733,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(flash_search._flash_promoted_path_limit, 17)
         self.assertEqual(flash_search._flash_family_probe_path_limit, 18)
         self.assertEqual(flash_search.copies, 18)
+        self.assertEqual(flash_search._terminal_refinement_members, {})
+        self.assertIsNone(budgeted_flash_search._terminal_refinement_members)
+        self.assertIsNone(multi_shape_search._terminal_refinement_members)
         self.assertEqual(non_flash_search.copies, 2)
 
     def test_lfbo_flash_starting_points_do_not_prune_close_sibling_leaf(self):
@@ -4277,7 +4863,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(search.population[0], winning_child)
         metrics = search._autotune_metrics.search_phase_metrics
         self.assertEqual(metrics["phase"], "cute_flash_structural_qualification_v22")
-        self.assertEqual(metrics["cute_flash_lane_policy_version"], 12)
+        self.assertEqual(metrics["cute_flash_lane_policy_version"], 14)
         self.assertTrue(metrics["completed"])
         self.assertEqual(metrics["qualification_rounds"], 2)
         self.assertEqual(metrics["qualification_rounds_started"], 2)
@@ -5850,6 +6436,43 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 ]
             )
         )
+
+    def test_lfbo_flash_terminal_refinement_allows_recorded_policy_failures(self):
+        for status in (
+            "ok",
+            "deduplicated",
+            "error",
+            "timeout",
+            "peer_compilation_fail",
+            "accuracy_error",
+            "source_rejected",
+        ):
+            with self.subTest(status=status):
+                succeeded = status in {"ok", "deduplicated"}
+                record = {
+                    "config_id": "candidate",
+                    "attempt_perf": 1.0 if succeeded else None,
+                    "selection_perf": 1.0 if succeeded else None,
+                    "status": status,
+                    "source_hash": "a" * 64,
+                }
+                self.assertTrue(flash_terminal_refinement_result_is_valid(record))
+                if status in {"accuracy_error", "source_rejected"}:
+                    self.assertFalse(flash_terminal_measurement_is_valid(record))
+
+        for status in ("filtered", "unknown", "projection_rejected"):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    flash_terminal_refinement_result_is_valid(
+                        {
+                            "config_id": "candidate",
+                            "attempt_perf": None,
+                            "selection_perf": None,
+                            "status": status,
+                            "source_hash": None,
+                        }
+                    )
+                )
 
     def test_lfbo_flash_qualification_reserves_lanes_before_surrogate_pruning(
         self,
@@ -9514,6 +10137,90 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             PopulationBasedSearch._repeat_for_target_ms(1e308, 1e-308), 20_000
         )
 
+    def test_mirrored_rebenchmark_attests_batched_call_sizing(self) -> None:
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_progress_bar=False,
+        )
+        search.args = ()
+        search.log = AutotuningLogger(search.settings)
+        search.best_perf_so_far = 20.0
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search._apply_rebenchmark_timings = Mock()
+        members = [
+            PopulationMember(lambda: None, [40.0], (), helion.Config(block_sizes=[1])),
+            PopulationMember(lambda: None, [20.0], (), helion.Config(block_sizes=[2])),
+        ]
+        repeats: list[int] = []
+
+        def mirrored_bench(_fns, *, repeat, desc=None, after_call=None):
+            repeats.append(repeat)
+            self.assertIsNone(desc)
+            self.assertIsNotNone(after_call)
+            sweep_count, calls_per_sample, total_calls = _mirrored_bench_call_layout(
+                repeat
+            )
+            return MirroredBenchmarkTrace(
+                orders=[[0, 1], [1, 0]] * (sweep_count // 2),
+                elapsed_ms=[[40.0, 20.0], [20.0, 40.0]] * (sweep_count // 2),
+                medians_ms=[40.0, 20.0],
+                sweep_count=sweep_count,
+                calls_per_sample=calls_per_sample,
+                total_calls=total_calls,
+            )
+
+        with (
+            clean_final_rebenchmark_env(),
+            patch(
+                "helion.autotuner.base_search.mirrored_bench_generic",
+                side_effect=mirrored_bench,
+            ),
+            patch(
+                "helion.autotuner.base_search.sync_object",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch("helion.autotuner.base_search.clear_jit_fast_path_caches"),
+        ):
+            trace = search.mirrored_rebenchmark(
+                members,
+                desc="Terminal coordinate refinement",
+                target_ms=200.0,
+            )
+            confirmation_trace = search.mirrored_rebenchmark(
+                members,
+                desc="Terminal coordinate refinement: confirming",
+                target_ms=5000.0,
+            )
+
+        self.assertEqual(repeats, [6, 126])
+        self.assertEqual(trace.target_ms, 200.0)
+        self.assertEqual(trace.repeat_reference_perf_ms, 40.0)
+        self.assertEqual(trace.sweep_count, 6)
+        self.assertEqual(trace.calls_per_sample, 1)
+        self.assertEqual(trace.total_calls, 6)
+        self.assertEqual(confirmation_trace.target_ms, 5000.0)
+        self.assertEqual(confirmation_trace.repeat_reference_perf_ms, 40.0)
+        self.assertEqual(confirmation_trace.sweep_count, 64)
+        self.assertEqual(confirmation_trace.calls_per_sample, 2)
+        self.assertEqual(confirmation_trace.total_calls, 128)
+        self.assertEqual(
+            search._apply_rebenchmark_timings.call_args_list,
+            [call(members, [40.0, 20.0]), call(members, [40.0, 20.0])],
+        )
+        metric = LFBOPatternSearch._flash_terminal_trace_metric(
+            ["config-a", "config-b"],
+            trace,
+        )
+        self.assertEqual(metric["target_ms"], 200.0)
+        self.assertEqual(metric["repeat_reference_perf_ms"], 40.0)
+        self.assertEqual(metric["sweep_count"], 6)
+        self.assertEqual(metric["calls_per_sample"], 1)
+        self.assertEqual(metric["total_calls"], 6)
+        self.assertEqual(len(metric["elapsed_ms"]), 6)
+        self.assertNotIn("sweeps", metric)
+
     def test_isolated_rebenchmark_rep_ms_is_timeout_bounded(self) -> None:
         self.assertEqual(PopulationBasedSearch._isolated_rep_ms(1000.0, 30), 1000)
         self.assertEqual(PopulationBasedSearch._isolated_rep_ms(60000.0, 30), 15000)
@@ -11552,7 +12259,24 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         assert isinstance(random_algorithm, dict)
         self.assertEqual(
             full_algorithm["cute_flash_lane_policy_version"],
-            12,
+            14,
+        )
+        self.assertEqual(
+            full_algorithm["cute_flash_terminal_coordinate_refinement"],
+            {
+                "schema_version": 2,
+                "policy_version": 2,
+                "coordinate_policy": (
+                    "same_leaf_full_surface_normalized_coordinate_v2"
+                ),
+                "rounds": 2,
+                "beam_width": 4,
+                "radius": 2,
+                "minimum_improvement_fraction": 0.001,
+                "measurement_policy": "mirrored_rotating_batched_wall_v2",
+                "round_target_ms": 200.0,
+                "confirmation_target_ms": 5000.0,
+            },
         )
         self.assertNotIn("cute_flash_lane_policy_version", quick_algorithm)
         self.assertNotIn("cute_flash_lane_policy_version", random_algorithm)
@@ -11585,7 +12309,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search._cute_flash_lane_policy_enabled = True
         cute_flash_policy = search._algorithm_cache_policy()
         self.assertEqual(cute_flash_policy["lfbo_version"], 1)
-        self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 12)
+        self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 14)
         self.assertEqual(cute_flash_policy["cute_flash_starting_path_limit"], 17)
         self.assertEqual(cute_flash_policy["cute_flash_family_probe_path_limit"], 18)
         self.assertEqual(cute_flash_policy["cute_flash_maximum_path_capacity"], 18)
@@ -11603,6 +12327,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                     "cute_flash_starting_path_limit",
                     "cute_flash_family_probe_path_limit",
                     "cute_flash_maximum_path_capacity",
+                    "cute_flash_terminal_coordinate_refinement",
                     "flash_structural_search",
                 }
             },
@@ -11889,6 +12614,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                 search = object.__new__(search_cls)
                 for name in parameters | inherited_fields:
                     setattr(search, name, 1)
+                if hasattr(search, "flash_structural_search"):
+                    search.flash_structural_search = get_effort_profile(
+                        "full"
+                    ).flash_structural_search
                 search._benchmark_provider_cls = LocalBenchmarkProvider
                 search.configs = []
                 search.provider = "provider"
@@ -13437,6 +14166,225 @@ class TestAutotuneBudget(TestCase):
         )
         self.assertEqual(provider._autotune_metrics.num_unique_sources, 2)
         self.assertEqual(provider._autotune_metrics.num_source_deduplications, 2)
+
+    def test_compile_config_failure_has_unstarted_source_evidence(self) -> None:
+        provider = self._make_stub_provider()
+        provider.settings.autotune_progress_bar = False
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: fn.source_hash,
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+
+        def compile_config(config, allow_print):
+            block_size = config.get("block_sizes")[0]
+            if block_size == 2:
+                raise RuntimeError("simulated compile_config failure")
+
+            def fn():
+                return None
+
+            fn.source_hash = str(block_size) * 64
+            return fn
+
+        def benchmark(config, fn):
+            provider._autotune_metrics.num_configs_tested += 1
+            return 1.0
+
+        provider.kernel.compile_config = compile_config
+        configs = [
+            helion.Config(block_sizes=[1]),
+            helion.Config(block_sizes=[2]),
+            helion.Config(block_sizes=[3]),
+        ]
+        failed_config = configs[1]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune"
+        metadata = KernelMetadata(kernel_source="source")
+
+        with (
+            provider.log.autotune_logging(
+                str(base_path), metadata, collect_dataset=True
+            ),
+            patch.object(
+                LocalBenchmarkProvider,
+                "_benchmark_function",
+                side_effect=benchmark,
+            ),
+        ):
+            results = provider.benchmark(configs)
+
+        with base_path.with_suffix(".csv").open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        with base_path.with_suffix(".sources.csv").open(newline="") as handle:
+            source_rows = list(csv.DictReader(handle))
+        metadata_record = json.loads(base_path.with_suffix(".meta.jsonl").read_text())
+        failed_id = canonical_config_id(failed_config)
+
+        self.assertEqual([result.status for result in results], ["ok", "error", "ok"])
+        self.assertEqual(
+            set(metadata_record["configs"]),
+            set(map(canonical_config_id, configs)),
+        )
+        self.assertEqual(len(rows), len(source_rows))
+        self.assertEqual(
+            [row["status"] for row in rows if row["config_id"] == failed_id],
+            ["error"],
+        )
+        failed_source_hash = next(
+            row["source_hash"] for row in source_rows if row["config_id"] == failed_id
+        )
+        self.assertEqual(
+            failed_source_hash, _compile_config_failure_source_hash(failed_config)
+        )
+        failed_member = PopulationMember(
+            results[1].fn,
+            [results[1].perf],
+            [],
+            failed_config,
+            status=results[1].status,
+        )
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.config_spec = provider.config_spec
+        self.assertEqual(
+            search._flash_terminal_member_result(failed_member)["source_hash"],
+            failed_source_hash,
+        )
+        self.assertEqual(
+            sum(row["status"] == "started" for row in rows),
+            provider._autotune_metrics.num_configs_tested,
+        )
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 1)
+        self.assertEqual(
+            len({row["source_hash"] for row in source_rows}),
+            provider._autotune_metrics.num_unique_sources,
+        )
+
+    def test_all_compile_failures_after_success_keep_prior_result(self) -> None:
+        provider = self._make_stub_provider()
+        provider.settings.autotune_progress_bar = False
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: fn.source_hash,
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+        fail_compilation = False
+
+        def compile_config(config, allow_print):
+            if fail_compilation:
+                raise RuntimeError("simulated terminal compile failure")
+
+            def fn():
+                return None
+
+            fn.source_hash = "a" * 64
+            return fn
+
+        provider.kernel.compile_config = compile_config
+        initial_config = helion.Config(block_sizes=[1])
+        failed_configs = [
+            helion.Config(block_sizes=[2]),
+            helion.Config(block_sizes=[3]),
+        ]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune"
+        metadata = KernelMetadata(kernel_source="source")
+
+        with (
+            provider.log.autotune_logging(
+                str(base_path), metadata, collect_dataset=True
+            ),
+            patch.object(
+                LocalBenchmarkProvider, "_benchmark_function", return_value=1.0
+            ),
+        ):
+            initial_result = provider.benchmark([initial_config])
+            fail_compilation = True
+            failed_results = provider.benchmark(failed_configs)
+
+        with base_path.with_suffix(".csv").open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        with base_path.with_suffix(".sources.csv").open(newline="") as handle:
+            source_rows = list(csv.DictReader(handle))
+        failed_ids = set(map(canonical_config_id, failed_configs))
+
+        self.assertEqual([result.status for result in initial_result], ["ok"])
+        self.assertEqual(
+            [result.status for result in failed_results], ["error", "error"]
+        )
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 2)
+        self.assertEqual(
+            {
+                row["config_id"]
+                for row in rows
+                if row["status"] == "error" and row["config_id"] in failed_ids
+            },
+            failed_ids,
+        )
+        self.assertFalse(
+            any(
+                row["status"] == "started" and row["config_id"] in failed_ids
+                for row in rows
+            )
+        )
+        self.assertEqual(
+            {
+                row["source_hash"]
+                for row in source_rows
+                if row["config_id"] in failed_ids
+            },
+            {_compile_config_failure_source_hash(config) for config in failed_configs},
+        )
+
+    def test_initial_all_compile_failures_still_raise(self) -> None:
+        provider = self._make_stub_provider()
+        provider.settings.autotune_progress_bar = False
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(
+                generated_source_hash=lambda fn: fn.source_hash,
+                should_deduplicate_generated_sources=lambda config_spec: True,
+            ),
+        )
+
+        def compile_config(config, allow_print):
+            raise RuntimeError("simulated initial compile failure")
+
+        provider.kernel.compile_config = compile_config
+        configs = [
+            helion.Config(block_sizes=[1]),
+            helion.Config(block_sizes=[2]),
+        ]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune"
+        metadata = KernelMetadata(kernel_source="source")
+
+        with (
+            provider.log.autotune_logging(
+                str(base_path), metadata, collect_dataset=True
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated initial compile failure"),
+        ):
+            provider.benchmark(configs)
+
+        with base_path.with_suffix(".csv").open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        failed_ids = set(map(canonical_config_id, configs))
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 2)
+        self.assertEqual(
+            {row["config_id"] for row in rows if row["status"] == "error"},
+            failed_ids,
+        )
 
     def test_invalidated_effective_source_rejects_later_alias(self) -> None:
         provider = self._make_stub_provider()

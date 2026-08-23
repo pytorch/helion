@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import glob
 import logging
@@ -28,6 +29,34 @@ T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+_MIRRORED_BENCH_MAX_SWEEPS = 64
+
+
+@dataclasses.dataclass(frozen=True)
+class MirroredBenchmarkTrace:
+    """Bounded wall-clock samples from deterministic mirrored benchmark sweeps."""
+
+    orders: list[list[int]]
+    elapsed_ms: list[list[float]]
+    medians_ms: list[float]
+    target_ms: float | None = None
+    repeat_reference_perf_ms: float | None = None
+    sweep_count: int | None = None
+    calls_per_sample: int | None = None
+    total_calls: int | None = None
+
+
+def _mirrored_bench_call_layout(desired_calls: int) -> tuple[int, int, int]:
+    """Return balanced sweep, batch, and actual timed-call counts."""
+    desired_calls = max(2, desired_calls)
+    if desired_calls % 2:
+        desired_calls += 1
+    calls_per_sample = max(1, math.ceil(desired_calls / _MIRRORED_BENCH_MAX_SWEEPS))
+    sweep_count = math.ceil(desired_calls / calls_per_sample)
+    if sweep_count % 2:
+        sweep_count += 1
+    total_calls = sweep_count * calls_per_sample
+    return sweep_count, calls_per_sample, total_calls
 
 
 def _make_l2_cache_clearer() -> Callable[[], None]:
@@ -311,6 +340,79 @@ def interleaved_bench_generic(
             all_times[j].append((end - start) * 1000)  # convert to ms
 
     return [statistics.median(times) for times in all_times]
+
+
+def mirrored_bench_generic(
+    fns: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+    after_call: Callable[[int], None] | None = None,
+) -> MirroredBenchmarkTrace:
+    """Benchmark functions in bounded, rotated forward/reverse sample pairs."""
+    if not fns:
+        return MirroredBenchmarkTrace([], [], [])
+
+    # Every forward sweep is paired with its exact reverse so each function has
+    # the same mean position within a pair. Rotate successive pairs to spread
+    # any nonlinear thermal drift across the candidate set. Fast kernels batch
+    # multiple individually timed calls into each retained sample so the trace is
+    # bounded without reducing the requested timing work.
+    sweep_count, calls_per_sample, total_calls = _mirrored_bench_call_layout(repeat)
+
+    _output: object = None
+    for index, fn in enumerate(fns):
+        try:
+            _output = fn()
+            synchronize_device()
+        finally:
+            if after_call is not None:
+                after_call(index)
+
+    clear_l2 = _make_l2_cache_clearer()
+    all_times: list[list[float]] = [[] for _ in fns]
+    orders: list[list[int]] = []
+    elapsed_ms: list[list[float]] = []
+    indices = list(range(len(fns)))
+    iterator = iter_with_progress(
+        range(sweep_count),
+        total=sweep_count,
+        description=desc,
+        enabled=desc is not None,
+    )
+    for sweep in iterator:
+        offset = (sweep // 2) % len(indices)
+        rotated = indices[offset:] + indices[:offset]
+        order = rotated if sweep % 2 == 0 else list(reversed(rotated))
+        sweep_times: list[float] = []
+        for index in order:
+            elapsed = 0.0
+            for _ in range(calls_per_sample):
+                clear_l2()
+                synchronize_device()
+                start = time.perf_counter()
+                try:
+                    output = fns[index]()
+                    synchronize_device()
+                    elapsed += (time.perf_counter() - start) * 1000
+                    _output = output
+                finally:
+                    if after_call is not None:
+                        after_call(index)
+            sample = elapsed / calls_per_sample
+            all_times[index].append(sample)
+            sweep_times.append(sample)
+        orders.append(order)
+        elapsed_ms.append(sweep_times)
+
+    return MirroredBenchmarkTrace(
+        orders,
+        elapsed_ms,
+        [statistics.median(times) for times in all_times],
+        sweep_count=sweep_count,
+        calls_per_sample=calls_per_sample,
+        total_calls=total_calls,
+    )
 
 
 def paired_device_micros_bench(

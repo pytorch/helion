@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
+import hashlib
 import itertools
 import json
 import os
@@ -469,6 +470,157 @@ def test_flash_normalized_seed_configs_are_length_invariant(
         for num_kv in num_kv_values
     }
     _assert_all_equal(fingerprints)
+
+
+@pytest.mark.parametrize("is_causal", (False, True), ids=("dense", "causal"))
+def test_flash_coordinate_neighbor_projections_are_length_invariant(
+    is_causal: bool,
+) -> None:
+    random_state = random.getstate()
+    try:
+        by_length: dict[int, tuple[object, ...]] = {}
+        for num_kv in _ALIGNED_LENGTHS:
+            spec = _flash_config_spec(
+                head_dim=64,
+                num_kv=num_kv,
+                dtype=torch.float16,
+                is_causal=is_causal,
+            )
+            generation = spec.create_config_generation()
+            base = generation.unflatten(generation.default_flat())
+            leaf = cute_flash.flash_structural_leaf_from_config(base.config)
+            assert leaf is not None
+            overrides = {
+                cute_flash.FLASH_PIPELINE_FAMILY_KEY: leaf.pipeline_family,
+                cute_flash.FLASH_SOFTMAX_DISC_KEY: leaf.softmax_disc,
+            }
+            if leaf.compound_exp2_packet is not None:
+                overrides[cute_flash.FLASH_EXP2_PACKET_KEY] = leaf.compound_exp2_packet
+            leaf_generation = spec.create_config_generation(overrides=overrides)
+            projections = generation.canonicalize_coordinate_projections(
+                leaf_generation.coordinate_neighbor_projections(
+                    leaf_generation.flatten(base),
+                    radius=2,
+                ),
+                base_config=base,
+            )
+            by_length[num_kv] = tuple(
+                (
+                    projection.flat_index,
+                    projection.key,
+                    projection.sequence_index,
+                    projection.from_value,
+                    projection.to_value,
+                    (
+                        "different_leaf"
+                        if projection.config is not None
+                        and cute_flash.flash_structural_leaf_from_config(
+                            projection.config.config
+                        )
+                        != leaf
+                        else projection.outcome
+                    ),
+                    (
+                        None
+                        if projection.config is None
+                        else json.dumps(
+                            projection.config.config,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    ),
+                )
+                for projection in projections
+            )
+        assert random.getstate() == random_state
+        _assert_all_equal(by_length)
+    finally:
+        random.setstate(random_state)
+
+
+def test_flash_coordinate_neighbors_reach_dense_heldout_refinements() -> None:
+    spec = _flash_config_spec(
+        head_dim=64,
+        num_kv=384,
+        dtype=torch.float16,
+        is_causal=False,
+    )
+    generation = spec.create_config_generation()
+    requested = generation.unflatten(generation.default_flat())
+    requested.config.update(
+        {
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
+            cute_flash.FLASH_SOFTMAX_DISC_KEY: False,
+            cute_flash.FLASH_EXP2_PACKET_KEY: "1x1",
+            cute_flash.FLASH_STAT_TRANSPORT_KEY: "single",
+            cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+            cute_flash.FLASH_CORR_TILE_SIZE_KEY: 8,
+        }
+    )
+    leaf_generation = spec.create_config_generation(
+        overrides={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
+            cute_flash.FLASH_SOFTMAX_DISC_KEY: False,
+        }
+    )
+    _flat, base = leaf_generation.canonicalize_flat(leaf_generation.flatten(requested))
+    leaf = cute_flash.flash_structural_leaf_from_config(base.config)
+    assert leaf is not None
+    projections = generation.canonicalize_coordinate_projections(
+        leaf_generation.coordinate_neighbor_projections(
+            leaf_generation.flatten(base),
+            radius=2,
+        ),
+        base_config=base,
+    )
+
+    requested_moves = {
+        (projection.key, projection.to_value): projection
+        for projection in projections
+        if projection.outcome == "candidate"
+        and projection.config is not None
+        and cute_flash.flash_structural_leaf_from_config(projection.config.config)
+        == leaf
+    }
+    assert (
+        cute_flash.FLASH_STAT_TRANSPORT_KEY,
+        "single_final",
+    ) in requested_moves
+    assert (cute_flash.FLASH_CORR_TILE_SIZE_KEY, 32) in requested_moves
+
+
+@pytest.mark.parametrize("is_causal", (False, True), ids=("dense", "causal"))
+def test_flash_terminal_coordinate_surface_catalog_is_length_invariant(
+    is_causal: bool,
+) -> None:
+    random_state = random.getstate()
+    try:
+        by_length: dict[int, str] = {}
+        for num_kv in (_ALIGNED_LENGTHS[0], _ALIGNED_LENGTHS[-1]):
+            catalog = (
+                _flash_config_spec(
+                    head_dim=64,
+                    num_kv=num_kv,
+                    dtype=torch.float16,
+                    is_causal=is_causal,
+                )
+                .create_config_generation()
+                .flash_terminal_coordinate_surface_catalog(radius=2)
+            )
+            payload = json.dumps(
+                catalog,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            by_length[num_kv] = hashlib.sha256(payload.encode()).hexdigest()
+            assert catalog["schema_version"] == 1
+            assert catalog["radius"] == 2
+            assert catalog["leaves"]
+        assert random.getstate() == random_state
+        _assert_all_equal(by_length)
+    finally:
+        random.setstate(random_state)
 
 
 @pytest.mark.parametrize(("dtype", "head_dim", "is_causal"), _SEMANTIC_CASES)
@@ -3388,6 +3540,27 @@ def test_unsafe_cga2_local_stage_local_softmax_canonicalizes(num_kv: int) -> Non
     requested = helion.Config.from_dict({"block_sizes": [1, 128, 128], **values})
     _, normalized = generation.canonicalize_flat(generation.flatten(requested))
     assert normalized.config[cute_flash.FLASH_SOFTMAX_SETUP_KEY] == "shared"
+
+    leaf_generation = spec.create_config_generation(
+        overrides={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_cga2_local",
+            cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
+        }
+    )
+    projections = generation.canonicalize_coordinate_projections(
+        leaf_generation.coordinate_neighbor_projections(
+            leaf_generation.flatten(normalized), radius=1
+        ),
+        base_config=normalized,
+    )
+    stage_local = next(
+        projection
+        for projection in projections
+        if projection.key == cute_flash.FLASH_SOFTMAX_SETUP_KEY
+        and projection.to_value == "stage_local"
+    )
+    assert stage_local.outcome == "incumbent_alias"
+    assert stage_local.config == normalized
 
 
 @pytest.mark.parametrize(

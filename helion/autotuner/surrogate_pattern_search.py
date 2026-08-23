@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import operator
 import random
@@ -12,12 +14,24 @@ from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import check_population_consistency
 from .base_search import performance
+from .benchmark_provider import MultiShapeBenchmarkProvider
+from .benchmark_provider import _compile_config_failure_source_hash
+from .benchmark_provider import _MultiShapeAutotuneArgs
+from .benchmark_provider import _unset_fn
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .effort_profile import FlashStructuralSearchConfig
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
 from .search_space_logger import canonical_config_id
 from helion._dist_utils import sync_seed
+
+_CUTE_FLASH_LANE_POLICY_VERSION = 14
+_FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION = 2
+_FLASH_TERMINAL_REFINEMENT_POLICY_VERSION = 2
+_FLASH_TERMINAL_COORDINATE_POLICY = "same_leaf_full_surface_normalized_coordinate_v2"
+_FLASH_TERMINAL_REFINEMENT_TARGET_MS = 200.0
+_FLASH_TERMINAL_CONFIRMATION_TARGET_MS = 5000.0
+_FLASH_TERMINAL_MEASUREMENT_POLICY = "mirrored_rotating_batched_wall_v2"
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -29,7 +43,9 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .benchmarking import MirroredBenchmarkTrace
     from .config_generation import ConfigGeneration
+    from .config_generation import CoordinateNeighborProjection
     from .config_generation import FlatConfig
 
 try:
@@ -71,6 +87,17 @@ def flash_terminal_measurement_is_valid(
         and record.get("projected_config_id") is None
         and attempt_perf is None
         and selection_perf is None
+    )
+
+
+def flash_terminal_refinement_result_is_valid(record: Mapping[str, object]) -> bool:
+    """Validate a candidate result recorded by terminal coordinate refinement."""
+    if flash_terminal_measurement_is_valid(record):
+        return True
+    return bool(
+        record.get("status") in {"accuracy_error", "source_rejected"}
+        and record.get("attempt_perf") is None
+        and record.get("selection_perf") is None
     )
 
 
@@ -218,6 +245,14 @@ class LFBOPatternSearch(PatternSearch):
         )
         if self._cute_flash_lane_policy_enabled:
             assert flash_structural_search is not None
+            if (
+                flash_structural_search.terminal_coordinate_rounds > 0
+                and flash_structural_search.terminal_coordinate_beam_width > 0
+                and self.settings.autotune_budget_seconds is None
+                and self.settings.autotune_benchmark_fn is None
+                and not isinstance(self.args, _MultiShapeAutotuneArgs)
+            ):
+                self._terminal_refinement_members = {}
             self._flash_promoted_path_limit = (
                 self.config_gen.flash_structural_starting_path_limit(
                     minimum=max(self.copies, flash_structural_search.starting_paths),
@@ -257,7 +292,22 @@ class LFBOPatternSearch(PatternSearch):
             }
         )
         if self._cute_flash_lane_policy_enabled:
-            policy["cute_flash_lane_policy_version"] = 12
+            policy["cute_flash_lane_policy_version"] = _CUTE_FLASH_LANE_POLICY_VERSION
+            assert self.flash_structural_search is not None
+            policy["cute_flash_terminal_coordinate_refinement"] = {
+                "schema_version": _FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION,
+                "policy_version": _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION,
+                "coordinate_policy": _FLASH_TERMINAL_COORDINATE_POLICY,
+                "rounds": self.flash_structural_search.terminal_coordinate_rounds,
+                "beam_width": (
+                    self.flash_structural_search.terminal_coordinate_beam_width
+                ),
+                "radius": self.radius,
+                "minimum_improvement_fraction": self.min_improvement_delta,
+                "measurement_policy": _FLASH_TERMINAL_MEASUREMENT_POLICY,
+                "round_target_ms": _FLASH_TERMINAL_REFINEMENT_TARGET_MS,
+                "confirmation_target_ms": (_FLASH_TERMINAL_CONFIRMATION_TARGET_MS),
+            }
             policy["cute_flash_starting_path_limit"] = self._flash_promoted_path_limit
             policy["cute_flash_family_probe_path_limit"] = (
                 self._flash_family_probe_path_limit
@@ -756,6 +806,8 @@ class LFBOPatternSearch(PatternSearch):
 
     def _flash_member_source_hash(self, member: PopulationMember) -> str | None:
         """Return the effective generated-source identity for one flash member."""
+        if member.fn is _unset_fn and member.status == "error":
+            return _compile_config_failure_source_hash(member.config)
         return self.config_spec.backend.generated_source_hash(member.fn)
 
     @staticmethod
@@ -3413,7 +3465,7 @@ class LFBOPatternSearch(PatternSearch):
         )
         self._autotune_metrics.search_phase_metrics = {
             "phase": "cute_flash_structural_qualification_v22",
-            "cute_flash_lane_policy_version": 12,
+            "cute_flash_lane_policy_version": _CUTE_FLASH_LANE_POLICY_VERSION,
             "completed": bool(
                 rounds_completed == qualification_passes_planned
                 and schedule_anchor_complete
@@ -4120,6 +4172,501 @@ class LFBOPatternSearch(PatternSearch):
         )
         cache[cache_key] = config_gen
         return config_gen
+
+    @staticmethod
+    def _flash_terminal_projection_metric(
+        projection: CoordinateNeighborProjection,
+        *,
+        outcome: str,
+    ) -> dict[str, object]:
+        return {
+            "flat_index": projection.flat_index,
+            "key": projection.key,
+            "sequence_index": projection.sequence_index,
+            "from_value": copy.deepcopy(projection.from_value),
+            "to_value": copy.deepcopy(projection.to_value),
+            "outcome": outcome,
+            "config_id": (
+                canonical_config_id(projection.config)
+                if projection.config is not None
+                else None
+            ),
+        }
+
+    def _flash_terminal_member_result(
+        self, member: PopulationMember
+    ) -> dict[str, object]:
+        succeeded = self._flash_member_succeeded(member)
+        return {
+            "config_id": canonical_config_id(member.config),
+            "attempt_perf": (
+                member.perfs[0]
+                if member.perfs and math.isfinite(member.perfs[0])
+                else None
+            ),
+            "selection_perf": member.perf if succeeded else None,
+            "status": member.status,
+            "source_hash": self._flash_member_source_hash(member),
+        }
+
+    @staticmethod
+    def _flash_terminal_trace_metric(
+        member_ids: Sequence[str], trace: MirroredBenchmarkTrace
+    ) -> dict[str, object]:
+        return {
+            "base_order": list(member_ids),
+            "target_ms": trace.target_ms,
+            "repeat_reference_perf_ms": trace.repeat_reference_perf_ms,
+            "sweep_count": trace.sweep_count,
+            "calls_per_sample": trace.calls_per_sample,
+            "total_calls": trace.total_calls,
+            "elapsed_ms": [list(times) for times in trace.elapsed_ms],
+            "median_ms": [
+                {"config_id": config_id, "value": timing}
+                for config_id, timing in zip(
+                    member_ids,
+                    trace.medians_ms,
+                    strict=True,
+                )
+            ],
+        }
+
+    def run_terminal_refinement(self, best: PopulationMember) -> PopulationMember:
+        """Close the final CuTe-flash basin with a deterministic coordinate beam."""
+        policy = getattr(self, "flash_structural_search", None)
+        phase = getattr(
+            getattr(self, "_autotune_metrics", None),
+            "search_phase_metrics",
+            None,
+        )
+        if (
+            not getattr(self, "_cute_flash_lane_policy_enabled", False)
+            or policy is None
+            or policy.terminal_coordinate_rounds <= 0
+            or policy.terminal_coordinate_beam_width <= 0
+            or not isinstance(phase, dict)
+            or self.performance_unit != "ms"
+            or self.settings.autotune_benchmark_fn is not None
+            or self.settings.autotune_budget_seconds is not None
+            or isinstance(
+                getattr(self, "benchmark_provider", None),
+                MultiShapeBenchmarkProvider,
+            )
+        ):
+            return best
+
+        search_generation = self._autotune_metrics.num_generations
+        initial_config_id = canonical_config_id(best.config)
+        config_manifest: dict[str, dict[str, object]] = {}
+        unique_candidate_ids: set[str] = set()
+        new_candidate_ids: set[str] = set()
+        reused_candidate_ids: set[str] = set()
+        intra_terminal_reused_candidate_ids: set[str] = set()
+        prior_failed_candidate_ids: set[str] = set()
+        projection_attempt_count = 0
+        projection_parent_count = 0
+        transcript: dict[str, object] = {
+            "schema_version": _FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION,
+            "policy_version": _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION,
+            "lane_policy_version": _CUTE_FLASH_LANE_POLICY_VERSION,
+            "coordinate_policy": _FLASH_TERMINAL_COORDINATE_POLICY,
+            "measurement_policy": _FLASH_TERMINAL_MEASUREMENT_POLICY,
+            "rounds_planned": policy.terminal_coordinate_rounds,
+            "beam_width": policy.terminal_coordinate_beam_width,
+            "maximum_projection_parent_count": 1
+            + policy.terminal_coordinate_beam_width
+            * max(policy.terminal_coordinate_rounds - 1, 0),
+            "projection_parent_count": 0,
+            "rounds_started": 0,
+            "rounds_completed": 0,
+            "completed": False,
+            "budget_exhausted": False,
+            "termination_reason": None,
+            "search_generation": search_generation,
+            "preterminal_num_configs_tested": getattr(
+                self._autotune_metrics,
+                "num_configs_tested",
+                0,
+            ),
+            "preterminal_registry_config_count": 0,
+            "preterminal_registry_config_ids_hash_policy": (
+                "sorted_compact_json_sha256_v1"
+            ),
+            "preterminal_registry_config_ids_sha256": None,
+            "radius": self.radius,
+            "minimum_improvement_fraction": self.min_improvement_delta,
+            "initial_incumbent_config_id": initial_config_id,
+            "refined_config_id": initial_config_id,
+            "final_config_id": initial_config_id,
+            "projection_attempt_count": 0,
+            "unique_candidate_count": 0,
+            "new_candidate_count": 0,
+            "reused_candidate_count": 0,
+            "intra_terminal_reused_candidate_count": 0,
+            "prior_failed_candidate_count": 0,
+            "accepted_config_ids": [],
+            "config_manifest_sha256": None,
+            "config_manifest": config_manifest,
+            "rounds": [],
+            "confirmation": None,
+        }
+        phase["terminal_coordinate_refinement"] = transcript
+
+        registry = getattr(self, "_terminal_refinement_members", None)
+        if registry is None:
+            registry = {}
+            self._terminal_refinement_members = registry
+        self._record_best_member_for_config(
+            registry,
+            best.config,
+            best,
+            replace=True,
+        )
+        preterminal_registry_config_ids = sorted(
+            canonical_config_id(config) for config in registry
+        )
+        preterminal_configs = set(registry)
+        transcript["preterminal_registry_config_count"] = len(
+            preterminal_registry_config_ids
+        )
+        transcript["preterminal_registry_config_ids_sha256"] = hashlib.sha256(
+            json.dumps(
+                preterminal_registry_config_ids,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+        def add_manifest_config(member_config: Config) -> None:
+            config_id = canonical_config_id(member_config)
+            config_manifest[config_id] = {"config": copy.deepcopy(member_config.config)}
+
+        def finish_transcript(current: PopulationMember) -> PopulationMember:
+            transcript["final_config_id"] = canonical_config_id(current.config)
+            transcript["unique_candidate_count"] = len(unique_candidate_ids)
+            transcript["new_candidate_count"] = len(new_candidate_ids)
+            transcript["reused_candidate_count"] = len(reused_candidate_ids)
+            transcript["intra_terminal_reused_candidate_count"] = len(
+                intra_terminal_reused_candidate_ids
+            )
+            transcript["prior_failed_candidate_count"] = len(prior_failed_candidate_ids)
+            sorted_manifest = dict(sorted(config_manifest.items()))
+            transcript["config_manifest"] = sorted_manifest
+            transcript["config_manifest_sha256"] = hashlib.sha256(
+                json.dumps(
+                    sorted_manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if self._autotune_metrics.num_generations != search_generation:
+                raise AssertionError(
+                    "terminal refinement changed LFBO generation count"
+                )
+            if current.config != best.config:
+                self.log(
+                    "Terminal coordinate refinement selected "
+                    f"{current.config} ({self.format_performance(current.perf)})"
+                )
+            self._selected_member = current
+            return current
+
+        add_manifest_config(best.config)
+        initial_leaf = self._flash_structural_leaf(best)
+        if initial_leaf is None:
+            transcript["termination_reason"] = "no_candidates"
+            transcript["completed"] = True
+            transcript["confirmation"] = {
+                "candidate_config_ids": [initial_config_id],
+                "measurement": None,
+                "best_config_id": initial_config_id,
+                "selected_config_id": initial_config_id,
+                "accepted": False,
+                "improvement_fraction": 0.0,
+                "skipped_reason": "missing_structural_leaf",
+            }
+            return finish_transcript(best)
+
+        incumbent = best
+        beam = [best]
+        final_beam = [best]
+        accepted_round_winners: list[PopulationMember] = []
+        accepted_configs: set[Config] = set()
+        round_metrics = transcript["rounds"]
+        assert isinstance(round_metrics, list)
+        termination_reason = "round_limit"
+
+        for round_index in range(1, policy.terminal_coordinate_rounds + 1):
+            transcript["rounds_started"] = round_index
+            parent_ids = [canonical_config_id(parent.config) for parent in beam]
+            projection_parent_count += len(parent_ids)
+            transcript["projection_parent_count"] = projection_parent_count
+            parent_configs = {parent.config for parent in beam}
+            parent_projections: list[dict[str, object]] = []
+            candidate_member_by_config: dict[Config, PopulationMember] = {}
+            candidate_configs: list[Config] = []
+            round_seen_configs: set[Config] = set()
+            newly_unbenchmarked: list[PopulationMember] = []
+            round_new_ids: list[str] = []
+            round_reused_ids: list[str] = []
+            round_intra_terminal_reused_ids: list[str] = []
+            prior_failed_ids: list[str] = []
+            for parent in beam:
+                leaf_config_gen = self._flash_leaf_config_generation(initial_leaf)
+                if leaf_config_gen is None:
+                    termination_reason = "no_candidates"
+                    break
+                projections = self.config_gen.canonicalize_coordinate_projections(
+                    leaf_config_gen.coordinate_neighbor_projections(
+                        leaf_config_gen.flatten(parent.config),
+                        radius=self.radius,
+                    ),
+                    base_config=parent.config,
+                )
+                requests: list[dict[str, object]] = []
+                projection_attempt_count += len(projections)
+                for projection in projections:
+                    outcome = projection.outcome
+                    config = projection.config
+                    if (
+                        outcome == "candidate"
+                        and config is not None
+                        and self._flash_structural_leaf_from_config(config)
+                        != initial_leaf
+                    ):
+                        outcome = "different_leaf"
+                    elif outcome == "candidate" and config in parent_configs:
+                        outcome = "beam_alias"
+                    elif outcome == "candidate" and config in round_seen_configs:
+                        outcome = "round_candidate_alias"
+                    requests.append(
+                        self._flash_terminal_projection_metric(
+                            projection,
+                            outcome=outcome,
+                        )
+                    )
+                    if config is not None:
+                        add_manifest_config(config)
+                    if outcome != "candidate" or config is None:
+                        continue
+                    round_seen_configs.add(config)
+                    candidate_configs.append(config)
+                    config_id = canonical_config_id(config)
+                    unique_candidate_ids.add(config_id)
+                    existing = registry.get(config)
+                    if existing is not None:
+                        candidate_member_by_config[config] = existing
+                        if self._flash_member_succeeded(existing):
+                            if config in preterminal_configs:
+                                round_reused_ids.append(config_id)
+                                reused_candidate_ids.add(config_id)
+                            else:
+                                round_intra_terminal_reused_ids.append(config_id)
+                                intra_terminal_reused_candidate_ids.add(config_id)
+                        else:
+                            prior_failed_ids.append(config_id)
+                            prior_failed_candidate_ids.add(config_id)
+                        continue
+
+                    member = self.make_unbenchmarked(self.config_gen.flatten(config))
+                    if member is None:
+                        prior_failed_ids.append(config_id)
+                        prior_failed_candidate_ids.add(config_id)
+                        continue
+                    candidate_member_by_config[config] = member
+                    newly_unbenchmarked.append(member)
+                    round_new_ids.append(config_id)
+                    new_candidate_ids.add(config_id)
+                parent_projections.append(
+                    {
+                        "parent_config_id": canonical_config_id(parent.config),
+                        "coordinate_requests": requests,
+                    }
+                )
+            if termination_reason == "no_candidates":
+                break
+
+            transcript["projection_attempt_count"] = projection_attempt_count
+            if newly_unbenchmarked:
+                self.benchmark_population(
+                    newly_unbenchmarked,
+                    desc=f"Terminal coordinate refinement {round_index}:",
+                )
+
+            measured: list[PopulationMember] = []
+            measured_configs: set[Config] = set()
+            for member in (*beam, *candidate_member_by_config.values()):
+                if (
+                    self._flash_member_succeeded(member)
+                    and member.config not in measured_configs
+                ):
+                    measured.append(member)
+                    measured_configs.add(member.config)
+
+            candidate_ids = [
+                canonical_config_id(config) for config in candidate_configs
+            ]
+            candidate_results = [
+                self._flash_terminal_member_result(candidate_member_by_config[config])
+                for config in candidate_configs
+                if config in candidate_member_by_config
+            ]
+
+            round_metric: dict[str, object] = {
+                "round_index": round_index,
+                "incumbent_config_id": canonical_config_id(incumbent.config),
+                "leaf": {
+                    "family": initial_leaf.pipeline_family,
+                    "compound_packet": initial_leaf.compound_exp2_packet,
+                    "softmax_disc": initial_leaf.softmax_disc,
+                },
+                "parent_config_ids": parent_ids,
+                "parent_projections": parent_projections,
+                "candidate_config_ids": candidate_ids,
+                "new_candidate_ids": round_new_ids,
+                "reused_candidate_ids": round_reused_ids,
+                "intra_terminal_reused_candidate_ids": (
+                    round_intra_terminal_reused_ids
+                ),
+                "prior_failed_candidate_ids": prior_failed_ids,
+                "candidate_results": candidate_results,
+                "comparison_config_ids": [],
+                "measurement": None,
+                "round_best_config_id": canonical_config_id(incumbent.config),
+                "selected_config_id": canonical_config_id(incumbent.config),
+                "accepted": False,
+                "improvement_fraction": 0.0,
+                "beam_config_ids": parent_ids,
+            }
+            round_metrics.append(round_metric)
+
+            if len(measured) < 2:
+                transcript["rounds_completed"] = round_index
+                final_beam = beam
+                termination_reason = "no_candidates"
+                break
+
+            member_ids = [canonical_config_id(member.config) for member in measured]
+            round_metric["comparison_config_ids"] = member_ids
+            trace = self.mirrored_rebenchmark(
+                measured,
+                desc=f"Terminal coordinate refinement {round_index}: comparing",
+                target_ms=_FLASH_TERMINAL_REFINEMENT_TARGET_MS,
+            )
+            round_metric["measurement"] = self._flash_terminal_trace_metric(
+                member_ids,
+                trace,
+            )
+            round_metric["candidate_results"] = [
+                self._flash_terminal_member_result(candidate_member_by_config[config])
+                for config in candidate_configs
+                if config in candidate_member_by_config
+            ]
+
+            round_best = min(measured, key=self._flash_member_rank_key)
+            improvement = (
+                1.0 - round_best.perf / incumbent.perf
+                if math.isfinite(round_best.perf)
+                and math.isfinite(incumbent.perf)
+                and incumbent.perf > 0.0
+                else 0.0
+            )
+            accepted = bool(
+                round_best.config != incumbent.config
+                and improvement >= self.min_improvement_delta
+            )
+            if accepted:
+                incumbent = round_best
+                add_manifest_config(incumbent.config)
+                if incumbent.config not in accepted_configs:
+                    accepted_configs.add(incumbent.config)
+                    accepted_round_winners.append(incumbent)
+                    accepted_config_ids = transcript["accepted_config_ids"]
+                    assert isinstance(accepted_config_ids, list)
+                    accepted_config_ids.append(canonical_config_id(incumbent.config))
+
+            ranked = sorted(measured, key=self._flash_member_rank_key)
+            next_beam = [incumbent]
+            for member in ranked:
+                if member.config in {item.config for item in next_beam}:
+                    continue
+                next_beam.append(member)
+                if len(next_beam) >= policy.terminal_coordinate_beam_width:
+                    break
+            beam = next_beam
+            final_beam = beam
+            round_metric["round_best_config_id"] = canonical_config_id(
+                round_best.config
+            )
+            round_metric["selected_config_id"] = canonical_config_id(incumbent.config)
+            round_metric["accepted"] = accepted
+            round_metric["improvement_fraction"] = improvement
+            round_metric["beam_config_ids"] = [
+                canonical_config_id(member.config) for member in beam
+            ]
+            transcript["rounds_completed"] = round_index
+
+        transcript["termination_reason"] = termination_reason
+        transcript["refined_config_id"] = canonical_config_id(incumbent.config)
+        confirmation_members: list[PopulationMember] = []
+        confirmation_configs: set[Config] = set()
+        for member in (best, *accepted_round_winners, *final_beam):
+            if member.config in confirmation_configs:
+                continue
+            confirmation_configs.add(member.config)
+            confirmation_members.append(member)
+            add_manifest_config(member.config)
+
+        current = best
+        if len(confirmation_members) > 1:
+            confirmation_ids = [
+                canonical_config_id(member.config) for member in confirmation_members
+            ]
+            confirmation_trace = self.mirrored_rebenchmark(
+                confirmation_members,
+                desc="Terminal coordinate refinement: confirming",
+                target_ms=_FLASH_TERMINAL_CONFIRMATION_TARGET_MS,
+            )
+            confirmed_best = min(
+                confirmation_members,
+                key=self._flash_member_rank_key,
+            )
+            confirmation_improvement = (
+                1.0 - confirmed_best.perf / best.perf
+                if math.isfinite(confirmed_best.perf)
+                and math.isfinite(best.perf)
+                and best.perf > 0.0
+                else 0.0
+            )
+            confirmation_accepted = bool(
+                confirmed_best.config != best.config
+                and confirmation_improvement >= self.min_improvement_delta
+            )
+            if confirmation_accepted:
+                current = confirmed_best
+            transcript["confirmation"] = {
+                "candidate_config_ids": confirmation_ids,
+                "measurement": self._flash_terminal_trace_metric(
+                    confirmation_ids,
+                    confirmation_trace,
+                ),
+                "best_config_id": canonical_config_id(confirmed_best.config),
+                "selected_config_id": canonical_config_id(current.config),
+                "accepted": confirmation_accepted,
+                "improvement_fraction": confirmation_improvement,
+                "skipped_reason": None,
+            }
+        else:
+            transcript["confirmation"] = {
+                "candidate_config_ids": [canonical_config_id(best.config)],
+                "measurement": None,
+                "best_config_id": canonical_config_id(best.config),
+                "selected_config_id": canonical_config_id(best.config),
+                "accepted": False,
+                "improvement_fraction": 0.0,
+                "skipped_reason": "single_candidate",
+            }
+        transcript["completed"] = True
+        return finish_transcript(current)
 
     def _generate_flash_leaf_neighbors(
         self,

@@ -5,8 +5,10 @@ import copy
 import dataclasses
 import datetime
 import functools
+import hashlib
 from itertools import count
 from itertools import starmap
+import json
 import math
 from math import inf
 import os
@@ -37,6 +39,7 @@ from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
+from .benchmark_worker import BenchmarkWorkerUnkillable
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
@@ -78,10 +81,19 @@ MultiShapeAggregation = Literal["geomean", "max"]
 MultiShapeReference = Literal["default", "baseline"] | None
 _SUCCESSFUL_BENCHMARK_STATUSES = frozenset(("ok", "deduplicated"))
 _COMPILER_SEED_TIMEOUT_RETRY_LIMIT = 1
+_COMPILE_CONFIG_FAILURE_SOURCE_DOMAIN = b"helion.compile_config_failure.v1\0"
 
 
 def _benchmark_status_succeeded(status: str) -> bool:
     return status in _SUCCESSFUL_BENCHMARK_STATUSES
+
+
+def _compile_config_failure_source_hash(config: Config) -> str:
+    """Return a stable ledger identity when compilation produced no callable."""
+    canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(
+        _COMPILE_CONFIG_FAILURE_SOURCE_DOMAIN + canonical.encode("utf-8")
+    ).hexdigest()
 
 
 @dataclasses.dataclass
@@ -1116,6 +1128,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             for c in all_configs
         ]
 
+        deduplicate_sources = self._effective_source_dedup_enabled()
+        backend = self.config_spec.backend if deduplicate_sources else None
+        source_hashes: dict[int, str] = {}
+        seen_sources = self._effective_source_hashes
+
         # Compilation phase
         for i, config in enumerate(all_configs):
             if self._budget_exceeded_synced():
@@ -1127,8 +1144,33 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 with capture_output() as captured:
                     compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception as e:
-                if not compiled and i == len(all_configs) - 1:
-                    raise
+                raise_if_no_viable_config = (
+                    not compiled
+                    and i == len(all_configs) - 1
+                    and self._autotune_metrics.num_successful_candidate_measurements
+                    == 0
+                )
+                self._record_compile_failure(config)
+                if deduplicate_sources:
+                    # No callable exists to carry generated-source identity, but
+                    # strict source ledgers still need an auditable terminal row.
+                    source_hash = _compile_config_failure_source_hash(config)
+                    if source_hash not in seen_sources:
+                        seen_sources.add(source_hash)
+                        self._autotune_metrics.num_unique_sources += 1
+                    config_id = self.log.register_config(config)
+                    if config_id is not None:
+                        self.log.record_autotune_entry(
+                            AutotuneLogEntry(
+                                generation=self._autotune_metrics.num_generations,
+                                status="error",
+                                perf_ms=None,
+                                compile_time=None,
+                                config_id=config_id,
+                                config=config,
+                                source_hash=source_hash,
+                            )
+                        )
                 maybe_dump_triton_failure(
                     self.kernel, config, e, captured_output=captured[0] or None
                 )
@@ -1137,15 +1179,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"{self.kernel.format_kernel_decorator(config, self.settings)}",
                     exc_info=True,
                 )
+                if raise_if_no_viable_config:
+                    raise
 
-        source_hashes: dict[int, str] = {}
         deduplicated_indices: set[int] = set()
         recorded_deduplicated_indices: set[int] = set()
         batch_repairs: dict[Config, BenchmarkResult] = {}
         unique_compiled: dict[int, Callable[..., object]] = {}
-        deduplicate_sources = self._effective_source_dedup_enabled()
-        backend = self.config_spec.backend if deduplicate_sources else None
-        seen_sources = self._effective_source_hashes
         cached_source_results = self._effective_source_results
         invalid_sources = self._invalid_effective_source_hashes
 
@@ -1707,6 +1747,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
             if latency is None:
                 return None
+        except BenchmarkWorkerUnkillable:
+            raise
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
@@ -1738,6 +1780,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self.settings.autotune_accuracy_check:
             try:
                 accuracy_result = self._run_subprocess_accuracy_check_job(fn)
+            except BenchmarkWorkerUnkillable:
+                raise
             except BenchmarkSubprocessError as e:
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
@@ -1901,6 +1945,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     warmup=warmup,
                     rep=rep,
                 )
+            except BenchmarkWorkerUnkillable:
+                raise
             except BenchmarkTimeout as e:
                 self.log.warning(f"{desc} subprocess failed: {e}")
                 self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
@@ -1973,8 +2019,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 child.set_budget_exceeded_fn(_never_exceeded)
                 self.children.append(child)
         except Exception as error:
-            for child in reversed(self.children):
-                child.cleanup()
+            self._cleanup_children()
             if f"arg_sets[{case_index}]" in str(error):
                 raise
             raise exc.AutotuneError(
@@ -2016,8 +2061,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                     )
                 self.args.reference_latencies = references
         except Exception as error:
-            for child in reversed(self.children):
-                child.cleanup()
+            self._cleanup_children()
             if f"arg_sets[{case_index}]" in str(error):
                 raise
             raise exc.AutotuneError(
@@ -2025,12 +2069,30 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             ) from error
 
     def cleanup(self) -> None:
+        try:
+            self._cleanup_children()
+        finally:
+            self._original_configs_by_materialized_key.clear()
+            self._anchor_fns_by_materialized_key.clear()
+            self._effective_source_repairs.clear()
+            self.budget_exceeded_fn = _never_exceeded
+
+    def _cleanup_children(self) -> None:
+        first_error: Exception | None = None
+        fatal_error: BenchmarkWorkerUnkillable | None = None
         for child in reversed(self.children):
-            child.cleanup()
-        self._original_configs_by_materialized_key.clear()
-        self._anchor_fns_by_materialized_key.clear()
-        self._effective_source_repairs.clear()
-        self.budget_exceeded_fn = _never_exceeded
+            try:
+                child.cleanup()
+            except BenchmarkWorkerUnkillable as error:
+                if fatal_error is None:
+                    fatal_error = error
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if fatal_error is not None:
+            raise fatal_error
+        if first_error is not None:
+            raise first_error
 
     def _measure_reference(
         self, child: LocalBenchmarkProvider, case_index: int
@@ -2367,6 +2429,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
     def _is_skippable_child_failure(
         child: LocalBenchmarkProvider, error: Exception
     ) -> bool:
+        if isinstance(error, BenchmarkWorkerUnkillable):
+            return False
         if match_unrecoverable_runtime_error(error):
             return False
         if isinstance(error, exc.InvalidConfig):
