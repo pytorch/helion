@@ -22,8 +22,9 @@ CUDA_VISIBLE_DEVICES=0 nohup /tmp/helion-grouped-gemm-venv/bin/python \
 ```
 
 The adapters enforce the provider versions used by the campaign: DeepGEMM
-2.6.1 at `559d79fb`; QuACK 0.6.4 at the post-release CUDA DSL 4.7 migration
-commit `60d88082`; cuDNN frontend 1.27.0 with backend 9.24.0.43; cuBLAS
+2.6.1 at `559d79fb`; QuACK 0.6.4 at current upstream main `c8ec3170`
+(including the post-release CUDA DSL 4.7 migration); cuDNN frontend 1.27.0
+with backend 9.24.0.43; cuBLAS
 13.6.1.10; and CUTLASS 4.7.0 at its `v4.7.0` tag (`dcf215af`). The QuACK
 `v0.6.4` tag itself pins CUDA DSL 4.6.2 and therefore cannot share Helion's
 4.7.0 worker environment. Binary files and imported provider modules are

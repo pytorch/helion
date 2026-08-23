@@ -25,7 +25,7 @@ QUACK_B_LAYOUTS = ("k_major", "n_major")
 _NATIVE_FILE_MARKERS = (".so", ".dylib", ".dll", ".pyd")
 QUACK_REPOSITORY = "https://github.com/Dao-AILab/quack"
 QUACK_VERSION = "0.6.4"
-QUACK_COMMIT = "60d88082272a256fa9b3b2ab631c82cfa78337c6"
+QUACK_COMMIT = "c8ec3170057987da0ec99883736f381ea1937cf3"
 QUACK_DEPENDENCY_VERSIONS = {
     "nvidia-cutlass-dsl": "4.7.0",
     "apache-tvm-ffi": "0.1.13.post3",
