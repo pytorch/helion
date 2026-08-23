@@ -791,7 +791,6 @@ class ConfigSpec:
         # retry. ``None`` leaves all benchmark behavior unchanged.
         self.compiler_seed_timeout_retry_repetitions: int | None = None
         self.autotuner_heuristics: list[str] = []
-        self.compiler_heuristic_metadata: dict[str, object] = {}
         self.matmul_facts: list[MatmulFact] = []
         # The Stage-1 categorizing product the reduction seed + allocator consume.
         self.reduction_kernel_fact: ReductionKernelFact | None = None

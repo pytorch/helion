@@ -137,11 +137,12 @@ def _selected_kernel(
     b_grouped: torch.Tensor,
     work_tile_metadata: torch.Tensor,
     row_alpha: hl.constexpr = 1,  # pyrefly: ignore[bad-function-definition]
+    mask_offset: hl.constexpr = 0,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     m_total_aligned, k = a_packed.shape
     _g, n, k2 = b_grouped.shape
     assert k == k2
-    assert work_tile_metadata.size(1) == 4
+    assert work_tile_metadata.size(1) >= 4
     block_m = hl.register_block_size(256)
     block_n = hl.register_block_size(128)
     block_k = hl.register_block_size(64)
@@ -166,6 +167,10 @@ def _selected_kernel(
         else:
             row_index = torch.add(global_m_start, local_m, alpha=2)
         valid_rows = local_m < valid_m
+        if mask_offset != 0:
+            valid_rows = (
+                local_m + mask_offset < valid_m  # pyrefly: ignore[unsupported-operation]
+            )
         store_rows = local_m < store_m
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k, block_size=block_k):
@@ -1462,6 +1467,50 @@ def test_grouped_worklist_nm_rejects_alpha_scaled_row() -> None:
         pytest.raises(
             helion.exc.BackendUnsupported,
             match="rank3 grouped semantic proof failed",
+        ),
+    ):
+        bound.to_triton_code(_selected_config())
+
+
+def test_grouped_worklist_nm_rejects_shifted_load_mask() -> None:
+    _require_codegen_cuda()
+
+    args = (*_make_args((224, 256), n=224, k=128), 1, 1)
+    _selected_kernel.reset()
+    bound = _selected_kernel.bind(args)
+    assert not bound.env.config_spec.cute_tcgen05_search_enabled
+    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    with (
+        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+        patch_cute_mma_support(),
+        pytest.raises(
+            helion.exc.BackendUnsupported,
+            match="rank3 grouped semantic proof failed",
+        ),
+    ):
+        bound.to_triton_code(_selected_config())
+
+
+def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
+    _require_codegen_cuda()
+
+    a_packed, b_grouped, worklist = _make_args((224, 256), n=224, k=128)
+    extra_column = torch.zeros(
+        (worklist.size(0), 1),
+        dtype=worklist.dtype,
+        device=worklist.device,
+    )
+    args = (a_packed, b_grouped, torch.cat((worklist, extra_column), dim=1))
+    _selected_kernel.reset()
+    bound = _selected_kernel.bind(args)
+    assert not bound.env.config_spec.cute_tcgen05_search_enabled
+    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    with (
+        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+        patch_cute_mma_support(),
+        pytest.raises(
+            helion.exc.BackendUnsupported,
+            match="rank3 grouped semantic proof failed|MMA RHS was not grouped rank-3",
         ),
     ):
         bound.to_triton_code(_selected_config())

@@ -36,19 +36,11 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 
-# Helion re-emits the kernel signature without module globals, so its
-# ``source_m_tile`` constexpr default remains the literal 224. This import-time
-# check binds that generated-source literal to the reviewed policy.
-if _REVIEWED.LEGACY_M_ALIGNMENT != 224:
-    raise RuntimeError("reviewed LEGACY_M_ALIGNMENT must remain 224")
-
-
 def _selected_key(
     a_packed: torch.Tensor,
     b_grouped: torch.Tensor,
     worklist: torch.Tensor,
     expected_m_per_group: int | None = None,
-    source_m_tile: int = _REVIEWED.LEGACY_M_ALIGNMENT,
 ) -> tuple[int, int, int, int, str, int, int]:
     """Select by logical shape, physical layout, and packed work volume."""
     if expected_m_per_group is not None and (
@@ -61,7 +53,6 @@ def _selected_key(
         raise ValueError("worklist must have shape [rows, 4]")
     if a_packed.ndim != 2 or int(a_packed.size(0)) <= 0:
         raise ValueError("a_packed must have a positive [packed_m, k] shape")
-    _REVIEWED.validate_source_m_tile(source_m_tile)
     groups, n, k = (int(value) for value in b_grouped.shape)
     if int(b_grouped.stride(2)) == 1:
         b_major = "k"
@@ -71,15 +62,22 @@ def _selected_key(
         raise ValueError(
             "b_grouped must use contiguous K-major or N-major grouped storage"
         )
-    # AOT key flattening omits None values.  Use zero as an internal sentinel
-    # so legacy calls retain a stable expected-M key field.
+    profile = _REVIEWED.reviewed_worklist_profile(
+        groups,
+        expected_m_per_group,
+        n,
+        k,
+    )
+    # AOT key flattening omits None values. Use zero as an internal sentinel so
+    # legacy calls retain a stable expected-M key field. The physical source
+    # tile is derived from the reviewed profile rather than a user annotation.
     return (
         groups,
         expected_m_per_group or 0,
         n,
         k,
         b_major,
-        source_m_tile,
+        profile.source_m_tile,
         int(a_packed.size(0)),
     )
 
@@ -89,7 +87,6 @@ def _reference(
     b_grouped: torch.Tensor,
     worklist: torch.Tensor,
     expected_m_per_group: int | None = None,
-    source_m_tile: int = _REVIEWED.LEGACY_M_ALIGNMENT,
 ) -> torch.Tensor:
     """FP32 oracle for valid rows and zero-filled aligned padding."""
     output = torch.zeros(
@@ -125,18 +122,12 @@ def grouped_gemm_deepgemm(
     b_grouped: torch.Tensor,
     worklist: torch.Tensor,
     expected_m_per_group: int | None = None,
-    source_m_tile: hl.constexpr = 224,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     """BF16 ``A[sum(align(Mg)),K] @ B[G,N,K].T`` using an N,M worklist."""
     m_total_aligned, k = a_packed.shape
     _groups, n, k2 = b_grouped.shape
     assert k == k2, "K dimension mismatch between A and B"
     assert worklist.size(1) == 4
-    source_m_tile = hl.register_heuristic_metadata(
-        "tcgen05_grouped_worklist_source_m_tile",
-        source_m_tile,
-    )
-    assert source_m_tile in _REVIEWED.SOURCE_M_TILES
 
     block_m = hl.register_block_size(_REVIEWED.BLOCK_M)
     block_n = hl.register_block_size(_REVIEWED.BLOCK_N)

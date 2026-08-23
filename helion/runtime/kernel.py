@@ -209,6 +209,36 @@ def _input_tensor_metadata(values: Sequence[object]) -> tuple[Hashable, ...]:
     return tuple(metadata)
 
 
+def _input_tensor_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
+    """Return a canonical key only when tensor arguments alias."""
+    aliases: list[int] = []
+    first_occurrence: dict[int, int] = {}
+
+    def collect(value: object) -> None:
+        if isinstance(value, torch.Tensor):
+            identity = id(value)
+            alias = first_occurrence.setdefault(identity, len(first_occurrence))
+            aliases.append(alias)
+            return
+        if isinstance(value, ConstExpr):
+            return
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            for field in dataclasses.fields(value):
+                collect(getattr(value, field.name))
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for _key, item in sorted(
+                value.items(),
+                key=lambda entry: _mapping_metadata_sort_key(entry[0]),
+            ):
+                collect(item)
+
+    collect(values)
+    return tuple(aliases) if len(set(aliases)) != len(aliases) else None
+
+
 @dataclasses.dataclass(frozen=True)
 class _CompilerSeedSpecializationExtractor:
     fact: CompilerHeuristicSpecializationFact
@@ -273,12 +303,17 @@ def _make_prepared_arg_guard(
 ) -> Callable[[tuple[object, ...]], bool]:
     namespace: dict[str, object] = {}
     checks = [f"len(args) == {len(args)}"]
+    tensor_indices: list[int] = []
     for index, arg in enumerate(args):
         prefix = f"args[{index}]"
         namespace[f"type_{index}"] = type(arg)
         checks.append(f"type({prefix}) is type_{index}")
         if type(arg) in (torch.Tensor, torch.nn.Parameter):
             assert isinstance(arg, torch.Tensor)
+            for previous in tensor_indices:
+                relation = "is" if arg is args[previous] else "is not"
+                checks.append(f"{prefix} {relation} args[{previous}]")
+            tensor_indices.append(index)
             namespace[f"dtype_{index}"] = arg.dtype
             namespace[f"shape_{index}"] = arg.shape
             namespace[f"stride_{index}"] = arg.stride()
@@ -963,6 +998,8 @@ class Kernel(Generic[_R]):
             )
         if self._key_fn is not None:
             key.append(self._key_fn(*args) if signature is None else signature[-1])
+        if (tensor_aliases := _input_tensor_aliases(args)) is not None:
+            key.append(("input_tensor_aliases", tensor_aliases))
         if signature is not None:
             extra_fns = self._specialize_extra.get(signature)
             if extra_fns:
@@ -1198,6 +1235,8 @@ class Kernel(Generic[_R]):
                 result.append(value)
             else:
                 result.append(self._specialization_key(value))
+        if (tensor_aliases := _input_tensor_aliases(args)) is not None:
+            result.append(("input_tensor_aliases", tensor_aliases))
         device_type, device_capability, promotion_hardware_key = (
             _device_specialization_key(
                 args,
@@ -1908,10 +1947,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self.env.restrict_pid_types_for_persistent(args)
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
-                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
-                    self.env,
-                    self.host_function.device_ir,
+                runtime_args = dict(
+                    zip(self.kernel.signature.parameters, args, strict=False)
                 )
+                with self.env.use_runtime_arg_values(runtime_args):
+                    self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
+                        self.env,
+                        self.host_function.device_ir,
+                    )
                 self._compiler_seed_specialization_extractors = (
                     _compiler_seed_specialization_extractors(
                         compiler_seed_specialization_facts(
@@ -2471,10 +2514,24 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             Config: The best configuration found during autotuning.
         """
+        normalized_args = self.kernel.normalize_args(*args)
+        if self._cache_managed:
+            rebound = self.kernel.bind(normalized_args)
+            if rebound is not self:
+                return rebound.autotune(
+                    normalized_args,
+                    force=force,
+                    **kwargs,
+                )
         ephemeral = self.env.backend.make_ephemeral_cache()
         ctx = ephemeral if ephemeral is not None else contextlib.nullcontext()
         with ctx:
-            config = self.env.backend.autotune(self, args, force=force, **kwargs)
+            config = self.env.backend.autotune(
+                self,
+                normalized_args,
+                force=force,
+                **kwargs,
+            )
         if ephemeral is not None:
             self.env.backend.finalize_ephemeral_cache(self, config)
         self.set_config(config)
@@ -2508,6 +2565,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             not self.env.specialized_vars
             and not self.env.specialized_strides
             and not self.env.tensor_descriptor_layout_guards
+            and not self.env.grouped_worklist_compatibility_guards
         ):
             return []
 
@@ -2618,6 +2676,83 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
 
             extractors.append(td_layout_extractor)
+
+        def make_grouped_worklist_compatibility_extractor(
+            source: Source,
+            group_count: int,
+            packed_m: int,
+        ) -> Callable[[Sequence[object]], Hashable]:
+            extract_tensor = make_extractor(source)
+            cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+            def grouped_worklist_compatibility_extractor(
+                args: Sequence[object],
+            ) -> Hashable:
+                from .._compiler.cute.grouped_worklist import (
+                    tcgen05_grouped_worklist_compatible_source_m_tiles,
+                )
+
+                tensor = extract_tensor(args)
+                if not isinstance(tensor, torch.Tensor):
+                    return (
+                        "not_tensor",
+                        type(tensor).__module__,
+                        type(tensor).__name__,
+                    )
+                if isinstance(tensor, FakeTensor):
+                    if not isinstance(tensor.constant, torch.Tensor):
+                        return ()
+                    tensor = tensor.constant
+                inference_values: tuple[int, ...] | None = None
+                if torch.is_inference(tensor):
+                    from .cute.launcher import _tcgen05_grouped_tensor_mutation_key
+
+                    with unset_fake_temporarily():
+                        mutation_key = _tcgen05_grouped_tensor_mutation_key(tensor)
+                    inference_values = cast("tuple[int, ...]", mutation_key[1])
+                else:
+                    mutation_key = ("version", int(tensor._version))
+                try:
+                    cached_mutation_key, cached_result = cache[tensor]
+                except KeyError:
+                    pass
+                else:
+                    if cached_mutation_key == mutation_key:
+                        return cast("tuple[int, ...]", cached_result)
+                if tensor.ndim != 2 or tensor.shape[1] != 4:
+                    rows = []
+                elif inference_values is not None:
+                    rows = [
+                        list(inference_values[index : index + 4])
+                        for index in range(0, len(inference_values), 4)
+                    ]
+                else:
+                    with unset_fake_temporarily():
+                        rows = cast(
+                            "list[list[int]]",
+                            tensor.detach().reshape(-1, 4).cpu().tolist(),
+                        )
+                result = tcgen05_grouped_worklist_compatible_source_m_tiles(
+                    rows,
+                    group_count=group_count,
+                    packed_m=packed_m,
+                )
+                cache[tensor] = (mutation_key, result)
+                return result
+
+            return grouped_worklist_compatibility_extractor
+
+        for source, guard in sorted(
+            self.env.grouped_worklist_compatibility_guards.items(),
+            key=lambda item: repr(item[0]),
+        ):
+            extractors.append(
+                make_grouped_worklist_compatibility_extractor(
+                    source,
+                    guard.group_count,
+                    guard.packed_m,
+                )
+            )
         return extractors
 
     @contextlib.contextmanager

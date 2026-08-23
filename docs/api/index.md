@@ -103,7 +103,6 @@ runtime
    triton_kernel
    register_block_size
    register_tunable
-   register_heuristic_metadata
    constexpr
    specialize
 ```

@@ -31,6 +31,7 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
+    from ..cute.cute_mma import Tcgen05GroupedWorklistAnalysis
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
 
@@ -583,16 +585,31 @@ def _tcgen05_grouped_worklist_structural_fact(
     fact = spec.matmul_facts[0]
     if fact.lhs_dtype is not torch.bfloat16 or fact.rhs_dtype is not torch.bfloat16:
         return None
-    if fact.m_block_id is None or fact.n_block_id is None or fact.k_block_id is None:
+    if (
+        fact.m_block_id is None
+        or (fact.k_block_id is None and fact.static_k != 0)
+        or (fact.n_block_id is None and fact.static_n != 0)
+    ):
         return None
+    if fact.k_block_id is None:
+        # A statically empty reduction erases the K block association from the
+        # matmul fact, but the registered third block axis remains its source.
+        # Recover it so the full grouped-worklist proof below can decide whether
+        # this kernel needs input-metadata specialization.
+        fact = fact._replace(k_block_id=spec.block_sizes[2].block_id)
     try:
-        block_indices = tuple(
-            spec.block_sizes.block_id_to_index(block_id)
-            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+        assert fact.m_block_id is not None
+        assert fact.k_block_id is not None
+        m_index = spec.block_sizes.block_id_to_index(fact.m_block_id)
+        k_index = spec.block_sizes.block_id_to_index(fact.k_block_id)
+        n_index = (
+            None
+            if fact.n_block_id is None
+            else spec.block_sizes.block_id_to_index(fact.n_block_id)
         )
     except KeyError:
         return None
-    return fact if block_indices == (0, 1, 2) else None
+    return fact if (m_index, n_index, k_index) in ((0, 1, 2), (0, None, 2)) else None
 
 
 def _tcgen05_grouped_worklist_fact(
@@ -1140,16 +1157,79 @@ def tcgen05_grouped_worklist_seed_configs(
     return dedupe_configs([primary, *clc_configs, *bk64.values(), *bk128.values()])
 
 
-def _tcgen05_grouped_worklist_source_m_tile(spec: ConfigSpec) -> int | None:
-    value = spec.compiler_heuristic_metadata.get(
-        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+def _tcgen05_grouped_worklist_source_m_tiles(
+    env: CompileEnvironment,
+    analysis: Tcgen05GroupedWorklistAnalysis,
+) -> tuple[int, ...]:
+    """Return legal source-M schedule families for one recognized input layout."""
+    if analysis.input_kind == "device_split_sizes":
+        # Compact A has no physical source-tile constraint. Source-32 currently
+        # requires the one-CTA path, which is not valid for device split sizes.
+        return (
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        )
+
+    facts = analysis.seed_facts
+    if not env.register_grouped_worklist_compatibility_guard(
+        analysis.metadata_tensor,
+        group_count=facts.groups_hint,
+        packed_m=facts.packed_m_hint,
+    ):
+        return ()
+    worklist = env.runtime_value_for_tensor(analysis.metadata_tensor)
+    if not isinstance(worklist, torch.Tensor):
+        return ()
+    from torch._subclasses import FakeTensor
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+    from ..cute.grouped_worklist import (
+        tcgen05_grouped_worklist_compatible_source_m_tiles,
     )
-    return (
-        value
-        if type(value) is int
-        and value in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
-        else None
+
+    if isinstance(worklist, FakeTensor):
+        if not isinstance(worklist.constant, torch.Tensor):
+            return ()
+        worklist = worklist.constant
+    with unset_fake_temporarily():
+        rows = (
+            cast("list[list[int]]", worklist.detach().cpu().tolist())
+            if worklist.ndim == 2 and worklist.shape[1] == 4
+            else []
+        )
+    compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
+        rows,
+        group_count=facts.groups_hint,
+        packed_m=facts.packed_m_hint,
     )
+    # Prefer the established two-CTA profiles over the compact source-32
+    # fallback. Ordinary 224- and 256-packed inputs are distinguishable because
+    # their segment capacities are incompatible with the other large tile.
+    preference = {
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT: 0,
+        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE: 1,
+        TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE: 2,
+    }
+    return tuple(sorted(compatible, key=preference.__getitem__))
+
+
+_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT = 8
+
+
+def _bounded_grouped_worklist_seed_families(
+    families: Sequence[Sequence[Config]],
+) -> list[Config]:
+    """Keep every legal family represented without expanding tuning startup."""
+    nonempty = [family for family in families if family]
+    if not nonempty:
+        return []
+    ranked = [
+        family[index]
+        for index in range(max(map(len, nonempty)))
+        for family in nonempty
+        if index < len(family)
+    ]
+    return dedupe_configs(ranked)[:_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT]
 
 
 def _tcgen05_grouped_worklist_hardware_identity(
@@ -1196,47 +1276,50 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
     ) -> frozenset[CompilerHeuristicSpecializationFact]:
         """Record grouped SMEM facts independently of seed generation.
 
-        Source-M metadata is the kernel's shape-independent semantic opt-in.
-        Publish its input specialization even when a zero/one first binding
-        cannot yet prove the grouped structure or register SMEM facts.
+        Grouped semantics are discovered from DeviceIR rather than a user
+        annotation. Publish seed specialization even when an empty first
+        binding cannot emit seeds, and input specialization when heuristics are
+        disabled but correctness facts still depend on runtime metadata.
         """
         spec = env.config_spec
-        source_m_tile = _tcgen05_grouped_worklist_source_m_tile(spec)
-        if source_m_tile is None:
-            return frozenset()
-        specialization_facts: frozenset[CompilerHeuristicSpecializationFact] = (
-            frozenset({"input_tensor_metadata"})
-        )
         fact = _tcgen05_grouped_worklist_structural_fact(env)
         if fact is None:
-            return specialization_facts
-        from ..cute.cute_mma import tcgen05_grouped_worklist_seed_facts
+            return frozenset()
+        from ..cute.cute_mma import analyze_tcgen05_grouped_worklist
 
-        seed_facts = tcgen05_grouped_worklist_seed_facts(
+        analysis = analyze_tcgen05_grouped_worklist(
             env,
             device_ir,
             fact,
-            source_m_tile=source_m_tile,
         )
-        if seed_facts is not None:
+        if analysis is None:
+            return frozenset()
+        seed_facts = analysis.seed_facts
+        if analysis.input_kind == "external_worklist":
+            env.register_grouped_worklist_compatibility_guard(
+                analysis.metadata_tensor,
+                group_count=seed_facts.groups_hint,
+                packed_m=seed_facts.packed_m_hint,
+            )
+        if seed_facts.groups_hint > 0:
             spec.register_cute_tcgen05_grouped_worklist_smem_facts(
                 group_count=seed_facts.groups_hint,
                 device_split_sizes=seed_facts.device_split_sizes,
             )
-        return specialization_facts
+        if env.settings.disable_autotuner_heuristics:
+            return frozenset({"input_tensor_metadata"})
+        return cls.CACHE_SPECIALIZATION_FACTS
 
     @classmethod
     def _eligible_inputs(
         cls,
         env: CompileEnvironment,
         device_ir: DeviceIR,
-    ) -> tuple[MatmulFact, int] | None:
+    ) -> tuple[MatmulFact, Tcgen05GroupedWorklistAnalysis] | None:
         spec = env.config_spec
-        source_m_tile = _tcgen05_grouped_worklist_source_m_tile(spec)
         fact = _tcgen05_grouped_worklist_fact(env)
         if (
-            source_m_tile is None
-            or fact is None
+            fact is None
             or (fact.static_n is not None and fact.static_n % 32 != 0)
             or spec.target_device_capability is None
             or f"sm{spec.target_device_capability[0]}{spec.target_device_capability[1]}"
@@ -1252,7 +1335,22 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         if not tcgen05_runtime_n_ptx_compatible():
             warn_tcgen05_runtime_n_ptx_fallback()
             return None
-        return fact, source_m_tile
+        from ..cute.cute_mma import analyze_tcgen05_grouped_worklist
+
+        analysis = analyze_tcgen05_grouped_worklist(env, device_ir, fact)
+        if (
+            analysis is None
+            or min(
+                analysis.seed_facts.groups_hint,
+                analysis.seed_facts.packed_m_hint,
+                analysis.seed_facts.n_hint,
+                analysis.seed_facts.k_hint,
+            )
+            <= 0
+            or analysis.seed_facts.n_hint % 32 != 0
+        ):
+            return None
+        return fact, analysis
 
     @classmethod
     def _seed_configs(
@@ -1263,71 +1361,67 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         eligible = cls._eligible_inputs(env, device_ir)
         if eligible is None:
             return []
-        fact, source_m_tile = eligible
+        _fact, analysis = eligible
         spec = env.config_spec
-        from ..cute.cute_mma import tcgen05_grouped_worklist_seed_facts
-
-        seed_facts = tcgen05_grouped_worklist_seed_facts(
-            env,
-            device_ir,
-            fact,
-            source_m_tile=source_m_tile,
-        )
-        if seed_facts is None:
+        seed_facts = analysis.seed_facts
+        source_m_tiles = _tcgen05_grouped_worklist_source_m_tiles(env, analysis)
+        if not source_m_tiles:
             return []
-        # ``packed_m_hint`` remains the exact compiler fact. Seed selection only
-        # needs a tile-wave estimate, so round this local ranking input upward:
-        # ordinary worklists to one source tile, and device split-size kernels
-        # to one equal-share source tile per group. Runtime/codegen validation
-        # never consumes the rounded value.
-        ranking_quantum = (
-            seed_facts.groups_hint * source_m_tile
-            if seed_facts.device_split_sizes
-            else source_m_tile
-        )
-        ranking_packed_m = (
-            (seed_facts.packed_m_hint + ranking_quantum - 1) // ranking_quantum
-        ) * ranking_quantum
-        configs = tcgen05_grouped_worklist_seed_configs(
-            groups=seed_facts.groups_hint,
-            packed_m=ranking_packed_m,
-            n=seed_facts.n_hint,
-            k=seed_facts.k_hint,
-            b_major=seed_facts.b_major,
-            source_m_tile=source_m_tile,
-            num_sm=spec.num_sm,
-            target_hardware_identity=_tcgen05_grouped_worklist_hardware_identity(env),
-        )
-        if seed_facts.device_split_sizes:
-            # Runtime-direct expands a host worklist. Device split-size kernels
-            # instead derive their group rows on device and are supported only
-            # by the scheduler-mailbox family. Convert otherwise-compatible
-            # direct seeds rather than dropping useful BK/reservation variants;
-            # panel swizzles and CLC have no mailbox equivalent.
-            mailbox_configs: list[Config] = []
-            for config in configs:
-                values = dict(config.config)
-                l2_swizzle_size = values.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1)
-                if values.get(
-                    TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
-                ) == Tcgen05PersistenceModel.CLC_PERSISTENT.value or (
-                    type(l2_swizzle_size) is int and l2_swizzle_size > 1
-                ):
-                    continue
-                values.pop(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, None)
-                mailbox_configs.append(Config.from_dict(values))
-            configs = dedupe_configs(mailbox_configs)
-        if fact.static_k is not None:
-            configs = [
+        families: list[list[Config]] = []
+        hardware_identity = _tcgen05_grouped_worklist_hardware_identity(env)
+        for source_m_tile in source_m_tiles:
+            # ``packed_m_hint`` remains the exact compiler fact. Seed selection
+            # only needs a tile-wave estimate, so round this local ranking input
+            # upward. Runtime/codegen validation never consumes the rounded value.
+            ranking_quantum = (
+                seed_facts.groups_hint * source_m_tile
+                if seed_facts.device_split_sizes
+                else source_m_tile
+            )
+            ranking_packed_m = (
+                (seed_facts.packed_m_hint + ranking_quantum - 1) // ranking_quantum
+            ) * ranking_quantum
+            family = tcgen05_grouped_worklist_seed_configs(
+                groups=seed_facts.groups_hint,
+                packed_m=ranking_packed_m,
+                n=seed_facts.n_hint,
+                k=seed_facts.k_hint,
+                b_major=seed_facts.b_major,
+                source_m_tile=source_m_tile,
+                num_sm=spec.num_sm,
+                target_hardware_identity=hardware_identity,
+            )
+            if seed_facts.device_split_sizes:
+                # Device split-size kernels derive group rows on device and are
+                # supported only by the scheduler-mailbox family. Convert direct
+                # seeds rather than dropping useful BK/reservation variants;
+                # panel swizzles and CLC have no mailbox equivalent.
+                mailbox_family: list[Config] = []
+                for config in family:
+                    values = dict(config.config)
+                    l2_swizzle_size = values.get(
+                        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
+                        1,
+                    )
+                    if values.get(
+                        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+                    ) == Tcgen05PersistenceModel.CLC_PERSISTENT.value or (
+                        type(l2_swizzle_size) is int and l2_swizzle_size > 1
+                    ):
+                        continue
+                    values.pop(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, None)
+                    mailbox_family.append(Config.from_dict(values))
+                family = dedupe_configs(mailbox_family)
+            family = [
                 config
-                for config in configs
-                if fact.static_k % cast("list[int]", config.config["block_sizes"])[2]
+                for config in family
+                if seed_facts.k_hint
+                % cast("list[int]", config.config["block_sizes"])[2]
                 == 0
             ]
-        return _filter_reachable_block_size_configs(
-            spec,
-            configs,
-        )
+            family = _filter_reachable_block_size_configs(spec, family)
+            families.append(family)
+        return _bounded_grouped_worklist_seed_families(families)
 
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:

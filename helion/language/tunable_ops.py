@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from typing import TypeVar
 
 import torch
 from torch._inductor.codegen.simd import constant_repr
@@ -31,11 +30,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "register_block_size",
-    "register_heuristic_metadata",
     "register_tunable",
 ]
-
-_T = TypeVar("_T")
 
 
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
@@ -192,56 +188,6 @@ def _register_tunable_codegen(state: CodegenState) -> ast.AST:
     config_value = state.config[name]
     assert isinstance(config_value, (int, float, bool))
     return expr_from_string(constant_repr(config_value))
-
-
-@_decorators.api(is_device_only=False)
-def register_heuristic_metadata(name: str, value: _T) -> _T:
-    """Attach a compile-time semantic value for compiler heuristics.
-
-    The operation is an identity at runtime. ``name`` and ``value`` must both
-    be literals while tracing; registering the same name twice is allowed only
-    when the values agree. Names are intentionally open-ended so out-of-tree
-    compiler heuristics can declare their own metadata contracts. Metadata with
-    no active consumer is retained but has no effect.
-    """
-    raise NotInsideKernel
-
-
-@_decorators.type_propagation(register_heuristic_metadata)
-def _register_heuristic_metadata_type(
-    name: TypeInfo,
-    value: TypeInfo,
-    *,
-    origin: Origin,
-) -> TypeInfo:
-    try:
-        name_value = name.as_literal()
-        metadata_value = value.as_literal()
-    except NotImplementedError as error:
-        raise exc.TypeInferenceError(
-            "hl.register_heuristic_metadata() requires literal name and value"
-        ) from error
-    if not isinstance(name_value, str) or not name_value:
-        raise exc.TypeInferenceError(
-            "hl.register_heuristic_metadata() requires a nonempty literal name"
-        )
-    metadata = CompileEnvironment.current().config_spec.compiler_heuristic_metadata
-    if name_value in metadata and metadata[name_value] != metadata_value:
-        raise exc.TypeInferenceError(
-            f"conflicting compiler heuristic metadata for {name_value!r}"
-        )
-    metadata[name_value] = metadata_value
-    return value
-
-
-@_decorators.codegen(register_heuristic_metadata, "common")
-def _register_heuristic_metadata_codegen(state: CodegenState) -> ast.AST:
-    return state.ast_arg(1)
-
-
-@_decorators.ref(register_heuristic_metadata)
-def _(name: str, value: _T) -> _T:
-    return value
 
 
 @_decorators.ref(register_tunable)

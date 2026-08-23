@@ -157,7 +157,6 @@ def _captured_calls(
         helion_b,
         worklist,
         shape.expected_m_per_group,
-        profile.source_m_tile,
     )
     bound = kernel_factory().bind(kernel_args)
     bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -221,18 +220,11 @@ def _run_aot_training(
             actual_ms,
             device,
         )
-        profile = _REVIEWED.exact_reviewed_worklist_profile(
-            shape.groups,
-            shape.expected_m_per_group,
-            shape.n,
-            shape.k,
-        )
         kernel_args = (
             a,
             helion_b,
             worklist,
             shape.expected_m_per_group,
-            profile.source_m_tile,
         )
         bound = kernel_factory().bind(kernel_args)
         bound.env.config_spec.cute_tcgen05_search_enabled = True

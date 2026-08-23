@@ -6,6 +6,9 @@ from typing import Any
 from unittest.mock import patch
 
 from pretuned_kernels.grouped_gemm_deepgemm import (
+    _helion_aot_grouped_gemm_deepgemm_cuda_sm100 as reviewed_heuristic,
+)
+from pretuned_kernels.grouped_gemm_deepgemm import (
     grouped_gemm_deepgemm as pretuned_deepgemm,
 )
 from pretuned_kernels.grouped_gemm_deepgemm import reviewed_profiles
@@ -49,7 +52,7 @@ def _packed_args(
     b_major: str,
     active_groups: int,
 ) -> tuple[
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None],
     torch.Tensor,
 ]:
     starts = torch.arange(active_groups, device=DEVICE) * source_m_tile
@@ -81,7 +84,7 @@ def _packed_args(
         device=DEVICE,
         dtype=torch.int32,
     )
-    return (a_packed, b_grouped, worklist, expected_m, source_m_tile), starts
+    return (a_packed, b_grouped, worklist, expected_m), starts
 
 
 def _reviewed_args(
@@ -90,7 +93,7 @@ def _reviewed_args(
     b_major: str,
     all_groups_active: bool,
 ) -> tuple[
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, int],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None],
     torch.Tensor,
 ]:
     groups, expected_m, n, k = shape
@@ -165,7 +168,7 @@ def _run_reviewed_shapes(
     return bounds, cache_keys
 
 
-def test_aot_key_distinguishes_b_layout_and_source_tile() -> None:
+def test_aot_key_distinguishes_b_layout_and_packed_extent() -> None:
     a = torch.empty(256, 64)
     a_larger = torch.empty(512, 64)
     b_k_major = torch.empty(2, 128, 64)
@@ -174,17 +177,63 @@ def test_aot_key_distinguishes_b_layout_and_source_tile() -> None:
     worklist = torch.empty(2, 4, dtype=torch.int32)
 
     keys = {
-        pretuned_deepgemm._selected_key(a, b_k_major, worklist, 20, 256),
-        pretuned_deepgemm._selected_key(a, b_n_major, worklist, 20, 256),
-        pretuned_deepgemm._selected_key(a, b_k_major, worklist, 20, 224),
-        pretuned_deepgemm._selected_key(a_larger, b_k_major, worklist, 20, 256),
+        pretuned_deepgemm._selected_key(a, b_k_major, worklist, 20),
+        pretuned_deepgemm._selected_key(a, b_n_major, worklist, 20),
+        pretuned_deepgemm._selected_key(a_larger, b_k_major, worklist, 20),
     }
 
-    assert len(keys) == 4
+    assert len(keys) == 3
+    assert all(key[-2] == reviewed_profiles.SMALL_M_ALIGNMENT for key in keys)
     with pytest.raises(ValueError, match="contiguous K-major or N-major"):
-        pretuned_deepgemm._selected_key(a, b_strided, worklist, 20, 256)
-    with pytest.raises(ValueError, match=reviewed_profiles.SOURCE_M_TILE_ERROR):
-        pretuned_deepgemm._selected_key(a, b_k_major, worklist, 20, 64)
+        pretuned_deepgemm._selected_key(a, b_strided, worklist, 20)
+
+
+def test_aot_key_derives_every_reviewed_profile_source_tile() -> None:
+    for shape, actual_ms in zip(
+        reviewed_profiles.OFFICIAL_SHAPES,
+        reviewed_profiles.official_actual_ms(seed=0),
+        strict=True,
+    ):
+        profile = reviewed_profiles.exact_reviewed_worklist_profile(
+            shape.groups,
+            shape.expected_m_per_group,
+            shape.n,
+            shape.k,
+        )
+        source_m_tile = profile.source_m_tile
+        packed_m = sum(
+            (actual_m + source_m_tile - 1) // source_m_tile * source_m_tile
+            for actual_m in actual_ms
+        )
+        a = torch.empty((packed_m, shape.k), device="meta")
+        if profile.b_major == "k":
+            b = torch.empty((shape.groups, shape.n, shape.k), device="meta")
+        else:
+            b = torch.empty(
+                (shape.groups, shape.k, shape.n),
+                device="meta",
+            ).transpose(1, 2)
+        worklist = torch.empty((shape.groups, 4), dtype=torch.int32, device="meta")
+
+        key = pretuned_deepgemm._selected_key(
+            a,
+            b,
+            worklist,
+            shape.expected_m_per_group,
+        )
+
+        assert key == (
+            shape.groups,
+            shape.expected_m_per_group,
+            shape.n,
+            shape.k,
+            profile.b_major,
+            source_m_tile,
+            packed_m,
+        )
+        assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(*key) == (
+            reviewed_profiles.reviewed_config_values(profile.config_name)
+        )
 
 
 @pytest.mark.parametrize(

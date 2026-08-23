@@ -26,6 +26,9 @@ from helion._compiler.autotuner_heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
 )
 from helion._compiler.autotuner_heuristics.cute import (
+    _bounded_grouped_worklist_seed_families,
+)
+from helion._compiler.autotuner_heuristics.cute import (
     _filter_reachable_block_size_configs,
 )
 from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_fact
@@ -120,6 +123,9 @@ from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashCausalTuningPolicy
 from helion._compiler.cute.flash_tuning import FlashDenseTuningPolicy
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
+from helion._compiler.cute.grouped_worklist import (
+    tcgen05_grouped_worklist_compatible_source_m_tiles,
+)
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTuning
 from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistWorkload
@@ -179,7 +185,16 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -646,74 +661,6 @@ class TestAutotunerHeuristic(TestCase):
         self.assertEqual(flat_default.config["block_sizes"], [64])
         self.assertEqual(flat_default.config["num_warps"], 8)
         self.assertEqual(flat_default.config["num_stages"], 2)
-
-    @onlyBackends(["triton"])
-    @skipIfRefEager("Compiler heuristic metadata is not collected in ref eager mode")
-    def test_register_heuristic_metadata_is_literal_identity(self) -> None:
-        @helion.kernel(backend="triton")
-        def metadata_kernel(
-            x: torch.Tensor,
-            semantic_value: hl.constexpr,
-            label: hl.constexpr,
-            enabled: hl.constexpr,
-            threshold: hl.constexpr,
-        ) -> torch.Tensor:
-            value = hl.register_heuristic_metadata(
-                "test.semantic_value", semantic_value
-            )
-            hl.register_heuristic_metadata("test.semantic_value", value)
-            hl.register_heuristic_metadata("test.label", label)
-            hl.register_heuristic_metadata("test.enabled", enabled)
-            hl.register_heuristic_metadata("test.threshold", threshold)
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.shape):
-                out[tile] = x[tile] + value  # pyrefly: ignore[unsupported-operation]
-            return out
-
-        bound = metadata_kernel.bind(
-            (
-                torch.empty([8], device=DEVICE, dtype=torch.float32),
-                7,
-                "layout-aware",
-                True,
-                float("-inf"),
-            )
-        )
-
-        self.assertEqual(
-            bound.config_spec.compiler_heuristic_metadata,
-            {
-                "test.semantic_value": 7,
-                "test.label": "layout-aware",
-                "test.enabled": True,
-                "test.threshold": float("-inf"),
-            },
-        )
-        bound.to_triton_code(bound.config_spec.default_config())
-
-    @onlyBackends(["triton"])
-    @skipIfRefEager("Compiler heuristic metadata is not collected in ref eager mode")
-    def test_register_heuristic_metadata_rejects_conflicting_duplicate(self) -> None:
-        @helion.kernel(backend="triton")
-        def conflicting_metadata(
-            x: torch.Tensor,
-            first: hl.constexpr,
-            second: hl.constexpr,
-        ) -> torch.Tensor:
-            hl.register_heuristic_metadata("test.semantic_value", first)
-            hl.register_heuristic_metadata("test.semantic_value", second)
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.shape):
-                out[tile] = x[tile]
-            return out
-
-        with self.assertRaisesRegex(
-            Exception,
-            "conflicting compiler heuristic metadata",
-        ):
-            conflicting_metadata.bind(
-                (torch.empty([8], device=DEVICE, dtype=torch.float32), 7, 8)
-            )
 
     def test_should_promote_gate(self) -> None:
         # should_promote() gates a seed's PROMOTION (becoming the autotune-off
@@ -1330,6 +1277,58 @@ class TestAutotunerHeuristic(TestCase):
         )
         self.assertIn("compiler_seed_results", repr(strict_keys[0]))
 
+    def test_grouped_worklist_compatible_source_tiles_validate_rows(self) -> None:
+        valid_cases = (
+            (
+                [[0, 0, 17, 32], [1, 32, 11, 32]],
+                64,
+                (TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,),
+            ),
+            (
+                [[0, 0, 17, 224], [1, 224, 11, 224]],
+                448,
+                (
+                    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+                    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                ),
+            ),
+            (
+                [[0, 0, 17, 256], [1, 256, 11, 256]],
+                512,
+                (
+                    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+                    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+                ),
+            ),
+        )
+        for rows, packed_m, expected in valid_cases:
+            with self.subTest(rows=rows):
+                self.assertEqual(
+                    tcgen05_grouped_worklist_compatible_source_m_tiles(
+                        rows,
+                        group_count=2,
+                        packed_m=packed_m,
+                    ),
+                    expected,
+                )
+
+        invalid_cases = (
+            ("row_count", [[0, 0, 17, 32]], 64),
+            ("row_width", [[0, 0, 17], [1, 32, 11, 32]], 64),
+            ("row_hole", [[0, 0, 17, 32], [1, 64, 11, 32]], 96),
+            ("row_overlap", [[0, 0, 17, 64], [1, 32, 11, 64]], 96),
+        )
+        for name, rows, packed_m in invalid_cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    tcgen05_grouped_worklist_compatible_source_m_tiles(
+                        rows,
+                        group_count=2,
+                        packed_m=packed_m,
+                    ),
+                    (),
+                )
+
     def test_grouped_worklist_seeds_are_packing_compatible_and_ranked(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         spec.cute_tcgen05_search_enabled = True
@@ -1502,6 +1501,26 @@ class TestAutotunerHeuristic(TestCase):
                 == Tcgen05PersistenceModel.CLC_PERSISTENT.value
                 for values in source256_values
             )
+        )
+
+    def test_grouped_worklist_automatic_seed_cap_round_robins_families(self) -> None:
+        families = [
+            [helion.Config(block_sizes=[family, index]) for index in range(length)]
+            for family, length in ((1, 6), (2, 4), (3, 3))
+        ]
+
+        self.assertEqual(
+            _bounded_grouped_worklist_seed_families(families),
+            [
+                families[0][0],
+                families[1][0],
+                families[2][0],
+                families[0][1],
+                families[1][1],
+                families[2][1],
+                families[0][2],
+                families[1][2],
+            ],
         )
 
     def test_grouped_worklist_clc_requires_full_physical_n_tile(self) -> None:
@@ -1929,6 +1948,7 @@ class TestAutotunerHeuristic(TestCase):
     def test_grouped_worklist_seed_configs_forward_exact_hardware_identity(
         self,
     ) -> None:
+        from helion._compiler.cute.cute_mma import Tcgen05GroupedWorklistAnalysis
         from helion._compiler.cute.cute_mma import Tcgen05GroupedWorklistSeedFacts
 
         spec = ConfigSpec(
@@ -1969,6 +1989,10 @@ class TestAutotunerHeuristic(TestCase):
             b_major="k",
             device_split_sizes=False,
         )
+        analysis = Tcgen05GroupedWorklistAnalysis(
+            seed_facts=seed_facts,
+            metadata_tensor=MagicMock(),
+        )
         env = MagicMock(device=torch.device("cuda:0"), config_spec=spec)
         device_ir = MagicMock()
 
@@ -1976,11 +2000,12 @@ class TestAutotunerHeuristic(TestCase):
             patch.object(
                 CuteTcgen05GroupedWorklistHeuristic,
                 "_eligible_inputs",
-                return_value=(fact, 256),
+                return_value=(fact, analysis),
             ),
             patch(
-                "helion._compiler.cute.cute_mma.tcgen05_grouped_worklist_seed_facts",
-                return_value=seed_facts,
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_source_m_tiles",
+                return_value=(256,),
             ),
             patch(
                 "helion._hardware.get_hardware_info",
@@ -2008,11 +2033,12 @@ class TestAutotunerHeuristic(TestCase):
             patch.object(
                 CuteTcgen05GroupedWorklistHeuristic,
                 "_eligible_inputs",
-                return_value=(fact, 256),
+                return_value=(fact, analysis),
             ),
             patch(
-                "helion._compiler.cute.cute_mma.tcgen05_grouped_worklist_seed_facts",
-                return_value=seed_facts,
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_source_m_tiles",
+                return_value=(256,),
             ),
             patch(
                 "helion._hardware.get_hardware_info",
@@ -2033,7 +2059,7 @@ class TestAutotunerHeuristic(TestCase):
                 b_major="k",
                 source_m_tile=256,
                 num_sm=152,
-            ),
+            )[:8],
         )
 
         same_arch_unknown_product = dataclasses.replace(
@@ -2120,16 +2146,25 @@ class TestAutotunerHeuristic(TestCase):
             )
         ]
         env = MagicMock(config_spec=bk128_only)
-        bk128_only.compiler_heuristic_metadata[
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-        ] = 224
-        with patch(
-            "helion._compiler.autotuner_heuristics.cute."
-            "tcgen05_runtime_n_ptx_compatible",
-            return_value=True,
+        analysis = MagicMock()
+        analysis.seed_facts.groups_hint = 1
+        analysis.seed_facts.packed_m_hint = 256
+        analysis.seed_facts.n_hint = 128
+        analysis.seed_facts.k_hint = 128
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "tcgen05_runtime_n_ptx_compatible",
+                return_value=True,
+            ),
+            patch(
+                "helion._compiler.cute.cute_mma.analyze_tcgen05_grouped_worklist",
+                return_value=analysis,
+            ),
         ):
-            self.assertIsNotNone(
-                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock())
+            self.assertEqual(
+                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock()),
+                (bk128_only.matmul_facts[0], analysis),
             )
             bk128_only.matmul_facts = [bk128_only.matmul_facts[0]._replace(static_n=33)]
             self.assertIsNone(
@@ -2138,11 +2173,9 @@ class TestAutotunerHeuristic(TestCase):
             bk128_only.matmul_facts = [
                 bk128_only.matmul_facts[0]._replace(static_n=None)
             ]
-            bk128_only.compiler_heuristic_metadata[
-                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-            ] = 256
-            self.assertIsNotNone(
-                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock())
+            self.assertEqual(
+                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock()),
+                (bk128_only.matmul_facts[0], analysis),
             )
 
     def test_grouped_worklist_seed_only_controls_survive_flattening(self) -> None:
@@ -2319,9 +2352,6 @@ class TestAutotunerHeuristic(TestCase):
                 rhs_dtype=torch.bfloat16,
             )
         ]
-        spec.compiler_heuristic_metadata[
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-        ] = 256
         env = MagicMock(device=DEVICE, config_spec=spec)
         device_ir = MagicMock()
         grouped_fact = spec.matmul_facts[0]
@@ -2370,6 +2400,9 @@ class TestAutotunerHeuristic(TestCase):
         from helion.language.matmul_ops import plan_cute_tcgen05_search
 
         def make_args(packed_m: int) -> tuple[object, ...]:
+            rows_per_group = packed_m // 6
+            self.assertEqual(packed_m, 6 * rows_per_group)
+            self.assertEqual(rows_per_group % 32, 0)
             return (
                 torch.empty(
                     [packed_m, 128],
@@ -2381,9 +2414,15 @@ class TestAutotunerHeuristic(TestCase):
                     device=DEVICE,
                     dtype=torch.bfloat16,
                 ),
-                torch.empty([6, 4], device=DEVICE, dtype=torch.int32),
+                torch.tensor(
+                    [
+                        [group, group * rows_per_group, rows_per_group, rows_per_group]
+                        for group in range(6)
+                    ],
+                    device=DEVICE,
+                    dtype=torch.int32,
+                ),
                 None,
-                32,
             )
 
         kernel = helion.kernel(
@@ -2492,12 +2531,16 @@ class TestAutotunerHeuristic(TestCase):
                     device=DEVICE,
                     dtype=torch.bfloat16,
                 ).transpose(1, 2)
+            worklist = torch.tensor(
+                [[group, group * 32, 32, 32] for group in range(6)],
+                device=DEVICE,
+                dtype=torch.int32,
+            )
             return (
                 torch.empty([6 * 32, k], device=DEVICE, dtype=torch.bfloat16),
                 b_grouped,
-                torch.empty([6, 4], device=DEVICE, dtype=torch.int32),
+                worklist,
                 None,
-                32,
             )
 
         kernel = helion.kernel(
@@ -2514,7 +2557,8 @@ class TestAutotunerHeuristic(TestCase):
         ) -> int:
             return max(current_num_sm - reserved_sms, 1)
 
-        first_args = make_args()
+        zero_k_args = make_args(k=0)
+        first_args = make_args(k=128)
         different_k_args = make_args(k=192)
         different_n_args = make_args(n=240)
         different_layout_args = make_args(b_major="n")
@@ -2535,6 +2579,7 @@ class TestAutotunerHeuristic(TestCase):
             ),
             patch("helion.runtime.get_num_sm", side_effect=get_num_sm),
         ):
+            zero_k = kernel.bind(zero_k_args)
             first = kernel.bind(first_args)
             different_k = kernel.bind(different_k_args)
             different_n = kernel.bind(different_n_args)
@@ -2548,6 +2593,7 @@ class TestAutotunerHeuristic(TestCase):
             different_k._run = lambda *_args: different_k_output
             different_n._run = lambda *_args: different_n_output
             different_layout._run = lambda *_args: different_layout_output
+            self.assertIs(zero_k(*first_args), first_output)
             self.assertIs(first(*different_k_args), different_k_output)
             self.assertIs(first(*different_n_args), different_n_output)
             self.assertIs(first(*different_layout_args), different_layout_output)
@@ -2555,12 +2601,13 @@ class TestAutotunerHeuristic(TestCase):
             current_num_sm = 132
             smaller_sm = kernel.bind(different_k_args)
 
+        self.assertIsNot(zero_k, first)
         self.assertIsNot(different_k, first)
         self.assertIsNot(different_n, first)
         self.assertIsNot(different_layout, first)
         self.assertIsNot(smaller_sm, first)
         self.assertIsNot(smaller_sm, different_k)
-        self.assertEqual(len(kernel._bound_kernels), 5)
+        self.assertEqual(len(kernel._bound_kernels), 6)
 
         def specialization_results(bound: object) -> dict[str, object]:
             matches = [
@@ -2576,11 +2623,16 @@ class TestAutotunerHeuristic(TestCase):
             self.assertEqual(len(matches), 1)
             return matches[0]
 
+        zero_k_results = specialization_results(zero_k)
         first_results = specialization_results(first)
         different_k_results = specialization_results(different_k)
         different_n_results = specialization_results(different_n)
         different_layout_results = specialization_results(different_layout)
         smaller_sm_results = specialization_results(smaller_sm)
+        self.assertEqual(
+            set(zero_k_results),
+            {"config_num_sm", "input_tensor_metadata"},
+        )
         self.assertEqual(first_results["config_num_sm"], 148)
         self.assertEqual(different_k_results["config_num_sm"], 148)
         self.assertEqual(different_n_results["config_num_sm"], 148)
@@ -2601,6 +2653,14 @@ class TestAutotunerHeuristic(TestCase):
             different_k_results["input_tensor_metadata"],
         )
         self.assertIsNone(first.config_spec.matmul_facts[0].static_k)
+        self.assertNotIn(
+            CuteTcgen05GroupedWorklistHeuristic.name,
+            zero_k.config_spec.autotuner_heuristics,
+        )
+        self.assertIn(
+            CuteTcgen05GroupedWorklistHeuristic.name,
+            first.config_spec.autotuner_heuristics,
+        )
         self.assertIsNone(first.config_spec.compiler_default_config)
         self.assertEqual(
             {
@@ -2610,6 +2670,22 @@ class TestAutotunerHeuristic(TestCase):
                 == TCGEN05_GROUPED_MODE_WORKLIST_NM
             },
             {64, 128},
+        )
+        self.assertEqual(
+            {
+                cast("list[int]", config.config["block_sizes"])[2]
+                for config in different_k.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            },
+            {64},
+        )
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                for config in different_n.config_spec.compiler_seed_configs
+            )
         )
 
     @onlyBackends(["cute"])
@@ -2623,7 +2699,21 @@ class TestAutotunerHeuristic(TestCase):
         source_m_tile = 224
         k = 128
 
-        def make_args(groups: int, *, n: int = 256) -> tuple[object, ...]:
+        def make_args(
+            groups: int,
+            *,
+            n: int = 256,
+            extents: tuple[int, ...] | None = None,
+        ) -> tuple[object, ...]:
+            if extents is None:
+                extents = (source_m_tile,) * groups
+            self.assertEqual(len(extents), groups)
+            self.assertEqual(sum(extents), groups * source_m_tile)
+            starts: list[int] = []
+            start = 0
+            for extent in extents:
+                starts.append(start)
+                start += extent
             return (
                 torch.empty(
                     [groups * source_m_tile, k],
@@ -2635,21 +2725,44 @@ class TestAutotunerHeuristic(TestCase):
                     device=DEVICE,
                     dtype=torch.bfloat16,
                 ),
-                torch.empty([groups, 4], device=DEVICE, dtype=torch.int32),
+                torch.tensor(
+                    [
+                        [group, starts[group], extent, extent]
+                        for group, extent in enumerate(extents)
+                    ],
+                    device=DEVICE,
+                    dtype=torch.int32,
+                ),
                 None,
-                source_m_tile,
             )
 
         groups = 6
         empty_args = make_args(groups, n=0)
         args = make_args(groups)
+        compact_args = make_args(
+            groups,
+            extents=(32, 32, 32, 32, 32, groups * source_m_tile - 5 * 32),
+        )
         different_groups = 7
         different_args = make_args(different_groups)
+        explicit_configs = [
+            tcgen05_grouped_worklist_seed_configs(
+                groups=groups,
+                packed_m=groups * source_m_tile,
+                n=256,
+                k=k,
+                b_major="k",
+                source_m_tile=tile,
+                num_sm=148,
+            )[0]
+            for tile in (source_m_tile, 32)
+        ]
         kernel = helion.kernel(
             _GROUPED_GEMM_DEEPGEMM_BODY,
             backend="cute",
             static_shapes=False,
             disable_autotuner_heuristics=True,
+            configs=explicit_configs,
         )
         with (
             patch_cute_mma_support(),
@@ -2663,14 +2776,21 @@ class TestAutotunerHeuristic(TestCase):
         ):
             empty_bound = kernel.bind(empty_args)
             bound = kernel.bind(args)
+            compact_bound = kernel.bind(compact_args)
             rebound = kernel.bind(different_args)
 
-        self.assertIsNone(
-            empty_bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
+        self.assertEqual(
+            empty_bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
+            (groups, False),
         )
         self.assertIsNot(bound, empty_bound)
         self.assertEqual(bound.config_spec.compiler_seed_configs, [])
         self.assertEqual(bound.config_spec.autotuner_heuristics, [])
+        self.assertTrue(bound.env.grouped_worklist_compatibility_guards)
+        self.assertIsNot(compact_bound, bound)
+        self.assertEqual(compact_bound.config_spec.compiler_seed_configs, [])
+        self.assertEqual(compact_bound.config_spec.autotuner_heuristics, [])
+        self.assertTrue(compact_bound.env.grouped_worklist_compatibility_guards)
         self.assertEqual(
             compiler_seed_configs(bound.env, bound.host_function.device_ir),
             [],
@@ -2720,15 +2840,15 @@ class TestAutotunerHeuristic(TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        def make_args(size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        def make_args(size: int, k: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
             return (
                 torch.empty(
-                    [size, 128],
+                    [size, k],
                     device=DEVICE,
                     dtype=torch.bfloat16,
                 ),
                 torch.empty(
-                    [128, size],
+                    [k, size],
                     device=DEVICE,
                     dtype=torch.bfloat16,
                 ),
@@ -2744,35 +2864,33 @@ class TestAutotunerHeuristic(TestCase):
                 return_value=BLACKWELL_HARDWARE,
             ),
         ):
+            zero = plain_matmul.bind(make_args(128, 0))
             first = plain_matmul.bind(make_args(128))
             rebound = plain_matmul.bind(make_args(256))
 
+        self.assertIsNot(first, zero)
         self.assertIs(rebound, first)
-        self.assertEqual(len(plain_matmul._bound_kernels), 1)
+        self.assertEqual(len(plain_matmul._bound_kernels), 2)
+        self.assertEqual(zero._compiler_seed_specialization_extractors, ())
         self.assertEqual(first._compiler_seed_specialization_extractors, ())
         self.assertIsNone(
             first.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
         )
 
     @onlyBackends(["cute"])
-    def test_grouped_worklist_bound_metadata_proof_and_effective_default(self) -> None:
-        from helion._compiler.cute.cute_mma import tcgen05_grouped_worklist_seed_facts
+    def test_grouped_worklist_unannotated_prepacked_seeds_and_rebind(self) -> None:
+        from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
 
         @helion.kernel(backend="cute", static_shapes=True)
-        def renamed_packing_kernel(
+        def unannotated_packing_kernel(
             a_packed: torch.Tensor,
             b_grouped: torch.Tensor,
             worklist: torch.Tensor,
-            packing_rows: hl.constexpr,
+            unused: torch.Tensor,
         ) -> torch.Tensor:
-            packing_rows = hl.register_heuristic_metadata(
-                "tcgen05_grouped_worklist_source_m_tile",
-                packing_rows,
-            )
             m_total, k = a_packed.shape
             _groups, n, k2 = b_grouped.shape
             assert k == k2
-            assert packing_rows in (32, 224, 256)
             block_m = hl.register_block_size(256)
             block_n = hl.register_block_size(128)
             block_k = hl.register_block_size(64, 128)
@@ -2817,13 +2935,11 @@ class TestAutotunerHeuristic(TestCase):
             b_major: str,
             k: int = 128,
             packed_m: int | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             groups, n = 6, 256
+            total_m = groups * source_m_tile if packed_m is None else packed_m
             a_packed = torch.empty(
-                [
-                    groups * source_m_tile if packed_m is None else packed_m,
-                    k,
-                ],
+                [total_m, k],
                 device=DEVICE,
                 dtype=torch.bfloat16,
             )
@@ -2839,12 +2955,21 @@ class TestAutotunerHeuristic(TestCase):
                     device=DEVICE,
                     dtype=torch.bfloat16,
                 ).transpose(1, 2)
-            worklist = torch.empty(
-                [groups, 4],
+            worklist = torch.tensor(
+                [
+                    [
+                        group,
+                        group * source_m_tile,
+                        source_m_tile,
+                        source_m_tile,
+                    ]
+                    for group in range(groups)
+                ],
                 device=DEVICE,
                 dtype=torch.int32,
             )
-            return a_packed, b_grouped, worklist, source_m_tile
+            unused = torch.empty([1], device=DEVICE, dtype=torch.bfloat16)
+            return a_packed, b_grouped, worklist, unused
 
         def grouped_seeds(spec: ConfigSpec, source_m_tile: int) -> list[helion.Config]:
             return [
@@ -2868,6 +2993,7 @@ class TestAutotunerHeuristic(TestCase):
         def seed_pipeline(
             bound: Any,
             source_m_tile: int,
+            compatible_source_m_tiles: set[int],
             *,
             clear_cluster_constraints: bool = False,
             expected_block_k: int | None = None,
@@ -2875,11 +3001,19 @@ class TestAutotunerHeuristic(TestCase):
         ) -> tuple[ConfigSpec, list[helion.Config], helion.Config, Any, list[Any]]:
             spec = bound.config_spec
             self.assertTrue(spec.cute_tcgen05_search_enabled)
+            grouped = [
+                config
+                for config in spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            ]
+            self.assertLessEqual(len(grouped), 8)
             self.assertEqual(
-                spec.compiler_heuristic_metadata[
-                    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-                ],
-                source_m_tile,
+                {
+                    config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+                    for config in grouped
+                },
+                compatible_source_m_tiles,
             )
             self.assertIn(
                 CuteTcgen05GroupedWorklistHeuristic.name,
@@ -2917,6 +3051,11 @@ class TestAutotunerHeuristic(TestCase):
                 )
             return spec, seeds, promoted, effective, transferred
 
+        compatible_source_m_tiles = {
+            32: {32},
+            224: {32, 224},
+            256: {32, 256},
+        }
         bounds = []
         with (
             patch_cute_mma_support(),
@@ -2946,7 +3085,7 @@ class TestAutotunerHeuristic(TestCase):
                 (256, "n"),
             ):
                 with self.subTest(source_m_tile=source_m_tile, b_major=b_major):
-                    bound = renamed_packing_kernel.bind(
+                    bound = unannotated_packing_kernel.bind(
                         make_args(source_m_tile, b_major)
                     )
                     bounds.append(bound)
@@ -2954,14 +3093,23 @@ class TestAutotunerHeuristic(TestCase):
                     spec, _seeds, promoted, effective, transferred = seed_pipeline(
                         bound,
                         source_m_tile,
+                        compatible_source_m_tiles[source_m_tile],
                         clear_cluster_constraints=expect_cluster2,
                         compile_default=True,
                     )
                     for _flat, normalized in transferred:
-                        if expect_cluster2:
+                        normalized_source_m_tile = normalized.config.get(
+                            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+                        )
+                        if normalized_source_m_tile in (224, 256):
                             self.assertEqual(
                                 normalized.config["tcgen05_cluster_m"],
                                 2,
+                            )
+                        elif normalized_source_m_tile == 32:
+                            self.assertEqual(
+                                normalized.config["tcgen05_cluster_m"],
+                                1,
                             )
                     self.assertIsNot(effective, promoted)
                     self.assertGreater(len(effective.config), len(promoted.config))
@@ -2986,17 +3134,105 @@ class TestAutotunerHeuristic(TestCase):
                         self.assertEqual(promoted.config["tcgen05_cluster_m"], 2)
                         self.assertEqual(effective.config["tcgen05_cluster_m"], 2)
 
+            mutable_args = make_args(224, "k")
+            original_worklist = mutable_args[2].clone()
+            original_bound = unannotated_packing_kernel.bind(mutable_args)
+            self.assertIs(original_bound, bounds[2])
+            compact_extents = (32, 32, 32, 32, 32, 1184)
+            compact_rows = []
+            start = 0
+            for group, extent in enumerate(compact_extents):
+                compact_rows.append([group, start, extent, extent])
+                start += extent
+            mutable_args[2].copy_(mutable_args[2].new_tensor(compact_rows))
+            compact_bound = unannotated_packing_kernel.bind(mutable_args)
+            self.assertIsNot(compact_bound, original_bound)
+            seed_pipeline(compact_bound, 32, {32})
+            selected = helion.Config(block_sizes=[256, 128, 64])
+            with patch.object(
+                compact_bound,
+                "autotune",
+                return_value=selected,
+            ) as rebound_autotune:
+                self.assertIs(
+                    original_bound.autotune(mutable_args, force=False),
+                    selected,
+                )
+            rebound_autotune.assert_called_once_with(
+                mutable_args,
+                force=False,
+            )
+            original_output = mutable_args[0]
+            compact_output = mutable_args[1]
+            original_bound._run = lambda *_args: original_output
+            compact_bound._run = lambda *_args: compact_output
+            self.assertIs(original_bound(*mutable_args), compact_output)
+            mutable_args[2].copy_(original_worklist)
+            self.assertIs(
+                unannotated_packing_kernel.bind(mutable_args),
+                original_bound,
+            )
+            self.assertIs(compact_bound(*mutable_args), original_output)
+
+            dynamic_kernel = helion.kernel(
+                unannotated_packing_kernel.fn,
+                backend="cute",
+                static_shapes=False,
+            )
+            aliased_args = make_args(224, "k")
+            aliased_worklist = aliased_args[2]
+            aliased_args = (*aliased_args[:3], aliased_worklist)
+            aliased_bound = dynamic_kernel.bind(aliased_args)
+            self.assertEqual(
+                grouped_seeds(aliased_bound.config_spec, 224),
+                [],
+            )
+            compact_worklist = cast("torch.Tensor", aliased_worklist).new_tensor(
+                compact_rows
+            )
+            dealiased_args = (
+                aliased_args[0],
+                aliased_args[1],
+                compact_worklist,
+                aliased_worklist,
+            )
+            dealiased_bound = dynamic_kernel.bind(dealiased_args)
+            self.assertIsNot(dealiased_bound, aliased_bound)
+            self.assertTrue(grouped_seeds(dealiased_bound.config_spec, 32))
+            restored_args = (
+                aliased_args[0],
+                aliased_args[1],
+                aliased_worklist.clone(),
+                aliased_worklist,
+            )
+            restored_bound = dynamic_kernel.bind(restored_args)
+            self.assertIsNot(restored_bound, dealiased_bound)
+            self.assertTrue(grouped_seeds(restored_bound.config_spec, 224))
+            aliased_output = aliased_args[0]
+            dealiased_output = dealiased_args[1]
+            restored_output = restored_args[2]
+            aliased_bound._run = lambda *_args: aliased_output
+            dealiased_bound._run = lambda *_args: dealiased_output
+            restored_bound._run = lambda *_args: restored_output
+            self.assertIs(dynamic_kernel(*aliased_args), aliased_output)
+            self.assertIsNotNone(dynamic_kernel._prepared_call)
+            self.assertEqual(len(dynamic_kernel._dispatch_cache), 1)
+            self.assertIs(dynamic_kernel(*dealiased_args), dealiased_output)
+            self.assertIsNotNone(dynamic_kernel._prepared_call)
+            self.assertEqual(len(dynamic_kernel._dispatch_cache), 2)
+            self.assertIs(dynamic_kernel(*restored_args), restored_output)
+            self.assertIsNotNone(dynamic_kernel._prepared_call)
+            self.assertEqual(len(dynamic_kernel._dispatch_cache), 3)
+
             from pretuned_kernels.grouped_gemm_deepgemm.grouped_gemm_deepgemm import (
                 grouped_gemm_deepgemm,
             )
 
             renamed_args = make_args(224, "n")
-            original_bound = grouped_gemm_deepgemm.bind(
-                (*renamed_args[:3], None, renamed_args[3])
-            )
-            self.assertIsNotNone(original_bound.config_spec.compiler_default_config)
+            pretuned_bound = grouped_gemm_deepgemm.bind((*renamed_args[:3], None))
+            self.assertIsNotNone(pretuned_bound.config_spec.compiler_default_config)
             self.assertEqual(
-                grouped_seeds(original_bound.config_spec, 224),
+                grouped_seeds(pretuned_bound.config_spec, 224),
                 grouped_seeds(bounds[3].config_spec, 224),
             )
             b200_256_bound = bounds[-1]
@@ -3004,12 +3240,13 @@ class TestAutotunerHeuristic(TestCase):
 
             for source_m_tile in (32, 256):
                 with self.subTest(source_m_tile=source_m_tile, k=192):
-                    bound = renamed_packing_kernel.bind(
+                    bound = unannotated_packing_kernel.bind(
                         make_args(source_m_tile, "n", k=192)
                     )
                     seed_pipeline(
                         bound,
                         source_m_tile,
+                        compatible_source_m_tiles[source_m_tile],
                         expected_block_k=64,
                         compile_default=True,
                     )
@@ -3020,42 +3257,48 @@ class TestAutotunerHeuristic(TestCase):
                     packed_m="non_aligned",
                 ):
                     exact_packed_m = 6 * source_m_tile + 1
-                    bound = renamed_packing_kernel.bind(
+                    bound = unannotated_packing_kernel.bind(
                         make_args(
                             source_m_tile,
                             "n",
                             packed_m=exact_packed_m,
                         )
                     )
-                    spec, _seeds, _promoted, _effective, _transferred = seed_pipeline(
-                        bound,
-                        source_m_tile,
+                    self.assertEqual(
+                        [
+                            config
+                            for config in bound.config_spec.compiler_seed_configs
+                            if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                        ],
+                        [],
                     )
                     host_function = bound.host_function
                     self.assertIsNotNone(host_function)
                     assert host_function is not None
-                    seed_facts = tcgen05_grouped_worklist_seed_facts(
+                    analysis = analyze_tcgen05_grouped_worklist(
                         bound.env,
                         host_function.device_ir,
-                        spec.matmul_facts[0],
-                        source_m_tile=source_m_tile,
+                        bound.config_spec.matmul_facts[0],
                     )
-                    self.assertIsNotNone(seed_facts)
-                    assert seed_facts is not None
-                    self.assertEqual(seed_facts.packed_m_hint, exact_packed_m)
+                    self.assertIsNotNone(analysis)
+                    assert analysis is not None
+                    self.assertEqual(
+                        analysis.seed_facts.packed_m_hint,
+                        exact_packed_m,
+                    )
 
         source32_host = bounds[0].host_function
         self.assertIsNotNone(source32_host)
         assert source32_host is not None
-        source32_facts = tcgen05_grouped_worklist_seed_facts(
+        source32_analysis = analyze_tcgen05_grouped_worklist(
             bounds[0].env,
             source32_host.device_ir,
             bounds[0].config_spec.matmul_facts[0],
-            source_m_tile=32,
         )
-        self.assertIsNotNone(source32_facts)
-        assert source32_facts is not None
-        self.assertEqual(source32_facts.packed_m_hint, 6 * 32)
+        self.assertIsNotNone(source32_analysis)
+        assert source32_analysis is not None
+        self.assertEqual(source32_analysis.seed_facts.packed_m_hint, 6 * 32)
         with (
             bounds[1].env,
             self.assertRaisesRegex(
@@ -3063,11 +3306,10 @@ class TestAutotunerHeuristic(TestCase):
                 "must use the provided compile environment",
             ),
         ):
-            tcgen05_grouped_worklist_seed_facts(
+            analyze_tcgen05_grouped_worklist(
                 bounds[0].env,
                 source32_host.device_ir,
                 bounds[0].config_spec.matmul_facts[0],
-                source_m_tile=32,
             )
         with (
             patch_cute_mma_support(),
@@ -3081,7 +3323,7 @@ class TestAutotunerHeuristic(TestCase):
             ),
             patch("helion._hardware.get_hardware_info", return_value=GB300_HARDWARE),
         ):
-            gb300_bound = renamed_packing_kernel.bind(make_args(256, "n"))
+            gb300_bound = unannotated_packing_kernel.bind(make_args(256, "n"))
         self.assertIsNot(gb300_bound, b200_256_bound)
         gb300_seeds = grouped_seeds(gb300_bound.config_spec, 256)
         self.assertTrue(gb300_seeds)
@@ -3089,6 +3331,61 @@ class TestAutotunerHeuristic(TestCase):
             gb300_bound.config_spec.compiler_default_config,
             gb300_seeds[0],
         )
+        unannotated_packing_kernel.reset()
+        with (
+            torch.inference_mode(),
+            patch_cute_mma_support(),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "tcgen05_runtime_n_ptx_compatible",
+                return_value=True,
+            ),
+            patch(
+                "helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=BLACKWELL_HARDWARE,
+            ),
+        ):
+            inference_args = make_args(224, "k")
+            inference_bound = unannotated_packing_kernel.bind(inference_args)
+            seed_pipeline(inference_bound, 224, {32, 224})
+            self.assertIs(
+                unannotated_packing_kernel.bind(inference_args),
+                inference_bound,
+            )
+            inference_output = inference_args[0]
+            inference_bound._run = lambda *_args: inference_output
+            self.assertIs(
+                unannotated_packing_kernel(*inference_args),
+                inference_output,
+            )
+            inference_args[2].copy_(inference_args[2].new_tensor(compact_rows))
+            compact_inference_bound = unannotated_packing_kernel.bind(inference_args)
+            self.assertIsNot(compact_inference_bound, inference_bound)
+            seed_pipeline(compact_inference_bound, 32, {32})
+            self.assertIs(
+                unannotated_packing_kernel.bind(inference_args),
+                compact_inference_bound,
+            )
+            compact_inference_output = inference_args[1]
+            compact_inference_bound._run = lambda *_args: compact_inference_output
+            self.assertIs(
+                unannotated_packing_kernel(*inference_args),
+                compact_inference_output,
+            )
+            with (
+                patch(
+                    "helion.runtime.cute.launcher._cuda_stream_capture_context",
+                    return_value=(123, 456),
+                ),
+                self.assertRaisesRegex(
+                    helion.exc.BackendUnsupported,
+                    "inference tensor grouped metadata.*capture",
+                ),
+            ):
+                unannotated_packing_kernel.bind(inference_args)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")

@@ -246,17 +246,6 @@ def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 .. autofunction:: register_tunable
 ```
 
-### register_heuristic_metadata()
-
-```{eval-rst}
-.. autofunction:: register_heuristic_metadata
-```
-
-Metadata names are consumer-defined rather than a closed Helion enum, allowing
-out-of-tree compiler heuristics to add contracts without changing the language
-API. An unconsumed name is retained but intentionally has no effect, so callers
-should use the exact name documented by their heuristic.
-
 ## Tile Operations
 
 ### Tile Class

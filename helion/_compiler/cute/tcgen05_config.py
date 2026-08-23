@@ -1009,7 +1009,7 @@ class CuteTcgen05Config:
 
         constraints = self.cluster_m2_search_constraints
         if is_grouped_worklist_two_cta():
-            # Worklist source-M metadata owns the validated physical
+            # The selected worklist source-M family owns the validated physical
             # 256x32/224/256 MMA profile and its K envelope independently of
             # the generic cluster-M2 policy. Compiler seeds widen the
             # otherwise-narrow pid fragment, so keep this exact family even
@@ -1585,8 +1585,8 @@ class CuteTcgen05Config:
         if smem_facts is None:
             # Compiler-owned seeds register scheduler-specific allocation facts
             # and are rejected here when their exact footprint is too large.  An
-            # explicit config has no source-M metadata contract at bind time, so
-            # those facts can legitimately be absent.  Admit only when the
+            # explicit config may be normalized without a discovered worklist
+            # contract, so those facts can legitimately be absent. Admit only when the
             # physical AB ring itself fits the raw target capacity, then defer
             # scheduler/mailbox allocations to the resolved worklist codegen
             # check.  That check proves the single grouped matmul and computes

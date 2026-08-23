@@ -301,6 +301,40 @@ def test_reviewed_heuristic_selects_every_profile_and_fallback() -> None:
         reviewed_heuristic.autotune_grouped_gemm_deepgemm(6, 20, 4096, 4096, packed_m=0)
 
 
+def test_b200_official_reviewed_profiles_remain_rank_zero() -> None:
+    b200_identity = ("cuda", "NVIDIA B200", "sm100")
+    for shape, actual_ms in zip(
+        reviewed_profiles.OFFICIAL_SHAPES,
+        reviewed_profiles.official_actual_ms(seed=0),
+        strict=True,
+    ):
+        profile = reviewed_profiles.exact_reviewed_worklist_profile(
+            shape.groups,
+            shape.expected_m_per_group,
+            shape.n,
+            shape.k,
+        )
+        source_m_tile = profile.source_m_tile
+        packed_m = sum(
+            (actual_m + source_m_tile - 1) // source_m_tile * source_m_tile
+            for actual_m in actual_ms
+        )
+        selected = cute_heuristics.tcgen05_grouped_worklist_seed_configs(
+            groups=shape.groups,
+            packed_m=packed_m,
+            n=shape.n,
+            k=shape.k,
+            b_major=profile.b_major,
+            source_m_tile=source_m_tile,
+            num_sm=148,
+            target_hardware_identity=b200_identity,
+        )[0]
+
+        assert selected.config == reviewed_profiles.reviewed_config_values(
+            profile.config_name
+        )
+
+
 def test_reviewed_heuristic_loads_with_only_its_sibling_profile(
     tmp_path: Path,
 ) -> None:

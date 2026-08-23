@@ -1,9 +1,10 @@
 """Reviewed B200 dispatch for ``grouped_gemm_deepgemm``.
 
 Ordinary JIT evaluation selects one of the reviewed exact logical profiles,
-while the user key separately specializes the physical B major, packed-A
-source tile, and total packed-M work. An internal expected-M value of zero
-represents a legacy call that omitted that metadata.
+while the user key separately specializes the physical B major and total
+packed-M work. The reviewed profile supplies the packed-A source tile; an
+internal expected-M value of zero represents a legacy call that omitted that
+shape hint.
 
 Dynamic standalone compilation is disabled for this kernel: CuTe specializes
 the physical grouped-B major, while four reviewed config values are shared by

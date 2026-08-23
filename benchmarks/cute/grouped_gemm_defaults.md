@@ -120,14 +120,24 @@ within and across all workers. Hardware slowdown, thermal slowdown, power-brake,
 sync-boost, application-clock, and unknown reason bits invalidate the run.
 
 The reviewed AOT artifact remains B200-specific and is rejected on GB300. The
-compiler uses target-specific SM103 rankings keyed only by facts observable at
-compilation (shape, B stride, physical source-tile count, and SM count), while
-preserving the B200 rankings on SM100. The table contains source-256 K-major and
+compiler recognizes the grouped matmul and segmented addressing from DeviceIR;
+kernels do not annotate themselves as grouped GEMMs. For compact device split
+sizes `[G]` or prefix offsets `[G + 1]`, source-M tile families are compiler
+schedule choices. For the benchmark's prepacked `[G, 4]` segment table, the
+compiler derives legal families from segment starts and capacities and
+specializes when the compatible family set changes. Target-specific SM103
+policies only rank otherwise-legal candidates, while SM100 retains the
+established B200 ranking. The measured table contains source-256 K-major and
 N-major workloads fitted in local sweeps; only its K-major entries can match
 this canonical-layout campaign. Treat exact benchmark-row results as in-sample,
 and use separate held-out distributions for generalization claims. The caller
 supplies the canonical B layout and reviewed A packing before binding; the
 compiler does not rewrite caller-owned inputs.
+Ordinary worklist tensors use their mutation version for dispatch
+specialization. An inference-mode worklist has no version counter, so binding
+re-reads its contents and keys the compatibility guard from those values,
+matching the launcher's value-based metadata key. Each inference-worklist
+specialization check therefore incurs a device-to-host metadata read.
 
 The output directory contains one `result.json`, `worker.log`, and
 `telemetry.csv` per provider/replicate plus `summary.json`. Telemetry is sampled

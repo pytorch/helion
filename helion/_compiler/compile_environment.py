@@ -58,6 +58,14 @@ class TensorDescriptorLayoutGuard:
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
 
 
+@dataclasses.dataclass(frozen=True)
+class GroupedWorklistCompatibilityGuard:
+    """Runtime values needed to classify a packed grouped-worklist layout."""
+
+    group_count: int
+    packed_m: int
+
+
 def _is_supported_tensor_input_source(source: Source) -> bool:
     if isinstance(source, LocalSource):
         return True
@@ -297,6 +305,7 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self._ambiguous_tensor_input_sources: set[torch.Tensor] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -342,6 +351,9 @@ class CompileEnvironment:
         self.specialized_strides: set[TensorPropertySource] = set()
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
+        ] = {}
+        self.grouped_worklist_compatibility_guards: dict[
+            Source, GroupedWorklistCompatibilityGuard
         ] = {}
         self._tensor_input_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
@@ -558,6 +570,9 @@ class CompileEnvironment:
         cache_key = id(fake_tensor)
         if cache_key in self._tensor_input_source_cache:
             return self._tensor_input_source_cache[cache_key]
+        if fake_tensor in self._ambiguous_tensor_input_sources:
+            self._tensor_input_source_cache[cache_key] = None
+            return None
 
         source = self.input_sources.get(fake_tensor)
         from .host_function import HostFunction
@@ -583,6 +598,32 @@ class CompileEnvironment:
 
         self._tensor_input_source_cache[cache_key] = result
         return result
+
+    def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:
+        """Replay a traced tensor's input source against the current real arguments."""
+        source = self.tensor_input_source(fake_tensor)
+        if source is None:
+            return None
+        return _replay_tensor_input_source(source, self.runtime_arg_values_by_name)
+
+    def register_grouped_worklist_compatibility_guard(
+        self,
+        fake_tensor: torch.Tensor,
+        *,
+        group_count: int,
+        packed_m: int,
+    ) -> bool:
+        """Specialize a bound kernel on compatible packed source-M tile families."""
+        source = self.tensor_input_source(fake_tensor)
+        if source is None:
+            return False
+        guard = GroupedWorklistCompatibilityGuard(group_count, packed_m)
+        previous = self.grouped_worklist_compatibility_guards.setdefault(source, guard)
+        if previous != guard:
+            raise RuntimeError(
+                "one grouped worklist input cannot describe conflicting packed layouts"
+            )
+        return True
 
     def tensor_descriptor_layout_signature(
         self, fake_tensor: torch.Tensor
@@ -1251,7 +1292,12 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
-        self.input_sources[result] = source
+        previous_source = self.input_sources.get(result)
+        if previous_source is not None and previous_source != source:
+            self._ambiguous_tensor_input_sources.add(result)
+            self._tensor_input_source_cache.pop(id(result), None)
+        else:
+            self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
                 if isinstance(s, torch.SymInt) and isinstance(

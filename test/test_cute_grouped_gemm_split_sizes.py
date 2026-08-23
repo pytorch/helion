@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import os
 from unittest.mock import patch
 
@@ -9,7 +10,7 @@ import torch
 
 import helion
 from helion._compat import requires_cuda_version
-from helion._compiler.cute.cute_mma import tcgen05_grouped_worklist_seed_facts
+from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
@@ -83,10 +84,6 @@ def _device_split_sizes_kernel(
     assert k == k2
     assert groups == 8
     assert split_sizes.size(0) == 8
-    hl.register_heuristic_metadata(
-        "tcgen05_grouped_worklist_source_m_tile",
-        224,
-    )
     block_m = hl.register_block_size(256)
     block_n = hl.register_block_size(128)
     block_k = hl.register_block_size(64)
@@ -120,6 +117,59 @@ def _device_split_sizes_kernel(
             + torch.where(group > 2, s2, 0)
             + torch.where(group > 3, s3, 0)
         )
+        local_m = tile_m.index
+        row_index = group_start + local_m
+        valid_rows = local_m < group_m
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            a_blk = hl.load(
+                a_packed,
+                [row_index, tile_k],
+                extra_mask=valid_rows[:, None],  # pyrefly: ignore[bad-index]
+            )
+            acc = torch.addmm(
+                acc,
+                a_blk,
+                b_grouped[group, tile_n, tile_k].T,
+            )
+        hl.store(
+            out,
+            [row_index, tile_n],
+            acc.to(out.dtype),
+            extra_mask=valid_rows[:, None],  # pyrefly: ignore[bad-index]
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _device_offsets_kernel(
+    a_packed: torch.Tensor,
+    b_grouped: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    m_total, k = a_packed.shape
+    groups, n, k2 = b_grouped.shape
+    assert k == k2
+    assert groups == 8
+    assert offsets.size(0) == 9
+    block_m = hl.register_block_size(256)
+    block_n = hl.register_block_size(128)
+    block_k = hl.register_block_size(64)
+    out = torch.empty(
+        m_total,
+        n,
+        dtype=a_packed.dtype,
+        device=a_packed.device,
+    )
+    for group_tile, tile_m, tile_n in hl.tile(
+        [groups, m_total, n],
+        block_size=[1, block_m, block_n],
+    ):
+        group = group_tile.index.sum()
+        group_start = offsets[group]
+        # Repeat the start load to ensure recognition follows tensor/index
+        # provenance rather than requiring one shared FX load node.
+        group_m = offsets[group + 1] - offsets[group]
         local_m = tile_m.index
         row_index = group_start + local_m
         valid_rows = local_m < group_m
@@ -343,6 +393,33 @@ def _make_device_split_sizes_args(
     return a_packed, b_grouped, split_sizes
 
 
+def _make_device_offsets_args(
+    m_sizes: tuple[int, ...],
+    *,
+    n: int = 128,
+    k: int = 128,
+    offsets_dtype: torch.dtype = torch.int32,
+    offsets_stride: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    a_packed, b_grouped, _split_sizes = _make_device_split_sizes_args(
+        m_sizes,
+        n=n,
+        k=k,
+        split_dtype=offsets_dtype,
+    )
+    offsets_storage = torch.empty(
+        (len(m_sizes) + 1) * offsets_stride,
+        device=DEVICE,
+        dtype=offsets_dtype,
+    )
+    offsets = offsets_storage[::offsets_stride]
+    offset_values = [0]
+    for size in m_sizes:
+        offset_values.append(offset_values[-1] + size)
+    offsets.copy_(torch.tensor(offset_values, device=DEVICE, dtype=offsets_dtype))
+    return a_packed, b_grouped, offsets
+
+
 def _configured_device_split_sizes_bound(
     args: tuple[torch.Tensor, ...], block_k: int = 128
 ):
@@ -397,6 +474,24 @@ def _assert_device_split_sizes_output(
         )
         start = end
     assert start == a_packed.size(0)
+
+
+def _assert_device_offsets_output(
+    out: torch.Tensor,
+    args: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    a_packed, b_grouped, offsets = args
+    offset_values = offsets.cpu().tolist()
+    for group, (start, end) in enumerate(itertools.pairwise(offset_values)):
+        expected = (a_packed[start:end].float() @ b_grouped[group].float().T).to(
+            out.dtype
+        )
+        torch.testing.assert_close(
+            out[start:end],
+            expected,
+            rtol=3e-2,
+            atol=3e-2,
+        )
 
 
 def _require_codegen_cuda() -> None:
@@ -461,11 +556,16 @@ def test_grouped_device_split_smem_accounting_includes_fixed_allocations() -> No
     assert _bk64_device_split_smem_bytes(51) > 227 * 1024
 
 
-def test_grouped_device_split_compiler_seeds_use_mailbox_scheduler() -> None:
+def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() -> None:
     _require_codegen_cuda()
     with torch.cuda.device(DEVICE):
-        if torch.cuda.get_device_capability(DEVICE) != (10, 0):
-            pytest.skip("grouped worklist compiler seeds require SM100")
+        capability = torch.cuda.get_device_capability(DEVICE)
+    hardware_name = {
+        (10, 0): "NVIDIA B200",
+        (10, 3): "NVIDIA GB300",
+    }.get(capability)
+    if hardware_name is None:
+        pytest.skip("grouped worklist compiler seeds require SM100 or SM103")
 
     args = _make_device_split_sizes_args(
         (0, 1, 127, 224, 256, 449, 0, 991),
@@ -479,21 +579,22 @@ def test_grouped_device_split_compiler_seeds_use_mailbox_scheduler() -> None:
             "helion._hardware.get_hardware_info",
             return_value=HardwareInfo(
                 device_kind="cuda",
-                hardware_name="NVIDIA B200",
+                hardware_name=hardware_name,
                 runtime_version="13.0",
-                compute_capability="sm100",
+                compute_capability=f"sm{capability[0]}{capability[1]}",
             ),
         ),
     ):
         bound = _device_split_sizes_kernel.bind(args)
 
-    seed_facts = tcgen05_grouped_worklist_seed_facts(
+    assert bound.host_function is not None
+    analysis = analyze_tcgen05_grouped_worklist(
         bound.env,
         bound.host_function.device_ir,
         bound.config_spec.matmul_facts[0],
-        source_m_tile=TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
     )
-    assert seed_facts is not None
+    assert analysis is not None
+    seed_facts = analysis.seed_facts
     assert seed_facts.device_split_sizes
     assert bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts == (
         8,
@@ -506,8 +607,19 @@ def test_grouped_device_split_compiler_seeds_use_mailbox_scheduler() -> None:
         == TCGEN05_GROUPED_MODE_WORKLIST_NM
     ]
     assert seeds
+    assert {
+        config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        for config in seeds
+    } == {
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    }
+    assert (
+        seeds[0].config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+        == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+    )
     assert all(
-        config.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is not True
+        TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY not in config.config
         for config in seeds
     )
     assert all(
@@ -515,6 +627,69 @@ def test_grouped_device_split_compiler_seeds_use_mailbox_scheduler() -> None:
         for config in seeds
     )
     assert bound.config_spec.compiler_default_config == seeds[0]
+
+
+def test_grouped_device_offsets_are_recognized_and_normalized() -> None:
+    _require_codegen_cuda()
+    with torch.cuda.device(DEVICE):
+        capability = torch.cuda.get_device_capability(DEVICE)
+    hardware_name = {
+        (10, 0): "NVIDIA B200",
+        (10, 3): "NVIDIA GB300",
+    }.get(capability)
+    if hardware_name is None:
+        pytest.skip("grouped worklist compiler seeds require SM100 or SM103")
+
+    args = _make_device_offsets_args(
+        (0, 1, 127, 224, 256, 449, 0, 991),
+        n=512,
+        k=64,
+        offsets_dtype=torch.int64,
+        offsets_stride=2,
+    )
+    _device_offsets_kernel.reset()
+    with (
+        patch_cute_mma_support(),
+        patch(
+            "helion._hardware.get_hardware_info",
+            return_value=HardwareInfo(
+                device_kind="cuda",
+                hardware_name=hardware_name,
+                runtime_version="13.0",
+                compute_capability=f"sm{capability[0]}{capability[1]}",
+            ),
+        ),
+    ):
+        bound = _device_offsets_kernel.bind(args)
+
+    assert bound.host_function is not None
+    analysis = analyze_tcgen05_grouped_worklist(
+        bound.env,
+        bound.host_function.device_ir,
+        bound.config_spec.matmul_facts[0],
+    )
+    assert analysis is not None
+    seed_facts = analysis.seed_facts
+    assert seed_facts.device_split_sizes
+    seeds = [
+        config
+        for config in bound.config_spec.compiler_seed_configs
+        if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+        == TCGEN05_GROUPED_MODE_WORKLIST_NM
+    ]
+    assert seeds
+
+    code = _code_for(_device_offsets_kernel, args, _selected_config(64))
+    plan = _grouped_plan(code)
+    _assert_plan_fields(
+        plan,
+        device_split_sizes=True,
+        device_layout_kind="offsets",
+        group_count=8,
+        m_size=args[0].size(0),
+        orientation="nm",
+    )
+    assert "iterator + cutlass.Int64(8) * cutlass.Int64(" in code
 
 
 @pytest.mark.parametrize(
@@ -618,6 +793,57 @@ def test_grouped_device_split_sizes_two_group_codegen() -> None:
         m_size=args[0].size(0),
         orientation="nm",
     )
+
+
+def test_grouped_device_offsets_runtime() -> None:
+    _require_runtime_cuda13_sm100()
+
+    args = _make_device_offsets_args(
+        (0, 224, 17, 0, 449, 1, 256, 1101),
+        n=224,
+        k=128,
+        offsets_dtype=torch.int64,
+        offsets_stride=2,
+    )
+    _device_offsets_kernel.reset()
+    with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+        bound = _device_offsets_kernel.bind(args)
+        bound.set_config(_selected_config(64))
+        result = bound(*args)
+        torch.cuda.synchronize()
+        _assert_device_offsets_output(result, args)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = bound(*args)
+        torch.cuda.synchronize()
+
+        # A negative start expands the raw offset interval beyond the source
+        # kernel's finite local-M domain. The normalized scheduler must cap the
+        # source extent before clipping it to visible rows.
+        m_total = args[0].size(0)
+        args[0].normal_()
+        args[2].copy_(args[2].new_tensor((-50, *(m_total for _ in range(8)))))
+        captured.fill_(-7.0)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        visible_rows = m_total - 50
+        expected = (args[0][:visible_rows].float() @ args[1][0].float().T).to(
+            captured.dtype
+        )
+        torch.testing.assert_close(
+            captured[:visible_rows],
+            expected,
+            rtol=3e-2,
+            atol=3e-2,
+        )
+        torch.testing.assert_close(
+            captured[visible_rows:],
+            torch.full_like(captured[visible_rows:], -7.0),
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_grouped_device_split_sizes_without_grouped_mode_falls_back() -> None:
