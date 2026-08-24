@@ -15,7 +15,7 @@ from .tile_dependency import UniformTaskPartition
 from .tile_dependency import dependency_predecessor_sets
 from .tile_dependency import instantiate_action_domains
 from .tile_dependency import instantiate_action_relations
-from .tile_dependency import predecessor_task_ids
+from .tile_dependency import instantiate_root_predecessor_sets
 from .tile_dependency import prove_uniform_task_partition
 
 CROSS_LOOP_NUM_WORKERS_CONFIG = "cross_loop_num_workers"
@@ -1293,8 +1293,7 @@ def lower_counted_events(
     for event in event_graph.events:
         if event.is_family_done or not event.key_count:
             continue
-        arrival_counts = set(event.expected_arrivals)
-        if len(arrival_counts) != 1 or not next(iter(arrival_counts)):
+        if any(not count for count in event.expected_arrivals):
             continue
 
         contributions: list[CountedEventContribution] = []
@@ -1549,144 +1548,84 @@ def instantiate_event_graph(
     dependency_graph: TileDependencyGraph,
     task_families: tuple[InstantiatedTaskFamily, ...],
 ) -> InstantiatedEventGraph:
-    """Instantiate the semantic task/event DAG for one kernel configuration.
+    """Instantiate root events from the canonical allocation-overlap relation.
 
-    This pass is intentionally independent of execution policy. Exact task
-    events retain their complete predecessor sets. A relation that cannot be
-    evaluated for this configuration is redirected to the producer's canonical
-    one-key family-completion event rather than being partially guessed.
+    Event construction consumes only configured predecessor sets.  The legacy
+    source-level affine event plan is retained temporarily as provenance for
+    existing diagnostics and tests, but it is no longer a legality proof.
+    Unrepresentable or sparse root relations monotonically lift to one
+    whole-family completion event.
     """
-    if len(task_families) != len(dependency_graph.task_families):
-        raise ValueError("task family count disagrees with the dependency graph")
-
-    exact_events: list[InstantiatedKeyedEvent] = []
-    family_done_uses: dict[
-        int,
-        dict[tuple[int, int | None, Literal["root_entry", "access"]], list[set[int]]],
-    ] = {}
-
-    def add_family_done_use(
-        producer_root: int,
-        use: EventUse,
-    ) -> None:
-        consumer_tasks = task_families[use.consumer_root].task_count
-        use_key = (
-            use.consumer_root,
-            use.consumer_access_id,
-            use.placement,
-        )
-        required = family_done_uses.setdefault(producer_root, {}).setdefault(
-            use_key,
-            [set() for _ in range(consumer_tasks)],
-        )
-        for keys in required:
-            keys.add(0)
-
-    for semantic_event in dependency_graph.events:
+    root_relations = instantiate_root_predecessor_sets(
+        dependency_graph,
+        task_families=task_families,
+    )
+    source_event_ids_by_pair: dict[tuple[int, int], set[int]] = {}
+    for use in dependency_graph.waits:
+        semantic_event = dependency_graph.event(use.event_id)
         if len(semantic_event.contributors) != 1:
-            raise ValueError(
-                "semantic multi-contributor events require an explicit task-to-key "
-                "relation"
-            )
-        producer_root = semantic_event.producer_root
-        producer = task_families[producer_root]
-        semantic_uses = dependency_graph.uses_for_event(semantic_event.event_id)
+            continue
+        source_event_ids_by_pair.setdefault(
+            (semantic_event.producer_root, use.consumer_root), set()
+        ).add(use.event_id)
 
-        if semantic_event.is_family_done:
-            for use in semantic_uses:
-                add_family_done_use(producer_root, use)
+    exact_uses_by_producer: dict[int, list[InstantiatedEventUse]] = {}
+    exact_source_events: dict[int, set[int]] = {}
+    family_done_consumers: dict[int, set[int]] = {}
+    family_done_source_events: dict[int, set[int]] = {}
+    for (producer_root, consumer_root), predecessors in sorted(root_relations.items()):
+        producer = task_families[producer_root]
+        complete_producer_domain = frozenset(range(producer.task_count))
+        source_event_ids = tuple(
+            sorted(source_event_ids_by_pair.get((producer_root, consumer_root), ()))
+        )
+        if (
+            predecessors is None
+            or producer.task_count == 1
+            or not any(predecessors)
+            or all(tasks == complete_producer_domain for tasks in predecessors)
+        ):
+            family_done_consumers.setdefault(producer_root, set()).add(consumer_root)
+            family_done_source_events.setdefault(producer_root, set()).update(
+                source_event_ids
+            )
             continue
 
-        uses_by_program_point: dict[
-            tuple[int, int | None, Literal["root_entry", "access"]],
-            list[set[int]],
-        ] = {}
-        fallback_uses: list[EventUse] = []
-        for use in semantic_uses:
-            predecessor_map = use.predecessor_map
-            consumer = task_families[use.consumer_root]
-            if predecessor_map is None:
-                fallback_uses.append(use)
-                continue
-            required_keys: list[set[int]] = []
-            for consumer_task in range(consumer.task_count):
-                predecessors = predecessor_task_ids(
-                    predecessor_map,
-                    consumer_coordinates=consumer.task_coordinates(consumer_task),
-                    block_sizes={**producer.block_sizes, **consumer.block_sizes},
-                    producer_axis_order=producer.logical_axis_order,
-                    producer_axis_counts=producer.axis_counts,
-                )
-                if predecessors is None:
-                    break
-                required_keys.append(set(predecessors))
-            if len(required_keys) != consumer.task_count:
-                fallback_uses.append(use)
-                continue
-            use_key = (
-                use.consumer_root,
-                use.consumer_access_id,
-                use.placement,
-            )
-            aggregate = uses_by_program_point.setdefault(
-                use_key,
-                [set() for _ in range(consumer.task_count)],
-            )
-            for consumer_task, keys in enumerate(required_keys):
-                aggregate[consumer_task].update(keys)
-
-        for use in fallback_uses:
-            add_family_done_use(producer_root, use)
-
-        exact_uses = tuple(
+        exact_uses_by_producer.setdefault(producer_root, []).append(
             InstantiatedEventUse(
                 consumer_root=consumer_root,
-                consumer_access_id=consumer_access_id,
-                placement=placement,
-                required_keys_by_task=tuple(frozenset(keys) for keys in required),
-            )
-            for (
-                consumer_root,
-                consumer_access_id,
-                placement,
-            ), required in sorted(
-                uses_by_program_point.items(),
-                key=lambda item: (
-                    item[0][0],
-                    -1 if item[0][1] is None else item[0][1],
-                    item[0][2],
-                ),
+                consumer_access_id=None,
+                placement="root_entry",
+                required_keys_by_task=predecessors,
             )
         )
-        if exact_uses:
-            exact_events.append(
-                InstantiatedKeyedEvent(
-                    event_id=len(exact_events),
-                    source_event_ids=(semantic_event.event_id,),
-                    key_count=producer.task_count,
-                    contributions=(
-                        InstantiatedEventContribution(
-                            producer_root=producer_root,
-                            keys_by_task=tuple(
-                                frozenset((task,))
-                                for task in range(producer.task_count)
-                            ),
-                        ),
-                    ),
-                    uses=exact_uses,
-                )
-            )
+        exact_source_events.setdefault(producer_root, set()).update(source_event_ids)
 
-    result = list(exact_events)
-    for producer_root, use_relations in sorted(family_done_uses.items()):
+    result = [
+        InstantiatedKeyedEvent(
+            event_id=event_id,
+            source_event_ids=tuple(sorted(exact_source_events.get(producer_root, ()))),
+            key_count=task_families[producer_root].task_count,
+            contributions=(
+                InstantiatedEventContribution(
+                    producer_root=producer_root,
+                    keys_by_task=tuple(
+                        frozenset((task,))
+                        for task in range(task_families[producer_root].task_count)
+                    ),
+                ),
+            ),
+            uses=tuple(exact_uses_by_producer[producer_root]),
+        )
+        for event_id, producer_root in enumerate(sorted(exact_uses_by_producer))
+    ]
+    for producer_root, consumer_roots in sorted(family_done_consumers.items()):
         producer = task_families[producer_root]
         result.append(
             InstantiatedKeyedEvent(
                 event_id=len(result),
                 source_event_ids=tuple(
-                    event.event_id
-                    for event in dependency_graph.events_contributed_by(producer_root)
-                    if event.is_family_done
+                    sorted(family_done_source_events.get(producer_root, ()))
                 ),
                 key_count=1,
                 contributions=(
@@ -1700,24 +1639,14 @@ def instantiate_event_graph(
                 uses=tuple(
                     InstantiatedEventUse(
                         consumer_root=consumer_root,
-                        consumer_access_id=consumer_access_id,
-                        placement=placement,
+                        consumer_access_id=None,
+                        placement="root_entry",
                         required_keys_by_task=tuple(
-                            frozenset(keys) for keys in required
+                            frozenset((0,))
+                            for _ in range(task_families[consumer_root].task_count)
                         ),
                     )
-                    for (
-                        consumer_root,
-                        consumer_access_id,
-                        placement,
-                    ), required in sorted(
-                        use_relations.items(),
-                        key=lambda item: (
-                            item[0][0],
-                            -1 if item[0][1] is None else item[0][1],
-                            item[0][2],
-                        ),
-                    )
+                    for consumer_root in sorted(consumer_roots)
                 ),
                 family_done_root=producer_root,
             )
@@ -2044,10 +1973,18 @@ def canonicalize_ready_events(
                 ),
             ),
         )
-
-        uses_to_remove.update(
-            (event_id, use_index) for event_id, use_index, _use in source_uses
+        single_publish_lowerable = not any(
+            len(keys) > 1
+            for contribution in canonical_event.contributions
+            for keys in contribution.keys_by_task
         )
+        if single_publish_lowerable:
+            uses_to_remove.update(
+                (event_id, use_index) for event_id, use_index, _use in source_uses
+            )
+        # Otherwise keep the independent exact events for scalar lowering. The
+        # canonical relation remains in the DAG for analysis; this is a
+        # lowering-capability test, not a topology choice.
         events.append(canonical_event)
 
     for event_id, event in enumerate(original_events):
@@ -2607,10 +2544,7 @@ def build_cross_loop_schedule(
 ) -> CrossLoopSchedule:
     """Derive all generic readiness strategies without inspecting root bodies."""
     event_graph = canonicalize_ready_events(
-        canonicalize_task_readiness(
-            instantiate_event_graph(dependency_plan, task_families),
-            dependency_plan,
-        )
+        instantiate_event_graph(dependency_plan, task_families)
     )
     event_graph = add_ordered_action_events(
         event_graph,
@@ -2708,8 +2642,44 @@ def build_cross_loop_schedule(
         fully_task_ready_edges=lowered_task_pairs,
         preordered_edges=preordered_edges,
     )
-    task_ready_edges = lowered_task_pairs
     root_order_edges = set(root_completion_edges) | set(preordered_edges)
+    retained_counted_events: list[CountedEventPlan] = []
+    for event in counted_events:
+        retained_use_indices = tuple(
+            use_index
+            for use_index, use in enumerate(event.uses)
+            if use_index == event.local_trigger_use
+            or not all(
+                _is_ordered_by_root_completion(
+                    contributor.producer_root,
+                    use.consumer_root,
+                    root_order_edges,
+                )
+                for contributor in event.contributors
+            )
+        )
+        if not retained_use_indices:
+            continue
+        retained_counted_events.append(
+            dataclasses.replace(
+                event,
+                uses=tuple(event.uses[index] for index in retained_use_indices),
+                local_trigger_use=(
+                    retained_use_indices.index(event.local_trigger_use)
+                    if event.local_trigger_use is not None
+                    else None
+                ),
+            )
+        )
+    counted_events = tuple(retained_counted_events)
+    selected_task_pairs = {
+        (contributor.producer_root, use.consumer_root)
+        for event in counted_events
+        for contributor in event.contributors
+        for use in event.uses
+    }
+    lowered_task_pairs = frozenset(selected_task_pairs | retained_wait_pairs)
+    task_ready_edges = lowered_task_pairs
     redundant_wait_pairs = {
         (dependency_plan.event(wait.event_id).producer_root, consumer_root)
         for consumer_root, waits in retained_waits.items()

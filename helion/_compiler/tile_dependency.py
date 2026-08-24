@@ -1282,6 +1282,60 @@ def dependency_predecessor_sets(
     return tuple(frozenset(tasks) for tasks in predecessors)
 
 
+def instantiate_root_predecessor_sets(
+    dependency_graph: TileDependencyGraph,
+    *,
+    task_families: tuple[InstantiatedTaskFamily, ...],
+) -> dict[tuple[int, int], tuple[frozenset[int], ...] | None]:
+    """Instantiate every root-pair relation with the canonical overlap proof.
+
+    A pair is exact only when every allocation hazard between the two roots can
+    be represented.  The returned predecessor sets already union all of those
+    hazards, so downstream event construction never needs to inspect accesses
+    or repeat the memory proof.
+    """
+    if len(task_families) != len(dependency_graph.task_families):
+        raise ValueError("task family count disagrees with the dependency graph")
+
+    access_by_id = {access.access_id: access for access in dependency_graph.accesses}
+    edges_by_pair: dict[tuple[int, int], list[TileDependency]] = {}
+    for dependency in dependency_graph.edges:
+        edges_by_pair.setdefault(
+            (dependency.producer_root, dependency.consumer_root), []
+        ).append(dependency)
+
+    result: dict[tuple[int, int], tuple[frozenset[int], ...] | None] = {}
+    for pair, dependencies in edges_by_pair.items():
+        if any(
+            not axis.canonical_origin
+            for root in pair
+            for axis in dependency_graph.task_families[root].axes
+        ):
+            # Configured task coordinates are zero based. Until a nonzero or
+            # strided source origin is first-class in the logical domain, using
+            # them as allocation coordinates would prove the wrong relation.
+            result[pair] = None
+            continue
+        consumer = task_families[pair[1]]
+        predecessors = [set() for _ in range(consumer.task_count)]
+        complete = True
+        for dependency in dependencies:
+            edge_predecessors = dependency_predecessor_sets(
+                dependency,
+                task_families=task_families,
+                access_by_id=access_by_id,
+            )
+            if edge_predecessors is None:
+                complete = False
+                break
+            for consumer_task, producer_tasks in enumerate(edge_predecessors):
+                predecessors[consumer_task].update(producer_tasks)
+        result[pair] = (
+            tuple(frozenset(tasks) for tasks in predecessors) if complete else None
+        )
+    return result
+
+
 def instantiate_action_domains(
     dependency_graph: TileDependencyGraph,
     *,

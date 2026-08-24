@@ -3311,7 +3311,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_task_wait", code)
+        self.assertIn("tile_dependency_keyed_event_wait", code)
+        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()

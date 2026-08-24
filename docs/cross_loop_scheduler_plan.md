@@ -3501,6 +3501,15 @@ to any contiguous nested consumer range whose exact dependencies admit the
 quotient. The lowering emits one wait before each original loop segment and
 preserves the loop body and range attributes.
 
+The quotient also has a deliberately narrow lowering contract: each consumer
+action waits on one derived readiness key. A raw relation that would require a
+consumer to poll several independent keys must first be quotiented into one
+deduplicated predecessor signature. If that cannot be represented, it lifts to
+an enclosing action or `FamilyDone`; the code generator does not synthesize an
+arbitrary multi-key polling loop. This keeps scheduling policy in the graph
+pass and prevents a merely legal, overly fine-grained event encoding from
+silently becoming the chosen schedule.
+
 ### Publication and lowering constraints
 
 - A nested publication is legal only at a boundary proved to execute exactly
@@ -3548,6 +3557,19 @@ Completed in the current scheduler checkpoint:
   `tile_dependency.py`; root and nested relations now use the same proof.
 - Added generic nested-consumer keyed events and schedule-derived milestone
   quotienting with nonuniform arrival counts.
+- Made `tile_dependency.py` instantiate one canonical predecessor relation per
+  root pair by unioning every allocation hazard. Root keyed events now consume
+  that relation instead of rerunning the legacy pairwise affine proof in the
+  scheduler; the old semantic event IDs are retained only as temporary
+  provenance for lowering and diagnostics.
+- Recompute dependency coverage from the counted events and waits that will
+  actually be emitted. Redundant fine-grained uses are removed only after the
+  selected root-completion order proves them unnecessary.
+- Kept counted-event lowering intentionally scalar at the consumer: arrival
+  counts may differ by key, but every consumer action waits on one quotient
+  key. Unquotientable multi-key relations safely fall back to family
+  completion. This preserves the useful batch/group FFN handoff without
+  selecting Gemma's legal but slower QKV-to-attention polling schedule.
 - Deleted `AccessCohortPlan`, `_derive_access_cohorts`,
   `place_access_ready_consumers`, access-marker discovery, cohort counter
   allocation, cohort lowering, and the access-specific event placement mode.
@@ -3563,9 +3585,11 @@ Completed in the current scheduler checkpoint:
 
 Remaining work, in order:
 
-1. Consolidate the residual root-only affine/event pipeline into the canonical
-   action-overlap relation and remove duplicate readiness builders and
-   canonicalizers.
+1. Finish deleting the residual semantic root-event and affine predecessor
+   representations now that configured root events use the canonical overlap
+   relation. Remove the unused task-readiness builder and collapse the two
+   remaining predecessor-signature canonicalizers only after differential
+   shape tests establish equivalent relations.
 2. Generalize event endpoints, liveness, and validation so nested producer
    publications are first-class while outer strand placement remains
    unchanged.
