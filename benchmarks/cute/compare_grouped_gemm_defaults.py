@@ -32,6 +32,7 @@ from typing import cast
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import TextIO
 
     from benchmarks.cute.grouped_gemm_benchmark import GroupedGemmCase
     from benchmarks.cute.grouped_gemm_benchmark import GroupedGemmInputs
@@ -62,12 +63,14 @@ if __name__ == "__main__":
 from benchmarks.cute import grouped_gemm_benchmark as common  # noqa: E402
 
 RESULT_SCHEMA = "helion-grouped-gemm-provider-defaults-v4"
-SUMMARY_SCHEMA = "helion-grouped-gemm-provider-summary-v5"
+SUMMARY_SCHEMA = "helion-grouped-gemm-provider-summary-v6"
+COMPUTE_APPLICATIONS_SCHEMA = "helion-gpu-compute-applications-v1"
 BENCHMARK_REPETITIONS = 102
 MIN_PUBLICATION_REPLICATES = 3
 THERMAL_WARMUP_MS = 10_000
 CAPTURE_WARMUPS = 2
 TELEMETRY_INTERVAL_SECONDS = 5
+COMPUTE_APPLICATION_INTERVAL_SECONDS = 1
 POST_WORKER_IDLE_GRACE_SECONDS = 5
 NVCC_RELEASE_PATTERN = re.compile(r"\brelease\s+(\d+\.\d+),\s+V([0-9.]+)")
 PROVIDERS = ("deepgemm", "quack", "cudnn", "cublaslt", "cutlass")
@@ -83,6 +86,13 @@ class ProviderSelectionPolicy:
     @property
     def requires_config_invariance(self) -> bool:
         return self.stability == "fixed"
+
+
+@dataclass(frozen=True)
+class _ComputeApplication:
+    pid: int
+    process_name: str
+    used_memory: str
 
 
 PROVIDER_SELECTION_POLICIES = {
@@ -1157,17 +1167,109 @@ def _resolve_target_gpu(cuda_visible_devices: str) -> str:
     return rows[0]
 
 
-def _require_target_gpu_idle(target_gpu_uuid: str) -> None:
+def _query_compute_applications(
+    target_gpu_uuid: str,
+) -> tuple[_ComputeApplication, ...]:
     output = _nvidia_smi(
         "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
         "--format=csv,noheader,nounits",
     )
+    applications: list[_ComputeApplication] = []
     for row in (line.strip() for line in output.splitlines() if line.strip()):
         fields = tuple(field.strip() for field in row.split(",", maxsplit=3))
         if len(fields) != 4:
             raise RuntimeError("compute-application query returned malformed CSV")
         if fields[0] == target_gpu_uuid:
-            raise RuntimeError(f"target GPU is not idle: {row}")
+            try:
+                pid = int(fields[1])
+            except ValueError as error:
+                raise RuntimeError(
+                    "compute-application query returned an invalid PID"
+                ) from error
+            if pid <= 0:
+                raise RuntimeError("compute-application query returned an invalid PID")
+            applications.append(
+                _ComputeApplication(
+                    pid=pid,
+                    process_name=fields[2],
+                    used_memory=fields[3],
+                )
+            )
+    return tuple(applications)
+
+
+def _require_target_gpu_idle(target_gpu_uuid: str) -> None:
+    applications = _query_compute_applications(target_gpu_uuid)
+    if applications:
+        application = applications[0]
+        raise RuntimeError(
+            "target GPU is not idle: "
+            f"{target_gpu_uuid}, {application.pid}, {application.process_name}, "
+            f"{application.used_memory}"
+        )
+
+
+def _record_compute_applications(
+    evidence: TextIO,
+    *,
+    sample_index: int,
+    target_gpu_uuid: str,
+    worker_process_group: int,
+    known_worker_pids: set[int],
+) -> None:
+    applications: list[dict[str, object]] = []
+    for application in _query_compute_applications(target_gpu_uuid):
+        try:
+            process_group: int | None = os.getpgid(application.pid)
+        except ProcessLookupError:
+            process_group = None
+        if process_group == worker_process_group:
+            allowed = True
+            membership_basis = "live_process_group"
+            known_worker_pids.add(application.pid)
+        elif process_group is None and application.pid in known_worker_pids:
+            allowed = True
+            membership_basis = (
+                "worker_process_group_leader"
+                if application.pid == worker_process_group
+                else "previously_observed_process_group"
+            )
+        else:
+            allowed = False
+            membership_basis = "outside_worker_process_group"
+        applications.append(
+            {
+                "pid": application.pid,
+                "process_group": process_group,
+                "process_name": application.process_name,
+                "used_memory": application.used_memory,
+                "allowed": allowed,
+                "membership_basis": membership_basis,
+            }
+        )
+    observation = {
+        "schema": COMPUTE_APPLICATIONS_SCHEMA,
+        "sample_index": sample_index,
+        "timestamp_unix_ns": time.time_ns(),
+        "target_gpu_uuid": target_gpu_uuid,
+        "worker_process_group": worker_process_group,
+        "applications": applications,
+    }
+    evidence.write(json.dumps(observation, sort_keys=True) + "\n")
+    evidence.flush()
+    foreign = [
+        application for application in applications if not application["allowed"]
+    ]
+    if foreign:
+        details = "; ".join(
+            f"pid={application['pid']} pgid={application['process_group']} "
+            f"name={application['process_name']!r}"
+            for application in foreign
+        )
+        raise RuntimeError(
+            f"target GPU {target_gpu_uuid} has a compute application outside "
+            f"worker process group {worker_process_group}: {details}"
+        )
 
 
 def _query_telemetry(target_gpu_uuid: str) -> str:
@@ -1236,6 +1338,97 @@ def _summarize_telemetry(path: Path, target_gpu_uuid: str) -> dict[str, Any]:
     }
 
 
+def _summarize_compute_applications(path: Path, target_gpu_uuid: str) -> dict[str, Any]:
+    observations = [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
+    if not observations:
+        raise RuntimeError(f"compute-application evidence is empty: {path}")
+    worker_process_group: int | None = None
+    known_worker_pids: set[int] = set()
+    applications: dict[tuple[int, int | None, str], dict[str, object]] = {}
+    foreign_observations = 0
+    application_observations = 0
+    for sample_index, observation in enumerate(observations):
+        if not isinstance(observation, dict) or (
+            observation.get("schema") != COMPUTE_APPLICATIONS_SCHEMA
+            or observation.get("sample_index") != sample_index
+            or observation.get("target_gpu_uuid") != target_gpu_uuid
+        ):
+            raise RuntimeError(f"malformed compute-application evidence: {path}")
+        observed_worker_process_group = observation.get("worker_process_group")
+        if (
+            not isinstance(observed_worker_process_group, int)
+            or observed_worker_process_group <= 0
+        ):
+            raise RuntimeError(f"malformed compute-application evidence: {path}")
+        if worker_process_group is None:
+            worker_process_group = observed_worker_process_group
+            known_worker_pids.add(worker_process_group)
+        elif observed_worker_process_group != worker_process_group:
+            raise RuntimeError(f"worker process group changed during run: {path}")
+        sample_applications = observation.get("applications")
+        if not isinstance(sample_applications, list):
+            raise RuntimeError(f"malformed compute-application evidence: {path}")
+        for application in sample_applications:
+            if not isinstance(application, dict):
+                raise RuntimeError(f"malformed compute-application evidence: {path}")
+            pid = application.get("pid")
+            process_group = application.get("process_group")
+            process_name = application.get("process_name")
+            allowed = application.get("allowed")
+            membership_basis = application.get("membership_basis")
+            if (
+                not isinstance(pid, int)
+                or pid <= 0
+                or (process_group is not None and not isinstance(process_group, int))
+                or not isinstance(process_name, str)
+                or not isinstance(allowed, bool)
+            ):
+                raise RuntimeError(f"malformed compute-application evidence: {path}")
+            if process_group == worker_process_group:
+                expected_allowed = True
+                expected_membership_basis = "live_process_group"
+                known_worker_pids.add(pid)
+            elif process_group is None and pid in known_worker_pids:
+                expected_allowed = True
+                expected_membership_basis = (
+                    "worker_process_group_leader"
+                    if pid == worker_process_group
+                    else "previously_observed_process_group"
+                )
+            else:
+                expected_allowed = False
+                expected_membership_basis = "outside_worker_process_group"
+            if (
+                allowed != expected_allowed
+                or membership_basis != expected_membership_basis
+            ):
+                raise RuntimeError(f"malformed compute-application evidence: {path}")
+            application_observations += 1
+            if not allowed:
+                foreign_observations += 1
+            applications[(pid, process_group, process_name)] = {
+                "pid": pid,
+                "process_group": process_group,
+                "process_name": process_name,
+            }
+    assert worker_process_group is not None
+    return {
+        "sample_count": len(observations),
+        "worker_process_group": worker_process_group,
+        "application_observation_count": application_observations,
+        "observed_applications": sorted(
+            applications.values(),
+            key=lambda application: (
+                cast("int", application["pid"]),
+                cast("str", application["process_name"]),
+            ),
+        ),
+        "foreign_application_observation_count": foreign_observations,
+    }
+
+
 def _process_group_exists(process_group: int) -> bool:
     try:
         os.killpg(process_group, 0)
@@ -1270,14 +1463,21 @@ def _run_monitored_worker(
     command: Sequence[str],
     *,
     environment: dict[str, str],
+    compute_applications_path: Path,
     log_path: Path,
     telemetry_path: Path,
     target_gpu_uuid: str,
-) -> tuple[int, int]:
-    samples = 0
+) -> tuple[int, int, int]:
+    telemetry_samples = 0
+    compute_application_samples = 0
+    worker_error: BaseException | None = None
     _require_target_gpu_idle(target_gpu_uuid)
     try:
-        with log_path.open("xb") as log, telemetry_path.open("x") as telemetry:
+        with (
+            compute_applications_path.open("x") as compute_applications,
+            log_path.open("xb") as log,
+            telemetry_path.open("x") as telemetry,
+        ):
             telemetry.write(",".join(TELEMETRY_FIELDS) + "\n")
             process = subprocess.Popen(
                 command,
@@ -1288,23 +1488,59 @@ def _run_monitored_worker(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            known_worker_pids = {process.pid}
             try:
-                next_sample = time.monotonic()
+                next_telemetry_sample = time.monotonic()
+                next_compute_application_sample = next_telemetry_sample
                 while process.poll() is None:
                     now = time.monotonic()
-                    if now >= next_sample:
+                    if now >= next_compute_application_sample:
+                        _record_compute_applications(
+                            compute_applications,
+                            sample_index=compute_application_samples,
+                            target_gpu_uuid=target_gpu_uuid,
+                            worker_process_group=process.pid,
+                            known_worker_pids=known_worker_pids,
+                        )
+                        compute_application_samples += 1
+                        next_compute_application_sample = (
+                            now + COMPUTE_APPLICATION_INTERVAL_SECONDS
+                        )
+                    if now >= next_telemetry_sample:
                         telemetry.write(_query_telemetry(target_gpu_uuid) + "\n")
                         telemetry.flush()
-                        samples += 1
-                        next_sample = now + TELEMETRY_INTERVAL_SECONDS
+                        telemetry_samples += 1
+                        next_telemetry_sample = now + TELEMETRY_INTERVAL_SECONDS
+                    next_sample = min(
+                        next_compute_application_sample, next_telemetry_sample
+                    )
                     time.sleep(min(0.25, max(0.0, next_sample - time.monotonic())))
+                _record_compute_applications(
+                    compute_applications,
+                    sample_index=compute_application_samples,
+                    target_gpu_uuid=target_gpu_uuid,
+                    worker_process_group=process.pid,
+                    known_worker_pids=known_worker_pids,
+                )
+                compute_application_samples += 1
                 telemetry.write(_query_telemetry(target_gpu_uuid) + "\n")
                 returncode = process.wait()
-                return returncode, samples + 1
+                return (
+                    returncode,
+                    telemetry_samples + 1,
+                    compute_application_samples,
+                )
             finally:
                 _terminate_process(process)
+    except BaseException as error:
+        worker_error = error
+        raise
     finally:
-        _wait_for_target_gpu_idle(target_gpu_uuid)
+        try:
+            _wait_for_target_gpu_idle(target_gpu_uuid)
+        except RuntimeError:
+            if worker_error is None:
+                raise
 
 
 def _geomean(values: Sequence[float]) -> float:
@@ -1425,6 +1661,7 @@ def summarize_results(
         row_helion_ms: list[list[float]] = [[] for _ in range(row_count)]
         row_provider_ms: list[list[float]] = [[] for _ in range(row_count)]
         provider_config_hashes: list[list[str]] = [[] for _ in range(row_count)]
+        provider_benchmark_labels: list[str | None] = []
         for result in provider_results:
             rows = result["rows"]
             if len(rows) != row_count or [row.get("row_index") for row in rows] != list(
@@ -1468,6 +1705,12 @@ def summarize_results(
                 provider_config_hashes[row_index].append(
                     row["configs"]["provider"]["config_sha256"]
                 )
+                benchmark_label = row["configs"]["provider"].get("benchmark_label")
+                if benchmark_label is not None and (
+                    not isinstance(benchmark_label, str) or not benchmark_label
+                ):
+                    raise RuntimeError(f"{provider} has an invalid benchmark label")
+                provider_benchmark_labels.append(benchmark_label)
             worst_index = min(range(row_count), key=speedups.__getitem__)
             replicate_summaries.append(
                 {
@@ -1515,7 +1758,10 @@ def summarize_results(
         )
         if selection_policy.requires_config_invariance and not all_configs_invariant:
             raise RuntimeError(f"{provider} selected config changed across replicates")
-        provider_summaries[provider] = {
+        distinct_benchmark_labels = set(provider_benchmark_labels)
+        if len(distinct_benchmark_labels) != 1:
+            raise RuntimeError(f"{provider} benchmark label changed across rows")
+        provider_summary = {
             "selection": selection_policy.mode,
             "selection_stability": selection_policy.stability,
             "config_invariance_required": selection_policy.requires_config_invariance,
@@ -1528,6 +1774,9 @@ def summarize_results(
             "rows": row_summaries,
             "config_distributions": provider_distributions,
         }
+        if benchmark_label := provider_benchmark_labels[0]:
+            provider_summary["benchmark_label"] = benchmark_label
+        provider_summaries[provider] = provider_summary
     distributions = [
         {
             "row_index": row_index,
@@ -1591,6 +1840,8 @@ def _print_summary(summary: dict[str, Any]) -> None:
                 f"  {result['selection_stability']} config variation on rows "
                 f"{varying_rows}"
             )
+        if benchmark_label := result.get("benchmark_label"):
+            print(f"  benchmark: {benchmark_label}")
     monitoring = summary["monitoring"]
     if monitoring["active_clock_event_reason_sample_count"]:
         print(
@@ -1620,20 +1871,26 @@ def _run_campaign(args: argparse.Namespace) -> int:
             run_dir = output_dir / run_id
             run_dir.mkdir()
             command = _worker_command(args, provider, replicate, run_dir, roots)
+            compute_applications_path = run_dir / "compute_applications.jsonl"
             telemetry_path = run_dir / "telemetry.csv"
             log_path = run_dir / "worker.log"
             print(f"=== {run_id} ===", flush=True)
-            returncode, samples = _run_monitored_worker(
-                command,
-                environment=_worker_environment(
-                    run_dir,
-                    cuda_visible_devices=target_gpu_uuid,
-                    helion_selection=args.helion_selection,
-                    quack_root=(roots.get("quack") if provider == "quack" else None),
-                ),
-                log_path=log_path,
-                telemetry_path=telemetry_path,
-                target_gpu_uuid=target_gpu_uuid,
+            returncode, telemetry_samples, compute_application_samples = (
+                _run_monitored_worker(
+                    command,
+                    environment=_worker_environment(
+                        run_dir,
+                        cuda_visible_devices=target_gpu_uuid,
+                        helion_selection=args.helion_selection,
+                        quack_root=(
+                            roots.get("quack") if provider == "quack" else None
+                        ),
+                    ),
+                    compute_applications_path=compute_applications_path,
+                    log_path=log_path,
+                    telemetry_path=telemetry_path,
+                    target_gpu_uuid=target_gpu_uuid,
+                )
             )
             if returncode:
                 tail = "".join(
@@ -1653,8 +1910,21 @@ def _run_campaign(args: argparse.Namespace) -> int:
             ):
                 raise RuntimeError(f"{run_id} worker used the wrong GPU: {device}")
             monitoring = _summarize_telemetry(telemetry_path, target_gpu_uuid)
-            if monitoring["sample_count"] != samples:
+            compute_application_monitoring = _summarize_compute_applications(
+                compute_applications_path, target_gpu_uuid
+            )
+            if monitoring["sample_count"] != telemetry_samples:
                 raise RuntimeError(f"{run_id} telemetry sample count changed")
+            if (
+                compute_application_monitoring["sample_count"]
+                != compute_application_samples
+            ):
+                raise RuntimeError(f"{run_id} compute-application sample count changed")
+            if compute_application_monitoring["foreign_application_observation_count"]:
+                raise RuntimeError(
+                    f"{run_id} compute-application evidence contains a process "
+                    "outside the worker process group"
+                )
             if monitoring["disallowed_clock_event_reason_sample_count"]:
                 raise RuntimeError(
                     f"{run_id} telemetry reported disallowed clock-event reasons: "
@@ -1668,7 +1938,22 @@ def _run_campaign(args: argparse.Namespace) -> int:
                     "result": str(result_path.relative_to(output_dir)),
                     "log": str(log_path.relative_to(output_dir)),
                     "telemetry": str(telemetry_path.relative_to(output_dir)),
+                    "compute_applications": str(
+                        compute_applications_path.relative_to(output_dir)
+                    ),
                     "telemetry_samples": monitoring["sample_count"],
+                    "compute_application_samples": compute_application_monitoring[
+                        "sample_count"
+                    ],
+                    "worker_process_group": compute_application_monitoring[
+                        "worker_process_group"
+                    ],
+                    "compute_application_observation_count": (
+                        compute_application_monitoring["application_observation_count"]
+                    ),
+                    "observed_compute_applications": compute_application_monitoring[
+                        "observed_applications"
+                    ],
                     "power_limit_watts": monitoring["power_limit_watts"],
                     "active_clock_event_reason_sample_count": monitoring[
                         "active_clock_event_reason_sample_count"
@@ -1696,6 +1981,18 @@ def _run_campaign(args: argparse.Namespace) -> int:
     summary["monitoring"] = {
         "target_gpu_uuid": target_gpu_uuid,
         "target_gpu_idle_before_after_each_run": True,
+        "compute_applications_monitored_during_each_run": True,
+        "compute_application_sample_interval_seconds": (
+            COMPUTE_APPLICATION_INTERVAL_SECONDS
+        ),
+        "compute_application_sample_count": sum(
+            run["compute_application_samples"] for run in runs
+        ),
+        "compute_application_observation_count": sum(
+            run["compute_application_observation_count"] for run in runs
+        ),
+        "foreign_compute_application_observation_count": 0,
+        "foreign_compute_applications_invalidate_run": True,
         "power_limit_watts": next(iter(power_limits)),
         "power_limit_constant_across_campaign": True,
         "telemetry_sample_count": sum(run["telemetry_samples"] for run in runs),

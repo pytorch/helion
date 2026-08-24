@@ -24,14 +24,30 @@ if TYPE_CHECKING:
 QUACK_B_LAYOUTS = ("k_major", "n_major")
 _NATIVE_FILE_MARKERS = (".so", ".dylib", ".dll", ".pyd")
 QUACK_REPOSITORY = "https://github.com/Dao-AILab/quack"
-QUACK_VERSION = "0.6.4"
+# The pinned post-release source still reports the preceding release version.
+QUACK_PACKAGE_METADATA_VERSION = "0.6.4"
+QUACK_BASE_RELEASE_TAG = "v0.6.4"
 QUACK_COMMIT = "c8ec3170057987da0ec99883736f381ea1937cf3"
+QUACK_BENCHMARK_LABEL = (
+    f"quack-main@{QUACK_COMMIT[:8]} (post-{QUACK_BASE_RELEASE_TAG}, non-release)"
+)
 QUACK_DEPENDENCY_VERSIONS = {
     "nvidia-cutlass-dsl": "4.7.0",
     "apache-tvm-ffi": "0.1.13.post3",
     "torch-c-dlpack-ext": "0.1.5",
     "einops": "0.8.2",
 }
+
+
+def _source_provenance() -> dict[str, object]:
+    return {
+        "kind": "upstream_main_snapshot",
+        "repository": QUACK_REPOSITORY,
+        "commit": QUACK_COMMIT,
+        "base_release_tag": QUACK_BASE_RELEASE_TAG,
+        "is_formal_release": False,
+        "benchmark_label": QUACK_BENCHMARK_LABEL,
+    }
 
 
 def _module_identity(module: ModuleType, root: Path, name: str) -> dict[str, str]:
@@ -122,9 +138,10 @@ def verify_quack_installation(
         distribution = importlib.metadata.distribution("quack-kernels")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError("QuACK requires the quack-kernels distribution") from error
-    if distribution.version != QUACK_VERSION:
+    if distribution.version != QUACK_PACKAGE_METADATA_VERSION:
         raise RuntimeError(
-            f"QuACK distribution is {distribution.version!r}, expected {QUACK_VERSION!r}"
+            "QuACK distribution is "
+            f"{distribution.version!r}, expected {QUACK_PACKAGE_METADATA_VERSION!r}"
         )
     native_files = _native_distribution_files(distribution)
     installation = "editable"
@@ -151,6 +168,7 @@ def verify_quack_installation(
     return {
         "repository": QUACK_REPOSITORY,
         "upstream_commit": str(checkout["commit"]),
+        "source_provenance": _source_provenance(),
         "distribution_version": distribution.version,
         "distribution_requirements": sorted(distribution.requires or ()),
         "dependency_versions": dependency_versions,
@@ -177,9 +195,10 @@ def _package_identity(quack_root: Path | None = None) -> dict[str, object]:
     identity = verify_quack_installation(quack_root)
     module = cast("Any", sys.modules["quack"])
     module_version = str(module.__version__)
-    if module_version != QUACK_VERSION:
+    if module_version != QUACK_PACKAGE_METADATA_VERSION:
         raise RuntimeError(
-            f"QuACK module is {module_version!r}, expected {QUACK_VERSION!r}"
+            "QuACK module is "
+            f"{module_version!r}, expected {QUACK_PACKAGE_METADATA_VERSION!r}"
         )
     return {
         **identity,
@@ -259,7 +278,7 @@ def prepare_quack_default(
         device=inputs.compact_a.device,
         dtype=torch.bfloat16,
     )
-    # This is the public API with its actual defaults: in QuACK 0.6.4,
+    # This is the public API with the snapshot's actual defaults:
     # ``tuned=True``, ``dynamic_scheduler=False``, and ``split_k=1``. Run it
     # once during preparation so candidate compilation and benchmarking cannot
     # enter this benchmark's captured/timed replay.
@@ -304,7 +323,7 @@ def prepare_quack_default(
         return output
 
     return common.PreparedImplementation(
-        name=f"quack-public-default-tuned-{b_layout}",
+        name=f"quack-main-{QUACK_COMMIT[:8]}-public-default-tuned-{b_layout}",
         call=call,
         output_tensors=lambda result: (cast("torch.Tensor", result),),
         logical_outputs=lambda result: inputs.compact_output_slices(
@@ -312,6 +331,7 @@ def prepare_quack_default(
         ),
         config={
             "provider": "quack",
+            "benchmark_label": QUACK_BENCHMARK_LABEL,
             "selection_mode": "public_api_default_tuned",
             "selection_api": "gemm(default tuned=True)",
             "replay_api": "gemm_tuned.fn(resolved config)",

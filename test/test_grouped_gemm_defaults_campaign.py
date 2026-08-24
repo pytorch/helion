@@ -145,6 +145,24 @@ def _mock_cuda_runtime(
     )
 
 
+def _write_compute_application_evidence(
+    path: Path, *, worker_process_group: int = 1234
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema": benchmark.COMPUTE_APPLICATIONS_SCHEMA,
+                "sample_index": 0,
+                "timestamp_unix_ns": 123,
+                "target_gpu_uuid": "GPU-test",
+                "worker_process_group": worker_process_group,
+                "applications": [],
+            }
+        )
+        + "\n"
+    )
+
+
 def test_parse_provider_subset_preserves_order_and_rejects_invalid() -> None:
     assert benchmark.parse_providers("quack,cudnn,cublaslt") == (
         "quack",
@@ -715,6 +733,7 @@ def test_monitored_worker_records_periodic_and_final_samples_then_cleans(
     idle_checks: list[tuple[str, str]] = []
     monkeypatch.setattr(benchmark.subprocess, "Popen", popen)
     monkeypatch.setattr(benchmark, "_query_telemetry", lambda _device: next(samples))
+    monkeypatch.setattr(benchmark, "_query_compute_applications", lambda _device: ())
     monkeypatch.setattr(benchmark, "_terminate_process", events.append)
     monkeypatch.setattr(
         benchmark,
@@ -727,16 +746,19 @@ def test_monitored_worker_records_periodic_and_final_samples_then_cleans(
         lambda uuid: idle_checks.append(("after", uuid)),
     )
     monkeypatch.setattr(benchmark.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(benchmark.time, "time_ns", lambda: 123)
     monkeypatch.setattr(benchmark.time, "sleep", lambda _seconds: None)
+    compute_applications_path = tmp_path / "compute_applications.jsonl"
     telemetry_path = tmp_path / "telemetry.csv"
 
     assert benchmark._run_monitored_worker(
         ("worker",),
         environment={"TEST": "1"},
+        compute_applications_path=compute_applications_path,
         log_path=tmp_path / "worker.log",
         telemetry_path=telemetry_path,
         target_gpu_uuid="GPU-test",
-    ) == (7, 2)
+    ) == (7, 2, 2)
     command, kwargs = events[0]
     assert command == ("worker",)
     assert kwargs == {
@@ -754,6 +776,214 @@ def test_monitored_worker_records_periodic_and_final_samples_then_cleans(
         "periodic",
         "final",
     ]
+    assert [
+        json.loads(line) for line in compute_applications_path.read_text().splitlines()
+    ] == [
+        {
+            "applications": [],
+            "sample_index": 0,
+            "schema": benchmark.COMPUTE_APPLICATIONS_SCHEMA,
+            "target_gpu_uuid": "GPU-test",
+            "timestamp_unix_ns": 123,
+            "worker_process_group": 1234,
+        },
+        {
+            "applications": [],
+            "sample_index": 1,
+            "schema": benchmark.COMPUTE_APPLICATIONS_SCHEMA,
+            "target_gpu_uuid": "GPU-test",
+            "timestamp_unix_ns": 123,
+            "worker_process_group": 1234,
+        },
+    ]
+
+
+def test_compute_application_monitor_allows_worker_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    applications = (
+        benchmark._ComputeApplication(1234, "worker", "10"),
+        benchmark._ComputeApplication(1235, "compiler-child", "20"),
+    )
+    monkeypatch.setattr(
+        benchmark, "_query_compute_applications", lambda _device: applications
+    )
+    monkeypatch.setattr(benchmark.os, "getpgid", lambda _pid: 1234)
+    evidence_path = tmp_path / "compute_applications.jsonl"
+    with evidence_path.open("x") as evidence:
+        benchmark._record_compute_applications(
+            evidence,
+            sample_index=0,
+            target_gpu_uuid="GPU-test",
+            worker_process_group=1234,
+            known_worker_pids={1234},
+        )
+
+    summary = benchmark._summarize_compute_applications(evidence_path, "GPU-test")
+
+    assert summary == {
+        "sample_count": 1,
+        "worker_process_group": 1234,
+        "application_observation_count": 2,
+        "observed_applications": [
+            {"pid": 1234, "process_group": 1234, "process_name": "worker"},
+            {
+                "pid": 1235,
+                "process_group": 1234,
+                "process_name": "compiler-child",
+            },
+        ],
+        "foreign_application_observation_count": 0,
+    }
+
+
+def test_compute_application_monitor_allows_known_worker_teardown_residue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        benchmark,
+        "_query_compute_applications",
+        lambda _device: (benchmark._ComputeApplication(1234, "worker", "10"),),
+    )
+    monkeypatch.setattr(
+        benchmark.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+    )
+    evidence_path = tmp_path / "compute_applications.jsonl"
+    with evidence_path.open("x") as evidence:
+        benchmark._record_compute_applications(
+            evidence,
+            sample_index=0,
+            target_gpu_uuid="GPU-test",
+            worker_process_group=1234,
+            known_worker_pids={1234},
+        )
+
+    observation = json.loads(evidence_path.read_text())
+    assert observation["applications"] == [
+        {
+            "allowed": True,
+            "membership_basis": "worker_process_group_leader",
+            "pid": 1234,
+            "process_group": None,
+            "process_name": "worker",
+            "used_memory": "10",
+        }
+    ]
+    assert (
+        benchmark._summarize_compute_applications(evidence_path, "GPU-test")[
+            "foreign_application_observation_count"
+        ]
+        == 0
+    )
+
+
+def test_monitored_worker_rejects_transient_foreign_compute_application(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process: Any = SimpleNamespace(pid=1234, poll=lambda: None)
+    clean = (benchmark._ComputeApplication(1234, "worker", "10"),)
+    foreign = (benchmark._ComputeApplication(9999, "foreign", "20"),)
+    application_samples = iter((clean, foreign))
+    cleanup: list[object] = []
+    idle_checks: list[tuple[str, str]] = []
+    monkeypatch.setattr(benchmark, "COMPUTE_APPLICATION_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(
+        benchmark.subprocess, "Popen", lambda *_args, **_kwargs: process
+    )
+    monkeypatch.setattr(benchmark, "_query_telemetry", lambda _device: "telemetry")
+    monkeypatch.setattr(
+        benchmark,
+        "_query_compute_applications",
+        lambda _device: next(application_samples),
+    )
+    monkeypatch.setattr(
+        benchmark.os,
+        "getpgid",
+        lambda pid: 1234 if pid == 1234 else 9999,
+    )
+    monkeypatch.setattr(benchmark, "_terminate_process", cleanup.append)
+    monkeypatch.setattr(
+        benchmark,
+        "_require_target_gpu_idle",
+        lambda uuid: idle_checks.append(("before", uuid)),
+    )
+
+    def fail_post_worker_idle_check(uuid: str) -> None:
+        idle_checks.append(("after", uuid))
+        raise RuntimeError("foreign process remained visible during cleanup")
+
+    monkeypatch.setattr(
+        benchmark, "_wait_for_target_gpu_idle", fail_post_worker_idle_check
+    )
+    monkeypatch.setattr(benchmark.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(benchmark.time, "sleep", lambda _seconds: None)
+    evidence_path = tmp_path / "compute_applications.jsonl"
+
+    with pytest.raises(RuntimeError, match="outside worker process group 1234"):
+        benchmark._run_monitored_worker(
+            ("worker",),
+            environment={},
+            compute_applications_path=evidence_path,
+            log_path=tmp_path / "worker.log",
+            telemetry_path=tmp_path / "telemetry.csv",
+            target_gpu_uuid="GPU-test",
+        )
+
+    observations = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert [observation["sample_index"] for observation in observations] == [0, 1]
+    assert observations[0]["applications"][0]["allowed"] is True
+    assert observations[1]["applications"][0] == {
+        "allowed": False,
+        "membership_basis": "outside_worker_process_group",
+        "pid": 9999,
+        "process_group": 9999,
+        "process_name": "foreign",
+        "used_memory": "20",
+    }
+    assert cleanup == [process]
+    assert idle_checks == [("before", "GPU-test"), ("after", "GPU-test")]
+
+
+def test_monitored_worker_interrupt_still_terminates_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process: Any = SimpleNamespace(pid=1234, poll=lambda: None)
+    cleanup: list[object] = []
+    interrupted = benchmark._CampaignInterrupted(signal.SIGTERM)
+    monkeypatch.setattr(
+        benchmark.subprocess, "Popen", lambda *_args, **_kwargs: process
+    )
+    monkeypatch.setattr(benchmark, "_require_target_gpu_idle", lambda _uuid: None)
+    monkeypatch.setattr(
+        benchmark,
+        "_query_compute_applications",
+        lambda _uuid: (_ for _ in ()).throw(interrupted),
+    )
+    monkeypatch.setattr(benchmark, "_terminate_process", cleanup.append)
+    monkeypatch.setattr(
+        benchmark,
+        "_wait_for_target_gpu_idle",
+        lambda _uuid: (_ for _ in ()).throw(RuntimeError("still busy")),
+    )
+
+    with pytest.raises(benchmark._CampaignInterrupted) as raised:
+        benchmark._run_monitored_worker(
+            ("worker",),
+            environment={},
+            compute_applications_path=tmp_path / "compute_applications.jsonl",
+            log_path=tmp_path / "worker.log",
+            telemetry_path=tmp_path / "telemetry.csv",
+            target_gpu_uuid="GPU-test",
+        )
+
+    assert raised.value is interrupted
+    assert cleanup == [process]
 
 
 def test_telemetry_allows_idle_and_sw_power_cap(
@@ -964,13 +1194,53 @@ def test_summary_reports_fresh_autotuned_provider_config_drift() -> None:
     )
 
     quack = summary["provider_results"]["quack"]
-    assert summary["schema"] == "helion-grouped-gemm-provider-summary-v5"
+    assert summary["schema"] == "helion-grouped-gemm-provider-summary-v6"
     assert summary["publication_eligible"] is True
     assert quack["selection"] == "public_api_default_tuned"
     assert quack["selection_stability"] == "fresh_autotuned"
     assert quack["config_invariance_required"] is False
     assert quack["all_configs_invariant"] is False
     assert all(not item["invariant"] for item in quack["config_distributions"])
+
+
+def test_summary_preserves_and_prints_provider_benchmark_label(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = _result("quack", 0)
+    for row in cast("list[dict[str, Any]]", result["rows"]):
+        row["configs"]["provider"]["benchmark_label"] = (
+            "quack-main@c8ec3170 (post-v0.6.4, non-release)"
+        )
+
+    summary = benchmark.summarize_results(
+        [result],
+        providers=("quack",),
+        replicates=1,
+        helion_selection="compiler_heuristic",
+    )
+    summary["monitoring"] = {"active_clock_event_reason_sample_count": 0}
+    benchmark._print_summary(summary)
+
+    assert summary["provider_results"]["quack"]["benchmark_label"] == (
+        "quack-main@c8ec3170 (post-v0.6.4, non-release)"
+    )
+    assert "benchmark: quack-main@c8ec3170 (post-v0.6.4, non-release)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_summary_rejects_provider_benchmark_label_drift() -> None:
+    result = _result("quack", 0)
+    rows = cast("list[dict[str, Any]]", result["rows"])
+    rows[0]["configs"]["provider"]["benchmark_label"] = "snapshot-a"
+
+    with pytest.raises(RuntimeError, match="benchmark label changed across rows"):
+        benchmark.summarize_results(
+            [result],
+            providers=("quack",),
+            replicates=1,
+            helion_selection="compiler_heuristic",
+        )
 
 
 def test_summary_rejects_fixed_provider_config_drift() -> None:
@@ -1074,10 +1344,11 @@ def test_campaign_runs_sequential_provider_replicates_and_writes_summary(
         command: list[str],
         *,
         environment: dict[str, str],
+        compute_applications_path: Path,
         log_path: Path,
         telemetry_path: Path,
         target_gpu_uuid: str,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         provider = command[command.index("--provider") + 1]
         replicate = int(command[command.index("--replicate") + 1])
         run_dir = Path(command[command.index("--run-dir") + 1])
@@ -1085,6 +1356,10 @@ def test_campaign_runs_sequential_provider_replicates_and_writes_summary(
         assert environment["CUDA_VISIBLE_DEVICES"] == target_gpu_uuid
         log_path.write_text("")
         telemetry_path.write_text("timestamp,uuid\n")
+        _write_compute_application_evidence(
+            compute_applications_path,
+            worker_process_group=10_000 + replicate,
+        )
         (run_dir / "result.json").write_text(
             json.dumps(
                 _result(
@@ -1094,7 +1369,7 @@ def test_campaign_runs_sequential_provider_replicates_and_writes_summary(
                 )
             )
         )
-        return 0, 2
+        return 0, 2, 1
 
     monkeypatch.setattr(benchmark, "_run_monitored_worker", run_worker)
     monkeypatch.setattr(benchmark, "_resolve_target_gpu", lambda _selector: "GPU-test")
@@ -1126,6 +1401,15 @@ def test_campaign_runs_sequential_provider_replicates_and_writes_summary(
         "0x1": 4,
         "0x4": 4,
     }
+    assert summary["monitoring"]["compute_applications_monitored_during_each_run"]
+    assert summary["monitoring"]["compute_application_sample_interval_seconds"] == 1
+    assert summary["monitoring"]["compute_application_sample_count"] == 4
+    assert summary["monitoring"]["compute_application_observation_count"] == 0
+    assert summary["monitoring"]["foreign_compute_application_observation_count"] == 0
+    assert summary["runs"][0]["compute_applications"] == (
+        "quack-r0/compute_applications.jsonl"
+    )
+    assert summary["runs"][0]["worker_process_group"] == 10_000
 
 
 def test_campaign_rejects_disallowed_clock_event_reason(
@@ -1138,10 +1422,13 @@ def test_campaign_rejects_disallowed_clock_event_reason(
     def run_worker(
         command: list[str],
         **_kwargs: object,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         run_dir = Path(command[command.index("--run-dir") + 1])
+        compute_applications_path = _kwargs["compute_applications_path"]
+        assert isinstance(compute_applications_path, Path)
+        _write_compute_application_evidence(compute_applications_path)
         (run_dir / "result.json").write_text(json.dumps(_result("quack", 0)))
-        return 0, 1
+        return 0, 1, 1
 
     monkeypatch.setattr(benchmark, "_run_monitored_worker", run_worker)
     monkeypatch.setattr(benchmark, "_resolve_target_gpu", lambda _selector: "GPU-test")
@@ -1170,11 +1457,14 @@ def test_campaign_rejects_power_limit_drift_across_workers(
     _mock_cuda_runtime(monkeypatch, tmp_path)
     args = _args(tmp_path, providers=("quack",), replicates=2)
 
-    def run_worker(command: list[str], **_kwargs: object) -> tuple[int, int]:
+    def run_worker(command: list[str], **_kwargs: object) -> tuple[int, int, int]:
         replicate = int(command[command.index("--replicate") + 1])
         run_dir = Path(command[command.index("--run-dir") + 1])
+        compute_applications_path = _kwargs["compute_applications_path"]
+        assert isinstance(compute_applications_path, Path)
+        _write_compute_application_evidence(compute_applications_path)
         (run_dir / "result.json").write_text(json.dumps(_result("quack", replicate)))
-        return 0, 1
+        return 0, 1, 1
 
     power_limits = iter((1000.0, 900.0))
     monkeypatch.setattr(benchmark, "_run_monitored_worker", run_worker)

@@ -1135,6 +1135,7 @@ def test_quack_public_default_call_contract(monkeypatch: Any) -> None:
         lambda quack_root=None: {
             "module_version": "test",
             "source_root": "/tmp/quack",
+            "source_provenance": quack_grouped_gemm._source_provenance(),
         },
     )
     monkeypatch.setattr(
@@ -1168,6 +1169,9 @@ def test_quack_public_default_call_contract(monkeypatch: Any) -> None:
     assert len(replay_calls) == 2
     assert all(call["config"] is selected_config for call in replay_calls)
     assert prepared.config["requested_config"] is None
+    assert prepared.config["benchmark_label"] == (
+        "quack-main@c8ec3170 (post-v0.6.4, non-release)"
+    )
     assert prepared.config["b_layout"] == "n_major"
     assert prepared.config["resolved_dynamic_scheduler"] is True
     assert prepared.config["selection_mode"] == "public_api_default_tuned"
@@ -1185,7 +1189,7 @@ def test_quack_source_override_rejects_native_distribution(
     tmp_path: Path,
 ) -> None:
     distribution = SimpleNamespace(
-        version=quack_grouped_gemm.QUACK_VERSION,
+        version=quack_grouped_gemm.QUACK_PACKAGE_METADATA_VERSION,
         files=(Path("quack/_native.so"), Path("quack/api.py")),
     )
     monkeypatch.setattr(
@@ -1203,7 +1207,7 @@ def test_quack_source_override_requires_child_import_path(
     tmp_path: Path,
 ) -> None:
     distribution = SimpleNamespace(
-        version=quack_grouped_gemm.QUACK_VERSION,
+        version=quack_grouped_gemm.QUACK_PACKAGE_METADATA_VERSION,
         files=(Path("quack/api.py"),),
     )
     monkeypatch.setattr(
@@ -1225,6 +1229,20 @@ def test_quack_editable_root_requires_pep610_editable_flag(tmp_path: Path) -> No
 
     with pytest.raises(RuntimeError, match="not installed from an editable checkout"):
         quack_grouped_gemm._editable_root(cast("Any", distribution))
+
+
+def test_quack_source_provenance_is_explicitly_not_a_release() -> None:
+    provenance = quack_grouped_gemm._source_provenance()
+
+    assert quack_grouped_gemm.QUACK_PACKAGE_METADATA_VERSION == "0.6.4"
+    assert provenance == {
+        "kind": "upstream_main_snapshot",
+        "repository": "https://github.com/Dao-AILab/quack",
+        "commit": "c8ec3170057987da0ec99883736f381ea1937cf3",
+        "base_release_tag": "v0.6.4",
+        "is_formal_release": False,
+        "benchmark_label": "quack-main@c8ec3170 (post-v0.6.4, non-release)",
+    }
 
 
 def test_quack_requires_pinned_source_dependencies(monkeypatch: Any) -> None:

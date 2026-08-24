@@ -22,13 +22,16 @@ CUDA_VISIBLE_DEVICES=0 nohup /tmp/helion-grouped-gemm-venv/bin/python \
 ```
 
 The adapters enforce the provider versions used by the campaign: DeepGEMM
-2.6.1 at `559d79fb`; QuACK 0.6.4 at current upstream main `c8ec3170`
-(including the post-release CUDA DSL 4.7 migration); cuDNN frontend 1.27.0
-with backend 9.24.0.43; cuBLAS
+2.6.1 at `559d79fb`; the QuACK upstream-main snapshot `c8ec3170`, whose
+distribution and module metadata still report 0.6.4 but which is **not** the
+formal `v0.6.4` release; cuDNN frontend 1.27.0 with backend 9.24.0.43; cuBLAS
 13.6.1.10; and CUTLASS 4.7.0 at its `v4.7.0` tag (`dcf215af`). The QuACK
-`v0.6.4` tag itself pins CUDA DSL 4.6.2 and therefore cannot share Helion's
-4.7.0 worker environment. Binary files and imported provider modules are
-hashed in each worker result.
+snapshot includes the post-release CUDA DSL 4.7 migration and is labeled
+`quack-main@c8ec3170 (post-v0.6.4, non-release)` in worker results. The formal
+`v0.6.4` tag pins CUDA DSL 4.6.2 and therefore cannot share Helion's 4.7.0
+worker environment. It is not the QuACK source measured by this paired
+campaign. Binary files and imported provider modules are hashed in each worker
+result.
 
 The normal Helion lock follows PyTorch's CUDA package versions and is not the
 publication environment for this benchmark. Starting from a working Helion
@@ -54,10 +57,12 @@ rejects missing or mismatched packages before starting a worker.
 `--providers` accepts any nonempty ordered subset. The DeepGEMM and CUTLASS
 source-root flags are required when their provider is selected. QuACK accepts
 either its pinned editable install or an explicit clean Python-source checkout
-through `--quack-root`; both modes require the `quack-kernels==0.6.4`
-distribution metadata. A source override is rejected if that distribution
-contains native artifacts that cannot be tied to the checkout. Run the command
-detached for long campaigns, especially `live_autotune`.
+through `--quack-root`; both modes require `quack-kernels==0.6.4` distribution
+metadata only as an installation/dependency contract. That version string does
+not identify the measured source as the `v0.6.4` release. A source override is
+rejected if that distribution contains native artifacts that cannot be tied to
+the checkout. Run the command detached for long campaigns, especially
+`live_autotune`.
 
 Helion modes are:
 
@@ -97,8 +102,12 @@ The controller records and rechecks the source commit/tree after every worker.
 
 The campaign resolves the selected GPU to its UUID, requires that GPU to have
 no compute applications immediately before and after every worker, and checks
-both worker results and telemetry against that UUID. Worker processes receive a
-clean set of Helion, provider, compiler, and CUDA loader controls. The CUDA
+both worker results and telemetry against that UUID. Throughout every worker,
+the controller independently records all compute applications on that GPU once
+per second and rejects a PID whose process group differs from the isolated
+worker process group. Worker children in that group are allowed. Worker
+processes receive a clean set of Helion, provider, compiler, and CUDA loader
+controls. The CUDA
 stack must come from the exact installed distributions
 `nvidia-cuda-runtime==13.3.29`, `nvidia-cuda-nvcc==13.3.73`,
 `nvidia-nvvm==13.3.73`, and `nvidia-cuda-crt==13.3.73`. The campaign uses
@@ -140,9 +149,13 @@ re-reads its contents and keys the compatibility guard from those values,
 matching the launcher's value-based metadata key. Each inference-worklist
 specialization check therefore incurs a device-to-host metadata read.
 
-The output directory contains one `result.json`, `worker.log`, and
-`telemetry.csv` per provider/replicate plus `summary.json`. Telemetry is sampled
-with `nvidia-smi` every five seconds. `--output-dir` is controller-only;
+The output directory contains one `result.json`, `worker.log`, `telemetry.csv`,
+and `compute_applications.jsonl` per provider/replicate plus `summary.json`.
+Telemetry is sampled with `nvidia-smi` every five seconds; GPU compute
+applications are sampled independently every second. Every process snapshot
+records the worker process group and the PID, process group, name, and memory
+use of each visible compute application.
+`--output-dir` is controller-only;
 workers receive only their isolated `--run-dir`. The summary reports
 per-provider geometric mean speedup, wins, worst row, provider selection
 stability, Helion/provider config distributions, and any
