@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +14,9 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion.autotuner import BooleanFragment
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -92,6 +95,40 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         result = kernel_with_enum(x)
         expected = x * 2.0
         torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("to_triton_code is not supported in ref eager mode")
+    def test_tunable_device_arguments_are_constexpr(self):
+        """Config-backed tunables must be compile-time device arguments."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty_like(x)
+            multiplier = hl.register_tunable("multiplier", IntegerFragment(1, 8, 2))
+            use_add = hl.register_tunable("use_add", BooleanFragment())
+
+            for tile in hl.tile(n):
+                if use_add:
+                    out[tile] = x[tile] + multiplier
+                else:
+                    out[tile] = x[tile] * multiplier
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        bound = fn.bind((x,))
+
+        for use_add in (False, True):
+            config = helion.Config(block_sizes=[64], multiplier=3, use_add=use_add)
+            code = bound.to_triton_code(config)
+            signature = re.search(r"^def _helion_fn\((.*)\):$", code, re.MULTILINE)
+            assert signature is not None
+            constexpr_type = bound.env.backend.constexpr_type
+            self.assertIn(f"multiplier: {constexpr_type}", signature.group(1))
+            self.assertIn(f"use_add: {constexpr_type}", signature.group(1))
+
+            result = bound.compile_config(config)(x)
+            expected = x + 3 if use_add else x * 3
+            torch.testing.assert_close(result, expected)
 
     def test_tensor_allocated_with_block_size(self):
         @helion.kernel()

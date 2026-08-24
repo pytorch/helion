@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -178,7 +179,12 @@ def _register_tunable_type(
     python_type = type(fragment_val.default())
     if not issubclass(python_type, (int, float, bool)):
         raise exc.TunableTypeNotSupported(python_type)
-    return NumericType.subtype(python_type).new_unbacked(origin)
+    result = NumericType.subtype(python_type).new_unbacked(origin)
+    # Codegen uses this provenance to annotate device arguments as constexpr.
+    for symbol in result.value._sympy_().free_symbols:
+        assert isinstance(symbol, sympy.Symbol)
+        env.tunable_symbols.add(symbol)
+    return result
 
 
 @_decorators.codegen(register_tunable, "common")
