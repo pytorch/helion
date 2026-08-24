@@ -316,6 +316,13 @@ def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "pallas", reason)
 
 
+def skipIfPallasTpu(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test only on real Pallas TPU (not in interpret mode)."""
+    return skipIfFn(
+        lambda: _get_backend() == "pallas" and not is_pallas_interpret(), reason
+    )
+
+
 def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
     """Mark test as expected failure if running with pallas (TPU or interpret mode)"""
     return xfailIfFn(lambda: _get_backend() == "pallas", reason)
