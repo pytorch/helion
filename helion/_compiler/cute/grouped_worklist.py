@@ -6,9 +6,13 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import cast
 
+import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
+from torch._subclasses import FakeTensor
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
@@ -18,10 +22,42 @@ from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    import torch
     from torch._guards import Source
 
     from ..compile_environment import CompileEnvironment
+
+
+GroupedWorklistRows = tuple[tuple[int, int, int, int], ...]
+
+
+def _tcgen05_grouped_worklist_rows_from_flattened(
+    flattened: tuple[int, ...],
+) -> GroupedWorklistRows:
+    return tuple(
+        cast("tuple[int, int, int, int]", flattened[index : index + 4])
+        for index in range(0, len(flattened), 4)
+    )
+
+
+def tcgen05_grouped_worklist_rows(value: object) -> GroupedWorklistRows | None:
+    """Copy one runtime worklist into a stable, hashable row representation."""
+    if not isinstance(value, torch.Tensor):
+        return None
+    if isinstance(value, FakeTensor):
+        if not isinstance(value.constant, torch.Tensor):
+            return None
+        value = value.constant
+    if value.ndim != 2 or value.shape[1] != 4:
+        return None
+    with unset_fake_temporarily():
+        copied_rows = cast("list[list[int]]", value.detach().cpu().tolist())
+    return tuple(
+        cast(
+            "tuple[int, int, int, int]",
+            tuple(int(item) for item in row),
+        )
+        for row in copied_rows
+    )
 
 
 class Tcgen05GroupedWorklistValidationError(ValueError):
@@ -34,8 +70,9 @@ def register_tcgen05_grouped_worklist_runtime_specialization(
     *,
     grouped_tensor: torch.Tensor,
     packed_tensor: torch.Tensor,
+    reviewed_rows: frozenset[GroupedWorklistRows] = frozenset(),
 ) -> bool:
-    """Register the runtime cache-key projection for an external worklist."""
+    """Register runtime worklist compatibility and reviewed-policy identity."""
     from ...runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
     from ..compile_environment import RuntimeInputSpecialization
 
@@ -70,12 +107,13 @@ def register_tcgen05_grouped_worklist_runtime_specialization(
     classifier = _Tcgen05GroupedWorklistCompatibilityClassifier(
         static_group_count,
         static_packed_m,
+        reviewed_rows,
     )
     env.register_runtime_input_specialization(
         f"cute_tcgen05_grouped_worklist:{source!r}",
         RuntimeInputSpecialization(
             sources=tuple(sources),
-            classifier_identity=(static_group_count, static_packed_m),
+            classifier_identity=(static_group_count, static_packed_m, reviewed_rows),
             classifier=classifier,
         ),
     )

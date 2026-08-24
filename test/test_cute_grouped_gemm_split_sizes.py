@@ -640,8 +640,12 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
     _require_codegen_cuda()
     with torch.cuda.device(DEVICE):
         capability = torch.cuda.get_device_capability(DEVICE)
-    if capability != (10, 0):
-        pytest.skip("grouped worklist compiler seeds require SM100")
+    hardware_name = {
+        (10, 0): "NVIDIA B200",
+        (10, 3): "NVIDIA GB300",
+    }.get(capability)
+    if hardware_name is None:
+        pytest.skip("grouped worklist compiler seeds require SM100 or SM103")
 
     args = _make_device_split_sizes_args(
         (0, 1, 127, 224, 256, 449, 0, 991),
@@ -655,9 +659,9 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
             "helion._hardware.get_hardware_info",
             return_value=HardwareInfo(
                 device_kind="cuda",
-                hardware_name="NVIDIA B200",
+                hardware_name=hardware_name,
                 runtime_version="13.0",
-                compute_capability="sm100",
+                compute_capability=f"sm{capability[0]}{capability[1]}",
             ),
         ),
     ):
@@ -709,8 +713,12 @@ def test_grouped_device_offsets_are_recognized_and_normalized() -> None:
     _require_codegen_cuda()
     with torch.cuda.device(DEVICE):
         capability = torch.cuda.get_device_capability(DEVICE)
-    if capability != (10, 0):
-        pytest.skip("grouped worklist compiler seeds require SM100")
+    hardware_name = {
+        (10, 0): "NVIDIA B200",
+        (10, 3): "NVIDIA GB300",
+    }.get(capability)
+    if hardware_name is None:
+        pytest.skip("grouped worklist compiler seeds require SM100 or SM103")
 
     args = _make_device_offsets_args(
         (0, 1, 127, 224, 256, 449, 0, 991),
@@ -726,9 +734,9 @@ def test_grouped_device_offsets_are_recognized_and_normalized() -> None:
             "helion._hardware.get_hardware_info",
             return_value=HardwareInfo(
                 device_kind="cuda",
-                hardware_name="NVIDIA B200",
+                hardware_name=hardware_name,
                 runtime_version="13.0",
-                compute_capability="sm100",
+                compute_capability=f"sm{capability[0]}{capability[1]}",
             ),
         ),
     ):

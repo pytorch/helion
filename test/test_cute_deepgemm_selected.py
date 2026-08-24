@@ -557,7 +557,7 @@ def _run_standard_graph_replay_case(
     expected_metadata: list[list[int]] | None = None,
     exact_replay: bool = False,
 ) -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
     args = _make_args(
         m_sizes,
         n=n,
@@ -615,7 +615,7 @@ def _require_codegen_cuda() -> None:
         pytest.skip("tcgen05 selected-path codegen needs CUDA fake inputs")
 
 
-def _require_runtime_cuda13_sm100() -> None:
+def _require_runtime_cuda13_sm100_or_newer() -> None:
     _require_codegen_cuda()
     if not requires_cuda_version("13"):
         pytest.skip("tcgen05 selected-path runtime needs CUDA >= 13")
@@ -627,6 +627,41 @@ def _require_runtime_cuda13_sm100() -> None:
         pytest.skip("tcgen05 requires SM100+")
     if not get_cute_mma_support().tcgen05_f16bf16:
         pytest.skip("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+
+def test_grouped_worklist_nm_unmatched_gb300_uses_generic_default() -> None:
+    _require_runtime_cuda13_sm100_or_newer()
+    if torch.cuda.get_device_name(DEVICE) != "NVIDIA GB300":
+        pytest.skip("the unmatched-product promotion gate is specific to GB300")
+
+    args = _make_args(
+        (1901, 1913, 1925, 1937, 1949, 1961, 1973, 1985),
+        n=512,
+        k=256,
+        dirty_padding=True,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    )
+    kernel = helion.kernel(
+        _selected_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+        bound = kernel.bind(args)
+        grouped_seeds = [
+            config
+            for config in bound.config_spec.compiler_seed_configs
+            if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ]
+        assert grouped_seeds
+        assert bound.config_spec.compiler_default_config == grouped_seeds[0]
+
+        out = bound(*args)
+        torch.cuda.synchronize()
+
+    _assert_output(out, args)
 
 
 def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
@@ -1560,7 +1595,7 @@ def test_grouped_worklist_nm_runtime_and_graph_replay(
     block_k: int,
     source_m_tile: int,
 ) -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
 
     small_source = source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
     m_sizes = (24, 23, 19, 17, 20, 18) if small_source else (224, 449, 256)
@@ -1636,7 +1671,7 @@ def test_grouped_worklist_nm_runtime_and_graph_replay(
 def test_grouped_worklist_nm_zero_token_groups_runtime_and_graph_replay(
     runtime_direct: bool,
 ) -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
 
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     args = _make_args(
@@ -1662,7 +1697,7 @@ def test_grouped_worklist_nm_zero_token_groups_runtime_and_graph_replay(
 
 
 def test_grouped_worklist_nm_zero_valid_tail_runtime_and_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
 
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     n = 256
@@ -1727,7 +1762,7 @@ def test_grouped_worklist_nm_invalid_metadata_is_rejected_at_launch(
     ab_stages: int | None,
     match: str,
 ) -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
 
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     args = _make_args(
@@ -1753,10 +1788,54 @@ def test_grouped_worklist_nm_invalid_metadata_is_rejected_at_launch(
             bound(*args)
 
 
-def test_grouped_worklist_nm_runtime_direct_clc_runtime_and_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
+@pytest.mark.parametrize(
+    ("source_m_tile", "mn_major_b", "consumer_regs", "l2_swizzle_size"),
+    (
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+            True,
+            224,
+            16,
+            id="source224-n-major-r224-panel16",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            True,
+            224,
+            16,
+            id="source256-n-major-r224-panel16",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            False,
+            256,
+            8,
+            id="source256-k-major-r256-panel8",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            False,
+            240,
+            1,
+            id="source256-k-major-r240-panel1",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            False,
+            256,
+            1,
+            id="source256-k-major-r256-panel1",
+        ),
+    ),
+)
+def test_grouped_worklist_nm_clc_runtime_and_graph_replay(
+    source_m_tile: int,
+    mn_major_b: bool,
+    consumer_regs: int,
+    l2_swizzle_size: int,
+) -> None:
+    _require_runtime_cuda13_sm100_or_newer()
 
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
     m_sizes = (1024, 1024, 1024)
     n = 4096
     args = _make_args(
@@ -1764,6 +1843,7 @@ def test_grouped_worklist_nm_runtime_direct_clc_runtime_and_graph_replay() -> No
         n=n,
         k=128,
         dirty_padding=True,
+        mn_major_b=mn_major_b,
         source_m_tile=source_m_tile,
     )
     logical_clusters = sum(
@@ -1779,8 +1859,8 @@ def test_grouped_worklist_nm_runtime_direct_clc_runtime_and_graph_replay() -> No
             64,
             ab_stages=6,
             source_m_tile=source_m_tile,
-            consumer_regs=256,
-            l2_swizzle_size=8,
+            consumer_regs=consumer_regs,
+            l2_swizzle_size=l2_swizzle_size,
             runtime_direct=True,
             clc=True,
         )

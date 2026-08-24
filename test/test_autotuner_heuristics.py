@@ -126,6 +126,15 @@ from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._compiler.cute.grouped_worklist import (
     tcgen05_grouped_worklist_compatible_source_m_tiles,
 )
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTuning
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistWorkload
+from helion._compiler.cute.grouped_worklist_policy import (
+    get_grouped_worklist_target_policy,
+)
+from helion._compiler.cute.grouped_worklist_policy import (
+    grouped_worklist_target_identities,
+)
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -264,6 +273,7 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
+from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
 from helion.runtime.kernel import _find_device as runtime_find_device
 from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
@@ -290,7 +300,7 @@ GB300_HARDWARE = HardwareInfo(
     device_kind="cuda",
     hardware_name="NVIDIA GB300",
     runtime_version="12.8",
-    compute_capability="sm100",
+    compute_capability="sm103",
 )
 A100_HARDWARE = HardwareInfo(
     device_kind="cuda",
@@ -365,7 +375,7 @@ class TestAutotunerHeuristic(TestCase):
                 packed_m=groups * (32 if source_m_tile == 32 else 4096),
                 n=n,
                 k=k,
-                b_major=b_major,
+                b_major=cast("Any", b_major),
                 source_m_tile=source_m_tile,
                 num_sm=148,
             )
@@ -385,6 +395,53 @@ class TestAutotunerHeuristic(TestCase):
             "source256_k": seeds(8, 4096, 2048, "k", 256),
             "source256_n": seeds(8, 4096, 2048, "n", 256),
         }
+
+    @staticmethod
+    def _expected_grouped_worklist_clc_config(
+        consumer_regs: int,
+        l2_swizzle_size: int,
+    ) -> dict[str, object]:
+        """Independent literal contract for GB300 rank-zero CLC seeds."""
+        return {
+            "block_sizes": [256, 128, 64],
+            "l2_groupings": [1],
+            "loop_orders": [[0, 1, 2]],
+            "num_stages": 7,
+            "num_warps": 8,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 6,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_consumer_regs": consumer_regs,
+            "tcgen05_grouped_mode": "worklist_nm",
+            "tcgen05_grouped_worklist_source_m_tile": 256,
+            "tcgen05_grouped_runtime_direct": True,
+            "tcgen05_l2_swizzle_size": l2_swizzle_size,
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_persistence_model": "clc_persistent",
+        }
+
+    @staticmethod
+    def _grouped_worklist_configs_from_arguments(
+        arguments: dict[str, Any],
+        target_hardware_identity: tuple[str, str, str] | None = None,
+        worklist_rows: tuple[tuple[int, int, int, int], ...] | None = None,
+    ) -> list[helion.Config]:
+        return tcgen05_grouped_worklist_seed_configs(
+            groups=cast("int", arguments["groups"]),
+            packed_m=cast("int", arguments["packed_m"]),
+            n=cast("int", arguments["n"]),
+            k=cast("int", arguments["k"]),
+            b_major=cast("Any", arguments["b_major"]),
+            source_m_tile=cast("int", arguments["source_m_tile"]),
+            num_sm=cast("int", arguments["num_sm"]),
+            target_hardware_identity=target_hardware_identity,
+            worklist_rows=worklist_rows,
+        )
 
     def test_disable_autotuner_heuristics_setting_env(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
@@ -822,14 +879,8 @@ class TestAutotunerHeuristic(TestCase):
                 side_effect=(
                     BLACKWELL_HARDWARE,
                     BLACKWELL_HARDWARE,
-                    dataclasses.replace(
-                        GB300_HARDWARE,
-                        compute_capability="sm103",
-                    ),
-                    dataclasses.replace(
-                        GB300_HARDWARE,
-                        compute_capability="sm103",
-                    ),
+                    GB300_HARDWARE,
+                    GB300_HARDWARE,
                 ),
             ) as hardware_info,
         ):
@@ -1327,6 +1378,66 @@ class TestAutotunerHeuristic(TestCase):
                     (),
                 )
 
+    def test_grouped_worklist_reviewed_signature_classifier_is_coarse(self) -> None:
+        policy = get_grouped_worklist_target_policy(("cuda", "NVIDIA GB300", "sm103"))
+        signatures = policy.reviewed_worklist_rows()
+        exact = next(
+            rows for rows in signatures if len(rows) == 4 and rows[0][2] == 9884
+        )
+        packed_m = sum(row[3] for row in exact)
+        classifier = _Tcgen05GroupedWorklistCompatibilityClassifier(
+            static_group_count=4,
+            static_packed_m=packed_m,
+            reviewed_rows=signatures,
+        )
+        worklist = torch.tensor(exact, dtype=torch.int32)
+        compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
+            exact,
+            group_count=4,
+            packed_m=packed_m,
+        )
+
+        self.assertEqual(classifier((worklist,)), (compatible, exact))
+
+        def rows_for_tile_counts(
+            tile_counts: tuple[int, ...],
+        ) -> tuple[tuple[int, int, int, int], ...]:
+            rows = []
+            start = 0
+            for group, count in enumerate(tile_counts):
+                stored_m = count * 256
+                rows.append((group, start, stored_m, stored_m))
+                start += stored_m
+            return tuple(rows)
+
+        skew_rows = rows_for_tile_counts((34, 34, 34, 33))
+        worklist.copy_(torch.tensor(skew_rows, dtype=torch.int32))
+        self.assertEqual(classifier((worklist,)), (compatible, None))
+
+        other_unseen = rows_for_tile_counts((33, 34, 34, 34))
+        self.assertEqual(
+            classifier((torch.tensor(other_unseen, dtype=torch.int32),)),
+            (compatible, None),
+        )
+
+        inference_classifier = _Tcgen05GroupedWorklistCompatibilityClassifier(
+            static_group_count=4,
+            static_packed_m=packed_m,
+            reviewed_rows=signatures,
+        )
+        with torch.inference_mode():
+            inference_worklist = torch.tensor(exact, dtype=torch.int32)
+        flattened = tuple(value for row in exact for value in row)
+        with patch(
+            "helion.runtime.cute.launcher._tcgen05_grouped_tensor_mutation_key",
+            return_value=("values", flattened),
+        ) as mutation_key:
+            self.assertEqual(
+                inference_classifier((inference_worklist,)),
+                (compatible, exact),
+            )
+        mutation_key.assert_called_once_with(inference_worklist)
+
     def test_grouped_worklist_seeds_are_packing_compatible_and_ranked(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         spec.cute_tcgen05_search_enabled = True
@@ -1588,6 +1699,576 @@ class TestAutotunerHeuristic(TestCase):
                         Tcgen05PersistenceModel.CLC_PERSISTENT.value,
                     )
 
+    def test_grouped_worklist_sm103_target_policy_is_exact(self) -> None:
+        gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
+        policy = get_grouped_worklist_target_policy(gb300_identity)
+        expected_tunings = {
+            (4, 6144, 7168, "k", 256, 135, 152): (256, 8),
+            (4, 7168, 3072, "k", 256, 131, 152): (232, 32),
+            (8, 7168, 3072, "k", 256, 140, 152): (240, 8),
+            (4, 4096, 4096, "k", 256, 139, 152): (224, 16),
+            (4, 4096, 2048, "k", 256, 128, 152): (240, 1),
+            (8, 6144, 7168, "k", 256, 152, 152): (240, 8),
+            (8, 4096, 4096, "k", 256, 135, 152): (256, 32),
+            (8, 4096, 2048, "k", 256, 128, 152): (256, 1),
+        }
+        self.assertEqual(
+            {
+                (
+                    tuning.workload.groups,
+                    tuning.workload.n,
+                    tuning.workload.k,
+                    tuning.workload.b_major,
+                    tuning.workload.source_m_tile,
+                    tuning.workload.source_tiles,
+                    tuning.workload.num_sm,
+                ): (
+                    tuning.consumer_regs,
+                    tuning.l2_swizzle_size,
+                )
+                for tuning in policy.tunings
+            },
+            expected_tunings,
+        )
+        reviewed_rows = policy.reviewed_worklist_rows()
+        self.assertEqual(len(reviewed_rows), 8)
+        for tuning in policy.tunings:
+            rows = tuning.workload.reviewed_worklist_rows
+            assert rows is not None
+            self.assertEqual(
+                tuning.workload.source_tiles,
+                sum(row[3] for row in rows) // tuning.workload.source_m_tile,
+            )
+        self.assertIn(
+            (
+                (0, 0, 9884, 9984),
+                (1, 9984, 9459, 9472),
+                (2, 19456, 7801, 7936),
+                (3, 27392, 7007, 7168),
+            ),
+            reviewed_rows,
+        )
+        self.assertIn(
+            (
+                (0, 0, 5102, 5120),
+                (1, 5120, 5282, 5376),
+                (2, 10496, 4858, 4864),
+                (3, 15360, 5084, 5120),
+                (4, 20480, 3629, 3840),
+                (5, 24320, 4660, 4864),
+                (6, 29184, 5076, 5120),
+                (7, 34304, 4548, 4608),
+            ),
+            reviewed_rows,
+        )
+        self.assertEqual(
+            grouped_worklist_target_identities(),
+            frozenset(
+                {
+                    ("cuda", "NVIDIA B200", "sm100"),
+                    gb300_identity,
+                }
+            ),
+        )
+        self.assertFalse(
+            get_grouped_worklist_target_policy(("cuda", "NVIDIA B200", "sm100")).tunings
+        )
+        for mismatched_identity in (
+            ("rocm", "NVIDIA GB300", "sm103"),
+            ("cuda", "NVIDIA GB300 NVL72", "sm103"),
+            ("cuda", "NVIDIA GB300", "sm100"),
+            None,
+        ):
+            self.assertFalse(
+                get_grouped_worklist_target_policy(mismatched_identity).tunings
+            )
+
+        tuning_by_key = {
+            (
+                tuning.workload.groups,
+                tuning.workload.n,
+                tuning.workload.k,
+                tuning.workload.b_major,
+                tuning.workload.source_m_tile,
+                tuning.workload.source_tiles,
+                tuning.workload.num_sm,
+            ): tuning
+            for tuning in policy.tunings
+        }
+        for workload_key, (consumer_regs, l2_swizzle_size) in expected_tunings.items():
+            groups, n, k, b_major, source_m_tile, source_tiles, num_sm = workload_key
+            with self.subTest(workload=workload_key):
+                selected = tcgen05_grouped_worklist_seed_configs(
+                    groups=groups,
+                    packed_m=source_tiles * source_m_tile,
+                    n=n,
+                    k=k,
+                    b_major=cast("Any", b_major),
+                    source_m_tile=source_m_tile,
+                    num_sm=num_sm,
+                    target_hardware_identity=gb300_identity,
+                    worklist_rows=tuning_by_key[
+                        workload_key
+                    ].workload.reviewed_worklist_rows,
+                )[0].config
+                self.assertEqual(
+                    selected,
+                    self._expected_grouped_worklist_clc_config(
+                        consumer_regs,
+                        l2_swizzle_size,
+                    ),
+                )
+
+    def test_grouped_worklist_target_envelopes_fall_back_exactly(self) -> None:
+        gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
+        row3_rows = next(
+            tuning.workload.reviewed_worklist_rows
+            for tuning in get_grouped_worklist_target_policy(gb300_identity).tunings
+            if tuning.workload.groups == 4
+            and tuning.workload.n == 4096
+            and tuning.workload.k == 2048
+        )
+        row3: dict[str, Any] = {
+            "groups": 4,
+            "packed_m": 128 * 256,
+            "n": 4096,
+            "k": 2048,
+            "b_major": "k",
+            "source_m_tile": 256,
+            "num_sm": 152,
+        }
+        perturbations = (
+            {"groups": 5},
+            {"n": 4352},
+            {"k": 2112},
+            {"b_major": "n"},
+            {"source_m_tile": 224, "packed_m": 128 * 224},
+            {"packed_m": 127 * 256},
+            {"num_sm": 151},
+        )
+        for perturbation in perturbations:
+            arguments = {**row3, **perturbation}
+            with self.subTest(perturbation=perturbation):
+                generic = self._grouped_worklist_configs_from_arguments(arguments)
+                off_profile = self._grouped_worklist_configs_from_arguments(
+                    arguments,
+                    gb300_identity,
+                    row3_rows,
+                )
+                self.assertEqual(off_profile, generic)
+
+        for mismatched_identity in (
+            ("rocm", "NVIDIA GB300", "sm103"),
+            ("cuda", "NVIDIA GB300 NVL72", "sm103"),
+            ("cuda", "NVIDIA GB300", "sm100"),
+        ):
+            with self.subTest(hardware_identity=mismatched_identity):
+                self.assertEqual(
+                    self._grouped_worklist_configs_from_arguments(
+                        row3,
+                        mismatched_identity,
+                        row3_rows,
+                    ),
+                    self._grouped_worklist_configs_from_arguments(row3),
+                )
+
+    def test_grouped_worklist_unmeasured_n_major_uses_generic_ranking(self) -> None:
+        gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
+        workload = next(
+            tuning.workload
+            for tuning in get_grouped_worklist_target_policy(gb300_identity).tunings
+            if tuning.workload.groups == 4
+            and tuning.workload.n == 7168
+            and tuning.workload.k == 3072
+        )
+        arguments = {
+            "groups": workload.groups,
+            "packed_m": workload.source_tiles * workload.source_m_tile,
+            "n": workload.n,
+            "k": workload.k,
+            "b_major": "n",
+            "source_m_tile": workload.source_m_tile,
+            "num_sm": workload.num_sm,
+        }
+
+        self.assertEqual(
+            self._grouped_worklist_configs_from_arguments(
+                arguments,
+                gb300_identity,
+                workload.reviewed_worklist_rows,
+            ),
+            self._grouped_worklist_configs_from_arguments(arguments),
+        )
+
+    def test_grouped_worklist_target_policy_rejects_malformed_tuning(self) -> None:
+        valid_workload: dict[str, Any] = {
+            "groups": 4,
+            "n": 4096,
+            "k": 4096,
+            "b_major": "k",
+            "source_m_tile": 256,
+            "source_tiles": 128,
+            "num_sm": 152,
+        }
+        for override, message in (
+            ({"groups": 0}, "positive integers"),
+            ({"b_major": "x"}, "B major"),
+            ({"source_m_tile": 16}, "source M tile"),
+            ({"n": 33}, "N must be divisible by 32"),
+            ({"source_tiles": 0}, "positive integers"),
+            (
+                {
+                    "reviewed_worklist_rows": tuple(
+                        (group, group * 256, 256, 256) for group in range(4)
+                    )
+                },
+                "do not match source tiles",
+            ),
+        ):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                GroupedWorklistWorkload(**cast("Any", {**valid_workload, **override}))
+
+        workload = GroupedWorklistWorkload(**cast("Any", valid_workload))
+        valid_tuning: dict[str, Any] = {
+            "workload": workload,
+            "consumer_regs": 240,
+            "l2_swizzle_size": 1,
+            "clc": False,
+        }
+        for override, message in (
+            ({"block_k": 32}, "block K"),
+            ({"consumer_regs": 128}, "consumer register"),
+            ({"l2_swizzle_size": 3}, "L2 swizzle"),
+            ({"ab_stages": 0}, "AB stages"),
+            ({"ab_stages": 8}, "AB stages"),
+            ({"runtime_direct": 1}, "scheduler flags"),
+            ({"clc": 1}, "scheduler flags"),
+            ({"reserved_sms": 0}, "reserved SM count"),
+            ({"reserved_sms": 151}, "reserved SM count"),
+            ({"reserved_sms": 10_000}, "reserved SM count"),
+            (
+                {"runtime_direct": False, "l2_swizzle_size": 8},
+                "panel swizzles require",
+            ),
+            (
+                {
+                    "workload": dataclasses.replace(workload, k=96),
+                    "block_k": 64,
+                },
+                "must divide workload K",
+            ),
+        ):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                GroupedWorklistTuning(**cast("Any", {**valid_tuning, **override}))
+
+        valid_clc = {**valid_tuning, "clc": True}
+        for override, message in (
+            ({"runtime_direct": False}, "requires runtime_direct"),
+            ({"reserved_sms": 1}, "cannot reserve SMs"),
+            (
+                {
+                    "workload": dataclasses.replace(
+                        workload,
+                        source_m_tile=32,
+                    )
+                },
+                "two-CTA source M tile",
+            ),
+            (
+                {"workload": dataclasses.replace(workload, n=4032)},
+                "N divisible by 256",
+            ),
+            (
+                {
+                    "workload": dataclasses.replace(
+                        workload,
+                        source_tiles=1,
+                    )
+                },
+                "at least one device wave",
+            ),
+            (
+                {
+                    "workload": dataclasses.replace(
+                        workload,
+                        n=256,
+                        source_tiles=65_536,
+                    )
+                },
+                "runtime grid limit",
+            ),
+        ):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                GroupedWorklistTuning(**cast("Any", {**valid_clc, **override}))
+
+    def test_grouped_worklist_target_policy_rejects_overlapping_workloads(
+        self,
+    ) -> None:
+        base = GroupedWorklistWorkload(
+            groups=8,
+            n=4096,
+            k=2048,
+            b_major="k",
+            source_m_tile=256,
+            source_tiles=128,
+            num_sm=152,
+        )
+
+        def tuning(workload: GroupedWorklistWorkload) -> GroupedWorklistTuning:
+            return GroupedWorklistTuning(
+                workload=workload,
+                consumer_regs=240,
+                l2_swizzle_size=1,
+                clc=False,
+            )
+
+        with self.assertRaisesRegex(ValueError, "immutable tuple"):
+            GroupedWorklistTargetPolicy(tunings=cast("Any", [tuning(base)]))
+        with self.assertRaisesRegex(ValueError, "must not overlap"):
+            GroupedWorklistTargetPolicy(
+                tunings=(
+                    tuning(base),
+                    tuning(
+                        dataclasses.replace(
+                            base,
+                            source_tiles=128,
+                        )
+                    ),
+                )
+            )
+        GroupedWorklistTargetPolicy(
+            tunings=(
+                tuning(base),
+                tuning(
+                    dataclasses.replace(
+                        base,
+                        source_tiles=130,
+                    )
+                ),
+            )
+        )
+        exact_rows = tuple((group, group * 4096, 4096, 4096) for group in range(8))
+        different_rows = (
+            (0, 0, 3840, 3840),
+            *(
+                tuple((group, 3840 + (group - 1) * 4096, 4096, 4096))
+                for group in range(1, 7)
+            ),
+            (7, 28416, 4352, 4352),
+        )
+        GroupedWorklistTargetPolicy(
+            tunings=(
+                tuning(dataclasses.replace(base, reviewed_worklist_rows=exact_rows)),
+                tuning(
+                    dataclasses.replace(
+                        base,
+                        reviewed_worklist_rows=different_rows,
+                    )
+                ),
+            )
+        )
+
+    def test_grouped_worklist_exact_target_seed_precedes_generic_branches(self) -> None:
+        rows = tuple((group, group * 256, 256, 256) for group in range(16))
+        tuning = GroupedWorklistTuning(
+            workload=GroupedWorklistWorkload(
+                groups=16,
+                n=256,
+                k=256,
+                b_major="k",
+                source_m_tile=256,
+                source_tiles=16,
+                num_sm=8,
+                reviewed_worklist_rows=rows,
+            ),
+            consumer_regs=256,
+            l2_swizzle_size=4,
+        )
+
+        with patch(
+            "helion._compiler.autotuner_heuristics.cute.get_grouped_worklist_target_policy",
+            return_value=GroupedWorklistTargetPolicy(tunings=(tuning,)),
+        ):
+            selected = tcgen05_grouped_worklist_seed_configs(
+                groups=16,
+                packed_m=16 * 256,
+                n=256,
+                k=256,
+                b_major="k",
+                source_m_tile=256,
+                num_sm=8,
+                target_hardware_identity=("cuda", "synthetic", "sm103"),
+                worklist_rows=rows,
+            )[0].config
+
+        self.assertEqual(
+            selected,
+            self._expected_grouped_worklist_clc_config(256, 4),
+        )
+
+    def test_grouped_worklist_seed_configs_forward_exact_hardware_identity(
+        self,
+    ) -> None:
+        from helion._compiler.cute.cute_mma import Tcgen05GroupedWorklistAnalysis
+        from helion._compiler.cute.cute_mma import Tcgen05GroupedWorklistSeedFacts
+
+        spec = ConfigSpec(
+            backend=CuteBackend(),
+            target_device_capability=(10, 3),
+            num_sm=152,
+        )
+        for block_id, size_hint, min_size, max_size in (
+            (0, 256, 256, 256),
+            (1, 4096, 128, 128),
+            (2, 2048, 64, 128),
+        ):
+            spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    min_size=min_size,
+                    max_size=max_size,
+                )
+            )
+        fact = MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=3,
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            static_m=256,
+            static_n=4096,
+            static_k=2048,
+            lhs_dtype=torch.bfloat16,
+            rhs_dtype=torch.bfloat16,
+        )
+        seed_facts = Tcgen05GroupedWorklistSeedFacts(
+            groups_hint=8,
+            packed_m_hint=128 * 256,
+            n_hint=4096,
+            k_hint=2048,
+            b_major="k",
+            device_split_sizes=False,
+        )
+        analysis = Tcgen05GroupedWorklistAnalysis(
+            seed_facts=seed_facts,
+            metadata_tensor=MagicMock(),
+            packed_tensor=MagicMock(),
+            grouped_tensor=MagicMock(),
+        )
+        env = MagicMock(device=torch.device("cuda:0"), config_spec=spec)
+        device_ir = MagicMock()
+        reviewed_rows = next(
+            tuning.workload.reviewed_worklist_rows
+            for tuning in get_grouped_worklist_target_policy(
+                ("cuda", "NVIDIA GB300", "sm103")
+            ).tunings
+            if tuning.workload.groups == 8
+            and tuning.workload.n == 4096
+            and tuning.workload.k == 2048
+        )
+        assert reviewed_rows is not None
+
+        with (
+            patch.object(
+                CuteTcgen05GroupedWorklistHeuristic,
+                "_eligible_inputs",
+                return_value=(fact, analysis),
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_source_analysis",
+                return_value=((256,), reviewed_rows),
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=GB300_HARDWARE,
+            ) as hardware_info,
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "get_grouped_worklist_target_policy",
+                wraps=get_grouped_worklist_target_policy,
+            ) as policy_lookup,
+        ):
+            configs = CuteTcgen05GroupedWorklistHeuristic._seed_configs(
+                env,
+                device_ir,
+            )
+
+        hardware_info.assert_called_once_with(torch.device("cuda:0"))
+        policy_lookup.assert_called_once_with(("cuda", "NVIDIA GB300", "sm103"))
+        self.assertEqual(
+            configs[0].config,
+            self._expected_grouped_worklist_clc_config(256, 1),
+        )
+
+        with (
+            patch.object(
+                CuteTcgen05GroupedWorklistHeuristic,
+                "_eligible_inputs",
+                return_value=(fact, analysis),
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_source_analysis",
+                return_value=((256,), None),
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                side_effect=RuntimeError("unclassified device"),
+            ),
+        ):
+            unclassified = CuteTcgen05GroupedWorklistHeuristic._seed_configs(
+                env,
+                device_ir,
+            )
+        self.assertEqual(
+            unclassified,
+            tcgen05_grouped_worklist_seed_configs(
+                groups=8,
+                packed_m=128 * 256,
+                n=4096,
+                k=2048,
+                b_major="k",
+                source_m_tile=256,
+                num_sm=152,
+            )[:8],
+        )
+
+        same_arch_unknown_product = dataclasses.replace(
+            GB300_HARDWARE,
+            hardware_name="NVIDIA future sm103",
+        )
+        with patch(
+            "helion._hardware.get_hardware_info",
+            side_effect=(GB300_HARDWARE, same_arch_unknown_product),
+        ):
+            gb300_cache_key = compiler_promotion_specialization_key(
+                "cute",
+                torch.device("cuda:0"),
+            )
+            unknown_cache_key = compiler_promotion_specialization_key(
+                "cute",
+                torch.device("cuda:0"),
+            )
+        self.assertEqual(
+            gb300_cache_key,
+            ((CuteTcgen05GroupedWorklistHeuristic.name, "NVIDIA GB300"),),
+        )
+        self.assertEqual(
+            unknown_cache_key,
+            ((CuteTcgen05GroupedWorklistHeuristic.name, None),),
+        )
+
     def test_grouped_worklist_seeds_filter_unreachable_block_k(self) -> None:
         configs = tcgen05_grouped_worklist_seed_configs(
             groups=8,
@@ -1766,8 +2447,15 @@ class TestAutotunerHeuristic(TestCase):
         self.assertEqual(l2_swizzle.search_choices, (1, 2, 4, 8))
         self.assertEqual(pid_type.search_choices, ("flat",))
 
-    def test_grouped_worklist_primary_promotes_only_on_b200(self) -> None:
-        spec = ConfigSpec(backend=CuteBackend())
+    def test_grouped_worklist_primary_promotes_on_b200(self) -> None:
+        self.assertEqual(
+            GB300_HARDWARE.get_compatible_compute_ids()[:2],
+            ["sm103", "sm100"],
+        )
+        spec = ConfigSpec(
+            backend=CuteBackend(),
+            target_device_capability=(10, 0),
+        )
         spec.cute_tcgen05_search_enabled = True
         for block_id, size_hint in enumerate((256, 256, 128)):
             spec.block_sizes.append(
@@ -1809,15 +2497,169 @@ class TestAutotunerHeuristic(TestCase):
             ]
             self.assertFalse(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
         spec.matmul_facts = [static_fact]
+        for mismatched_hardware in (
+            dataclasses.replace(BLACKWELL_HARDWARE, compute_capability="sm103"),
+            dataclasses.replace(GB300_HARDWARE, compute_capability="sm100"),
+        ):
+            with (
+                self.subTest(
+                    hardware_name=mismatched_hardware.hardware_name,
+                    compute_capability=mismatched_hardware.compute_capability,
+                ),
+                patch(
+                    "helion._compiler.autotuner_heuristics.cute."
+                    "tcgen05_runtime_n_ptx_compatible",
+                    return_value=True,
+                ),
+                patch(
+                    "helion._hardware.get_hardware_info",
+                    return_value=mismatched_hardware,
+                ),
+            ):
+                self.assertFalse(
+                    CuteTcgen05GroupedWorklistHeuristic.should_promote(env)
+                )
+
+    def test_grouped_worklist_gb300_target_override_requires_exact_rows(self) -> None:
+        gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
+        exact_rows = (
+            (0, 0, 2870, 3072),
+            (1, 3072, 4080, 4096),
+            (2, 7168, 4999, 5120),
+            (3, 12288, 3466, 3584),
+            (4, 15872, 3666, 3840),
+            (5, 19712, 5006, 5120),
+            (6, 24832, 3336, 3584),
+            (7, 28416, 4261, 4352),
+        )
+        balanced_rows = tuple((group, group * 4096, 4096, 4096) for group in range(8))
+        kwargs = {
+            "groups": 8,
+            "packed_m": 128 * 256,
+            "n": 4096,
+            "k": 2048,
+            "b_major": "k",
+            "source_m_tile": 256,
+            "num_sm": 152,
+        }
+        exact_ranked = tcgen05_grouped_worklist_seed_configs(
+            **cast("Any", kwargs),
+            target_hardware_identity=gb300_identity,
+            worklist_rows=exact_rows,
+        )
+        same_total_ranked = tcgen05_grouped_worklist_seed_configs(
+            **cast("Any", kwargs),
+            target_hardware_identity=gb300_identity,
+            worklist_rows=balanced_rows,
+        )
+        generic_ranked = tcgen05_grouped_worklist_seed_configs(
+            **cast("Any", kwargs),
+        )
+
+        self.assertNotEqual(exact_ranked[0], generic_ranked[0])
+        self.assertEqual(same_total_ranked, generic_ranked)
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_gb300_reviewed_signature_rebinds(self) -> None:
+        from pretuned_kernels.grouped_gemm_deepgemm.grouped_gemm_deepgemm import (
+            _GROUPED_GEMM_DEEPGEMM_BODY,
+        )
+
+        def rows_for_tile_counts(
+            tile_counts: tuple[int, ...],
+        ) -> tuple[tuple[int, int, int, int], ...]:
+            rows = []
+            start = 0
+            for group, count in enumerate(tile_counts):
+                stored_m = count * 256
+                rows.append((group, start, stored_m, stored_m))
+                start += stored_m
+            return tuple(rows)
+
+        exact_rows = rows_for_tile_counts((1, 2, 2, 3))
+        skew_rows = rows_for_tile_counts((3, 2, 2, 1))
+        policy = GroupedWorklistTargetPolicy(
+            tunings=(
+                GroupedWorklistTuning(
+                    workload=GroupedWorklistWorkload(
+                        groups=4,
+                        n=256,
+                        k=128,
+                        b_major="k",
+                        source_m_tile=256,
+                        source_tiles=8,
+                        num_sm=152,
+                        reviewed_worklist_rows=exact_rows,
+                    ),
+                    consumer_regs=256,
+                    l2_swizzle_size=1,
+                    clc=False,
+                ),
+            )
+        )
+        a = torch.empty((8 * 256, 128), device=DEVICE, dtype=torch.bfloat16)
+        b = torch.empty((4, 256, 128), device=DEVICE, dtype=torch.bfloat16)
+        worklist = torch.tensor(exact_rows, device=DEVICE, dtype=torch.int32)
+        args = (a, b, worklist)
+        kernel = helion.kernel(
+            _GROUPED_GEMM_DEEPGEMM_BODY,
+            backend="cute",
+            static_shapes=True,
+        )
+
         with (
+            patch_cute_mma_support(),
             patch(
                 "helion._compiler.autotuner_heuristics.cute."
                 "tcgen05_runtime_n_ptx_compatible",
                 return_value=True,
             ),
+            patch(
+                "helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"
+            ),
             patch("helion._hardware.get_hardware_info", return_value=GB300_HARDWARE),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "get_grouped_worklist_target_policy",
+                return_value=policy,
+            ),
         ):
-            self.assertFalse(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
+            exact_bound = kernel.bind(args)
+            exact_default = exact_bound.config_spec.compiler_default_config
+            self.assertIsNotNone(exact_default)
+            assert exact_default is not None
+            exact_seeds = [
+                config
+                for config in exact_bound.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            ]
+            self.assertEqual(exact_default, exact_seeds[0])
+
+            worklist.copy_(torch.tensor(skew_rows, device=DEVICE, dtype=torch.int32))
+            skew_bound = kernel.bind(args)
+            self.assertIsNot(skew_bound, exact_bound)
+            skew_default = skew_bound.config_spec.compiler_default_config
+            self.assertIsNotNone(skew_default)
+            assert skew_default is not None
+            skew_seeds = [
+                config
+                for config in skew_bound.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            ]
+            self.assertEqual(skew_default, skew_seeds[0])
+            self.assertNotEqual(skew_default, exact_default)
+
+            exact_output = torch.empty((), device=DEVICE)
+            skew_output = torch.empty((), device=DEVICE)
+            exact_bound._run = lambda *_args: exact_output
+            skew_bound._run = lambda *_args: skew_output
+            self.assertIs(exact_bound(*args), skew_output)
+
+            worklist.copy_(torch.tensor(exact_rows, device=DEVICE, dtype=torch.int32))
+            self.assertIs(kernel.bind(args), exact_bound)
+            self.assertIs(exact_bound(*args), exact_output)
 
     def test_grouped_worklist_seeds_require_validated_runtime_n_ptx(self) -> None:
         spec = ConfigSpec(
@@ -1981,13 +2823,6 @@ class TestAutotunerHeuristic(TestCase):
         self.assertNotIn(
             TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
             first.config_spec._flat_fields(),
-        )
-        self.assertTrue(
-            any(
-                config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
-                == TCGEN05_GROUPED_MODE_WORKLIST_NM
-                for config in first.config_spec.compiler_seed_configs
-            )
         )
         transfer_errors: list[str] = []
         generation = first.config_spec.create_config_generation()
@@ -2401,6 +3236,7 @@ class TestAutotunerHeuristic(TestCase):
         self.assertIsNot(bound, empty_bound)
         self.assertEqual(bound.config_spec.compiler_seed_configs, [])
         self.assertEqual(bound.config_spec.autotuner_heuristics, [])
+        self.assertIsNone(bound.config_spec.compiler_default_config)
         self.assertTrue(bound.env.runtime_input_specializations)
         self.assertIsNot(compact_bound, bound)
         self.assertEqual(compact_bound.config_spec.compiler_seed_configs, [])
@@ -2690,6 +3526,11 @@ class TestAutotunerHeuristic(TestCase):
                 "helion._hardware.get_hardware_info",
                 return_value=BLACKWELL_HARDWARE,
             ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_hardware_identity",
+                return_value=("cuda", "NVIDIA B200", "sm100"),
+            ),
         ):
             for source_m_tile, b_major in (
                 (32, "k"),
@@ -2940,8 +3781,12 @@ class TestAutotunerHeuristic(TestCase):
         ):
             gb300_bound = unannotated_packing_kernel.bind(make_args(256, "n"))
         self.assertIsNot(gb300_bound, b200_256_bound)
-        self.assertTrue(grouped_seeds(gb300_bound.config_spec, 256))
-        self.assertIsNone(gb300_bound.config_spec.compiler_default_config)
+        gb300_seeds = grouped_seeds(gb300_bound.config_spec, 256)
+        self.assertTrue(gb300_seeds)
+        self.assertEqual(
+            gb300_bound.config_spec.compiler_default_config,
+            gb300_seeds[0],
+        )
         unannotated_packing_kernel.reset()
         with (
             torch.inference_mode(),
@@ -2957,6 +3802,11 @@ class TestAutotunerHeuristic(TestCase):
             patch(
                 "helion._hardware.get_hardware_info",
                 return_value=BLACKWELL_HARDWARE,
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_hardware_identity",
+                return_value=("cuda", "NVIDIA B200", "sm100"),
             ),
         ):
             inference_args = make_args(224, "k")

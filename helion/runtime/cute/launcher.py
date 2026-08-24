@@ -38,10 +38,15 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
+from ..._compiler.cute.grouped_worklist import GroupedWorklistRows
 from ..._compiler.cute.grouped_worklist import Tcgen05GroupedWorklistValidationError
+from ..._compiler.cute.grouped_worklist import (
+    _tcgen05_grouped_worklist_rows_from_flattened,
+)
 from ..._compiler.cute.grouped_worklist import (
     tcgen05_grouped_worklist_compatible_source_m_tiles,
 )
+from ..._compiler.cute.grouped_worklist import tcgen05_grouped_worklist_rows
 from ..._compiler.cute.grouped_worklist import validate_tcgen05_grouped_worklist_rows
 from ..._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ..._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
@@ -2752,6 +2757,7 @@ class _Tcgen05GroupedWorklistCompatibilityClassifier:
 
     static_group_count: int | None
     static_packed_m: int | None
+    reviewed_rows: frozenset[GroupedWorklistRows] = frozenset()
     cache: WeakIdKeyDictionary = field(
         default_factory=WeakIdKeyDictionary,
         compare=False,
@@ -2794,24 +2800,22 @@ class _Tcgen05GroupedWorklistCompatibilityClassifier:
             pass
         else:
             if cached_input_key == input_key:
-                return cast("tuple[int, ...]", cached_result)
+                return cast("Hashable", cached_result)
         if tensor.ndim != 2 or tensor.shape[1] != 4:
-            rows = []
+            rows: GroupedWorklistRows = ()
         elif inference_values is not None:
-            rows = [
-                list(inference_values[index : index + 4])
-                for index in range(0, len(inference_values), 4)
-            ]
+            rows = _tcgen05_grouped_worklist_rows_from_flattened(inference_values)
         else:
-            with unset_fake_temporarily():
-                rows = cast(
-                    "list[list[int]]",
-                    tensor.detach().reshape(-1, 4).cpu().tolist(),
-                )
-        result = tcgen05_grouped_worklist_compatible_source_m_tiles(
+            rows = tcgen05_grouped_worklist_rows(tensor) or ()
+        compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
             rows,
             group_count=group_count,
             packed_m=packed_m,
+        )
+        result: Hashable = (
+            compatible
+            if not self.reviewed_rows
+            else (compatible, rows if rows in self.reviewed_rows else None)
         )
         self.cache[tensor] = (input_key, result)
         return result

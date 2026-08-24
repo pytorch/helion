@@ -10,6 +10,7 @@ log: logging.Logger = logging.getLogger(__name__)
 
 # Compute capability lists for fallback (newest to oldest)
 _CUDA_COMPUTE_CAPS: list[str] = [
+    "sm103",
     "sm100",
     "sm90",
     "sm89",

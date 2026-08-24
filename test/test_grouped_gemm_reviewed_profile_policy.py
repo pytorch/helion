@@ -24,6 +24,9 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from helion._compiler.autotuner_heuristics import cute as cute_heuristics
 from helion._compiler.backend import CuteBackend
+from helion._compiler.cute.grouped_worklist_policy import (
+    get_grouped_worklist_target_policy,
+)
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import L2GroupingSpec
@@ -850,6 +853,66 @@ def test_reviewed_heuristic_contract_and_invalid_inputs() -> None:
         )
         is None
     )
+
+
+def test_b200_official_reviewed_profiles_remain_rank_zero() -> None:
+    b200_identity = ("cuda", "NVIDIA B200", "sm100")
+    for shape, actual_ms in zip(
+        reviewed_profiles.OFFICIAL_SHAPES,
+        reviewed_profiles.official_actual_ms(seed=0),
+        strict=True,
+    ):
+        profile = reviewed_profiles.exact_reviewed_worklist_profile(
+            shape.groups,
+            shape.expected_m_per_group,
+            shape.n,
+            shape.k,
+        )
+        source_m_tile = profile.source_m_tile
+        packed_m = sum(
+            (actual_m + source_m_tile - 1) // source_m_tile * source_m_tile
+            for actual_m in actual_ms
+        )
+        selected = cute_heuristics.tcgen05_grouped_worklist_seed_configs(
+            groups=shape.groups,
+            packed_m=packed_m,
+            n=shape.n,
+            k=shape.k,
+            b_major=profile.b_major,
+            source_m_tile=source_m_tile,
+            num_sm=148,
+            target_hardware_identity=b200_identity,
+        )[0]
+
+        assert selected.config == reviewed_profiles.reviewed_config_values(
+            profile.config_name
+        )
+
+
+def test_gb300_policy_signatures_match_official_seed_zero_worklists() -> None:
+    expected = set()
+    for shape, actual_ms in zip(
+        reviewed_profiles.OFFICIAL_SHAPES,
+        reviewed_profiles.official_actual_ms(seed=0),
+        strict=True,
+    ):
+        profile = reviewed_profiles.exact_reviewed_worklist_profile(
+            shape.groups,
+            shape.expected_m_per_group,
+            shape.n,
+            shape.k,
+        )
+        assert profile.source_m_tile == 256
+        rows = []
+        start = 0
+        for group, actual_m in enumerate(actual_ms):
+            stored_m = (actual_m + 255) // 256 * 256
+            rows.append((group, start, actual_m, stored_m))
+            start += stored_m
+        expected.add(tuple(rows))
+
+    policy = get_grouped_worklist_target_policy(("cuda", "NVIDIA GB300", "sm103"))
+    assert policy.reviewed_worklist_rows() == frozenset(expected)
 
 
 def test_reviewed_heuristic_loads_with_only_its_sibling_profile(
